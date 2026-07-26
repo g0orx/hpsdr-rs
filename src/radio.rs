@@ -1,0 +1,1662 @@
+/*
+    Protocol 1 (Metis/old protocol) and Protocol 2 start-and-stream
+    implementation.
+
+    RX frame layout and register encoding confirmed against the user's
+    own old_protocol.c / new_protocol.c and the official openHPSDR
+    Ethernet Protocol v4.3 spec, rather than reconstructed from public
+    docs alone -- see inline notes for the handful of RX pieces that
+    are still educated assumptions rather than verified.
+
+    TX (MOX/PTT + TX audio/IQ streaming) is NOT held to that same bar.
+    None of it has a confirmed reference -- see the module notes on
+    fill_tx_payload (P1) and the "Protocol 2 TX (DUC) IQ streaming"
+    section (P2) below for exactly what's guessed and how each guess
+    is designed to fail closed (no transmission) rather than fail open
+    (unintended transmission) if wrong. Bench-test into a dummy load
+    at reduced drive before ever keying into an antenna.
+*/
+
+use crate::discovery::Device;
+use std::collections::VecDeque;
+use std::io;
+use std::net::UdpSocket;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
+
+const DATA_PORT: u16 = 1024; // same port as discovery, confirmed
+const USB_FRAME_SIZE: usize = 512;
+const HEADER_SIZE: usize = 8; // 0xEF 0xFE 0x01 <endpoint> <4-byte seq>
+const PACKET_SIZE: usize = HEADER_SIZE + USB_FRAME_SIZE * 2; // 1032
+
+const EP_COMMAND_AUDIO: u8 = 0x02; // host -> radio
+const EP_IQ_DATA: u8 = 0x06; // radio -> host, narrowband IQ
+const EP_WIDEBAND: u8 = 0x04; // radio -> host, wideband (ignored for now)
+
+// Protocol 2 -- fixed ports per the openHPSDR Ethernet Protocol v4.3 spec.
+const P2_GENERAL_PORT: u16 = 1024;
+const P2_DDC_SPECIFIC_PORT: u16 = 1025;
+const P2_TX_SPECIFIC_PORT: u16 = 1026;
+const P2_HIGH_PRIORITY_PORT: u16 = 1027;
+const P2_DDC0_IQ_PORT: u16 = 1035; // DDC1 = 1036, DDC2 = 1037, ...
+// Confirmed by the user: separate from P2_TX_SPECIFIC_PORT above, which
+// only carries the small TX-specific *config* packet (DAC count, DUC
+// rate/size) -- the actual outgoing DUC IQ audio stream itself goes
+// here instead. An earlier version of this file guessed 1026 (reusing
+// the config port) for this, which was wrong -- see p2_tx_iq_loop.
+const P2_TX_IQ_PORT: u16 = 1029;
+// Incoming (radio -> host) source port for the radio's own
+// high-priority status packets -- confirmed by the user: the host is
+// expected to respond with a fresh outgoing High Priority packet (port
+// P2_HIGH_PRIORITY_PORT above) whenever one of these arrives, in
+// addition to sending on content change. Same numeric value as
+// P2_DDC_SPECIFIC_PORT above by protocol convention, but a completely
+// different thing -- that's the *outgoing* DDC-config destination
+// port, this is an *incoming* source port. See p2_receiver_loop.
+const P2_HP_STATUS_SOURCE_PORT: u16 = 1025;
+const P2_PACKET_SIZE: usize = 1444; // General/DDC-specific/High-Priority and DDC IQ -- NOT the TX-specific packet, see P2_TX_SPECIFIC_PACKET_SIZE
+const P2_KEEPALIVE_INTERVAL: Duration = Duration::from_millis(250);
+const P2_DSP_CLOCK_HZ: f64 = 122_880_000.0; // Hermes/Angelia/Orion; fixed for v1
+
+/// How many IQ samples to keep buffered per receiver before dropping the
+/// oldest. ~2 seconds at 48kHz; tune once real DSP consumption exists.
+/// How many IQ samples to keep buffered per receiver before dropping the
+/// oldest. Deliberately small (~0.25s at 48kHz) -- this is a FIFO with
+/// no catch-up mechanism, so any backlog that accumulates becomes
+/// permanent added latency rather than self-correcting. A small cap
+/// bounds worst-case latency rather than papering over a timing
+/// mismatch by delaying everything.
+const IQ_BUFFER_CAPACITY: usize = 12_000;
+
+/// TX-direction counterpart of IQ_BUFFER_CAPACITY -- same "small,
+/// drop-oldest" reasoning. Sized generously since TX IQ can be
+/// produced at a higher rate (DUC rate, e.g. 192ksps) than RX IQ is
+/// consumed from, but still bounded so a stall doesn't grow key-down
+/// latency without limit.
+const TX_IQ_BUFFER_CAPACITY: usize = 100_000;
+
+#[derive(Copy, Clone, Debug)]
+pub struct IqSample {
+    pub i: i32,
+    pub q: i32,
+}
+
+#[derive(Copy, Clone, Debug)]
+pub struct RadioSettings {
+    pub frequency_hz: u32,
+    pub sample_rate: u32,
+    pub receivers: u8,
+}
+
+impl Default for RadioSettings {
+    fn default() -> Self {
+        Self {
+            frequency_hz: 7_100_000, // 40m, arbitrary sensible default
+            sample_rate: 48_000,
+            receivers: 1, // hardcoded single-receiver for this first version
+        }
+    }
+}
+
+pub struct RadioSession {
+    pub iq_buffers: Vec<Arc<Mutex<VecDeque<IqSample>>>>,
+    pub frequency_hz: Arc<AtomicU32>,
+    pub sample_rate: Arc<AtomicU32>,
+    /// Which ADC (0-indexed) the primary receiver's DDC pulls from.
+    pub adc: Arc<AtomicU32>,
+    /// Antenna port selection (0=ANT1, 1=ANT2, 2=ANT3). This is a
+    /// single shared value, not per-receiver -- Alex's antenna relays
+    /// are one physical shared resource, only meaningful when ADC0 is
+    /// in use (only ADC0's signal path runs through the Alex relay
+    /// bank on this board family). Whichever receiver last changes it
+    /// affects every receiver sharing ADC0.
+    pub antenna: Arc<AtomicU32>,
+    /// Additional receivers beyond the first (P2 only -- P1 has no
+    /// confirmed way to enable more than one DDC, see module note).
+    /// Index 0 here corresponds to receiver index 1 overall (receiver
+    /// 0 is frequency_hz/sample_rate/adc above). Pre-sized up to
+    /// whatever the board reported supporting; active_receiver_count
+    /// tracks how many of these are actually turned on right now.
+    pub extra_frequencies_hz: Vec<Arc<AtomicU32>>,
+    pub extra_sample_rates_hz: Vec<Arc<AtomicU32>>,
+    pub extra_adcs: Vec<Arc<AtomicU32>>,
+    pub active_receiver_count: Arc<AtomicU32>,
+    /// PTT/MOX state. Read by both protocols' sender loops (to decide
+    /// whether to key the radio and stream TX audio/IQ instead of
+    /// silence), and by tx.rs's TXA thread (to decide whether to
+    /// actually run mic audio through TXA or idle). Written from the
+    /// UI's PTT control and from rigctl/TCI's set_ptt/trx commands.
+    pub mox: Arc<AtomicBool>,
+    /// TX audio/IQ produced by tx.rs, consumed by whichever sender
+    /// loop(s) below are currently keyed. See tx.rs and
+    /// fill_tx_payload's module notes for the confidence caveats on
+    /// what format this actually needs to be in per protocol.
+    pub tx_iq: Arc<Mutex<VecDeque<f32>>>,
+    /// Desired TX output power in watts, converted to each protocol's
+    /// actual drive byte via drive_byte_for_watts -- see that
+    /// function's doc comment. Confirmed by the user to belong at byte
+    /// 345 of the P2 High Priority packet (P1's equivalent is command
+    /// address=3); previously never set at all on P2 (left at 0), which
+    /// the radio may have refused to transmit at, same as the
+    /// previously-unset TX frequency bytes. Starts deliberately low
+    /// (see RadioSession::start) rather than defaulting to max power.
+    pub tx_power_watts: Arc<AtomicU32>,
+    /// Current band's PA gain in dB (f32 bits, via
+    /// f32::to_bits/from_bits), fed into drive_byte_for_watts in place
+    /// of a flat constant. main.rs owns the actual per-band calibration
+    /// table (keyed by band name, alongside its other per-band UI
+    /// state) and keeps this updated to whichever band the current
+    /// frequency falls in -- radio.rs has no concept of bands, so it
+    /// just carries whatever single resolved value main.rs last stored
+    /// here. Defaults to DEFAULT_PA_GAIN_DB.
+    pub pa_gain_db: Arc<AtomicU32>,
+    /// Raw forward-power ADC reading reported back by the radio itself
+    /// while transmitting (P1: confirmed via a working reference --
+    /// status address 1, bytes 3-4 of the incoming C&C header. P2:
+    /// confirmed via the official protocol spec -- bytes 14-15 of the
+    /// incoming High-Priority status packet). Stored raw here, not
+    /// converted to watts -- that needs board-specific calibration
+    /// constants, confirmed by the user and applied in main.rs's
+    /// power_watts_and_swr (kept at the UI layer since it's a pure,
+    /// board-dependent display-time conversion, not radio state).
+    pub tx_forward_power: Arc<AtomicU32>,
+    /// Same as tx_forward_power but for reverse (reflected) power --
+    /// P1 confirmed at status address 2, bytes 1-2; P2 confirmed at
+    /// bytes 22-23 of the High-Priority status packet. Needed together
+    /// with forward power to compute SWR.
+    pub tx_reverse_power: Arc<AtomicU32>,
+    stop_flag: Arc<AtomicBool>,
+    sender_thread: Option<JoinHandle<()>>,
+    receiver_thread: Option<JoinHandle<()>>,
+    /// P2 only -- p2_tx_iq_loop's handle. Always None on P1, which
+    /// streams TX audio through the existing sender_loop instead (its
+    /// packet cadence is already fast enough to double as an audio
+    /// stream; P2's isn't, hence the separate thread -- see
+    /// p2_tx_iq_loop's doc comment).
+    tx_iq_thread: Option<JoinHandle<()>>,
+    protocol: u8,
+    radio_ip: std::net::IpAddr,
+}
+
+impl RadioSession {
+    pub fn start(device: &Device, settings: RadioSettings) -> io::Result<Self> {
+        let frequency_hz = Arc::new(AtomicU32::new(settings.frequency_hz));
+        let sample_rate = Arc::new(AtomicU32::new(settings.sample_rate));
+        let adc = Arc::new(AtomicU32::new(0));
+        let antenna = Arc::new(AtomicU32::new(0));
+        let mox = Arc::new(AtomicBool::new(false));
+        let tx_iq = Arc::new(Mutex::new(VecDeque::with_capacity(TX_IQ_BUFFER_CAPACITY)));
+        // Deliberately low rather than defaulting to max power -- easier
+        // to notice "too low, turn it up" on a bench test than to start
+        // a first-ever TX test at full drive into whatever's connected
+        // to the antenna port.
+        let tx_power_watts = Arc::new(AtomicU32::new(2));
+        let pa_gain_db = Arc::new(AtomicU32::new(DEFAULT_PA_GAIN_DB.to_bits()));
+        let tx_forward_power = Arc::new(AtomicU32::new(0));
+        let tx_reverse_power = Arc::new(AtomicU32::new(0));
+        match device.protocol {
+            1 => start_protocol1(
+                device, settings, frequency_hz, sample_rate, adc, antenna, mox, tx_iq,
+                tx_power_watts, pa_gain_db, tx_forward_power, tx_reverse_power,
+            ),
+            2 => start_protocol2(
+                device, settings, frequency_hz, sample_rate, adc, antenna, mox, tx_iq,
+                tx_power_watts, pa_gain_db, tx_forward_power, tx_reverse_power,
+            ),
+            p => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("unknown protocol {p}"),
+            )),
+        }
+    }
+
+    /// Keys or unkeys the transmitter. See RadioSession::mox's doc
+    /// comment for who reads this.
+    ///
+    /// SAFETY: this is the one call in this whole project that can
+    /// cause actual RF to leave the radio. Callers (UI PTT control,
+    /// rigctl/TCI PTT commands) are responsible for only calling this
+    /// with `true` when the operator actually intends to transmit --
+    /// this method itself does no license/band/power-limit checking
+    /// whatsoever.
+    pub fn set_mox(&self, on: bool) {
+        self.mox.store(on, Ordering::Relaxed);
+    }
+
+    pub fn mox_active(&self) -> bool {
+        self.mox.load(Ordering::Relaxed)
+    }
+
+    /// Retunes the running receiver. Takes effect on the next packet the
+    /// sender thread sends (up to one pacing interval away -- effectively
+    /// immediate for P1, up to 250ms for P2's keep-alive cadence).
+    pub fn set_frequency(&self, hz: u32) {
+        self.frequency_hz.store(hz, Ordering::Relaxed);
+    }
+
+    /// Changes the live radio-side sample rate (P1: shared across all
+    /// receivers; P2: this receiver's DDC only). Same timing as
+    /// set_frequency. NOTE: this alone does not update WDSP's demod
+    /// chain, which has its input rate fixed at channel-creation time --
+    /// callers must recreate SpectrumHandle/AudioOutput after calling
+    /// this for the whole pipeline to stay consistent.
+    pub fn set_sample_rate(&self, hz: u32) {
+        self.sample_rate.store(hz, Ordering::Relaxed);
+    }
+
+    /// Total buffered samples across all receivers -- handy for a simple
+    /// "is data flowing" indicator in the UI before real DSP consumes this.
+    pub fn total_buffered_samples(&self) -> usize {
+        self.iq_buffers.iter().map(|b| b.lock().unwrap().len()).sum()
+    }
+
+    /// Activates the next configured-but-inactive receiver (P2 only --
+    /// for P1 this always returns None, since extra_frequencies_hz is
+    /// always empty there). Returns the new receiver's overall index
+    /// (1-based, since 0 is the original receiver) if one was available.
+    pub fn add_receiver(&self) -> Option<usize> {
+        let current = self.active_receiver_count.load(Ordering::Relaxed) as usize;
+        if current >= self.iq_buffers.len() {
+            return None; // no more configured slots
+        }
+        self.active_receiver_count.store((current + 1) as u32, Ordering::Relaxed);
+        Some(current)
+    }
+
+    pub fn stop(&mut self) {
+        // Unkey first, before anything else -- a session ending (app
+        // closing, "Stop" clicked, sample rate change tearing this
+        // down for a rebuild) must never leave the transmitter keyed.
+        self.set_mox(false);
+        self.stop_flag.store(true, Ordering::SeqCst);
+        // Join the sender first so it's no longer sending "keep running"
+        // traffic, then tell the radio to actually stop. P1 has no
+        // watchdog at all -- without an explicit stop it can stay wedged
+        // in a running state until power-cycled. P2 does have a watchdog
+        // but it can take up to ~1s; better to stop it immediately.
+        if let Some(t) = self.sender_thread.take() {
+            let _ = t.join();
+        }
+        if let Some(t) = self.tx_iq_thread.take() {
+            let _ = t.join();
+        }
+        self.send_stop_command();
+        if let Some(t) = self.receiver_thread.take() {
+            let _ = t.join();
+        }
+    }
+
+    fn send_stop_command(&self) {
+        let socket = match UdpSocket::bind(("0.0.0.0", 0)) {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+        match self.protocol {
+            1 => {
+                // Same Start packet shape, Command 0x00 = stop.
+                // Size confirmed against the reference (metis_stop) --
+                // corrects an earlier 63-byte guess to the actual 64.
+                let mut pkt = [0u8; 64];
+                pkt[0] = 0xEF;
+                pkt[1] = 0xFE;
+                pkt[2] = 0x04;
+                pkt[3] = 0x00;
+                let _ = socket.send_to(&pkt, (self.radio_ip, DATA_PORT));
+            }
+            2 => {
+                // High Priority packet with the run bit cleared.
+                let pkt = [0u8; P2_PACKET_SIZE]; // seq=0, byte4=0 (run=0) is fine for a one-shot goodbye
+                let _ = socket.send_to(&pkt, (self.radio_ip, P2_HIGH_PRIORITY_PORT));
+            }
+            _ => {}
+        }
+    }
+}
+
+impl Drop for RadioSession {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+fn start_protocol1(
+    device: &Device,
+    settings: RadioSettings,
+    frequency_hz: Arc<AtomicU32>,
+    sample_rate: Arc<AtomicU32>,
+    adc: Arc<AtomicU32>,
+    antenna: Arc<AtomicU32>,
+    mox: Arc<AtomicBool>,
+    tx_iq: Arc<Mutex<VecDeque<f32>>>,
+    tx_power_watts: Arc<AtomicU32>,
+    pa_gain_db: Arc<AtomicU32>,
+    tx_forward_power: Arc<AtomicU32>,
+    tx_reverse_power: Arc<AtomicU32>,
+) -> io::Result<RadioSession> {
+    let socket = UdpSocket::bind(("0.0.0.0", 0))?;
+    socket.set_read_timeout(Some(Duration::from_millis(500)))?;
+    // device.address is the radio's IP, captured from its discovery reply;
+    // confirmed streaming traffic stays on the same port 1024.
+    let target = std::net::SocketAddr::new(device.address.ip(), DATA_PORT);
+    socket.connect(target)?;
+
+    // Confirmed against a working reference (rustyHPSDR): before
+    // sending the actual start command, the client sends TWO COMPLETE
+    // rotations of all 11 C&C registers (RX/TX frequency, receiver
+    // count/antenna, drive, attenuation, the fixed-value registers,
+    // etc.). Skipping this (as an earlier version of this file did --
+    // going straight to the start command with no configuration sent
+    // at all yet) could plausibly explain exactly the symptom seen:
+    // no signal on a fresh start, working after a stop+start, since by
+    // then the radio would have already absorbed configuration sent
+    // during the first attempt's brief window before this fix existed.
+    {
+        let mut pre_seq: u32 = 0;
+        let mut pre_ozy_command: u8 = 1;
+        let mut pre_current_receiver: u8 = 0;
+        let mut rotations = 0;
+        while rotations < 2 {
+            let packet = p1_build_packet(
+                pre_seq,
+                &mut pre_ozy_command,
+                &mut pre_current_receiver,
+                settings.receivers.max(1),
+                settings.frequency_hz,
+                0, // antenna: ANT1 default: nothing to key yet, live antenna updates once running
+                0, // tx_power_watts: not transmitting during startup config
+                DEFAULT_PA_GAIN_DB, // irrelevant while not transmitting (drive forced to 0 above)
+                settings.sample_rate,
+                false, // mox: never keyed during startup config
+                &tx_iq,
+            );
+            socket.send(&packet)?;
+            pre_seq = pre_seq.wrapping_add(1);
+            if pre_ozy_command == 1 && pre_current_receiver == 0 {
+                rotations += 1;
+            }
+        }
+    }
+
+    // Start command: <0xEF><0xFE><0x04><Command><60 zero bytes>.
+    // Command byte and packet size both confirmed against the
+    // reference (metis_start) -- corrects two previously-wrong
+    // guesses: this was 0x01 in a 63-byte buffer; the reference uses
+    // 0x03 in a 64-byte buffer.
+    let mut start_pkt = [0u8; 64];
+    start_pkt[0] = 0xEF;
+    start_pkt[1] = 0xFE;
+    start_pkt[2] = 0x04;
+    start_pkt[3] = 0x03;
+    socket.send(&start_pkt)?;
+
+    let stop_flag = Arc::new(AtomicBool::new(false));
+    let iq_buffers: Vec<Arc<Mutex<VecDeque<IqSample>>>> = (0..settings.receivers.max(1))
+        .map(|_| Arc::new(Mutex::new(VecDeque::with_capacity(IQ_BUFFER_CAPACITY))))
+        .collect();
+
+    let sender_socket = socket.try_clone()?;
+    let sender_stop = Arc::clone(&stop_flag);
+    let sender_frequency = Arc::clone(&frequency_hz);
+    let sender_sample_rate = Arc::clone(&sample_rate);
+    let sender_mox = Arc::clone(&mox);
+    let sender_tx_iq = Arc::clone(&tx_iq);
+    let sender_antenna = Arc::clone(&antenna);
+    let sender_receivers = settings.receivers.max(1);
+    let sender_tx_power_watts = Arc::clone(&tx_power_watts);
+    let sender_pa_gain_db = Arc::clone(&pa_gain_db);
+    let sender_thread = thread::spawn(move || {
+        sender_loop(
+            sender_socket,
+            sender_frequency,
+            sender_sample_rate,
+            sender_mox,
+            sender_tx_iq,
+            sender_receivers,
+            sender_antenna,
+            sender_tx_power_watts,
+            sender_pa_gain_db,
+            sender_stop,
+        );
+    });
+
+    let receiver_socket = socket.try_clone()?;
+    let receiver_stop = Arc::clone(&stop_flag);
+    let receiver_buffers = iq_buffers.clone();
+    let receiver_sample_rate = Arc::clone(&sample_rate);
+    let receiver_tx_forward_power = Arc::clone(&tx_forward_power);
+    let receiver_tx_reverse_power = Arc::clone(&tx_reverse_power);
+    let receiver_thread = thread::spawn(move || {
+        receiver_loop(
+            receiver_socket,
+            receiver_buffers,
+            settings.receivers.max(1),
+            receiver_sample_rate,
+            receiver_tx_forward_power,
+            receiver_tx_reverse_power,
+            receiver_stop,
+        );
+    });
+
+    Ok(RadioSession {
+        iq_buffers,
+        frequency_hz,
+        sample_rate,
+        adc,
+        antenna,
+        extra_frequencies_hz: Vec::new(), // P1: no confirmed multi-receiver enable register
+        extra_sample_rates_hz: Vec::new(),
+        extra_adcs: Vec::new(),
+        active_receiver_count: Arc::new(AtomicU32::new(1)),
+        mox,
+        tx_iq,
+        tx_power_watts,
+        pa_gain_db,
+        tx_forward_power,
+        tx_reverse_power,
+        stop_flag,
+        sender_thread: Some(sender_thread),
+        receiver_thread: Some(receiver_thread),
+        tx_iq_thread: None, // P1 streams TX audio through sender_thread itself
+        protocol: 1,
+        radio_ip: device.address.ip(),
+    })
+}
+
+/// Builds one 512-byte USB frame: 3 sync bytes, 5 C&C bytes, rest
+/// zeroed unless overwritten afterward (see fill_tx_payload -- the
+/// tail carries TX audio/IQ while keyed, silence/zero otherwise).
+fn build_usb_frame(c0: u8, c1: u8, c2: u8, c3: u8, c4: u8) -> [u8; USB_FRAME_SIZE] {
+    let mut frame = [0u8; USB_FRAME_SIZE];
+    frame[0] = 0x7F;
+    frame[1] = 0x7F;
+    frame[2] = 0x7F;
+    frame[3] = c0;
+    frame[4] = c1;
+    frame[5] = c2;
+    frame[6] = c3;
+    frame[7] = c4;
+    frame
+}
+
+/// Inverse of sign_extend_24: packs a [-1.0, 1.0] sample into 3
+/// big-endian bytes, same 2^23-1 scale spectrum.rs's IQ_NORM uses on
+/// the RX side. Rounding (round-half-away-from-zero rather than
+/// truncation toward zero) confirmed against a working reference
+/// (rustyHPSDR).
+fn pack_24(v: f32) -> [u8; 3] {
+    let scaled = (v.clamp(-1.0, 1.0) * 8_388_607.0) as f64;
+    let rounded = if scaled >= 0.0 { (scaled + 0.5).floor() } else { (scaled - 0.5).ceil() };
+    let b = (rounded as i32).to_be_bytes();
+    [b[1], b[2], b[3]]
+}
+
+/// Fills `frame`'s payload (everything after the 8-byte sync+C&C
+/// header) with interleaved I/Q pulled from `tx_iq`, padding with
+/// silence if the buffer underruns so frame timing/size stays exact
+/// regardless of how much real TX audio is available yet.
+///
+/// UNVERIFIED, and the least-confident part of the whole TX path: it's
+/// not confirmed whether Protocol 1's outgoing C&C frames actually
+/// carry interleaved I/Q here (mirroring how parse_iq_packet reads the
+/// *incoming* RX frames) or instead expect raw audio samples for the
+/// radio's own hardware to modulate -- see tx.rs's module note on why
+/// this project's TxProcessor produces IQ rather than audio. If TX
+/// sounds garbled or silent on a Protocol 1 radio, checking which of
+/// those two this radio actually wants is the first thing to try.
+/// Confirmed against a working reference (rustyHPSDR): this is NOT
+/// simply a continuous stream of packed I/Q like RX's own payload is.
+/// Each unit is 4 bytes of "dummy RX audio" (always zero while
+/// actually transmitting -- the reference's own naming, not guessed)
+/// followed by one 16-bit I/Q pair (NOT 24-bit -- TX uses a narrower
+/// sample width than RX does), big-endian, scaled by 32767 (signed
+/// 16-bit max). An earlier version of this function packed 24-bit I/Q
+/// with no padding at all between samples -- structurally wrong on
+/// every count (wrong width, wrong interleaving, missing the padding
+/// bytes entirely), which a radio's firmware would have no way to
+/// decode as valid TX audio.
+fn fill_tx_payload(frame: &mut [u8; USB_FRAME_SIZE], tx_iq: &Mutex<VecDeque<f32>>) {
+    let mut buf = tx_iq.lock().unwrap();
+    let mut b = HEADER_SIZE;
+    while b + 8 <= USB_FRAME_SIZE {
+        frame[b] = 0;
+        frame[b + 1] = 0;
+        frame[b + 2] = 0;
+        frame[b + 3] = 0;
+        let i = buf.pop_front().unwrap_or(0.0);
+        let q = buf.pop_front().unwrap_or(0.0);
+        let i_sample = (i.clamp(-1.0, 1.0) * 32767.0) as i16;
+        let q_sample = (q.clamp(-1.0, 1.0) * 32767.0) as i16;
+        frame[b + 4] = (i_sample >> 8) as u8;
+        frame[b + 5] = i_sample as u8;
+        frame[b + 6] = (q_sample >> 8) as u8;
+        frame[b + 7] = q_sample as u8;
+        b += 8;
+    }
+}
+
+/// Reference's own default pa_calibration-table gain, in dB, before
+/// any user calibration is applied. Used both as drive_byte_for_watts's
+/// fallback and as the UI's slider default (see main.rs's PA Calibration
+/// settings) so an unset/never-calibrated band behaves identically to
+/// this uncalibrated reference starting point.
+pub const DEFAULT_PA_GAIN_DB: f32 = 38.8;
+
+/// Converts a desired TX output power (watts) into a protocol drive
+/// byte (0-255), via a dBm/DAC-voltage calibration curve using the
+/// given per-band PA gain. Originally P1-only: confirmed against a
+/// working reference (rustyHPSDR) that P1's command address=3 drive
+/// byte is NOT a simple linear 0-255 scale (sending a raw slider value
+/// directly, as an earlier version of this file did, doesn't
+/// correspond to anything meaningful for P1 -- plausibly why "0 watts"
+/// showed regardless of the slider value). P2's High Priority packet
+/// byte 345 *is* confirmed linear 0-255 by the official protocol spec
+/// at the wire level, but that says nothing about how a real PA
+/// actually responds to it -- so P2 now uses this same conversion too,
+/// purely host-side (nothing in the P2 protocol itself requires it).
+///
+/// `gain_db` is the current band's PA gain (main.rs resolves this from
+/// its per-band PA Calibration sliders, falling back to
+/// DEFAULT_PA_GAIN_DB for any band the user hasn't calibrated) --
+/// real per-band calibration varies with the actual amplifier's
+/// response per band, which no fixed constant here can capture.
+fn drive_byte_for_watts(watts: f32, gain_db: f32) -> u8 {
+    let watts = watts.max(0.01); // avoid log10(0)/log10(negative)
+    let target_dbm = 10.0 * (watts * 1000.0).log10() - gain_db;
+    let target_volts = (10.0_f32.powf(target_dbm * 0.1) * 0.05).sqrt();
+    let volts = (target_volts / 0.8).min(1.0);
+    let actual_volts = (volts / 0.98).clamp(0.0, 1.0);
+    (actual_volts * 255.0) as u8
+}
+
+fn sample_rate_code(rate: u32) -> u8 {
+    match rate {
+        48_000 => 0x00,
+        96_000 => 0x01,
+        192_000 => 0x02,
+        384_000 => 0x03,
+        _ => 0x00,
+    }
+}
+
+/// Builds one full P1 packet (general-control frame + whichever C&C
+/// register is currently up in the rotation), advancing `ozy_command`
+/// and `current_receiver` exactly as the confirmed reference does.
+/// Shared between the pre-start "send two full rotations" sequence in
+/// start_protocol1 and the ongoing sender_loop, so both send identical
+/// packet content rather than two slightly-different implementations
+/// drifting apart over time.
+#[allow(clippy::too_many_arguments)]
+fn p1_build_packet(
+    seq: u32,
+    ozy_command: &mut u8,
+    current_receiver: &mut u8,
+    receivers: u8,
+    frequency_hz: u32,
+    antenna_val: u32,
+    tx_power_watts_val: u32,
+    pa_gain_db: f32,
+    sample_rate_hz: u32,
+    mox_on: bool,
+    tx_iq: &Mutex<VecDeque<f32>>,
+) -> [u8; PACKET_SIZE] {
+    // MOX/PTT bit: inferred to be C0's bit 0 on both frames, based
+    // on every register value used elsewhere in this file (0x00,
+    // 0x04, ...) already being even -- i.e. bit 0 has never been
+    // meaningfully used for register selection, which is
+    // consistent with (but not confirmed as) it being a separate
+    // MOX flag orthogonal to the register address in bits 7:1.
+    // Corroborated by public HPSDR/HL2 docs, not yet verified
+    // against your old_protocol.c -- flag if this differs.
+    let mox_bit: u8 = if mox_on { 0x01 } else { 0x00 };
+
+    let mut packet = [0u8; PACKET_SIZE];
+    packet[0] = 0xEF;
+    packet[1] = 0xFE;
+    packet[2] = 0x01;
+    packet[3] = EP_COMMAND_AUDIO;
+    packet[4..8].copy_from_slice(&seq.to_be_bytes());
+
+    // USB frame 1: always register 0 (general control).
+    //
+    // C4 confirmed against a working reference (rustyHPSDR):
+    // previously hardcoded to 0x00 here, which meant the radio was
+    // NEVER told the actual receiver count at all -- a real bug,
+    // not just a missing nicety, since the receiver count directly
+    // determines the byte stride of the interleaved IQ stream the
+    // radio sends back. Duplex (bit 2) is unconditionally set in
+    // the reference; antenna selection (bits 0-1) now uses the
+    // same antenna value P2 already tracks. NOT yet implemented,
+    // unlike the reference: per-band attenuation, EXT1/EXT2/XVTR
+    // antenna types, and separate TX-vs-RX antenna selection while
+    // keyed -- this project doesn't have equivalent per-band
+    // config infrastructure for P1 yet.
+    let c1 = sample_rate_code(sample_rate_hz);
+    let mut c4: u8 = 0x04; // Duplex -- confirmed always set
+    c4 |= match antenna_val {
+        1 => 0x01, // ANT2
+        2 => 0x02, // ANT3
+        _ => 0x00, // ANT1
+    };
+    c4 |= (receivers.max(1) - 1) << 3;
+    let mut frame0 = build_usb_frame(0x00 | mox_bit, c1, 0x00, 0x00, c4);
+
+    // USB frame 2: the rotating command. Ported directly from the
+    // reference where this project has equivalent state to feed
+    // it (frequency, mox, receivers, drive); fixed/inert defaults
+    // where it doesn't (CW keyer, mic bias, per-band LO
+    // offset/attenuation, per-receiver ADC assignment) -- flagged
+    // per-command below, not silently guessed.
+    let freq = frequency_hz as i32;
+    let (c0b, c1b, c2b, c3b, c4b) = match *ozy_command {
+        1 => {
+            // TX frequency. No split-VFO support yet, so this is
+            // always the same frequency as RX -- matches this
+            // project's existing simplex-only assumption elsewhere
+            // (see radio.rs's P2 TX-freq handling). No per-band LO
+            // offset applied (not tracked here).
+            (0x02, (freq >> 24) as u8, (freq >> 16) as u8, (freq >> 8) as u8, freq as u8)
+        }
+        2 => {
+            // RX frequency for current_receiver. This project
+            // doesn't track distinct per-receiver frequencies at
+            // the P1 session level yet (unlike P2) -- every
+            // receiver index currently gets the same frequency
+            // rather than its own. Real for a single-receiver
+            // session; a known simplification for multi-receiver.
+            let c0 = 0x04 + (*current_receiver * 2);
+            *current_receiver += 1;
+            if *current_receiver >= receivers.max(1) {
+                *current_receiver = 0;
+            }
+            (c0, (freq >> 24) as u8, (freq >> 16) as u8, (freq >> 8) as u8, freq as u8)
+        }
+        3 => {
+            // Drive level (while transmitting) + mic boost. Confirmed
+            // against the reference: computed from a desired power
+            // target (watts) via a dBm/DAC-voltage calibration curve --
+            // see p1_drive_byte_for_watts's doc comment. An earlier
+            // version of this file sent the UI's 0-255 value directly
+            // as a raw byte (correct for P2's confirmed-linear byte
+            // 345, but not what P1 actually expects), which very
+            // plausibly explains persistent "0 watts" TX output even
+            // with a nonzero drive setting. Mic boost not tracked --
+            // left off.
+            let c1 = if mox_on {
+                drive_byte_for_watts(tx_power_watts_val as f32, pa_gain_db)
+            } else {
+                0x00
+            };
+            (0x12, c1, 0x00, 0x00, 0x00)
+        }
+        4 => {
+            // Mic bias/PTT-source config (C1) and RX attenuation
+            // (C4). No mic bias/PTT-source settings tracked --
+            // C1=0. Attenuation fixed at 0 (0x20 = the "standard,
+            // non-HermesLite" attenuation-enable pattern with a
+            // 0dB value) -- no per-band attenuation table here yet.
+            (0x14, 0x00, 0x00, 0x00, 0x20)
+        }
+        5 => {
+            // CW keyer settings -- this project has no CW keyer,
+            // so all inert/off.
+            (0x16, 0x00, 0x00, 0x00, 0x00)
+        }
+        6 => {
+            // Per-receiver ADC assignment. No per-receiver ADC
+            // tracking here yet -- both default to ADC0.
+            (0x1C, 0x00, 0x00, 0x00, 0x00)
+        }
+        7 => {
+            // CW mode bit (C1) + sidetone volume/PTT delay (C2/C3).
+            // No CW support -- all off/zero.
+            (0x1E, 0x00, 0x00, 0x00, 0x00)
+        }
+        // Confirmed fixed values from the reference -- sent
+        // unconditionally every cycle by a working client
+        // regardless of any session state. Exact purpose not
+        // independently documented (possibly clock/codec init);
+        // included verbatim rather than omitted, since these were
+        // never sent at all before this fix.
+        8 => (0x20, 0x00, 0x00, 0x28, 0x0A),
+        9 => (0x22, 0x19, 0x00, 0xC8, 0x00),
+        10 => (0x24, 0x00, 0x00, 0x00, 0x00),
+        _ => (0x2E, 0x00, 0x00, 0x04, 0x15),
+    };
+    if *current_receiver == 0 {
+        *ozy_command = if *ozy_command >= 11 { 1 } else { *ozy_command + 1 };
+    }
+    let mut frame1 = build_usb_frame(c0b | mox_bit, c1b, c2b, c3b, c4b);
+
+    // While keyed, both frames' payloads carry TX audio/IQ instead
+    // of staying zeroed -- see fill_tx_payload's confidence note.
+    // Keep sending real (or silence-padded) TX data on every
+    // packet while mox_on, never a stale/half-built one: an
+    // under-full or garbage payload going out while the
+    // transmitter is actually keyed is worse than silence.
+    if mox_on {
+        fill_tx_payload(&mut frame0, tx_iq);
+        fill_tx_payload(&mut frame1, tx_iq);
+    }
+
+    packet[HEADER_SIZE..HEADER_SIZE + USB_FRAME_SIZE].copy_from_slice(&frame0);
+    packet[HEADER_SIZE + USB_FRAME_SIZE..].copy_from_slice(&frame1);
+    packet
+}
+
+fn sender_loop(
+    socket: UdpSocket,
+    frequency_hz: Arc<AtomicU32>,
+    sample_rate: Arc<AtomicU32>,
+    mox: Arc<AtomicBool>,
+    tx_iq: Arc<Mutex<VecDeque<f32>>>,
+    receivers: u8,
+    antenna: Arc<AtomicU32>,
+    tx_power_watts: Arc<AtomicU32>,
+    pa_gain_db: Arc<AtomicU32>,
+    stop: Arc<AtomicBool>,
+) {
+    let mut seq: u32 = 0;
+    let mut ozy_command: u8 = 1;
+    let mut current_receiver: u8 = 0;
+
+    while !stop.load(Ordering::Relaxed) {
+        let current_rate = sample_rate.load(Ordering::Relaxed);
+
+        // 126 samples per 1032-byte packet is fixed by the frame geometry, so
+        // pacing outgoing packets at sample_rate/126 keeps us roughly in sync
+        // with the radio's own clock. This is standard HPSDR client behavior,
+        // not yet verified against your source's exact pacing mechanism.
+        let interval = Duration::from_secs_f64(126.0 / current_rate as f64);
+        let mox_on = mox.load(Ordering::Relaxed);
+
+        let packet = p1_build_packet(
+            seq,
+            &mut ozy_command,
+            &mut current_receiver,
+            receivers,
+            frequency_hz.load(Ordering::Relaxed),
+            antenna.load(Ordering::Relaxed),
+            tx_power_watts.load(Ordering::Relaxed),
+            f32::from_bits(pa_gain_db.load(Ordering::Relaxed)),
+            current_rate,
+            mox_on,
+            &tx_iq,
+        );
+
+        if socket.send(&packet).is_err() {
+            break; // socket closed or radio gone; let the thread exit
+        }
+
+        seq = seq.wrapping_add(1);
+        thread::sleep(interval);
+    }
+}
+
+fn receiver_loop(
+    socket: UdpSocket,
+    buffers: Vec<Arc<Mutex<VecDeque<IqSample>>>>,
+    receivers: u8,
+    sample_rate: Arc<AtomicU32>,
+    tx_forward_power: Arc<AtomicU32>,
+    tx_reverse_power: Arc<AtomicU32>,
+    stop: Arc<AtomicBool>,
+) {
+    let mut buf = [0u8; PACKET_SIZE + 64]; // a little slack in case of larger packets
+    while !stop.load(Ordering::Relaxed) {
+        match socket.recv(&mut buf) {
+            Ok(n) if n == PACKET_SIZE => {
+                if buf[0] == 0xEF && buf[1] == 0xFE && buf[2] == 0x01 && buf[3] == EP_IQ_DATA {
+                    let capacity = iq_buffer_capacity_for_rate(sample_rate.load(Ordering::Relaxed));
+                    parse_iq_packet(
+                        &buf[HEADER_SIZE..PACKET_SIZE],
+                        receivers,
+                        &buffers,
+                        capacity,
+                        &tx_forward_power,
+                        &tx_reverse_power,
+                    );
+                }
+                // EP_WIDEBAND (0x04) and anything else: ignored for now.
+            }
+            Ok(_) => continue, // unexpected length, ignore
+            Err(e)
+                if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut =>
+            {
+                continue
+            }
+            Err(_) => break,
+        }
+    }
+}
+
+/// ~0.25s worth of samples at the given rate, floored so very low rates
+/// still get a sane minimum. Computed live (not a fixed constant) so
+/// the buffer represents a constant TIME duration regardless of actual
+/// sample rate -- a fixed sample count would represent much less time
+/// at high rates, giving the demod thread far less headroom before a
+/// brief hiccup causes samples to be dropped (heard as audio glitches).
+fn iq_buffer_capacity_for_rate(sample_rate_hz: u32) -> usize {
+    ((sample_rate_hz as usize) / 4).max(4_000)
+}
+
+/// `payload` is the two 512-byte USB frames (no outer 8-byte header).
+fn parse_iq_packet(
+    payload: &[u8],
+    receivers: u8,
+    buffers: &[Arc<Mutex<VecDeque<IqSample>>>],
+    capacity: usize,
+    tx_forward_power: &Arc<AtomicU32>,
+    tx_reverse_power: &Arc<AtomicU32>,
+) {
+    for frame_idx in 0..2 {
+        let frame = &payload[frame_idx * USB_FRAME_SIZE..(frame_idx + 1) * USB_FRAME_SIZE];
+        // frame[0..3] = sync, frame[3..8] = C0-C4 status from the radio.
+        //
+        // Confirmed against a working reference: C0's bits mirror the
+        // same layout the host uses when *sending* commands -- bit 0 =
+        // PTT, bits 1-2 = dot/dash (not consumed here, no CW support),
+        // and bits 3-7 = a status "address" the radio cycles through on
+        // its own, the same way the host cycles through C&C registers.
+        // Address 1 carries exciter power (C1-C2) and Alex forward
+        // power (C3-C4); address 2 carries Alex reverse power (C1-C2).
+        let c0 = frame[3];
+        let address = (c0 >> 3) & 0x1F;
+        if address == 1 {
+            let forward = u16::from_be_bytes([frame[6], frame[7]]);
+            tx_forward_power.store(forward as u32, Ordering::Relaxed);
+        } else if address == 2 {
+            let reverse = u16::from_be_bytes([frame[4], frame[5]]);
+            tx_reverse_power.store(reverse as u32, Ordering::Relaxed);
+        }
+
+        let mut b = 8;
+        let iq_samples = (USB_FRAME_SIZE - 8) / ((receivers as usize * 6) + 2);
+
+        for _s in 0..iq_samples {
+            for rx in 0..receivers as usize {
+                let i = sign_extend_24(frame[b], frame[b + 1], frame[b + 2]);
+                b += 3;
+                let q = sign_extend_24(frame[b], frame[b + 1], frame[b + 2]);
+                b += 3;
+                push_sample(&buffers[rx], IqSample { i, q }, capacity);
+            }
+            b += 2; // mic sample, unused on receive side
+        }
+    }
+}
+
+fn sign_extend_24(b0: u8, b1: u8, b2: u8) -> i32 {
+    if b0 & 0x80 != 0 {
+        i32::from_be_bytes([0xFF, b0, b1, b2])
+    } else {
+        i32::from_be_bytes([0, b0, b1, b2])
+    }
+}
+
+fn push_sample(buf: &Arc<Mutex<VecDeque<IqSample>>>, s: IqSample, capacity: usize) {
+    let mut q = buf.lock().unwrap();
+    if q.len() >= capacity {
+        q.pop_front();
+    }
+    q.push_back(s);
+}
+
+// ---------------------------------------------------------------------
+// Protocol 2
+//
+// Unlike Protocol 1's single shared port, P2 uses four fixed destination
+// ports on the radio (General/DDC-specific/TX-specific/High-priority),
+// and the radio streams data back to whatever address+port the host
+// used to make contact -- so one unconnected local socket handles
+// everything, with incoming packets demultiplexed by source port.
+//
+// "Start" is not a dedicated command: setup packets are sent once
+// (General, DDC-specific, TX-specific), then a High Priority packet
+// with the run bit set actually starts streaming. All four are then
+// resent together on the keep-alive timer, since the radio drops back
+// to standby if it doesn't see a C&C packet within ~1 second.
+// ---------------------------------------------------------------------
+
+/// phase_word[31:0] = 2^32 * frequency(Hz) / DSP clock frequency (Hz)
+fn phase_word(freq_hz: u32) -> u32 {
+    ((4294967296.0_f64 * freq_hz as f64) / P2_DSP_CLOCK_HZ) as u32
+}
+
+fn start_protocol2(
+    device: &Device,
+    settings: RadioSettings,
+    frequency_hz: Arc<AtomicU32>,
+    sample_rate: Arc<AtomicU32>,
+    adc: Arc<AtomicU32>,
+    antenna: Arc<AtomicU32>,
+    mox: Arc<AtomicBool>,
+    tx_iq: Arc<Mutex<VecDeque<f32>>>,
+    tx_power_watts: Arc<AtomicU32>,
+    pa_gain_db: Arc<AtomicU32>,
+    tx_forward_power: Arc<AtomicU32>,
+    tx_reverse_power: Arc<AtomicU32>,
+) -> io::Result<RadioSession> {
+    // Confirmed against a working reference (rustyHPSDR): it explicitly
+    // sets SO_REUSEADDR and (on Unix) SO_REUSEPORT before binding, via
+    // socket2, rather than a plain UdpSocket::bind. Matching that here
+    // for correctness/robustness (e.g. faster reconnects after a crash
+    // without waiting out TIME_WAIT) -- though these are host-side
+    // kernel socket options with no effect on what the radio actually
+    // receives, so this isn't expected to explain the state-transition
+    // problem specifically.
+    let socket_addr: std::net::SocketAddr = "0.0.0.0:0".parse().expect("invalid address");
+    let setup_socket = socket2::Socket::new(
+        socket2::Domain::for_address(socket_addr),
+        socket2::Type::DGRAM,
+        Some(socket2::Protocol::UDP),
+    )?;
+    setup_socket.set_reuse_address(true)?;
+    #[cfg(unix)]
+    {
+        setup_socket.set_reuse_port(true)?;
+    }
+    setup_socket.bind(&socket_addr.into())?;
+    let socket: UdpSocket = setup_socket.into();
+    socket.set_read_timeout(Some(Duration::from_millis(500)))?;
+    // Deliberately not calling connect(): we need to both send to four
+    // different destination ports on the radio and receive from several
+    // different source ports (1025 status, 1035+ IQ, etc.) on the radio.
+    let radio_ip = device.address.ip();
+
+    let stop_flag = Arc::new(AtomicBool::new(false));
+    let iq_buffers: Vec<Arc<Mutex<VecDeque<IqSample>>>> = (0..settings.receivers.max(1))
+        .map(|_| Arc::new(Mutex::new(VecDeque::with_capacity(IQ_BUFFER_CAPACITY))))
+        .collect();
+
+    // Extra receivers beyond the first, pre-sized to whatever was
+    // requested (the caller sets settings.receivers from the board's
+    // reported capability for P2). None are active until add_receiver()
+    // is called -- active_receiver_count starts at 1.
+    let extra_count = settings.receivers.max(1).saturating_sub(1) as usize;
+    let extra_frequencies_hz: Vec<Arc<AtomicU32>> = (0..extra_count)
+        .map(|_| Arc::new(AtomicU32::new(settings.frequency_hz)))
+        .collect();
+    let extra_sample_rates_hz: Vec<Arc<AtomicU32>> = (0..extra_count)
+        .map(|_| Arc::new(AtomicU32::new(settings.sample_rate)))
+        .collect();
+    let extra_adcs: Vec<Arc<AtomicU32>> = (0..extra_count).map(|_| Arc::new(AtomicU32::new(0))).collect();
+    let active_receiver_count = Arc::new(AtomicU32::new(1));
+    // Shared between the sender and receiver threads: set by
+    // p2_receiver_loop when the radio's own high-priority status
+    // packet arrives, consumed by p2_sender_loop to send an immediate
+    // response rather than waiting for content to change or the next
+    // keepalive tick.
+    let hp_request = Arc::new(AtomicBool::new(false));
+
+    let sender_socket = socket.try_clone()?;
+    let sender_stop = Arc::clone(&stop_flag);
+    let sender_frequency = Arc::clone(&frequency_hz);
+    let sender_sample_rate = Arc::clone(&sample_rate);
+    let sender_adc = Arc::clone(&adc);
+    let sender_antenna = Arc::clone(&antenna);
+    let sender_extra_frequencies = extra_frequencies_hz.clone();
+    let sender_extra_sample_rates = extra_sample_rates_hz.clone();
+    let sender_extra_adcs = extra_adcs.clone();
+    let sender_active_count = Arc::clone(&active_receiver_count);
+    let sender_mox = Arc::clone(&mox);
+    let sender_tx_power_watts = Arc::clone(&tx_power_watts);
+    let sender_pa_gain_db = Arc::clone(&pa_gain_db);
+    let sender_hp_request = Arc::clone(&hp_request);
+    let num_adcs = device.adcs;
+    let sender_thread = thread::spawn(move || {
+        p2_sender_loop(
+            sender_socket,
+            radio_ip,
+            num_adcs,
+            sender_frequency,
+            sender_sample_rate,
+            sender_adc,
+            sender_antenna,
+            sender_extra_frequencies,
+            sender_extra_sample_rates,
+            sender_extra_adcs,
+            sender_active_count,
+            sender_mox,
+            sender_tx_power_watts,
+            sender_pa_gain_db,
+            sender_hp_request,
+            sender_stop,
+        );
+    });
+
+    let tx_iq_socket = socket.try_clone()?;
+    let tx_iq_stop = Arc::clone(&stop_flag);
+    let tx_iq_mox = Arc::clone(&mox);
+    let tx_iq_buffer = Arc::clone(&tx_iq);
+    let tx_iq_thread = thread::spawn(move || {
+        p2_tx_iq_loop(tx_iq_socket, radio_ip, tx_iq_mox, tx_iq_buffer, tx_iq_stop);
+    });
+
+    let receiver_socket = socket.try_clone()?;
+    let receiver_stop = Arc::clone(&stop_flag);
+    let receiver_buffers = iq_buffers.clone();
+    let receiver_sample_rate = Arc::clone(&sample_rate);
+    let receiver_hp_request = Arc::clone(&hp_request);
+    let receiver_tx_forward_power = Arc::clone(&tx_forward_power);
+    let receiver_tx_reverse_power = Arc::clone(&tx_reverse_power);
+    let receiver_mox = Arc::clone(&mox);
+    let receiver_thread = thread::spawn(move || {
+        p2_receiver_loop(
+            receiver_socket,
+            receiver_buffers,
+            receiver_sample_rate,
+            receiver_hp_request,
+            receiver_tx_forward_power,
+            receiver_tx_reverse_power,
+            receiver_mox,
+            receiver_stop,
+        );
+    });
+
+    Ok(RadioSession {
+        iq_buffers,
+        frequency_hz,
+        sample_rate,
+        adc,
+        antenna,
+        extra_frequencies_hz,
+        extra_sample_rates_hz,
+        extra_adcs,
+        active_receiver_count,
+        mox,
+        tx_iq,
+        tx_power_watts,
+        pa_gain_db,
+        tx_forward_power,
+        tx_reverse_power,
+        stop_flag,
+        sender_thread: Some(sender_thread),
+        receiver_thread: Some(receiver_thread),
+        tx_iq_thread: Some(tx_iq_thread),
+        protocol: 2,
+        radio_ip,
+    })
+}
+
+// Confirmed against the protocol spec (fields only defined through
+// byte 59) and the very first reference capture (General packet
+// captured at exactly 60 bytes): unlike DDC-specific/High-Priority,
+// which really are P2_PACKET_SIZE (1444) uniformly, the General
+// packet is only 60 bytes. This was wrong for this entire project --
+// sent as the full 1444 bytes -- until this fix. If the radio's
+// firmware validates packet length against expected size per type
+// (plausible for embedded/FPGA firmware), a wrong-sized General
+// packet could be silently rejected or mishandled -- which would mean
+// none of byte 58's PA-enable or byte 59's Alex-enable were ever
+// actually being applied, regardless of how correct their bit values
+// were, explaining "PA-enable and Alex-enable bits confirmed correct
+// byte-for-byte, yet the radio never transitions" perfectly.
+const P2_GENERAL_PACKET_SIZE: usize = 60;
+
+fn p2_general_packet(seq: u32, num_adcs: u8) -> [u8; P2_GENERAL_PACKET_SIZE] {
+    let mut p = [0u8; P2_GENERAL_PACKET_SIZE];
+    p[0..4].copy_from_slice(&seq.to_be_bytes());
+    p[4] = 0x00; // General packet command
+    // Bytes 5..33: DDC/DUC/high-priority/audio/IQ port overrides, left at
+    // zero throughout so the radio uses its documented default ports.
+    p[23] = 0x00; // wideband not enabled
+    p[37] = 0x08; // bit 3: send DDC/DUC tuning as phase word (required by all current FPGA code)
+    p[38] = 0x01; // bit 0: enable hardware watchdog timer (auto-standby on lost link)
+    // Confirmed against a working reference (rustyHPSDR): this was
+    // missing entirely before. Without the PA itself enabled here, the
+    // radio may never actually transition into transmit regardless of
+    // MOX/TR_RELAY/filter word all being correct -- a strong candidate
+    // for the root cause of "no state transition at all".
+    p[58] = 0x01; // enable PA
+    p[59] = if num_adcs == 2 { 0x03 } else { 0x01 }; // enable Alex0 (+ Alex1 if this board has 2 ADCs)
+    p
+}
+
+fn p2_ddc_specific_packet(seq: u32, sample_rates_hz: &[u32], adcs: &[u32], num_adcs: u8) -> [u8; P2_PACKET_SIZE] {
+    let mut p = [0u8; P2_PACKET_SIZE];
+    p[0..4].copy_from_slice(&seq.to_be_bytes());
+    p[4] = num_adcs.max(1); // number of ADCs the board actually has
+
+    // Dither/random: confirmed 0 (both off) against a working reference
+    // capture -- corrects an earlier unconfirmed assumption here that
+    // these should be all-1s ("off produces worse ADC noise"). Left at
+    // 0 to match what's actually been observed working.
+    p[5] = 0;
+    p[6] = 0;
+
+    // Enable bits for DDC0..DDCn-1 (byte 7 covers DDC0-7; we don't
+    // support boards with more than 8 DDCs in this pass).
+    let n = sample_rates_hz.len().min(8);
+    p[7] = if n >= 8 { 0xFF } else { ((1u16 << n) - 1) as u8 };
+
+    // Each DDC's config is a 6-byte entry starting at byte 17: ADC(1),
+    // rate(2, ksps big-endian), CIC1(1), CIC2(1), sample size(1).
+    for (i, &rate) in sample_rates_hz.iter().enumerate() {
+        let base = 17 + i * 6;
+        if base + 6 > P2_PACKET_SIZE {
+            break; // more receivers than fit in the packet -- shouldn't happen in practice
+        }
+        let adc = adcs.get(i).copied().unwrap_or(0);
+        p[base] = adc as u8;
+        let rate_ksps = (rate / 1000) as u16;
+        p[base + 1..base + 3].copy_from_slice(&rate_ksps.to_be_bytes());
+        p[base + 5] = 24; // sample size, bits
+    }
+    p
+}
+
+// Confirmed by the user: unlike the other three C&C packet types
+// (General/DDC-specific/High-Priority), which really are P2_PACKET_SIZE
+// (1444) uniformly, the TX-specific packet is only 60 bytes. An earlier
+// version of this file sent it at the full 1444 bytes, which was wrong
+// -- see p2_tx_specific_packet.
+const P2_TX_SPECIFIC_PACKET_SIZE: usize = 60;
+
+fn p2_tx_specific_packet(seq: u32) -> [u8; P2_TX_SPECIFIC_PACKET_SIZE] {
+    let mut p = [0u8; P2_TX_SPECIFIC_PACKET_SIZE];
+    p[0..4].copy_from_slice(&seq.to_be_bytes());
+    // Number of DACs -- confirmed by the user: always 1, not gated on
+    // mox_on. Correcting an earlier assumption here (this used to
+    // toggle 0/1 with mox_on on the theory that 0 "disables the DUC
+    // output path" when not transmitting) -- actual key/unkey is
+    // handled entirely by the High Priority packet's MOX bit and
+    // Alex's TR_RELAY flag, not by this count.
+    p[4] = 1;
+    // Confirmed against a working reference (rustyHPSDR) that this
+    // packet does NOT carry a DUC rate/sample-size field at bytes
+    // 14..17 -- an earlier version of this file invented one there,
+    // which was wrong; removed.
+    //
+    // What the reference DOES set here, which this project doesn't
+    // populate yet (left at 0, i.e. all these features off/default) --
+    // confirmed non-zero in a real working session capture (values in
+    // parens are what was actually observed, not guessed): byte 5 --
+    // CW sidetone/keyer-mode/breakin flags (0x11 observed); byte 6 --
+    // sidetone volume (0x14 observed); bytes 7-8 -- sidetone frequency
+    // (0x028a = 650Hz observed); byte 9 -- keyer speed (0x0c = 12wpm
+    // observed); byte 10 -- keyer weight (0x1e observed); bytes 11-12
+    // -- keyer hang time (0x012c = 300ms observed); byte 50 -- mic/line
+    // routing flags (0x12 observed); byte 51 -- line-in gain (0x10
+    // observed). None of these looked related to the "no state
+    // transition" symptom (they're CW/audio-routing config, not
+    // TX-enable), so still left as a follow-up rather than guessed at
+    // -- but now with real confirmed values to match if it turns out
+    // to matter, rather than needing to reverse-engineer them blind.
+    p
+}
+
+fn p2_high_priority_packet(
+    seq: u32,
+    frequencies_hz: &[u32],
+    antenna: u32,
+    mox_on: bool,
+    tx_freq_hz: u32,
+    tx_drive: u8,
+) -> [u8; P2_PACKET_SIZE] {
+    let mut p = [0u8; P2_PACKET_SIZE];
+    p[0..4].copy_from_slice(&seq.to_be_bytes());
+    // bit 0: run (unchanged -- already confirmed working for RX).
+    //
+    // MOX/PTT bit position is NOT confirmed against your reference.
+    // Deliberately placed at bit 1 rather than reusing/overloading bit
+    // 0: if this guess is wrong, the fail mode is "PTT silently
+    // doesn't key the radio" (bit 1 turns out to mean something else,
+    // or MOX is actually elsewhere), never "the radio transmits when
+    // it shouldn't" -- getting this bit wrong must fail closed, not
+    // open. Verify against new_protocol.c / the official Ethernet
+    // protocol v4.3 spec before relying on this to actually key.
+    let mox_bit: u8 = if mox_on { 0x02 } else { 0x00 };
+    p[4] = 0x01 | mox_bit;
+
+    // Each DDC's frequency/phase word is a 4-byte big-endian entry
+    // starting at byte 9 (DDC0 = 9..13, DDC1 = 13..17, ...).
+    for (i, &freq) in frequencies_hz.iter().enumerate() {
+        let base = 9 + i * 4;
+        if base + 4 > P2_PACKET_SIZE {
+            break;
+        }
+        let phase = phase_word(freq);
+        p[base..base + 4].copy_from_slice(&phase.to_be_bytes());
+    }
+
+    // TX frequency (bytes 329..333) and TX drive/power level (byte
+    // 345, 0-255) -- both confirmed by the user. Drive is gated on
+    // mox_on (0 when receiving), matching the confirmed reference --
+    // it computes power as 0 whenever not transmitting, tx_drive only
+    // while keyed.
+    p[329..333].copy_from_slice(&phase_word(tx_freq_hz).to_be_bytes());
+    p[345] = if mox_on { tx_drive } else { 0 };
+
+    // Antenna/filter selection is driven by receiver 0's frequency --
+    // there's only one Alex front end, shared across all DDCs.
+    let primary_freq = frequencies_hz.first().copied().unwrap_or(7_100_000);
+    p[1432..1436].copy_from_slice(&alex0_word(primary_freq, antenna, mox_on).to_be_bytes());
+
+    // Bytes 1428-1429: the v4.3 spec documents this as an "Alex0 TX
+    // relay pre-stage" field, and a previous version of this file
+    // populated it on that basis -- but confirmed against three
+    // independent known-working implementations (piHPSDR, linHPSDR,
+    // rustyHPSDR), none of them set it; all three leave it at the
+    // initialized 0x0000. Reverted to match every real-world
+    // implementation actually observed, rather than a spec detail that
+    // isn't actually exercised in practice. Left at 0 (the array's
+    // default), so no explicit write needed here.
+
+    p
+}
+
+/// Alex "filter1" register: HPF/preamp selection, LPF selection,
+/// antenna, and T/R relay, per the Orion Mk II / ANAN-7000DLE/8000DLE
+/// bit table (matches this board -- board type "Orion2"). Other board
+/// families use different bit maps entirely (see the Alex appendix),
+/// so this specific mapping is board-specific, not a general-protocol
+/// constant.
+///
+/// Bit values and both filter ladders below are a direct, confirmed
+/// port of the user's own reference implementation (not a guess) --
+/// including the fact that HPF and LPF selection are both set on
+/// *every* packet regardless of RX/TX state, with TR_RELAY (bit 27)
+/// separately controlling which physical signal path (RX front-end
+/// through the HPF bank, or TX output through the LPF bank) is
+/// actually connected. Only the antenna/TR_RELAY handling was written
+/// by me; the two threshold ladders and every constant value came
+/// directly from the user.
+fn alex0_word(freq_hz: u32, antenna: u32, mox_on: bool) -> u32 {
+    const HPF_13MHZ: u32 = 0x00000002;
+    const HPF_20MHZ: u32 = 0x00000004;
+    const PREAMP_6M: u32 = 0x00000008;
+    const HPF_9_5MHZ: u32 = 0x00000010;
+    const HPF_6_5MHZ: u32 = 0x00000020;
+    const HPF_1_5MHZ: u32 = 0x00000040;
+    const HPF_BYPASS: u32 = 0x00001000;
+    const LPF_30_20: u32 = 0x00100000;
+    const LPF_60_40: u32 = 0x00200000;
+    const LPF_80: u32 = 0x00400000;
+    const LPF_160: u32 = 0x00800000;
+    const ANT_1: u32 = 0x01000000;
+    const ANT_2: u32 = 0x02000000;
+    const ANT_3: u32 = 0x04000000;
+    const TR_RELAY: u32 = 0x08000000;
+    const LPF_BYPASS: u32 = 0x20000000;
+    const LPF_12_10: u32 = 0x40000000;
+    const LPF_17_15: u32 = 0x80000000;
+
+    let f = freq_hz as f64;
+
+    // HPF/preamp ladder ("set BPF" in the reference).
+    let hpf = if f < 1_500_000.0 {
+        HPF_BYPASS
+    } else if f < 2_100_000.0 {
+        HPF_1_5MHZ
+    } else if f < 5_500_000.0 {
+        HPF_6_5MHZ
+    } else if f < 11_000_000.0 {
+        HPF_9_5MHZ
+    } else if f < 22_000_000.0 {
+        HPF_13MHZ
+    } else if f < 35_000_000.0 {
+        HPF_20MHZ
+    } else {
+        PREAMP_6M
+    };
+
+    // LPF ladder -- previously entirely missing in this project (only
+    // HPF was ever set), which is the most likely reason TX produced
+    // no RF output even after TR_RELAY started being set correctly:
+    // with no LPF bits set, the TX output path had no filter selected
+    // at all.
+    let lpf = if f > 32_000_000.0 {
+        LPF_BYPASS
+    } else if f > 22_000_000.0 {
+        LPF_12_10
+    } else if f > 15_000_000.0 {
+        LPF_17_15
+    } else if f > 8_000_000.0 {
+        LPF_30_20
+    } else if f > 4_500_000.0 {
+        LPF_60_40
+    } else if f > 2_400_000.0 {
+        LPF_80
+    } else if f > 1_500_000.0 {
+        LPF_160
+    } else {
+        LPF_BYPASS
+    };
+
+    let ant = match antenna {
+        1 => ANT_2,
+        2 => ANT_3,
+        _ => ANT_1,
+    };
+
+    let tr = if mox_on { TR_RELAY } else { 0 };
+
+    hpf | lpf | ant | tr
+}
+
+fn p2_sender_loop(
+    socket: UdpSocket,
+    radio_ip: std::net::IpAddr,
+    num_adcs: u8,
+    frequency_hz: Arc<AtomicU32>,
+    sample_rate: Arc<AtomicU32>,
+    adc: Arc<AtomicU32>,
+    antenna: Arc<AtomicU32>,
+    extra_frequencies_hz: Vec<Arc<AtomicU32>>,
+    extra_sample_rates_hz: Vec<Arc<AtomicU32>>,
+    extra_adcs: Vec<Arc<AtomicU32>>,
+    active_receiver_count: Arc<AtomicU32>,
+    mox: Arc<AtomicBool>,
+    tx_power_watts: Arc<AtomicU32>,
+    pa_gain_db: Arc<AtomicU32>,
+    hp_request: Arc<AtomicBool>,
+    stop: Arc<AtomicBool>,
+) {
+    let mut general_seq: u32 = 0;
+    let mut ddc_seq: u32 = 0;
+    let mut tx_seq: u32 = 0;
+    let mut hp_seq: u32 = 0;
+
+    // Earlier versions of this loop tried "send only on change" for
+    // TX-specific and High-Priority, based on a description of the
+    // reference's behavior -- but a closer look at the actual
+    // reference (rustyHPSDR) shows all four C&C packets share ONE
+    // send trigger on its slow path (`if keepalive || updated { send
+    // all four }`), which is what the unconditional periodic send
+    // below (every P2_KEEPALIVE_INTERVAL) still mirrors.
+    //
+    // On top of that slow path, the reference also has a SECOND, much
+    // faster path -- confirmed by reading its actual source (rustyHPSDR's
+    // protocol2/mod.rs), not inferred: every single incoming
+    // High-Priority status packet from the radio (port 1025, arriving
+    // roughly every ~1ms while running, confirmed via a real packet
+    // capture) immediately triggers an outgoing High-Priority reply,
+    // keeping the drive/power byte continuously fresh rather than
+    // stale for up to a full P2_KEEPALIVE_INTERVAL. hp_request (set by
+    // p2_receiver_loop on every incoming status packet) now actually
+    // gates this fast reactive resend below, instead of being
+    // tracked-but-unused as before.
+    //
+    // NOTE on why this exists despite NOT being the fix for the bug
+    // that prompted it: this was originally added chasing a report of
+    // TX output power bouncing between the expected level and 0W on a
+    // steady carrier, on the theory that a stale drive command was the
+    // cause. An A/B test (this reactive send on vs. off, same board,
+    // same test) showed an identical bounce pattern either way, ruling
+    // that out -- the real cause turned out to be a raw single-packet
+    // ADC ripple that's apparently normal for this board, made highly
+    // visible only because the UI redrew it unsmoothed every frame (see
+    // main.rs's smoothed_fwd_power/smoothed_rev_power, which is the
+    // actual fix). This reactive send is kept anyway because it's still
+    // a real, confirmed improvement over a 250ms-stale drive command
+    // matching the reference's own behavior -- just not the fix for
+    // that specific bug.
+    let mut next_keepalive = Instant::now();
+
+    while !stop.load(Ordering::Relaxed) {
+        let due_for_keepalive = Instant::now() >= next_keepalive;
+        let reactive_hp = hp_request.swap(false, Ordering::Relaxed);
+        if !due_for_keepalive && !reactive_hp {
+            thread::sleep(Duration::from_millis(1));
+            continue;
+        }
+
+        let active = (active_receiver_count.load(Ordering::Relaxed) as usize).max(1);
+        let mut freqs = Vec::with_capacity(active);
+        let mut rates = Vec::with_capacity(active);
+        let mut adcs = Vec::with_capacity(active);
+        freqs.push(frequency_hz.load(Ordering::Relaxed));
+        rates.push(sample_rate.load(Ordering::Relaxed));
+        adcs.push(adc.load(Ordering::Relaxed));
+        for i in 0..active.saturating_sub(1) {
+            if let Some(f) = extra_frequencies_hz.get(i) {
+                freqs.push(f.load(Ordering::Relaxed));
+            }
+            if let Some(r) = extra_sample_rates_hz.get(i) {
+                rates.push(r.load(Ordering::Relaxed));
+            }
+            if let Some(a) = extra_adcs.get(i) {
+                adcs.push(a.load(Ordering::Relaxed));
+            }
+        }
+
+        let mox_on = mox.load(Ordering::Relaxed);
+        let antenna_now = antenna.load(Ordering::Relaxed);
+        // No split VFO support yet -- TX frequency is always the
+        // primary receiver's frequency (simplex).
+        let tx_freq_hz = freqs.first().copied().unwrap_or(7_100_000);
+        let drive = drive_byte_for_watts(
+            tx_power_watts.load(Ordering::Relaxed) as f32,
+            f32::from_bits(pa_gain_db.load(Ordering::Relaxed)),
+        );
+
+        if due_for_keepalive {
+            let general = p2_general_packet(general_seq, num_adcs);
+            let ddc = p2_ddc_specific_packet(ddc_seq, &rates, &adcs, num_adcs);
+            let tx = p2_tx_specific_packet(tx_seq);
+            let hp = p2_high_priority_packet(hp_seq, &freqs, antenna_now, mox_on, tx_freq_hz, drive);
+
+            let sends: [(&[u8], u16); 5] = [
+                (&general[..], P2_GENERAL_PORT),
+                (&ddc[..], P2_DDC_SPECIFIC_PORT),
+                // Confirmed against a real working capture: DDC-specific
+                // goes out twice per cycle, back-to-back, byte-identical
+                // -- not a bug in the reference, an actual quirk of how
+                // it talks to the radio.
+                (&ddc[..], P2_DDC_SPECIFIC_PORT),
+                (&tx[..], P2_TX_SPECIFIC_PORT),
+                (&hp[..], P2_HIGH_PRIORITY_PORT),
+            ];
+
+            for (packet, port) in sends {
+                if socket.send_to(packet, (radio_ip, port)).is_err() {
+                    return; // socket closed or radio gone; stop this thread
+                }
+            }
+
+            general_seq = general_seq.wrapping_add(1);
+            ddc_seq = ddc_seq.wrapping_add(1);
+            tx_seq = tx_seq.wrapping_add(1);
+            hp_seq = hp_seq.wrapping_add(1);
+            next_keepalive = Instant::now() + P2_KEEPALIVE_INTERVAL;
+        } else {
+            // Reactive path -- HP only, matching the reference's own
+            // send_high_priority-on-every-status-packet behavior. Kept
+            // deliberately minimal (not resending all four) to match
+            // what was actually confirmed in the reference source
+            // rather than guessing it should be more than that.
+            let hp = p2_high_priority_packet(hp_seq, &freqs, antenna_now, mox_on, tx_freq_hz, drive);
+            if socket.send_to(&hp, (radio_ip, P2_HIGH_PRIORITY_PORT)).is_err() {
+                return;
+            }
+            hp_seq = hp_seq.wrapping_add(1);
+        }
+    }
+}
+
+fn p2_receiver_loop(
+    socket: UdpSocket,
+    buffers: Vec<Arc<Mutex<VecDeque<IqSample>>>>,
+    sample_rate: Arc<AtomicU32>,
+    hp_request: Arc<AtomicBool>,
+    tx_forward_power: Arc<AtomicU32>,
+    tx_reverse_power: Arc<AtomicU32>,
+    mox: Arc<AtomicBool>,
+    stop: Arc<AtomicBool>,
+) {
+    let mut buf = [0u8; P2_PACKET_SIZE + 64];
+    // Diagnostic only -- added to help pin down a reported case where
+    // TX output power bounced between the expected level and 0W on a
+    // steady carrier even after ruling out mic-audio underrun as the
+    // cause (underrun rate was too low, ~1%, to explain a bounce that
+    // dramatic). Logs an edge-triggered line each time a real,
+    // radio-reported HP status packet's forward-power bytes cross to
+    // or from near-zero while transmitting -- distinguishes "the radio
+    // itself is reporting near-zero forward power" (a real ADC/PA/
+    // reflection issue upstream of this code) from "this code just
+    // isn't updating" (a parsing/packet-loss bug in this file), which
+    // looking at the UI meter alone can't tell apart.
+    let mut last_forward_near_zero = false;
+    let mut last_transition = Instant::now();
+    while !stop.load(Ordering::Relaxed) {
+        match socket.recv_from(&mut buf) {
+            Ok((n, src)) => {
+                let port = src.port();
+                if port >= P2_DDC0_IQ_PORT && ((port - P2_DDC0_IQ_PORT) as usize) < buffers.len() {
+                    let ddc = (port - P2_DDC0_IQ_PORT) as usize;
+                    if n == P2_PACKET_SIZE {
+                        let capacity = iq_buffer_capacity_for_rate(sample_rate.load(Ordering::Relaxed));
+                        p2_parse_ddc_iq_packet(&buf[..n], &buffers[ddc], capacity);
+                    }
+                } else if port == P2_HP_STATUS_SOURCE_PORT {
+                    // Confirmed by the user: the radio's own
+                    // high-priority status packets should prompt an
+                    // immediate response, not just the change-detected/
+                    // keepalive send p2_sender_loop otherwise does.
+                    //
+                    // Forward power (bytes 14-15) and reverse power
+                    // (bytes 22-23) confirmed against the official
+                    // protocol spec ("Bytes 14 & 15... forward power
+                    // from the exciter Power Amplifier... Bytes 22 &
+                    // 23... reverse power from the exciter Power
+                    // Amplifier"). See RadioSession::tx_forward_power's
+                    // doc comment on why this isn't converted to real
+                    // watts here.
+                    if n >= 24 {
+                        let forward = u16::from_be_bytes([buf[14], buf[15]]);
+                        tx_forward_power.store(forward as u32, Ordering::Relaxed);
+                        let reverse = u16::from_be_bytes([buf[22], buf[23]]);
+                        tx_reverse_power.store(reverse as u32, Ordering::Relaxed);
+
+                        if mox.load(Ordering::Relaxed) {
+                            let near_zero = forward < 50; // ~1% of full-scale 4095
+                            if near_zero != last_forward_near_zero {
+                                let elapsed = last_transition.elapsed();
+                                // Full packet dump, not just the forward-power
+                                // bytes -- added because a fast (1-7ms)
+                                // near-every-packet bounce is more consistent
+                                // with SOME packets on this port being a
+                                // different reply type than assumed (e.g. an
+                                // ack to a different one of the 5 packets this
+                                // client sends per cycle) than with a real PA
+                                // fault, which wouldn't correlate packet-to-
+                                // packet like this. Comparing hex side-by-side
+                                // between a near-zero and recovered packet
+                                // should show a discriminating field this
+                                // code isn't currently checking, if that's
+                                // what's actually happening.
+                                let hex: String =
+                                    buf[..n].iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(" ");
+                                eprintln!(
+                                    "tx: radio-reported forward power {} near-zero (raw={forward}, \
+                                     n={n} bytes) while transmitting, {:.0}ms since the last \
+                                     transition -- full packet: {hex}",
+                                    if near_zero { "went" } else { "recovered from" },
+                                    elapsed.as_secs_f64() * 1000.0,
+                                );
+                                last_forward_near_zero = near_zero;
+                                last_transition = Instant::now();
+                            }
+                        }
+                    }
+                    hp_request.store(true, Ordering::Relaxed);
+                }
+                // mic (1026), wideband (1027), command replies (1024):
+                // still not consumed.
+            }
+            Err(e)
+                if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut =>
+            {
+                continue
+            }
+            Err(_) => break,
+        }
+    }
+}
+
+/// DDC I&Q packet: 4-byte seq, 8-byte timestamp, 2-byte bits-per-sample
+/// (always 24), 2-byte samples-per-frame (always 238), then interleaved
+/// 3-byte I / 3-byte Q samples.
+fn p2_parse_ddc_iq_packet(packet: &[u8], buffer: &Arc<Mutex<VecDeque<IqSample>>>, capacity: usize) {
+    if packet.len() < 16 {
+        return;
+    }
+    let samples_per_frame = u16::from_be_bytes([packet[14], packet[15]]) as usize;
+    let mut b = 16;
+    for _ in 0..samples_per_frame {
+        if b + 6 > packet.len() {
+            break;
+        }
+        let i = sign_extend_24(packet[b], packet[b + 1], packet[b + 2]);
+        let q = sign_extend_24(packet[b + 3], packet[b + 4], packet[b + 5]);
+        b += 6;
+        push_sample(buffer, IqSample { i, q }, capacity);
+    }
+}
+
+// ---------------------------------------------------------------------
+// Protocol 2 TX (DUC) IQ streaming
+//
+// Confirmed against a working reference (rustyHPSDR's Protocol2::
+// send_iq_buffer): destination port P2_TX_IQ_PORT (1029), and the
+// packet layout is NOT the same shape as the confirmed incoming DDC IQ
+// packet the way an earlier version of this file assumed by symmetry
+// -- there's no timestamp/bits-per-sample/samples-per-frame header at
+// all here, just a 4-byte sequence number followed immediately by 240
+// interleaved 24-bit I/Q samples (4 + 240*6 = 1444 bytes, filling
+// P2_PACKET_SIZE exactly with no padding).
+// ---------------------------------------------------------------------
+
+const P2_DUC_SAMPLES_PER_FRAME: usize = 240; // confirmed (rustyHPSDR's IQ_BUFFER_SIZE)
+const P2_DUC_RATE_HZ: f64 = 192_000.0; // matches p2_high_priority_packet's TX phase word clock assumption
+
+fn p2_duc_packet(seq: u32, tx_iq: &Mutex<VecDeque<f32>>) -> [u8; P2_PACKET_SIZE] {
+    let mut p = [0u8; P2_PACKET_SIZE];
+    p[0..4].copy_from_slice(&seq.to_be_bytes());
+
+    let mut buf = tx_iq.lock().unwrap();
+    let mut b = 4;
+    for _ in 0..P2_DUC_SAMPLES_PER_FRAME {
+        let i = buf.pop_front().unwrap_or(0.0);
+        let q = buf.pop_front().unwrap_or(0.0);
+        p[b..b + 3].copy_from_slice(&pack_24(i));
+        p[b + 3..b + 6].copy_from_slice(&pack_24(q));
+        b += 6;
+    }
+    p
+}
+
+/// Streams DUC IQ to the radio while (and only while) MOX is asserted.
+/// Separate from p2_sender_loop's slow ~250ms C&C cadence -- this needs
+/// to run continuously at close to real time (~1.25ms/packet at
+/// 192ksps with 240 samples/packet) whenever transmitting, the same
+/// way p2_receiver_loop's RX IQ ingestion is a separate fast path from
+/// the C&C keepalive.
+fn p2_tx_iq_loop(
+    socket: UdpSocket,
+    radio_ip: std::net::IpAddr,
+    mox: Arc<AtomicBool>,
+    tx_iq: Arc<Mutex<VecDeque<f32>>>,
+    stop: Arc<AtomicBool>,
+) {
+    let mut seq: u32 = 0;
+    let interval = Duration::from_secs_f64(P2_DUC_SAMPLES_PER_FRAME as f64 / P2_DUC_RATE_HZ);
+
+    while !stop.load(Ordering::Relaxed) {
+        if !mox.load(Ordering::Relaxed) {
+            // Not transmitting -- nothing to stream. Check back soon
+            // so the first DUC packet goes out promptly after PTT.
+            thread::sleep(Duration::from_millis(20));
+            continue;
+        }
+
+        let packet = p2_duc_packet(seq, &tx_iq);
+        if socket.send_to(&packet, (radio_ip, P2_TX_IQ_PORT)).is_err() {
+            return; // socket closed or radio gone; stop this thread
+        }
+        seq = seq.wrapping_add(1);
+        thread::sleep(interval);
+    }
+}

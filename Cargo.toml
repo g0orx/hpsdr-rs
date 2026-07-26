@@ -1,0 +1,19 @@
+[package]
+name = "hpsdr-rs"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+eframe = "0.35"
+egui = "0.35"
+network-interface = "1"
+socket2 = { version = "0.5", features = ["all"] }
+serde = { version = "1", features = ["derive"] }
+cpal = "0.17"
+serde_json = "1"
+tungstenite = "0.29"
+
+# NOTE: I could not compile-check this in the sandbox this was written in
+# (no Rust toolchain available), so treat these version numbers as a
+# starting point -- run `cargo update` / `cargo check` locally and adjust
+# if crates.io has moved on since.
