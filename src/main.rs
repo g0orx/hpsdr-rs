@@ -643,7 +643,8 @@ impl eframe::App for HpsdrApp {
                             egui::RichText::new(format_frequency(freq_hz))
                                 .monospace()
                                 .size(28.0)
-                                .strong(),
+                                .strong()
+                                .color(egui::Color32::GREEN),
                         )
                         .sense(egui::Sense::hover()),
                     );
@@ -1245,7 +1246,7 @@ impl eframe::App for HpsdrApp {
                         viewport_id,
                         egui::ViewportBuilder::default()
                             .with_title(title)
-                            .with_inner_size([500.0, 500.0]),
+                            .with_inner_size([1024.0, 500.0]),
                         move |ui: &mut egui::Ui, _class: egui::ViewportClass| {
                             if ui.input(|i| i.viewport().close_requested()) {
                                 rx_for_closure.lock().unwrap().open = false;
@@ -2363,7 +2364,7 @@ fn render_extra_receiver_ui(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceiver>>) {
         (d.spectrum.clone(), d.revision)
     };
 
-    ui.heading(format_frequency(freq_hz));
+    ui.heading(egui::RichText::new(format_frequency(freq_hz)).color(egui::Color32::GREEN));
     ui.weak("Scroll to tune -- Shift: 100 Hz, none: 1 kHz. Click spectrum/waterfall to jump.");
 
     ui.horizontal_wrapped(|ui| {
