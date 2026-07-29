@@ -703,9 +703,8 @@ impl eframe::App for HpsdrApp {
                                 settings_changed = true;
                             }
                         }
-                    });
 
-                    ui.horizontal(|ui| {
+                        ui.add_space(12.0);
                         ui.label("Filter width:");
                         let mut width = current_width;
                         if scroll_slider_f64(
@@ -721,7 +720,7 @@ impl eframe::App for HpsdrApp {
                         }
                     });
 
-                    ui.horizontal(|ui| {
+                    ui.horizontal_wrapped(|ui| {
                         ui.label("Audio gain:");
                         let mut gain = current_gain;
                         if scroll_slider_f32(
@@ -734,11 +733,10 @@ impl eframe::App for HpsdrApp {
                             connected.spectrum.set_gain(gain);
                             settings_changed = true;
                         }
-                    });
 
-                    if connected.tx_enabled {
-                        if connected.tx_handle.is_some() {
-                            ui.horizontal(|ui| {
+                        if connected.tx_enabled {
+                            if connected.tx_handle.is_some() {
+                                ui.add_space(12.0);
                                 ui.label("Mic gain:");
                                 let mut mic_gain = connected.mic_gain;
                                 if scroll_slider_f32(
@@ -754,24 +752,23 @@ impl eframe::App for HpsdrApp {
                                     }
                                     settings_changed = true;
                                 }
-                            });
-                        }
-                        // Neither protocol's wire-level drive byte is
-                        // linear with actual output watts on real
-                        // hardware (P1's is confirmed non-linear against
-                        // a reference; P2's byte itself is a confirmed
-                        // linear 0-255 field, but that's a statement
-                        // about the wire format, not about how a real PA
-                        // responds to it). Both protocols now compute
-                        // their drive byte from the same watts-target +
-                        // per-band-gain curve (see
-                        // radio::drive_byte_for_watts) rather than
-                        // exposing a raw 0-255 slider -- P2 used to
-                        // expose the raw byte directly here, which
-                        // worked but couldn't be calibrated to match a
-                        // real wattmeter reading the way P1's watts
-                        // slider already could.
-                        ui.horizontal(|ui| {
+                            }
+                            // Neither protocol's wire-level drive byte is
+                            // linear with actual output watts on real
+                            // hardware (P1's is confirmed non-linear against
+                            // a reference; P2's byte itself is a confirmed
+                            // linear 0-255 field, but that's a statement
+                            // about the wire format, not about how a real PA
+                            // responds to it). Both protocols now compute
+                            // their drive byte from the same watts-target +
+                            // per-band-gain curve (see
+                            // radio::drive_byte_for_watts) rather than
+                            // exposing a raw 0-255 slider -- P2 used to
+                            // expose the raw byte directly here, which
+                            // worked but couldn't be calibrated to match a
+                            // real wattmeter reading the way P1's watts
+                            // slider already could.
+                            ui.add_space(12.0);
                             ui.label("TX Power:");
                             let mut watts =
                                 connected.session.tx_power_watts.load(Ordering::Relaxed) as i32;
@@ -786,13 +783,8 @@ impl eframe::App for HpsdrApp {
                                 connected.session.tx_power_watts.store(watts as u32, Ordering::Relaxed);
                                 settings_changed = true;
                             }
-                        });
-                        ui.weak(
-                            "Accuracy depends on per-band PA Calibration (Settings -> \
-                             TX) -- an uncalibrated band uses a default gain curve; treat \
-                             as approximate until calibrated against a real wattmeter.",
-                        );
-                    }
+                        }
+                    });
 
                     ui.horizontal_wrapped(|ui| {
                         ui.label("Noise:");
@@ -939,8 +931,12 @@ impl eframe::App for HpsdrApp {
                             // Roughly one physical wheel "notch" on most
                             // platforms/mice -- not verified against your
                             // specific hardware, tune if steps feel too
-                            // coarse or too fine.
-                            const NOTCH: f32 = 20.0;
+                            // coarse or too fine. Raised from an earlier
+                            // 20.0 -- reported as too sensitive (one
+                            // wheel click jumping more than a single
+                            // frequency step), so this now requires more
+                            // accumulated scroll motion per step.
+                            const NOTCH: f32 = 50.0;
 
                             let shift = ui.input(|i| i.modifiers.shift);
                             let step: i64 = if shift { 100 } else { 1_000 };
@@ -1024,10 +1020,6 @@ impl eframe::App for HpsdrApp {
                         );
                     }
                     let x_dial = x_for_offset(0.0);
-                    ui.painter().line_segment(
-                        [egui::pos2(x_dial, rect.top()), egui::pos2(x_dial, rect.bottom())],
-                        egui::Stroke::new(1.0, egui::Color32::RED),
-                    );
 
                     let num_freq_ticks = 5;
                     for t in 0..num_freq_ticks {
@@ -1097,13 +1089,21 @@ impl eframe::App for HpsdrApp {
                         ));
                     }
 
+                    // Drawn last (on top of the trace/gridlines above)
+                    // and thicker than a plain 1px stroke so it's
+                    // unambiguous regardless of what's under it or the
+                    // display's DPI scaling.
+                    ui.painter().line_segment(
+                        [egui::pos2(x_dial, rect.top()), egui::pos2(x_dial, rect.bottom())],
+                        egui::Stroke::new(2.0, egui::Color32::RED),
+                    );
+
                     if let Some(pos) = spectrum_resp.hover_pos() {
                         let hover_freq = freq_at_x(pos.x, rect, freq_hz, sample_rate);
                         draw_freq_hover_tooltip(ui.painter(), pos, hover_freq);
                     }
 
                     ui.add_space(8.0);
-                    ui.label("Waterfall");
                     let waterfall_height = 200.0;
                     let (rect, waterfall_click_resp) = ui.allocate_exact_size(
                         egui::vec2(ui.available_width(), waterfall_height),
@@ -2478,7 +2478,8 @@ fn render_extra_receiver_ui(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceiver>>) {
         };
         if delta != 0.0 {
             rx.scroll_accum += delta;
-            const NOTCH: f32 = 20.0;
+            // See the main receiver's own scroll-to-tune NOTCH comment.
+            const NOTCH: f32 = 50.0;
             let shift = ui.input(|i| i.modifiers.shift);
             let step: i64 = if shift { 100 } else { 1_000 };
             let mut new_freq = freq_hz as i64;
@@ -2532,10 +2533,6 @@ fn render_extra_receiver_ui(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceiver>>) {
         egui::Color32::from_rgba_unmultiplied(70, 150, 230, 50),
     );
     let x_dial = x_for_offset(0.0);
-    ui.painter().line_segment(
-        [egui::pos2(x_dial, rect.top()), egui::pos2(x_dial, rect.bottom())],
-        egui::Stroke::new(1.0, egui::Color32::RED),
-    );
 
     if spectrum_row.len() > 1 {
         let range = (db_high - db_low).max(1.0);
@@ -2580,13 +2577,19 @@ fn render_extra_receiver_ui(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceiver>>) {
             .add(egui::Shape::line(points, egui::Stroke::new(1.5, egui::Color32::LIGHT_GREEN)));
     }
 
+    // Drawn last (on top of the trace/gridlines above) and thicker
+    // than a plain 1px stroke, same as the main window.
+    ui.painter().line_segment(
+        [egui::pos2(x_dial, rect.top()), egui::pos2(x_dial, rect.bottom())],
+        egui::Stroke::new(2.0, egui::Color32::RED),
+    );
+
     if let Some(pos) = spectrum_resp.hover_pos() {
         let hover_freq = freq_at_x(pos.x, rect, freq_hz, sample_rate);
         draw_freq_hover_tooltip(ui.painter(), pos, hover_freq);
     }
 
     ui.add_space(4.0);
-    ui.label("Waterfall");
     let waterfall_height = 200.0;
     let (wf_rect, wf_resp) = ui.allocate_exact_size(
         egui::vec2(ui.available_width(), waterfall_height),
@@ -3236,10 +3239,18 @@ fn main() -> eframe::Result<()> {
     // without the user having to resize first. Still resizable/
     // shrinkable afterward; min_inner_size just keeps it from being
     // dragged down to something unusably cramped again.
+    //
+    // Height reduced twice now: 950 -> 700 (estimate) -> 660 (this
+    // time pixel-measured directly against an actual screenshot at
+    // 1200x700 -- laid-out content, including the Stop button, ended
+    // at y=637, leaving a 63px empty gap below it. 660 leaves a small,
+    // deliberate margin rather than an exact fit, since content height
+    // varies a little with things like whether TX is armed (extra
+    // Mic gain/TX Power controls on the Audio gain row).
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1200.0, 950.0])
-            .with_min_inner_size([900.0, 700.0]),
+            .with_inner_size([1200.0, 660.0])
+            .with_min_inner_size([900.0, 520.0]),
         ..Default::default()
     };
     eframe::run_native(
