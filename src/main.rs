@@ -452,6 +452,7 @@ impl eframe::App for HpsdrApp {
                                         duc_rate,
                                     );
                                     tx_handle.set_mic_gain(mic_gain);
+                                    tx_handle.set_mode(spectrum.mode());
                                     (true, Some(mic), Some(tx_handle))
                                 }
                                 Err(e) => {
@@ -674,6 +675,9 @@ impl eframe::App for HpsdrApp {
                                 );
                                 connected.spectrum.set_mode(band.default_mode);
                                 connected.spectrum.set_width_hz(band.default_width_hz);
+                                if let Some(tx) = &connected.tx_handle {
+                                    tx.set_mode(band.default_mode);
+                                }
                                 settings_changed = true;
                             }
                         }
@@ -693,6 +697,9 @@ impl eframe::App for HpsdrApp {
                                 connected
                                     .spectrum
                                     .set_width_hz(spectrum::default_width_hz(mode));
+                                if let Some(tx) = &connected.tx_handle {
+                                    tx.set_mode(mode);
+                                }
                                 settings_changed = true;
                             }
                         }
@@ -1019,7 +1026,7 @@ impl eframe::App for HpsdrApp {
                     let x_dial = x_for_offset(0.0);
                     ui.painter().line_segment(
                         [egui::pos2(x_dial, rect.top()), egui::pos2(x_dial, rect.bottom())],
-                        egui::Stroke::new(1.0, egui::Color32::YELLOW),
+                        egui::Stroke::new(1.0, egui::Color32::RED),
                     );
 
                     let num_freq_ticks = 5;
@@ -1090,6 +1097,11 @@ impl eframe::App for HpsdrApp {
                         ));
                     }
 
+                    if let Some(pos) = spectrum_resp.hover_pos() {
+                        let hover_freq = freq_at_x(pos.x, rect, freq_hz, sample_rate);
+                        draw_freq_hover_tooltip(ui.painter(), pos, hover_freq);
+                    }
+
                     ui.add_space(8.0);
                     ui.label("Waterfall");
                     let waterfall_height = 200.0;
@@ -1115,6 +1127,10 @@ impl eframe::App for HpsdrApp {
                     } else {
                         ui.painter().rect_filled(rect, 0.0, egui::Color32::BLACK);
                         ui.put(rect, egui::Label::new("Creating FFTW Wisdom File..."));
+                    }
+                    if let Some(pos) = waterfall_click_resp.hover_pos() {
+                        let hover_freq = freq_at_x(pos.x, rect, freq_hz, sample_rate);
+                        draw_freq_hover_tooltip(ui.painter(), pos, hover_freq);
                     }
 
                     ui.add_space(8.0);
@@ -1271,7 +1287,7 @@ impl eframe::App for HpsdrApp {
                             ui.horizontal(|ui| {
                                 for (tab, label) in [
                                     (SettingsTab::Network, "Network"),
-                                    (SettingsTab::Agc, "AGC"),
+                                    (SettingsTab::Agc, "RX"),
                                     (SettingsTab::Spectrum, "Spectrum"),
                                     (SettingsTab::Tx, "TX"),
                                 ] {
@@ -1383,7 +1399,18 @@ impl eframe::App for HpsdrApp {
                                 SettingsTab::Agc => {
                                     ui.label("Sample Rate:");
                                     ui.horizontal_wrapped(|ui| {
-                                        for rate in [48_000u32, 96_000, 192_000, 384_000] {
+                                        // Protocol 2 boards support 768/1536ksps too (encoded as
+                                        // a raw ksps value in p2_ddc_specific_packet, not the
+                                        // fixed 2-bit code P1 uses -- see sample_rate_code, which
+                                        // only has entries up to 384000 and would silently fall
+                                        // through to 48kHz for anything higher, so these extra
+                                        // rates are P2-only).
+                                        let rates: &[u32] = if connected.device.protocol == 2 {
+                                            &[48_000, 96_000, 192_000, 384_000, 768_000, 1_536_000]
+                                        } else {
+                                            &[48_000, 96_000, 192_000, 384_000]
+                                        };
+                                        for &rate in rates {
                                             let selected = rate == connected.sample_rate;
                                             let label = format!("{}", rate / 1000);
                                             if ui
@@ -1793,6 +1820,7 @@ impl eframe::App for HpsdrApp {
                                                         duc_rate,
                                                     );
                                                     tx_handle.set_mic_gain(connected.mic_gain);
+                                                    tx_handle.set_mode(connected.spectrum.mode());
                                                     connected.mic_input = Some(mic);
                                                     connected.tx_handle = Some(tx_handle);
                                                     connected.tx_enabled = true;
@@ -2010,6 +2038,23 @@ impl eframe::App for HpsdrApp {
 /// Compact axis-label format, e.g. 7,100,000 Hz -> "7100.0k".
 fn format_khz(hz: f64) -> String {
     format!("{:.1}k", hz / 1000.0)
+}
+
+/// Small frequency readout drawn next to the mouse cursor while
+/// hovering the spectrum trace or waterfall, so you can read off the
+/// frequency under the pointer without having to tune there first.
+fn draw_freq_hover_tooltip(painter: &egui::Painter, pos: egui::Pos2, freq_hz: u32) {
+    let text = format_khz(freq_hz as f64);
+    let text_pos = pos + egui::vec2(12.0, -18.0);
+    let bg_rect = egui::Rect::from_min_size(text_pos - egui::vec2(4.0, 3.0), egui::vec2(74.0, 18.0));
+    painter.rect_filled(bg_rect, 3.0, egui::Color32::from_rgba_unmultiplied(20, 20, 20, 220));
+    painter.text(
+        text_pos,
+        egui::Align2::LEFT_TOP,
+        text,
+        egui::FontId::monospace(12.0),
+        egui::Color32::WHITE,
+    );
 }
 
 /// Status color for the rigctl/TCI indicators in the main panel:
@@ -2489,7 +2534,7 @@ fn render_extra_receiver_ui(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceiver>>) {
     let x_dial = x_for_offset(0.0);
     ui.painter().line_segment(
         [egui::pos2(x_dial, rect.top()), egui::pos2(x_dial, rect.bottom())],
-        egui::Stroke::new(1.0, egui::Color32::YELLOW),
+        egui::Stroke::new(1.0, egui::Color32::RED),
     );
 
     if spectrum_row.len() > 1 {
@@ -2533,6 +2578,11 @@ fn render_extra_receiver_ui(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceiver>>) {
             .collect();
         ui.painter()
             .add(egui::Shape::line(points, egui::Stroke::new(1.5, egui::Color32::LIGHT_GREEN)));
+    }
+
+    if let Some(pos) = spectrum_resp.hover_pos() {
+        let hover_freq = freq_at_x(pos.x, rect, freq_hz, sample_rate);
+        draw_freq_hover_tooltip(ui.painter(), pos, hover_freq);
     }
 
     ui.add_space(4.0);
@@ -2583,6 +2633,10 @@ fn render_extra_receiver_ui(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceiver>>) {
         ui.painter().rect_filled(wf_rect, 0.0, egui::Color32::BLACK);
         ui.put(wf_rect, egui::Label::new("Creating FFTW Wisdom File..."));
     }
+    if let Some(pos) = wf_resp.hover_pos() {
+        let hover_freq = freq_at_x(pos.x, wf_rect, freq_hz, sample_rate);
+        draw_freq_hover_tooltip(ui.painter(), pos, hover_freq);
+    }
 
     // Bounded rather than unconditional -- see the same call in the
     // main receiver's update loop for why.
@@ -2600,7 +2654,7 @@ fn render_extra_receiver_settings(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceive
     let freq_hz = rx.frequency_hz.load(Ordering::Relaxed);
 
     ui.horizontal(|ui| {
-        for (tab, label) in [(SettingsTab::Agc, "AGC"), (SettingsTab::Spectrum, "Spectrum")] {
+        for (tab, label) in [(SettingsTab::Agc, "RX"), (SettingsTab::Spectrum, "Spectrum")] {
             if ui.selectable_label(rx.settings_tab == tab, label).clicked() {
                 rx.settings_tab = tab;
             }
@@ -2622,7 +2676,11 @@ fn render_extra_receiver_settings(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceive
         SettingsTab::Agc => {
             ui.label("Sample Rate:");
             ui.horizontal_wrapped(|ui| {
-                for rate in [48_000u32, 96_000, 192_000, 384_000] {
+                // Extra receivers are Protocol 2 only (see radio.rs's
+                // module note -- P1 has no confirmed multi-DDC enable),
+                // so no protocol check needed here unlike the primary
+                // receiver's own sample rate selector.
+                for rate in [48_000u32, 96_000, 192_000, 384_000, 768_000, 1_536_000] {
                     let selected = rate == current_rate;
                     let label = format!("{}", rate / 1000);
                     if ui.add(egui::Button::selectable(selected, label)).clicked() && !selected {
@@ -2990,6 +3048,7 @@ fn change_sample_rate(connected: &mut ConnectedState, new_rate: u32) {
                     new_rate as i32,
                 );
                 tx_handle.set_mic_gain(mic_gain);
+                tx_handle.set_mode(connected.spectrum.mode());
                 connected.tx_handle = Some(tx_handle);
             }
         }

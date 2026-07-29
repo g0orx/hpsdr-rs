@@ -1612,11 +1612,24 @@ fn p2_parse_ddc_iq_packet(packet: &[u8], buffer: &Arc<Mutex<VecDeque<IqSample>>>
 const P2_DUC_SAMPLES_PER_FRAME: usize = 240; // confirmed (rustyHPSDR's IQ_BUFFER_SIZE)
 const P2_DUC_RATE_HZ: f64 = 192_000.0; // matches p2_high_priority_packet's TX phase word clock assumption
 
-fn p2_duc_packet(seq: u32, tx_iq: &Mutex<VecDeque<f32>>) -> [u8; P2_PACKET_SIZE] {
+/// Returns (packet, starved) -- `starved` is true if tx_iq had fewer
+/// than P2_DUC_SAMPLES_PER_FRAME I/Q pairs already buffered at the
+/// start of this call, meaning at least part of this packet's payload
+/// is unwrap_or(0.0) silence rather than real TXA output. See
+/// p2_tx_iq_loop's aggregate diagnostic -- added to check for
+/// production/consumption starvation at THIS stage (radio.rs's own
+/// queue drain) specifically, as distinct from tx.rs's separate
+/// mic-capture-buffer diagnostic, while chasing a reported wideband/
+/// dirty TX spectrum: a starved chunk here means real, audible/
+/// visible gaps get spliced into an otherwise-continuous carrier,
+/// which is a textbook cause of broadband splatter (a gated/chopped
+/// tone has sidebands a smooth one doesn't).
+fn p2_duc_packet(seq: u32, tx_iq: &Mutex<VecDeque<f32>>) -> ([u8; P2_PACKET_SIZE], bool) {
     let mut p = [0u8; P2_PACKET_SIZE];
     p[0..4].copy_from_slice(&seq.to_be_bytes());
 
     let mut buf = tx_iq.lock().unwrap();
+    let starved = buf.len() < P2_DUC_SAMPLES_PER_FRAME * 2;
     let mut b = 4;
     for _ in 0..P2_DUC_SAMPLES_PER_FRAME {
         let i = buf.pop_front().unwrap_or(0.0);
@@ -1625,7 +1638,7 @@ fn p2_duc_packet(seq: u32, tx_iq: &Mutex<VecDeque<f32>>) -> [u8; P2_PACKET_SIZE]
         p[b + 3..b + 6].copy_from_slice(&pack_24(q));
         b += 6;
     }
-    p
+    (p, starved)
 }
 
 /// Streams DUC IQ to the radio while (and only while) MOX is asserted.
@@ -1644,19 +1657,81 @@ fn p2_tx_iq_loop(
     let mut seq: u32 = 0;
     let interval = Duration::from_secs_f64(P2_DUC_SAMPLES_PER_FRAME as f64 / P2_DUC_RATE_HZ);
 
+    // Diagnostic only -- see p2_duc_packet's doc comment. Aggregated
+    // per second (not per packet, which would be ~800/s) so it's cheap
+    // to leave in.
+    let mut starve_window_start = Instant::now();
+    let mut starved_packets_this_window: u32 = 0;
+    let mut packets_this_window: u32 = 0;
+
+    // Absolute-deadline pacing, not `thread::sleep(interval)` after
+    // every send (an earlier version of this loop did that). The
+    // difference matters here specifically: this was confirmed by
+    // measuring an actual reported wideband/dirty TX spectrum -- a
+    // regular comb of spurs at ~755Hz spacing (pixel-measured from a
+    // screenshot against the display's own gridline spacing for
+    // calibration) -- against this loop's own packet rate: 240 samples
+    // @ 192ksps = exactly 800Hz, an unmistakable match within
+    // measurement precision. `thread::sleep(interval)` re-measured
+    // fresh each iteration lets whatever scheduling jitter occurred on
+    // one send (OS wake-up latency, contention with this process's
+    // several other real-time-ish threads -- p2_sender_loop's C&C
+    // polling, tx.rs's own TXA loop, MicInput's audio callback, etc.)
+    // get permanently baked into that packet's send time rather than
+    // corrected on the next one, producing exactly the periodic
+    // jitter-at-the-packet-rate signature a comb like that implies.
+    // Scheduling against a fixed, monotonically-advancing `next_send`
+    // instead means jitter on one packet doesn't compound into the
+    // next -- each send is timed relative to the ORIGINAL schedule,
+    // not relative to whenever the previous send actually happened.
+    let mut next_send = Instant::now();
+
     while !stop.load(Ordering::Relaxed) {
         if !mox.load(Ordering::Relaxed) {
             // Not transmitting -- nothing to stream. Check back soon
             // so the first DUC packet goes out promptly after PTT.
             thread::sleep(Duration::from_millis(20));
+            // Resync so the first packet after PTT goes out immediately
+            // against a fresh schedule, not delayed by however long MOX
+            // was off (which would otherwise leave `next_send` far in
+            // the past, though the `else` branch below would also
+            // eventually recover from that -- resetting here is just
+            // more direct).
+            next_send = Instant::now();
             continue;
         }
 
-        let packet = p2_duc_packet(seq, &tx_iq);
+        let (packet, starved) = p2_duc_packet(seq, &tx_iq);
         if socket.send_to(&packet, (radio_ip, P2_TX_IQ_PORT)).is_err() {
             return; // socket closed or radio gone; stop this thread
         }
+        if starved {
+            starved_packets_this_window += 1;
+        }
+        packets_this_window += 1;
+        if starve_window_start.elapsed() >= Duration::from_secs(1) {
+            if starved_packets_this_window > 0 {
+                eprintln!(
+                    "tx: DUC IQ queue underrun on {starved_packets_this_window}/{packets_this_window} \
+                     packets in the last second -- silence spliced into the TX IQ stream during those"
+                );
+            }
+            starve_window_start = Instant::now();
+            starved_packets_this_window = 0;
+            packets_this_window = 0;
+        }
         seq = seq.wrapping_add(1);
-        thread::sleep(interval);
+
+        next_send += interval;
+        let now = Instant::now();
+        if next_send > now {
+            thread::sleep(next_send - now);
+        } else {
+            // Fell behind real time (e.g. a genuine scheduling
+            // hiccup) -- resync to now rather than trying to "catch
+            // up" by bursting several packets back-to-back, which
+            // would be worse than the drift it's correcting for.
+            next_send = now;
+        }
     }
 }

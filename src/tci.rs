@@ -57,6 +57,14 @@ pub struct TciServer {
     /// from "not running at all" (server is None).
     connected: Arc<AtomicU32>,
     thread: Option<JoinHandle<()>>,
+    /// Per-client handler threads -- stop() joins these too, not just
+    /// the accept thread. handle_client already polls `stop` via its
+    /// own read timeout (so it was never leaked indefinitely the way
+    /// rigctl.rs's equivalent was before a matching fix), but without
+    /// this a caller that immediately rebinds the same address (e.g.
+    /// main.rs's change_sample_rate) could still race a client thread
+    /// that hasn't quite exited yet.
+    client_threads: Arc<Mutex<Vec<JoinHandle<()>>>>,
 }
 
 impl TciServer {
@@ -75,8 +83,10 @@ impl TciServer {
 
         let stop = Arc::new(AtomicBool::new(false));
         let connected = Arc::new(AtomicU32::new(0));
+        let client_threads: Arc<Mutex<Vec<JoinHandle<()>>>> = Arc::new(Mutex::new(Vec::new()));
         let accept_stop = Arc::clone(&stop);
         let accept_connected = Arc::clone(&connected);
+        let accept_client_threads = Arc::clone(&client_threads);
         let thread = thread::spawn(move || {
             while !accept_stop.load(Ordering::Relaxed) {
                 match listener.accept() {
@@ -87,11 +97,14 @@ impl TciServer {
                         let conn_mox = Arc::clone(&mox);
                         let conn_stop = Arc::clone(&accept_stop);
                         let conn_connected = Arc::clone(&accept_connected);
-                        thread::spawn(move || {
+                        let handle = thread::spawn(move || {
                             conn_connected.fetch_add(1, Ordering::Relaxed);
                             handle_client(stream, freq, params, conn_mox, conn_stop);
                             conn_connected.fetch_sub(1, Ordering::Relaxed);
                         });
+                        let mut threads = accept_client_threads.lock().unwrap();
+                        threads.retain(|h| !h.is_finished()); // opportunistic cleanup
+                        threads.push(handle);
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                         thread::sleep(Duration::from_millis(100));
@@ -105,6 +118,7 @@ impl TciServer {
             stop,
             connected,
             thread: Some(thread),
+            client_threads,
         })
     }
 
@@ -117,6 +131,14 @@ impl TciServer {
 
     pub fn stop(&mut self) {
         self.stop.store(true, Ordering::SeqCst);
+        // Join client threads too -- see client_threads' doc comment.
+        // Each should already be on its way out (its own read timeout
+        // means it notices `stop` within ~250ms), this just makes sure
+        // stop() doesn't return before that's actually happened.
+        let threads: Vec<JoinHandle<()>> = self.client_threads.lock().unwrap().drain(..).collect();
+        for t in threads {
+            let _ = t.join();
+        }
         if let Some(t) = self.thread.take() {
             let _ = t.join();
         }

@@ -263,7 +263,28 @@ impl TxProcessor {
             wdsp::SetTXABandpassFreqs(channel, 300.0, 2700.0);
         }
 
-        let duc_ratio = ((duc_rate / dsp_rate).max(1)) as usize;
+        // BUG FIX, confirmed against the reference (rustyHPSDR's
+        // Transmitter::new: `output_samples = microphone_buffer_size *
+        // (output_rate/sample_rate)`, where sample_rate is always the
+        // MIC INPUT rate, never the internal dsp_rate): this buffer's
+        // size must scale with duc_rate/mic_rate, not duc_rate/dsp_rate.
+        // For Protocol 2 those give different answers (192000/96000=2
+        // vs. the correct 192000/48000=4) -- an earlier version of this
+        // file used dsp_rate here, sizing iq_scratch at HALF the pairs
+        // WDSP's fexchange0 actually writes for this channel's real
+        // configured rates (OpenChannel above already passes the true
+        // mic_rate/dsp_rate/duc_rate triple, matching the reference
+        // exactly -- only this buffer's OWN size calculation, done
+        // independently on this side, had the wrong ratio). fexchange0
+        // trusts the caller to size its output buffer correctly and
+        // does no bounds checking of its own, so this was an actual
+        // out-of-bounds write into memory past this Vec's allocation on
+        // every single TX audio chunk while transmitting on Protocol 2
+        // -- undefined behavior, and a very plausible explanation for a
+        // reported wideband/dirty TX signal (a real screenshot
+        // comparison against rustyHPSDR's clean single-tone spike on
+        // the same Tune test first surfaced this).
+        let duc_ratio = ((duc_rate / mic_rate).max(1)) as usize;
         let out_iq_pairs = TX_BUFFER_SIZE * duc_ratio;
 
         TxProcessor {

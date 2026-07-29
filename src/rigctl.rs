@@ -45,6 +45,21 @@ pub struct RigctlServer {
     /// from "not running at all" (server is None).
     connected: Arc<AtomicU32>,
     thread: Option<JoinHandle<()>>,
+    /// Per-client handler threads (see handle_client) -- stop() joins
+    /// these too, not just the accept thread. Without this, a client
+    /// connected at the moment this server is torn down (e.g. by
+    /// main.rs's change_sample_rate, which drops and immediately
+    /// recreates RigctlServer against a fresh DemodParams handle) was
+    /// silently leaked: its thread kept running, still holding the
+    /// TCP connection open, forever using the *old* frequency_hz/
+    /// demod_params/mox handles from before the rebuild. Confirmed as
+    /// the cause of a reported "RIGCTL Error" in WSJT-X after changing
+    /// the receiver sample rate -- the leaked connection's socket was
+    /// still bound to the same local port when the new listener tried
+    /// to bind it, and WSJT-X's one persistent connection was left
+    /// talking to a thread with no live relationship to the actually-
+    /// current session state.
+    client_threads: Arc<Mutex<Vec<JoinHandle<()>>>>,
 }
 
 impl RigctlServer {
@@ -65,23 +80,38 @@ impl RigctlServer {
 
         let stop = Arc::new(AtomicBool::new(false));
         let connected = Arc::new(AtomicU32::new(0));
+        let client_threads: Arc<Mutex<Vec<JoinHandle<()>>>> = Arc::new(Mutex::new(Vec::new()));
         let accept_stop = Arc::clone(&stop);
         let accept_connected = Arc::clone(&connected);
+        let accept_client_threads = Arc::clone(&client_threads);
         let thread = thread::spawn(move || {
             while !accept_stop.load(Ordering::Relaxed) {
                 match listener.accept() {
                     Ok((stream, peer)) => {
                         println!("rigctl: client connected from {peer}");
+                        // Matches tci.rs's already-proven approach: a
+                        // read timeout so handle_client's loop notices
+                        // `stop` promptly instead of blocking forever
+                        // in read_line() on an idle connection -- see
+                        // client_threads' doc comment for why an
+                        // unbounded block here was a real bug, not
+                        // just untidy.
+                        if let Err(e) = stream.set_read_timeout(Some(Duration::from_millis(250))) {
+                            eprintln!("rigctl: failed to set read timeout: {e}");
+                        }
                         let freq = Arc::clone(&frequency_hz);
                         let params = Arc::clone(&demod_params);
                         let conn_mox = Arc::clone(&mox);
                         let conn_stop = Arc::clone(&accept_stop);
                         let conn_connected = Arc::clone(&accept_connected);
-                        thread::spawn(move || {
+                        let handle = thread::spawn(move || {
                             conn_connected.fetch_add(1, Ordering::Relaxed);
                             handle_client(stream, freq, params, conn_mox, conn_stop);
                             conn_connected.fetch_sub(1, Ordering::Relaxed);
                         });
+                        let mut threads = accept_client_threads.lock().unwrap();
+                        threads.retain(|h| !h.is_finished()); // opportunistic cleanup
+                        threads.push(handle);
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                         thread::sleep(Duration::from_millis(100));
@@ -95,6 +125,7 @@ impl RigctlServer {
             stop,
             connected,
             thread: Some(thread),
+            client_threads,
         })
     }
 
@@ -107,6 +138,15 @@ impl RigctlServer {
 
     pub fn stop(&mut self) {
         self.stop.store(true, Ordering::SeqCst);
+        // Join client threads too (not just the accept thread) so a
+        // caller that immediately rebinds the same address (e.g. after
+        // a sample-rate change) doesn't race a not-yet-closed client
+        // connection still holding the port -- see client_threads'
+        // doc comment.
+        let threads: Vec<JoinHandle<()>> = self.client_threads.lock().unwrap().drain(..).collect();
+        for t in threads {
+            let _ = t.join();
+        }
         if let Some(t) = self.thread.take() {
             let _ = t.join();
         }
@@ -151,6 +191,19 @@ fn handle_client(
                     }
                     None => break, // quit command
                 }
+            }
+            // Read timeout (see start()'s set_read_timeout) -- expected
+            // on an idle connection, not a real error. Loop back around
+            // to re-check `stop` rather than treating it as the
+            // connection having failed. `line` may hold a partial
+            // fragment of whatever WSJT-X was mid-way through sending;
+            // next iteration's `line.clear()` drops it, same tradeoff
+            // tci.rs already accepts for its own read-timeout loop --
+            // fine in practice since commands are tiny single-line
+            // sends, not something realistically split across a 250ms
+            // window.
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock || e.kind() == std::io::ErrorKind::TimedOut => {
+                continue;
             }
             Err(_) => break,
         }
