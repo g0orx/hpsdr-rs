@@ -394,6 +394,19 @@ fn run(
     let mut starved_chunks_this_window: u32 = 0;
     let mut chunks_this_window: u32 = 0;
 
+    // Absolute-deadline pacing, not `thread::sleep(chunk_interval)` after
+    // every iteration (which this loop used until now). Same fix, same
+    // reasoning, as p2_tx_iq_loop's own next_send -- see its doc comment
+    // for the full explanation. This loop is the actual PRODUCER feeding
+    // that one's tx_iq queue; relative sleep-based pacing here lets any
+    // one iteration's jitter (WDSP processing time, mutex contention,
+    // OS scheduling) push every later chunk's real production time
+    // later too, rather than being corrected on the next iteration --
+    // which starves that downstream queue exactly like drifting sender
+    // pacing was already confirmed to spur the RF output on the
+    // consumer side.
+    let mut next_chunk = Instant::now();
+
     while !stop.load(Ordering::Relaxed) {
         if !mox.load(Ordering::Relaxed) {
             // Not transmitting -- drop any mic audio that accumulated
@@ -402,6 +415,10 @@ fn run(
             // TXA chain on nothing.
             mic_buffer.lock().unwrap().clear();
             thread::sleep(Duration::from_millis(20));
+            // Resync so the first chunk after PTT is produced against a
+            // fresh schedule, not delayed by however long MOX was off --
+            // same reasoning as p2_tx_iq_loop's own resync here.
+            next_chunk = Instant::now();
             continue;
         }
 
@@ -445,7 +462,16 @@ fn run(
         let alc_av = processor.meter(wdsp::txaMeterType_TXA_ALC_AV);
         *display.lock().unwrap() = TxDisplay { mic_pk, alc_av };
 
-        thread::sleep(chunk_interval);
+        next_chunk += chunk_interval;
+        let now = Instant::now();
+        if next_chunk > now {
+            thread::sleep(next_chunk - now);
+        } else {
+            // Fell behind real time -- resync to now rather than
+            // bursting several chunks back-to-back to "catch up", same
+            // reasoning as p2_tx_iq_loop's own fallback.
+            next_chunk = now;
+        }
     }
 }
 
