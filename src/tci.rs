@@ -48,7 +48,14 @@ use tungstenite::Message;
 pub const DEFAULT_ADDR: &str = "127.0.0.1:40001";
 const PROTOCOL_NAME: &str = "protocol:hpsdr-rs;";
 
+/// A swappable reference to "whichever DemodParams is current right
+/// now" -- see TciServer::set_demod_params's doc comment (and
+/// rigctl.rs's identical DemodParamsCell, which this mirrors) for why
+/// this indirection exists.
+type DemodParamsCell = Arc<Mutex<Arc<Mutex<DemodParams>>>>;
+
 pub struct TciServer {
+    demod_params: DemodParamsCell,
     stop: Arc<AtomicBool>,
     /// Count of currently-connected clients (normally 0 or 1, but the
     /// accept loop doesn't limit concurrent connections, so a counter
@@ -62,8 +69,10 @@ pub struct TciServer {
     /// own read timeout (so it was never leaked indefinitely the way
     /// rigctl.rs's equivalent was before a matching fix), but without
     /// this a caller that immediately rebinds the same address (e.g.
-    /// main.rs's change_sample_rate) could still race a client thread
-    /// that hasn't quite exited yet.
+    /// the user stopping/restarting this from Settings -> Network)
+    /// could still race a client thread that hasn't quite exited yet.
+    /// A sample-rate change no longer tears this server down at all
+    /// anymore -- see set_demod_params.
     client_threads: Arc<Mutex<Vec<JoinHandle<()>>>>,
 }
 
@@ -81,19 +90,21 @@ impl TciServer {
         listener.set_nonblocking(true)?;
         println!("tci: listening on {addr}");
 
+        let demod_params: DemodParamsCell = Arc::new(Mutex::new(demod_params));
         let stop = Arc::new(AtomicBool::new(false));
         let connected = Arc::new(AtomicU32::new(0));
         let client_threads: Arc<Mutex<Vec<JoinHandle<()>>>> = Arc::new(Mutex::new(Vec::new()));
         let accept_stop = Arc::clone(&stop);
         let accept_connected = Arc::clone(&connected);
         let accept_client_threads = Arc::clone(&client_threads);
+        let accept_demod_params = Arc::clone(&demod_params);
         let thread = thread::spawn(move || {
             while !accept_stop.load(Ordering::Relaxed) {
                 match listener.accept() {
                     Ok((stream, peer)) => {
                         println!("tci: client connected from {peer}");
                         let freq = Arc::clone(&frequency_hz);
-                        let params = Arc::clone(&demod_params);
+                        let params = Arc::clone(&accept_demod_params);
                         let conn_mox = Arc::clone(&mox);
                         let conn_stop = Arc::clone(&accept_stop);
                         let conn_connected = Arc::clone(&accept_connected);
@@ -115,11 +126,21 @@ impl TciServer {
         });
 
         Ok(Self {
+            demod_params,
             stop,
             connected,
             thread: Some(thread),
             client_threads,
         })
+    }
+
+    /// Points this server (and every currently-connected client's
+    /// handler thread) at a different DemodParams -- see rigctl.rs's
+    /// identical set_demod_params for the full explanation (this fixes
+    /// the same reported "disconnects on sample rate change" bug for
+    /// TCI clients too).
+    pub fn set_demod_params(&self, new_demod_params: Arc<Mutex<DemodParams>>) {
+        *self.demod_params.lock().unwrap() = new_demod_params;
     }
 
     /// True while at least one client is currently connected. Callers
@@ -154,7 +175,7 @@ impl Drop for TciServer {
 fn handle_client(
     stream: TcpStream,
     frequency_hz: Arc<AtomicU32>,
-    demod_params: Arc<Mutex<DemodParams>>,
+    demod_params: DemodParamsCell,
     mox: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
 ) {
@@ -176,7 +197,7 @@ fn handle_client(
 
     // Best-effort initial state push -- see module-level note.
     let freq = frequency_hz.load(Ordering::Relaxed);
-    let mode = demod_params.lock().unwrap().mode;
+    let mode = demod_params.lock().unwrap().clone().lock().unwrap().mode;
     let _ = ws.send(Message::Text(PROTOCOL_NAME.into()));
     let _ = ws.send(Message::Text(format!("vfo:0,0,{freq};").into()));
     let _ = ws.send(Message::Text(format!("modulation:0,{};", mode_to_tci(mode)).into()));
@@ -192,7 +213,13 @@ fn handle_client(
                     if cmd.is_empty() {
                         continue;
                     }
-                    if let Some(response) = handle_command(cmd, &frequency_hz, &demod_params, &mox) {
+                    // Resolved fresh on every command (not once per
+                    // connection) so a sample-rate change mid-session --
+                    // see set_demod_params -- takes effect immediately
+                    // for already-connected clients too, not just new
+                    // ones.
+                    let current_params = demod_params.lock().unwrap().clone();
+                    if let Some(response) = handle_command(cmd, &frequency_hz, &current_params, &mox) {
                         if ws.send(Message::Text(response.into())).is_err() {
                             return;
                         }

@@ -3237,28 +3237,22 @@ fn change_sample_rate(connected: &mut ConnectedState, new_rate: u32) {
     let agc = connected.spectrum.agc();
     let agc_params = connected.spectrum.agc_params();
 
-    // rigctl/TCI are started/stopped manually from the Network tab now
-    // (not auto-started), so a server that's currently stopped should
-    // stay stopped across this restart -- only restart the ones that
-    // were actually running, against the new SpectrumHandle's
-    // DemodParams (the old servers hold a clone of the *old* one,
-    // which goes stale once a new SpectrumHandle replaces it).
-    let rigctl_was_running = connected.rigctl_server.is_some();
-    let tci_was_running = connected.tci_server.is_some();
-
     connected.session.set_sample_rate(new_rate);
 
     // Explicitly tear down everything that depends on the old WDSP
-    // channel or bound ports BEFORE creating replacements. Otherwise
-    // the new SpectrumHandle would open WDSP channel 0 again while the
-    // old background thread still owns it (WDSP isn't confirmed
-    // thread-safe for concurrent access to the same channel), and the
-    // new rigctl/TCI servers would try to bind ports the old ones
-    // haven't released yet -- simply reassigning these fields at the
-    // end doesn't help, since Rust builds the new value (and thus
-    // tries to bind/open) before dropping the old one.
-    connected.rigctl_server = None;
-    connected.tci_server = None;
+    // channel BEFORE creating a replacement. Otherwise the new
+    // SpectrumHandle would open WDSP channel 0 again while the old
+    // background thread still owns it (WDSP isn't confirmed thread-safe
+    // for concurrent access to the same channel) -- simply reassigning
+    // `connected.spectrum` at the end doesn't help, since Rust builds
+    // the new value (and thus opens the channel) before dropping the
+    // old one.
+    //
+    // rigctl/TCI themselves are NOT torn down here anymore -- see
+    // RigctlServer::set_demod_params's doc comment. They keep running
+    // (and keep any already-connected client, e.g. WSJT-X, connected)
+    // and are just pointed at the new SpectrumHandle's DemodParams
+    // below, once it exists.
     connected.audio_output = None;
     connected.spectrum.stop();
 
@@ -3284,43 +3278,11 @@ fn change_sample_rate(connected: &mut ConnectedState, new_rate: u32) {
             None
         }
     };
-    if rigctl_was_running {
-        connected.rigctl_server = match RigctlServer::start(
-            &connected.rigctl_addr,
-            Arc::clone(&connected.session.frequency_hz),
-            spectrum.demod_params_handle(),
-            Arc::clone(&connected.session.mox),
-        ) {
-            Ok(s) => {
-                connected.rigctl_error = None;
-                Some(s)
-            }
-            Err(e) => {
-                let msg = format!("couldn't re-listen on {}: {e}", connected.rigctl_addr);
-                eprintln!("rigctl: {msg}");
-                connected.rigctl_error = Some(msg);
-                None
-            }
-        };
+    if let Some(s) = &connected.rigctl_server {
+        s.set_demod_params(spectrum.demod_params_handle());
     }
-    if tci_was_running {
-        connected.tci_server = match TciServer::start(
-            &connected.tci_addr,
-            Arc::clone(&connected.session.frequency_hz),
-            spectrum.demod_params_handle(),
-            Arc::clone(&connected.session.mox),
-        ) {
-            Ok(s) => {
-                connected.tci_error = None;
-                Some(s)
-            }
-            Err(e) => {
-                let msg = format!("couldn't re-listen on {}: {e}", connected.tci_addr);
-                eprintln!("tci: {msg}");
-                connected.tci_error = Some(msg);
-                None
-            }
-        };
+    if let Some(s) = &connected.tci_server {
+        s.set_demod_params(spectrum.demod_params_handle());
     }
 
     connected.spectrum = spectrum;

@@ -36,7 +36,13 @@ use std::time::Duration;
 
 pub const DEFAULT_ADDR: &str = "127.0.0.1:4532";
 
+/// A swappable reference to "whichever DemodParams is current right
+/// now" -- see RigctlServer::set_demod_params's doc comment for why
+/// this indirection exists.
+type DemodParamsCell = Arc<Mutex<Arc<Mutex<DemodParams>>>>;
+
 pub struct RigctlServer {
+    demod_params: DemodParamsCell,
     stop: Arc<AtomicBool>,
     /// Count of currently-connected clients (normally 0 or 1, but the
     /// accept loop doesn't limit concurrent connections, so a counter
@@ -47,18 +53,15 @@ pub struct RigctlServer {
     thread: Option<JoinHandle<()>>,
     /// Per-client handler threads (see handle_client) -- stop() joins
     /// these too, not just the accept thread. Without this, a client
-    /// connected at the moment this server is torn down (e.g. by
-    /// main.rs's change_sample_rate, which drops and immediately
-    /// recreates RigctlServer against a fresh DemodParams handle) was
+    /// connected at the moment this server is torn down (e.g. the user
+    /// explicitly stopping/restarting it from Settings -> Network) was
     /// silently leaked: its thread kept running, still holding the
-    /// TCP connection open, forever using the *old* frequency_hz/
-    /// demod_params/mox handles from before the rebuild. Confirmed as
-    /// the cause of a reported "RIGCTL Error" in WSJT-X after changing
-    /// the receiver sample rate -- the leaked connection's socket was
-    /// still bound to the same local port when the new listener tried
-    /// to bind it, and WSJT-X's one persistent connection was left
-    /// talking to a thread with no live relationship to the actually-
-    /// current session state.
+    /// TCP connection and the old local port, so a caller that
+    /// immediately rebinds the same address would race a socket the
+    /// old listener hadn't actually released yet. A sample-rate change
+    /// no longer tears this server down at all anymore -- see
+    /// set_demod_params -- but this still matters for the
+    /// user-initiated stop/restart case.
     client_threads: Arc<Mutex<Vec<JoinHandle<()>>>>,
 }
 
@@ -78,12 +81,14 @@ impl RigctlServer {
         listener.set_nonblocking(true)?;
         println!("rigctl: listening on {addr}");
 
+        let demod_params: DemodParamsCell = Arc::new(Mutex::new(demod_params));
         let stop = Arc::new(AtomicBool::new(false));
         let connected = Arc::new(AtomicU32::new(0));
         let client_threads: Arc<Mutex<Vec<JoinHandle<()>>>> = Arc::new(Mutex::new(Vec::new()));
         let accept_stop = Arc::clone(&stop);
         let accept_connected = Arc::clone(&connected);
         let accept_client_threads = Arc::clone(&client_threads);
+        let accept_demod_params = Arc::clone(&demod_params);
         let thread = thread::spawn(move || {
             while !accept_stop.load(Ordering::Relaxed) {
                 match listener.accept() {
@@ -100,7 +105,7 @@ impl RigctlServer {
                             eprintln!("rigctl: failed to set read timeout: {e}");
                         }
                         let freq = Arc::clone(&frequency_hz);
-                        let params = Arc::clone(&demod_params);
+                        let params = Arc::clone(&accept_demod_params);
                         let conn_mox = Arc::clone(&mox);
                         let conn_stop = Arc::clone(&accept_stop);
                         let conn_connected = Arc::clone(&accept_connected);
@@ -122,11 +127,29 @@ impl RigctlServer {
         });
 
         Ok(Self {
+            demod_params,
             stop,
             connected,
             thread: Some(thread),
             client_threads,
         })
+    }
+
+    /// Points this server (and every currently-connected client's
+    /// handler thread) at a different DemodParams -- e.g. after
+    /// main.rs's change_sample_rate rebuilds the SpectrumHandle, which
+    /// creates a fresh DemodParams that the *old* one this server
+    /// started with knows nothing about. Previously the only way to
+    /// pick up a new DemodParams was to drop and recreate the whole
+    /// RigctlServer, which tore down the TCP listener and forcibly
+    /// disconnected any client (e.g. WSJT-X) that happened to be
+    /// connected at the time -- confirmed as the cause of a reported
+    /// "rigctl disconnects on sample rate change". frequency_hz and mox
+    /// don't need this treatment since they're the same Arc from
+    /// RadioSession across a sample-rate change; only DemodParams gets
+    /// replaced.
+    pub fn set_demod_params(&self, new_demod_params: Arc<Mutex<DemodParams>>) {
+        *self.demod_params.lock().unwrap() = new_demod_params;
     }
 
     /// True while at least one client is currently connected. Callers
@@ -162,7 +185,7 @@ impl Drop for RigctlServer {
 fn handle_client(
     stream: TcpStream,
     frequency_hz: Arc<AtomicU32>,
-    demod_params: Arc<Mutex<DemodParams>>,
+    demod_params: DemodParamsCell,
     mox: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
 ) {
@@ -183,7 +206,12 @@ fn handle_client(
                 if cmd.is_empty() {
                     continue;
                 }
-                match handle_command(cmd, &frequency_hz, &demod_params, &mox) {
+                // Resolved fresh on every command (not once per
+                // connection) so a sample-rate change mid-session -- see
+                // set_demod_params -- takes effect immediately for
+                // already-connected clients too, not just new ones.
+                let current_params = demod_params.lock().unwrap().clone();
+                match handle_command(cmd, &frequency_hz, &current_params, &mox) {
                     Some(response) => {
                         if writer.write_all(response.as_bytes()).is_err() {
                             break;
