@@ -1324,6 +1324,28 @@ impl eframe::App for HpsdrApp {
                 // which cleanly stops that receiver's threads/audio via
                 // its Drop impls.
                 connected.extra_receivers.retain(|rx| rx.lock().unwrap().open);
+                // active_receiver_count drives which DDCs the radio is
+                // actually told to enable/stream (see p2_sender_loop's
+                // contiguous DDC0..active-1 enable mask) -- it must
+                // shrink back down when a receiver window closes, or
+                // the radio keeps streaming a DDC nobody's reading and
+                // "Add Receiver" undercounts how many slots are really
+                // free. DDCs can only be enabled as a contiguous block
+                // from DDC0, so the count can't drop below whatever the
+                // highest still-open extra receiver's index requires --
+                // e.g. closing receiver 1 while receiver 2 stays open
+                // must leave DDC1 enabled too, since DDC2 can't run
+                // without it.
+                let active_count = connected
+                    .extra_receivers
+                    .iter()
+                    .map(|rx| rx.lock().unwrap().ddc_index)
+                    .max()
+                    .map_or(1, |highest| highest + 1);
+                connected
+                    .session
+                    .active_receiver_count
+                    .store(active_count as u32, Ordering::Relaxed);
                 for rx in connected.extra_receivers.clone() {
                     let ddc_index = rx.lock().unwrap().ddc_index;
                     let viewport_id = egui::ViewportId::from_hash_of(("extra_receiver", ddc_index));
