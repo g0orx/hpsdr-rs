@@ -1283,25 +1283,7 @@ impl eframe::App for HpsdrApp {
                                 connected.smoothed_rev_power as u32,
                                 connected.device.board,
                             );
-                            ui.painter().rect_filled(meter_rect, 4.0, egui::Color32::from_rgb(20, 20, 20));
-                            ui.painter().text(
-                                meter_rect.center() - egui::vec2(0.0, 12.0),
-                                egui::Align2::CENTER_CENTER,
-                                format!("{watts:.0} W"),
-                                egui::FontId::proportional(26.0),
-                                egui::Color32::from_rgb(255, 120, 60),
-                            );
-                            ui.painter().text(
-                                meter_rect.center() + egui::vec2(0.0, 16.0),
-                                egui::Align2::CENTER_CENTER,
-                                format!("SWR {swr:.1}:1"),
-                                egui::FontId::proportional(16.0),
-                                if swr > 3.0 {
-                                    egui::Color32::from_rgb(220, 60, 60)
-                                } else {
-                                    egui::Color32::LIGHT_GRAY
-                                },
-                            );
+                            draw_power_meter(ui, meter_rect, watts, swr, connected.max_tx_power_watts as f32);
                         } else {
                             // Reset so the next key-up's meter ramps from
                             // zero (like a real wattmeter's needle
@@ -2486,6 +2468,80 @@ fn draw_s_meter(ui: &mut egui::Ui, rect: egui::Rect, db: f64) {
         s_meter_label(db, S9),
         egui::FontId::monospace(13.0),
         egui::Color32::WHITE,
+    );
+}
+
+/// Same semicircle-gauge treatment as draw_s_meter, scaled 0..max_watts
+/// instead of S-units, shown in place of it while transmitting. The
+/// needle (and the combined digital readout) turn red once SWR crosses
+/// the same 3.0 threshold the plain-text display this replaces already
+/// flagged, so a bad match is visible at a glance without reading the
+/// number.
+fn draw_power_meter(ui: &mut egui::Ui, rect: egui::Rect, watts: f32, swr: f32, max_watts: f32) {
+    let painter = ui.painter();
+    painter.rect_filled(rect, 4.0, egui::Color32::from_gray(20));
+
+    // Same reserved-bottom-space approach as draw_s_meter, and the same
+    // TEXT_ZONE/TOP_MARGIN values -- see its doc comment for why they
+    // exist -- so this gauge ends up the same size, not a smaller one
+    // just because its readout happens to say more.
+    const TEXT_ZONE: f32 = 26.0;
+    const TOP_MARGIN: f32 = 6.0;
+    let center = egui::pos2(rect.center().x, rect.bottom() - TEXT_ZONE);
+    let radius = (rect.width() * 0.45).min((rect.height() - TEXT_ZONE - TOP_MARGIN) / 1.16);
+
+    let max_watts = max_watts.max(1.0);
+    let angle_for_watts = |w: f32| -> f32 {
+        let t = (w / max_watts).clamp(0.0, 1.0);
+        std::f32::consts::PI - t * std::f32::consts::PI // left (180deg) to right (0deg)
+    };
+    let point_at = |angle: f32, r: f32| -> egui::Pos2 { center + egui::vec2(angle.cos(), -angle.sin()) * r };
+
+    // Face arc
+    let arc: Vec<egui::Pos2> = (0..=60)
+        .map(|i| point_at(std::f32::consts::PI - (i as f32 / 60.0) * std::f32::consts::PI, radius))
+        .collect();
+    painter.add(egui::Shape::line(arc, egui::Stroke::new(2.0, egui::Color32::WHITE)));
+
+    // 0/25/50/75/100% of max_watts ticks, labeled with the actual watt
+    // value rather than a percentage -- max_watts varies per radio (see
+    // ConnectedState::max_tx_power_watts), so a fixed set of watt
+    // labels wouldn't make sense across boards the way S1-S9 does.
+    for frac in [0.0, 0.25, 0.5, 0.75, 1.0] {
+        let w = max_watts * frac;
+        let angle = angle_for_watts(w);
+        painter.line_segment(
+            [point_at(angle, radius * 0.85), point_at(angle, radius)],
+            egui::Stroke::new(2.0, egui::Color32::WHITE),
+        );
+        painter.text(
+            point_at(angle, radius * 1.16),
+            egui::Align2::CENTER_CENTER,
+            format!("{w:.0}"),
+            egui::FontId::proportional(11.0),
+            egui::Color32::WHITE,
+        );
+    }
+
+    let bad_swr = swr > 3.0;
+    let needle_color =
+        if bad_swr { egui::Color32::from_rgb(220, 60, 60) } else { egui::Color32::YELLOW };
+    let needle_angle = angle_for_watts(watts);
+    painter.line_segment(
+        [center, point_at(needle_angle, radius * 0.92)],
+        egui::Stroke::new(2.5, needle_color),
+    );
+    painter.circle_filled(center, 4.0, needle_color);
+
+    // Digital readout: watts + SWR combined into the one line draw_s_meter
+    // itself uses, so the two gauges stay visually consistent -- see
+    // draw_s_meter's own readout for the pattern this mirrors.
+    painter.text(
+        egui::pos2(center.x, rect.bottom() - 2.0),
+        egui::Align2::CENTER_BOTTOM,
+        format!("{watts:.0}W  SWR {swr:.1}:1"),
+        egui::FontId::monospace(13.0),
+        if bad_swr { egui::Color32::from_rgb(220, 60, 60) } else { egui::Color32::from_rgb(255, 150, 70) },
     );
 }
 
