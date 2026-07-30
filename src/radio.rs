@@ -1394,6 +1394,15 @@ fn p2_sender_loop(
     // matching the reference's own behavior -- just not the fix for
     // that specific bug.
     let mut next_keepalive = Instant::now();
+    // Diagnostic only -- edge-triggered (not every send) log of how many
+    // DDCs this client is actually asking the radio to enable. Added
+    // alongside p2_receiver_loop's "first IQ packet per DDC" log: if
+    // `active` reaches 7 here but no IQ ever arrives on DDC4-6's ports,
+    // that rules out a client-side bug in *requesting* the extra DDCs
+    // and points at the radio itself (hardware/firmware not actually
+    // streaming that many concurrent DDCs despite advertising support
+    // for them in its discovery reply).
+    let mut last_logged_active: Option<usize> = None;
 
     while !stop.load(Ordering::Relaxed) {
         let due_for_keepalive = Instant::now() >= next_keepalive;
@@ -1404,6 +1413,10 @@ fn p2_sender_loop(
         }
 
         let active = (active_receiver_count.load(Ordering::Relaxed) as usize).max(1);
+        if last_logged_active != Some(active) {
+            eprintln!("radio: requesting {active} active DDC(s) from the radio");
+            last_logged_active = Some(active);
+        }
         let mut freqs = Vec::with_capacity(active);
         let mut rates = Vec::with_capacity(active);
         let mut adcs = Vec::with_capacity(active);
@@ -1500,12 +1513,26 @@ fn p2_receiver_loop(
     // looking at the UI meter alone can't tell apart.
     let mut last_forward_near_zero = false;
     let mut last_transition = Instant::now();
+    // Diagnostic only -- added while chasing a report that extra
+    // receivers beyond the 4th show no spectrum/waterfall at all.
+    // Logs once, the first time any IQ packet actually arrives from a
+    // given DDC's source port, so it's possible to tell "the radio
+    // never sends this DDC's IQ at all" (a hardware/firmware/bandwidth
+    // limit outside this codebase) apart from "IQ arrives fine but WDSP
+    // isn't turning it into spectrum/waterfall pixels" (a WDSP-side
+    // issue -- see SpectrumAnalyzer::open's XCreateAnalyzer success
+    // check and demod()'s fexchange0 error check).
+    let mut ddc_seen = vec![false; buffers.len()];
     while !stop.load(Ordering::Relaxed) {
         match socket.recv_from(&mut buf) {
             Ok((n, src)) => {
                 let port = src.port();
                 if port >= P2_DDC0_IQ_PORT && ((port - P2_DDC0_IQ_PORT) as usize) < buffers.len() {
                     let ddc = (port - P2_DDC0_IQ_PORT) as usize;
+                    if !ddc_seen[ddc] {
+                        ddc_seen[ddc] = true;
+                        eprintln!("radio: first IQ packet received for DDC{ddc} (port {port})");
+                    }
                     if n == P2_PACKET_SIZE {
                         let capacity = iq_buffer_capacity_for_rate(sample_rate.load(Ordering::Relaxed));
                         p2_parse_ddc_iq_packet(&buf[..n], &buffers[ddc], capacity);

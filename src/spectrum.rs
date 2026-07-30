@@ -464,6 +464,23 @@ impl SpectrumAnalyzer {
                 1,
                 path_cstring.as_ptr() as *mut std::os::raw::c_char,
             );
+            // success's out-param convention isn't documented here, but
+            // every other WDSP error out-param in this file (fexchange0's
+            // `error`) is 0 = ok, so treat nonzero the same way. Added
+            // while chasing a report that receivers beyond the 4th
+            // (channel index 3) show no spectrum/waterfall at all --
+            // this is the one place WDSP itself can report "I refused to
+            // create channel N" rather than just silently producing no
+            // data, so surfacing it is the fastest way to tell a WDSP-
+            // side channel limit apart from an IQ-data-never-arrives
+            // problem upstream (radio/network) of WDSP entirely.
+            if success != 0 {
+                eprintln!(
+                    "spectrum: XCreateAnalyzer(channel={channel}) returned success={success} \
+                     (nonzero -- WDSP likely refused to create this channel's analyzer; if this \
+                     is a higher-numbered extra receiver, that spectrum/waterfall will stay empty)"
+                );
+            }
 
             let pixels = SPECTRUM_WIDTH * ZOOM;
             // a_fft_size must be large enough for two independent
@@ -762,6 +779,20 @@ impl SpectrumAnalyzer {
                 self.demod_audio_scratch.as_mut_ptr(),
                 &mut error,
             );
+        }
+        // Edge-triggered (not every call, which would fire ~47 times/sec
+        // per channel) -- added alongside XCreateAnalyzer's success
+        // check above while chasing a report that higher-numbered extra
+        // receivers (channel index 4+) show no spectrum/waterfall.
+        // fexchange0's error isn't documented here either, but pairs
+        // with the same "0 = ok" convention as everything else in this
+        // file that reports one.
+        let now_erroring = error != 0;
+        if self.last_fexchange_error != Some(now_erroring) {
+            if now_erroring {
+                eprintln!("spectrum: fexchange0(channel={}) reporting error={error}", self.channel);
+            }
+            self.last_fexchange_error = Some(now_erroring);
         }
 
         self.demod_audio_scratch.iter().map(|&v| v as f32).collect()
