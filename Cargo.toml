@@ -4,7 +4,25 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-eframe = "0.35"
+# default-features disabled specifically to drop "accesskit" (Linux
+# screen-reader/AT-SPI support via egui-winit -> accesskit_unix ->
+# zbus/atspi -> the `polling` crate's epoll wait loop) -- confirmed via
+# `perf record -g` that this D-Bus event loop was the actual source of
+# one CPU core sitting pegged near 100% (polling::epoll::Poller::
+# wait_deadline was ~80% of all captured samples), a known issue with
+# accesskit's AT-SPI integration busy-polling even with no assistive
+# technology active, especially under GNOME's always-running AT-SPI
+# registry daemon. This app has no accessibility/screen-reader use
+# case, so there's no downside to dropping it. The rest of this list
+# is eframe 0.35's own default feature set, copied verbatim minus
+# "accesskit" -- keep in sync if eframe's defaults ever change.
+eframe = { version = "0.35", default-features = false, features = [
+    "default_fonts",
+    "wayland",
+    "web_screen_reader",
+    "wgpu",
+    "x11",
+] }
 egui = "0.35"
 network-interface = "1"
 socket2 = { version = "0.5", features = ["all"] }
