@@ -391,6 +391,27 @@ impl SpectrumAnalyzer {
             }
         });
 
+        // Serializes each channel's one-time setup sequence (OpenChannel
+        // through SetAnalyzer/SetDisplay* below) across every
+        // SpectrumAnalyzer::open() call in the process, even though
+        // they run on independent per-channel background threads.
+        // Added after a segfault reproduced specifically when restoring
+        // multiple receivers at startup (main + saved extra receivers'
+        // SpectrumHandle threads all call open() within the same brief
+        // window) but not when adding a receiver to an already-running
+        // session (by then the previous channel's setup had long since
+        // finished) -- consistent with FFTW's planner (invoked inside
+        // XCreateAnalyzer/SetAnalyzer for the various analyzer FFT
+        // sizes) not being safe to call concurrently from multiple
+        // threads, which is a well-documented FFTW footgun and exactly
+        // the class of bug this timing points to. Each channel's own
+        // steady-state feed()/demod() loop afterward is untouched by
+        // this lock and continues to run fully concurrently, matching
+        // the fact that multiple receivers work fine together once
+        // they're all past this one-time setup.
+        static WDSP_SETUP_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _setup_guard = WDSP_SETUP_LOCK.lock().unwrap();
+
         unsafe {
             wdsp::OpenChannel(
                 channel,
