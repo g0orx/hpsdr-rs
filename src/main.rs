@@ -901,8 +901,6 @@ impl eframe::App for HpsdrApp {
                         ui.add_space(12.0);
                         ui.colored_label(network_status_color(tci_status), "TCI")
                             .on_hover_text(network_status_hover("TCI", tci_status, &connected.tci_addr));
-                        ui.add_space(12.0);
-                        ui.weak("(start/stop in Settings -> Network)");
                     });
 
                     if connected.tx_enabled {
@@ -2201,11 +2199,12 @@ fn network_status_color(status: Option<bool>) -> egui::Color32 {
 }
 
 fn network_status_hover(name: &str, status: Option<bool>, addr: &str) -> String {
-    match status {
+    let state = match status {
         None => format!("{name}: not running"),
         Some(false) => format!("{name}: listening on {addr}, no client connected"),
         Some(true) => format!("{name}: client connected on {addr}"),
-    }
+    };
+    format!("{state}\n(start/stop in Settings -> Network)")
 }
 
 fn format_frequency(hz: u32) -> String {
