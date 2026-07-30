@@ -1309,6 +1309,13 @@ impl eframe::App for HpsdrApp {
                                         None,
                                     ) {
                                         connected.extra_receivers.push(rx);
+                                        // Without this, a freshly added
+                                        // receiver is only persisted if
+                                        // some other setting happens to
+                                        // change afterward -- closing the
+                                        // app right after adding one
+                                        // would silently lose it.
+                                        connected.settings_dirty.store(true, Ordering::Relaxed);
                                     }
                                 }
                             } else {
@@ -1358,7 +1365,14 @@ impl eframe::App for HpsdrApp {
                             .with_inner_size([1024.0, 500.0]),
                         move |ui: &mut egui::Ui, _class: egui::ViewportClass| {
                             if ui.input(|i| i.viewport().close_requested()) {
-                                rx_for_closure.lock().unwrap().open = false;
+                                let mut rx = rx_for_closure.lock().unwrap();
+                                rx.open = false;
+                                // Without this, closing a receiver is
+                                // only persisted if some other setting
+                                // happens to change afterward --
+                                // closing the app right after would
+                                // silently bring it back next launch.
+                                rx.settings_dirty.store(true, Ordering::Relaxed);
                                 return;
                             }
 
