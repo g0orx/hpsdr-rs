@@ -1639,6 +1639,21 @@ fn p2_parse_ddc_iq_packet(packet: &[u8], buffer: &Arc<Mutex<VecDeque<IqSample>>>
 const P2_DUC_SAMPLES_PER_FRAME: usize = 240; // confirmed (rustyHPSDR's IQ_BUFFER_SIZE)
 const P2_DUC_RATE_HZ: f64 = 192_000.0; // matches p2_high_priority_packet's TX phase word clock assumption
 
+/// How many IQ pairs p2_tx_iq_loop lets tx_iq accumulate before it
+/// starts actually draining it, each time MOX goes active. One full
+/// production cycle from tx.rs's TxProcessor (512 mic samples *
+/// duc_ratio 4 at 192ksps/48kHz = 2048 pairs) arrives in one lump every
+/// ~10.7ms, while this loop drains it steadily at 240 pairs/1.25ms in
+/// between. A one-lump cushion (2048) got real, continuous underruns
+/// (~1-2% of packets throughout a whole transmission) down to a single
+/// occasional packet right at the key-down transition itself -- the
+/// narrow race between finishing that first cushion and tx.rs's *next*
+/// lump landing. Two full lumps' worth of margin instead of one, for
+/// that last transition-edge case: at the cost of one more ~10.7ms of
+/// one-time TX audio latency per PTT (now ~21ms total), still
+/// essentially imperceptible for voice.
+const TX_PREBUFFER_PAIRS: usize = 4096;
+
 /// Returns (packet, starved) -- `starved` is true if tx_iq had fewer
 /// than P2_DUC_SAMPLES_PER_FRAME I/Q pairs already buffered at the
 /// start of this call, meaning at least part of this packet's payload
@@ -1712,6 +1727,11 @@ fn p2_tx_iq_loop(
     // next -- each send is timed relative to the ORIGINAL schedule,
     // not relative to whenever the previous send actually happened.
     let mut next_send = Instant::now();
+    // See TX_PREBUFFER_PAIRS's doc comment. Reset false whenever MOX
+    // drops so the next key-down re-fills its own cushion from scratch
+    // rather than trusting whatever's left over from a previous, now
+    // long-idle transmission.
+    let mut warmed_up = false;
 
     while !stop.load(Ordering::Relaxed) {
         if !mox.load(Ordering::Relaxed) {
@@ -1725,11 +1745,36 @@ fn p2_tx_iq_loop(
             // eventually recover from that -- resetting here is just
             // more direct).
             next_send = Instant::now();
+            warmed_up = false;
             continue;
         }
 
-        let (packet, starved) = p2_duc_packet(seq, &tx_iq);
-        if socket.send_to(&packet, (radio_ip, P2_TX_IQ_PORT)).is_err() {
+        // *2: tx_iq stores interleaved I/Q floats, not pairs -- same
+        // convention as p2_duc_packet's own starved check just below.
+        if !warmed_up && tx_iq.lock().unwrap().len() >= TX_PREBUFFER_PAIRS * 2 {
+            warmed_up = true;
+        }
+
+        let (packet, starved) = if warmed_up {
+            p2_duc_packet(seq, &tx_iq)
+        } else {
+            // Still building the initial cushion -- send silence
+            // without touching the queue, so it actually accumulates
+            // instead of being drained back down as fast as it fills.
+            // Not counted as starved: this is an intentional, one-time
+            // ramp-up, not a real underrun.
+            let mut p = [0u8; P2_PACKET_SIZE];
+            p[0..4].copy_from_slice(&seq.to_be_bytes());
+            (p, false)
+        };
+        if let Err(e) = socket.send_to(&packet, (radio_ip, P2_TX_IQ_PORT)) {
+            // Previously silent -- this thread just exited here with no
+            // log at all, meaning a single transient send error (a full
+            // OS send buffer, a brief network blip) would permanently
+            // stop ALL further TX IQ for the rest of the session with
+            // zero indication why, indistinguishable from a real
+            // dropout with no clue left behind to tell them apart.
+            eprintln!("tx: DUC IQ socket.send_to failed, stopping TX IQ streaming: {e}");
             return; // socket closed or radio gone; stop this thread
         }
         if starved {
