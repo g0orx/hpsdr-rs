@@ -2405,8 +2405,23 @@ fn draw_s_meter(ui: &mut egui::Ui, rect: egui::Rect, db: f64) {
     let painter = ui.painter();
     painter.rect_filled(rect, 4.0, egui::Color32::from_gray(20));
 
-    let center = egui::pos2(rect.center().x, rect.bottom() - 14.0);
-    let radius = (rect.width() * 0.45).min(rect.height() * 0.72);
+    // Reserve room at the bottom for the digital readout text (drawn
+    // below) so the arc's flat baseline and the needle's pivot dot --
+    // both sitting right at center.y -- can't overlap it. The previous
+    // fixed 14px gap here was less than a 13pt monospace glyph's actual
+    // height, so the top of the readout visibly clipped through the
+    // arc/pivot. TEXT_ZONE and TOP_MARGIN below derive the radius from
+    // whatever's actually left over instead of a size tuned for one
+    // specific rect, so this keeps working if the meter's rect size
+    // ever changes again.
+    const TEXT_ZONE: f32 = 26.0;
+    const TOP_MARGIN: f32 = 6.0;
+    let center = egui::pos2(rect.center().x, rect.bottom() - TEXT_ZONE);
+    // The S9 tick label (closest to straight up, at angle_for_db(S9))
+    // is the tallest thing drawn above center -- its label sits at
+    // radius*1.16 from center, so that's what TOP_MARGIN is measured
+    // against, not the bare arc radius itself.
+    let radius = (rect.width() * 0.45).min((rect.height() - TEXT_ZONE - TOP_MARGIN) / 1.16);
 
     const S9: f64 = -73.0;
     const DB_MIN: f64 = S9 - 54.0; // S0
