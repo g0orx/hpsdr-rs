@@ -96,6 +96,13 @@ pub struct Config {
     pub tx_waterfall_db_high: Option<f32>,
     #[serde(default)]
     pub band_settings: std::collections::HashMap<String, BandSettings>,
+    /// Last filter width used per mode, keyed by Mode::label() (e.g.
+    /// "USB") -- see main.rs's width_for_mode. A mode with no entry
+    /// here (never used yet, or a config saved before this existed)
+    /// falls back to spectrum::default_width_hz(mode), same as if this
+    /// map didn't exist at all.
+    #[serde(default)]
+    pub width_memory: std::collections::HashMap<String, f64>,
     /// Extra receivers (beyond the primary one above), P2 only. On
     /// reconnect these are automatically recreated with their saved
     /// settings, matching however many were active last time.
@@ -114,6 +121,10 @@ pub struct ExtraReceiverConfig {
     pub adc: u8,
     #[serde(default)]
     pub band_settings: std::collections::HashMap<String, BandSettings>,
+    /// See Config::width_memory's doc comment -- same thing, per extra
+    /// receiver instead of shared across the session.
+    #[serde(default)]
+    pub width_memory: std::collections::HashMap<String, f64>,
     pub mode: Mode,
     pub width_hz: f64,
     pub gain: f32,

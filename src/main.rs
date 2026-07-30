@@ -109,6 +109,18 @@ fn remember_band_settings(
     }
 }
 
+/// Last filter width the user set while in `mode`, if any -- falls back
+/// to the mode's built-in default (spectrum::default_width_hz) the
+/// first time a mode is used, same as before this per-mode memory
+/// existed. Keyed by Mode::label() (a fixed string) rather than Mode
+/// itself so it round-trips through JSON the same way band_memory does.
+fn width_for_mode(width_memory: &std::collections::HashMap<String, f64>, mode: spectrum::Mode) -> f64 {
+    width_memory
+        .get(mode.label())
+        .copied()
+        .unwrap_or_else(|| spectrum::default_width_hz(mode))
+}
+
 #[derive(Copy, Clone, PartialEq, Eq)]
 enum SettingsTab {
     Network,
@@ -155,6 +167,9 @@ struct ExtraReceiver {
     /// Config) knows to persist it too.
     settings_dirty: Arc<std::sync::atomic::AtomicBool>,
     band_memory: std::collections::HashMap<String, BandSettings>,
+    /// Last filter width used per mode -- see width_for_mode's doc
+    /// comment. Keyed by Mode::label().
+    width_memory: std::collections::HashMap<String, f64>,
     /// CTUN ("Click to Tune") -- see ConnectedState::ctun's doc comment
     /// for the full explanation; same behavior here, just per extra
     /// receiver instead of shared across the whole session.
@@ -198,6 +213,9 @@ struct ConnectedState {
     extra_receivers: Vec<Arc<Mutex<ExtraReceiver>>>,
     settings_dirty: Arc<std::sync::atomic::AtomicBool>,
     band_memory: std::collections::HashMap<String, BandSettings>,
+    /// Last filter width used per mode -- see width_for_mode's doc
+    /// comment. Keyed by Mode::label().
+    width_memory: std::collections::HashMap<String, f64>,
     /// CTUN ("Click to Tune"): when on, the hardware/LO frequency
     /// (session.frequency_hz) stays fixed and clicking/scrolling the
     /// spectrum instead moves ctun_frequency_hz -- a listen frequency
@@ -517,6 +535,7 @@ impl eframe::App for HpsdrApp {
                                 extra_receivers,
                                 settings_dirty,
                                 band_memory: cfg.band_settings.clone(),
+                                width_memory: cfg.width_memory.clone(),
                                 ctun: false,
                                 ctun_frequency_hz: initial_frequency_hz,
                                 rigctl_addr,
@@ -760,7 +779,7 @@ impl eframe::App for HpsdrApp {
                                 connected.spectrum.set_mode(mode);
                                 connected
                                     .spectrum
-                                    .set_width_hz(spectrum::default_width_hz(mode));
+                                    .set_width_hz(width_for_mode(&connected.width_memory, mode));
                                 if let Some(tx) = &connected.tx_handle {
                                     tx.set_mode(mode);
                                 }
@@ -780,6 +799,9 @@ impl eframe::App for HpsdrApp {
                             " Hz",
                         ) {
                             connected.spectrum.set_width_hz(width);
+                            connected
+                                .width_memory
+                                .insert(current_mode.label().to_string(), width);
                             settings_changed = true;
                         }
                     });
@@ -2075,6 +2097,7 @@ impl eframe::App for HpsdrApp {
                                 waterfall_palette: rx.waterfall_palette,
                                 adc: rx.adc.load(std::sync::atomic::Ordering::Relaxed) as u8,
                                 band_settings: rx.band_memory.clone(),
+                                width_memory: rx.width_memory.clone(),
                             }
                         })
                         .collect();
@@ -2112,6 +2135,7 @@ impl eframe::App for HpsdrApp {
                             connected.session.antenna.load(std::sync::atomic::Ordering::Relaxed) as u8,
                         ),
                         band_settings: connected.band_memory.clone(),
+                        width_memory: connected.width_memory.clone(),
                         pa_calibration: connected.pa_calibration.clone(),
                         max_tx_power_watts: Some(connected.max_tx_power_watts),
                         rigctl_addr: Some(connected.rigctl_addr.clone()),
@@ -2550,7 +2574,7 @@ fn render_extra_receiver_ui(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceiver>>) {
             let selected = mode == current_mode;
             if ui.add(egui::Button::selectable(selected, mode.label())).clicked() && !selected {
                 rx.spectrum.set_mode(mode);
-                rx.spectrum.set_width_hz(spectrum::default_width_hz(mode));
+                rx.spectrum.set_width_hz(width_for_mode(&rx.width_memory, mode));
                 rx.settings_dirty.store(true, Ordering::Relaxed);
             }
         }
@@ -2561,6 +2585,7 @@ fn render_extra_receiver_ui(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceiver>>) {
         let mut width = current_width;
         if scroll_slider_f64(ui, &mut rx.slider_scroll_accum, &mut width, 50.0..=5000.0, 50.0, " Hz") {
             rx.spectrum.set_width_hz(width);
+            rx.width_memory.insert(current_mode.label().to_string(), width);
             rx.settings_dirty.store(true, Ordering::Relaxed);
         }
     });
@@ -3113,6 +3138,7 @@ fn spawn_extra_receiver(
         settings_tab: SettingsTab::Agc,
         settings_dirty,
         band_memory: saved.map(|s| s.band_settings.clone()).unwrap_or_default(),
+        width_memory: saved.map(|s| s.width_memory.clone()).unwrap_or_default(),
         ctun: false,
         ctun_frequency_hz: initial_frequency_hz,
         open: true,
