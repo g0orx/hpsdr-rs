@@ -277,6 +277,22 @@ pub struct DemodParams {
     /// inside the RXA chain itself, so switching is just a Set*Run
     /// call, no extra buffer plumbing needed.
     pub noise_reduction: NoiseReduction,
+    /// CTUN ("Click to Tune"): when true, the hardware/LO frequency
+    /// (lo_frequency_hz below) stays fixed and ctun_offset_hz shifts the
+    /// RXA demod chain instead, so the user can pick a different listen
+    /// frequency within the same spectrum window without retuning the
+    /// radio. Confirmed against a working reference (rustyHPSDR).
+    pub ctun: bool,
+    /// Offset (Hz) from lo_frequency_hz to the CTUN'd listen frequency.
+    /// Only meaningful while ctun is true; ignored (and reset to 0 on
+    /// the wire) while false.
+    pub ctun_offset_hz: f64,
+    /// The actual hardware-tuned (LO) frequency, mirrored here every
+    /// frame from main.rs's RadioSession/ExtraReceiver state purely so
+    /// demod() can pass it to RXANBPSetTuneFrequency while CTUN is off
+    /// -- radio.rs/main.rs own the real value, this is just a read-only
+    /// copy for the analyzer thread.
+    pub lo_frequency_hz: f64,
 }
 
 impl Default for DemodParams {
@@ -303,6 +319,9 @@ impl Default for DemodParams {
             noise_blanker: NoiseBlanker::Off,
             nb_threshold: 20.0,
             noise_reduction: NoiseReduction::Off,
+            ctun: false,
+            ctun_offset_hz: 0.0,
+            lo_frequency_hz: 0.0,
         }
     }
 }
@@ -335,6 +354,13 @@ struct SpectrumAnalyzer {
     last_nb_enabled: Option<NoiseBlanker>,
     last_nb_threshold: Option<f64>,
     last_nr_enabled: Option<NoiseReduction>,
+    last_ctun: Option<bool>,
+    last_ctun_offset: Option<f64>,
+    last_lo_frequency: Option<f64>,
+    /// Edge-triggered diagnostic state for fexchange0's error out-param
+    /// -- see its doc comment in demod() for why this exists and why
+    /// it's edge- rather than every-call-triggered.
+    last_fexchange_error: Option<bool>,
 }
 
 impl SpectrumAnalyzer {
@@ -525,6 +551,10 @@ impl SpectrumAnalyzer {
                 last_nb_enabled: None,
                 last_nb_threshold: None,
                 last_nr_enabled: None,
+                last_ctun: None,
+                last_ctun_offset: None,
+                last_lo_frequency: None,
+                last_fexchange_error: None,
             }
         }
     }
@@ -662,6 +692,47 @@ impl SpectrumAnalyzer {
                 wdsp::SetRXASBNRRun(self.channel, nr4_run);
             }
             self.last_nr_enabled = Some(params.noise_reduction);
+        }
+
+        // CTUN ("Click to Tune"): confirmed against a working reference
+        // (rustyHPSDR). SetRXAShiftFreq shifts the IQ into the RXA
+        // demod chain so the passband tracks the CTUN'd frequency
+        // without retuning the radio; RXANBPSetShiftFrequency keeps the
+        // noise-blanker preprocessor's own frequency reference in sync
+        // with that same shift. These are mutually exclusive with
+        // RXANBPSetTuneFrequency below -- the NBP object tracks either
+        // an absolute tuned frequency or a shift, never both at once,
+        // matching the reference's own if/else (never both branches in
+        // the same call).
+        if params.ctun {
+            if self.last_ctun != Some(true) {
+                unsafe {
+                    wdsp::SetRXAShiftRun(self.channel, 1);
+                }
+                self.last_ctun = Some(true);
+            }
+            if self.last_ctun_offset != Some(params.ctun_offset_hz) {
+                unsafe {
+                    wdsp::SetRXAShiftFreq(self.channel, params.ctun_offset_hz);
+                    wdsp::RXANBPSetShiftFrequency(self.channel, params.ctun_offset_hz);
+                }
+                self.last_ctun_offset = Some(params.ctun_offset_hz);
+            }
+        } else {
+            if self.last_ctun != Some(false) {
+                unsafe {
+                    wdsp::SetRXAShiftFreq(self.channel, 0.0);
+                    wdsp::SetRXAShiftRun(self.channel, 0);
+                }
+                self.last_ctun = Some(false);
+                self.last_ctun_offset = Some(0.0);
+            }
+            if self.last_lo_frequency != Some(params.lo_frequency_hz) {
+                unsafe {
+                    wdsp::RXANBPSetTuneFrequency(self.channel, params.lo_frequency_hz);
+                }
+                self.last_lo_frequency = Some(params.lo_frequency_hz);
+            }
         }
 
         for (i, s) in samples.iter().enumerate() {
@@ -884,6 +955,25 @@ impl SpectrumHandle {
     }
     pub fn set_noise_reduction(&self, v: NoiseReduction) {
         self.demod_params.lock().unwrap().noise_reduction = v;
+    }
+
+    pub fn ctun(&self) -> bool {
+        self.demod_params.lock().unwrap().ctun
+    }
+
+    /// Enables/disables CTUN and sets the current offset (Hz) from the
+    /// hardware/LO frequency to the CTUN'd listen frequency. Callers
+    /// should pass offset_hz: 0.0 when disabling.
+    pub fn set_ctun(&self, ctun: bool, offset_hz: f64) {
+        let mut p = self.demod_params.lock().unwrap();
+        p.ctun = ctun;
+        p.ctun_offset_hz = offset_hz;
+    }
+
+    /// Mirrors the actual hardware/LO frequency into the analyzer thread
+    /// -- see DemodParams::lo_frequency_hz's doc comment for why.
+    pub fn set_lo_frequency_hz(&self, hz: f64) {
+        self.demod_params.lock().unwrap().lo_frequency_hz = hz;
     }
 
     /// Clone of the shared DemodParams handle, for other consumers
