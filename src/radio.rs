@@ -1041,7 +1041,6 @@ fn start_protocol2(
     let receiver_hp_request = Arc::clone(&hp_request);
     let receiver_tx_forward_power = Arc::clone(&tx_forward_power);
     let receiver_tx_reverse_power = Arc::clone(&tx_reverse_power);
-    let receiver_mox = Arc::clone(&mox);
     let receiver_thread = thread::spawn(move || {
         p2_receiver_loop(
             receiver_socket,
@@ -1050,7 +1049,6 @@ fn start_protocol2(
             receiver_hp_request,
             receiver_tx_forward_power,
             receiver_tx_reverse_power,
-            receiver_mox,
             receiver_stop,
         );
     });
@@ -1496,23 +1494,9 @@ fn p2_receiver_loop(
     hp_request: Arc<AtomicBool>,
     tx_forward_power: Arc<AtomicU32>,
     tx_reverse_power: Arc<AtomicU32>,
-    mox: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
 ) {
     let mut buf = [0u8; P2_PACKET_SIZE + 64];
-    // Diagnostic only -- added to help pin down a reported case where
-    // TX output power bounced between the expected level and 0W on a
-    // steady carrier even after ruling out mic-audio underrun as the
-    // cause (underrun rate was too low, ~1%, to explain a bounce that
-    // dramatic). Logs an edge-triggered line each time a real,
-    // radio-reported HP status packet's forward-power bytes cross to
-    // or from near-zero while transmitting -- distinguishes "the radio
-    // itself is reporting near-zero forward power" (a real ADC/PA/
-    // reflection issue upstream of this code) from "this code just
-    // isn't updating" (a parsing/packet-loss bug in this file), which
-    // looking at the UI meter alone can't tell apart.
-    let mut last_forward_near_zero = false;
-    let mut last_transition = Instant::now();
     // Diagnostic only -- added while chasing a report that extra
     // receivers beyond the 4th show no spectrum/waterfall at all.
     // Logs once, the first time any IQ packet actually arrives from a
@@ -1556,37 +1540,6 @@ fn p2_receiver_loop(
                         tx_forward_power.store(forward as u32, Ordering::Relaxed);
                         let reverse = u16::from_be_bytes([buf[22], buf[23]]);
                         tx_reverse_power.store(reverse as u32, Ordering::Relaxed);
-
-                        if mox.load(Ordering::Relaxed) {
-                            let near_zero = forward < 50; // ~1% of full-scale 4095
-                            if near_zero != last_forward_near_zero {
-                                let elapsed = last_transition.elapsed();
-                                // Full packet dump, not just the forward-power
-                                // bytes -- added because a fast (1-7ms)
-                                // near-every-packet bounce is more consistent
-                                // with SOME packets on this port being a
-                                // different reply type than assumed (e.g. an
-                                // ack to a different one of the 5 packets this
-                                // client sends per cycle) than with a real PA
-                                // fault, which wouldn't correlate packet-to-
-                                // packet like this. Comparing hex side-by-side
-                                // between a near-zero and recovered packet
-                                // should show a discriminating field this
-                                // code isn't currently checking, if that's
-                                // what's actually happening.
-                                let hex: String =
-                                    buf[..n].iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(" ");
-                                eprintln!(
-                                    "tx: radio-reported forward power {} near-zero (raw={forward}, \
-                                     n={n} bytes) while transmitting, {:.0}ms since the last \
-                                     transition -- full packet: {hex}",
-                                    if near_zero { "went" } else { "recovered from" },
-                                    elapsed.as_secs_f64() * 1000.0,
-                                );
-                                last_forward_near_zero = near_zero;
-                                last_transition = Instant::now();
-                            }
-                        }
                     }
                     hp_request.store(true, Ordering::Relaxed);
                 }
