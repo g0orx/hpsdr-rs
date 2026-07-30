@@ -3492,6 +3492,26 @@ impl Palette {
 }
 
 fn main() -> eframe::Result<()> {
+    // Force winit's X11 backend (via XWayland) rather than native Wayland.
+    // Confirmed via `perf record`/`strace -p` on a running session: winit's
+    // Wayland backend pegged one CPU core continuously on this system --
+    // tens of thousands of epoll_ctl/timerfd_settime/epoll_pwait cycles per
+    // second on the main UI thread alone (~150us/cycle), not a normal
+    // blocking wait -- while switching to X11 (WAYLAND_DISPLAY cleared)
+    // eliminated it entirely on the same session, same hardware. Root cause
+    // not pinned down further (deep in winit/calloop's Wayland event-loop
+    // internals; egui-winit/accesskit's AT-SPI/D-Bus stack was ruled out
+    // and removed separately -- see Cargo.toml). winit 0.30 selects its
+    // Linux backend purely by checking WAYLAND_DISPLAY/WAYLAND_SOCKET at
+    // startup (see winit::platform_impl::linux::mod.rs), so clearing it
+    // here -- before eframe/winit ever read it, and before any other
+    // threads exist -- is enough to force X11 without needing the user to
+    // remember an env var on every launch. Revisit if a real Wayland fix
+    // ever lands upstream and this workaround is no longer needed.
+    unsafe {
+        std::env::remove_var("WAYLAND_DISPLAY");
+    }
+
     // eframe's default inner size (~430x300 as of 0.35) is far too
     // small to show the whole main-window layout at once (band/mode
     // rows, spectrum, waterfall, and the Stop button all stack
