@@ -81,12 +81,26 @@ pub struct BandSettings {
     pub db_high: f32,
     pub waterfall_db_low: f32,
     pub waterfall_db_high: f32,
+    /// Mode last used on this band. Option (not just Mode) so band
+    /// entries saved before this field existed still deserialize --
+    /// serde defaults a missing key to None for Option fields with no
+    /// #[serde(default)] needed. None is also what a band that's never
+    /// actually been visited (band_memory has no entry for it at all)
+    /// effectively behaves like, so band-switch logic treats "no entry"
+    /// and "entry with mode: None" the same way: fall back to the
+    /// band's own default_mode.
+    #[serde(default)]
+    pub mode: Option<spectrum::Mode>,
 }
 
-/// Records the current frequency and level ranges against whichever
-/// band the frequency falls in, so switching bands and back remembers
-/// where you actually were and how the displays were set, not just the
-/// band's defaults.
+/// Records the current frequency, level ranges, and mode against
+/// whichever band the frequency falls in, so switching bands and back
+/// remembers where you actually were, how the displays were set, and
+/// what mode you had selected -- not just the band's defaults. Called
+/// on every tuning/mode/level-range change (not just band switches),
+/// since a full BandSettings replace on each call means anything not
+/// passed through here would otherwise get silently reset on the next
+/// unrelated change within the same band.
 fn remember_band_settings(
     band_memory: &mut std::collections::HashMap<String, BandSettings>,
     freq_hz: u32,
@@ -94,6 +108,7 @@ fn remember_band_settings(
     db_high: f32,
     waterfall_db_low: f32,
     waterfall_db_high: f32,
+    mode: spectrum::Mode,
 ) {
     if let Some(band) = band_for_frequency(freq_hz) {
         band_memory.insert(
@@ -104,6 +119,7 @@ fn remember_band_settings(
                 db_high,
                 waterfall_db_low,
                 waterfall_db_high,
+                mode: Some(mode),
             },
         );
     }
@@ -598,6 +614,11 @@ impl eframe::App for HpsdrApp {
                 let sample_rate = connected.sample_rate;
                 let current_mode = connected.spectrum.mode();
                 let current_width = connected.spectrum.width_hz();
+                // Reused by resolve_tune (clamping a CTUN target so the
+                // passband stays fully on-screen) and by the passband
+                // overlay drawn below -- computed once here rather than
+                // separately in both places.
+                let passband = spectrum::passband_for(current_mode, current_width);
                 let current_gain = connected.spectrum.gain();
                 let current_agc = connected.spectrum.agc();
                 let agc_params = connected.spectrum.agc_params();
@@ -712,27 +733,6 @@ impl eframe::App for HpsdrApp {
 
                     ui.add_space(8.0);
                     ui.horizontal_wrapped(|ui| {
-                        if ui
-                            .add(egui::Button::selectable(connected.ctun, "CTUN"))
-                            .on_hover_text(
-                                "Click to Tune: browse within the spectrum without retuning the radio",
-                            )
-                            .clicked()
-                        {
-                            if connected.ctun {
-                                // Turning off: commit the CTUN'd listen
-                                // frequency as the new hardware/LO
-                                // frequency, so listening continues
-                                // uninterrupted at the same real
-                                // frequency rather than snapping back.
-                                connected.session.set_frequency(connected.ctun_frequency_hz);
-                            } else {
-                                connected.ctun_frequency_hz = freq_hz;
-                            }
-                            connected.ctun = !connected.ctun;
-                            settings_changed = true;
-                        }
-                        ui.label("Band:");
                         let current_band = band_for_frequency(dial_freq_hz).map(|b| b.name);
                         for band in &BANDS {
                             let selected = Some(band.name) == current_band;
@@ -751,6 +751,14 @@ impl eframe::App for HpsdrApp {
                                     connected.waterfall_db_low = s.waterfall_db_low;
                                     connected.waterfall_db_high = s.waterfall_db_high;
                                 }
+                                // Restore whatever mode was last used on
+                                // this band, if any -- falls back to the
+                                // band's own default_mode the first time
+                                // it's visited. Width follows the mode
+                                // (width_for_mode's own per-mode memory),
+                                // not a per-band value.
+                                let resolved_mode =
+                                    saved.and_then(|s| s.mode).unwrap_or(band.default_mode);
                                 remember_band_settings(
                                     &mut connected.band_memory,
                                     target,
@@ -758,20 +766,21 @@ impl eframe::App for HpsdrApp {
                                     connected.db_high,
                                     connected.waterfall_db_low,
                                     connected.waterfall_db_high,
+                                    resolved_mode,
                                 );
-                                connected.spectrum.set_mode(band.default_mode);
-                                connected.spectrum.set_width_hz(band.default_width_hz);
+                                connected.spectrum.set_mode(resolved_mode);
+                                connected
+                                    .spectrum
+                                    .set_width_hz(width_for_mode(&connected.width_memory, resolved_mode));
                                 if let Some(tx) = &connected.tx_handle {
-                                    tx.set_mode(band.default_mode);
+                                    tx.set_mode(resolved_mode);
                                 }
                                 settings_changed = true;
                             }
                         }
                     });
 
-                    ui.add_space(8.0);
                     ui.horizontal_wrapped(|ui| {
-                        ui.label("Mode:");
                         for mode in ALL_MODES {
                             let selected = mode == current_mode;
                             if ui
@@ -786,6 +795,15 @@ impl eframe::App for HpsdrApp {
                                 if let Some(tx) = &connected.tx_handle {
                                     tx.set_mode(mode);
                                 }
+                                remember_band_settings(
+                                    &mut connected.band_memory,
+                                    dial_freq_hz,
+                                    connected.db_low,
+                                    connected.db_high,
+                                    connected.waterfall_db_low,
+                                    connected.waterfall_db_high,
+                                    mode,
+                                );
                                 settings_changed = true;
                             }
                         }
@@ -876,7 +894,26 @@ impl eframe::App for HpsdrApp {
                     });
 
                     ui.horizontal_wrapped(|ui| {
-                        ui.label("Noise:");
+                        if ui
+                            .add(egui::Button::selectable(connected.ctun, "CTUN"))
+                            .on_hover_text(
+                                "Click to Tune: browse within the spectrum without retuning the radio",
+                            )
+                            .clicked()
+                        {
+                            if connected.ctun {
+                                // Turning off: commit the CTUN'd listen
+                                // frequency as the new hardware/LO
+                                // frequency, so listening continues
+                                // uninterrupted at the same real
+                                // frequency rather than snapping back.
+                                connected.session.set_frequency(connected.ctun_frequency_hz);
+                            } else {
+                                connected.ctun_frequency_hz = freq_hz;
+                            }
+                            connected.ctun = !connected.ctun;
+                            settings_changed = true;
+                        }
                         let nb = connected.spectrum.noise_blanker();
                         if ui
                             .add(egui::Button::selectable(nb != spectrum::NoiseBlanker::Off, nb.label()))
@@ -1012,13 +1049,13 @@ impl eframe::App for HpsdrApp {
                         if spectrum_resp.clicked() {
                             let new_freq = freq_at_x(pos.x, rect, freq_hz, sample_rate);
                             let (effective_freq, retune) =
-                                resolve_tune(connected.ctun, freq_hz, sample_rate, new_freq);
+                                resolve_tune(connected.ctun, freq_hz, sample_rate, passband, new_freq);
                             if let Some(lo) = retune {
                                 connected.session.set_frequency(lo);
                             } else {
                                 connected.ctun_frequency_hz = effective_freq;
                             }
-                            remember_band_settings(&mut connected.band_memory, effective_freq, connected.db_low, connected.db_high, connected.waterfall_db_low, connected.waterfall_db_high);
+                            remember_band_settings(&mut connected.band_memory, effective_freq, connected.db_low, connected.db_high, connected.waterfall_db_low, connected.waterfall_db_high, current_mode);
                             settings_changed = true;
                         }
                     }
@@ -1066,13 +1103,13 @@ impl eframe::App for HpsdrApp {
 
                             if new_freq as u32 != dial_freq_hz {
                                 let (effective_freq, retune) =
-                                    resolve_tune(connected.ctun, freq_hz, sample_rate, new_freq as u32);
+                                    resolve_tune(connected.ctun, freq_hz, sample_rate, passband, new_freq as u32);
                                 if let Some(lo) = retune {
                                     connected.session.set_frequency(lo);
                                 } else {
                                     connected.ctun_frequency_hz = effective_freq;
                                 }
-                                remember_band_settings(&mut connected.band_memory, effective_freq, connected.db_low, connected.db_high, connected.waterfall_db_low, connected.waterfall_db_high);
+                                remember_band_settings(&mut connected.band_memory, effective_freq, connected.db_low, connected.db_high, connected.waterfall_db_low, connected.waterfall_db_high, current_mode);
                                 settings_changed = true;
                             }
                         }
@@ -1099,13 +1136,13 @@ impl eframe::App for HpsdrApp {
 
                             if new_freq as u32 != dial_freq_hz {
                                 let (effective_freq, retune) =
-                                    resolve_tune(connected.ctun, freq_hz, sample_rate, new_freq as u32);
+                                    resolve_tune(connected.ctun, freq_hz, sample_rate, passband, new_freq as u32);
                                 if let Some(lo) = retune {
                                     connected.session.set_frequency(lo);
                                 } else {
                                     connected.ctun_frequency_hz = effective_freq;
                                 }
-                                remember_band_settings(&mut connected.band_memory, effective_freq, connected.db_low, connected.db_high, connected.waterfall_db_low, connected.waterfall_db_high);
+                                remember_band_settings(&mut connected.band_memory, effective_freq, connected.db_low, connected.db_high, connected.waterfall_db_low, connected.waterfall_db_high, current_mode);
                                 settings_changed = true;
                             }
                         }
@@ -1129,7 +1166,7 @@ impl eframe::App for HpsdrApp {
                             .clamp(0.0, 1.0) as f32;
                         rect.left() + frac * rect.width()
                     };
-                    let (pb_low, pb_high) = spectrum::passband_for(current_mode, current_width);
+                    let (pb_low, pb_high) = passband;
                     let x_low = x_for_offset(pb_low + ctun_offset_hz);
                     let x_high = x_for_offset(pb_high + ctun_offset_hz);
                     ui.painter().rect_filled(
@@ -1240,13 +1277,13 @@ impl eframe::App for HpsdrApp {
                         if waterfall_click_resp.clicked() {
                             let new_freq = freq_at_x(pos.x, rect, freq_hz, sample_rate);
                             let (effective_freq, retune) =
-                                resolve_tune(connected.ctun, freq_hz, sample_rate, new_freq);
+                                resolve_tune(connected.ctun, freq_hz, sample_rate, passband, new_freq);
                             if let Some(lo) = retune {
                                 connected.session.set_frequency(lo);
                             } else {
                                 connected.ctun_frequency_hz = effective_freq;
                             }
-                            remember_band_settings(&mut connected.band_memory, effective_freq, connected.db_low, connected.db_high, connected.waterfall_db_low, connected.waterfall_db_high);
+                            remember_band_settings(&mut connected.band_memory, effective_freq, connected.db_low, connected.db_high, connected.waterfall_db_low, connected.waterfall_db_high, current_mode);
                             settings_changed = true;
                         }
                     }
@@ -1759,6 +1796,7 @@ impl eframe::App for HpsdrApp {
                                                 connected.db_high,
                                                 connected.waterfall_db_low,
                                                 connected.waterfall_db_high,
+                                                current_mode,
                                             );
                                             settings_changed = true;
                                         }
@@ -1779,6 +1817,7 @@ impl eframe::App for HpsdrApp {
                                                 connected.db_high,
                                                 connected.waterfall_db_low,
                                                 connected.waterfall_db_high,
+                                                current_mode,
                                             );
                                             settings_changed = true;
                                         }
@@ -1816,6 +1855,7 @@ impl eframe::App for HpsdrApp {
                                                 connected.db_high,
                                                 connected.waterfall_db_low,
                                                 connected.waterfall_db_high,
+                                                current_mode,
                                             );
                                             settings_changed = true;
                                         }
@@ -1836,6 +1876,7 @@ impl eframe::App for HpsdrApp {
                                                 connected.db_high,
                                                 connected.waterfall_db_low,
                                                 connected.waterfall_db_high,
+                                                current_mode,
                                             );
                                             settings_changed = true;
                                         }
@@ -2596,6 +2637,9 @@ fn render_extra_receiver_ui(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceiver>>) {
     let sample_rate = rx.sample_rate_hz.load(Ordering::Relaxed);
     let current_mode = rx.spectrum.mode();
     let current_width = rx.spectrum.width_hz();
+    // Reused by resolve_tune (clamping a CTUN target so the passband
+    // stays fully on-screen) and by the passband overlay drawn below.
+    let passband = spectrum::passband_for(current_mode, current_width);
     let current_gain = rx.spectrum.gain();
     let db_low = rx.db_low;
     let db_high = rx.db_high;
@@ -2621,20 +2665,6 @@ fn render_extra_receiver_ui(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceiver>>) {
         .on_hover_text("Scroll to tune -- Shift: 100 Hz, none: 1 kHz. Click spectrum/waterfall to jump.");
 
     ui.horizontal_wrapped(|ui| {
-        if ui
-            .add(egui::Button::selectable(rx.ctun, "CTUN"))
-            .on_hover_text("Click to Tune: browse within the spectrum without retuning the radio")
-            .clicked()
-        {
-            if rx.ctun {
-                rx.frequency_hz.store(rx.ctun_frequency_hz, Ordering::Relaxed);
-            } else {
-                rx.ctun_frequency_hz = freq_hz;
-            }
-            rx.ctun = !rx.ctun;
-            rx.settings_dirty.store(true, Ordering::Relaxed);
-        }
-        ui.label("Band:");
         let current_band = band_for_frequency(dial_freq_hz).map(|b| b.name);
         for band in &BANDS {
             let selected = Some(band.name) == current_band;
@@ -2651,6 +2681,10 @@ fn render_extra_receiver_ui(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceiver>>) {
                 }
                 let (new_db_low, new_db_high, new_wf_low, new_wf_high) =
                     (rx.db_low, rx.db_high, rx.waterfall_db_low, rx.waterfall_db_high);
+                // Restore whatever mode was last used on this band, if
+                // any -- see the main receiver's own band-click handler
+                // for the full reasoning.
+                let resolved_mode = saved.and_then(|s| s.mode).unwrap_or(band.default_mode);
                 remember_band_settings(
                     &mut rx.band_memory,
                     target,
@@ -2658,9 +2692,10 @@ fn render_extra_receiver_ui(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceiver>>) {
                     new_db_high,
                     new_wf_low,
                     new_wf_high,
+                    resolved_mode,
                 );
-                rx.spectrum.set_mode(band.default_mode);
-                rx.spectrum.set_width_hz(band.default_width_hz);
+                rx.spectrum.set_mode(resolved_mode);
+                rx.spectrum.set_width_hz(width_for_mode(&rx.width_memory, resolved_mode));
                 rx.settings_dirty.store(true, Ordering::Relaxed);
             }
         }
@@ -2672,6 +2707,15 @@ fn render_extra_receiver_ui(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceiver>>) {
             if ui.add(egui::Button::selectable(selected, mode.label())).clicked() && !selected {
                 rx.spectrum.set_mode(mode);
                 rx.spectrum.set_width_hz(width_for_mode(&rx.width_memory, mode));
+                remember_band_settings(
+                    &mut rx.band_memory,
+                    dial_freq_hz,
+                    db_low,
+                    db_high,
+                    wf_db_low,
+                    wf_db_high,
+                    mode,
+                );
                 rx.settings_dirty.store(true, Ordering::Relaxed);
             }
         }
@@ -2696,7 +2740,19 @@ fn render_extra_receiver_ui(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceiver>>) {
     });
 
     ui.horizontal_wrapped(|ui| {
-        ui.label("Noise:");
+        if ui
+            .add(egui::Button::selectable(rx.ctun, "CTUN"))
+            .on_hover_text("Click to Tune: browse within the spectrum without retuning the radio")
+            .clicked()
+        {
+            if rx.ctun {
+                rx.frequency_hz.store(rx.ctun_frequency_hz, Ordering::Relaxed);
+            } else {
+                rx.ctun_frequency_hz = freq_hz;
+            }
+            rx.ctun = !rx.ctun;
+            rx.settings_dirty.store(true, Ordering::Relaxed);
+        }
         let nb = rx.spectrum.noise_blanker();
         if ui
             .add(egui::Button::selectable(nb != spectrum::NoiseBlanker::Off, nb.label()))
@@ -2751,13 +2807,13 @@ fn render_extra_receiver_ui(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceiver>>) {
     if let Some(pos) = spectrum_resp.interact_pointer_pos() {
         if spectrum_resp.clicked() {
             let new_freq = freq_at_x(pos.x, rect, freq_hz, sample_rate);
-            let (effective_freq, retune) = resolve_tune(rx.ctun, freq_hz, sample_rate, new_freq);
+            let (effective_freq, retune) = resolve_tune(rx.ctun, freq_hz, sample_rate, passband, new_freq);
             if let Some(lo) = retune {
                 rx.frequency_hz.store(lo, Ordering::Relaxed);
             } else {
                 rx.ctun_frequency_hz = effective_freq;
             }
-            remember_band_settings(&mut rx.band_memory, effective_freq, db_low, db_high, wf_db_low, wf_db_high);
+            remember_band_settings(&mut rx.band_memory, effective_freq, db_low, db_high, wf_db_low, wf_db_high, current_mode);
             rx.settings_dirty.store(true, Ordering::Relaxed);
         }
     }
@@ -2783,13 +2839,13 @@ fn render_extra_receiver_ui(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceiver>>) {
             new_freq = new_freq.max(0);
             if new_freq as u32 != dial_freq_hz {
                 let (effective_freq, retune) =
-                    resolve_tune(rx.ctun, freq_hz, sample_rate, new_freq as u32);
+                    resolve_tune(rx.ctun, freq_hz, sample_rate, passband, new_freq as u32);
                 if let Some(lo) = retune {
                     rx.frequency_hz.store(lo, Ordering::Relaxed);
                 } else {
                     rx.ctun_frequency_hz = effective_freq;
                 }
-                remember_band_settings(&mut rx.band_memory, effective_freq, db_low, db_high, wf_db_low, wf_db_high);
+                remember_band_settings(&mut rx.band_memory, effective_freq, db_low, db_high, wf_db_low, wf_db_high, current_mode);
                 rx.settings_dirty.store(true, Ordering::Relaxed);
             }
         }
@@ -2822,7 +2878,7 @@ fn render_extra_receiver_ui(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceiver>>) {
         let frac = ((offset_hz + half_span_hz) / sample_rate as f64).clamp(0.0, 1.0) as f32;
         rect.left() + frac * rect.width()
     };
-    let (pb_low, pb_high) = spectrum::passband_for(current_mode, current_width);
+    let (pb_low, pb_high) = passband;
     let x_low = x_for_offset(pb_low + ctun_offset_hz);
     let x_high = x_for_offset(pb_high + ctun_offset_hz);
     ui.painter().rect_filled(
@@ -2896,13 +2952,13 @@ fn render_extra_receiver_ui(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceiver>>) {
     if let Some(pos) = wf_resp.interact_pointer_pos() {
         if wf_resp.clicked() {
             let new_freq = freq_at_x(pos.x, wf_rect, freq_hz, sample_rate);
-            let (effective_freq, retune) = resolve_tune(rx.ctun, freq_hz, sample_rate, new_freq);
+            let (effective_freq, retune) = resolve_tune(rx.ctun, freq_hz, sample_rate, passband, new_freq);
             if let Some(lo) = retune {
                 rx.frequency_hz.store(lo, Ordering::Relaxed);
             } else {
                 rx.ctun_frequency_hz = effective_freq;
             }
-            remember_band_settings(&mut rx.band_memory, effective_freq, db_low, db_high, wf_db_low, wf_db_high);
+            remember_band_settings(&mut rx.band_memory, effective_freq, db_low, db_high, wf_db_low, wf_db_high, current_mode);
             rx.settings_dirty.store(true, Ordering::Relaxed);
         }
     }
@@ -3091,7 +3147,7 @@ fn render_extra_receiver_settings(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceive
                 if scroll_slider_f32(ui, &mut rx.slider_scroll_accum, &mut low, -180.0..=0.0, 2.0) {
                     rx.db_low = low;
                     let (a, b, c, d) = (rx.db_low, rx.db_high, rx.waterfall_db_low, rx.waterfall_db_high);
-                    remember_band_settings(&mut rx.band_memory, freq_hz, a, b, c, d);
+                    remember_band_settings(&mut rx.band_memory, freq_hz, a, b, c, d, agc_params.mode);
                     rx.settings_dirty.store(true, Ordering::Relaxed);
                 }
                 let mut high = rx.db_high;
@@ -3099,7 +3155,7 @@ fn render_extra_receiver_settings(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceive
                 if scroll_slider_f32(ui, &mut rx.slider_scroll_accum, &mut high, -180.0..=0.0, 2.0) {
                     rx.db_high = high;
                     let (a, b, c, d) = (rx.db_low, rx.db_high, rx.waterfall_db_low, rx.waterfall_db_high);
-                    remember_band_settings(&mut rx.band_memory, freq_hz, a, b, c, d);
+                    remember_band_settings(&mut rx.band_memory, freq_hz, a, b, c, d, agc_params.mode);
                     rx.settings_dirty.store(true, Ordering::Relaxed);
                 }
             });
@@ -3121,7 +3177,7 @@ fn render_extra_receiver_settings(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceive
                 if scroll_slider_f32(ui, &mut rx.slider_scroll_accum, &mut wlow, -180.0..=0.0, 2.0) {
                     rx.waterfall_db_low = wlow;
                     let (a, b, c, d) = (rx.db_low, rx.db_high, rx.waterfall_db_low, rx.waterfall_db_high);
-                    remember_band_settings(&mut rx.band_memory, freq_hz, a, b, c, d);
+                    remember_band_settings(&mut rx.band_memory, freq_hz, a, b, c, d, agc_params.mode);
                     rx.settings_dirty.store(true, Ordering::Relaxed);
                 }
                 let mut whigh = rx.waterfall_db_high;
@@ -3129,7 +3185,7 @@ fn render_extra_receiver_settings(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceive
                 if scroll_slider_f32(ui, &mut rx.slider_scroll_accum, &mut whigh, -180.0..=0.0, 2.0) {
                     rx.waterfall_db_high = whigh;
                     let (a, b, c, d) = (rx.db_low, rx.db_high, rx.waterfall_db_low, rx.waterfall_db_high);
-                    remember_band_settings(&mut rx.band_memory, freq_hz, a, b, c, d);
+                    remember_band_settings(&mut rx.band_memory, freq_hz, a, b, c, d, agc_params.mode);
                     rx.settings_dirty.store(true, Ordering::Relaxed);
                 }
             });
@@ -3153,13 +3209,30 @@ fn freq_at_x(x: f32, rect: egui::Rect, center_freq_hz: u32, sample_rate: u32) ->
 /// membership/display and remember_band_settings) plus Some(lo) if the
 /// hardware should be retuned to `lo`.
 ///
-/// A CTUN target is clamped to the visible spectrum span -- since the LO
-/// doesn't move to follow it while CTUN is on, there's nowhere for it to
-/// go past the edge of the window that's actually on screen.
-fn resolve_tune(ctun: bool, lo_freq_hz: u32, sample_rate: u32, new_freq: u32) -> (u32, Option<u32>) {
+/// A CTUN target is clamped so the current mode's filter passband --
+/// not just the dial point itself -- stays fully within the visible
+/// spectrum span. Since the LO doesn't move to follow the dial while
+/// CTUN is on, letting the dial get close enough to either edge would
+/// let part of the passband (the shaded region drawn around the dial,
+/// extending `passband.0`..`passband.1` Hz relative to it) run off the
+/// edge of the spectrum/waterfall.
+fn resolve_tune(
+    ctun: bool,
+    lo_freq_hz: u32,
+    sample_rate: u32,
+    passband: (f64, f64),
+    new_freq: u32,
+) -> (u32, Option<u32>) {
     if ctun {
-        let half_span = sample_rate / 2;
-        let clamped = new_freq.clamp(lo_freq_hz.saturating_sub(half_span), lo_freq_hz + half_span);
+        let half_span = sample_rate as f64 / 2.0;
+        let (pb_low, pb_high) = passband;
+        // Only the side each edge actually extends past the dial
+        // tightens that bound -- e.g. USB's passband is entirely to
+        // the right (pb_low > 0), so the left edge isn't restricted
+        // any further than the plain dial-in-span limit.
+        let lower = (lo_freq_hz as f64 - half_span - pb_low.min(0.0)).max(0.0);
+        let upper = (lo_freq_hz as f64 + half_span - pb_high.max(0.0)).max(lower);
+        let clamped = (new_freq as f64).clamp(lower, upper) as u32;
         (clamped, None)
     } else {
         (new_freq, Some(new_freq))
