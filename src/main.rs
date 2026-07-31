@@ -16,7 +16,7 @@ use discovery_ui::{DiscoveryAction, DiscoveryWindow};
 use eframe::egui;
 use radio::{IqSample, RadioSession, RadioSettings};
 use rigctl::RigctlServer;
-use spectrum::{SpectrumHandle, ALL_AGC, ALL_MODES};
+use spectrum::{SpectrumHandle, ALL_MODES};
 use std::collections::VecDeque;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
@@ -444,6 +444,9 @@ impl eframe::App for HpsdrApp {
                             }
                             if let Some(v) = cfg.noise_reduction {
                                 spectrum.set_noise_reduction(v);
+                            }
+                            if let Some(v) = cfg.snb {
+                                spectrum.set_snb(v);
                             }
                             let mic_gain = cfg.mic_gain.unwrap_or(0.5);
 
@@ -890,6 +893,28 @@ impl eframe::App for HpsdrApp {
                             .clicked()
                         {
                             connected.spectrum.set_noise_reduction(nr.next());
+                            settings_changed = true;
+                        }
+                        let snb = connected.spectrum.snb();
+                        if ui
+                            .add(egui::Button::selectable(snb, "SNB"))
+                            .on_hover_text(
+                                "Spectral Noise Blanker -- independent of NB/NR, can run alongside them",
+                            )
+                            .clicked()
+                        {
+                            connected.spectrum.set_snb(!snb);
+                            settings_changed = true;
+                        }
+                        if ui
+                            .add(egui::Button::selectable(
+                                current_agc != spectrum::Agc::Off,
+                                current_agc.label(),
+                            ))
+                            .on_hover_text("Click to cycle: Off -> Long -> Slow -> Medium -> Fast -> Off")
+                            .clicked()
+                        {
+                            connected.spectrum.set_agc(current_agc.next());
                             settings_changed = true;
                         }
                     });
@@ -1607,21 +1632,6 @@ impl eframe::App for HpsdrApp {
                                         ui.separator();
                                     }
 
-                                    ui.label("AGC Mode:");
-                                    ui.horizontal_wrapped(|ui| {
-                                        for agc in ALL_AGC {
-                                            let selected = agc == current_agc;
-                                            if ui
-                                                .add(egui::Button::selectable(selected, agc.label()))
-                                                .clicked()
-                                                && !selected
-                                            {
-                                                connected.spectrum.set_agc(agc);
-                                                settings_changed = true;
-                                            }
-                                        }
-                                    });
-
                                     ui.horizontal_wrapped(|ui| {
                                         let mut attack = agc_params.agc_attack_ms;
                                         ui.label("Attack:");
@@ -2085,6 +2095,7 @@ impl eframe::App for HpsdrApp {
                                 noise_blanker: agc_params.noise_blanker,
                                 nb_threshold: agc_params.nb_threshold,
                                 noise_reduction: agc_params.noise_reduction,
+                                snb: agc_params.snb,
                                 db_low: rx.db_low,
                                 db_high: rx.db_high,
                                 waterfall_db_low: rx.waterfall_db_low,
@@ -2114,6 +2125,7 @@ impl eframe::App for HpsdrApp {
                         noise_blanker: Some(agc_params_now.noise_blanker),
                         nb_threshold: Some(agc_params_now.nb_threshold),
                         noise_reduction: Some(agc_params_now.noise_reduction),
+                        snb: Some(agc_params_now.snb),
                         mic_gain: Some(connected.mic_gain),
                         tx_power_watts: Some(connected.session.tx_power_watts.load(Ordering::Relaxed)),
                         db_low: Some(connected.db_low),
@@ -2703,6 +2715,24 @@ fn render_extra_receiver_ui(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceiver>>) {
             rx.spectrum.set_noise_reduction(nr.next());
             rx.settings_dirty.store(true, Ordering::Relaxed);
         }
+        let snb = rx.spectrum.snb();
+        if ui
+            .add(egui::Button::selectable(snb, "SNB"))
+            .on_hover_text("Spectral Noise Blanker -- independent of NB/NR, can run alongside them")
+            .clicked()
+        {
+            rx.spectrum.set_snb(!snb);
+            rx.settings_dirty.store(true, Ordering::Relaxed);
+        }
+        let current_agc = rx.spectrum.agc();
+        if ui
+            .add(egui::Button::selectable(current_agc != spectrum::Agc::Off, current_agc.label()))
+            .on_hover_text("Click to cycle: Off -> Long -> Slow -> Medium -> Fast -> Off")
+            .clicked()
+        {
+            rx.spectrum.set_agc(current_agc.next());
+            rx.settings_dirty.store(true, Ordering::Relaxed);
+        }
     });
 
     ui.add_space(4.0);
@@ -2924,7 +2954,6 @@ fn render_extra_receiver_ui(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceiver>>) {
 /// requested for extra receivers).
 fn render_extra_receiver_settings(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceiver>>) {
     let mut rx = rx.lock().unwrap();
-    let current_agc = rx.spectrum.agc();
     let agc_params = rx.spectrum.agc_params();
     let current_rate = rx.sample_rate_hz.load(Ordering::Relaxed);
     let freq_hz = rx.frequency_hz.load(Ordering::Relaxed);
@@ -2995,17 +3024,6 @@ fn render_extra_receiver_settings(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceive
                 });
             }
             ui.separator();
-
-            ui.label("AGC Mode:");
-            ui.horizontal_wrapped(|ui| {
-                for agc in ALL_AGC {
-                    let selected = agc == current_agc;
-                    if ui.add(egui::Button::selectable(selected, agc.label())).clicked() && !selected {
-                        rx.spectrum.set_agc(agc);
-                        rx.settings_dirty.store(true, Ordering::Relaxed);
-                    }
-                }
-            });
 
             ui.horizontal_wrapped(|ui| {
                 let mut attack = agc_params.agc_attack_ms;
@@ -3195,6 +3213,7 @@ fn spawn_extra_receiver(
         spectrum.set_noise_blanker(s.noise_blanker);
         spectrum.set_nb_threshold(s.nb_threshold);
         spectrum.set_noise_reduction(s.noise_reduction);
+        spectrum.set_snb(s.snb);
     }
 
     let audio_output = AudioOutput::start(Arc::clone(&spectrum.audio_out)).ok();
@@ -3270,6 +3289,7 @@ fn change_sample_rate(connected: &mut ConnectedState, new_rate: u32) {
     spectrum.set_noise_blanker(agc_params.noise_blanker);
     spectrum.set_nb_threshold(agc_params.nb_threshold);
     spectrum.set_noise_reduction(agc_params.noise_reduction);
+    spectrum.set_snb(agc_params.snb);
 
     connected.audio_output = match AudioOutput::start(Arc::clone(&spectrum.audio_out)) {
         Ok(a) => Some(a),
@@ -3352,6 +3372,7 @@ fn change_extra_receiver_sample_rate(rx: &mut ExtraReceiver, new_rate: u32) {
     spectrum.set_noise_blanker(agc_params.noise_blanker);
     spectrum.set_nb_threshold(agc_params.nb_threshold);
     spectrum.set_noise_reduction(agc_params.noise_reduction);
+    spectrum.set_snb(agc_params.snb);
 
     rx.audio_output = match AudioOutput::start(Arc::clone(&spectrum.audio_out)) {
         Ok(a) => Some(a),

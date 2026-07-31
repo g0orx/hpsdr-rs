@@ -57,6 +57,9 @@ pub struct Config {
     pub noise_blanker: Option<NoiseBlanker>,
     pub nb_threshold: Option<f64>,
     pub noise_reduction: Option<NoiseReduction>,
+    /// SNB ("Spectral Noise Blanker") -- independent of noise_reduction
+    /// above, see spectrum::DemodParams::snb's doc comment for why.
+    pub snb: Option<bool>,
     /// TX mic gain. Deliberately one of very few TX settings persisted
     /// -- whether TX was armed (tx_enabled) is intentionally NOT saved
     /// (see main.rs's auto-arm-on-connect comment).
@@ -149,6 +152,9 @@ pub struct ExtraReceiverConfig {
     pub nb_threshold: f64,
     #[serde(default)]
     pub noise_reduction: NoiseReduction,
+    /// See Config::snb's doc comment.
+    #[serde(default)]
+    pub snb: bool,
 }
 
 fn config_path(mac: [u8; 6]) -> Option<PathBuf> {

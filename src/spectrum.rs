@@ -164,6 +164,16 @@ impl Agc {
             Agc::Fast => "AGC Fast",
         }
     }
+
+    pub fn next(self) -> Self {
+        match self {
+            Agc::Off => Agc::Long,
+            Agc::Long => Agc::Slow,
+            Agc::Slow => Agc::Medium,
+            Agc::Medium => Agc::Fast,
+            Agc::Fast => Agc::Off,
+        }
+    }
 }
 
 /// Noise blanker state. WDSP's ANB ("NB") and NOB ("NB2") are
@@ -277,6 +287,14 @@ pub struct DemodParams {
     /// inside the RXA chain itself, so switching is just a Set*Run
     /// call, no extra buffer plumbing needed.
     pub noise_reduction: NoiseReduction,
+    /// SNB ("Spectral Noise Blanker", WDSP's SNBA stage) -- unlike
+    /// NoiseReduction's NR/NR2/NR3/NR4, this is an independent toggle
+    /// rather than part of that mutually-exclusive cycle: SNB targets
+    /// impulsive/broadband noise (clicks, ignition, etc.) while NR
+    /// targets steady-state hiss, and real HPSDR clients (piHPSDR,
+    /// Thetis) commonly run both at once. Lives inside the RXA chain
+    /// like NR does, so this is likewise just a Set*Run call.
+    pub snb: bool,
     /// CTUN ("Click to Tune"): when true, the hardware/LO frequency
     /// (lo_frequency_hz below) stays fixed and ctun_offset_hz shifts the
     /// RXA demod chain instead, so the user can pick a different listen
@@ -319,6 +337,7 @@ impl Default for DemodParams {
             noise_blanker: NoiseBlanker::Off,
             nb_threshold: 20.0,
             noise_reduction: NoiseReduction::Off,
+            snb: false,
             ctun: false,
             ctun_offset_hz: 0.0,
             lo_frequency_hz: 0.0,
@@ -354,6 +373,7 @@ struct SpectrumAnalyzer {
     last_nb_enabled: Option<NoiseBlanker>,
     last_nb_threshold: Option<f64>,
     last_nr_enabled: Option<NoiseReduction>,
+    last_snb_enabled: Option<bool>,
     last_ctun: Option<bool>,
     last_ctun_offset: Option<f64>,
     last_lo_frequency: Option<f64>,
@@ -589,6 +609,7 @@ impl SpectrumAnalyzer {
                 last_nb_enabled: None,
                 last_nb_threshold: None,
                 last_nr_enabled: None,
+                last_snb_enabled: None,
                 last_ctun: None,
                 last_ctun_offset: None,
                 last_lo_frequency: None,
@@ -650,6 +671,11 @@ impl SpectrumAnalyzer {
         if self.last_passband != Some(passband) {
             unsafe {
                 wdsp::RXASetPassband(self.channel, passband.0, passband.1);
+                // SNBA's own analysis bandwidth -- same (low, high) as
+                // the demod passband above, so its noise estimate
+                // tracks whatever's actually being listened to rather
+                // than a stale/independent range.
+                wdsp::SetRXASNBAOutputBandwidth(self.channel, passband.0, passband.1);
             }
             self.last_passband = Some(passband);
         }
@@ -730,6 +756,16 @@ impl SpectrumAnalyzer {
                 wdsp::SetRXASBNRRun(self.channel, nr4_run);
             }
             self.last_nr_enabled = Some(params.noise_reduction);
+        }
+
+        // SNB ("Spectral Noise Blanker", WDSP's SNBA stage) -- see
+        // DemodParams::snb's doc comment for why this is independent
+        // of the NoiseReduction mutex above rather than folded into it.
+        if self.last_snb_enabled != Some(params.snb) {
+            unsafe {
+                wdsp::SetRXASNBARun(self.channel, params.snb as c_int);
+            }
+            self.last_snb_enabled = Some(params.snb);
         }
 
         // CTUN ("Click to Tune"): confirmed against a working reference
@@ -1007,6 +1043,13 @@ impl SpectrumHandle {
     }
     pub fn set_noise_reduction(&self, v: NoiseReduction) {
         self.demod_params.lock().unwrap().noise_reduction = v;
+    }
+
+    pub fn snb(&self) -> bool {
+        self.demod_params.lock().unwrap().snb
+    }
+    pub fn set_snb(&self, v: bool) {
+        self.demod_params.lock().unwrap().snb = v;
     }
 
     pub fn ctun(&self) -> bool {
