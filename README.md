@@ -1,5 +1,9 @@
 # hpsdr-rs
 
+![License: GPLv2+](https://img.shields.io/badge/license-GPLv2%2B-blue.svg)
+![Status: early development](https://img.shields.io/badge/status-early%20development-yellow.svg)
+![Rust edition](https://img.shields.io/badge/rust-2021-orange.svg)
+
 A Rust/egui desktop client for [openHPSDR](https://openhpsdr.org/) Protocol 1 and Protocol 2 radios (Metis/Ozy-style and Hermes/Orion-style boards), using [WDSP](https://github.com/NR0V/wdsp) for DSP.
 
 > **Status: early / actively in development.** RX has seen the most real-world testing. TX works and has been used for real QSOs, but parts of the TX signal path are still noted in the source as unverified against the official protocol spec on untested hardware. **Always bench-test into a dummy load at reduced drive before transmitting into a real antenna**, especially after pulling a new build.
@@ -46,6 +50,15 @@ The app opens a discovery window that listens for radios on the network; select 
 ## Roadmap
 
 PureSignal (PA linearization/predistortion) is planned but not yet implemented — current focus is on stabilizing and testing Protocol 1 and Protocol 2 operation across different radios first.
+
+## Contributing
+
+Issues and pull requests are welcome. A few things that'll help:
+
+- **For anything touching the TX path**: bench-test into a dummy load at reduced drive before a real antenna, and say in the PR description what you actually tested it against (mode, protocol, hardware). Several TX bugs in this project's history turned out to be protocol- or radio-specific, so mentioning which you used helps a lot.
+- **Reference-driven DSP/protocol changes**: where this project's behavior is meant to match a known-working implementation (piHPSDR, rustyHPSDR, Thetis, or the official openHPSDR protocol docs/WDSP source), please check against the actual reference rather than a plausible-sounding guess, and say which reference and where in the PR/commit message. A few real bugs here came from parameter changes that sounded reasonable but turned out not to match how any working reference actually behaves.
+- **Comments**: explain *why*, not *what* -- code should already say what it does. A comment earns its place by capturing a non-obvious constraint, a reference confirmation, or the reasoning behind a fix, not by restating the line below it.
+- For larger changes, opening an issue first to discuss the approach is appreciated before investing in a big PR.
 
 ## License
 
