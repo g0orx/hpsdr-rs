@@ -627,6 +627,9 @@ unsafe extern "C" {
     pub fn SetTXAALCHang(channel: ::std::os::raw::c_int, hang: ::std::os::raw::c_int);
 }
 unsafe extern "C" {
+    pub fn SetTXAALCMaxGain(channel: ::std::os::raw::c_int, maxgain: f64);
+}
+unsafe extern "C" {
     pub fn SetTXALevelerSt(channel: ::std::os::raw::c_int, state: ::std::os::raw::c_int);
 }
 unsafe extern "C" {

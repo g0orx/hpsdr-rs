@@ -114,6 +114,13 @@ pub struct TxDisplay {
 pub struct TxParams {
     pub mode: Mode,
     pub mic_gain: f32,
+    /// Filter width (Hz), same UI control/meaning as RX's per-mode
+    /// width slider (spectrum::width_for_mode) -- ROOT CAUSE FIX, see
+    /// TxProcessor's bandpass-freqs update in process() for the full
+    /// story: this was previously not threaded through to TX at all,
+    /// and the TX bandpass filter was hardcoded to a fixed 300-2700Hz
+    /// regardless of mode or this setting.
+    pub width_hz: f64,
 }
 
 impl Default for TxParams {
@@ -134,6 +141,7 @@ impl Default for TxParams {
             // confirmed-correct and fixed to match the reference, the
             // unit convention on top of it is a deliberate deviation.
             mic_gain: 0.5,
+            width_hz: crate::spectrum::default_width_hz(Mode::Usb),
         }
     }
 }
@@ -144,6 +152,7 @@ struct TxProcessor {
     iq_scratch: Vec<f64>,
     last_mode: Option<Mode>,
     last_gain: Option<f32>,
+    last_passband: Option<(f64, f64)>,
 }
 
 impl TxProcessor {
@@ -153,6 +162,8 @@ impl TxProcessor {
         // Protocol 1. An earlier version of this file fixed this at
         // 48000 always, which was wrong for P2.
         let dsp_rate = if protocol == 2 { 96_000 } else { 48_000 };
+        let default_passband =
+            crate::spectrum::passband_for(Mode::Usb, crate::spectrum::default_width_hz(Mode::Usb));
 
         unsafe {
             // type_=1: TXA. Delay/slew params (tdelayup/tslewup/
@@ -187,8 +198,38 @@ impl TxProcessor {
             // needed to correct CIC droop at the edges of the transmit
             // passband.
             wdsp::TXASetNC(channel, TX_FFT_SIZE);
-            wdsp::TXASetMP(channel, 0); // low-latency mode off, matches reference default
+            // TESTED AND RULED OUT: tried mp=1 (minimum phase,
+            // matching Thetis's actual default -- rustyHPSDR and
+            // piHPSDR both effectively use mp=0/linear-phase) on the
+            // theory that a shorter effective filter settling time
+            // would shrink the transient a meter trace had localized
+            // to this filter stage. A real-hardware trace compared
+            // point-by-point against the mp=0 baseline (same offsets
+            // since PTT) showed near-identical alc_av/out_av numbers
+            // (e.g. -10.4dB vs -10.6dB, -6.7dB vs -6.8dB) -- no
+            // measurable difference, so filter phase type isn't it
+            // either. Reverted to 0, matching 2 of 3 references again.
+            wdsp::TXASetMP(channel, 0);
             wdsp::SetTXABandpassWindow(channel, 1);
+            // CONFIRMED via the diagnostic test this replaced: with
+            // the bandpass filter (bp0) off, alc_pk/alc_av went
+            // through one settling transient and then locked
+            // completely flat (zero movement) for the rest of a
+            // ~2-second trace -- with it on, they cycle continuously
+            // for the whole transmission and never settle. That rules
+            // out a transient/settling-time mechanism (also consistent
+            // with attack-time and min-phase both measuring zero
+            // effect earlier) and points at the filter's STEADY-STATE
+            // passband not being flat across the narrow ~50Hz range
+            // WSJT-X's FT8 hops its 8 tones within: each tone gets a
+            // measurably different filter gain, and since WSJT-X
+            // cycles through that same tone set repeatedly for the
+            // whole transmission, output visibly bounces among those
+            // same few levels on repeat -- explaining the continuous,
+            // repeating "fast flutter" reported, why Tune (one fixed
+            // frequency, always the same gain) never shows it, and why
+            // neither attack time nor filter phase changed anything.
+            // Filter back on -- it must stay on for real operation.
             wdsp::SetTXABandpassRun(channel, 1);
             wdsp::SetTXAFMEmphPosition(channel, 0);
             if protocol == 1 {
@@ -200,10 +241,47 @@ impl TxProcessor {
             wdsp::SetTXAAMSQRun(channel, 0);
             wdsp::SetTXAosctrlRun(channel, 0);
 
-            // ALC decay corrected to match the reference (10, not the
-            // previous unconfirmed guess of 60). Always-on, as before.
+            // Attack/decay: back to piHPSDR's confirmed 1ms/10ms.
+            // TESTED AND RULED OUT: raised attack to 25ms on the
+            // theory that the ALC (which WDSP's xtxa() runs AFTER the
+            // 2048-tap/~21ms-group-delay TX bandpass filter) was
+            // reacting to filter-settling transients on each FT8 tone
+            // change (~6/sec, matching the reported "fast regular
+            // flutter") -- real hardware test showed the bouncing
+            // persisted unchanged at 25ms, so the ALC's own attack
+            // speed is not the (or not the only) mechanism. Reverted
+            // rather than leave an unjustified reference deviation in
+            // place. See the meter-trace diagnostic below this
+            // function -- added instead of guessing a fourth ALC
+            // constant -- for actually observing what's happening
+            // through the chain during a bouncing transmission.
             wdsp::SetTXAALCAttack(channel, 1);
             wdsp::SetTXAALCDecay(channel, 10);
+            // MaxGain: this is the actual root cause of the
+            // pumping/power-bouncing-on-real-speech bug (steady on
+            // Tune's continuous tone, bouncing on WSJT-X CQ/voice).
+            // The parameter is in dB (WDSP: max_gain =
+            // pow(10, maxgain/20) -- see wcpAGC.c SetTXAALCMaxGain),
+            // and it sets how far the ALC's gain floor is allowed to
+            // rise during quiet gaps (wcpAGC.c: min_volts =
+            // out_target/(var_gain*max_gain)), which then gets
+            // slammed back down by the 1ms attack on the next loud
+            // syllable/tone. Real speech has gaps for that gain to
+            // ride up into every cycle -- Tune's unbroken tone
+            // doesn't, so it settles and stays steady. WDSP's own
+            // create_wcpagc default (TXA.c) is max_gain=1.0 (0dB,
+			// no boost allowed at all), and piHPSDR never calls this
+            // setter, so it runs at that same no-boost default --
+            // confirmed by checking WDSP's C source directly, not
+            // just piHPSDR's call list. 5.0 (dB, not linear -- a
+            // unit mixup with TXALevelerTop below, which is also dB)
+            // was giving ~1.8x of boost headroom, enough to
+            // reproduce the exact symptom reported. Reverted to 0.0
+            // dB (i.e. no boost) to match the confirmed-working
+            // reference exactly; use the existing Mic Gain slider
+            // for headroom instead, which is what piHPSDR relies on
+            // for the same purpose.
+            wdsp::SetTXAALCMaxGain(channel, 0.0);
             wdsp::SetTXAALCSt(channel, 1);
 
             // Leveler: a separate, slower average-level-normalizing
@@ -253,14 +331,30 @@ impl TxProcessor {
             wdsp::SetTXACompressorGain(channel, 0.0);
             wdsp::SetTXACompressorRun(channel, 0);
 
-            // TX bandpass passband -- fixed at a typical SSB voice
-            // bandwidth for now. NOT mode-adaptive yet (the reference
-            // switches this per-mode via its own filter_low/filter_high
-            // state, e.g. different values for CW); a reasonable
-            // default given this project's current single fixed-filter
-            // setup, but worth revisiting if CW or other modes need a
-            // narrower passband.
-            wdsp::SetTXABandpassFreqs(channel, 300.0, 2700.0);
+            // TX bandpass passband -- ROOT CAUSE FIX: this was
+            // hardcoded to 300-2700Hz regardless of mode/width, which
+            // is what actually caused a reported TX power/ALC
+            // "bouncing" bug during real WSJT-X FT8 traffic (steady on
+            // WSJT-X's own Tune, bouncing on a real CQ). Root-caused
+            // via a real hardware meter trace to the bandpass filter's
+            // STEADY-STATE (not transient) response -- confirmed by
+            // testing attack time and filter phase, neither of which
+            // (both transient-related) changed anything, while
+            // disabling the filter entirely turned the continuous
+            // bounce into a single settling blip. The user's actual
+            // setup: DIGU mode, 4000Hz filter width, WSJT-X TX audio
+            // frequency 2700Hz -- exactly on this hardcoded filter's
+            // upper edge, so FT8's ~50Hz-wide set of 8 tones straddled
+            // the edge, each getting a different real gain from the
+            // filter's transition band, and WSJT-X cycling through
+            // that tone set for the whole transmission produced a
+            // continuous, repeating power swing. Now computed with the
+            // SAME passband_for(mode, width_hz) RX already uses for
+            // RXASetPassband, so TX tracks the user's actual mode/
+            // width instead of a fixed guess. Initial value here
+            // matches TxParams::default(); process() updates it live
+            // on mode/width change, same pattern as mic_gain/mode.
+            wdsp::SetTXABandpassFreqs(channel, default_passband.0, default_passband.1);
         }
 
         // BUG FIX, confirmed against the reference (rustyHPSDR's
@@ -293,14 +387,37 @@ impl TxProcessor {
             iq_scratch: vec![0.0; out_iq_pairs * 2],
             last_mode: None,
             last_gain: None,
+            last_passband: Some(default_passband),
         }
     }
 
     /// mic_samples: TX_BUFFER_SIZE mono samples. Returns interleaved
     /// I/Q f32 TX samples at the DUC rate this channel was opened
-    /// with.
-    fn process(&mut self, mic_samples: &[f32], mode: Mode, mic_gain: f32) -> Vec<f32> {
+    /// with, plus fexchange0's own error code (0 = ok, see call site
+    /// below for what nonzero means -- this was previously discarded
+    /// entirely, silently hiding a whole class of possible dropout).
+    fn process(
+        &mut self,
+        mic_samples: &[f32],
+        mode: Mode,
+        mic_gain: f32,
+        width_hz: f64,
+    ) -> (Vec<f32>, c_int) {
         debug_assert_eq!(mic_samples.len(), TX_BUFFER_SIZE);
+
+        // Live bandpass-freqs update -- see open()'s SetTXABandpassFreqs
+        // comment for the full root-cause story. Same
+        // change-detection pattern as last_mode/last_gain below, just
+        // keyed on the computed (f_low, f_high) pair instead of the
+        // raw mode/width so a width change alone (same mode) still
+        // triggers it.
+        let passband = crate::spectrum::passband_for(mode, width_hz);
+        if self.last_passband != Some(passband) {
+            unsafe {
+                wdsp::SetTXABandpassFreqs(self.channel, passband.0, passband.1);
+            }
+            self.last_passband = Some(passband);
+        }
 
         if self.last_mode != Some(mode) {
             unsafe {
@@ -338,7 +455,7 @@ impl TxProcessor {
             );
         }
 
-        self.iq_scratch.iter().map(|&v| v as f32).collect()
+        (self.iq_scratch.iter().map(|&v| v as f32).collect(), error)
     }
 
     fn meter(&self, mt: u32) -> f64 {
@@ -394,6 +511,27 @@ fn run(
     let mut starved_chunks_this_window: u32 = 0;
     let mut chunks_this_window: u32 = 0;
 
+    // Second diagnostic, added after the mic-buffer one above didn't
+    // reproduce anything (no underruns logged, yet power/ALC still
+    // bounced): fexchange0's `error` output was being silently
+    // discarded entirely. Per WDSP's iobuffs.c, fexchange0 is NOT a
+    // direct passthrough -- it's a producer/consumer ring buffer
+    // (r1 in / r2 out) serviced by WDSP's OWN internal worker thread,
+    // completely separate from this loop's own pacing. If that
+    // internal thread ever falls behind (e.g. under the kind of
+    // system-wide CPU pressure WSJT-X's own decoding/waterfall
+    // rendering can cause, vs. the near-idle system a bare Tune press
+    // sees), fexchange0 hands back a ZERO-FILLED output buffer
+    // (memset) and sets error to a nonzero value (-2 for "not enough
+    // processed output ready") -- real silence inserted into the TX
+    // IQ stream, invisible to the mic-buffer check above since it
+    // happens entirely inside WDSP, downstream of anything this loop
+    // can see. This would explain the exact reported shape: steady on
+    // a continuous Tune, bouncing on real WSJT-X CQ traffic (which
+    // runs alongside far more concurrent system load).
+    let mut exch_error_window_start = Instant::now();
+    let mut exch_errors_this_window: u32 = 0;
+
     // Absolute-deadline pacing, not `thread::sleep(chunk_interval)` after
     // every iteration (which this loop used until now). Same fix, same
     // reasoning, as p2_tx_iq_loop's own next_send -- see its doc comment
@@ -446,7 +584,21 @@ fn run(
         }
 
         let p = *params.lock().unwrap();
-        let iq = processor.process(&chunk, p.mode, p.mic_gain);
+        let (iq, exch_error) = processor.process(&chunk, p.mode, p.mic_gain, p.width_hz);
+        if exch_error != 0 {
+            exch_errors_this_window += 1;
+        }
+        if exch_error_window_start.elapsed() >= Duration::from_secs(1) {
+            if exch_errors_this_window > 0 {
+                eprintln!(
+                    "tx: fexchange0 returned a nonzero error on {exch_errors_this_window} chunks \
+                     in the last second -- WDSP's own internal TXA worker thread fell behind and \
+                     substituted real silence into the TX IQ output (see tx.rs's run() comment)"
+                );
+            }
+            exch_error_window_start = Instant::now();
+            exch_errors_this_window = 0;
+        }
 
         {
             let mut out = tx_iq_out.lock().unwrap();
@@ -544,6 +696,12 @@ impl TxHandle {
     }
     pub fn set_mic_gain(&self, gain: f32) {
         self.params.lock().unwrap().mic_gain = gain.max(0.0);
+    }
+
+    /// See TxParams::width_hz's doc comment -- feeds the TX bandpass
+    /// filter's passband, same UI control as RX's per-mode width.
+    pub fn set_width_hz(&self, width_hz: f64) {
+        self.params.lock().unwrap().width_hz = width_hz;
     }
 
     pub fn stop(&mut self) {

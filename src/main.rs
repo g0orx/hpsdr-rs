@@ -506,6 +506,7 @@ impl eframe::App for HpsdrApp {
                                     );
                                     tx_handle.set_mic_gain(mic_gain);
                                     tx_handle.set_mode(spectrum.mode());
+                                    tx_handle.set_width_hz(spectrum.width_hz());
                                     (true, Some(mic), Some(tx_handle))
                                 }
                                 Err(e) => {
@@ -769,11 +770,12 @@ impl eframe::App for HpsdrApp {
                                     resolved_mode,
                                 );
                                 connected.spectrum.set_mode(resolved_mode);
-                                connected
-                                    .spectrum
-                                    .set_width_hz(width_for_mode(&connected.width_memory, resolved_mode));
+                                let resolved_width_hz =
+                                    width_for_mode(&connected.width_memory, resolved_mode);
+                                connected.spectrum.set_width_hz(resolved_width_hz);
                                 if let Some(tx) = &connected.tx_handle {
                                     tx.set_mode(resolved_mode);
+                                    tx.set_width_hz(resolved_width_hz);
                                 }
                                 settings_changed = true;
                             }
@@ -789,11 +791,11 @@ impl eframe::App for HpsdrApp {
                                 && !selected
                             {
                                 connected.spectrum.set_mode(mode);
-                                connected
-                                    .spectrum
-                                    .set_width_hz(width_for_mode(&connected.width_memory, mode));
+                                let mode_width_hz = width_for_mode(&connected.width_memory, mode);
+                                connected.spectrum.set_width_hz(mode_width_hz);
                                 if let Some(tx) = &connected.tx_handle {
                                     tx.set_mode(mode);
+                                    tx.set_width_hz(mode_width_hz);
                                 }
                                 remember_band_settings(
                                     &mut connected.band_memory,
@@ -820,6 +822,9 @@ impl eframe::App for HpsdrApp {
                             " Hz",
                         ) {
                             connected.spectrum.set_width_hz(width);
+                            if let Some(tx) = &connected.tx_handle {
+                                tx.set_width_hz(width);
+                            }
                             connected
                                 .width_memory
                                 .insert(current_mode.label().to_string(), width);
@@ -892,6 +897,22 @@ impl eframe::App for HpsdrApp {
                             }
                         }
                     });
+
+                    // Moved here from Settings -> TX (still shown there
+                    // too) so it's visible alongside the TX power/SWR
+                    // gauge without needing a separate window open --
+                    // added specifically to help tell apart "ALC is
+                    // pumping / mic is clipping on real modulated audio"
+                    // from a buffering/timing issue when a reported
+                    // power swing (steady on Tune's flat tone, bouncing
+                    // on a real WSJT-X transmission) didn't correlate
+                    // with any DUC IQ queue/mic buffer underrun log.
+                    if connected.tx_enabled {
+                        if let Some(tx) = &connected.tx_handle {
+                            let disp = *tx.display.lock().unwrap();
+                            ui.weak(format!("Mic level: {:.3}    ALC: {:.1}", disp.mic_pk, disp.alc_av));
+                        }
+                    }
 
                     ui.horizontal_wrapped(|ui| {
                         if ui
@@ -2013,6 +2034,7 @@ impl eframe::App for HpsdrApp {
                                                     );
                                                     tx_handle.set_mic_gain(connected.mic_gain);
                                                     tx_handle.set_mode(connected.spectrum.mode());
+                                                    tx_handle.set_width_hz(connected.spectrum.width_hz());
                                                     connected.mic_input = Some(mic);
                                                     connected.tx_handle = Some(tx_handle);
                                                     connected.tx_enabled = true;
@@ -3405,6 +3427,7 @@ fn change_sample_rate(connected: &mut ConnectedState, new_rate: u32) {
                 );
                 tx_handle.set_mic_gain(mic_gain);
                 tx_handle.set_mode(connected.spectrum.mode());
+                tx_handle.set_width_hz(connected.spectrum.width_hz());
                 connected.tx_handle = Some(tx_handle);
             }
         }
