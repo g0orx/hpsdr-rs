@@ -286,6 +286,18 @@ struct ConnectedState {
     /// user corrects it in Settings -> TX, so each physical radio
     /// remembers its own real limit from then on.
     max_tx_power_watts: u32,
+    /// TX Power (%, of max_tx_power_watts) used while tuning, instead
+    /// of the normal TX Power slider -- see Config::tune_power_percent.
+    tune_power_percent: u32,
+    /// Whether the Tune button is currently engaged -- transient, not
+    /// persisted. See the main-panel Tune button handler for the full
+    /// mechanism (WDSP PostGen tone + a temporary TX Power override).
+    tune_active: bool,
+    /// The TX Power (watts) value to restore when Tune ends -- saved
+    /// at the moment Tune is engaged, since tx_power_watts itself gets
+    /// temporarily overwritten with the reduced tune wattage while
+    /// tuning. None whenever tune_active is false.
+    pre_tune_power_watts: Option<u32>,
     /// Exponentially-smoothed forward/reverse power ADC counts (same
     /// raw units as session.tx_forward_power/tx_reverse_power), used
     /// only for the TX meter display -- NOT written back to the
@@ -571,6 +583,9 @@ impl eframe::App for HpsdrApp {
                                 max_tx_power_watts: cfg
                                     .max_tx_power_watts
                                     .unwrap_or_else(|| default_max_tx_power_watts(device.board)),
+                                tune_power_percent: cfg.tune_power_percent.unwrap_or(20),
+                                tune_active: false,
+                                pre_tune_power_watts: None,
                                 smoothed_fwd_power: 0.0,
                                 smoothed_rev_power: 0.0,
                             });
@@ -882,19 +897,26 @@ impl eframe::App for HpsdrApp {
                             // slider already could.
                             ui.add_space(12.0);
                             ui.label("TX Power:");
-                            let mut watts =
-                                connected.session.tx_power_watts.load(Ordering::Relaxed) as i32;
-                            if scroll_slider_i32(
-                                ui,
-                                &mut connected.slider_scroll_accum,
-                                &mut watts,
-                                0..=connected.max_tx_power_watts as i32,
-                                1,
-                                "W",
-                            ) {
-                                connected.session.tx_power_watts.store(watts as u32, Ordering::Relaxed);
-                                settings_changed = true;
-                            }
+                            // Disabled while Tune is active -- the atomic
+                            // is temporarily holding the reduced tune
+                            // wattage (see the Tune button handler), so
+                            // this still shows the right number, it just
+                            // can't be perturbed mid-tune.
+                            ui.add_enabled_ui(!connected.tune_active, |ui| {
+                                let mut watts =
+                                    connected.session.tx_power_watts.load(Ordering::Relaxed) as i32;
+                                if scroll_slider_i32(
+                                    ui,
+                                    &mut connected.slider_scroll_accum,
+                                    &mut watts,
+                                    0..=connected.max_tx_power_watts as i32,
+                                    1,
+                                    "W",
+                                ) {
+                                    connected.session.tx_power_watts.store(watts as u32, Ordering::Relaxed);
+                                    settings_changed = true;
+                                }
+                            });
                         }
                     });
 
@@ -1022,6 +1044,89 @@ impl eframe::App for HpsdrApp {
                                 .on_hover_text("Click to toggle transmit on/off");
                             if mox_resp.clicked() {
                                 connected.session.set_mox(!mox_now);
+                            }
+
+                            // Tune: WDSP PostGen tone at passband
+                            // center, replacing mic audio, at a
+                            // reduced/configurable power (Settings ->
+                            // TX, "Tune Power") -- see tx.rs's
+                            // TxParams::tune and config.rs's
+                            // tune_power_percent doc comments for the
+                            // full mechanism. Disabled (can't be
+                            // clicked to START) whenever something
+                            // else already has MOX asserted -- e.g.
+                            // WSJT-X/rigctl mid-transmission -- so
+                            // Tune can't hijack an externally-keyed
+                            // transmission; still clickable to turn
+                            // OFF if tune itself is what's currently
+                            // keying.
+                            let tune_may_start = !mox_now || connected.tune_active;
+                            let tune_label = if connected.tune_active { "TUNE ON" } else { "TUNE" };
+                            let tune_color = if connected.tune_active {
+                                egui::Color32::from_rgb(230, 140, 20)
+                            } else {
+                                egui::Color32::from_gray(60)
+                            };
+                            let tune_resp = ui
+                                .add_enabled(
+                                    tune_may_start,
+                                    egui::Button::new(
+                                        egui::RichText::new(tune_label)
+                                            .strong()
+                                            .color(egui::Color32::WHITE),
+                                    )
+                                    .fill(tune_color),
+                                )
+                                .on_hover_text(
+                                    "Click to toggle a steady tone centered in the passband, \
+                                     at Tune Power (Settings -> TX), for antenna/PA tuning",
+                                );
+                            if tune_resp.clicked() {
+                                if connected.tune_active {
+                                    connected.session.set_mox(false);
+                                    if let Some(tx) = &connected.tx_handle {
+                                        tx.set_tune(false);
+                                    }
+                                    if let Some(prev) = connected.pre_tune_power_watts.take() {
+                                        connected.session.tx_power_watts.store(prev, Ordering::Relaxed);
+                                    }
+                                    connected.tune_active = false;
+                                } else {
+                                    connected.pre_tune_power_watts =
+                                        Some(connected.session.tx_power_watts.load(Ordering::Relaxed));
+                                    if let Some(tx) = &connected.tx_handle {
+                                        tx.set_tune(true);
+                                    }
+                                    connected.session.set_mox(true);
+                                    connected.tune_active = true;
+                                }
+                            }
+
+                            // Safety net: if something else cleared
+                            // MOX while tune was active (TX disarmed,
+                            // an external CAT client, etc.), clean up
+                            // rather than leaving the button stuck
+                            // showing "TUNE ON" while nothing is
+                            // actually transmitting.
+                            if connected.tune_active && !connected.session.mox_active() {
+                                if let Some(tx) = &connected.tx_handle {
+                                    tx.set_tune(false);
+                                }
+                                if let Some(prev) = connected.pre_tune_power_watts.take() {
+                                    connected.session.tx_power_watts.store(prev, Ordering::Relaxed);
+                                }
+                                connected.tune_active = false;
+                            }
+
+                            // Kept live (not just set once on click) so
+                            // adjusting the Tune Power slider (Settings
+                            // -> TX) while already tuning takes effect
+                            // immediately instead of only on the next
+                            // TUNE off/on cycle.
+                            if connected.tune_active {
+                                let tune_watts =
+                                    connected.max_tx_power_watts * connected.tune_power_percent / 100;
+                                connected.session.tx_power_watts.store(tune_watts, Ordering::Relaxed);
                             }
 
                             // Spacebar: hold-to-talk, the traditional
@@ -2008,6 +2113,28 @@ impl eframe::App for HpsdrApp {
                                     );
                                     ui.add_space(8.0);
 
+                                    ui.horizontal(|ui| {
+                                        ui.label("Tune Power:");
+                                        let mut percent = connected.tune_power_percent as i32;
+                                        if scroll_slider_i32(
+                                            ui,
+                                            &mut connected.slider_scroll_accum,
+                                            &mut percent,
+                                            1..=100,
+                                            1,
+                                            "%",
+                                        ) {
+                                            connected.tune_power_percent = percent as u32;
+                                            settings_changed = true;
+                                        }
+                                    });
+                                    ui.weak(
+                                        "Percentage of Max TX Power used by the main panel's \
+                                         TUNE button -- a fixed safety ceiling for antenna/PA \
+                                         tuning, independent of your normal TX Power setting.",
+                                    );
+                                    ui.add_space(8.0);
+
                                     let mut tx_enabled = connected.tx_enabled;
                                     if ui.checkbox(&mut tx_enabled, "Enable Transmit").changed() {
                                         if tx_enabled {
@@ -2053,6 +2180,15 @@ impl eframe::App for HpsdrApp {
                                             connected.tx_handle = None;
                                             connected.mic_input = None;
                                             connected.tx_enabled = false;
+                                            // tx_handle is gone regardless, but tune_active/
+                                            // pre_tune_power_watts live on ConnectedState and
+                                            // would otherwise survive a disarm -- restore the
+                                            // real TX Power rather than leaving it at whatever
+                                            // reduced tune wattage happened to be active.
+                                            if let Some(prev) = connected.pre_tune_power_watts.take() {
+                                                connected.session.tx_power_watts.store(prev, Ordering::Relaxed);
+                                            }
+                                            connected.tune_active = false;
                                         }
                                         settings_changed = true;
                                     }
@@ -2208,6 +2344,7 @@ impl eframe::App for HpsdrApp {
                         width_memory: connected.width_memory.clone(),
                         pa_calibration: connected.pa_calibration.clone(),
                         max_tx_power_watts: Some(connected.max_tx_power_watts),
+                        tune_power_percent: Some(connected.tune_power_percent),
                         rigctl_addr: Some(connected.rigctl_addr.clone()),
                         tci_addr: Some(connected.tci_addr.clone()),
                         rigctl_running: Some(connected.rigctl_server.is_some()),

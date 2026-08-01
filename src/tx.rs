@@ -121,6 +121,11 @@ pub struct TxParams {
     /// and the TX bandpass filter was hardcoded to a fixed 300-2700Hz
     /// regardless of mode or this setting.
     pub width_hz: f64,
+    /// When true, WDSP's PostGen tone generator replaces mic audio
+    /// with a steady single tone centered in the current passband --
+    /// see TxProcessor::process()'s PostGen update for the mechanism
+    /// (confirmed against rustyHPSDR's own Tune implementation).
+    pub tune: bool,
 }
 
 impl Default for TxParams {
@@ -142,6 +147,7 @@ impl Default for TxParams {
             // unit convention on top of it is a deliberate deviation.
             mic_gain: 0.5,
             width_hz: crate::spectrum::default_width_hz(Mode::Usb),
+            tune: false,
         }
     }
 }
@@ -153,6 +159,7 @@ struct TxProcessor {
     last_mode: Option<Mode>,
     last_gain: Option<f32>,
     last_passband: Option<(f64, f64)>,
+    last_tune: Option<bool>,
 }
 
 impl TxProcessor {
@@ -388,6 +395,7 @@ impl TxProcessor {
             last_mode: None,
             last_gain: None,
             last_passband: Some(default_passband),
+            last_tune: None,
         }
     }
 
@@ -402,6 +410,7 @@ impl TxProcessor {
         mode: Mode,
         mic_gain: f32,
         width_hz: f64,
+        tune: bool,
     ) -> (Vec<f32>, c_int) {
         debug_assert_eq!(mic_samples.len(), TX_BUFFER_SIZE);
 
@@ -415,8 +424,32 @@ impl TxProcessor {
         if self.last_passband != Some(passband) {
             unsafe {
                 wdsp::SetTXABandpassFreqs(self.channel, passband.0, passband.1);
+                // Tune tone frequency tracks the SAME passband as the
+                // bandpass filter -- its midpoint is the right tone
+                // for every mode (including CW, which centers on its
+                // 600Hz pitch via passband_for's own offset), with no
+                // mode-specific sign handling needed unlike
+                // rustyHPSDR's set_tuning, since passband_for already
+                // encodes that convention.
+                wdsp::SetTXAPostGenToneFreq(self.channel, (passband.0 + passband.1) / 2.0);
             }
             self.last_passband = Some(passband);
+        }
+
+        // Tune: WDSP's PostGen tone generator runs AFTER the ALC/AM/FM
+        // stages in xtxa()'s processing order (confirmed in TXA.c),
+        // so it overwrites whatever the normal mic->Panel-gain->ALC
+        // chain produced -- no interaction with mic input or ALC to
+        // worry about, matches rustyHPSDR's own Tune mechanism
+        // (set_tuning: ToneMag 0.99999, Mode 0 = Tone, Run toggles the
+        // generator on/off).
+        if self.last_tune != Some(tune) {
+            unsafe {
+                wdsp::SetTXAPostGenMode(self.channel, 0);
+                wdsp::SetTXAPostGenToneMag(self.channel, 0.99999);
+                wdsp::SetTXAPostGenRun(self.channel, tune as c_int);
+            }
+            self.last_tune = Some(tune);
         }
 
         if self.last_mode != Some(mode) {
@@ -584,7 +617,7 @@ fn run(
         }
 
         let p = *params.lock().unwrap();
-        let (iq, exch_error) = processor.process(&chunk, p.mode, p.mic_gain, p.width_hz);
+        let (iq, exch_error) = processor.process(&chunk, p.mode, p.mic_gain, p.width_hz, p.tune);
         if exch_error != 0 {
             exch_errors_this_window += 1;
         }
@@ -702,6 +735,11 @@ impl TxHandle {
     /// filter's passband, same UI control as RX's per-mode width.
     pub fn set_width_hz(&self, width_hz: f64) {
         self.params.lock().unwrap().width_hz = width_hz;
+    }
+
+    /// See TxParams::tune's doc comment.
+    pub fn set_tune(&self, tune: bool) {
+        self.params.lock().unwrap().tune = tune;
     }
 
     pub fn stop(&mut self) {
