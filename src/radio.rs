@@ -370,6 +370,7 @@ fn start_protocol1(
                 settings.sample_rate,
                 false, // mox: never keyed during startup config
                 matches!(device.board, Boards::HermesLite | Boards::HermesLite2),
+                &[], // no extra receivers active yet this early -- falls back to the main frequency
                 &tx_iq,
             );
             socket.send(&packet)?;
@@ -397,6 +398,25 @@ fn start_protocol1(
         .map(|_| Arc::new(Mutex::new(VecDeque::with_capacity(IQ_BUFFER_CAPACITY))))
         .collect();
 
+    // Extra receivers beyond the first, pre-sized to whatever was
+    // requested (settings.receivers, from the board's reported
+    // capability -- e.g. a HermesLite2 reporting 4 via its discovery
+    // reply's buf19 byte). None are active until add_receiver() is
+    // called -- active_receiver_count starts at 1. Same pattern as
+    // start_protocol2's own init just below in this file. Sample rate
+    // is still tracked per-extra-receiver for struct-shape parity with
+    // P2, but P1 has only one real shared clock (see sample_rate_code
+    // in the general-control frame, no per-receiver override slot) --
+    // main.rs keeps every extra receiver's rate in sync with the
+    // primary's rather than exposing it as independently adjustable.
+    let extra_count = settings.receivers.max(1).saturating_sub(1) as usize;
+    let extra_frequencies_hz: Vec<Arc<AtomicU32>> =
+        (0..extra_count).map(|_| Arc::new(AtomicU32::new(settings.frequency_hz))).collect();
+    let extra_sample_rates_hz: Vec<Arc<AtomicU32>> =
+        (0..extra_count).map(|_| Arc::new(AtomicU32::new(settings.sample_rate))).collect();
+    let extra_adcs: Vec<Arc<AtomicU32>> = (0..extra_count).map(|_| Arc::new(AtomicU32::new(0))).collect();
+    let active_receiver_count = Arc::new(AtomicU32::new(1));
+
     let sender_socket = socket.try_clone()?;
     let sender_stop = Arc::clone(&stop_flag);
     let sender_frequency = Arc::clone(&frequency_hz);
@@ -404,7 +424,8 @@ fn start_protocol1(
     let sender_mox = Arc::clone(&mox);
     let sender_tx_iq = Arc::clone(&tx_iq);
     let sender_antenna = Arc::clone(&antenna);
-    let sender_receivers = settings.receivers.max(1);
+    let sender_active_receiver_count = Arc::clone(&active_receiver_count);
+    let sender_extra_frequencies_hz = extra_frequencies_hz.clone();
     let sender_tx_power_watts = Arc::clone(&tx_power_watts);
     let sender_pa_gain_db = Arc::clone(&pa_gain_db);
     let sender_is_hermes_lite = matches!(device.board, Boards::HermesLite | Boards::HermesLite2);
@@ -415,7 +436,8 @@ fn start_protocol1(
             sender_sample_rate,
             sender_mox,
             sender_tx_iq,
-            sender_receivers,
+            sender_active_receiver_count,
+            sender_extra_frequencies_hz,
             sender_antenna,
             sender_tx_power_watts,
             sender_pa_gain_db,
@@ -428,13 +450,14 @@ fn start_protocol1(
     let receiver_stop = Arc::clone(&stop_flag);
     let receiver_buffers = iq_buffers.clone();
     let receiver_sample_rate = Arc::clone(&sample_rate);
+    let receiver_active_receiver_count = Arc::clone(&active_receiver_count);
     let receiver_tx_forward_power = Arc::clone(&tx_forward_power);
     let receiver_tx_reverse_power = Arc::clone(&tx_reverse_power);
     let receiver_thread = thread::spawn(move || {
         receiver_loop(
             receiver_socket,
             receiver_buffers,
-            settings.receivers.max(1),
+            receiver_active_receiver_count,
             receiver_sample_rate,
             receiver_tx_forward_power,
             receiver_tx_reverse_power,
@@ -448,10 +471,10 @@ fn start_protocol1(
         sample_rate,
         adc,
         antenna,
-        extra_frequencies_hz: Vec::new(), // P1: no confirmed multi-receiver enable register
-        extra_sample_rates_hz: Vec::new(),
-        extra_adcs: Vec::new(),
-        active_receiver_count: Arc::new(AtomicU32::new(1)),
+        extra_frequencies_hz,
+        extra_sample_rates_hz,
+        extra_adcs,
+        active_receiver_count,
         mox,
         tx_iq,
         tx_power_watts,
@@ -603,6 +626,7 @@ fn p1_build_packet(
     sample_rate_hz: u32,
     mox_on: bool,
     is_hermes_lite: bool,
+    extra_frequencies_hz: &[Arc<AtomicU32>],
     tx_iq: &Mutex<VecDeque<f32>>,
 ) -> [u8; PACKET_SIZE] {
     // MOX/PTT bit: inferred to be C0's bit 0 on both frames, based
@@ -663,18 +687,33 @@ fn p1_build_packet(
             (0x02, (freq >> 24) as u8, (freq >> 16) as u8, (freq >> 8) as u8, freq as u8)
         }
         2 => {
-            // RX frequency for current_receiver. This project
-            // doesn't track distinct per-receiver frequencies at
-            // the P1 session level yet (unlike P2) -- every
-            // receiver index currently gets the same frequency
-            // rather than its own. Real for a single-receiver
-            // session; a known simplification for multi-receiver.
-            let c0 = 0x04 + (*current_receiver * 2);
+            // RX frequency for current_receiver. ROOT CAUSE FIX:
+            // this previously sent the SAME frequency_hz for every
+            // receiver index regardless of which one c0's register
+            // address actually pointed at -- the cycling logic
+            // itself was already correct (confirmed against the
+            // reference), it just had no per-receiver frequency
+            // source to pull from yet, so every receiver beyond the
+            // first was silently retuned to the main frequency on
+            // every single cycle. Now pulls each extra receiver's
+            // own tracked frequency (extra_frequencies_hz, index 0 =
+            // the second receiver overall), matching how Protocol 2
+            // already gives each DDC its own independent VFO.
+            let rx_index = *current_receiver;
+            let c0 = 0x04 + (rx_index * 2);
             *current_receiver += 1;
             if *current_receiver >= receivers.max(1) {
                 *current_receiver = 0;
             }
-            (c0, (freq >> 24) as u8, (freq >> 16) as u8, (freq >> 8) as u8, freq as u8)
+            let rx_freq = if rx_index == 0 {
+                freq
+            } else {
+                extra_frequencies_hz
+                    .get(rx_index as usize - 1)
+                    .map(|f| f.load(Ordering::Relaxed) as i32)
+                    .unwrap_or(freq)
+            };
+            (c0, (rx_freq >> 24) as u8, (rx_freq >> 16) as u8, (rx_freq >> 8) as u8, rx_freq as u8)
         }
         3 => {
             // Drive level (while transmitting) + mic boost. Confirmed
@@ -804,7 +843,8 @@ fn sender_loop(
     sample_rate: Arc<AtomicU32>,
     mox: Arc<AtomicBool>,
     tx_iq: Arc<Mutex<VecDeque<f32>>>,
-    receivers: u8,
+    active_receiver_count: Arc<AtomicU32>,
+    extra_frequencies_hz: Vec<Arc<AtomicU32>>,
     antenna: Arc<AtomicU32>,
     tx_power_watts: Arc<AtomicU32>,
     pa_gain_db: Arc<AtomicU32>,
@@ -843,6 +883,11 @@ fn sender_loop(
         // not yet verified against your source's exact pacing mechanism.
         let interval = Duration::from_secs_f64(126.0 / current_rate as f64);
         let mox_on = mox.load(Ordering::Relaxed);
+        // Read live each cycle (not a fixed value captured at session
+        // start) so a receiver added mid-session via the "Add
+        // Receiver" button is actually told to the radio, matching
+        // how p2_sender_loop already reads active_receiver_count.
+        let receivers = (active_receiver_count.load(Ordering::Relaxed) as u8).max(1);
 
         let packet = p1_build_packet(
             seq,
@@ -856,6 +901,7 @@ fn sender_loop(
             current_rate,
             mox_on,
             is_hermes_lite,
+            &extra_frequencies_hz,
             &tx_iq,
         );
 
@@ -881,7 +927,7 @@ fn sender_loop(
 fn receiver_loop(
     socket: UdpSocket,
     buffers: Vec<Arc<Mutex<VecDeque<IqSample>>>>,
-    receivers: u8,
+    active_receiver_count: Arc<AtomicU32>,
     sample_rate: Arc<AtomicU32>,
     tx_forward_power: Arc<AtomicU32>,
     tx_reverse_power: Arc<AtomicU32>,
@@ -893,6 +939,12 @@ fn receiver_loop(
             Ok(n) if n == PACKET_SIZE => {
                 if buf[0] == 0xEF && buf[1] == 0xFE && buf[2] == 0x01 && buf[3] == EP_IQ_DATA {
                     let capacity = iq_buffer_capacity_for_rate(sample_rate.load(Ordering::Relaxed));
+                    // Read live (not a fixed value captured at session
+                    // start) so the interleaving stride matches
+                    // however many receivers sender_loop is CURRENTLY
+                    // telling the radio to stream -- same reasoning as
+                    // sender_loop's own live read just above.
+                    let receivers = (active_receiver_count.load(Ordering::Relaxed) as u8).max(1);
                     parse_iq_packet(
                         &buf[HEADER_SIZE..PACKET_SIZE],
                         receivers,

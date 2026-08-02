@@ -156,6 +156,12 @@ struct ExtraReceiver {
     sample_rate_hz: Arc<std::sync::atomic::AtomicU32>,
     adc: Arc<std::sync::atomic::AtomicU32>,
     num_adcs: u8,
+    /// 1 or 2 -- Protocol 1 has a single shared RX/TX sample-rate
+    /// register with no per-receiver override slot, unlike Protocol 2
+    /// where each DDC really can run its own rate. Used to disable
+    /// this receiver's own sample-rate control when it can't actually
+    /// be honored independently (see render_extra_receiver_settings).
+    protocol: u8,
     /// Shared with every other receiver (including the primary) --
     /// Alex's antenna relays are one physical resource, not per-DDC.
     antenna: Arc<std::sync::atomic::AtomicU32>,
@@ -357,12 +363,16 @@ impl eframe::App for HpsdrApp {
                     if let Some(sr) = cfg.sample_rate {
                         settings.sample_rate = sr;
                     }
-                    // Pre-size for multiple receivers where we actually
-                    // support enabling them (P2 only -- see radio.rs's
-                    // module note on why P1 stays single-receiver).
-                    if device.protocol == 2 {
-                        settings.receivers = device.supported_receivers.max(1);
-                    }
+                    // Pre-size for multiple receivers, per whatever the
+                    // radio's own discovery reply reported supporting --
+                    // both protocols now genuinely support independent
+                    // per-receiver tuning (P1: start_protocol1's
+                    // extra_frequencies_hz + p1_build_packet's
+                    // ozy_command==2 branch; this used to be gated to P2
+                    // only, which is why iq_buffers/Add Receiver stayed
+                    // stuck at 1 for every P1 radio regardless of what it
+                    // actually supports).
+                    settings.receivers = device.supported_receivers.max(1);
                     match RadioSession::start(&device, settings) {
                         Ok(session) => {
                             // Override RadioSession::start's hardcoded
@@ -492,6 +502,7 @@ impl eframe::App for HpsdrApp {
                                 if let Some(rx) = spawn_extra_receiver(
                                     &session,
                                     device.adcs,
+                                    device.protocol,
                                     Arc::clone(&settings_dirty),
                                     Some(saved),
                                 ) {
@@ -1517,31 +1528,36 @@ impl eframe::App for HpsdrApp {
                             connected.show_settings_window = !connected.show_settings_window;
                         }
 
-                        if connected.device.protocol == 2 {
-                            let active =
-                                connected.session.active_receiver_count.load(Ordering::Relaxed) as usize;
-                            let max = connected.session.iq_buffers.len();
-                            if active < max {
-                                if ui.button(format!("Add Receiver ({active}/{max})")).clicked() {
-                                    if let Some(rx) = spawn_extra_receiver(
-                                        &connected.session,
-                                        connected.device.adcs,
-                                        Arc::clone(&connected.settings_dirty),
-                                        None,
-                                    ) {
-                                        connected.extra_receivers.push(rx);
-                                        // Without this, a freshly added
-                                        // receiver is only persisted if
-                                        // some other setting happens to
-                                        // change afterward -- closing the
-                                        // app right after adding one
-                                        // would silently lose it.
-                                        connected.settings_dirty.store(true, Ordering::Relaxed);
-                                    }
+                        // Used to be gated to protocol == 2 only -- P1
+                        // genuinely supports independent per-receiver
+                        // tuning too (classic Metis/Ozy DDC round-robin),
+                        // it just wasn't wired up: see start_protocol1's
+                        // extra_frequencies_hz and p1_build_packet's
+                        // ozy_command==2 branch for the actual fix.
+                        let active =
+                            connected.session.active_receiver_count.load(Ordering::Relaxed) as usize;
+                        let max = connected.session.iq_buffers.len();
+                        if active < max {
+                            if ui.button(format!("Add Receiver ({active}/{max})")).clicked() {
+                                if let Some(rx) = spawn_extra_receiver(
+                                    &connected.session,
+                                    connected.device.adcs,
+                                    connected.device.protocol,
+                                    Arc::clone(&connected.settings_dirty),
+                                    None,
+                                ) {
+                                    connected.extra_receivers.push(rx);
+                                    // Without this, a freshly added
+                                    // receiver is only persisted if
+                                    // some other setting happens to
+                                    // change afterward -- closing the
+                                    // app right after adding one
+                                    // would silently lose it.
+                                    connected.settings_dirty.store(true, Ordering::Relaxed);
                                 }
-                            } else {
-                                ui.weak(format!("All {max} receivers active"));
                             }
+                        } else {
+                            ui.weak(format!("All {max} receivers active"));
                         }
                     });
 
@@ -3243,22 +3259,34 @@ fn render_extra_receiver_settings(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceive
 
         SettingsTab::Agc => {
             ui.label("Sample Rate:");
-            ui.horizontal_wrapped(|ui| {
-                // Extra receivers are Protocol 2 only (see radio.rs's
-                // module note -- P1 has no confirmed multi-DDC enable),
-                // so no protocol check needed here unlike the primary
-                // receiver's own sample rate selector.
-                for rate in [48_000u32, 96_000, 192_000, 384_000, 768_000, 1_536_000] {
-                    let selected = rate == current_rate;
-                    let label = format!("{}", rate / 1000);
-                    if ui.add(egui::Button::selectable(selected, label)).clicked() && !selected {
-                        change_extra_receiver_sample_rate(&mut rx, rate);
-                        rx.settings_dirty.store(true, Ordering::Relaxed);
+            // Disabled on Protocol 1 -- unlike P2 (where each DDC really
+            // can run its own independent decimation rate), P1 has a
+            // single shared RX/TX sample-rate register with no per-
+            // receiver override slot (see radio.rs's p1_build_packet:
+            // sample_rate_code(sample_rate_hz) in the general-control
+            // frame, sent once for the whole session). This receiver's
+            // rate is kept in sync with the main receiver's instead
+            // (see change_sample_rate's P1 branch) rather than exposed
+            // as independently adjustable, which the hardware has no
+            // way to actually honor.
+            ui.add_enabled_ui(rx.protocol != 1, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    for rate in [48_000u32, 96_000, 192_000, 384_000, 768_000, 1_536_000] {
+                        let selected = rate == current_rate;
+                        let label = format!("{}", rate / 1000);
+                        if ui.add(egui::Button::selectable(selected, label)).clicked() && !selected {
+                            change_extra_receiver_sample_rate(&mut rx, rate);
+                            rx.settings_dirty.store(true, Ordering::Relaxed);
+                        }
                     }
-                }
-                ui.weak("kHz");
+                    ui.weak("kHz");
+                });
             });
-            ui.weak("Changing this briefly interrupts audio/spectrum for this receiver while the demod chain restarts.");
+            if rx.protocol == 1 {
+                ui.weak("Follows the main receiver's sample rate on Protocol 1 (one shared clock).");
+            } else {
+                ui.weak("Changing this briefly interrupts audio/spectrum for this receiver while the demod chain restarts.");
+            }
             ui.separator();
 
             let current_adc = rx.adc.load(Ordering::Relaxed);
@@ -3460,6 +3488,7 @@ fn resolve_tune(
 fn spawn_extra_receiver(
     session: &RadioSession,
     num_adcs: u8,
+    protocol: u8,
     settings_dirty: Arc<std::sync::atomic::AtomicBool>,
     saved: Option<&ExtraReceiverConfig>,
 ) -> Option<Arc<Mutex<ExtraReceiver>>> {
@@ -3506,6 +3535,7 @@ fn spawn_extra_receiver(
         sample_rate_hz: rate_arc,
         adc: adc_arc,
         num_adcs,
+        protocol,
         antenna: antenna_arc,
         spectrum,
         audio_output,
@@ -3615,6 +3645,21 @@ fn change_sample_rate(connected: &mut ConnectedState, new_rate: u32) {
                 tx_handle.set_mode(connected.spectrum.mode());
                 tx_handle.set_width_hz(connected.spectrum.width_hz());
                 connected.tx_handle = Some(tx_handle);
+            }
+        }
+    }
+
+    // P1 has one shared clock for every receiver, unlike P2 where each
+    // DDC can run its own independent rate -- keep every currently-open
+    // extra receiver in sync with the new rate rather than letting it
+    // silently go stale relative to what's actually arriving from the
+    // radio (see render_extra_receiver_settings's matching P1
+    // sample-rate-disable note, the other half of this).
+    if connected.device.protocol == 1 {
+        for rx in &connected.extra_receivers {
+            let mut rx = rx.lock().unwrap();
+            if rx.sample_rate_hz.load(Ordering::Relaxed) != new_rate {
+                change_extra_receiver_sample_rate(&mut rx, new_rate);
             }
         }
     }

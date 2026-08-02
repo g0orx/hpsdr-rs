@@ -151,7 +151,13 @@ fn board_info_p2(board_id: u8) -> (Boards, u8, u8, u8, u64, u64) {
         3 => (Boards::Angelia, 2, 7, 1, 0, 61_440_000),
         4 => (Boards::Orion, 2, 7, 1, 0, 61_440_000),
         5 => (Boards::Orion2, 2, 7, 1, 0, 61_440_000),
-        6 => (Boards::HermesLite2, 1, 5, 1, 0, 30_720_000),
+        // Real HermesLite2 hardware supports up to 4 receivers (confirmed
+        // by the user), not 5 -- this entry is very likely unreachable in
+        // practice anyway, since HermesLite2 only actually speaks Protocol
+        // 1 (see board_info_p1's buf19-based dynamic lookup, the path a
+        // real HL2 unit's discovery reply takes), but corrected for
+        // accuracy rather than left silently wrong.
+        6 => (Boards::HermesLite2, 1, 4, 1, 0, 30_720_000),
         10 => (Boards::Saturn, 2, 7, 1, 0, 61_440_000),
         _ => (Boards::Unknown, 1, 1, 1, 0, 61_440_000),
     }
