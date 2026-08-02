@@ -8,6 +8,8 @@ A Rust/egui desktop client for [openHPSDR](https://openhpsdr.org/) Protocol 1 an
 
 > **Status: early / actively in development.** RX has seen the most real-world testing. TX works and has been used for real QSOs, but parts of the TX signal path are still noted in the source as unverified against the official protocol spec on untested hardware. **Always bench-test into a dummy load at reduced drive before transmitting into a real antenna**, especially after pulling a new build.
 
+![hpsdr-rs main window and a second independent receiver, showing the spectrum/waterfall display, S-meter, and TX controls](images/screenshot.png)
+
 ## Features
 
 - Protocol 1 (Metis/Ozy) and Protocol 2 (Hermes/Orion) support, with standard openHPSDR UDP discovery (broadcast, port 1024)
