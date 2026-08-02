@@ -431,8 +431,11 @@ impl eframe::App for HpsdrApp {
                                 tci_server = match TciServer::start(
                                     &tci_addr,
                                     Arc::clone(&session.frequency_hz),
+                                    Arc::clone(&session.sample_rate),
                                     spectrum.demod_params_handle(),
                                     Arc::clone(&session.mox),
+                                    Arc::clone(&spectrum.tci_audio_out),
+                                    Arc::clone(&spectrum.iq_out),
                                 ) {
                                     Ok(s) => Some(s),
                                     Err(e) => {
@@ -1740,8 +1743,11 @@ impl eframe::App for HpsdrApp {
                                             connected.tci_server = match TciServer::start(
                                                 &connected.tci_addr,
                                                 Arc::clone(&connected.session.frequency_hz),
+                                                Arc::clone(&connected.session.sample_rate),
                                                 connected.spectrum.demod_params_handle(),
                                                 Arc::clone(&connected.session.mox),
+                                                Arc::clone(&connected.spectrum.tci_audio_out),
+                                                Arc::clone(&connected.spectrum.iq_out),
                                             ) {
                                                 Ok(s) => Some(s),
                                                 Err(e) => {
@@ -1768,7 +1774,12 @@ impl eframe::App for HpsdrApp {
 
                                     ui.add_space(8.0);
                                     ui.weak(
-                                        "Format: address:port, e.g. 127.0.0.1:4532. Both are RX only -- PTT is accepted but not implemented.",
+                                        "Format: address:port, e.g. 0.0.0.0:4532 (the default -- listens on \
+                                         every network interface, so another machine on your network can \
+                                         connect too, not just this one). Use 127.0.0.1:PORT instead to \
+                                         restrict it to this machine only. Neither protocol has any \
+                                         authentication, so only expose this on networks you trust. Both \
+                                         are RX only -- PTT is accepted but not implemented.",
                                     );
                                 }
 
@@ -3614,6 +3625,11 @@ fn change_sample_rate(connected: &mut ConnectedState, new_rate: u32) {
     }
     if let Some(s) = &connected.tci_server {
         s.set_demod_params(spectrum.demod_params_handle());
+        // Points any already-streaming client at this new
+        // SpectrumHandle's queues -- see TciServer::set_audio_iq's doc
+        // comment for why this can't be skipped the same way
+        // set_demod_params can't be.
+        s.set_audio_iq(Arc::clone(&spectrum.tci_audio_out), Arc::clone(&spectrum.iq_out));
     }
 
     connected.spectrum = spectrum;

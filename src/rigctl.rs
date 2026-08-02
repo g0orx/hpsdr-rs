@@ -1,8 +1,14 @@
 /*
     Minimal implementation of Hamlib's rigctld network protocol, enough
     for WSJT-X's "Hamlib NET rigctl" rig backend to read/set frequency
-    and mode, and key/unkey PTT. Listens on 127.0.0.1:4532 by default --
-    Hamlib's own standard default port for this.
+    and mode, and key/unkey PTT. Listens on 0.0.0.0:4532 by default --
+    Hamlib's own standard default port for this, but bound to all
+    interfaces rather than just loopback, so a client on another
+    machine on the network (a remote-operating laptop, a tablet, a
+    separate shack PC) can connect too, not just software running on
+    this same machine. This protocol has no authentication of its own,
+    so anyone who can reach this port on the network can key the
+    radio; only expose it on networks you trust.
 
     set_ptt here just flips RadioSession's mox flag -- the same one the
     on-screen PTT button and TCI's trx command use. See radio.rs and
@@ -34,7 +40,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-pub const DEFAULT_ADDR: &str = "127.0.0.1:4532";
+pub const DEFAULT_ADDR: &str = "0.0.0.0:4532";
 
 /// A swappable reference to "whichever DemodParams is current right
 /// now" -- see RigctlServer::set_demod_params's doc comment for why
@@ -66,7 +72,8 @@ pub struct RigctlServer {
 }
 
 impl RigctlServer {
-    /// Starts listening in the background on `addr` (e.g. "127.0.0.1:4532").
+    /// Starts listening in the background on `addr` (e.g. "0.0.0.0:4532",
+    /// the default -- or "127.0.0.1:4532" to restrict to this machine only).
     /// Returns Err if the address is invalid or the port is already in
     /// use (e.g. another rigctld already running) -- the caller should
     /// treat that as non-fatal, same as audio device failures elsewhere

@@ -3,7 +3,13 @@
     protocol -- an open WebSocket-based control protocol originally from
     Expert Electronics (ExpertSDR2/3), also supported by Thetis/
     OpenHPSDR and digital-mode software like JTDX. Listens on
-    127.0.0.1:40001, TCI's standard default port.
+    0.0.0.0:40001 by default (TCI's standard default port, but bound to
+    all interfaces rather than just loopback) so a client on another
+    machine on the network -- a remote-operating laptop, a tablet, a
+    separate shack PC -- can connect too, not just software running on
+    this same machine. This protocol has no authentication of its own,
+    so anyone who can reach this port on the network can control the
+    radio; only expose it on networks you trust.
 
     CONFIDENCE LEVEL, please read before trusting this blindly:
     - Command syntax (`name:arg1,arg2,...;`, reserved chars :,;) and the
@@ -26,18 +32,51 @@
       from general knowledge of the crate, not verified against 0.29
       specifically -- same caveat as every other external-crate API in
       this project.
+    - The binary streaming format (audio_start/audio_stop/iq_start/
+      iq_stop, and the 64-byte header + LE f32 samples it triggers) is
+      confirmed against rustyHPSDR's own TCI server
+      (~/github/rustyHPSDR/src/tci/mod.rs) -- the strongest reference
+      available here, since the user has it directly confirmed
+      working against TCI Remote, the exact client this was written
+      for. An earlier pass was based on github.com/ftl/tci (a clean
+      independent Go client library) instead, which got several
+      concrete details wrong once cross-checked against rustyHPSDR:
+      Format=4 instead of the correct 3, no explicit `channels` field
+      (rustyHPSDR always declares stereo, channels=2, as its own
+      header field rather than folding it into reserved padding),
+      9 reserved u32s instead of 8, `length` as total float count
+      instead of frame-pair count, and I/Q samples in the naive I-then-Q
+      order rather than rustyHPSDR's explicitly-swapped Q-then-I.
+      rustyHPSDR also streams audio to any connected client
+      unconditionally (no audio_start/audio_stop gate at all, only
+      iq_start/iq_stop) -- matched here too (audio_streaming defaults
+      to true), while still honoring audio_start/audio_stop if a
+      client sends them, for compatibility with clients that expect
+      that gate to exist. Thetis's own TCI server
+      (TAPR/OpenHPSDR-Thetis/.../TCIServer.cs) turned out to have this
+      as a literal `// todo !` stub, so wasn't usable as a reference at
+      all.
 
     trx (PTT) flips RadioSession's mox flag -- same one the on-screen
     PTT button and rigctl's set_ptt use. See rigctl.rs's module note on
     the "armed but keyed with silence" gap if TX isn't enabled in
     Settings -> TX when a client sends trx:0,true;.
 
-    Also unlike rigctl.rs: TCI supports IQ/audio streaming to clients
-    (for skimmers, recording, etc.) as a separate concern from this
-    control channel. Not implemented here -- this is control-only.
+    Unlike rigctl.rs: TCI also streams RX audio (audio_start/stop) and
+    raw wideband IQ (iq_start/stop, which is what lets a client render
+    its own spectrum/waterfall -- TCI has no separate spectrum message
+    type) to clients, as TCI Remote (an Android remote-listening app)
+    needs both to be useful for anything beyond frequency/mode/PTT
+    sync. See spectrum.rs's tci_audio_out/iq_out doc comments for
+    where this data actually comes from -- dedicated taps, not shared
+    with the existing local-playback/analyzer consumers of similar
+    data, since a second reader of an already-consumed queue would
+    steal samples from the first. TX audio (a client sending audio to
+    the radio, e.g. for voice macros) isn't implemented -- RX only.
 */
 
 use crate::spectrum::{DemodParams, Mode};
+use std::collections::VecDeque;
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
@@ -45,7 +84,7 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 use tungstenite::Message;
 
-pub const DEFAULT_ADDR: &str = "127.0.0.1:40001";
+pub const DEFAULT_ADDR: &str = "0.0.0.0:40001";
 const PROTOCOL_NAME: &str = "protocol:hpsdr-rs;";
 
 /// A swappable reference to "whichever DemodParams is current right
@@ -54,8 +93,24 @@ const PROTOCOL_NAME: &str = "protocol:hpsdr-rs;";
 /// this indirection exists.
 type DemodParamsCell = Arc<Mutex<Arc<Mutex<DemodParams>>>>;
 
+/// The two dedicated streaming taps a SpectrumHandle exposes for TCI
+/// specifically (spectrum.rs's tci_audio_out/iq_out -- NOT the same
+/// queues local playback/other consumers use, see that module's doc
+/// comments for why). Bundled together since they always come from
+/// and get swapped together with the same SpectrumHandle.
+#[derive(Clone)]
+struct AudioIqTaps {
+    audio: Arc<Mutex<VecDeque<f32>>>,
+    iq: Arc<Mutex<VecDeque<(f32, f32)>>>,
+}
+
+/// Swappable the same way DemodParamsCell is -- see
+/// TciServer::set_audio_iq's doc comment.
+type AudioIqCell = Arc<Mutex<AudioIqTaps>>;
+
 pub struct TciServer {
     demod_params: DemodParamsCell,
+    audio_iq: AudioIqCell,
     stop: Arc<AtomicBool>,
     /// Count of currently-connected clients (normally 0 or 1, but the
     /// accept loop doesn't limit concurrent connections, so a counter
@@ -78,19 +133,24 @@ pub struct TciServer {
 
 impl TciServer {
     /// Starts listening in the background on `addr` (e.g.
-    /// "127.0.0.1:40001"). Returns Err if the address is invalid or the
-    /// port is already in use.
+    /// "0.0.0.0:40001", the default -- or "127.0.0.1:40001" to restrict
+    /// to this machine only). Returns Err if the address is invalid or
+    /// the port is already in use.
     pub fn start(
         addr: &str,
         frequency_hz: Arc<AtomicU32>,
+        sample_rate: Arc<AtomicU32>,
         demod_params: Arc<Mutex<DemodParams>>,
         mox: Arc<AtomicBool>,
+        tci_audio_out: Arc<Mutex<VecDeque<f32>>>,
+        iq_out: Arc<Mutex<VecDeque<(f32, f32)>>>,
     ) -> std::io::Result<Self> {
         let listener = TcpListener::bind(addr)?;
         listener.set_nonblocking(true)?;
         println!("tci: listening on {addr}");
 
         let demod_params: DemodParamsCell = Arc::new(Mutex::new(demod_params));
+        let audio_iq: AudioIqCell = Arc::new(Mutex::new(AudioIqTaps { audio: tci_audio_out, iq: iq_out }));
         let stop = Arc::new(AtomicBool::new(false));
         let connected = Arc::new(AtomicU32::new(0));
         let client_threads: Arc<Mutex<Vec<JoinHandle<()>>>> = Arc::new(Mutex::new(Vec::new()));
@@ -98,19 +158,22 @@ impl TciServer {
         let accept_connected = Arc::clone(&connected);
         let accept_client_threads = Arc::clone(&client_threads);
         let accept_demod_params = Arc::clone(&demod_params);
+        let accept_audio_iq = Arc::clone(&audio_iq);
         let thread = thread::spawn(move || {
             while !accept_stop.load(Ordering::Relaxed) {
                 match listener.accept() {
                     Ok((stream, peer)) => {
                         println!("tci: client connected from {peer}");
                         let freq = Arc::clone(&frequency_hz);
+                        let rate = Arc::clone(&sample_rate);
                         let params = Arc::clone(&accept_demod_params);
+                        let audio_iq = Arc::clone(&accept_audio_iq);
                         let conn_mox = Arc::clone(&mox);
                         let conn_stop = Arc::clone(&accept_stop);
                         let conn_connected = Arc::clone(&accept_connected);
                         let handle = thread::spawn(move || {
                             conn_connected.fetch_add(1, Ordering::Relaxed);
-                            handle_client(stream, freq, params, conn_mox, conn_stop);
+                            handle_client(stream, freq, rate, params, audio_iq, conn_mox, conn_stop);
                             conn_connected.fetch_sub(1, Ordering::Relaxed);
                         });
                         let mut threads = accept_client_threads.lock().unwrap();
@@ -127,6 +190,7 @@ impl TciServer {
 
         Ok(Self {
             demod_params,
+            audio_iq,
             stop,
             connected,
             thread: Some(thread),
@@ -141,6 +205,19 @@ impl TciServer {
     /// TCI clients too).
     pub fn set_demod_params(&self, new_demod_params: Arc<Mutex<DemodParams>>) {
         *self.demod_params.lock().unwrap() = new_demod_params;
+    }
+
+    /// Same idea as set_demod_params, for the streaming taps -- a
+    /// SpectrumHandle recreated on a sample-rate change (main.rs's
+    /// change_sample_rate) hands out entirely new audio_out/iq_out
+    /// queues, so any client currently mid-stream needs pointing at
+    /// the new ones or its stream would silently go dead.
+    pub fn set_audio_iq(
+        &self,
+        new_audio_out: Arc<Mutex<VecDeque<f32>>>,
+        new_iq_out: Arc<Mutex<VecDeque<(f32, f32)>>>,
+    ) {
+        *self.audio_iq.lock().unwrap() = AudioIqTaps { audio: new_audio_out, iq: new_iq_out };
     }
 
     /// True while at least one client is currently connected. Callers
@@ -175,7 +252,9 @@ impl Drop for TciServer {
 fn handle_client(
     stream: TcpStream,
     frequency_hz: Arc<AtomicU32>,
+    sample_rate: Arc<AtomicU32>,
     demod_params: DemodParamsCell,
+    audio_iq: AudioIqCell,
     mox: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
 ) {
@@ -189,9 +268,12 @@ fn handle_client(
         }
     };
 
-    // Poll for the stop flag periodically rather than blocking forever
-    // on read().
-    if let Err(e) = ws.get_ref().set_read_timeout(Some(Duration::from_millis(250))) {
+    // Poll frequently enough for real-time audio/IQ streaming to not
+    // feel laggy (previously 250ms, fine for control-only but far too
+    // coarse once this loop is also responsible for pushing streaming
+    // data at roughly this same cadence -- see the streaming sends
+    // below). Still just a read timeout, not a hard latency guarantee.
+    if let Err(e) = ws.get_ref().set_read_timeout(Some(Duration::from_millis(20))) {
         eprintln!("tci: failed to set read timeout: {e}");
     }
 
@@ -204,6 +286,18 @@ fn handle_client(
     let _ = ws.send(Message::Text(
         format!("trx:0,{};", mox.load(Ordering::Relaxed)).into(),
     ));
+
+    // Per-client streaming state -- audio defaults to ON (see below),
+    // IQ defaults to OFF, only enabled by an explicit iq_start. This
+    // asymmetry matches rustyHPSDR's own TCI server (confirmed working
+    // against TCI Remote): it streams audio to any connected client
+    // unconditionally, with no audio_start/audio_stop gate at all, and
+    // only gates iq_start/iq_stop. audio_start/audio_stop are still
+    // handled below (see handle_command) in case a client does send
+    // them -- harmless either way, and keeps this spec-compliant for
+    // any other TCI client that relies on that gate.
+    let mut audio_streaming = true;
+    let mut iq_streaming = false;
 
     while !stop.load(Ordering::Relaxed) {
         match ws.read() {
@@ -219,7 +313,14 @@ fn handle_client(
                     // for already-connected clients too, not just new
                     // ones.
                     let current_params = demod_params.lock().unwrap().clone();
-                    if let Some(response) = handle_command(cmd, &frequency_hz, &current_params, &mox) {
+                    if let Some(response) = handle_command(
+                        cmd,
+                        &frequency_hz,
+                        &current_params,
+                        &mox,
+                        &mut audio_streaming,
+                        &mut iq_streaming,
+                    ) {
                         if ws.send(Message::Text(response.into())).is_err() {
                             return;
                         }
@@ -232,11 +333,129 @@ fn handle_client(
                 if e.kind() == std::io::ErrorKind::WouldBlock
                     || e.kind() == std::io::ErrorKind::TimedOut =>
             {
-                continue;
+                // Falls through to the streaming sends below rather
+                // than `continue`ing past them -- a read timing out
+                // is the NORMAL case for most of this loop's life
+                // (nothing to read most of the time), and streaming
+                // needs to keep flowing on every tick regardless of
+                // whether a text command happened to arrive this
+                // cycle.
             }
             Err(_) => break,
         }
+
+        // Streaming taps re-resolved fresh each tick (not once per
+        // connection) for the same reason current_params is above --
+        // see TciServer::set_audio_iq's doc comment: a sample-rate
+        // change mid-session hands out new queues, and an
+        // already-streaming client needs to follow them, not keep
+        // draining an abandoned queue that will never get new data
+        // again.
+        let taps = audio_iq.lock().unwrap().clone();
+
+        if audio_streaming {
+            let samples: Vec<f32> = {
+                let mut q = taps.audio.lock().unwrap();
+                q.drain(..).collect()
+            };
+            if !samples.is_empty() {
+                // Mono -> stereo: TCI's audio format is stereo (both
+                // the reference client library and rustyHPSDR's own
+                // confirmed-working server always declare channels=2);
+                // this project's RX audio is mono, so duplicate each
+                // sample to both channels.
+                let stereo: Vec<(f32, f32)> = samples.into_iter().map(|s| (s, s)).collect();
+                let msg = encode_binary_message(
+                    0,
+                    TCI_AUDIO_SAMPLE_RATE,
+                    BinaryMessageType::RxAudioStream,
+                    &stereo,
+                );
+                if ws.send(Message::Binary(msg.into())).is_err() {
+                    return;
+                }
+            }
+        }
+
+        if iq_streaming {
+            let pairs: Vec<(f32, f32)> = {
+                let mut q = taps.iq.lock().unwrap();
+                q.drain(..).collect()
+            };
+            if !pairs.is_empty() {
+                // Q before I -- confirmed against rustyHPSDR's own
+                // working IQ streaming code, which swaps this
+                // explicitly ("SWAP: Push Q then I"), not I before Q
+                // as would be the naive/obvious order.
+                let swapped: Vec<(f32, f32)> = pairs.into_iter().map(|(i, q)| (q, i)).collect();
+                let msg = encode_binary_message(
+                    0,
+                    sample_rate.load(Ordering::Relaxed),
+                    BinaryMessageType::IqStream,
+                    &swapped,
+                );
+                if ws.send(Message::Binary(msg.into())).is_err() {
+                    return;
+                }
+            }
+        }
     }
+}
+
+/// RX audio's fixed output rate -- must match spectrum.rs's own
+/// OUTPUT_RATE (not imported directly since that constant is private
+/// to that module and this is the only other place that needs it).
+/// Lines up exactly with TCI's own AudioSampleRate48k, one of only
+/// four rates (8k/12k/24k/48k) the protocol defines for audio.
+const TCI_AUDIO_SAMPLE_RATE: u32 = 48_000;
+
+/// TCI's binary streaming message types -- numeric values confirmed
+/// against BOTH github.com/ftl/tci and rustyHPSDR's own TCIStreamType
+/// enum (rustyHPSDR's is the stronger reference here: it's confirmed
+/// actually working against TCI Remote, the exact client this was
+/// written for). TX_AUDIO_STREAM/TX_CHRONO (a client sending TX audio
+/// back to the radio) aren't implemented, so aren't listed here.
+enum BinaryMessageType {
+    IqStream = 0,
+    RxAudioStream = 1,
+}
+
+/// Encodes one TCI binary streaming message: a fixed 64-byte
+/// little-endian header, then `frames` interleaved sample pairs as
+/// little-endian f32 (so `frames.len()` samples per channel, 2*
+/// `frames.len()` floats total). Header layout and field values
+/// confirmed against rustyHPSDR's own TCI server
+/// (~/github/rustyHPSDR/src/tci/mod.rs), which is proven working
+/// against TCI Remote -- this replaced an earlier version based on
+/// github.com/ftl/tci (a third-party client library, not confirmed
+/// against this specific app) that had it subtly wrong: Format=4
+/// instead of 3, no explicit `channels` field (rustyHPSDR always
+/// declares stereo, channels=2), 9 reserved u32s instead of 8, and
+/// `length` as total float count instead of frame-pair count.
+/// `trx` is always 0 here -- rigctl/TCI only ever expose the primary
+/// receiver (see spawn_extra_receiver and TciServer's own module
+/// note), so there's no second index to send.
+fn encode_binary_message(
+    trx: u32,
+    sample_rate: u32,
+    msg_type: BinaryMessageType,
+    frames: &[(f32, f32)],
+) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(64 + frames.len() * 8);
+    buf.extend_from_slice(&trx.to_le_bytes());
+    buf.extend_from_slice(&sample_rate.to_le_bytes());
+    buf.extend_from_slice(&3u32.to_le_bytes()); // Format: float32
+    buf.extend_from_slice(&0u32.to_le_bytes()); // Codec: uncompressed
+    buf.extend_from_slice(&0u32.to_le_bytes()); // CRC: unused
+    buf.extend_from_slice(&(frames.len() as u32).to_le_bytes()); // length: frame-pair count, not float count
+    buf.extend_from_slice(&(msg_type as u32).to_le_bytes());
+    buf.extend_from_slice(&2u32.to_le_bytes()); // channels: always stereo
+    buf.extend_from_slice(&[0u8; 32]); // Reserved: 8 * u32
+    for (a, b) in frames {
+        buf.extend_from_slice(&a.to_le_bytes());
+        buf.extend_from_slice(&b.to_le_bytes());
+    }
+    buf
 }
 
 /// Returns Some(response-to-send) for recognized commands, or None to
@@ -247,6 +466,8 @@ fn handle_command(
     frequency_hz: &Arc<AtomicU32>,
     demod_params: &Arc<Mutex<DemodParams>>,
     mox: &Arc<AtomicBool>,
+    audio_streaming: &mut bool,
+    iq_streaming: &mut bool,
 ) -> Option<String> {
     let mut parts = cmd.splitn(2, ':');
     let name = parts.next().unwrap_or("").to_lowercase();
@@ -280,6 +501,30 @@ fn handle_command(
             let on = matches!(args.get(1), Some(&"true") | Some(&"1"));
             mox.store(on, Ordering::Relaxed);
             Some(format!("trx:{},{};", args.first().unwrap_or(&"0"), on))
+        }
+        // audio_start:receiver; / audio_stop:receiver; -- fire-and-
+        // forget, no reply (confirmed against the reference: these are
+        // sent as commands, not requests). Receiver index itself is
+        // ignored -- only the primary receiver is ever exposed here
+        // (see this file's module note), so there's nothing to
+        // distinguish.
+        "audio_start" => {
+            *audio_streaming = true;
+            None
+        }
+        "audio_stop" => {
+            *audio_streaming = false;
+            None
+        }
+        // iq_start:receiver; / iq_stop:receiver; -- same reasoning as
+        // audio_start/stop above.
+        "iq_start" => {
+            *iq_streaming = true;
+            None
+        }
+        "iq_stop" => {
+            *iq_streaming = false;
+            None
         }
         _ => None,
     }

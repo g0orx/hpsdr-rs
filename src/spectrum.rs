@@ -354,6 +354,14 @@ impl Default for DemodParams {
 // correcting. A small cap bounds worst-case audio delay directly.
 const AUDIO_BUFFER_CAPACITY: usize = 14_400;
 
+// Same "small, bounded, drop-oldest" reasoning as AUDIO_BUFFER_CAPACITY
+// above -- a TCI client that isn't draining fast enough (or isn't
+// streaming at all) shouldn't cause unbounded growth here. Sized more
+// generously than the audio buffer since this carries raw wideband IQ,
+// which can be at a much higher rate than the fixed 48kHz audio output
+// (up to whatever the receiver's actual sample rate is).
+const IQ_OUT_CAPACITY: usize = 200_000;
+
 struct SpectrumAnalyzer {
     channel: i32,
     iq_scratch: Vec<f64>,
@@ -880,6 +888,8 @@ fn run(
     display: Arc<Mutex<SpectrumDisplay>>,
     demod_params: Arc<Mutex<DemodParams>>,
     audio_out: Arc<Mutex<VecDeque<f32>>>,
+    tci_audio_out: Arc<Mutex<VecDeque<f32>>>,
+    iq_out: Arc<Mutex<VecDeque<(f32, f32)>>>,
     stop: Arc<AtomicBool>,
 ) {
     let mut analyzer = SpectrumAnalyzer::open(channel, sample_rate);
@@ -897,6 +907,23 @@ fn run(
         if chunk.len() < BUFFER_SIZE {
             thread::sleep(Duration::from_millis(5));
             continue;
+        }
+
+        // Raw wideband IQ tap for TCI's iq_start streaming -- a
+        // dedicated copy, not a second reader of iq_buffer (which
+        // this loop already drains via .drain() above; a second
+        // consumer popping the same queue would steal samples from
+        // this one instead of getting its own copy). Same
+        // normalization already used elsewhere in this file (IQ_NORM
+        // = 2^23).
+        {
+            let mut out = iq_out.lock().unwrap();
+            for s in &chunk {
+                if out.len() >= IQ_OUT_CAPACITY {
+                    out.pop_front();
+                }
+                out.push_back((s.i as f32 / IQ_NORM as f32, s.q as f32 / IQ_NORM as f32));
+            }
         }
 
         let (spectrum, waterfall) = analyzer.feed(&chunk);
@@ -921,12 +948,22 @@ fn run(
         display.lock().unwrap().meter_db = meter_db;
         {
             let mut out = audio_out.lock().unwrap();
+            // Dedicated tap for TCI's audio_start streaming -- same
+            // reasoning as iq_out above: audio_out is already drained
+            // by the local AudioOutput speaker playback, so TCI needs
+            // its own copy rather than a second reader of that same
+            // queue (which would steal samples from local playback).
+            let mut tci_out = tci_audio_out.lock().unwrap();
             for sample in audio {
                 let sample = (sample * params.gain).clamp(-1.0, 1.0);
                 if out.len() >= AUDIO_BUFFER_CAPACITY {
                     out.pop_front();
                 }
                 out.push_back(sample);
+                if tci_out.len() >= AUDIO_BUFFER_CAPACITY {
+                    tci_out.pop_front();
+                }
+                tci_out.push_back(sample);
             }
         }
     }
@@ -938,6 +975,14 @@ fn run(
 pub struct SpectrumHandle {
     pub display: Arc<Mutex<SpectrumDisplay>>,
     pub audio_out: Arc<Mutex<VecDeque<f32>>>,
+    /// Dedicated audio tap for TCI's audio_start streaming -- NOT the
+    /// same queue as audio_out (which the local AudioOutput speaker
+    /// playback already drains); see run()'s doc comment on why a
+    /// second consumer of that same queue would glitch both.
+    pub tci_audio_out: Arc<Mutex<VecDeque<f32>>>,
+    /// Raw wideband IQ tap for TCI's iq_start streaming, normalized
+    /// the same way this file normalizes IQ elsewhere (IQ_NORM).
+    pub iq_out: Arc<Mutex<VecDeque<(f32, f32)>>>,
     demod_params: Arc<Mutex<DemodParams>>,
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
@@ -948,17 +993,35 @@ impl SpectrumHandle {
         let display = Arc::new(Mutex::new(SpectrumDisplay::default()));
         let demod_params = Arc::new(Mutex::new(DemodParams::default()));
         let audio_out = Arc::new(Mutex::new(VecDeque::with_capacity(AUDIO_BUFFER_CAPACITY)));
+        let tci_audio_out = Arc::new(Mutex::new(VecDeque::with_capacity(AUDIO_BUFFER_CAPACITY)));
+        let iq_out = Arc::new(Mutex::new(VecDeque::with_capacity(IQ_OUT_CAPACITY)));
         let stop = Arc::new(AtomicBool::new(false));
         let thread = {
             let display = Arc::clone(&display);
             let demod_params = Arc::clone(&demod_params);
             let audio_out = Arc::clone(&audio_out);
+            let tci_audio_out = Arc::clone(&tci_audio_out);
+            let iq_out = Arc::clone(&iq_out);
             let stop = Arc::clone(&stop);
-            thread::spawn(move || run(channel, iq_buffer, sample_rate, display, demod_params, audio_out, stop))
+            thread::spawn(move || {
+                run(
+                    channel,
+                    iq_buffer,
+                    sample_rate,
+                    display,
+                    demod_params,
+                    audio_out,
+                    tci_audio_out,
+                    iq_out,
+                    stop,
+                )
+            })
         };
         Self {
             display,
             audio_out,
+            tci_audio_out,
+            iq_out,
             demod_params,
             stop,
             thread: Some(thread),
