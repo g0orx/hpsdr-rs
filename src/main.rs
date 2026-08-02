@@ -286,8 +286,9 @@ struct ConnectedState {
     /// user corrects it in Settings -> TX, so each physical radio
     /// remembers its own real limit from then on.
     max_tx_power_watts: u32,
-    /// TX Power (%, of max_tx_power_watts) used while tuning, instead
-    /// of the normal TX Power slider -- see Config::tune_power_percent.
+    /// TX Power used while tuning, as a percentage of whatever the TX
+    /// Power slider was set to when TUNE was pressed (pre_tune_power_watts
+    /// below) -- see Config::tune_power_percent.
     tune_power_percent: u32,
     /// Whether the Tune button is currently engaged -- transient, not
     /// persisted. See the main-panel Tune button handler for the full
@@ -897,26 +898,26 @@ impl eframe::App for HpsdrApp {
                             // slider already could.
                             ui.add_space(12.0);
                             ui.label("TX Power:");
-                            // Disabled while Tune is active -- the atomic
-                            // is temporarily holding the reduced tune
-                            // wattage (see the Tune button handler), so
-                            // this still shows the right number, it just
-                            // can't be perturbed mid-tune.
-                            ui.add_enabled_ui(!connected.tune_active, |ui| {
-                                let mut watts =
-                                    connected.session.tx_power_watts.load(Ordering::Relaxed) as i32;
-                                if scroll_slider_i32(
-                                    ui,
-                                    &mut connected.slider_scroll_accum,
-                                    &mut watts,
-                                    0..=connected.max_tx_power_watts as i32,
-                                    1,
-                                    "W",
-                                ) {
-                                    connected.session.tx_power_watts.store(watts as u32, Ordering::Relaxed);
-                                    settings_changed = true;
-                                }
-                            });
+                            // Adjustable during Tune too, not just
+                            // normal TX -- Tune Power only sets the
+                            // starting reduced level when TUNE is
+                            // pressed (see the Tune button handler), it
+                            // doesn't keep re-enforcing a ratio, so
+                            // adjusting here works exactly like normal
+                            // operation while tuning.
+                            let mut watts =
+                                connected.session.tx_power_watts.load(Ordering::Relaxed) as i32;
+                            if scroll_slider_i32(
+                                ui,
+                                &mut connected.slider_scroll_accum,
+                                &mut watts,
+                                0..=connected.max_tx_power_watts as i32,
+                                1,
+                                "W",
+                            ) {
+                                connected.session.tx_power_watts.store(watts as u32, Ordering::Relaxed);
+                                settings_changed = true;
+                            }
                         }
                     });
 
@@ -1092,8 +1093,18 @@ impl eframe::App for HpsdrApp {
                                     }
                                     connected.tune_active = false;
                                 } else {
-                                    connected.pre_tune_power_watts =
-                                        Some(connected.session.tx_power_watts.load(Ordering::Relaxed));
+                                    let current_watts =
+                                        connected.session.tx_power_watts.load(Ordering::Relaxed);
+                                    connected.pre_tune_power_watts = Some(current_watts);
+                                    // Applied once, as a safety-reduced
+                                    // starting point -- NOT continuously
+                                    // re-enforced, so the TX Power slider
+                                    // stays fully adjustable during tune
+                                    // (see below, no more add_enabled_ui
+                                    // wrapper) rather than fighting a
+                                    // per-frame override.
+                                    let tune_watts = current_watts * connected.tune_power_percent / 100;
+                                    connected.session.tx_power_watts.store(tune_watts, Ordering::Relaxed);
                                     if let Some(tx) = &connected.tx_handle {
                                         tx.set_tune(true);
                                     }
@@ -1116,17 +1127,6 @@ impl eframe::App for HpsdrApp {
                                     connected.session.tx_power_watts.store(prev, Ordering::Relaxed);
                                 }
                                 connected.tune_active = false;
-                            }
-
-                            // Kept live (not just set once on click) so
-                            // adjusting the Tune Power slider (Settings
-                            // -> TX) while already tuning takes effect
-                            // immediately instead of only on the next
-                            // TUNE off/on cycle.
-                            if connected.tune_active {
-                                let tune_watts =
-                                    connected.max_tx_power_watts * connected.tune_power_percent / 100;
-                                connected.session.tx_power_watts.store(tune_watts, Ordering::Relaxed);
                             }
 
                             // Spacebar: hold-to-talk, the traditional
@@ -1161,7 +1161,6 @@ impl eframe::App for HpsdrApp {
                             if mox_now {
                                 ui.colored_label(egui::Color32::from_rgb(210, 50, 50), "TRANSMITTING");
                             }
-                            ui.weak("(or hold Space, or rigctl/TCI)");
                         });
                     }
 
@@ -1325,7 +1324,7 @@ impl eframe::App for HpsdrApp {
                             egui::pos2(x + 2.0, rect.bottom() - 2.0),
                             egui::Align2::LEFT_BOTTOM,
                             format_khz(tick_freq_hz),
-                            egui::FontId::monospace(10.0),
+                            egui::FontId::monospace(13.0),
                             egui::Color32::GRAY,
                         );
                     }
@@ -1335,8 +1334,9 @@ impl eframe::App for HpsdrApp {
 
                         // Reserve space at the bottom for the frequency
                         // axis labels drawn there, so the trace/gridlines
-                        // never overdraw them.
-                        const FREQ_AXIS_MARGIN: f32 = 16.0;
+                        // never overdraw them. Sized for the 13.0 font
+                        // above, not just the older/smaller 10.0.
+                        const FREQ_AXIS_MARGIN: f32 = 20.0;
                         let plot_bottom = rect.bottom() - FREQ_AXIS_MARGIN;
                         let plot_height = plot_bottom - rect.top();
 
@@ -2104,13 +2104,6 @@ impl eframe::App for HpsdrApp {
                                             settings_changed = true;
                                         }
                                     });
-                                    ui.weak(
-                                        "The radio only reports its board type, not the specific \
-                                         model or its actual max output -- e.g. Orion2 covers both \
-                                         a 100W ANAN-100D and a 200W ANAN-8000DLE. Set this to \
-                                         match your actual radio; it's remembered per-radio from \
-                                         here on.",
-                                    );
                                     ui.add_space(8.0);
 
                                     ui.horizontal(|ui| {
@@ -2128,11 +2121,6 @@ impl eframe::App for HpsdrApp {
                                             settings_changed = true;
                                         }
                                     });
-                                    ui.weak(
-                                        "Percentage of Max TX Power used by the main panel's \
-                                         TUNE button -- a fixed safety ceiling for antenna/PA \
-                                         tuning, independent of your normal TX Power setting.",
-                                    );
                                     ui.add_space(8.0);
 
                                     let mut tx_enabled = connected.tx_enabled;
@@ -2193,27 +2181,6 @@ impl eframe::App for HpsdrApp {
                                         settings_changed = true;
                                     }
 
-                                    if connected.tx_enabled {
-                                        ui.separator();
-                                        if let Some(tx) = &connected.tx_handle {
-                                            let disp = *tx.display.lock().unwrap();
-                                            ui.label(format!(
-                                                "Mic level: {:.3}    ALC: {:.1}",
-                                                disp.mic_pk, disp.alc_av
-                                            ));
-                                            ui.weak(
-                                                "(mic level/ALC units aren't confirmed against a \
-                                                 reference -- treat as relative, not calibrated)",
-                                            );
-                                            ui.weak("Mic gain and TX Drive are on the main panel now.");
-                                        }
-                                        ui.add_space(4.0);
-                                        ui.weak(
-                                            "PTT: hold the TX button on the main panel, or send \
-                                             rigctl \\set_ptt / TCI trx.",
-                                        );
-                                    }
-
                                     // Used by both protocols -- see
                                     // radio::drive_byte_for_watts. Neither
                                     // protocol's raw drive byte tracks
@@ -2225,16 +2192,6 @@ impl eframe::App for HpsdrApp {
                                     ui.add_space(8.0);
                                     ui.separator();
                                     ui.label("PA Calibration");
-                                    ui.weak(
-                                        "Per-band PA gain (dB), used to convert the main \
-                                         panel's TX Power (W) target into the radio's actual \
-                                         drive byte. Key up into a dummy load at a known TX \
-                                         Power on each band, measure actual output with a \
-                                         wattmeter, and raise/lower that band's gain until the \
-                                         reading matches -- higher gain means less drive for \
-                                         the same target power. Bands you haven't calibrated \
-                                         stay at the uncalibrated default.",
-                                    );
                                     ui.add_space(4.0);
                                     for band in &BANDS {
                                         let mut gain_db = connected
@@ -3027,7 +2984,7 @@ fn render_extra_receiver_ui(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceiver>>) {
             egui::pos2(x + 2.0, rect.bottom() - 2.0),
             egui::Align2::LEFT_BOTTOM,
             format_khz(tick_freq_hz),
-            egui::FontId::monospace(10.0),
+            egui::FontId::monospace(13.0),
             egui::Color32::GRAY,
         );
     }
@@ -3052,7 +3009,8 @@ fn render_extra_receiver_ui(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceiver>>) {
 
         // Reserve space at the bottom for the frequency axis labels
         // drawn there, so the trace/gridlines never overdraw them.
-        const FREQ_AXIS_MARGIN: f32 = 16.0;
+        // Sized for the 13.0 font above, not just the older/smaller 10.0.
+        const FREQ_AXIS_MARGIN: f32 = 20.0;
         let plot_bottom = rect.bottom() - FREQ_AXIS_MARGIN;
         let plot_height = plot_bottom - rect.top();
 

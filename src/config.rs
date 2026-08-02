@@ -86,12 +86,11 @@ pub struct Config {
     /// Orion2). Missing (e.g. never set, or configs saved before this
     /// existed) falls back to main.rs's default_max_tx_power_watts.
     pub max_tx_power_watts: Option<u32>,
-    /// TX Power (%, of max_tx_power_watts) used while the Tune button
-    /// is active, instead of the normal TX Power slider -- a fixed
-    /// safety ceiling for antenna-tuner/PA tuning, not derived from
-    /// whatever the normal TX Power slider happens to be set to.
-    /// Matches piHPSDR's separate tune_drive setting. Missing falls
-    /// back to a conservative 20%.
+    /// TX Power used while the Tune button is active, as a percentage
+    /// of whatever the TX Power slider was set to at the moment TUNE
+    /// was pressed (main.rs's pre_tune_power_watts) -- scales with
+    /// your normal operating power rather than being a fixed ceiling.
+    /// Missing falls back to a conservative 20%.
     pub tune_power_percent: Option<u32>,
     /// Spectrum/waterfall display range while transmitting -- separate
     /// from db_low/db_high/waterfall_db_low/waterfall_db_high (which
