@@ -17,7 +17,7 @@
     at reduced drive before ever keying into an antenna.
 */
 
-use crate::discovery::Device;
+use crate::discovery::{Boards, Device};
 use std::collections::VecDeque;
 use std::io;
 use std::net::UdpSocket;
@@ -369,6 +369,7 @@ fn start_protocol1(
                 DEFAULT_PA_GAIN_DB, // irrelevant while not transmitting (drive forced to 0 above)
                 settings.sample_rate,
                 false, // mox: never keyed during startup config
+                matches!(device.board, Boards::HermesLite | Boards::HermesLite2),
                 &tx_iq,
             );
             socket.send(&packet)?;
@@ -406,6 +407,7 @@ fn start_protocol1(
     let sender_receivers = settings.receivers.max(1);
     let sender_tx_power_watts = Arc::clone(&tx_power_watts);
     let sender_pa_gain_db = Arc::clone(&pa_gain_db);
+    let sender_is_hermes_lite = matches!(device.board, Boards::HermesLite | Boards::HermesLite2);
     let sender_thread = thread::spawn(move || {
         sender_loop(
             sender_socket,
@@ -417,6 +419,7 @@ fn start_protocol1(
             sender_antenna,
             sender_tx_power_watts,
             sender_pa_gain_db,
+            sender_is_hermes_lite,
             sender_stop,
         );
     });
@@ -599,6 +602,7 @@ fn p1_build_packet(
     pa_gain_db: f32,
     sample_rate_hz: u32,
     mox_on: bool,
+    is_hermes_lite: bool,
     tx_iq: &Mutex<VecDeque<f32>>,
 ) -> [u8; PACKET_SIZE] {
     // MOX/PTT bit: inferred to be C0's bit 0 on both frames, based
@@ -688,15 +692,64 @@ fn p1_build_packet(
             } else {
                 0x00
             };
-            (0x12, c1, 0x00, 0x00, 0x00)
+            // HermesLite/HermesLite2's REAL PA-enable mechanism,
+            // confirmed against piHPSDR's old_protocol.c (case 3,
+            // the DEVICE_HERMES_LITE2 block): C2 bit 3 (0x08) is what
+            // actually enables the PA on this board -- NOT the C4
+            // byte in command 0x14 below (an earlier attempt touched
+            // that instead, based on a DIFFERENT HL2-specific block
+            // in the same reference for command 0x14; both blocks
+            // are real, but 0x14's C4 controls an extended RX-gain
+            // range, not PA enable, so it alone didn't fix TX output).
+            // C2/C3/C4 are also explicitly zeroed for HL2 here
+            // (piHPSDR's comment: "do not set any Apollo/Alex bits"),
+            // since those bits mean something else on this board than
+            // on standard Hermes-family hardware. Sent unconditionally
+            // (not gated on mox_on) to match how this board's PA
+            // enable works in the reference (a persistent "PA
+            // enabled" mode, not a per-transmission key) and this
+            // project's existing P2 "enable PA" fix, which is also
+            // unconditional.
+            let (c2, c3, c4) = if is_hermes_lite { (0x08, 0x00, 0x00) } else { (0x00, 0x00, 0x00) };
+            (0x12, c1, c2, c3, c4)
         }
         4 => {
-            // Mic bias/PTT-source config (C1) and RX attenuation
-            // (C4). No mic bias/PTT-source settings tracked --
-            // C1=0. Attenuation fixed at 0 (0x20 = the "standard,
-            // non-HermesLite" attenuation-enable pattern with a
-            // 0dB value) -- no per-band attenuation table here yet.
-            (0x14, 0x00, 0x00, 0x00, 0x20)
+            // Mic bias/PTT-source config (C1) and RX
+            // attenuation/PA-enable (C4). No mic bias/PTT-source
+            // settings tracked -- C1=0.
+            //
+            // ROOT CAUSE FIX, confirmed against piHPSDR's
+            // old_protocol.c: C4 was previously hardcoded to 0x20
+            // (the RX-only attenuator pattern) UNCONDITIONALLY, never
+            // varying with mox_on at all -- meaning the PA was never
+            // actually enabled for TX on Protocol 1, for ANY board,
+            // regardless of a correctly-computed drive level (command
+            // 3's C1 byte). This is what "TX Power set to max, MOX/
+            // Tune asserted, but 0W out" was actually caused by.
+            //
+            // Standard (non-HermesLite) boards: piHPSDR sends 0x20 |
+            // attenuation while receiving, but 0x3F (all attenuator
+            // bits set) while transmitting -- that all-1s pattern is
+            // what actually enables the PA, not a real attenuation
+            // value. No per-band attenuation table here yet, so the
+            // RX case simplifies to the fixed 0x20 (0dB) already used.
+            //
+            // HermesLite/HermesLite2 repurpose this byte entirely:
+            // bit 6 (0x40) must always be set, with bits 0-5 as an
+            // extended RX gain value (0-60) this project has no UI
+            // for yet, left at 0 -- which happens to exactly match
+            // what piHPSDR itself forces RX gain to while
+            // transmitting with the PA enabled, so this simplification
+            // costs nothing on TX and is a reasonable "no extra RX
+            // gain boost" default otherwise.
+            let c4: u8 = if is_hermes_lite {
+                0x40
+            } else if mox_on {
+                0x3F
+            } else {
+                0x20
+            };
+            (0x14, 0x00, 0x00, 0x00, c4)
         }
         5 => {
             // CW keyer settings -- this project has no CW keyer,
@@ -755,11 +808,31 @@ fn sender_loop(
     antenna: Arc<AtomicU32>,
     tx_power_watts: Arc<AtomicU32>,
     pa_gain_db: Arc<AtomicU32>,
+    is_hermes_lite: bool,
     stop: Arc<AtomicBool>,
 ) {
     let mut seq: u32 = 0;
     let mut ozy_command: u8 = 1;
     let mut current_receiver: u8 = 0;
+
+    // Absolute-deadline pacing, not `thread::sleep(interval)` computed
+    // fresh each iteration (which this loop used until now) -- same
+    // fix, same reasoning, as p2_tx_iq_loop's own next_send (see its
+    // doc comment for the full explanation): relative sleep-based
+    // pacing lets any one iteration's jitter (packet-build time,
+    // socket.send() time, OS scheduling contention with this
+    // process's several other real-time-ish threads) get permanently
+    // baked into every later send's timing rather than corrected on
+    // the next one. This loop carries P1's TX IQ (fill_tx_payload
+    // pulls from the same tx_iq queue tx.rs produces into) as well as
+    // RX control, so drifting send timing here doesn't just risk a
+    // late control update -- it corrupts the TX IQ stream's actual
+    // timing, which for a radio whose DAC expects a steady sample
+    // clock is exactly the kind of transport-level jitter that shows
+    // up as broadband splatter identical regardless of the underlying
+    // audio content (matching a report of the same wide/splattering
+    // signal from both WDSP's own Tune tone and WSJT-X's).
+    let mut next_send = Instant::now();
 
     while !stop.load(Ordering::Relaxed) {
         let current_rate = sample_rate.load(Ordering::Relaxed);
@@ -782,6 +855,7 @@ fn sender_loop(
             f32::from_bits(pa_gain_db.load(Ordering::Relaxed)),
             current_rate,
             mox_on,
+            is_hermes_lite,
             &tx_iq,
         );
 
@@ -790,7 +864,17 @@ fn sender_loop(
         }
 
         seq = seq.wrapping_add(1);
-        thread::sleep(interval);
+
+        next_send += interval;
+        let now = Instant::now();
+        if next_send > now {
+            thread::sleep(next_send - now);
+        } else {
+            // Fell behind real time -- resync to now rather than
+            // bursting several packets back-to-back to "catch up",
+            // same reasoning as p2_tx_iq_loop's own fallback.
+            next_send = now;
+        }
     }
 }
 
