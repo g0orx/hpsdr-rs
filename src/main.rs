@@ -175,6 +175,9 @@ struct ExtraReceiver {
     waterfall_db_low: f32,
     waterfall_db_high: f32,
     waterfall_palette: Palette,
+    /// See ConnectedState::spectrum_waterfall_ratio's doc comment --
+    /// same thing, per extra receiver instead of shared.
+    spectrum_waterfall_ratio: f32,
     show_settings_window: bool,
     settings_tab: SettingsTab,
     /// Shared with ConnectedState -- any control here that changes a
@@ -223,6 +226,10 @@ struct ConnectedState {
     tx_waterfall_db_low: f32,
     tx_waterfall_db_high: f32,
     waterfall_palette: Palette,
+    /// Spectrum's share (0.0-1.0) of the combined spectrum+waterfall
+    /// height, adjustable via the drag handle between them -- see
+    /// Config::spectrum_waterfall_ratio's doc comment.
+    spectrum_waterfall_ratio: f32,
     slider_scroll_accum: f32,
     show_settings_window: bool,
     settings_tab: SettingsTab,
@@ -562,6 +569,9 @@ impl eframe::App for HpsdrApp {
                                     .tx_waterfall_db_high
                                     .unwrap_or(cfg.waterfall_db_high.unwrap_or(-60.0) + 60.0),
                                 waterfall_palette: cfg.waterfall_palette.unwrap_or(Palette::Ocean),
+                                spectrum_waterfall_ratio: cfg
+                                    .spectrum_waterfall_ratio
+                                    .unwrap_or(150.0 / 350.0),
                                 slider_scroll_accum: 0.0,
                                 show_settings_window: false,
                                 settings_tab: SettingsTab::Agc,
@@ -1164,7 +1174,22 @@ impl eframe::App for HpsdrApp {
                         });
                     }
 
-                    let spectrum_height = 150.0;
+                    // Split the window's remaining vertical space between
+                    // the spectrum and waterfall, according to
+                    // connected.spectrum_waterfall_ratio (adjustable via
+                    // the drag handle between them, see
+                    // spectrum_waterfall_divider) -- so they grow with
+                    // the window instead of leaving empty space below a
+                    // fixed size. Reserve room for the gap+Stop button
+                    // below the waterfall first, since available_height()
+                    // here is everything down to the bottom of the
+                    // panel, not just what's free for the spectrum alone.
+                    let stop_button_reserve =
+                        ui.spacing().interact_size.y + 8.0 + SPECTRUM_WATERFALL_DIVIDER_HEIGHT;
+                    let spectrum_waterfall_height =
+                        (ui.available_height() - stop_button_reserve).max(200.0);
+                    let spectrum_height =
+                        (spectrum_waterfall_height * connected.spectrum_waterfall_ratio).max(80.0);
                     let (rect, spectrum_resp) = ui.allocate_exact_size(
                         egui::vec2(ui.available_width(), spectrum_height),
                         egui::Sense::click(),
@@ -1393,8 +1418,14 @@ impl eframe::App for HpsdrApp {
                         draw_freq_hover_tooltip(ui.painter(), pos, hover_freq);
                     }
 
-                    ui.add_space(8.0);
-                    let waterfall_height = 200.0;
+                    if spectrum_waterfall_divider(
+                        ui,
+                        &mut connected.spectrum_waterfall_ratio,
+                        spectrum_waterfall_height,
+                    ) {
+                        settings_changed = true;
+                    }
+                    let waterfall_height = (spectrum_waterfall_height - spectrum_height).max(80.0);
                     let (rect, waterfall_click_resp) = ui.allocate_exact_size(
                         egui::vec2(ui.available_width(), waterfall_height),
                         egui::Sense::click(),
@@ -2257,6 +2288,7 @@ impl eframe::App for HpsdrApp {
                                 waterfall_db_low: rx.waterfall_db_low,
                                 waterfall_db_high: rx.waterfall_db_high,
                                 waterfall_palette: rx.waterfall_palette,
+                                spectrum_waterfall_ratio: rx.spectrum_waterfall_ratio,
                                 adc: rx.adc.load(std::sync::atomic::Ordering::Relaxed) as u8,
                                 band_settings: rx.band_memory.clone(),
                                 width_memory: rx.width_memory.clone(),
@@ -2293,6 +2325,7 @@ impl eframe::App for HpsdrApp {
                         tx_waterfall_db_low: Some(connected.tx_waterfall_db_low),
                         tx_waterfall_db_high: Some(connected.tx_waterfall_db_high),
                         waterfall_palette: Some(connected.waterfall_palette),
+                        spectrum_waterfall_ratio: Some(connected.spectrum_waterfall_ratio),
                         adc: Some(connected.session.adc.load(std::sync::atomic::Ordering::Relaxed) as u8),
                         antenna: Some(
                             connected.session.antenna.load(std::sync::atomic::Ordering::Relaxed) as u8,
@@ -2350,6 +2383,53 @@ impl eframe::App for HpsdrApp {
 /// Compact axis-label format, e.g. 7,100,000 Hz -> "7100.0k".
 fn format_khz(hz: f64) -> String {
     format!("{:.1}k", hz / 1000.0)
+}
+
+/// Height of the draggable divider between the spectrum and waterfall
+/// displays -- replaces the plain ui.add_space() that used to sit
+/// there, so it doesn't add extra vertical space on top of it.
+const SPECTRUM_WATERFALL_DIVIDER_HEIGHT: f32 = 8.0;
+
+/// Draggable divider between the spectrum and waterfall displays.
+/// Updates `ratio` (spectrum's share of their combined height, see
+/// Config::spectrum_waterfall_ratio's doc comment) from vertical drag
+/// delta, clamped so neither pane can be dragged down to nothing.
+/// `combined_pane_height` is spectrum_height + waterfall_height as
+/// used by the caller (i.e. excluding this divider's own height) --
+/// needed to convert a pixel drag delta into a ratio delta. Returns
+/// true if the ratio actually changed this frame, so callers can flag
+/// settings_changed/settings_dirty the same way every other
+/// interactive control here does.
+fn spectrum_waterfall_divider(ui: &mut egui::Ui, ratio: &mut f32, combined_pane_height: f32) -> bool {
+    let (rect, resp) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width(), SPECTRUM_WATERFALL_DIVIDER_HEIGHT),
+        egui::Sense::drag(),
+    );
+    let mut changed = false;
+    if resp.dragged() && combined_pane_height > 1.0 {
+        let new_ratio =
+            (*ratio + resp.drag_delta().y / combined_pane_height).clamp(0.15, 0.85);
+        if new_ratio != *ratio {
+            *ratio = new_ratio;
+            changed = true;
+        }
+    }
+    if resp.hovered() || resp.dragged() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeVertical);
+    }
+    let color = if resp.dragged() {
+        egui::Color32::from_gray(200)
+    } else if resp.hovered() {
+        egui::Color32::from_gray(150)
+    } else {
+        egui::Color32::from_gray(70)
+    };
+    let mid_y = rect.center().y;
+    ui.painter().line_segment(
+        [egui::pos2(rect.left() + 4.0, mid_y), egui::pos2(rect.right() - 4.0, mid_y)],
+        egui::Stroke::new(2.0, color),
+    );
+    changed
 }
 
 /// Small frequency readout drawn next to the mouse cursor while
@@ -2914,7 +2994,15 @@ fn render_extra_receiver_ui(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceiver>>) {
 
     ui.add_space(4.0);
     ui.label("Spectrum");
-    let spectrum_height = 150.0;
+    // Split the window's remaining vertical space between the spectrum
+    // and waterfall, according to rx.spectrum_waterfall_ratio
+    // (adjustable via the drag handle between them) -- see the main
+    // receiver's own version of this for the full reasoning. Nothing
+    // else is rendered below the waterfall in this window, so no
+    // reserve is needed here (unlike the main receiver's Stop button).
+    let spectrum_waterfall_height =
+        (ui.available_height() - SPECTRUM_WATERFALL_DIVIDER_HEIGHT).max(200.0);
+    let spectrum_height = (spectrum_waterfall_height * rx.spectrum_waterfall_ratio).max(80.0);
     let (rect, spectrum_resp) = ui.allocate_exact_size(
         egui::vec2(ui.available_width(), spectrum_height),
         egui::Sense::click(),
@@ -3060,8 +3148,10 @@ fn render_extra_receiver_ui(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceiver>>) {
         draw_freq_hover_tooltip(ui.painter(), pos, hover_freq);
     }
 
-    ui.add_space(4.0);
-    let waterfall_height = 200.0;
+    if spectrum_waterfall_divider(ui, &mut rx.spectrum_waterfall_ratio, spectrum_waterfall_height) {
+        rx.settings_dirty.store(true, Ordering::Relaxed);
+    }
+    let waterfall_height = (spectrum_waterfall_height - spectrum_height).max(80.0);
     let (wf_rect, wf_resp) = ui.allocate_exact_size(
         egui::vec2(ui.available_width(), waterfall_height),
         egui::Sense::click(),
@@ -3428,6 +3518,7 @@ fn spawn_extra_receiver(
         waterfall_db_low: saved.map(|s| s.waterfall_db_low).unwrap_or(-140.0),
         waterfall_db_high: saved.map(|s| s.waterfall_db_high).unwrap_or(-60.0),
         waterfall_palette: saved.map(|s| s.waterfall_palette).unwrap_or(Palette::Ocean),
+        spectrum_waterfall_ratio: saved.map(|s| s.spectrum_waterfall_ratio).unwrap_or(150.0 / 350.0),
         show_settings_window: false,
         settings_tab: SettingsTab::Agc,
         settings_dirty,

@@ -36,6 +36,10 @@ pub struct Config {
     pub waterfall_db_low: Option<f32>,
     pub waterfall_db_high: Option<f32>,
     pub waterfall_palette: Option<Palette>,
+    /// Spectrum's share (0.0-1.0) of the combined spectrum+waterfall
+    /// height -- draggable via the divider between them. Missing falls
+    /// back to their old fixed 150/350 proportions.
+    pub spectrum_waterfall_ratio: Option<f32>,
     pub adc: Option<u8>,
     pub antenna: Option<u8>,
     pub rigctl_addr: Option<String>,
@@ -161,6 +165,13 @@ pub struct ExtraReceiverConfig {
     /// See Config::snb's doc comment.
     #[serde(default)]
     pub snb: bool,
+    /// See Config::spectrum_waterfall_ratio's doc comment.
+    #[serde(default = "default_spectrum_waterfall_ratio")]
+    pub spectrum_waterfall_ratio: f32,
+}
+
+fn default_spectrum_waterfall_ratio() -> f32 {
+    150.0 / 350.0
 }
 
 fn config_path(mac: [u8; 6]) -> Option<PathBuf> {
