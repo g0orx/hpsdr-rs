@@ -84,6 +84,14 @@ const TX_IQ_BUFFER_CAPACITY: usize = 100_000;
 /// counterpart of that local-mic buffer).
 const TCI_TX_AUDIO_CAPACITY: usize = 24_000;
 
+/// PureSignal feedback IQ arrives at 192ksps on P2 (confirmed fixed
+/// rate -- new_protocol.c hardcodes it for the reserved DDC0/DDC1
+/// regardless of any receiver's own configured rate) and is only ever
+/// produced while transmitting -- same "small, bounded, drop-oldest"
+/// reasoning as TX_IQ_BUFFER_CAPACITY, sized the same for consistency
+/// since both run at a similar order-of-magnitude rate.
+const PS_FEEDBACK_BUFFER_CAPACITY: usize = 100_000;
+
 #[derive(Copy, Clone, Debug)]
 pub struct IqSample {
     pub i: i32,
@@ -95,6 +103,14 @@ pub struct RadioSettings {
     pub frequency_hz: u32,
     pub sample_rate: u32,
     pub receivers: u8,
+    /// Requests the 2 extra "feedback" pseudo-receivers PureSignal
+    /// needs (TX-DAC loopback + off-air RX feedback) instead of
+    /// `receivers` real, user-visible ones -- see
+    /// RadioSession::ps_rx_feedback_iq/ps_tx_feedback_iq's doc comment
+    /// and ps_feedback_config's doc comment for the full story. Fixed
+    /// at session-start time, same as `receivers` itself -- toggling
+    /// this requires a reconnect, not a live setting.
+    pub puresignal_enabled: bool,
     /// Initial value for RadioSession::rx_attenuation (P1, standard
     /// boards only) -- see that field's doc comment. main.rs loads
     /// this from Config, falling back to this struct's own default
@@ -108,10 +124,58 @@ impl Default for RadioSettings {
             frequency_hz: 7_100_000, // 40m, arbitrary sensible default
             sample_rate: 48_000,
             receivers: 1, // hardcoded single-receiver for this first version
+            puresignal_enabled: false,
             // Non-zero rather than 0dB -- see RadioSession::rx_attenuation's
             // doc comment for why 0dB caused real front-end overload.
             rx_attenuation: 12,
         }
+    }
+}
+
+/// PureSignal feedback receiver-index table -- CONFIRMED against
+/// piHPSDR (the only implementation with actual hardware behind it
+/// checked so far): old_protocol.c's how_many_receivers/
+/// rx_feedback_channel/tx_feedback_channel for P1's fixed, board-
+/// dependent indices, and new_protocol.c's PS-specific branch
+/// (`transmitter->puresignal && isTransmitting()`) for P2's DDC0/DDC1
+/// reservation, which is NOT board-dependent the way P1 is.
+///
+/// Returns `(rx_feedback_idx, tx_feedback_idx, max_real_receivers)`,
+/// all 0-based, or `None` if PureSignal isn't known to be supported on
+/// this board/protocol combination. `max_real_receivers` differs in
+/// meaning by protocol:
+/// - P1: a hard, board-dependent CAP on real/user-visible receivers
+///   while PS is active -- the total receiver count requested from the
+///   radio is fixed per board (e.g. 5 for Angelia/Orion/Orion2, with
+///   feedback occupying the last 2), so real RX is capped at
+///   `total - 2`. On the smallest boards (Metis/HermesLite, total=2)
+///   this is 0 -- no real RX at all while PS is active.
+/// - P2: always `None` (no cap) -- DDC0/DDC1 are simply reserved for
+///   feedback and real receivers are offset to start at DDC2, but the
+///   total is otherwise just "however many the user wants" like normal,
+///   bounded only by the board's own supported_receivers maximum.
+///
+/// Both protocols agree on one more thing this function doesn't encode
+/// (handled at the call site instead, since it needs the live TX
+/// frequency, not just a static table lookup): the feedback DDCs are
+/// always tuned to the TX frequency, never an independent RX
+/// frequency -- confirmed via old_protocol.c's channel_freq ("all
+/// other channels are used for PURESIGNAL and get the TX freq") and
+/// new_protocol.c's high-priority packet builder ("Set DDC0 and DDC1
+/// (synchronized) to the transmit frequency").
+fn ps_feedback_config(protocol: u8, board: Boards) -> Option<(u8, u8, Option<u8>)> {
+    match protocol {
+        1 => match board {
+            Boards::Metis | Boards::HermesLite => Some((0, 1, Some(0))),
+            Boards::Hermes | Boards::Hermes2 | Boards::HermesLite2 => Some((2, 3, Some(2))),
+            Boards::Angelia | Boards::Orion | Boards::Orion2 => Some((3, 4, Some(3))),
+            Boards::Saturn | Boards::Unknown => None,
+        },
+        // P2: DDC0/DDC1 reservation is universal, not board-dependent --
+        // confirmed via new_protocol.c, no per-board variation in that
+        // branch unlike P1's.
+        2 => Some((0, 1, None)),
+        _ => None,
     }
 }
 
@@ -154,6 +218,19 @@ pub struct RadioSession {
     pub extra_sample_rates_hz: Vec<Arc<AtomicU32>>,
     pub extra_adcs: Vec<Arc<AtomicU32>>,
     pub active_receiver_count: Arc<AtomicU32>,
+    /// PureSignal feedback IQ -- see ps_feedback_config's doc comment
+    /// for which receiver/DDC index these actually come from per
+    /// protocol/board. Raw ADC-scale IqSample, same as every other
+    /// receiver's buffer above (not yet normalized to float) --
+    /// intentionally NOT part of `iq_buffers`, which is sized to
+    /// user-visible receivers only and drives the Add Receiver UI;
+    /// these are a separate, always-present pair of dedicated queues
+    /// (matching the tx_iq/tci_tx_audio convention: never share a
+    /// queue between two independent consumers). Empty/unused
+    /// whenever `puresignal_enabled` was false at connect time -- no
+    /// behavior change for existing non-PS sessions.
+    pub ps_rx_feedback_iq: Arc<Mutex<VecDeque<IqSample>>>,
+    pub ps_tx_feedback_iq: Arc<Mutex<VecDeque<IqSample>>>,
     /// PTT/MOX state. Read by both protocols' sender loops (to decide
     /// whether to key the radio and stream TX audio/IQ instead of
     /// silence), and by tx.rs's TXA thread (to decide whether to
@@ -242,14 +319,18 @@ impl RadioSession {
         let pa_gain_db = Arc::new(AtomicU32::new(DEFAULT_PA_GAIN_DB.to_bits()));
         let tx_forward_power = Arc::new(AtomicU32::new(0));
         let tx_reverse_power = Arc::new(AtomicU32::new(0));
+        let ps_rx_feedback_iq = Arc::new(Mutex::new(VecDeque::with_capacity(PS_FEEDBACK_BUFFER_CAPACITY)));
+        let ps_tx_feedback_iq = Arc::new(Mutex::new(VecDeque::with_capacity(PS_FEEDBACK_BUFFER_CAPACITY)));
         match device.protocol {
             1 => start_protocol1(
                 device, settings, frequency_hz, sample_rate, adc, antenna, rx_attenuation, mox, tx_iq,
                 tci_tx_audio, tx_power_watts, pa_gain_db, tx_forward_power, tx_reverse_power,
+                ps_rx_feedback_iq, ps_tx_feedback_iq,
             ),
             2 => start_protocol2(
                 device, settings, frequency_hz, sample_rate, adc, antenna, rx_attenuation, mox, tx_iq,
                 tci_tx_audio, tx_power_watts, pa_gain_db, tx_forward_power, tx_reverse_power,
+                ps_rx_feedback_iq, ps_tx_feedback_iq,
             ),
             p => Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -382,6 +463,8 @@ fn start_protocol1(
     pa_gain_db: Arc<AtomicU32>,
     tx_forward_power: Arc<AtomicU32>,
     tx_reverse_power: Arc<AtomicU32>,
+    ps_rx_feedback_iq: Arc<Mutex<VecDeque<IqSample>>>,
+    ps_tx_feedback_iq: Arc<Mutex<VecDeque<IqSample>>>,
 ) -> io::Result<RadioSession> {
     let socket = UdpSocket::bind(("0.0.0.0", 0))?;
     socket.set_read_timeout(Some(Duration::from_millis(500)))?;
@@ -389,6 +472,38 @@ fn start_protocol1(
     // confirmed streaming traffic stays on the same port 1024.
     let target = std::net::SocketAddr::new(device.address.ip(), DATA_PORT);
     socket.connect(target)?;
+
+    // PureSignal (P1): see ps_feedback_config's doc comment. `ps_config`
+    // is None whenever PS wasn't requested, or this board has no known
+    // PS support -- everything below falls back to today's exact
+    // behavior in that case. `ps_wire_total` is the FIXED total
+    // receiver count the radio must be told about for the feedback
+    // indices to line up (independent of active_receiver_count/Add
+    // Receiver, which only tracks how many of the REAL slots the UI
+    // has turned on); `real_receivers` is the cap on those real slots.
+    //
+    // NOT forced to a minimum of 1 real receiver -- on Metis/HermesLite
+    // (max_real=0), real receiver indices would otherwise collide with
+    // the feedback indices themselves (rx_feedback_idx=0 there), a
+    // genuine wire-level correctness bug, not just a UI nicety. This
+    // does mean `iq_buffers` can legitimately end up empty on those
+    // smallest boards while PS is active -- main.rs's connect flow
+    // (which assumes iq_buffers[0] always exists for the main
+    // SpectrumHandle) doesn't handle that yet; not a concern for the
+    // 2-ADC Angelia/Orion/Orion2-class hardware this was built against,
+    // but flagged rather than silently papered over for anyone with
+    // one of the smaller boards.
+    let ps_config = if settings.puresignal_enabled {
+        ps_feedback_config(1, device.board)
+    } else {
+        None
+    };
+    let real_receivers = match ps_config {
+        Some((_, _, Some(max_real))) => settings.receivers.max(1).min(max_real),
+        Some((_, _, None)) | None => settings.receivers.max(1),
+    };
+    let ps_wire_total: Option<u8> = ps_config.map(|(_, tx_idx, _)| tx_idx + 1);
+    let ps_feedback_indices: Option<(u8, u8)> = ps_config.map(|(rx_idx, tx_idx, _)| (rx_idx, tx_idx));
 
     // Confirmed against a working reference (rustyHPSDR): before
     // sending the actual start command, the client sends TWO COMPLETE
@@ -410,7 +525,7 @@ fn start_protocol1(
                 pre_seq,
                 &mut pre_ozy_command,
                 &mut pre_current_receiver,
-                settings.receivers.max(1),
+                ps_wire_total.unwrap_or_else(|| settings.receivers.max(1)),
                 settings.frequency_hz,
                 0, // antenna: ANT1 default: nothing to key yet, live antenna updates once running
                 0, // tx_power_watts: not transmitting during startup config
@@ -444,14 +559,16 @@ fn start_protocol1(
     socket.send(&start_pkt)?;
 
     let stop_flag = Arc::new(AtomicBool::new(false));
-    let iq_buffers: Vec<Arc<Mutex<VecDeque<IqSample>>>> = (0..settings.receivers.max(1))
+    let iq_buffers: Vec<Arc<Mutex<VecDeque<IqSample>>>> = (0..real_receivers)
         .map(|_| Arc::new(Mutex::new(VecDeque::with_capacity(IQ_BUFFER_CAPACITY))))
         .collect();
 
     // Extra receivers beyond the first, pre-sized to whatever was
     // requested (settings.receivers, from the board's reported
     // capability -- e.g. a HermesLite2 reporting 4 via its discovery
-    // reply's buf19 byte). None are active until add_receiver() is
+    // reply's buf19 byte) -- capped to `real_receivers` when PureSignal
+    // reserves some of that capability for feedback instead (see
+    // ps_feedback_config). None are active until add_receiver() is
     // called -- active_receiver_count starts at 1. Same pattern as
     // start_protocol2's own init just below in this file. Sample rate
     // is still tracked per-extra-receiver for struct-shape parity with
@@ -459,7 +576,7 @@ fn start_protocol1(
     // in the general-control frame, no per-receiver override slot) --
     // main.rs keeps every extra receiver's rate in sync with the
     // primary's rather than exposing it as independently adjustable.
-    let extra_count = settings.receivers.max(1).saturating_sub(1) as usize;
+    let extra_count = real_receivers.saturating_sub(1) as usize;
     let extra_frequencies_hz: Vec<Arc<AtomicU32>> =
         (0..extra_count).map(|_| Arc::new(AtomicU32::new(settings.frequency_hz))).collect();
     let extra_sample_rates_hz: Vec<Arc<AtomicU32>> =
@@ -496,6 +613,7 @@ fn start_protocol1(
             sender_rx_attenuation,
             sender_is_hermes_lite,
             sender_num_adcs,
+            ps_wire_total,
             sender_stop,
         );
     });
@@ -507,6 +625,8 @@ fn start_protocol1(
     let receiver_active_receiver_count = Arc::clone(&active_receiver_count);
     let receiver_tx_forward_power = Arc::clone(&tx_forward_power);
     let receiver_tx_reverse_power = Arc::clone(&tx_reverse_power);
+    let receiver_ps_rx_feedback_iq = Arc::clone(&ps_rx_feedback_iq);
+    let receiver_ps_tx_feedback_iq = Arc::clone(&ps_tx_feedback_iq);
     let receiver_thread = thread::spawn(move || {
         receiver_loop(
             receiver_socket,
@@ -515,6 +635,10 @@ fn start_protocol1(
             receiver_sample_rate,
             receiver_tx_forward_power,
             receiver_tx_reverse_power,
+            ps_wire_total,
+            ps_feedback_indices,
+            receiver_ps_rx_feedback_iq,
+            receiver_ps_tx_feedback_iq,
             receiver_stop,
         );
     });
@@ -530,6 +654,8 @@ fn start_protocol1(
         extra_sample_rates_hz,
         extra_adcs,
         active_receiver_count,
+        ps_rx_feedback_iq,
+        ps_tx_feedback_iq,
         mox,
         tx_iq,
         tci_tx_audio,
@@ -874,19 +1000,18 @@ fn p1_build_packet(
             // second ADC is actually in use. This project previously
             // left C1 hardcoded to 0x00 unconditionally -- leaving the
             // second ADC's attenuator circuit unconfigured/floating on
-            // every 2-ADC board. Confirmed via real hardware testing
-            // (ANAN-100D/Angelia) to be the cause of a persistent
-            // comb-pattern spectrum + sawtooth-sounding audio (ruled
-            // out to be RX overload or a connect-time transient by two
-            // other real-hardware tests, and confirmed absent when the
-            // identical radio is driven by piHPSDR instead -- i.e.
-            // real, this project's bug, not the hardware) -- an
-            // unconfigured second-ADC attenuator is a plausible source
-            // of analog crosstalk into the first ADC's signal path,
-            // which only 2-ADC boards have a second ADC to produce.
-            // No per-ADC1 attenuation value tracked yet (unlike
-            // rx_attenuation for ADC0) -- just the required enable
-            // bit, at 0dB.
+            // every 2-ADC board. Worth testing as the cause of a
+            // persistent comb-pattern spectrum + sawtooth-sounding
+            // audio seen on ANAN-100D/Angelia (ruled out to be RX
+            // overload or a connect-time transient by two other real-
+            // hardware tests, and confirmed absent when the identical
+            // radio is driven by piHPSDR instead -- i.e. real, this
+            // project's bug, not the hardware) -- an unconfigured
+            // second-ADC attenuator is a plausible source of analog
+            // crosstalk into the first ADC's signal path, which only
+            // 2-ADC boards have a second ADC to produce. No per-ADC1
+            // attenuation value tracked yet (unlike rx_attenuation for
+            // ADC0) -- just the required enable bit, at 0dB.
             let c1: u8 = if num_adcs == 2 { 0x20 } else { 0x00 };
             (0x16, c1, 0x00, 0x00, 0x00)
         }
@@ -946,6 +1071,13 @@ fn sender_loop(
     rx_attenuation: Arc<AtomicU32>,
     is_hermes_lite: bool,
     num_adcs: u8,
+    // PureSignal: overrides active_receiver_count's live value with a
+    // FIXED total when Some -- see start_protocol1's ps_wire_total doc
+    // comment for why these need to be decoupled (active_receiver_count
+    // only tracks how many REAL slots the Add Receiver UI has turned
+    // on; the wire-level total must stay fixed so the feedback indices
+    // always land at the same position regardless of that).
+    ps_wire_total: Option<u8>,
     stop: Arc<AtomicBool>,
 ) {
     let mut seq: u32 = 0;
@@ -978,7 +1110,10 @@ fn sender_loop(
         // start) so a receiver added mid-session via the "Add
         // Receiver" button is actually told to the radio, matching
         // how p2_sender_loop already reads active_receiver_count.
-        let receivers = (active_receiver_count.load(Ordering::Relaxed) as u8).max(1);
+        // PureSignal overrides this with a fixed total when active --
+        // see this function's ps_wire_total doc comment.
+        let receivers =
+            ps_wire_total.unwrap_or_else(|| (active_receiver_count.load(Ordering::Relaxed) as u8).max(1));
 
         // ROOT CAUSE FIX: this used to hardcode "126 samples per
         // 1032-byte packet" regardless of `receivers`, which only
@@ -994,9 +1129,11 @@ fn sender_loop(
         // stream's framing (P1's simple USB-audio-style protocol has
         // no independent flow control -- the host's own outgoing
         // cadence doubles as the radio's timing reference). This went
-        // completely unexercised until multi-receiver support let a
-        // real session ever run with receivers>1 for the first time.
-        //
+        // completely unexercised until PureSignal became the first
+        // thing to ever force receivers>1 in a real session (confirmed
+        // via a real hardware test: a garbled/aliased-looking waterfall
+        // with PS enabled, gone the moment PS -- and therefore the
+        // forced receivers=5 -- was disabled again).
         // The `8` here is the per-FRAME 3-byte-sync + 5-byte-C&C prefix
         // build_usb_frame writes (NOT the same thing as this file's
         // top-level HEADER_SIZE constant, which is the OUTER packet's
@@ -1051,9 +1188,23 @@ fn receiver_loop(
     sample_rate: Arc<AtomicU32>,
     tx_forward_power: Arc<AtomicU32>,
     tx_reverse_power: Arc<AtomicU32>,
+    // PureSignal -- see start_protocol1's ps_wire_total/ps_feedback_indices
+    // doc comments. All None/unused when PS wasn't requested.
+    ps_wire_total: Option<u8>,
+    ps_feedback_indices: Option<(u8, u8)>,
+    ps_rx_feedback_iq: Arc<Mutex<VecDeque<IqSample>>>,
+    ps_tx_feedback_iq: Arc<Mutex<VecDeque<IqSample>>>,
     stop: Arc<AtomicBool>,
 ) {
     let mut buf = [0u8; PACKET_SIZE + 64]; // a little slack in case of larger packets
+    // DIAGNOSTIC (Phase 1 -- remove once PS's real WDSP consumer exists
+    // and this has been confirmed working against real hardware): once-
+    // per-second summary of how many samples actually arrived in each
+    // PS feedback queue, so it's possible to tell "feedback IQ is really
+    // flowing" apart from "silently empty" from the console alone.
+    let mut ps_rx_fb_window: u32 = 0;
+    let mut ps_tx_fb_window: u32 = 0;
+    let mut ps_window_start = Instant::now();
     while !stop.load(Ordering::Relaxed) {
         match socket.recv(&mut buf) {
             Ok(n) if n == PACKET_SIZE => {
@@ -1063,16 +1214,25 @@ fn receiver_loop(
                     // start) so the interleaving stride matches
                     // however many receivers sender_loop is CURRENTLY
                     // telling the radio to stream -- same reasoning as
-                    // sender_loop's own live read just above.
-                    let receivers = (active_receiver_count.load(Ordering::Relaxed) as u8).max(1);
-                    parse_iq_packet(
+                    // sender_loop's own live read just above. PureSignal
+                    // overrides this with a fixed total, same as
+                    // sender_loop, so both sides of the wire always
+                    // agree on the stride.
+                    let receivers = ps_wire_total
+                        .unwrap_or_else(|| (active_receiver_count.load(Ordering::Relaxed) as u8).max(1));
+                    let (rx_fb, tx_fb) = parse_iq_packet(
                         &buf[HEADER_SIZE..PACKET_SIZE],
                         receivers,
                         &buffers,
                         capacity,
                         &tx_forward_power,
                         &tx_reverse_power,
+                        ps_feedback_indices,
+                        &ps_rx_feedback_iq,
+                        &ps_tx_feedback_iq,
                     );
+                    ps_rx_fb_window += rx_fb;
+                    ps_tx_fb_window += tx_fb;
                 }
                 // EP_WIDEBAND (0x04) and anything else: ignored for now.
             }
@@ -1083,6 +1243,17 @@ fn receiver_loop(
                 continue
             }
             Err(_) => break,
+        }
+        if ps_feedback_indices.is_some() && ps_window_start.elapsed() >= Duration::from_secs(1) {
+            if ps_rx_fb_window > 0 || ps_tx_fb_window > 0 {
+                eprintln!(
+                    "radio: PS feedback this second -- rx={ps_rx_fb_window} samples, \
+                     tx={ps_tx_fb_window} samples"
+                );
+            }
+            ps_rx_fb_window = 0;
+            ps_tx_fb_window = 0;
+            ps_window_start = Instant::now();
         }
     }
 }
@@ -1098,6 +1269,7 @@ fn iq_buffer_capacity_for_rate(sample_rate_hz: u32) -> usize {
 }
 
 /// `payload` is the two 512-byte USB frames (no outer 8-byte header).
+#[allow(clippy::too_many_arguments)]
 fn parse_iq_packet(
     payload: &[u8],
     receivers: u8,
@@ -1105,7 +1277,26 @@ fn parse_iq_packet(
     capacity: usize,
     tx_forward_power: &Arc<AtomicU32>,
     tx_reverse_power: &Arc<AtomicU32>,
-) {
+    // PureSignal: `ps_feedback_indices` is `Some((rx_feedback_idx,
+    // tx_feedback_idx))` when active -- see ps_feedback_config's doc
+    // comment. Those two wire indices are diverted into the dedicated
+    // feedback queues below INSTEAD of `buffers`, which is only sized
+    // to the real/user-visible receiver count (see start_protocol1's
+    // real_receivers) and would be out of bounds for them.
+    ps_feedback_indices: Option<(u8, u8)>,
+    ps_rx_feedback_iq: &Arc<Mutex<VecDeque<IqSample>>>,
+    ps_tx_feedback_iq: &Arc<Mutex<VecDeque<IqSample>>>,
+    // DIAGNOSTIC (Phase 1 -- protocol plumbing verification, see
+    // receiver_loop's per-second summary): returns how many samples
+    // this call routed into (ps_rx_feedback_iq, ps_tx_feedback_iq), so
+    // the caller can report a real arrival rate rather than just a
+    // queue depth (which plateaus at PS_FEEDBACK_BUFFER_CAPACITY and
+    // stops moving once full, misleadingly looking "stalled"). Remove
+    // this return value once PS's real WDSP consumer exists and this
+    // diagnostic is no longer needed.
+) -> (u32, u32) {
+    let mut rx_fb_pushed: u32 = 0;
+    let mut tx_fb_pushed: u32 = 0;
     for frame_idx in 0..2 {
         let frame = &payload[frame_idx * USB_FRAME_SIZE..(frame_idx + 1) * USB_FRAME_SIZE];
         // frame[0..3] = sync, frame[3..8] = C0-C4 status from the radio.
@@ -1136,11 +1327,23 @@ fn parse_iq_packet(
                 b += 3;
                 let q = sign_extend_24(frame[b], frame[b + 1], frame[b + 2]);
                 b += 3;
-                push_sample(&buffers[rx], IqSample { i, q }, capacity);
+                let sample = IqSample { i, q };
+                match ps_feedback_indices {
+                    Some((rx_fb, _)) if rx as u8 == rx_fb => {
+                        push_sample(ps_rx_feedback_iq, sample, PS_FEEDBACK_BUFFER_CAPACITY);
+                        rx_fb_pushed += 1;
+                    }
+                    Some((_, tx_fb)) if rx as u8 == tx_fb => {
+                        push_sample(ps_tx_feedback_iq, sample, PS_FEEDBACK_BUFFER_CAPACITY);
+                        tx_fb_pushed += 1;
+                    }
+                    _ => push_sample(&buffers[rx], sample, capacity),
+                }
             }
             b += 2; // mic sample, unused on receive side
         }
     }
+    (rx_fb_pushed, tx_fb_pushed)
 }
 
 fn sign_extend_24(b0: u8, b1: u8, b2: u8) -> i32 {
@@ -1195,7 +1398,17 @@ fn start_protocol2(
     pa_gain_db: Arc<AtomicU32>,
     tx_forward_power: Arc<AtomicU32>,
     tx_reverse_power: Arc<AtomicU32>,
+    ps_rx_feedback_iq: Arc<Mutex<VecDeque<IqSample>>>,
+    ps_tx_feedback_iq: Arc<Mutex<VecDeque<IqSample>>>,
 ) -> io::Result<RadioSession> {
+    // PureSignal (P2): see ps_feedback_config's doc comment. Unlike P1,
+    // real-receiver capacity isn't capped -- DDC0/DDC1 are simply
+    // reserved ahead of real receivers, which start at DDC2 instead of
+    // DDC0 (p2_sender_loop/p2_receiver_loop), so `settings.receivers`
+    // itself is unaffected here.
+    let puresignal_enabled =
+        settings.puresignal_enabled && ps_feedback_config(2, device.board).is_some();
+
     // Confirmed against a working reference (rustyHPSDR): it explicitly
     // sets SO_REUSEADDR and (on Unix) SO_REUSEPORT before binding, via
     // socket2, rather than a plain UdpSocket::bind. Matching that here
@@ -1280,6 +1493,7 @@ fn start_protocol2(
             sender_tx_power_watts,
             sender_pa_gain_db,
             sender_hp_request,
+            puresignal_enabled,
             sender_stop,
         );
     });
@@ -1299,6 +1513,8 @@ fn start_protocol2(
     let receiver_hp_request = Arc::clone(&hp_request);
     let receiver_tx_forward_power = Arc::clone(&tx_forward_power);
     let receiver_tx_reverse_power = Arc::clone(&tx_reverse_power);
+    let receiver_ps_rx_feedback_iq = Arc::clone(&ps_rx_feedback_iq);
+    let receiver_ps_tx_feedback_iq = Arc::clone(&ps_tx_feedback_iq);
     let receiver_thread = thread::spawn(move || {
         p2_receiver_loop(
             receiver_socket,
@@ -1307,6 +1523,9 @@ fn start_protocol2(
             receiver_hp_request,
             receiver_tx_forward_power,
             receiver_tx_reverse_power,
+            puresignal_enabled,
+            receiver_ps_rx_feedback_iq,
+            receiver_ps_tx_feedback_iq,
             receiver_stop,
         );
     });
@@ -1322,6 +1541,8 @@ fn start_protocol2(
         extra_sample_rates_hz,
         extra_adcs,
         active_receiver_count,
+        ps_rx_feedback_iq,
+        ps_tx_feedback_iq,
         mox,
         tx_iq,
         tci_tx_audio,
@@ -1372,7 +1593,22 @@ fn p2_general_packet(seq: u32, num_adcs: u8) -> [u8; P2_GENERAL_PACKET_SIZE] {
     p
 }
 
-fn p2_ddc_specific_packet(seq: u32, sample_rates_hz: &[u32], adcs: &[u32], num_adcs: u8) -> [u8; P2_PACKET_SIZE] {
+/// `ps_mox_gate`: `Some(mox_on)` when PureSignal is active -- the
+/// caller (p2_sender_loop) has then prepended 2 entries to
+/// sample_rates_hz/adcs for DDC0 (RX-feedback)/DDC1 (TX-feedback)
+/// ahead of any real receivers. Confirmed against piHPSDR's
+/// new_protocol.c PS-specific branch: those two DDCs' enable bits are
+/// gated on MOX (only stream feedback while transmitting, unlike real
+/// receivers which stay enabled regardless), and a "sync DDC1 to
+/// DDC0" flag at byte 1363 is required since DDC1 has no independent
+/// enable bit of its own -- it only streams by riding DDC0's.
+fn p2_ddc_specific_packet(
+    seq: u32,
+    sample_rates_hz: &[u32],
+    adcs: &[u32],
+    num_adcs: u8,
+    ps_mox_gate: Option<bool>,
+) -> [u8; P2_PACKET_SIZE] {
     let mut p = [0u8; P2_PACKET_SIZE];
     p[0..4].copy_from_slice(&seq.to_be_bytes());
     p[4] = num_adcs.max(1); // number of ADCs the board actually has
@@ -1387,7 +1623,25 @@ fn p2_ddc_specific_packet(seq: u32, sample_rates_hz: &[u32], adcs: &[u32], num_a
     // Enable bits for DDC0..DDCn-1 (byte 7 covers DDC0-7; we don't
     // support boards with more than 8 DDCs in this pass).
     let n = sample_rates_hz.len().min(8);
-    p[7] = if n >= 8 { 0xFF } else { ((1u16 << n) - 1) as u8 };
+    p[7] = match ps_mox_gate {
+        Some(mox_on) => {
+            // Bits 0-1 (DDC0/DDC1, the reserved feedback pair) gated on
+            // MOX; bits 2.. (real receivers) always enabled, same as
+            // the non-PS formula below just shifted up by the 2
+            // reserved slots.
+            let real_n = n.saturating_sub(2).min(6);
+            let real_bits: u8 = if real_n > 0 { (((1u16 << real_n) - 1) << 2) as u8 } else { 0 };
+            let fb_bits: u8 = if mox_on { 0x03 } else { 0x00 };
+            real_bits | fb_bits
+        }
+        None => {
+            if n >= 8 {
+                0xFF
+            } else {
+                ((1u16 << n) - 1) as u8
+            }
+        }
+    };
 
     // Each DDC's config is a 6-byte entry starting at byte 17: ADC(1),
     // rate(2, ksps big-endian), CIC1(1), CIC2(1), sample size(1).
@@ -1402,6 +1656,11 @@ fn p2_ddc_specific_packet(seq: u32, sample_rates_hz: &[u32], adcs: &[u32], num_a
         p[base + 1..base + 3].copy_from_slice(&rate_ksps.to_be_bytes());
         p[base + 5] = 24; // sample size, bits
     }
+
+    if ps_mox_gate.is_some() {
+        p[1363] = 0x02; // sync DDC1 to DDC0 -- DDC1 has no enable bit of its own
+    }
+
     p
 }
 
@@ -1610,6 +1869,11 @@ fn p2_sender_loop(
     tx_power_watts: Arc<AtomicU32>,
     pa_gain_db: Arc<AtomicU32>,
     hp_request: Arc<AtomicBool>,
+    // PureSignal -- see ps_feedback_config's doc comment. When true,
+    // DDC0/DDC1 are reserved for feedback (RX-feedback/TX-feedback
+    // respectively) ahead of any real receivers -- confirmed universal
+    // on P2 regardless of board, unlike P1's board-dependent table.
+    puresignal_enabled: bool,
     stop: Arc<AtomicBool>,
 ) {
     let mut general_seq: u32 = 0;
@@ -1675,9 +1939,33 @@ fn p2_sender_loop(
             eprintln!("radio: requesting {active} active DDC(s) from the radio");
             last_logged_active = Some(active);
         }
-        let mut freqs = Vec::with_capacity(active);
-        let mut rates = Vec::with_capacity(active);
-        let mut adcs = Vec::with_capacity(active);
+        let mox_on = mox.load(Ordering::Relaxed);
+        // No split VFO support yet -- TX frequency is always the
+        // primary receiver's frequency (simplex). Computed up front
+        // (not derived from freqs[0] further down) since PureSignal's
+        // reserved DDC0/DDC1 entries need this same value prepended
+        // ahead of the real receiver frequencies below.
+        let tx_freq_hz = frequency_hz.load(Ordering::Relaxed);
+
+        let mut freqs = Vec::with_capacity(active + 2);
+        let mut rates = Vec::with_capacity(active + 2);
+        let mut adcs = Vec::with_capacity(active + 2);
+        // PureSignal: DDC0 (RX-feedback, ADC0) and DDC1 (TX-feedback,
+        // the virtual loopback ADC past this board's real ones) always
+        // tuned to the TX frequency and running at a fixed 192ksps --
+        // confirmed against piHPSDR's new_protocol.c PS-specific
+        // branch. Prepended ahead of any real receivers, which get
+        // pushed to DDC2+ as a result -- see p2_ddc_specific_packet's
+        // ps_mox_gate param for how their enable bits get gated on MOX
+        // separately from these two.
+        if puresignal_enabled {
+            freqs.push(tx_freq_hz);
+            rates.push(192_000);
+            adcs.push(0);
+            freqs.push(tx_freq_hz);
+            rates.push(192_000);
+            adcs.push(num_adcs as u32);
+        }
         freqs.push(frequency_hz.load(Ordering::Relaxed));
         rates.push(sample_rate.load(Ordering::Relaxed));
         adcs.push(adc.load(Ordering::Relaxed));
@@ -1693,19 +1981,16 @@ fn p2_sender_loop(
             }
         }
 
-        let mox_on = mox.load(Ordering::Relaxed);
         let antenna_now = antenna.load(Ordering::Relaxed);
-        // No split VFO support yet -- TX frequency is always the
-        // primary receiver's frequency (simplex).
-        let tx_freq_hz = freqs.first().copied().unwrap_or(7_100_000);
         let drive = drive_byte_for_watts(
             tx_power_watts.load(Ordering::Relaxed) as f32,
             f32::from_bits(pa_gain_db.load(Ordering::Relaxed)),
         );
+        let ps_mox_gate = puresignal_enabled.then_some(mox_on);
 
         if due_for_keepalive {
             let general = p2_general_packet(general_seq, num_adcs);
-            let ddc = p2_ddc_specific_packet(ddc_seq, &rates, &adcs, num_adcs);
+            let ddc = p2_ddc_specific_packet(ddc_seq, &rates, &adcs, num_adcs, ps_mox_gate);
             let tx = p2_tx_specific_packet(tx_seq);
             let hp = p2_high_priority_packet(hp_seq, &freqs, antenna_now, mox_on, tx_freq_hz, drive);
 
@@ -1747,6 +2032,7 @@ fn p2_sender_loop(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn p2_receiver_loop(
     socket: UdpSocket,
     buffers: Vec<Arc<Mutex<VecDeque<IqSample>>>>,
@@ -1754,6 +2040,14 @@ fn p2_receiver_loop(
     hp_request: Arc<AtomicBool>,
     tx_forward_power: Arc<AtomicU32>,
     tx_reverse_power: Arc<AtomicU32>,
+    // PureSignal -- see p2_sender_loop's matching doc comment. When
+    // true, DDC0/DDC1's IQ (source ports P2_DDC0_IQ_PORT+0/+1) is
+    // diverted into the two feedback queues instead of `buffers`,
+    // which is sized to real receivers only and indexed 2 lower
+    // (DDC2 -> buffers[0], DDC3 -> buffers[1], ...).
+    puresignal_enabled: bool,
+    ps_rx_feedback_iq: Arc<Mutex<VecDeque<IqSample>>>,
+    ps_tx_feedback_iq: Arc<Mutex<VecDeque<IqSample>>>,
     stop: Arc<AtomicBool>,
 ) {
     let mut buf = [0u8; P2_PACKET_SIZE + 64];
@@ -1766,12 +2060,22 @@ fn p2_receiver_loop(
     // isn't turning it into spectrum/waterfall pixels" (a WDSP-side
     // issue -- see SpectrumAnalyzer::open's XCreateAnalyzer success
     // check and demod()'s fexchange0 error check).
-    let mut ddc_seen = vec![false; buffers.len()];
+    let ddc_reserved = if puresignal_enabled { 2 } else { 0 };
+    let mut ddc_seen = vec![false; buffers.len() + ddc_reserved];
+    // DIAGNOSTIC (Phase 1 -- remove once PS's real WDSP consumer exists
+    // and this has been confirmed working against real hardware): once-
+    // per-second summary of how many DDC0/DDC1 (feedback) packets
+    // actually arrived, same reasoning as receiver_loop's P1 equivalent.
+    let mut ps_rx_fb_window: u32 = 0;
+    let mut ps_tx_fb_window: u32 = 0;
+    let mut ps_window_start = Instant::now();
     while !stop.load(Ordering::Relaxed) {
         match socket.recv_from(&mut buf) {
             Ok((n, src)) => {
                 let port = src.port();
-                if port >= P2_DDC0_IQ_PORT && ((port - P2_DDC0_IQ_PORT) as usize) < buffers.len() {
+                if port >= P2_DDC0_IQ_PORT
+                    && ((port - P2_DDC0_IQ_PORT) as usize) < buffers.len() + ddc_reserved
+                {
                     let ddc = (port - P2_DDC0_IQ_PORT) as usize;
                     if !ddc_seen[ddc] {
                         ddc_seen[ddc] = true;
@@ -1779,7 +2083,15 @@ fn p2_receiver_loop(
                     }
                     if n == P2_PACKET_SIZE {
                         let capacity = iq_buffer_capacity_for_rate(sample_rate.load(Ordering::Relaxed));
-                        p2_parse_ddc_iq_packet(&buf[..n], &buffers[ddc], capacity);
+                        if puresignal_enabled && ddc == 0 {
+                            p2_parse_ddc_iq_packet(&buf[..n], &ps_rx_feedback_iq, PS_FEEDBACK_BUFFER_CAPACITY);
+                            ps_rx_fb_window += 1;
+                        } else if puresignal_enabled && ddc == 1 {
+                            p2_parse_ddc_iq_packet(&buf[..n], &ps_tx_feedback_iq, PS_FEEDBACK_BUFFER_CAPACITY);
+                            ps_tx_fb_window += 1;
+                        } else {
+                            p2_parse_ddc_iq_packet(&buf[..n], &buffers[ddc - ddc_reserved], capacity);
+                        }
                     }
                 } else if port == P2_HP_STATUS_SOURCE_PORT {
                     // Confirmed by the user: the radio's own
@@ -1812,6 +2124,17 @@ fn p2_receiver_loop(
                 continue
             }
             Err(_) => break,
+        }
+        if puresignal_enabled && ps_window_start.elapsed() >= Duration::from_secs(1) {
+            if ps_rx_fb_window > 0 || ps_tx_fb_window > 0 {
+                eprintln!(
+                    "radio: PS feedback this second -- rx={ps_rx_fb_window} packets, \
+                     tx={ps_tx_fb_window} packets"
+                );
+            }
+            ps_rx_fb_window = 0;
+            ps_tx_fb_window = 0;
+            ps_window_start = Instant::now();
         }
     }
 }

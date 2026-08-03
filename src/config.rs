@@ -121,6 +121,12 @@ pub struct Config {
     /// settings, matching however many were active last time.
     #[serde(default)]
     pub extra_receivers: Vec<ExtraReceiverConfig>,
+    /// PureSignal (experimental, Phase 1 -- protocol-level feedback
+    /// plumbing only, no WDSP predistortion engine wired up yet). Only
+    /// takes effect on the NEXT connect -- see radio::RadioSettings's
+    /// matching field doc comment for why this can't be a live toggle.
+    #[serde(default)]
+    pub puresignal_enabled: Option<bool>,
     /// Protocol 1 RX step attenuator (0-31 dB), standard (non-HermesLite)
     /// boards only -- see radio::RadioSession::rx_attenuation's doc
     /// comment. Missing (e.g. configs saved before this existed)

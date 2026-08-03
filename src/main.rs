@@ -331,6 +331,14 @@ struct ConnectedState {
     /// ballistic damping for exactly this reason.
     smoothed_fwd_power: f32,
     smoothed_rev_power: f32,
+    /// PureSignal (experimental, Phase 1 -- protocol plumbing only, see
+    /// radio::RadioSettings::puresignal_enabled). Reflects what THIS
+    /// session was actually started with -- editable in Settings, but
+    /// only takes effect on the next connect (can't be toggled live,
+    /// same reasoning as sample_rate's Add Receiver interaction: the
+    /// wire-level receiver/DDC count is fixed for the life of the
+    /// sender/receiver threads).
+    puresignal_enabled: bool,
 }
 
 enum AppState {
@@ -373,6 +381,7 @@ impl eframe::App for HpsdrApp {
                     // stuck at 1 for every P1 radio regardless of what it
                     // actually supports).
                     settings.receivers = device.supported_receivers.max(1);
+                    settings.puresignal_enabled = cfg.puresignal_enabled.unwrap_or(false);
                     if let Some(atten) = cfg.rx_attenuation {
                         settings.rx_attenuation = atten;
                     }
@@ -618,6 +627,7 @@ impl eframe::App for HpsdrApp {
                                 pre_tune_power_watts: None,
                                 smoothed_fwd_power: 0.0,
                                 smoothed_rev_power: 0.0,
+                                puresignal_enabled: settings.puresignal_enabled,
                             });
                         }
                         Err(e) => {
@@ -2324,6 +2334,33 @@ impl eframe::App for HpsdrApp {
                                             }
                                         });
                                     }
+
+                                    // Phase 1 of an in-progress PureSignal
+                                    // implementation -- protocol-level
+                                    // feedback plumbing only so far (no
+                                    // WDSP predistortion engine wired up
+                                    // yet, no calibration UI beyond this
+                                    // bare on/off switch). See
+                                    // radio::RadioSettings::puresignal_enabled
+                                    // and radio::ps_feedback_config for
+                                    // what this actually requests from the
+                                    // radio once enabled.
+                                    ui.add_space(8.0);
+                                    ui.separator();
+                                    ui.label("PureSignal (experimental)");
+                                    ui.add_space(4.0);
+                                    let mut puresignal_enabled = connected.puresignal_enabled;
+                                    if ui
+                                        .checkbox(&mut puresignal_enabled, "Enable PureSignal")
+                                        .changed()
+                                    {
+                                        connected.puresignal_enabled = puresignal_enabled;
+                                        settings_changed = true;
+                                    }
+                                    ui.weak(
+                                        "Reserves 2 extra feedback receivers from the radio -- \
+                                         takes effect on next connect, not live.",
+                                    );
                                 }
                             }
                         });
@@ -2414,6 +2451,7 @@ impl eframe::App for HpsdrApp {
                         rigctl_running: Some(connected.rigctl_server.is_some()),
                         tci_running: Some(connected.tci_server.is_some()),
                         extra_receivers,
+                        puresignal_enabled: Some(connected.puresignal_enabled),
                         rx_attenuation: Some(
                             connected.session.rx_attenuation.load(std::sync::atomic::Ordering::Relaxed),
                         ),
