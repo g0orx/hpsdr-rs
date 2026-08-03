@@ -1469,7 +1469,7 @@ impl eframe::App for HpsdrApp {
                         );
                     } else {
                         ui.painter().rect_filled(rect, 0.0, egui::Color32::BLACK);
-                        ui.put(rect, egui::Label::new("Creating FFTW Wisdom File..."));
+                        ui.put(rect, egui::Label::new(wisdom_status_text()));
                     }
                     if let Some(pos) = waterfall_click_resp.hover_pos() {
                         let hover_freq = freq_at_x(pos.x, rect, freq_hz, sample_rate);
@@ -3231,7 +3231,7 @@ fn render_extra_receiver_ui(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceiver>>) {
         );
     } else {
         ui.painter().rect_filled(wf_rect, 0.0, egui::Color32::BLACK);
-        ui.put(wf_rect, egui::Label::new("Creating FFTW Wisdom File..."));
+        ui.put(wf_rect, egui::Label::new(wisdom_status_text()));
     }
     if let Some(pos) = wf_resp.hover_pos() {
         let hover_freq = freq_at_x(pos.x, wf_rect, freq_hz, sample_rate);
@@ -3750,6 +3750,31 @@ fn min_max(v: &[f32]) -> (f32, f32) {
 /// image. Each row is auto-ranged independently for now -- a fixed
 /// calibrated range would need real fscLin/fscHin values, which weren't
 /// set in the confirmed SetAnalyzer call (both left at 0.0).
+/// Live progress text for the one-time FFTW wisdom-generation pass
+/// (spectrum.rs's WDSPwisdom call), shown in place of the waterfall
+/// while no rows have arrived yet on a fresh machine/config. WDSP
+/// itself maintains this as a plain C global (wisdom.c's `status`
+/// buffer, updated via sprintf on the RX spectrum thread as each FFT
+/// size is planned) with no synchronization -- reading it from the UI
+/// thread while it's being written is technically a data race, but
+/// it's a short, frequently-overwritten status string read purely for
+/// display, the same way upstream reference clients (e.g. piHPSDR)
+/// poll it, so a torn read at worst shows one garbled frame of text
+/// rather than anything unsafe.
+fn wisdom_status_text() -> String {
+    const FALLBACK: &str = "Creating FFTW Wisdom File...";
+    unsafe {
+        let ptr = wdsp_sys::wisdom_get_status();
+        if ptr.is_null() {
+            return FALLBACK.to_string();
+        }
+        match std::ffi::CStr::from_ptr(ptr).to_str() {
+            Ok(s) if !s.trim().is_empty() => s.trim().to_string(),
+            _ => FALLBACK.to_string(),
+        }
+    }
+}
+
 fn build_waterfall_image(
     rows: &[Vec<f32>],
     palette: Palette,

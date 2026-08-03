@@ -393,6 +393,17 @@ struct SpectrumAnalyzer {
 
 impl SpectrumAnalyzer {
     fn open(channel: i32, sample_rate: i32) -> Self {
+        // Acquired BEFORE the wisdom-generation pass below, not just
+        // around OpenChannel -- see wdsp_sys::SETUP_LOCK's doc comment.
+        // Wisdom generation on a fresh machine/config can itself run
+        // long enough for a concurrent TXA channel's own OpenChannel
+        // call (tx.rs's TxProcessor::open, started unconditionally
+        // alongside RX at initial connect) to land in the middle of it
+        // if this guard were taken any later, which is exactly what
+        // produced a real "double free or corruption (!prev)" crash on
+        // first launch.
+        let _setup_guard = wdsp::SETUP_LOCK.lock().unwrap();
+
         static WISDOM_LOADED: std::sync::Once = std::sync::Once::new();
         WISDOM_LOADED.call_once(|| {
             // FFTW plan computation for large transforms (our analyzer
@@ -419,26 +430,14 @@ impl SpectrumAnalyzer {
             }
         });
 
-        // Serializes each channel's one-time setup sequence (OpenChannel
-        // through SetAnalyzer/SetDisplay* below) across every
-        // SpectrumAnalyzer::open() call in the process, even though
-        // they run on independent per-channel background threads.
-        // Added after a segfault reproduced specifically when restoring
-        // multiple receivers at startup (main + saved extra receivers'
-        // SpectrumHandle threads all call open() within the same brief
-        // window) but not when adding a receiver to an already-running
-        // session (by then the previous channel's setup had long since
-        // finished) -- consistent with FFTW's planner (invoked inside
-        // XCreateAnalyzer/SetAnalyzer for the various analyzer FFT
-        // sizes) not being safe to call concurrently from multiple
-        // threads, which is a well-documented FFTW footgun and exactly
-        // the class of bug this timing points to. Each channel's own
-        // steady-state feed()/demod() loop afterward is untouched by
-        // this lock and continues to run fully concurrently, matching
-        // the fact that multiple receivers work fine together once
-        // they're all past this one-time setup.
-        static WDSP_SETUP_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let _setup_guard = WDSP_SETUP_LOCK.lock().unwrap();
+        // _setup_guard (acquired above, before the wisdom pass) stays
+        // held through this whole OpenChannel/SetAnalyzer/SetDisplay*
+        // sequence too, until this function returns -- see its
+        // acquisition above for why. Each channel's own steady-state
+        // feed()/demod() loop afterward is untouched by this lock and
+        // continues to run fully concurrently, matching the fact that
+        // multiple receivers work fine together once they're all past
+        // this one-time setup.
 
         unsafe {
             wdsp::OpenChannel(

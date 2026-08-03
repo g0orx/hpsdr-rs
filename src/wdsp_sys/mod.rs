@@ -17,6 +17,33 @@
 
 #![allow(non_camel_case_types)]
 
+/// Serializes one-time WDSP channel setup (OpenChannel and everything
+/// around it, including the FFTW wisdom-generation pass triggered on a
+/// fresh machine/config -- see spectrum.rs's WDSPwisdom call) across
+/// EVERY channel this process opens, RXA and TXA alike -- not just
+/// among receivers. FFTW's planner is well-documented as unsafe to
+/// call concurrently from multiple threads, and every WDSP channel
+/// (spectrum.rs's SpectrumAnalyzer::open for RXA, tx.rs's
+/// TxProcessor::open for TXA) does exactly that during its one-time
+/// setup, each on its own independent background thread.
+///
+/// Previously this was a `Mutex` local to SpectrumAnalyzer::open,
+/// added after a segfault reproduced when multiple *receiver* threads
+/// opened concurrently at startup -- it correctly serialized RXA
+/// against RXA, but TXA's OpenChannel call in tx.rs took no lock at
+/// all, so it could still race against an in-progress RXA setup (most
+/// dangerously the wisdom pass, which can run long enough on a first-
+/// ever launch for TX setup -- started unconditionally alongside RX at
+/// initial connect, see main.rs's MicInput::start/TxHandle::start call
+/// site -- to land right in the middle of it), corrupting FFTW's
+/// shared planner state (glibc's "double free or corruption (!prev)"
+/// is the classic symptom). Now shared here so both call sites
+/// serialize against each other, not just against their own kind.
+/// Each channel's own steady-state feed()/demod()/run() loop
+/// afterward is untouched by this lock and continues to run fully
+/// concurrently -- only the one-time setup sequence takes it.
+pub static SETUP_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 pub const DETECTOR_MODE_PEAK: u32 = 0;
 pub const DETECTOR_MODE_ROSENFELL: u32 = 1;
 pub const DETECTOR_MODE_AVERAGE: u32 = 2;

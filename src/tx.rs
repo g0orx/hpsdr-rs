@@ -172,6 +172,19 @@ impl TxProcessor {
         let default_passband =
             crate::spectrum::passband_for(Mode::Usb, crate::spectrum::default_width_hz(Mode::Usb));
 
+        // Serializes this one-time TXA setup sequence against every RXA
+        // channel's own setup (spectrum.rs's SpectrumAnalyzer::open) --
+        // see wdsp_sys::SETUP_LOCK's doc comment. Without this, TX
+        // setup (started unconditionally alongside RX at initial
+        // connect -- see main.rs's MicInput::start/TxHandle::start call
+        // site) could run its own OpenChannel/FFTW calls concurrently
+        // with an in-progress RXA setup, most dangerously the FFTW
+        // wisdom-generation pass on a fresh machine/config, corrupting
+        // FFTW's shared planner state (glibc's "double free or
+        // corruption (!prev)" crash on startup was the confirmed
+        // real-world symptom this fixed).
+        let _setup_guard = wdsp::SETUP_LOCK.lock().unwrap();
+
         unsafe {
             // type_=1: TXA. Delay/slew params (tdelayup/tslewup/
             // tdelaydown/tslewdown) and dsp_size now match the
