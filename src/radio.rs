@@ -95,6 +95,11 @@ pub struct RadioSettings {
     pub frequency_hz: u32,
     pub sample_rate: u32,
     pub receivers: u8,
+    /// Initial value for RadioSession::rx_attenuation (P1, standard
+    /// boards only) -- see that field's doc comment. main.rs loads
+    /// this from Config, falling back to this struct's own default
+    /// for a never-saved config.
+    pub rx_attenuation: u32,
 }
 
 impl Default for RadioSettings {
@@ -103,6 +108,9 @@ impl Default for RadioSettings {
             frequency_hz: 7_100_000, // 40m, arbitrary sensible default
             sample_rate: 48_000,
             receivers: 1, // hardcoded single-receiver for this first version
+            // Non-zero rather than 0dB -- see RadioSession::rx_attenuation's
+            // doc comment for why 0dB caused real front-end overload.
+            rx_attenuation: 12,
         }
     }
 }
@@ -120,6 +128,22 @@ pub struct RadioSession {
     /// bank on this board family). Whichever receiver last changes it
     /// affects every receiver sharing ADC0.
     pub antenna: Arc<AtomicU32>,
+    /// Protocol 1, standard (non-HermesLite) boards only -- RX step
+    /// attenuator, 0-31 dB, encoded into the C4 byte of command 4
+    /// (0x14) as `0x20 | attenuation` (bit 5 = attenuator-enable,
+    /// confirmed against piHPSDR's old_protocol.c: `output_buffer[C4]
+    /// = 0x20 | ((int)adc[0].gain & 0x1F)` while receiving). ROOT CAUSE
+    /// FIX: this was previously hardcoded to a fixed 0x20 (0dB, no
+    /// attenuation at all) -- confirmed via real hardware testing
+    /// (ANAN-100D/Angelia on a real HF antenna) that this causes
+    /// genuine front-end overload from ordinary band signals, visible
+    /// as either a comb-shaped intermod pattern or sustained broadband
+    /// noise depending on exactly what's on the band at the moment,
+    /// randomly varying between connections since real RF conditions
+    /// vary. HermesLite/HermesLite2 are unaffected -- they use a
+    /// different, already-separate RX gain mechanism (bit 6 of the
+    /// same byte, see p1_build_packet's is_hermes_lite branch).
+    pub rx_attenuation: Arc<AtomicU32>,
     /// Additional receivers beyond the first (P2 only -- P1 has no
     /// confirmed way to enable more than one DDC, see module note).
     /// Index 0 here corresponds to receiver index 1 overall (receiver
@@ -201,6 +225,12 @@ impl RadioSession {
         let sample_rate = Arc::new(AtomicU32::new(settings.sample_rate));
         let adc = Arc::new(AtomicU32::new(0));
         let antenna = Arc::new(AtomicU32::new(0));
+        // See RadioSettings::rx_attenuation's doc comment -- main.rs
+        // loads this from Config, falling back to RadioSettings::default's
+        // own non-zero default rather than the old hardcoded 0dB, which
+        // real-hardware testing confirmed causes front-end overload on
+        // an ordinary HF antenna.
+        let rx_attenuation = Arc::new(AtomicU32::new(settings.rx_attenuation));
         let mox = Arc::new(AtomicBool::new(false));
         let tx_iq = Arc::new(Mutex::new(VecDeque::with_capacity(TX_IQ_BUFFER_CAPACITY)));
         let tci_tx_audio = Arc::new(Mutex::new(VecDeque::with_capacity(TCI_TX_AUDIO_CAPACITY)));
@@ -214,11 +244,11 @@ impl RadioSession {
         let tx_reverse_power = Arc::new(AtomicU32::new(0));
         match device.protocol {
             1 => start_protocol1(
-                device, settings, frequency_hz, sample_rate, adc, antenna, mox, tx_iq,
+                device, settings, frequency_hz, sample_rate, adc, antenna, rx_attenuation, mox, tx_iq,
                 tci_tx_audio, tx_power_watts, pa_gain_db, tx_forward_power, tx_reverse_power,
             ),
             2 => start_protocol2(
-                device, settings, frequency_hz, sample_rate, adc, antenna, mox, tx_iq,
+                device, settings, frequency_hz, sample_rate, adc, antenna, rx_attenuation, mox, tx_iq,
                 tci_tx_audio, tx_power_watts, pa_gain_db, tx_forward_power, tx_reverse_power,
             ),
             p => Err(io::Error::new(
@@ -344,6 +374,7 @@ fn start_protocol1(
     sample_rate: Arc<AtomicU32>,
     adc: Arc<AtomicU32>,
     antenna: Arc<AtomicU32>,
+    rx_attenuation: Arc<AtomicU32>,
     mox: Arc<AtomicBool>,
     tx_iq: Arc<Mutex<VecDeque<f32>>>,
     tci_tx_audio: Arc<Mutex<VecDeque<f32>>>,
@@ -387,6 +418,8 @@ fn start_protocol1(
                 settings.sample_rate,
                 false, // mox: never keyed during startup config
                 matches!(device.board, Boards::HermesLite | Boards::HermesLite2),
+                rx_attenuation.load(Ordering::Relaxed) as u8,
+                device.adcs,
                 &[], // no extra receivers active yet this early -- falls back to the main frequency
                 &tx_iq,
             );
@@ -445,7 +478,9 @@ fn start_protocol1(
     let sender_extra_frequencies_hz = extra_frequencies_hz.clone();
     let sender_tx_power_watts = Arc::clone(&tx_power_watts);
     let sender_pa_gain_db = Arc::clone(&pa_gain_db);
+    let sender_rx_attenuation = Arc::clone(&rx_attenuation);
     let sender_is_hermes_lite = matches!(device.board, Boards::HermesLite | Boards::HermesLite2);
+    let sender_num_adcs = device.adcs;
     let sender_thread = thread::spawn(move || {
         sender_loop(
             sender_socket,
@@ -458,7 +493,9 @@ fn start_protocol1(
             sender_antenna,
             sender_tx_power_watts,
             sender_pa_gain_db,
+            sender_rx_attenuation,
             sender_is_hermes_lite,
+            sender_num_adcs,
             sender_stop,
         );
     });
@@ -488,6 +525,7 @@ fn start_protocol1(
         sample_rate,
         adc,
         antenna,
+        rx_attenuation,
         extra_frequencies_hz,
         extra_sample_rates_hz,
         extra_adcs,
@@ -644,6 +682,8 @@ fn p1_build_packet(
     sample_rate_hz: u32,
     mox_on: bool,
     is_hermes_lite: bool,
+    rx_attenuation: u8,
+    num_adcs: u8,
     extra_frequencies_hz: &[Arc<AtomicU32>],
     tx_iq: &Mutex<VecDeque<f32>>,
 ) -> [u8; PACKET_SIZE] {
@@ -788,8 +828,21 @@ fn p1_build_packet(
             // attenuation while receiving, but 0x3F (all attenuator
             // bits set) while transmitting -- that all-1s pattern is
             // what actually enables the PA, not a real attenuation
-            // value. No per-band attenuation table here yet, so the
-            // RX case simplifies to the fixed 0x20 (0dB) already used.
+            // value.
+            //
+            // ROOT CAUSE FIX (RX case): this was hardcoded to a fixed
+            // 0x20 (0dB, no attenuation) regardless of `rx_attenuation`
+            // -- confirmed via real hardware testing (ANAN-100D/
+            // Angelia on a real HF antenna) that 0dB causes genuine
+            // front-end overload from ordinary band signals (visible
+            // as an intermod comb pattern or sustained broadband
+            // noise depending on what's on the band at the moment --
+            // real RF conditions vary, which is why this appeared
+            // random between connections). piHPSDR's own reference
+            // for this exact byte while receiving is `0x20 |
+            // ((int)adc[0].gain & 0x1F)` -- a real, user-configured
+            // value, not a constant. Now uses RadioSession::rx_attenuation
+            // (0-31 dB, Settings -> RX Attenuation) the same way.
             //
             // HermesLite/HermesLite2 repurpose this byte entirely:
             // bit 6 (0x40) must always be set, with bits 0-5 as an
@@ -804,14 +857,38 @@ fn p1_build_packet(
             } else if mox_on {
                 0x3F
             } else {
-                0x20
+                0x20 | (rx_attenuation & 0x1F)
             };
             (0x14, 0x00, 0x00, 0x00, c4)
         }
         5 => {
-            // CW keyer settings -- this project has no CW keyer,
-            // so all inert/off.
-            (0x16, 0x00, 0x00, 0x00, 0x00)
+            // CW keyer settings (C2-C4) -- this project has no CW
+            // keyer, so all inert/off.
+            //
+            // CANDIDATE FIX (C1), not yet confirmed against real
+            // hardware: piHPSDR's old_protocol.c (case 5) shows that
+            // on 2-ADC boards (Angelia, Orion, Orion2) C1 is the
+            // SECOND ADC's step attenuator, and bit 5 (0x20, "Att
+            // enable") "must be set all the time" per that
+            // reference's own comment, regardless of whether the
+            // second ADC is actually in use. This project previously
+            // left C1 hardcoded to 0x00 unconditionally -- leaving the
+            // second ADC's attenuator circuit unconfigured/floating on
+            // every 2-ADC board. Confirmed via real hardware testing
+            // (ANAN-100D/Angelia) to be the cause of a persistent
+            // comb-pattern spectrum + sawtooth-sounding audio (ruled
+            // out to be RX overload or a connect-time transient by two
+            // other real-hardware tests, and confirmed absent when the
+            // identical radio is driven by piHPSDR instead -- i.e.
+            // real, this project's bug, not the hardware) -- an
+            // unconfigured second-ADC attenuator is a plausible source
+            // of analog crosstalk into the first ADC's signal path,
+            // which only 2-ADC boards have a second ADC to produce.
+            // No per-ADC1 attenuation value tracked yet (unlike
+            // rx_attenuation for ADC0) -- just the required enable
+            // bit, at 0dB.
+            let c1: u8 = if num_adcs == 2 { 0x20 } else { 0x00 };
+            (0x16, c1, 0x00, 0x00, 0x00)
         }
         6 => {
             // Per-receiver ADC assignment. No per-receiver ADC
@@ -866,7 +943,9 @@ fn sender_loop(
     antenna: Arc<AtomicU32>,
     tx_power_watts: Arc<AtomicU32>,
     pa_gain_db: Arc<AtomicU32>,
+    rx_attenuation: Arc<AtomicU32>,
     is_hermes_lite: bool,
+    num_adcs: u8,
     stop: Arc<AtomicBool>,
 ) {
     let mut seq: u32 = 0;
@@ -895,17 +974,38 @@ fn sender_loop(
     while !stop.load(Ordering::Relaxed) {
         let current_rate = sample_rate.load(Ordering::Relaxed);
 
-        // 126 samples per 1032-byte packet is fixed by the frame geometry, so
-        // pacing outgoing packets at sample_rate/126 keeps us roughly in sync
-        // with the radio's own clock. This is standard HPSDR client behavior,
-        // not yet verified against your source's exact pacing mechanism.
-        let interval = Duration::from_secs_f64(126.0 / current_rate as f64);
-        let mox_on = mox.load(Ordering::Relaxed);
         // Read live each cycle (not a fixed value captured at session
         // start) so a receiver added mid-session via the "Add
         // Receiver" button is actually told to the radio, matching
         // how p2_sender_loop already reads active_receiver_count.
         let receivers = (active_receiver_count.load(Ordering::Relaxed) as u8).max(1);
+
+        // ROOT CAUSE FIX: this used to hardcode "126 samples per
+        // 1032-byte packet" regardless of `receivers`, which only
+        // happens to be correct for the single-receiver case (63
+        // sample-groups/frame * 2 frames -- see parse_iq_packet's
+        // identical stride formula). More receivers means fewer
+        // sample-groups fit in the same fixed 512-byte USB frame, so
+        // a real packet actually represents LESS wall-clock time as
+        // receiver count grows -- pacing against a fixed 126 paced
+        // this host's outgoing C&C/TX-audio stream 4x+ too slowly
+        // whenever receivers>1 relative to what the radio's own
+        // real-time ADC production needs, throwing off the return IQ
+        // stream's framing (P1's simple USB-audio-style protocol has
+        // no independent flow control -- the host's own outgoing
+        // cadence doubles as the radio's timing reference). This went
+        // completely unexercised until multi-receiver support let a
+        // real session ever run with receivers>1 for the first time.
+        //
+        // The `8` here is the per-FRAME 3-byte-sync + 5-byte-C&C prefix
+        // build_usb_frame writes (NOT the same thing as this file's
+        // top-level HEADER_SIZE constant, which is the OUTER packet's
+        // header -- same numeric value, 8, but a different 8 bytes) --
+        // matches parse_iq_packet's identical stride formula exactly.
+        let samples_per_frame = (USB_FRAME_SIZE - 8) / ((receivers as usize * 6) + 2);
+        let samples_per_packet = samples_per_frame * 2; // two USB frames per packet
+        let interval = Duration::from_secs_f64(samples_per_packet as f64 / current_rate as f64);
+        let mox_on = mox.load(Ordering::Relaxed);
 
         let packet = p1_build_packet(
             seq,
@@ -919,6 +1019,8 @@ fn sender_loop(
             current_rate,
             mox_on,
             is_hermes_lite,
+            rx_attenuation.load(Ordering::Relaxed) as u8,
+            num_adcs,
             &extra_frequencies_hz,
             &tx_iq,
         );
@@ -1085,6 +1187,7 @@ fn start_protocol2(
     sample_rate: Arc<AtomicU32>,
     adc: Arc<AtomicU32>,
     antenna: Arc<AtomicU32>,
+    rx_attenuation: Arc<AtomicU32>, // P1-only setting; carried here purely to populate RadioSession's shared field
     mox: Arc<AtomicBool>,
     tx_iq: Arc<Mutex<VecDeque<f32>>>,
     tci_tx_audio: Arc<Mutex<VecDeque<f32>>>,
@@ -1214,6 +1317,7 @@ fn start_protocol2(
         sample_rate,
         adc,
         antenna,
+        rx_attenuation,
         extra_frequencies_hz,
         extra_sample_rates_hz,
         extra_adcs,

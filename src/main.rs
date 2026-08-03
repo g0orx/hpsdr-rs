@@ -373,6 +373,9 @@ impl eframe::App for HpsdrApp {
                     // stuck at 1 for every P1 radio regardless of what it
                     // actually supports).
                     settings.receivers = device.supported_receivers.max(1);
+                    if let Some(atten) = cfg.rx_attenuation {
+                        settings.rx_attenuation = atten;
+                    }
                     match RadioSession::start(&device, settings) {
                         Ok(session) => {
                             // Override RadioSession::start's hardcoded
@@ -1856,6 +1859,46 @@ impl eframe::App for HpsdrApp {
                                         ui.separator();
                                     }
 
+                                    // Protocol 1, standard (non-HermesLite) boards only --
+                                    // HermesLite/HermesLite2 use a different RX gain mechanism
+                                    // this project doesn't expose a control for yet (see
+                                    // radio.rs's p1_build_packet command-4 doc comment), and P2
+                                    // doesn't use this field at all. ROOT CAUSE FIX: this was
+                                    // previously hardcoded to 0dB (no attenuation), which real
+                                    // hardware testing (ANAN-100D/Angelia on an HF antenna)
+                                    // confirmed causes front-end overload from ordinary band
+                                    // signals -- visible as an intermod comb pattern or
+                                    // sustained broadband noise depending on band conditions at
+                                    // the moment, which is why it looked random between connects.
+                                    if connected.device.protocol == 1
+                                        && !matches!(connected.device.board, Boards::HermesLite | Boards::HermesLite2)
+                                    {
+                                        let mut atten =
+                                            connected.session.rx_attenuation.load(Ordering::Relaxed) as i32;
+                                        ui.horizontal(|ui| {
+                                            ui.label("RX Attenuation:");
+                                            if scroll_slider_i32(
+                                                ui,
+                                                &mut connected.slider_scroll_accum,
+                                                &mut atten,
+                                                0..=31,
+                                                1,
+                                                " dB",
+                                            ) {
+                                                connected
+                                                    .session
+                                                    .rx_attenuation
+                                                    .store(atten as u32, Ordering::Relaxed);
+                                                settings_changed = true;
+                                            }
+                                        });
+                                        ui.weak(
+                                            "Raise this if the spectrum looks garbled/overloaded on a \
+                                             strong band -- 0dB is maximum sensitivity, not a safe default.",
+                                        );
+                                        ui.separator();
+                                    }
+
                                     ui.horizontal_wrapped(|ui| {
                                         let mut attack = agc_params.agc_attack_ms;
                                         ui.label("Attack:");
@@ -2371,6 +2414,9 @@ impl eframe::App for HpsdrApp {
                         rigctl_running: Some(connected.rigctl_server.is_some()),
                         tci_running: Some(connected.tci_server.is_some()),
                         extra_receivers,
+                        rx_attenuation: Some(
+                            connected.session.rx_attenuation.load(std::sync::atomic::Ordering::Relaxed),
+                        ),
                     }
                     .save(connected.device.mac);
                 }

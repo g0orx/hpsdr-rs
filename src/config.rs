@@ -121,6 +121,12 @@ pub struct Config {
     /// settings, matching however many were active last time.
     #[serde(default)]
     pub extra_receivers: Vec<ExtraReceiverConfig>,
+    /// Protocol 1 RX step attenuator (0-31 dB), standard (non-HermesLite)
+    /// boards only -- see radio::RadioSession::rx_attenuation's doc
+    /// comment. Missing (e.g. configs saved before this existed)
+    /// falls back to RadioSession::start's own default rather than the
+    /// old hardcoded 0dB.
+    pub rx_attenuation: Option<u32>,
 }
 
 fn default_nb_threshold() -> f64 {
