@@ -84,6 +84,20 @@ const TX_IQ_BUFFER_CAPACITY: usize = 100_000;
 /// counterpart of that local-mic buffer).
 const TCI_TX_AUDIO_CAPACITY: usize = 24_000;
 
+/// Confirmed against rustyHPSDR: TWO complete rotations before the
+/// Start command -- see start_protocol1's pre-config-rotation doc
+/// comment. TESTED AND RULED OUT: bumped to 5 as an experiment (raw
+/// UDP packet loss/reordering during this one-time window, theorized
+/// to explain an intermittent comb-pattern/sawtooth-audio artifact on
+/// 2-ADC P1 boards) -- real hardware testing showed no meaningful
+/// improvement (~1-in-5 successful connections either way), which
+/// rules out packet loss in THIS window as the/a dominant cause: if it
+/// were, 5 independent copies of each command instead of 2 should have
+/// made failure astronomically unlikely, not left it at ~80%. Reverted
+/// to the confirmed reference value rather than leave an unjustified
+/// deviation in place.
+const PRE_CONFIG_ROTATIONS: u32 = 2;
+
 /// PureSignal feedback IQ arrives at 192ksps on P2 (confirmed fixed
 /// rate -- new_protocol.c hardcodes it for the reserved DDC0/DDC1
 /// regardless of any receiver's own configured rate) and is only ever
@@ -509,54 +523,21 @@ fn start_protocol1(
     // sending the actual start command, the client sends TWO COMPLETE
     // rotations of all 11 C&C registers (RX/TX frequency, receiver
     // count/antenna, drive, attenuation, the fixed-value registers,
-    // etc.). Skipping this (as an earlier version of this file did --
-    // going straight to the start command with no configuration sent
-    // at all yet) could plausibly explain exactly the symptom seen:
-    // no signal on a fresh start, working after a stop+start, since by
-    // then the radio would have already absorbed configuration sent
-    // during the first attempt's brief window before this fix existed.
-    {
-        let mut pre_seq: u32 = 0;
-        let mut pre_ozy_command: u8 = 1;
-        let mut pre_current_receiver: u8 = 0;
-        let mut rotations = 0;
-        while rotations < 2 {
-            let packet = p1_build_packet(
-                pre_seq,
-                &mut pre_ozy_command,
-                &mut pre_current_receiver,
-                ps_wire_total.unwrap_or_else(|| settings.receivers.max(1)),
-                settings.frequency_hz,
-                0, // antenna: ANT1 default: nothing to key yet, live antenna updates once running
-                0, // tx_power_watts: not transmitting during startup config
-                DEFAULT_PA_GAIN_DB, // irrelevant while not transmitting (drive forced to 0 above)
-                settings.sample_rate,
-                false, // mox: never keyed during startup config
-                matches!(device.board, Boards::HermesLite | Boards::HermesLite2),
-                rx_attenuation.load(Ordering::Relaxed) as u8,
-                device.adcs,
-                &[], // no extra receivers active yet this early -- falls back to the main frequency
-                &tx_iq,
-            );
-            socket.send(&packet)?;
-            pre_seq = pre_seq.wrapping_add(1);
-            if pre_ozy_command == 1 && pre_current_receiver == 0 {
-                rotations += 1;
-            }
-        }
-    }
-
-    // Start command: <0xEF><0xFE><0x04><Command><60 zero bytes>.
-    // Command byte and packet size both confirmed against the
-    // reference (metis_start) -- corrects two previously-wrong
-    // guesses: this was 0x01 in a 63-byte buffer; the reference uses
-    // 0x03 in a 64-byte buffer.
-    let mut start_pkt = [0u8; 64];
-    start_pkt[0] = 0xEF;
-    start_pkt[1] = 0xFE;
-    start_pkt[2] = 0x04;
-    start_pkt[3] = 0x03;
-    socket.send(&start_pkt)?;
+    // etc.), THEN the Start command. See p1_send_preconfig_and_start's
+    // doc comment -- this is also what's replayed on a detected frame
+    // desync (receiver_loop's sync check), not just here at initial
+    // connect.
+    p1_send_preconfig_and_start(
+        &socket,
+        ps_wire_total,
+        settings.receivers.max(1),
+        settings.frequency_hz,
+        settings.sample_rate,
+        matches!(device.board, Boards::HermesLite | Boards::HermesLite2),
+        rx_attenuation.load(Ordering::Relaxed) as u8,
+        device.adcs,
+        &tx_iq,
+    )?;
 
     let stop_flag = Arc::new(AtomicBool::new(false));
     let iq_buffers: Vec<Arc<Mutex<VecDeque<IqSample>>>> = (0..real_receivers)
@@ -786,6 +767,75 @@ fn sample_rate_code(rate: u32) -> u8 {
         384_000 => 0x03,
         _ => 0x00,
     }
+}
+
+/// Sends the confirmed-reference pre-config sequence (two full
+/// rotations of all 11 C&C registers over raw, unacknowledged UDP)
+/// followed by the Start command, at initial connection (start_protocol1).
+///
+/// NOTE: an earlier version of this project also called this from
+/// sender_loop to recover from a detected frame desync via a full
+/// stop+restart, on the theory (borrowed from rustyHPSDR) that a lost
+/// USB-frame sync couldn't be recovered any other way. Real hardware
+/// testing disproved that: the actual cause was a fixed, connection-
+/// wide byte-phase offset (not per-frame corruption), which restarting
+/// just reproduced identically every time (an infinite restart loop).
+/// The real fix is in parse_iq_stream (receiver_loop) -- discover the
+/// phase once via a byte scan, then track it for the rest of the
+/// connection -- so no restart-on-desync path exists here anymore.
+#[allow(clippy::too_many_arguments)]
+fn p1_send_preconfig_and_start(
+    socket: &UdpSocket,
+    ps_wire_total: Option<u8>,
+    receivers_fallback: u8,
+    frequency_hz: u32,
+    sample_rate: u32,
+    is_hermes_lite: bool,
+    rx_attenuation: u8,
+    num_adcs: u8,
+    tx_iq: &Mutex<VecDeque<f32>>,
+) -> io::Result<()> {
+    let mut pre_seq: u32 = 0;
+    let mut pre_ozy_command: u8 = 1;
+    let mut pre_current_receiver: u8 = 0;
+    let mut rotations = 0;
+    while rotations < PRE_CONFIG_ROTATIONS {
+        let packet = p1_build_packet(
+            pre_seq,
+            &mut pre_ozy_command,
+            &mut pre_current_receiver,
+            ps_wire_total.unwrap_or(receivers_fallback),
+            frequency_hz,
+            0, // antenna: ANT1 default: nothing to key yet, live antenna updates once running
+            0, // tx_power_watts: not transmitting during startup config
+            DEFAULT_PA_GAIN_DB, // irrelevant while not transmitting (drive forced to 0 above)
+            sample_rate,
+            false, // mox: never keyed during startup config
+            is_hermes_lite,
+            rx_attenuation,
+            num_adcs,
+            &[], // no extra receivers active yet this early -- falls back to the main frequency
+            tx_iq,
+        );
+        socket.send(&packet)?;
+        pre_seq = pre_seq.wrapping_add(1);
+        if pre_ozy_command == 1 && pre_current_receiver == 0 {
+            rotations += 1;
+        }
+    }
+
+    // Start command: <0xEF><0xFE><0x04><Command><60 zero bytes>.
+    // Command byte and packet size both confirmed against the
+    // reference (metis_start) -- corrects two previously-wrong
+    // guesses: this was 0x01 in a 63-byte buffer; the reference uses
+    // 0x03 in a 64-byte buffer.
+    let mut start_pkt = [0u8; 64];
+    start_pkt[0] = 0xEF;
+    start_pkt[1] = 0xFE;
+    start_pkt[2] = 0x04;
+    start_pkt[3] = 0x03;
+    socket.send(&start_pkt)?;
+    Ok(())
 }
 
 /// Builds one full P1 packet (general-control frame + whichever C&C
@@ -1205,6 +1255,13 @@ fn receiver_loop(
     let mut ps_rx_fb_window: u32 = 0;
     let mut ps_tx_fb_window: u32 = 0;
     let mut ps_window_start = Instant::now();
+    // Persistent byte-stream parse state for parse_iq_stream -- see its
+    // doc comment. Owned here (not per-packet) because a "frame" can
+    // straddle two packets once the discovered sync phase isn't a
+    // multiple of the packet size, and the discovered phase itself is
+    // a connection-wide constant, not something to rediscover per call.
+    let mut carry: Vec<u8> = Vec::new();
+    let mut frame_synced = false;
     while !stop.load(Ordering::Relaxed) {
         match socket.recv(&mut buf) {
             Ok(n) if n == PACKET_SIZE => {
@@ -1220,7 +1277,7 @@ fn receiver_loop(
                     // agree on the stride.
                     let receivers = ps_wire_total
                         .unwrap_or_else(|| (active_receiver_count.load(Ordering::Relaxed) as u8).max(1));
-                    let (rx_fb, tx_fb) = parse_iq_packet(
+                    let (rx_fb, tx_fb) = parse_iq_stream(
                         &buf[HEADER_SIZE..PACKET_SIZE],
                         receivers,
                         &buffers,
@@ -1230,6 +1287,8 @@ fn receiver_loop(
                         ps_feedback_indices,
                         &ps_rx_feedback_iq,
                         &ps_tx_feedback_iq,
+                        &mut carry,
+                        &mut frame_synced,
                     );
                     ps_rx_fb_window += rx_fb;
                     ps_tx_fb_window += tx_fb;
@@ -1269,8 +1328,37 @@ fn iq_buffer_capacity_for_rate(sample_rate_hz: u32) -> usize {
 }
 
 /// `payload` is the two 512-byte USB frames (no outer 8-byte header).
+///
+/// ROOT CAUSE FIX for the intermittent P1 comb-pattern bug -- replaces
+/// an earlier, WRONG fixed-position model (frame 0 always starts at
+/// payload byte 0, frame 1 always at byte 512) that assumed every
+/// received packet's 512-byte "USB frames" line up with the packet
+/// boundary. Real hardware testing proved that's false: the radio's
+/// actual sync preamble sits at a CONSTANT but non-zero phase offset
+/// relative to that assumption (confirmed via a byte-scan diagnostic --
+/// e.g. exactly 360 bytes in one observed session, identical at every
+/// single frame for the entire session, never drifting). That's a
+/// FIXED, connection-wide phase shift (plausibly some one-time
+/// leftover-FIFO condition right after Start), not per-frame
+/// corruption -- which also explains why an earlier stop+restart
+/// attempt looped forever: restarting just reproduces the identical
+/// fixed shift again, since whatever causes it recurs on every fresh
+/// Start too.
+///
+/// The correct fix, confirmed by rustyHPSDR's own ACTIVE (not the
+/// red-herring commented-out) protocol1/mod.rs::process_ozy_buffer,
+/// which is 100% reliable on this exact hardware: treat the incoming
+/// data as a continuous BYTE STREAM, not discrete fixed-size frames.
+/// Discover the true sync phase once via a byte scan, then carry any
+/// leftover bytes across packet boundaries indefinitely (a "frame" can
+/// -- and after a phase shift, will -- straddle two packets) rather
+/// than assuming each 1024-byte payload starts a fresh frame at byte 0.
+/// `carry`/`frame_synced` are owned by the caller (receiver_loop) and
+/// persist for the whole connection, exactly like the reference
+/// client's own persistent parse state. Confirmed working on real
+/// hardware, P1 with PureSignal both off and on.
 #[allow(clippy::too_many_arguments)]
-fn parse_iq_packet(
+fn parse_iq_stream(
     payload: &[u8],
     receivers: u8,
     buffers: &[Arc<Mutex<VecDeque<IqSample>>>],
@@ -1294,11 +1382,49 @@ fn parse_iq_packet(
     // stops moving once full, misleadingly looking "stalled"). Remove
     // this return value once PS's real WDSP consumer exists and this
     // diagnostic is no longer needed.
+    carry: &mut Vec<u8>,
+    frame_synced: &mut bool,
 ) -> (u32, u32) {
     let mut rx_fb_pushed: u32 = 0;
     let mut tx_fb_pushed: u32 = 0;
-    for frame_idx in 0..2 {
-        let frame = &payload[frame_idx * USB_FRAME_SIZE..(frame_idx + 1) * USB_FRAME_SIZE];
+
+    carry.extend_from_slice(payload);
+
+    if !*frame_synced {
+        let found = (0..carry.len().saturating_sub(2))
+            .find(|&i| carry[i] == 0x7F && carry[i + 1] == 0x7F && carry[i + 2] == 0x7F);
+        match found {
+            Some(i) => {
+                if i > 0 {
+                    carry.drain(0..i);
+                }
+                *frame_synced = true;
+            }
+            None => {
+                // Sync pattern not found yet -- keep accumulating, but
+                // cap growth so a stream that never contains one
+                // (e.g. no cable connected) doesn't grow unbounded.
+                if carry.len() > 8192 {
+                    carry.clear();
+                }
+                return (0, 0);
+            }
+        }
+    }
+
+    while carry.len() >= USB_FRAME_SIZE {
+        // Defensive re-check: if a frame boundary we expect to be
+        // sync-aligned isn't, alignment has genuinely been lost (not
+        // just this code's own wrong initial assumption, since that's
+        // already been corrected above) -- force full rediscovery
+        // rather than silently parsing garbage.
+        if carry[0] != 0x7F || carry[1] != 0x7F || carry[2] != 0x7F {
+            eprintln!("radio: P1 frame sync lost mid-stream, rediscovering");
+            *frame_synced = false;
+            carry.clear();
+            return (rx_fb_pushed, tx_fb_pushed);
+        }
+
         // frame[0..3] = sync, frame[3..8] = C0-C4 status from the radio.
         //
         // Confirmed against a working reference: C0's bits mirror the
@@ -1308,6 +1434,7 @@ fn parse_iq_packet(
         // its own, the same way the host cycles through C&C registers.
         // Address 1 carries exciter power (C1-C2) and Alex forward
         // power (C3-C4); address 2 carries Alex reverse power (C1-C2).
+        let frame = &carry[0..USB_FRAME_SIZE];
         let c0 = frame[3];
         let address = (c0 >> 3) & 0x1F;
         if address == 1 {
@@ -1342,7 +1469,10 @@ fn parse_iq_packet(
             }
             b += 2; // mic sample, unused on receive side
         }
+
+        carry.drain(0..USB_FRAME_SIZE);
     }
+
     (rx_fb_pushed, tx_fb_pushed)
 }
 
