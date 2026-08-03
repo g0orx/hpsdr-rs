@@ -506,6 +506,7 @@ impl Drop for TxProcessor {
 
 fn run(
     mic_buffer: Arc<Mutex<VecDeque<f32>>>,
+    tci_tx_audio: Arc<Mutex<VecDeque<f32>>>,
     tx_iq_out: Arc<Mutex<VecDeque<f32>>>,
     mox: Arc<AtomicBool>,
     params: Arc<Mutex<TxParams>>,
@@ -580,11 +581,12 @@ fn run(
 
     while !stop.load(Ordering::Relaxed) {
         if !mox.load(Ordering::Relaxed) {
-            // Not transmitting -- drop any mic audio that accumulated
-            // while idle so the next PTT doesn't start by replaying a
-            // backlog of stale audio, and don't burn CPU running the
-            // TXA chain on nothing.
+            // Not transmitting -- drop any mic/TCI audio that
+            // accumulated while idle so the next PTT doesn't start by
+            // replaying a backlog of stale audio, and don't burn CPU
+            // running the TXA chain on nothing.
             mic_buffer.lock().unwrap().clear();
+            tci_tx_audio.lock().unwrap().clear();
             thread::sleep(Duration::from_millis(20));
             // Resync so the first chunk after PTT is produced against a
             // fresh schedule, not delayed by however long MOX was off --
@@ -594,12 +596,29 @@ fn run(
         }
 
         {
-            let mut buf = mic_buffer.lock().unwrap();
-            if buf.len() < TX_BUFFER_SIZE {
-                starved_chunks_this_window += 1;
-            }
-            for slot in chunk.iter_mut() {
-                *slot = buf.pop_front().unwrap_or(0.0); // silence on underrun, not silence on stall
+            // TCI-sourced audio takes priority over the local mic for
+            // any chunk where it has a full chunk's worth available --
+            // see radio.rs's tci_tx_audio doc comment for why this is
+            // a separate queue rather than both sources feeding
+            // mic_buffer directly (would interleave/garble if both
+            // were ever active at once). No TCI client sending audio
+            // -> this queue never fills -> falls through to mic_buffer
+            // exactly as before, zero behavior change for local-mic
+            // operation.
+            let mut tci_buf = tci_tx_audio.lock().unwrap();
+            if tci_buf.len() >= TX_BUFFER_SIZE {
+                for slot in chunk.iter_mut() {
+                    *slot = tci_buf.pop_front().unwrap_or(0.0);
+                }
+            } else {
+                drop(tci_buf);
+                let mut buf = mic_buffer.lock().unwrap();
+                if buf.len() < TX_BUFFER_SIZE {
+                    starved_chunks_this_window += 1;
+                }
+                for slot in chunk.iter_mut() {
+                    *slot = buf.pop_front().unwrap_or(0.0); // silence on underrun, not silence on stall
+                }
             }
         }
         chunks_this_window += 1;
@@ -686,6 +705,7 @@ impl TxHandle {
     /// concept).
     pub fn start(
         mic_buffer: Arc<Mutex<VecDeque<f32>>>,
+        tci_tx_audio: Arc<Mutex<VecDeque<f32>>>,
         tx_iq_out: Arc<Mutex<VecDeque<f32>>>,
         mox: Arc<AtomicBool>,
         channel: i32,
@@ -703,8 +723,8 @@ impl TxHandle {
             let stop = Arc::clone(&stop);
             thread::spawn(move || {
                 run(
-                    mic_buffer, tx_iq_out, mox, params, display, channel, protocol, mic_rate,
-                    duc_rate, stop,
+                    mic_buffer, tci_tx_audio, tx_iq_out, mox, params, display, channel, protocol,
+                    mic_rate, duc_rate, stop,
                 )
             })
         };

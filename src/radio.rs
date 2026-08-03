@@ -77,6 +77,13 @@ const IQ_BUFFER_CAPACITY: usize = 12_000;
 /// latency without limit.
 const TX_IQ_BUFFER_CAPACITY: usize = 100_000;
 
+/// Same "small, bounded, drop-oldest" reasoning as the other buffers
+/// here -- a backlog becomes added key-down latency, not something
+/// that self-corrects. Mono audio at 48kHz, ~0.5s, matching audio.rs's
+/// own MIC_BUFFER_CAPACITY for the same reason (this is the TCI-client
+/// counterpart of that local-mic buffer).
+const TCI_TX_AUDIO_CAPACITY: usize = 24_000;
+
 #[derive(Copy, Clone, Debug)]
 pub struct IqSample {
     pub i: i32,
@@ -134,6 +141,14 @@ pub struct RadioSession {
     /// fill_tx_payload's module notes for the confidence caveats on
     /// what format this actually needs to be in per protocol.
     pub tx_iq: Arc<Mutex<VecDeque<f32>>>,
+    /// TX audio *received from a TCI client* (mono, downmixed from the
+    /// stereo wire format) -- see tx.rs's run() for how this takes
+    /// priority over the local mic_buffer on any chunk where it has
+    /// data, and tci.rs's TX_AUDIO_STREAM handling for how it gets
+    /// filled. Long-lived here (like mox/tx_iq above) so it stays
+    /// stable across TX arm/disarm cycles and TCI server restarts,
+    /// rather than being recreated each time either does.
+    pub tci_tx_audio: Arc<Mutex<VecDeque<f32>>>,
     /// Desired TX output power in watts, converted to each protocol's
     /// actual drive byte via drive_byte_for_watts -- see that
     /// function's doc comment. Confirmed by the user to belong at byte
@@ -188,6 +203,7 @@ impl RadioSession {
         let antenna = Arc::new(AtomicU32::new(0));
         let mox = Arc::new(AtomicBool::new(false));
         let tx_iq = Arc::new(Mutex::new(VecDeque::with_capacity(TX_IQ_BUFFER_CAPACITY)));
+        let tci_tx_audio = Arc::new(Mutex::new(VecDeque::with_capacity(TCI_TX_AUDIO_CAPACITY)));
         // Deliberately low rather than defaulting to max power -- easier
         // to notice "too low, turn it up" on a bench test than to start
         // a first-ever TX test at full drive into whatever's connected
@@ -199,11 +215,11 @@ impl RadioSession {
         match device.protocol {
             1 => start_protocol1(
                 device, settings, frequency_hz, sample_rate, adc, antenna, mox, tx_iq,
-                tx_power_watts, pa_gain_db, tx_forward_power, tx_reverse_power,
+                tci_tx_audio, tx_power_watts, pa_gain_db, tx_forward_power, tx_reverse_power,
             ),
             2 => start_protocol2(
                 device, settings, frequency_hz, sample_rate, adc, antenna, mox, tx_iq,
-                tx_power_watts, pa_gain_db, tx_forward_power, tx_reverse_power,
+                tci_tx_audio, tx_power_watts, pa_gain_db, tx_forward_power, tx_reverse_power,
             ),
             p => Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -330,6 +346,7 @@ fn start_protocol1(
     antenna: Arc<AtomicU32>,
     mox: Arc<AtomicBool>,
     tx_iq: Arc<Mutex<VecDeque<f32>>>,
+    tci_tx_audio: Arc<Mutex<VecDeque<f32>>>,
     tx_power_watts: Arc<AtomicU32>,
     pa_gain_db: Arc<AtomicU32>,
     tx_forward_power: Arc<AtomicU32>,
@@ -477,6 +494,7 @@ fn start_protocol1(
         active_receiver_count,
         mox,
         tx_iq,
+        tci_tx_audio,
         tx_power_watts,
         pa_gain_db,
         tx_forward_power,
@@ -1069,6 +1087,7 @@ fn start_protocol2(
     antenna: Arc<AtomicU32>,
     mox: Arc<AtomicBool>,
     tx_iq: Arc<Mutex<VecDeque<f32>>>,
+    tci_tx_audio: Arc<Mutex<VecDeque<f32>>>,
     tx_power_watts: Arc<AtomicU32>,
     pa_gain_db: Arc<AtomicU32>,
     tx_forward_power: Arc<AtomicU32>,
@@ -1201,6 +1220,7 @@ fn start_protocol2(
         active_receiver_count,
         mox,
         tx_iq,
+        tci_tx_audio,
         tx_power_watts,
         pa_gain_db,
         tx_forward_power,

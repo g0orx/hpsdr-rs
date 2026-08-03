@@ -71,8 +71,24 @@
     where this data actually comes from -- dedicated taps, not shared
     with the existing local-playback/analyzer consumers of similar
     data, since a second reader of an already-consumed queue would
-    steal samples from the first. TX audio (a client sending audio to
-    the radio, e.g. for voice macros) isn't implemented -- RX only.
+    steal samples from the first.
+
+    TX audio (a client sending audio to the radio, e.g. for voice
+    macros or a fully remote digital-mode setup) is implemented and
+    confirmed working end-to-end against TCI Remote: PTT, TxChrono
+    requests, and the TX_AUDIO_STREAM response are all exchanged
+    correctly, and the received audio reaches WDSP's TXA chain at a
+    proper level (verified via its own internal meters against a Tune
+    baseline). One real-world quirk found along the way: TCI Remote's
+    `length` header field does NOT follow the frame-pair convention
+    this project's own outgoing messages use (see
+    decode_binary_message's doc comment) -- incoming payload size is
+    derived from the actual received byte count instead of trusting
+    that field. Received TX audio lands in radio.rs's
+    RadioSession::tci_tx_audio, which tx.rs's TXA loop prefers over the
+    local mic_buffer on any chunk where it has data (see run()'s doc
+    comment there) -- so local mic PTT keeps working completely
+    unaffected whenever no TCI client is actively sending audio.
 */
 
 use crate::spectrum::{DemodParams, Mode};
@@ -144,6 +160,7 @@ impl TciServer {
         mox: Arc<AtomicBool>,
         tci_audio_out: Arc<Mutex<VecDeque<f32>>>,
         iq_out: Arc<Mutex<VecDeque<(f32, f32)>>>,
+        tci_tx_audio: Arc<Mutex<VecDeque<f32>>>,
     ) -> std::io::Result<Self> {
         let listener = TcpListener::bind(addr)?;
         listener.set_nonblocking(true)?;
@@ -159,6 +176,7 @@ impl TciServer {
         let accept_client_threads = Arc::clone(&client_threads);
         let accept_demod_params = Arc::clone(&demod_params);
         let accept_audio_iq = Arc::clone(&audio_iq);
+        let accept_tci_tx_audio = Arc::clone(&tci_tx_audio);
         let thread = thread::spawn(move || {
             while !accept_stop.load(Ordering::Relaxed) {
                 match listener.accept() {
@@ -168,12 +186,13 @@ impl TciServer {
                         let rate = Arc::clone(&sample_rate);
                         let params = Arc::clone(&accept_demod_params);
                         let audio_iq = Arc::clone(&accept_audio_iq);
+                        let tx_audio = Arc::clone(&accept_tci_tx_audio);
                         let conn_mox = Arc::clone(&mox);
                         let conn_stop = Arc::clone(&accept_stop);
                         let conn_connected = Arc::clone(&accept_connected);
                         let handle = thread::spawn(move || {
                             conn_connected.fetch_add(1, Ordering::Relaxed);
-                            handle_client(stream, freq, rate, params, audio_iq, conn_mox, conn_stop);
+                            handle_client(stream, freq, rate, params, audio_iq, tx_audio, conn_mox, conn_stop);
                             conn_connected.fetch_sub(1, Ordering::Relaxed);
                         });
                         let mut threads = accept_client_threads.lock().unwrap();
@@ -255,6 +274,7 @@ fn handle_client(
     sample_rate: Arc<AtomicU32>,
     demod_params: DemodParamsCell,
     audio_iq: AudioIqCell,
+    tci_tx_audio: Arc<Mutex<VecDeque<f32>>>,
     mox: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
 ) {
@@ -328,7 +348,29 @@ fn handle_client(
                 }
             }
             Ok(Message::Close(_)) => break,
-            Ok(_) => {} // ping/pong/binary -- ignored for now
+            Ok(Message::Binary(data)) => {
+                // A client sending TX audio -- see decode_binary_message's
+                // doc comment for the confidence caveat on this whole
+                // exchange (no confirmed-working reference for the
+                // server side of it, unlike RX audio/IQ above).
+                if let Some((msg_type, samples)) = decode_binary_message(&data) {
+                    if msg_type == BinaryMessageType::TxAudioStream as u32 {
+                        // Stereo -> mono: simple L/R average. No
+                        // existing precedent to match here (audio.rs's
+                        // MicInput requests mono directly from cpal
+                        // rather than downmixing stereo in software).
+                        let mut q = tci_tx_audio.lock().unwrap();
+                        let capacity = q.capacity(); // matches radio.rs's TCI_TX_AUDIO_CAPACITY
+                        for pair in samples.chunks_exact(2) {
+                            if q.len() >= capacity {
+                                q.pop_front();
+                            }
+                            q.push_back((pair[0] + pair[1]) * 0.5);
+                        }
+                    }
+                }
+            }
+            Ok(_) => {} // ping/pong -- ignored for now
             Err(tungstenite::Error::Io(ref e))
                 if e.kind() == std::io::ErrorKind::WouldBlock
                     || e.kind() == std::io::ErrorKind::TimedOut =>
@@ -369,6 +411,7 @@ fn handle_client(
                     0,
                     TCI_AUDIO_SAMPLE_RATE,
                     BinaryMessageType::RxAudioStream,
+                    stereo.len() as u32,
                     &stereo,
                 );
                 if ws.send(Message::Binary(msg.into())).is_err() {
@@ -392,6 +435,7 @@ fn handle_client(
                     0,
                     sample_rate.load(Ordering::Relaxed),
                     BinaryMessageType::IqStream,
+                    swapped.len() as u32,
                     &swapped,
                 );
                 if ws.send(Message::Binary(msg.into())).is_err() {
@@ -399,8 +443,32 @@ fn handle_client(
                 }
             }
         }
+
+        // TxChrono -- requests TX audio from this client while
+        // transmitting. Confirmed working end-to-end against TCI Remote:
+        // sent once per loop tick (the same ~20ms cadence used for RX
+        // streaming above) while mox is active, requesting
+        // TCI_TX_AUDIO_CHUNK samples -- chosen to match tx.rs's own
+        // TX_BUFFER_SIZE. A client that doesn't implement TX audio
+        // simply won't respond to this; harmless either way.
+        if mox.load(Ordering::Relaxed) {
+            let chrono = encode_binary_message(
+                0,
+                TCI_AUDIO_SAMPLE_RATE,
+                BinaryMessageType::TxChrono,
+                TCI_TX_AUDIO_CHUNK,
+                &[],
+            );
+            if ws.send(Message::Binary(chrono.into())).is_err() {
+                return;
+            }
+        }
     }
 }
+
+/// Matches tx.rs's own TX_BUFFER_SIZE -- see the TxChrono comment
+/// above for why this is what gets requested per chunk.
+const TCI_TX_AUDIO_CHUNK: u32 = 512;
 
 /// RX audio's fixed output rate -- must match spectrum.rs's own
 /// OUTPUT_RATE (not imported directly since that constant is private
@@ -413,11 +481,16 @@ const TCI_AUDIO_SAMPLE_RATE: u32 = 48_000;
 /// against BOTH github.com/ftl/tci and rustyHPSDR's own TCIStreamType
 /// enum (rustyHPSDR's is the stronger reference here: it's confirmed
 /// actually working against TCI Remote, the exact client this was
-/// written for). TX_AUDIO_STREAM/TX_CHRONO (a client sending TX audio
-/// back to the radio) aren't implemented, so aren't listed here.
+/// written for). TxAudioStream/TxChrono (a client sending TX audio
+/// back to the radio) are BEST-EFFORT, not confirmed the way the RX
+/// side is -- see decode_binary_message's and the TxChrono call
+/// site's doc comments.
+#[derive(PartialEq)]
 enum BinaryMessageType {
     IqStream = 0,
     RxAudioStream = 1,
+    TxAudioStream = 2,
+    TxChrono = 3,
 }
 
 /// Encodes one TCI binary streaming message: a fixed 64-byte
@@ -434,11 +507,17 @@ enum BinaryMessageType {
 /// `length` as total float count instead of frame-pair count.
 /// `trx` is always 0 here -- rigctl/TCI only ever expose the primary
 /// receiver (see spawn_extra_receiver and TciServer's own module
-/// note), so there's no second index to send.
+/// note), so there's no second index to send. `length` is passed
+/// explicitly rather than derived from `frames.len()` so a TxChrono
+/// message (no payload bytes at all, per the one confirmed detail
+/// found on this exchange -- see ftl/tci's own decode skipping
+/// payload parsing for this type) can still carry a requested-sample-
+/// count hint in the header.
 fn encode_binary_message(
     trx: u32,
     sample_rate: u32,
     msg_type: BinaryMessageType,
+    length: u32,
     frames: &[(f32, f32)],
 ) -> Vec<u8> {
     let mut buf = Vec::with_capacity(64 + frames.len() * 8);
@@ -447,7 +526,7 @@ fn encode_binary_message(
     buf.extend_from_slice(&3u32.to_le_bytes()); // Format: float32
     buf.extend_from_slice(&0u32.to_le_bytes()); // Codec: uncompressed
     buf.extend_from_slice(&0u32.to_le_bytes()); // CRC: unused
-    buf.extend_from_slice(&(frames.len() as u32).to_le_bytes()); // length: frame-pair count, not float count
+    buf.extend_from_slice(&length.to_le_bytes()); // frame-pair count, not float count
     buf.extend_from_slice(&(msg_type as u32).to_le_bytes());
     buf.extend_from_slice(&2u32.to_le_bytes()); // channels: always stereo
     buf.extend_from_slice(&[0u8; 32]); // Reserved: 8 * u32
@@ -456,6 +535,40 @@ fn encode_binary_message(
         buf.extend_from_slice(&b.to_le_bytes());
     }
     buf
+}
+
+/// Inverse of encode_binary_message -- parses the 64-byte header and
+/// returns (Type, samples), where `samples` is the raw float32 payload
+/// (still interleaved, e.g. stereo L,R,L,R for TxAudioStream; caller
+/// downmixes). Returns None if the buffer is shorter than the header.
+///
+/// CORRECTED after real-world testing against TCI Remote: the header's
+/// `length` field is NOT used to determine how many floats to read.
+/// An earlier version derived the expected float count from `length`
+/// (assuming it meant frame-pairs, matching this project's own
+/// *outgoing* convention, confirmed against rustyHPSDR) and rejected
+/// the frame if the payload didn't match -- but real frames from TCI
+/// Remote were rejected this way (16448 bytes = 64-byte header +
+/// 16384-byte payload = exactly 4096 f32s / 2048 stereo pairs, yet
+/// still didn't satisfy that check), meaning this client's `length`
+/// doesn't follow the same frame-pair convention for data it SENDS
+/// (whatever it actually means here isn't confirmed). Rather than
+/// guess at yet another `length` semantic, this now derives the float
+/// count directly from the actual received payload size instead --
+/// unambiguous, self-describing, and doesn't depend on a convention
+/// that's turned out to differ by direction/client.
+fn decode_binary_message(data: &[u8]) -> Option<(u32, Vec<f32>)> {
+    if data.len() < 64 {
+        return None;
+    }
+    let msg_type = u32::from_le_bytes(data[24..28].try_into().ok()?);
+    let payload = &data[64..];
+    let num_floats = payload.len() / 4; // drops any trailing partial float, if ever present
+    let samples = payload[..num_floats * 4]
+        .chunks_exact(4)
+        .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+        .collect();
+    Some((msg_type, samples))
 }
 
 /// Returns Some(response-to-send) for recognized commands, or None to

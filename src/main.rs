@@ -436,6 +436,7 @@ impl eframe::App for HpsdrApp {
                                     Arc::clone(&session.mox),
                                     Arc::clone(&spectrum.tci_audio_out),
                                     Arc::clone(&spectrum.iq_out),
+                                    Arc::clone(&session.tci_tx_audio),
                                 ) {
                                     Ok(s) => Some(s),
                                     Err(e) => {
@@ -531,6 +532,7 @@ impl eframe::App for HpsdrApp {
                                 Ok(mic) => {
                                     let tx_handle = TxHandle::start(
                                         mic_buffer,
+                                        Arc::clone(&session.tci_tx_audio),
                                         Arc::clone(&session.tx_iq),
                                         Arc::clone(&session.mox),
                                         session.iq_buffers.len() as i32,
@@ -1748,6 +1750,7 @@ impl eframe::App for HpsdrApp {
                                                 Arc::clone(&connected.session.mox),
                                                 Arc::clone(&connected.spectrum.tci_audio_out),
                                                 Arc::clone(&connected.spectrum.iq_out),
+                                                Arc::clone(&connected.session.tci_tx_audio),
                                             ) {
                                                 Ok(s) => Some(s),
                                                 Err(e) => {
@@ -2198,6 +2201,7 @@ impl eframe::App for HpsdrApp {
                                                 Ok(mic) => {
                                                     let tx_handle = TxHandle::start(
                                                         mic_buffer,
+                                                        Arc::clone(&connected.session.tci_tx_audio),
                                                         Arc::clone(&connected.session.tx_iq),
                                                         Arc::clone(&connected.session.mox),
                                                         connected.session.iq_buffers.len() as i32,
@@ -3650,6 +3654,7 @@ fn change_sample_rate(connected: &mut ConnectedState, new_rate: u32) {
             if let Some(mic) = &connected.mic_input {
                 let tx_handle = TxHandle::start(
                     Arc::clone(mic.buffer()),
+                    Arc::clone(&connected.session.tci_tx_audio),
                     Arc::clone(&connected.session.tx_iq),
                     Arc::clone(&connected.session.mox),
                     connected.session.iq_buffers.len() as i32,
