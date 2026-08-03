@@ -143,6 +143,8 @@ enum SettingsTab {
     Agc,
     Spectrum,
     Tx,
+    PaCalibration,
+    PureSignal,
 }
 
 /// A receiver beyond the first, shown in its own native OS window (P2
@@ -281,6 +283,17 @@ struct ConnectedState {
     /// disable/re-enable of TX within the same session, and so it's
     /// available to persist even while TX is currently disarmed.
     mic_gain: f32,
+    /// PureSignal calibration values (Settings -> PureSignal), same
+    /// "tracked here, pushed to TxHandle on change" pattern as
+    /// mic_gain above -- see tx::PsParams's field docs for what each
+    /// one means. `ps_enabled` is the LIVE engine on/off (tx::PsParams::
+    /// enabled), distinct from `puresignal_enabled` above (which only
+    /// gates the connect-time feedback-receiver wire request).
+    ps_enabled: bool,
+    ps_hw_peak: f64,
+    ps_mox_delay: f64,
+    ps_loop_delay: f64,
+    ps_tx_delay_ns: f64,
     /// Per-band PA gain (dB), keyed by band name. See
     /// Config::pa_calibration and radio::drive_byte_for_watts. Resolved
     /// to the current band and pushed into session.pa_gain_db once per
@@ -511,6 +524,17 @@ impl eframe::App for HpsdrApp {
                                 spectrum.set_snb(v);
                             }
                             let mic_gain = cfg.mic_gain.unwrap_or(0.5);
+                            // See tx::PsParams::default for these same
+                            // fallback values -- kept in sync deliberately
+                            // (both are "reference default if never
+                            // calibrated", just one's Config's fallback,
+                            // one's PsParams's fallback for a session that
+                            // skips Config loading entirely).
+                            let ps_enabled = true;
+                            let ps_hw_peak = cfg.ps_hw_peak.unwrap_or(0.2899);
+                            let ps_mox_delay = cfg.ps_mox_delay.unwrap_or(0.2);
+                            let ps_loop_delay = cfg.ps_loop_delay.unwrap_or(0.0);
+                            let ps_tx_delay_ns = cfg.ps_tx_delay_ns.unwrap_or(150.0);
 
                             let settings_dirty = Arc::new(std::sync::atomic::AtomicBool::new(false));
                             let mut extra_receivers = Vec::new();
@@ -551,10 +575,18 @@ impl eframe::App for HpsdrApp {
                                         device.protocol,
                                         48_000,
                                         duc_rate,
+                                        settings.puresignal_enabled,
+                                        Arc::clone(&session.ps_rx_feedback_iq),
+                                        Arc::clone(&session.ps_tx_feedback_iq),
                                     );
                                     tx_handle.set_mic_gain(mic_gain);
                                     tx_handle.set_mode(spectrum.mode());
                                     tx_handle.set_width_hz(spectrum.width_hz());
+                                    tx_handle.set_ps_enabled(ps_enabled);
+                                    tx_handle.set_ps_hw_peak(ps_hw_peak);
+                                    tx_handle.set_ps_mox_delay(ps_mox_delay);
+                                    tx_handle.set_ps_loop_delay(ps_loop_delay);
+                                    tx_handle.set_ps_tx_delay_ns(ps_tx_delay_ns);
                                     (true, Some(mic), Some(tx_handle))
                                 }
                                 Err(e) => {
@@ -618,6 +650,11 @@ impl eframe::App for HpsdrApp {
                                 tx_handle,
                                 ptt_held: false,
                                 mic_gain,
+                                ps_enabled,
+                                ps_hw_peak,
+                                ps_mox_delay,
+                                ps_loop_delay,
+                                ps_tx_delay_ns,
                                 pa_calibration: cfg.pa_calibration.clone(),
                                 max_tx_power_watts: cfg
                                     .max_tx_power_watts
@@ -1684,6 +1721,8 @@ impl eframe::App for HpsdrApp {
                                     (SettingsTab::Agc, "RX"),
                                     (SettingsTab::Spectrum, "Spectrum"),
                                     (SettingsTab::Tx, "TX"),
+                                    (SettingsTab::PaCalibration, "PA Calibration"),
+                                    (SettingsTab::PureSignal, "PureSignal"),
                                 ] {
                                     if ui
                                         .selectable_label(connected.settings_tab == tab, label)
@@ -2261,10 +2300,18 @@ impl eframe::App for HpsdrApp {
                                                         connected.device.protocol,
                                                         48_000,
                                                         duc_rate,
+                                                        connected.puresignal_enabled,
+                                                        Arc::clone(&connected.session.ps_rx_feedback_iq),
+                                                        Arc::clone(&connected.session.ps_tx_feedback_iq),
                                                     );
                                                     tx_handle.set_mic_gain(connected.mic_gain);
                                                     tx_handle.set_mode(connected.spectrum.mode());
                                                     tx_handle.set_width_hz(connected.spectrum.width_hz());
+                                                    tx_handle.set_ps_enabled(connected.ps_enabled);
+                                                    tx_handle.set_ps_hw_peak(connected.ps_hw_peak);
+                                                    tx_handle.set_ps_mox_delay(connected.ps_mox_delay);
+                                                    tx_handle.set_ps_loop_delay(connected.ps_loop_delay);
+                                                    tx_handle.set_ps_tx_delay_ns(connected.ps_tx_delay_ns);
                                                     connected.mic_input = Some(mic);
                                                     connected.tx_handle = Some(tx_handle);
                                                     connected.tx_enabled = true;
@@ -2295,7 +2342,8 @@ impl eframe::App for HpsdrApp {
                                         }
                                         settings_changed = true;
                                     }
-
+                                }
+                                SettingsTab::PaCalibration => {
                                     // Used by both protocols -- see
                                     // radio::drive_byte_for_watts. Neither
                                     // protocol's raw drive byte tracks
@@ -2304,9 +2352,6 @@ impl eframe::App for HpsdrApp {
                                     // per-band calibration to make the
                                     // main panel's TX Power (W) slider
                                     // mean anything close to accurate.
-                                    ui.add_space(8.0);
-                                    ui.separator();
-                                    ui.label("PA Calibration");
                                     ui.add_space(4.0);
                                     for band in &BANDS {
                                         let mut gain_db = connected
@@ -2334,20 +2379,13 @@ impl eframe::App for HpsdrApp {
                                             }
                                         });
                                     }
-
-                                    // Phase 1 of an in-progress PureSignal
-                                    // implementation -- protocol-level
-                                    // feedback plumbing only so far (no
-                                    // WDSP predistortion engine wired up
-                                    // yet, no calibration UI beyond this
-                                    // bare on/off switch). See
-                                    // radio::RadioSettings::puresignal_enabled
-                                    // and radio::ps_feedback_config for
-                                    // what this actually requests from the
-                                    // radio once enabled.
-                                    ui.add_space(8.0);
-                                    ui.separator();
-                                    ui.label("PureSignal (experimental)");
+                                }
+                                SettingsTab::PureSignal => {
+                                    // See radio::RadioSettings::puresignal_enabled
+                                    // and radio::ps_feedback_config for what
+                                    // the checkbox below actually requests
+                                    // from the radio; tx::PsParams/PsStatus
+                                    // for the live calibration controls.
                                     ui.add_space(4.0);
                                     let mut puresignal_enabled = connected.puresignal_enabled;
                                     if ui
@@ -2361,6 +2399,134 @@ impl eframe::App for HpsdrApp {
                                         "Reserves 2 extra feedback receivers from the radio -- \
                                          takes effect on next connect, not live.",
                                     );
+
+                                    if connected.puresignal_enabled {
+                                        if let Some(tx) = &connected.tx_handle {
+                                            ui.add_space(6.0);
+
+                                            let mut ps_enabled = connected.ps_enabled;
+                                            if ui
+                                                .checkbox(&mut ps_enabled, "Running (continuous auto-calibrate)")
+                                                .changed()
+                                            {
+                                                connected.ps_enabled = ps_enabled;
+                                                tx.set_ps_enabled(ps_enabled);
+                                                settings_changed = true;
+                                            }
+
+                                            if ui.button("Calibrate Now").clicked() {
+                                                tx.ps_calibrate();
+                                            }
+                                            ui.weak(
+                                                "Runs one single manual calibration on top of Running above -- \
+                                                 e.g. after changing drive or band.",
+                                            );
+
+                                            let status = *tx.ps_status.lock().unwrap();
+                                            ui.horizontal(|ui| {
+                                                ui.label("Feedback level:");
+                                                // Confirmed ranges (Thetis/piHPSDR):
+                                                // <90 too weak, 128-181 ideal, >256
+                                                // dangerously strong.
+                                                let color = if status.feedback_level > 256 {
+                                                    egui::Color32::from_rgb(220, 60, 60)
+                                                } else if status.feedback_level > 181 {
+                                                    egui::Color32::from_rgb(80, 140, 220)
+                                                } else if status.feedback_level >= 128 {
+                                                    egui::Color32::from_rgb(80, 200, 80)
+                                                } else if status.feedback_level >= 90 {
+                                                    egui::Color32::from_rgb(220, 200, 60)
+                                                } else {
+                                                    egui::Color32::from_rgb(220, 60, 60)
+                                                };
+                                                ui.colored_label(color, format!("{}", status.feedback_level));
+                                            });
+                                            ui.horizontal(|ui| {
+                                                ui.label("Correcting:");
+                                                let (text, color) = if status.correcting {
+                                                    ("yes", egui::Color32::from_rgb(80, 200, 80))
+                                                } else {
+                                                    ("no", egui::Color32::GRAY)
+                                                };
+                                                ui.colored_label(color, text);
+                                            });
+                                            ui.label(format!("Measured peak TX: {:.4}", status.max_tx));
+
+                                            ui.add_space(4.0);
+                                            let mut hw_peak = connected.ps_hw_peak;
+                                            ui.horizontal(|ui| {
+                                                ui.label("HW Peak:");
+                                                if scroll_slider_f64(
+                                                    ui,
+                                                    &mut connected.slider_scroll_accum,
+                                                    &mut hw_peak,
+                                                    0.0..=1.0,
+                                                    0.001,
+                                                    "",
+                                                ) {
+                                                    connected.ps_hw_peak = hw_peak;
+                                                    tx.set_ps_hw_peak(hw_peak);
+                                                    settings_changed = true;
+                                                }
+                                            });
+                                            ui.weak(
+                                                "Per-hardware-model constant -- set once, compare against \
+                                                 Measured peak TX above, leave alone otherwise.",
+                                            );
+
+                                            ui.horizontal(|ui| {
+                                                ui.label("MOX Delay (s):");
+                                                let mut mox_delay = connected.ps_mox_delay;
+                                                if scroll_slider_f64(
+                                                    ui,
+                                                    &mut connected.slider_scroll_accum,
+                                                    &mut mox_delay,
+                                                    0.0..=1.0,
+                                                    0.01,
+                                                    " s",
+                                                ) {
+                                                    connected.ps_mox_delay = mox_delay;
+                                                    tx.set_ps_mox_delay(mox_delay);
+                                                    settings_changed = true;
+                                                }
+                                            });
+                                            ui.horizontal(|ui| {
+                                                ui.label("Loop Delay (s):");
+                                                let mut loop_delay = connected.ps_loop_delay;
+                                                if scroll_slider_f64(
+                                                    ui,
+                                                    &mut connected.slider_scroll_accum,
+                                                    &mut loop_delay,
+                                                    0.0..=1.0,
+                                                    0.01,
+                                                    " s",
+                                                ) {
+                                                    connected.ps_loop_delay = loop_delay;
+                                                    tx.set_ps_loop_delay(loop_delay);
+                                                    settings_changed = true;
+                                                }
+                                            });
+                                            ui.horizontal(|ui| {
+                                                ui.label("TX Delay (ns):");
+                                                let mut tx_delay_ns = connected.ps_tx_delay_ns;
+                                                if scroll_slider_f64(
+                                                    ui,
+                                                    &mut connected.slider_scroll_accum,
+                                                    &mut tx_delay_ns,
+                                                    0.0..=2000.0,
+                                                    1.0,
+                                                    " ns",
+                                                ) {
+                                                    connected.ps_tx_delay_ns = tx_delay_ns;
+                                                    tx.set_ps_tx_delay_ns(tx_delay_ns);
+                                                    settings_changed = true;
+                                                }
+                                            });
+                                            ui.weak("Advanced -- rarely need changing from the defaults.");
+                                        } else {
+                                            ui.weak("TX must be enabled for PureSignal calibration controls.");
+                                        }
+                                    }
                                 }
                             }
                         });
@@ -2455,6 +2621,10 @@ impl eframe::App for HpsdrApp {
                         rx_attenuation: Some(
                             connected.session.rx_attenuation.load(std::sync::atomic::Ordering::Relaxed),
                         ),
+                        ps_hw_peak: Some(connected.ps_hw_peak),
+                        ps_mox_delay: Some(connected.ps_mox_delay),
+                        ps_loop_delay: Some(connected.ps_loop_delay),
+                        ps_tx_delay_ns: Some(connected.ps_tx_delay_ns),
                     }
                     .save(connected.device.mac);
                 }
@@ -3351,10 +3521,13 @@ fn render_extra_receiver_settings(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceive
         // -- fall back to AGC if this is ever somehow selected.
         SettingsTab::Network => rx.settings_tab = SettingsTab::Agc,
 
-        // TX is global (one radio, one PA/mic path), not per-receiver
-        // -- no TX tab shown for extra receivers, so redirect same as
-        // Network if this is ever somehow selected.
+        // TX (and PA Calibration/PureSignal, split out of it) are all
+        // global (one radio, one PA/mic path), not per-receiver -- no
+        // such tabs shown for extra receivers, so redirect same as
+        // Network if any of these are ever somehow selected.
         SettingsTab::Tx => rx.settings_tab = SettingsTab::Agc,
+        SettingsTab::PaCalibration => rx.settings_tab = SettingsTab::Agc,
+        SettingsTab::PureSignal => rx.settings_tab = SettingsTab::Agc,
 
         SettingsTab::Agc => {
             ui.label("Sample Rate:");
@@ -3745,10 +3918,18 @@ fn change_sample_rate(connected: &mut ConnectedState, new_rate: u32) {
                     connected.device.protocol,
                     48_000,
                     new_rate as i32,
+                    connected.puresignal_enabled,
+                    Arc::clone(&connected.session.ps_rx_feedback_iq),
+                    Arc::clone(&connected.session.ps_tx_feedback_iq),
                 );
                 tx_handle.set_mic_gain(mic_gain);
                 tx_handle.set_mode(connected.spectrum.mode());
                 tx_handle.set_width_hz(connected.spectrum.width_hz());
+                tx_handle.set_ps_enabled(connected.ps_enabled);
+                tx_handle.set_ps_hw_peak(connected.ps_hw_peak);
+                tx_handle.set_ps_mox_delay(connected.ps_mox_delay);
+                tx_handle.set_ps_loop_delay(connected.ps_loop_delay);
+                tx_handle.set_ps_tx_delay_ns(connected.ps_tx_delay_ns);
                 connected.tx_handle = Some(tx_handle);
             }
         }

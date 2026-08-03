@@ -44,8 +44,26 @@
     (never transmits unless explicitly armed), the audio isn't garbled,
     and ALC is actually preventing overdrive. See radio.rs for the
     equally-unverified protocol-level MOX/TX-IQ framing this feeds.
+
+    PureSignal (Phase 2 -- see the plan doc for the full multi-phase
+    story): feeds forward TX IQ and the two feedback streams radio.rs
+    already demuxes into WDSP's calcc engine (psccF), which lives
+    inside this same TXA channel with no separate OpenChannel needed.
+    Feedback arrives with real network latency behind the corresponding
+    TX audio it's paired with here (see drain_ps_feedback) -- any
+    chunk where it hasn't caught up yet simply skips the PS feed rather
+    than stalling the real-time audio loop, which is expected/normal
+    right after PTT, not an error. RX-feedback is decimated 2:1 on
+    Protocol 2 only, to correct for an empirically-confirmed real-
+    hardware quirk (not a protocol requirement) where DDC0 delivers
+    samples at ~2x DDC1's rate despite both being requested identically
+    -- see PS_P2_RX_FEEDBACK_DECIMATION's doc comment. Like everything
+    else in this file, none of this has a confirmed-working reference
+    for the exact call cadence/timing -- Phase 4's real-hardware
+    verification is what actually validates it.
 */
 
+use crate::radio::IqSample;
 use crate::spectrum::Mode;
 use crate::wdsp_sys as wdsp;
 use std::collections::VecDeque;
@@ -98,6 +116,26 @@ const TX_FFT_SIZE: i32 = 2048;
 // self-corrects.
 const TX_IQ_BUFFER_CAPACITY: usize = 100_000;
 
+/// Same convention as spectrum.rs's own (private) IQ_NORM -- 2^23,
+/// scaling a 24-bit signed sample to [-1.0, 1.0].
+const PS_IQ_NORM: f32 = 8_388_608.0;
+
+/// How many raw samples PureSignal's RX-feedback queue (radio.rs's
+/// ps_rx_feedback_iq) delivers per matching TX-feedback/DUC-rate pair,
+/// on Protocol 2 only. NOT a protocol requirement -- an empirically
+/// confirmed real-hardware quirk (ANAN-8000DLE/Orion2): DDC0
+/// (RX-feedback) delivers samples at ~2x the packet rate of DDC1
+/// (TX-feedback), despite both being configured identically at
+/// 192ksps (see radio.rs's ps_feedback_config module note and the
+/// PureSignal plan's real-hardware-findings section for the full
+/// investigation). Decimated 2:1 (simple averaging, not a proper
+/// anti-alias filter) before pairing with the TX-feedback/forward IQ
+/// for pscc/psccF, which expects matching-length buffers. Protocol 1
+/// has no such mismatch (both feedback slots are demuxed from the
+/// same interleaved wire stream at the same rate), hence this only
+/// applies when `protocol == 2`.
+const PS_P2_RX_FEEDBACK_DECIMATION: usize = 2;
+
 #[derive(Copy, Clone, Default)]
 pub struct TxDisplay {
     /// Peak mic input level, roughly 0.0-1.0-ish (units not confirmed
@@ -108,6 +146,71 @@ pub struct TxDisplay {
     /// treat the UI meter built from this as relative/qualitative
     /// ("is ALC doing something") rather than a calibrated reading.
     pub alc_av: f64,
+}
+
+/// PureSignal calibration controls (Settings -> PureSignal), applied
+/// live each chunk while transmitting -- see TxProcessor::apply_ps_params.
+/// Distinct from RadioSettings::puresignal_enabled, which only gates
+/// whether the feedback-receiver wire plumbing gets requested at
+/// connect time and can't be toggled without reconnecting; `enabled`
+/// here is a live on/off for the WDSP engine itself, meaningful only
+/// when the session was actually connected with puresignal_enabled
+/// (otherwise there's no feedback data for it to do anything with).
+#[derive(Copy, Clone)]
+pub struct PsParams {
+    /// true = continuous auto-calibrate (`SetPSControl(ch,0,0,1,0)`,
+    /// the normal running state during TX, confirmed against Thetis/
+    /// piHPSDR); false = reset/off (`SetPSControl(ch,1,0,0,0)`).
+    pub enabled: bool,
+    /// Incremented by the Calibrate button each click; tx.rs issues a
+    /// single-shot manual calibration (`SetPSControl(ch,1,1,0,0)`)
+    /// whenever it sees this change, matching Thetis/piHPSDR's own
+    /// "Single Calibrate" action -- separate from the continuous
+    /// auto-calibrate `enabled` above runs the rest of the time.
+    pub calibrate_request: u32,
+    /// `SetPSHWPeak` -- per-hardware-model calibration constant (0.0-1.0
+    /// normalized ADC feedback level at full-scale RF), confirmed
+    /// Thetis defaults: P1/USB 0.4072, P2 0.2899, Saturn 0.6121. Set
+    /// once per radio model and left alone; not auto-detected.
+    pub hw_peak: f64,
+    /// `SetPSMoxDelay` (seconds) -- settling time between MOX assertion
+    /// and feedback collection. Confirmed reference default: 0.2s.
+    pub mox_delay: f64,
+    /// `SetPSLoopDelay` (seconds) -- time between correction
+    /// recalculations. Confirmed reference default: 0.0s (fastest).
+    pub loop_delay: f64,
+    /// `SetPSTXDelay` (nanoseconds) -- PA chain group delay
+    /// compensation. Confirmed reference default: 150ns (Apache Labs
+    /// hardware).
+    pub tx_delay_ns: f64,
+}
+
+impl Default for PsParams {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            calibrate_request: 0,
+            hw_peak: 0.2899, // P2 default -- see field doc comment
+            mox_delay: 0.2,
+            loop_delay: 0.0,
+            tx_delay_ns: 150.0,
+        }
+    }
+}
+
+/// Live PureSignal status, read back from WDSP each chunk while
+/// transmitting -- see TxProcessor::ps_status.
+#[derive(Copy, Clone, Default)]
+pub struct PsStatus {
+    /// GetPSInfo's info[4] -- feedback signal level, confirmed ranges
+    /// (Thetis/piHPSDR): <90 too weak, 128-181 ideal, >256 dangerously
+    /// strong.
+    pub feedback_level: i32,
+    /// GetPSInfo's info[14] -- corrections currently being applied.
+    pub correcting: bool,
+    /// GetPSMaxTX -- measured peak TX amplitude (0.0-1.0 normalized),
+    /// polled live so the user can compare against hw_peak.
+    pub max_tx: f64,
 }
 
 #[derive(Copy, Clone)]
@@ -160,6 +263,15 @@ struct TxProcessor {
     last_gain: Option<f32>,
     last_passband: Option<(f64, f64)>,
     last_tune: Option<bool>,
+    /// See set_ps_mox's doc comment.
+    last_ps_mox: Option<bool>,
+    /// See apply_ps_params's doc comment.
+    last_ps_enabled: Option<bool>,
+    last_ps_calibrate_request: Option<u32>,
+    last_ps_hw_peak: Option<f64>,
+    last_ps_mox_delay: Option<f64>,
+    last_ps_loop_delay: Option<f64>,
+    last_ps_tx_delay_ns: Option<f64>,
 }
 
 impl TxProcessor {
@@ -377,6 +489,15 @@ impl TxProcessor {
             wdsp::SetTXABandpassFreqs(channel, default_passband.0, default_passband.1);
         }
 
+        // PureSignal: no separate OpenChannel/channel-id needed -- the
+        // PS engine (WDSP's calcc) lives inside this SAME TXA channel,
+        // auto-created by the OpenChannel call above (confirmed via
+        // wdsp/TXA.c: `txa[channel].calcc.p = create_calcc(...)` runs
+        // unconditionally as part of TXA setup). Live control (enable/
+        // calibrate/HWPeak/delays) is applied per-chunk from
+        // apply_ps_params instead of a fixed call here -- see that
+        // method's doc comment and Settings -> PureSignal's UI.
+
         // BUG FIX, confirmed against the reference (rustyHPSDR's
         // Transmitter::new: `output_samples = microphone_buffer_size *
         // (output_rate/sample_rate)`, where sample_rate is always the
@@ -409,6 +530,13 @@ impl TxProcessor {
             last_gain: None,
             last_passband: Some(default_passband),
             last_tune: None,
+            last_ps_mox: None,
+            last_ps_enabled: None,
+            last_ps_calibrate_request: None,
+            last_ps_hw_peak: None,
+            last_ps_mox_delay: None,
+            last_ps_loop_delay: None,
+            last_ps_tx_delay_ns: None,
         }
     }
 
@@ -507,6 +635,130 @@ impl TxProcessor {
     fn meter(&self, mt: u32) -> f64 {
         unsafe { wdsp::GetTXAMeter(self.channel, mt as c_int) }
     }
+
+    /// PureSignal: tells WDSP the current PTT state -- confirmed
+    /// against Thetis (console.cs), which calls this on EVERY MOX
+    /// transition (TX and RX), not just once at setup. Edge-triggered
+    /// (only calls into WDSP when the state actually changes) as a
+    /// cheap FFI-call optimization, same pattern as last_mode/
+    /// last_gain elsewhere in this struct -- not a correctness
+    /// requirement.
+    fn set_ps_mox(&mut self, mox_on: bool) {
+        if self.last_ps_mox != Some(mox_on) {
+            unsafe {
+                wdsp::SetPSMox(self.channel, mox_on as c_int);
+            }
+            self.last_ps_mox = Some(mox_on);
+        }
+    }
+
+    /// PureSignal: applies Settings -> PureSignal's live controls,
+    /// each edge-triggered against its own cached last-value (same
+    /// pattern as last_mode/last_gain elsewhere in this struct) so an
+    /// unchanged control costs nothing beyond the comparison. `enabled`
+    /// toggling maps to the confirmed Thetis/piHPSDR call patterns:
+    /// `SetPSControl(ch,0,0,1,0)` (continuous auto-calibrate) when
+    /// true, `SetPSControl(ch,1,0,0,0)` (reset/off) when false.
+    /// `calibrate_request` is a monotonic counter rather than a plain
+    /// bool specifically so a click is never missed/coalesced with
+    /// another change in the same chunk -- any change in the counter
+    /// (not just "became true") triggers one single-shot manual
+    /// calibration (`SetPSControl(ch,1,1,0,0)`).
+    fn apply_ps_params(&mut self, ps: &PsParams) {
+        if self.last_ps_enabled != Some(ps.enabled) {
+            unsafe {
+                if ps.enabled {
+                    wdsp::SetPSControl(self.channel, 0, 0, 1, 0);
+                } else {
+                    wdsp::SetPSControl(self.channel, 1, 0, 0, 0);
+                }
+            }
+            self.last_ps_enabled = Some(ps.enabled);
+        }
+        if self.last_ps_calibrate_request != Some(ps.calibrate_request) {
+            unsafe {
+                wdsp::SetPSControl(self.channel, 1, 1, 0, 0);
+            }
+            self.last_ps_calibrate_request = Some(ps.calibrate_request);
+        }
+        if self.last_ps_hw_peak != Some(ps.hw_peak) {
+            unsafe {
+                wdsp::SetPSHWPeak(self.channel, ps.hw_peak);
+            }
+            self.last_ps_hw_peak = Some(ps.hw_peak);
+        }
+        if self.last_ps_mox_delay != Some(ps.mox_delay) {
+            unsafe {
+                wdsp::SetPSMoxDelay(self.channel, ps.mox_delay);
+            }
+            self.last_ps_mox_delay = Some(ps.mox_delay);
+        }
+        if self.last_ps_loop_delay != Some(ps.loop_delay) {
+            unsafe {
+                wdsp::SetPSLoopDelay(self.channel, ps.loop_delay);
+            }
+            self.last_ps_loop_delay = Some(ps.loop_delay);
+        }
+        if self.last_ps_tx_delay_ns != Some(ps.tx_delay_ns) {
+            unsafe {
+                // WDSP's SetPSTXDelay takes seconds, not nanoseconds --
+                // confirmed against piHPSDR/Thetis, both of which
+                // expose this to the user in ns (a PA/relay group delay
+                // is naturally a small ns-scale number) but convert
+                // before the call.
+                wdsp::SetPSTXDelay(self.channel, ps.tx_delay_ns * 1e-9);
+            }
+            self.last_ps_tx_delay_ns = Some(ps.tx_delay_ns);
+        }
+    }
+
+    /// PureSignal: reads back live status for the UI (Settings ->
+    /// PureSignal's feedback-level meter, Correcting indicator, and
+    /// Get Peak readout) -- confirmed against Thetis/piHPSDR's own
+    /// polling of the same three values. `GetPSInfo` fills a 16-int
+    /// array; only indices 4 (feedback level) and 14 (correcting flag)
+    /// are interpreted anywhere in either reference, the rest are raw
+    /// diagnostic counters neither app gives semantic meaning to.
+    fn read_ps_status(&self) -> PsStatus {
+        let mut info = [0i32; 16];
+        let mut max_tx: f64 = 0.0;
+        unsafe {
+            wdsp::GetPSInfo(self.channel, info.as_mut_ptr());
+            wdsp::GetPSMaxTX(self.channel, &mut max_tx);
+        }
+        PsStatus {
+            feedback_level: info[4],
+            correcting: info[14] != 0,
+            max_tx,
+        }
+    }
+
+    /// PureSignal: feeds one chunk of forward (tx) and feedback (rx)
+    /// IQ into WDSP's calcc engine. `size` is the pair count -- all
+    /// four slices must be exactly this long. See tx.rs's module note
+    /// and the PureSignal plan for the confidence caveats on this
+    /// whole exchange (no confirmed-working reference for the exact
+    /// call cadence, unlike the rest of this file's WDSP calls).
+    /// `solidmox` (WDSP: whether MOX has been continuously asserted
+    /// long enough to be considered "solid" rather than a transient
+    /// key-up) is passed the same as `mox` -- this project has no
+    /// separate debounce/hang-time tracking for that distinction yet.
+    #[allow(clippy::too_many_arguments)]
+    fn feed_ps(&self, itx: &mut [f32], qtx: &mut [f32], irx: &mut [f32], qrx: &mut [f32], mox_on: bool) {
+        let size = itx.len() as c_int;
+        unsafe {
+            wdsp::psccF(
+                self.channel,
+                size,
+                itx.as_mut_ptr(),
+                qtx.as_mut_ptr(),
+                irx.as_mut_ptr(),
+                qrx.as_mut_ptr(),
+                mox_on as c_int,
+                mox_on as c_int,
+            );
+        }
+    }
 }
 
 impl Drop for TxProcessor {
@@ -517,6 +769,56 @@ impl Drop for TxProcessor {
     }
 }
 
+/// PureSignal: drains exactly `pairs` matching pairs from the
+/// TX-feedback and RX-feedback queues, normalized to [-1.0, 1.0] and
+/// with RX-feedback decimated by `rx_decimation` (simple averaging,
+/// not a proper anti-alias filter -- see
+/// PS_P2_RX_FEEDBACK_DECIMATION's doc comment) so both streams end up
+/// the same length for psccF. Returns None (leaving both queues
+/// completely untouched) if either doesn't have enough data yet --
+/// feedback arrives with real network latency behind the
+/// corresponding TX audio it's paired with here, so an empty/partial
+/// queue is the normal case right after PTT, not an error condition.
+fn drain_ps_feedback(
+    tx_feedback: &Mutex<VecDeque<IqSample>>,
+    rx_feedback: &Mutex<VecDeque<IqSample>>,
+    pairs: usize,
+    rx_decimation: usize,
+) -> Option<(Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>)> {
+    let rx_samples_needed = pairs * rx_decimation;
+    let mut tx_q = tx_feedback.lock().unwrap();
+    let mut rx_q = rx_feedback.lock().unwrap();
+    if tx_q.len() < pairs || rx_q.len() < rx_samples_needed {
+        return None;
+    }
+
+    let mut itx = Vec::with_capacity(pairs);
+    let mut qtx = Vec::with_capacity(pairs);
+    for _ in 0..pairs {
+        let s = tx_q.pop_front().unwrap();
+        itx.push(s.i as f32 / PS_IQ_NORM);
+        qtx.push(s.q as f32 / PS_IQ_NORM);
+    }
+    drop(tx_q);
+
+    let mut irx = Vec::with_capacity(pairs);
+    let mut qrx = Vec::with_capacity(pairs);
+    for _ in 0..pairs {
+        let (mut i_sum, mut q_sum) = (0.0f32, 0.0f32);
+        for _ in 0..rx_decimation {
+            let s = rx_q.pop_front().unwrap();
+            i_sum += s.i as f32 / PS_IQ_NORM;
+            q_sum += s.q as f32 / PS_IQ_NORM;
+        }
+        irx.push(i_sum / rx_decimation as f32);
+        qrx.push(q_sum / rx_decimation as f32);
+    }
+    drop(rx_q);
+
+    Some((itx, qtx, irx, qrx))
+}
+
+#[allow(clippy::too_many_arguments)]
 fn run(
     mic_buffer: Arc<Mutex<VecDeque<f32>>>,
     tci_tx_audio: Arc<Mutex<VecDeque<f32>>>,
@@ -528,9 +830,21 @@ fn run(
     protocol: u8,
     mic_rate: i32,
     duc_rate: i32,
+    puresignal_enabled: bool,
+    ps_rx_feedback_iq: Arc<Mutex<VecDeque<IqSample>>>,
+    ps_tx_feedback_iq: Arc<Mutex<VecDeque<IqSample>>>,
+    ps_params: Arc<Mutex<PsParams>>,
+    ps_status: Arc<Mutex<PsStatus>>,
     stop: Arc<AtomicBool>,
 ) {
     let mut processor = TxProcessor::open(channel, protocol, mic_rate, duc_rate);
+    // PureSignal: RX-feedback (DDC0) delivers at 2x DDC1's rate on
+    // Protocol 2 only -- see PS_P2_RX_FEEDBACK_DECIMATION's doc comment.
+    let ps_rx_feedback_decimation = if puresignal_enabled && protocol == 2 {
+        PS_P2_RX_FEEDBACK_DECIMATION
+    } else {
+        1
+    };
     let mut chunk = vec![0.0f32; TX_BUFFER_SIZE];
     // Real-time duration of one TX_BUFFER_SIZE chunk at the mic capture
     // rate -- e.g. ~11ms for 512 samples at 48kHz. Without this, the
@@ -600,12 +914,24 @@ fn run(
             // running the TXA chain on nothing.
             mic_buffer.lock().unwrap().clear();
             tci_tx_audio.lock().unwrap().clear();
+            if puresignal_enabled {
+                // Same reasoning as the mic/TCI clears above -- a
+                // feedback backlog from before this idle period is
+                // stale by the time the next PTT starts.
+                ps_rx_feedback_iq.lock().unwrap().clear();
+                ps_tx_feedback_iq.lock().unwrap().clear();
+                processor.set_ps_mox(false);
+            }
             thread::sleep(Duration::from_millis(20));
             // Resync so the first chunk after PTT is produced against a
             // fresh schedule, not delayed by however long MOX was off --
             // same reasoning as p2_tx_iq_loop's own resync here.
             next_chunk = Instant::now();
             continue;
+        }
+        if puresignal_enabled {
+            processor.set_ps_mox(true);
+            processor.apply_ps_params(&ps_params.lock().unwrap());
         }
 
         {
@@ -665,6 +991,28 @@ fn run(
             exch_errors_this_window = 0;
         }
 
+        if puresignal_enabled {
+            // Pairs, not raw floats -- iq is interleaved I,Q,I,Q,...
+            let pairs_needed = iq.len() / 2;
+            if let Some((mut itx, mut qtx, mut irx, mut qrx)) = drain_ps_feedback(
+                &ps_tx_feedback_iq,
+                &ps_rx_feedback_iq,
+                pairs_needed,
+                ps_rx_feedback_decimation,
+            ) {
+                processor.feed_ps(&mut itx, &mut qtx, &mut irx, &mut qrx, true);
+            }
+            // else: feedback hasn't caught up yet (real network latency
+            // behind this chunk's TX audio, most likely right after
+            // PTT) -- skip this chunk's PS feed rather than stall the
+            // real-time audio loop waiting for it.
+
+            // Read back regardless of whether this chunk's feed
+            // succeeded above -- reflects WDSP's own ongoing internal
+            // state, not just this one call.
+            *ps_status.lock().unwrap() = processor.read_ps_status();
+        }
+
         {
             let mut out = tx_iq_out.lock().unwrap();
             for v in iq {
@@ -698,7 +1046,13 @@ fn run(
 /// pattern as SpectrumHandle::start's iq_buffer parameter.
 pub struct TxHandle {
     pub display: Arc<Mutex<TxDisplay>>,
+    /// PureSignal live status (feedback level, correcting, measured
+    /// peak) -- see PsStatus's field docs. Only meaningful when this
+    /// session was connected with PureSignal's feedback plumbing
+    /// active; otherwise stays at its Default (all zero/false).
+    pub ps_status: Arc<Mutex<PsStatus>>,
     params: Arc<Mutex<TxParams>>,
+    ps_params: Arc<Mutex<PsParams>>,
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
 }
@@ -716,6 +1070,7 @@ impl TxHandle {
     /// packet stub), or the session's current RX sample rate for
     /// Protocol 1 (which has one shared ADC/DAC clock, no separate DUC
     /// concept).
+    #[allow(clippy::too_many_arguments)]
     pub fn start(
         mic_buffer: Arc<Mutex<VecDeque<f32>>>,
         tci_tx_audio: Arc<Mutex<VecDeque<f32>>>,
@@ -725,26 +1080,36 @@ impl TxHandle {
         protocol: u8,
         mic_rate: i32,
         duc_rate: i32,
+        puresignal_enabled: bool,
+        ps_rx_feedback_iq: Arc<Mutex<VecDeque<IqSample>>>,
+        ps_tx_feedback_iq: Arc<Mutex<VecDeque<IqSample>>>,
     ) -> Self {
         let display = Arc::new(Mutex::new(TxDisplay::default()));
         let params = Arc::new(Mutex::new(TxParams::default()));
+        let ps_params = Arc::new(Mutex::new(PsParams::default()));
+        let ps_status = Arc::new(Mutex::new(PsStatus::default()));
         let stop = Arc::new(AtomicBool::new(false));
 
         let thread = {
             let display = Arc::clone(&display);
             let params = Arc::clone(&params);
+            let ps_params = Arc::clone(&ps_params);
+            let ps_status = Arc::clone(&ps_status);
             let stop = Arc::clone(&stop);
             thread::spawn(move || {
                 run(
                     mic_buffer, tci_tx_audio, tx_iq_out, mox, params, display, channel, protocol,
-                    mic_rate, duc_rate, stop,
+                    mic_rate, duc_rate, puresignal_enabled, ps_rx_feedback_iq, ps_tx_feedback_iq,
+                    ps_params, ps_status, stop,
                 )
             })
         };
 
         Self {
             display,
+            ps_status,
             params,
+            ps_params,
             stop,
             thread: Some(thread),
         }
@@ -773,6 +1138,33 @@ impl TxHandle {
     /// See TxParams::tune's doc comment.
     pub fn set_tune(&self, tune: bool) {
         self.params.lock().unwrap().tune = tune;
+    }
+
+    /// Current PureSignal params snapshot, for Settings -> PureSignal
+    /// to read on each redraw.
+    pub fn ps_params(&self) -> PsParams {
+        *self.ps_params.lock().unwrap()
+    }
+    pub fn set_ps_enabled(&self, enabled: bool) {
+        self.ps_params.lock().unwrap().enabled = enabled;
+    }
+    /// Triggers one single-shot manual calibration -- see
+    /// PsParams::calibrate_request's doc comment for why this is a
+    /// counter bump rather than a plain flag.
+    pub fn ps_calibrate(&self) {
+        self.ps_params.lock().unwrap().calibrate_request += 1;
+    }
+    pub fn set_ps_hw_peak(&self, hw_peak: f64) {
+        self.ps_params.lock().unwrap().hw_peak = hw_peak.clamp(0.0, 1.0);
+    }
+    pub fn set_ps_mox_delay(&self, mox_delay: f64) {
+        self.ps_params.lock().unwrap().mox_delay = mox_delay.max(0.0);
+    }
+    pub fn set_ps_loop_delay(&self, loop_delay: f64) {
+        self.ps_params.lock().unwrap().loop_delay = loop_delay.max(0.0);
+    }
+    pub fn set_ps_tx_delay_ns(&self, tx_delay_ns: f64) {
+        self.ps_params.lock().unwrap().tx_delay_ns = tx_delay_ns.max(0.0);
     }
 
     pub fn stop(&mut self) {

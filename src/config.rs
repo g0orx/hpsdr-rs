@@ -133,6 +133,18 @@ pub struct Config {
     /// falls back to RadioSession::start's own default rather than the
     /// old hardcoded 0dB.
     pub rx_attenuation: Option<u32>,
+    /// PureSignal calibration values (Settings -> PureSignal) -- see
+    /// tx::PsParams's field docs for what each one means. Missing
+    /// (e.g. configs saved before Phase 3 existed) falls back to the
+    /// same reference defaults tx::PsParams::default uses.
+    #[serde(default)]
+    pub ps_hw_peak: Option<f64>,
+    #[serde(default)]
+    pub ps_mox_delay: Option<f64>,
+    #[serde(default)]
+    pub ps_loop_delay: Option<f64>,
+    #[serde(default)]
+    pub ps_tx_delay_ns: Option<f64>,
 }
 
 fn default_nb_threshold() -> f64 {

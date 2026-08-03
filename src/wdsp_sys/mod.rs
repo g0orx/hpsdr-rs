@@ -846,6 +846,25 @@ unsafe extern "C" {
     );
 }
 unsafe extern "C" {
+    /// Float-buffer variant of `pscc` above (wdsp/calcc.c) -- separate
+    /// I/Q buffers rather than interleaved complex pairs, and f32
+    /// rather than f64, matching this project's own convention
+    /// elsewhere (avoids a f32->f64 conversion buffer on every call).
+    /// `mox`/`solidmox` let WDSP know the current PTT state directly
+    /// as part of the call, confirmed against piHPSDR's transmitter.c
+    /// call site.
+    pub fn psccF(
+        channel: ::std::os::raw::c_int,
+        size: ::std::os::raw::c_int,
+        itxbuff: *mut f32,
+        qtxbuff: *mut f32,
+        irxbuff: *mut f32,
+        qrxbuff: *mut f32,
+        mox: ::std::os::raw::c_int,
+        solidmox: ::std::os::raw::c_int,
+    );
+}
+unsafe extern "C" {
     pub fn create_eerEXT(
         id: ::std::os::raw::c_int,
         run: ::std::os::raw::c_int,
