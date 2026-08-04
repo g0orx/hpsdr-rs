@@ -1,7 +1,11 @@
 /*
     Minimal implementation of Hamlib's rigctld network protocol, enough
     for WSJT-X's "Hamlib NET rigctl" rig backend to read/set frequency
-    and mode, and key/unkey PTT. Listens on 0.0.0.0:4532 by default --
+    and mode, key/unkey PTT, and read the S-meter (`l STRENGTH`, returns
+    the raw dBm value from the same calibrated GetRXAMeter reading
+    main.rs's on-screen S-meter uses). Every other Hamlib level (SWR,
+    ALC, RFPOWER, ...) responds RPRT -1 (unsupported) rather than a
+    made-up value. Listens on 0.0.0.0:4532 by default --
     Hamlib's own standard default port for this, but bound to all
     interfaces rather than just loopback, so a client on another
     machine on the network (a remote-operating laptop, a tablet, a
@@ -32,7 +36,7 @@
     `rigctl -m 2 -r 127.0.0.1:4532 f`
 */
 
-use crate::spectrum::{DemodParams, Mode};
+use crate::spectrum::{DemodParams, Mode, SpectrumDisplay};
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -47,8 +51,16 @@ pub const DEFAULT_ADDR: &str = "0.0.0.0:4532";
 /// this indirection exists.
 type DemodParamsCell = Arc<Mutex<Arc<Mutex<DemodParams>>>>;
 
+/// Same swappable-reference reasoning as DemodParamsCell, for the
+/// SpectrumDisplay get_level (STRENGTH) reads that a sample-rate change
+/// (main.rs's change_sample_rate) would otherwise leave pointed at a
+/// stale, no-longer-updated SpectrumHandle -- see set_display's doc
+/// comment.
+type DisplayCell = Arc<Mutex<Arc<Mutex<SpectrumDisplay>>>>;
+
 pub struct RigctlServer {
     demod_params: DemodParamsCell,
+    display: DisplayCell,
     stop: Arc<AtomicBool>,
     /// Count of currently-connected clients (normally 0 or 1, but the
     /// accept loop doesn't limit concurrent connections, so a counter
@@ -82,6 +94,7 @@ impl RigctlServer {
         addr: &str,
         frequency_hz: Arc<AtomicU32>,
         demod_params: Arc<Mutex<DemodParams>>,
+        display: Arc<Mutex<SpectrumDisplay>>,
         mox: Arc<AtomicBool>,
     ) -> std::io::Result<Self> {
         let listener = TcpListener::bind(addr)?;
@@ -89,6 +102,7 @@ impl RigctlServer {
         println!("rigctl: listening on {addr}");
 
         let demod_params: DemodParamsCell = Arc::new(Mutex::new(demod_params));
+        let display: DisplayCell = Arc::new(Mutex::new(display));
         let stop = Arc::new(AtomicBool::new(false));
         let connected = Arc::new(AtomicU32::new(0));
         let client_threads: Arc<Mutex<Vec<JoinHandle<()>>>> = Arc::new(Mutex::new(Vec::new()));
@@ -96,6 +110,7 @@ impl RigctlServer {
         let accept_connected = Arc::clone(&connected);
         let accept_client_threads = Arc::clone(&client_threads);
         let accept_demod_params = Arc::clone(&demod_params);
+        let accept_display = Arc::clone(&display);
         let thread = thread::spawn(move || {
             while !accept_stop.load(Ordering::Relaxed) {
                 match listener.accept() {
@@ -113,12 +128,13 @@ impl RigctlServer {
                         }
                         let freq = Arc::clone(&frequency_hz);
                         let params = Arc::clone(&accept_demod_params);
+                        let disp = Arc::clone(&accept_display);
                         let conn_mox = Arc::clone(&mox);
                         let conn_stop = Arc::clone(&accept_stop);
                         let conn_connected = Arc::clone(&accept_connected);
                         let handle = thread::spawn(move || {
                             conn_connected.fetch_add(1, Ordering::Relaxed);
-                            handle_client(stream, freq, params, conn_mox, conn_stop);
+                            handle_client(stream, freq, params, disp, conn_mox, conn_stop);
                             conn_connected.fetch_sub(1, Ordering::Relaxed);
                         });
                         let mut threads = accept_client_threads.lock().unwrap();
@@ -135,6 +151,7 @@ impl RigctlServer {
 
         Ok(Self {
             demod_params,
+            display,
             stop,
             connected,
             thread: Some(thread),
@@ -157,6 +174,15 @@ impl RigctlServer {
     /// replaced.
     pub fn set_demod_params(&self, new_demod_params: Arc<Mutex<DemodParams>>) {
         *self.demod_params.lock().unwrap() = new_demod_params;
+    }
+
+    /// Same reasoning as set_demod_params -- a sample-rate change
+    /// rebuilds SpectrumHandle (and its `display`) from scratch, so
+    /// `l STRENGTH`/`\get_level STRENGTH` would silently keep reading a
+    /// frozen meter_db from the old, no-longer-updated SpectrumDisplay
+    /// without this.
+    pub fn set_display(&self, new_display: Arc<Mutex<SpectrumDisplay>>) {
+        *self.display.lock().unwrap() = new_display;
     }
 
     /// True while at least one client is currently connected. Callers
@@ -193,6 +219,7 @@ fn handle_client(
     stream: TcpStream,
     frequency_hz: Arc<AtomicU32>,
     demod_params: DemodParamsCell,
+    display: DisplayCell,
     mox: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
 ) {
@@ -218,7 +245,8 @@ fn handle_client(
                 // set_demod_params -- takes effect immediately for
                 // already-connected clients too, not just new ones.
                 let current_params = demod_params.lock().unwrap().clone();
-                match handle_command(cmd, &frequency_hz, &current_params, &mox) {
+                let current_display = display.lock().unwrap().clone();
+                match handle_command(cmd, &frequency_hz, &current_params, &current_display, &mox) {
                     Some(response) => {
                         if writer.write_all(response.as_bytes()).is_err() {
                             break;
@@ -249,6 +277,7 @@ fn handle_command(
     cmd: &str,
     frequency_hz: &Arc<AtomicU32>,
     demod_params: &Arc<Mutex<DemodParams>>,
+    display: &Arc<Mutex<SpectrumDisplay>>,
     mox: &Arc<AtomicBool>,
 ) -> Option<String> {
     let mut parts = cmd.split_whitespace();
@@ -315,6 +344,34 @@ fn handle_command(
             }
             None => "RPRT -1\n".to_string(),
         },
+        "l" | "\\get_level" => {
+            let level = parts.next().unwrap_or("");
+            match level {
+                // STRENGTH: the raw dBm value from GetRXAMeter, no S9
+                // offset applied -- same source main.rs's on-screen
+                // S-meter reads (see its own draw_s_meter doc comment
+                // for the S9=-73dBm reference point that display
+                // applies separately, purely for its own tick labels).
+                // WSJT-X and Hamlib's own `rigctl` CLI both send this
+                // bare (no numeric arg) to poll the meter; there's no
+                // set_level counterpart since it's a read-only
+                // receive-side meter.
+                "STRENGTH" => {
+                    let db = display.lock().unwrap().meter_db;
+                    format!("{}\n", db.round() as i32)
+                }
+                // Every other Hamlib level (SWR, ALC, RFPOWER, AF, RF,
+                // SQL, ...) isn't backed by anything yet -- RPRT -1
+                // (unsupported) rather than a made-up value, matching
+                // this file's existing fallback for any unrecognized
+                // command.
+                _ => "RPRT -1\n".to_string(),
+            }
+        }
+        // No settable levels yet -- every one of them (including
+        // STRENGTH, which is receive-only on real hardware too) is
+        // read-only from this app's side.
+        "L" | "\\set_level" => "RPRT -1\n".to_string(),
         "\\chk_vfo" => "CHKVFO 0\n".to_string(),
         "\\dump_state" => dump_state(),
         "q" | "Q" | "\\quit" => return None,
@@ -333,8 +390,20 @@ fn mode_to_hamlib(mode: Mode) -> &'static str {
         Mode::Cwu => "CW",
         Mode::Fmn => "FM",
         Mode::Am => "AM",
-        Mode::Digu => "PKTUSB",
-        Mode::Digl => "PKTLSB",
+        // Hamlib's technically-canonical names for these two are
+        // "PKTUSB"/"PKTLSB" (RIG_MODE_PKTUSB/PKTLSB), but WSJT-X
+        // compares the polled mode against its own configured mode and
+        // throws a "rig mode doesn't match" warning unless they agree
+        // exactly -- and WSJT-X's own convention (matching how most
+        // real rigs report a digital sub-mode over CAT) is plain
+        // USB/LSB, not the PKT-prefixed name. Reported this way to
+        // match that in practice, at the cost of any other Hamlib
+        // client losing the plain-voice-vs-digital distinction in
+        // get_mode specifically (set_mode below still accepts
+        // "PKTUSB"/"PKTLSB" as input and maps them to Digu/Digl, so
+        // that direction is unaffected).
+        Mode::Digu => "USB",
+        Mode::Digl => "LSB",
         Mode::Sam => "SAM",
         // No clean Hamlib equivalent for these two -- fall back to
         // something that won't confuse a client expecting a real mode.
@@ -389,6 +458,14 @@ fn dump_state() -> String {
         "0\n",       // attenuator list
         "0\n",       // has_get_func
         "0\n",       // has_set_func
+        // Left at 0 rather than advertising a RIG_LEVEL_STRENGTH bit --
+        // this file's exact bitmask value isn't confirmed against
+        // Hamlib source (see module note), and getting it wrong here
+        // could be worse than a plain 0 for a client that trusts this
+        // capability list. `l STRENGTH` is handled directly regardless
+        // of what's advertised here -- see handle_command -- which is
+        // enough for Hamlib's own `rigctl` CLI and any client that
+        // just tries it rather than gating on this first.
         "0\n",       // has_get_level
         "0\n",       // has_set_level
         "0\n",       // has_get_parm

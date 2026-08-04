@@ -465,6 +465,7 @@ impl eframe::App for HpsdrApp {
                                     &rigctl_addr,
                                     Arc::clone(&session.frequency_hz),
                                     spectrum.demod_params_handle(),
+                                    Arc::clone(&spectrum.display),
                                     Arc::clone(&session.mox),
                                 ) {
                                     Ok(s) => Some(s),
@@ -1891,6 +1892,7 @@ impl eframe::App for HpsdrApp {
                                                 &connected.rigctl_addr,
                                                 Arc::clone(&connected.session.frequency_hz),
                                                 connected.spectrum.demod_params_handle(),
+                                                Arc::clone(&connected.spectrum.display),
                                                 Arc::clone(&connected.session.mox),
                                             ) {
                                                 Ok(s) => Some(s),
@@ -4120,6 +4122,7 @@ fn change_sample_rate(connected: &mut ConnectedState, new_rate: u32) {
     };
     if let Some(s) = &connected.rigctl_server {
         s.set_demod_params(spectrum.demod_params_handle());
+        s.set_display(Arc::clone(&spectrum.display));
     }
     if let Some(s) = &connected.tci_server {
         s.set_demod_params(spectrum.demod_params_handle());
