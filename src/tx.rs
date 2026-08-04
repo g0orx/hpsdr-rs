@@ -682,6 +682,21 @@ impl TxProcessor {
                     // Tune's "near max but leave a little headroom"
                     // choice, adapted for two tones summing instead of
                     // one.
+                    //
+                    // TRIED AND REVERTED: unequal magnitudes (0.55/0.35)
+                    // to avoid the exact-zero envelope null equal
+                    // magnitudes produce, on the theory that noise-floor
+                    // samples at the null were causing WDSP's scheck()
+                    // info[6] bit 0x0010 ("fitted curve dips negative").
+                    // Confirmed WRONG on real P2 hardware: unequal
+                    // magnitudes never let the envelope reach near-zero
+                    // at all, so PS's lowest amplitude bucket never
+                    // fills and calibration collection (state=LCOLLECT)
+                    // never completes even once -- worse than the
+                    // original problem. Equal magnitudes are required
+                    // for calibration to complete at all; the 0x0010
+                    // cause is still unresolved (see the PureSignal plan
+                    // doc's real-hardware-findings section).
                     wdsp::SetTXAPostGenMode(self.channel, 1);
                     wdsp::SetTXAPostGenTTMag(self.channel, 0.45, 0.45);
                     wdsp::SetTXAPostGenRun(self.channel, 1);
