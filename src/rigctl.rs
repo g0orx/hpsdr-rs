@@ -390,20 +390,8 @@ fn mode_to_hamlib(mode: Mode) -> &'static str {
         Mode::Cwu => "CW",
         Mode::Fmn => "FM",
         Mode::Am => "AM",
-        // Hamlib's technically-canonical names for these two are
-        // "PKTUSB"/"PKTLSB" (RIG_MODE_PKTUSB/PKTLSB), but WSJT-X
-        // compares the polled mode against its own configured mode and
-        // throws a "rig mode doesn't match" warning unless they agree
-        // exactly -- and WSJT-X's own convention (matching how most
-        // real rigs report a digital sub-mode over CAT) is plain
-        // USB/LSB, not the PKT-prefixed name. Reported this way to
-        // match that in practice, at the cost of any other Hamlib
-        // client losing the plain-voice-vs-digital distinction in
-        // get_mode specifically (set_mode below still accepts
-        // "PKTUSB"/"PKTLSB" as input and maps them to Digu/Digl, so
-        // that direction is unaffected).
-        Mode::Digu => "USB",
-        Mode::Digl => "LSB",
+        Mode::Digu => "PKTUSB",
+        Mode::Digl => "PKTLSB",
         Mode::Sam => "SAM",
         // No clean Hamlib equivalent for these two -- fall back to
         // something that won't confuse a client expecting a real mode.
