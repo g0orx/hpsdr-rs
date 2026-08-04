@@ -810,6 +810,25 @@ unsafe extern "C" {
     pub fn SetPSPtol(channel: ::std::os::raw::c_int, ptol: f64);
 }
 unsafe extern "C" {
+    /// Diagnostic-only -- exposes calcc's internal scatter data
+    /// (x/ym/yc/ys, nsamps=ints*spi=4096 doubles each) and fitted
+    /// correction-table coefficients (cm/cc/cs, ints*4=64 doubles
+    /// each). Caller must size buffers to match TXA.c's fixed
+    /// create_calcc call (ints=16, spi=256) -- there is no getter for
+    /// ints/spi themselves, they're a compile-time constant on the
+    /// WDSP side for this project's usage.
+    pub fn GetPSDisp(
+        channel: ::std::os::raw::c_int,
+        x: *mut f64,
+        ym: *mut f64,
+        yc: *mut f64,
+        ys: *mut f64,
+        cm: *mut f64,
+        cc: *mut f64,
+        cs: *mut f64,
+    );
+}
+unsafe extern "C" {
     pub fn SetPSFeedbackRate(channel: ::std::os::raw::c_int, rate: ::std::os::raw::c_int);
 }
 unsafe extern "C" {

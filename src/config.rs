@@ -145,6 +145,17 @@ pub struct Config {
     pub ps_loop_delay: Option<f64>,
     #[serde(default)]
     pub ps_tx_delay_ns: Option<f64>,
+    /// PureSignal feedback TX-time step attenuator (0-31 dB, Protocol 1
+    /// standard boards only) -- see radio::RadioSession::ps_tx_attenuation's
+    /// doc comment. Missing falls back to RadioSettings::default's own
+    /// 0dB (no attenuation, matching the old unconditional hardcoded
+    /// behavior before this control existed).
+    #[serde(default)]
+    pub ps_tx_attenuation: Option<u32>,
+    /// See tx::PsParams::ptol's doc comment. Missing falls back to
+    /// WDSP's own reference default (0.8).
+    #[serde(default)]
+    pub ps_ptol: Option<f64>,
 }
 
 fn default_nb_threshold() -> f64 {

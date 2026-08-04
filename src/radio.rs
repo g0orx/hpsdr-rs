@@ -130,6 +130,9 @@ pub struct RadioSettings {
     /// this from Config, falling back to this struct's own default
     /// for a never-saved config.
     pub rx_attenuation: u32,
+    /// Initial value for RadioSession::ps_tx_attenuation (P1, standard
+    /// boards only, PureSignal) -- see that field's doc comment.
+    pub ps_tx_attenuation: u32,
 }
 
 impl Default for RadioSettings {
@@ -142,6 +145,7 @@ impl Default for RadioSettings {
             // Non-zero rather than 0dB -- see RadioSession::rx_attenuation's
             // doc comment for why 0dB caused real front-end overload.
             rx_attenuation: 12,
+            ps_tx_attenuation: 0,
         }
     }
 }
@@ -222,6 +226,35 @@ pub struct RadioSession {
     /// different, already-separate RX gain mechanism (bit 6 of the
     /// same byte, see p1_build_packet's is_hermes_lite branch).
     pub rx_attenuation: Arc<AtomicU32>,
+    /// PureSignal -- TX-time step attenuator (0-31 dB) applied to
+    /// ADC0's input while transmitting (ADC0 doubles as PureSignal's
+    /// feedback source during TX on this board family, on both
+    /// protocols). Standard (non-HermesLite) boards only.
+    ///
+    /// P1: encoded into command 6 (0x1C)'s C3 byte -- confirmed against
+    /// piHPSDR's old_protocol.c: `output_buffer[C3] |=
+    /// transmitter->attenuation; // Step attenuator of first ADC, value
+    /// used when TXing`.
+    /// P2: encoded into the High Priority packet's byte 1443 -- confirmed
+    /// against piHPSDR's new_protocol.c: `high_priority_buffer_to_radio[1443]
+    /// = transmitter->attenuation;` while transmitting (byte 1442, ADC1's
+    /// attenuator, is separately forced to 31/max while transmitting "to
+    /// protect RX2 in DIVERSITY setups").
+    ///
+    /// hpsdr-rs previously never implemented either byte at all
+    /// (hardcoded 0x00/unwritten) -- a real, confirmed gap on BOTH
+    /// protocols: with no attenuation control on the feedback path at
+    /// all, the feedback signal is far stronger than WDSP's PS engine
+    /// expects (confirmed via real hardware testing on both P1/Angelia
+    /// and P2/Orion2: raw feedback amplitude 40-50% of full ADC scale,
+    /// pinning GetPSInfo's reported feedback level at its maximum
+    /// regardless of drive level or the HW Peak calibration constant).
+    /// piHPSDR's own "Auto Attenuate" logic targets a feedback level
+    /// near 152 (its comment: "175 means 1.2dB too strong, 132 means
+    /// 1.2dB too weak") by adjusting exactly this value -- not by
+    /// touching HW Peak, which is a fixed per-hardware-model reference
+    /// constant, not a per-session tuning knob.
+    pub ps_tx_attenuation: Arc<AtomicU32>,
     /// Additional receivers beyond the first (P2 only -- P1 has no
     /// confirmed way to enable more than one DDC, see module note).
     /// Index 0 here corresponds to receiver index 1 overall (receiver
@@ -322,6 +355,8 @@ impl RadioSession {
         // real-hardware testing confirmed causes front-end overload on
         // an ordinary HF antenna.
         let rx_attenuation = Arc::new(AtomicU32::new(settings.rx_attenuation));
+        // See RadioSession::ps_tx_attenuation's doc comment.
+        let ps_tx_attenuation = Arc::new(AtomicU32::new(settings.ps_tx_attenuation));
         let mox = Arc::new(AtomicBool::new(false));
         let tx_iq = Arc::new(Mutex::new(VecDeque::with_capacity(TX_IQ_BUFFER_CAPACITY)));
         let tci_tx_audio = Arc::new(Mutex::new(VecDeque::with_capacity(TCI_TX_AUDIO_CAPACITY)));
@@ -337,14 +372,14 @@ impl RadioSession {
         let ps_tx_feedback_iq = Arc::new(Mutex::new(VecDeque::with_capacity(PS_FEEDBACK_BUFFER_CAPACITY)));
         match device.protocol {
             1 => start_protocol1(
-                device, settings, frequency_hz, sample_rate, adc, antenna, rx_attenuation, mox, tx_iq,
-                tci_tx_audio, tx_power_watts, pa_gain_db, tx_forward_power, tx_reverse_power,
-                ps_rx_feedback_iq, ps_tx_feedback_iq,
+                device, settings, frequency_hz, sample_rate, adc, antenna, rx_attenuation,
+                ps_tx_attenuation, mox, tx_iq, tci_tx_audio, tx_power_watts, pa_gain_db,
+                tx_forward_power, tx_reverse_power, ps_rx_feedback_iq, ps_tx_feedback_iq,
             ),
             2 => start_protocol2(
-                device, settings, frequency_hz, sample_rate, adc, antenna, rx_attenuation, mox, tx_iq,
-                tci_tx_audio, tx_power_watts, pa_gain_db, tx_forward_power, tx_reverse_power,
-                ps_rx_feedback_iq, ps_tx_feedback_iq,
+                device, settings, frequency_hz, sample_rate, adc, antenna, rx_attenuation,
+                ps_tx_attenuation, mox, tx_iq, tci_tx_audio, tx_power_watts, pa_gain_db,
+                tx_forward_power, tx_reverse_power, ps_rx_feedback_iq, ps_tx_feedback_iq,
             ),
             p => Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -470,6 +505,7 @@ fn start_protocol1(
     adc: Arc<AtomicU32>,
     antenna: Arc<AtomicU32>,
     rx_attenuation: Arc<AtomicU32>,
+    ps_tx_attenuation: Arc<AtomicU32>,
     mox: Arc<AtomicBool>,
     tx_iq: Arc<Mutex<VecDeque<f32>>>,
     tci_tx_audio: Arc<Mutex<VecDeque<f32>>>,
@@ -535,6 +571,7 @@ fn start_protocol1(
         settings.sample_rate,
         matches!(device.board, Boards::HermesLite | Boards::HermesLite2),
         rx_attenuation.load(Ordering::Relaxed) as u8,
+        ps_tx_attenuation.load(Ordering::Relaxed) as u8,
         device.adcs,
         &tx_iq,
     )?;
@@ -577,6 +614,7 @@ fn start_protocol1(
     let sender_tx_power_watts = Arc::clone(&tx_power_watts);
     let sender_pa_gain_db = Arc::clone(&pa_gain_db);
     let sender_rx_attenuation = Arc::clone(&rx_attenuation);
+    let sender_ps_tx_attenuation = Arc::clone(&ps_tx_attenuation);
     let sender_is_hermes_lite = matches!(device.board, Boards::HermesLite | Boards::HermesLite2);
     let sender_num_adcs = device.adcs;
     let sender_thread = thread::spawn(move || {
@@ -592,6 +630,7 @@ fn start_protocol1(
             sender_tx_power_watts,
             sender_pa_gain_db,
             sender_rx_attenuation,
+            sender_ps_tx_attenuation,
             sender_is_hermes_lite,
             sender_num_adcs,
             ps_wire_total,
@@ -631,6 +670,7 @@ fn start_protocol1(
         adc,
         antenna,
         rx_attenuation,
+        ps_tx_attenuation,
         extra_frequencies_hz,
         extra_sample_rates_hz,
         extra_adcs,
@@ -792,6 +832,7 @@ fn p1_send_preconfig_and_start(
     sample_rate: u32,
     is_hermes_lite: bool,
     rx_attenuation: u8,
+    ps_tx_attenuation: u8,
     num_adcs: u8,
     tx_iq: &Mutex<VecDeque<f32>>,
 ) -> io::Result<()> {
@@ -813,6 +854,7 @@ fn p1_send_preconfig_and_start(
             false, // mox: never keyed during startup config
             is_hermes_lite,
             rx_attenuation,
+            ps_tx_attenuation,
             num_adcs,
             &[], // no extra receivers active yet this early -- falls back to the main frequency
             tx_iq,
@@ -859,6 +901,7 @@ fn p1_build_packet(
     mox_on: bool,
     is_hermes_lite: bool,
     rx_attenuation: u8,
+    ps_tx_attenuation: u8,
     num_adcs: u8,
     extra_frequencies_hz: &[Arc<AtomicU32>],
     tx_iq: &Mutex<VecDeque<f32>>,
@@ -987,38 +1030,49 @@ fn p1_build_packet(
             (0x12, c1, c2, c3, c4)
         }
         4 => {
-            // Mic bias/PTT-source config (C1) and RX
-            // attenuation/PA-enable (C4). No mic bias/PTT-source
-            // settings tracked -- C1=0.
+            // Mic bias/PTT-source config (C1) and RX/TX
+            // attenuation (C4).
             //
-            // ROOT CAUSE FIX, confirmed against piHPSDR's
-            // old_protocol.c: C4 was previously hardcoded to 0x20
-            // (the RX-only attenuator pattern) UNCONDITIONALLY, never
-            // varying with mox_on at all -- meaning the PA was never
-            // actually enabled for TX on Protocol 1, for ANY board,
-            // regardless of a correctly-computed drive level (command
-            // 3's C1 byte). This is what "TX Power set to max, MOX/
-            // Tune asserted, but 0W out" was actually caused by.
+            // BUG FIX: C1 was hardcoded to 0x00 entirely, on the
+            // (wrong) assumption there was nothing to track here.
+            // piHPSDR's C1 bit 0x40 is set whenever `mic_ptt_enabled`
+            // (a physical mic-connector PTT switch) is FALSE -- which
+            // is piHPSDR's own default (`int mic_ptt_enabled=0;` in
+            // radio.c), i.e. the bit is set in typical/default usage.
+            // This project has no physical-mic-PTT concept at all (TX
+            // audio comes from software/TCI, not a mic jack), so this
+            // is unconditionally the "no mic PTT" case -- the bit
+            // should always be set, not left at 0. Bits 0x20 (mic
+            // bias) and 0x10 (mic PTT tip/ring) stay 0 -- no mic bias
+            // or physical mic connector exists here either.
             //
-            // Standard (non-HermesLite) boards: piHPSDR sends 0x20 |
-            // attenuation while receiving, but 0x3F (all attenuator
-            // bits set) while transmitting -- that all-1s pattern is
-            // what actually enables the PA, not a real attenuation
-            // value.
+            // BUG FIX: an earlier session's "ROOT CAUSE FIX" claimed
+            // piHPSDR sends 0x3F (all attenuator bits set) here while
+            // transmitting, and that this magic value is what actually
+            // enables the PA -- that was a misreading. Direct source
+            // inspection of old_protocol.c's real command-4 case shows
+            // no such thing: the standard (non-HermesLite,
+            // !have_rx_gain) branch is `output_buffer[C4] = 0x20 |
+            // (transmitter->attenuation & 0x1F)` while transmitting --
+            // the SAME 0x20-enable-bit-plus-attenuation shape as
+            // receiving, just a different attenuation source. The only
+            // real `0x3F` in that file is a completely different byte
+            // (command 5/0x16's C1, the SECOND ADC's attenuator on
+            // 2-ADC boards) -- conflating the two was the bug. This
+            // project has no separate TX-attenuation setting, so reuses
+            // RadioSession::rx_attenuation for both cases (matching
+            // this project's existing simplification pattern for the
+            // HermesLite RX-gain case just below), removing the
+            // mox_on-dependent branch entirely for standard boards.
             //
-            // ROOT CAUSE FIX (RX case): this was hardcoded to a fixed
-            // 0x20 (0dB, no attenuation) regardless of `rx_attenuation`
-            // -- confirmed via real hardware testing (ANAN-100D/
-            // Angelia on a real HF antenna) that 0dB causes genuine
-            // front-end overload from ordinary band signals (visible
-            // as an intermod comb pattern or sustained broadband
-            // noise depending on what's on the band at the moment --
-            // real RF conditions vary, which is why this appeared
-            // random between connections). piHPSDR's own reference
-            // for this exact byte while receiving is `0x20 |
-            // ((int)adc[0].gain & 0x1F)` -- a real, user-configured
-            // value, not a constant. Now uses RadioSession::rx_attenuation
-            // (0-31 dB, Settings -> RX Attenuation) the same way.
+            // ROOT CAUSE FIX (RX case, still valid): this was hardcoded
+            // to a fixed 0x20 (0dB, no attenuation) regardless of
+            // `rx_attenuation` -- confirmed via real hardware testing
+            // (ANAN-100D/Angelia on a real HF antenna) that 0dB causes
+            // genuine front-end overload from ordinary band signals.
+            // piHPSDR's own reference for this byte while receiving is
+            // `0x20 | ((int)adc[0].gain & 0x1F)` -- a real,
+            // user-configured value, not a constant.
             //
             // HermesLite/HermesLite2 repurpose this byte entirely:
             // bit 6 (0x40) must always be set, with bits 0-5 as an
@@ -1028,14 +1082,9 @@ fn p1_build_packet(
             // transmitting with the PA enabled, so this simplification
             // costs nothing on TX and is a reasonable "no extra RX
             // gain boost" default otherwise.
-            let c4: u8 = if is_hermes_lite {
-                0x40
-            } else if mox_on {
-                0x3F
-            } else {
-                0x20 | (rx_attenuation & 0x1F)
-            };
-            (0x14, 0x00, 0x00, 0x00, c4)
+            let c4: u8 =
+                if is_hermes_lite { 0x40 } else { 0x20 | (rx_attenuation & 0x1F) };
+            (0x14, 0x40, 0x00, 0x00, c4)
         }
         5 => {
             // CW keyer settings (C2-C4) -- this project has no CW
@@ -1066,9 +1115,20 @@ fn p1_build_packet(
             (0x16, c1, 0x00, 0x00, 0x00)
         }
         6 => {
-            // Per-receiver ADC assignment. No per-receiver ADC
-            // tracking here yet -- both default to ADC0.
-            (0x1C, 0x00, 0x00, 0x00, 0x00)
+            // Per-receiver ADC assignment (C1) -- no per-receiver ADC
+            // tracking here yet, both default to ADC0.
+            //
+            // BUG FIX: C3 (step attenuator of the FIRST ADC, applied
+            // only while transmitting -- see RadioSession::
+            // ps_tx_attenuation's doc comment) was hardcoded to 0x00,
+            // meaning PureSignal's feedback path (which shares ADC0 on
+            // this board family) had no attenuation control at all.
+            // Confirmed against piHPSDR's old_protocol.c: `output_buffer[C3]
+            // |= transmitter->attenuation;`, sent unconditionally (the
+            // radio only actually applies it during TX, per the
+            // reference's own comment) -- matches this byte's mox-
+            // independent send here too.
+            (0x1C, 0x00, 0x00, ps_tx_attenuation & 0x1F, 0x00)
         }
         7 => {
             // CW mode bit (C1) + sidetone volume/PTT delay (C2/C3).
@@ -1119,6 +1179,7 @@ fn sender_loop(
     tx_power_watts: Arc<AtomicU32>,
     pa_gain_db: Arc<AtomicU32>,
     rx_attenuation: Arc<AtomicU32>,
+    ps_tx_attenuation: Arc<AtomicU32>,
     is_hermes_lite: bool,
     num_adcs: u8,
     // PureSignal: overrides active_receiver_count's live value with a
@@ -1207,6 +1268,7 @@ fn sender_loop(
             mox_on,
             is_hermes_lite,
             rx_attenuation.load(Ordering::Relaxed) as u8,
+            ps_tx_attenuation.load(Ordering::Relaxed) as u8,
             num_adcs,
             &extra_frequencies_hz,
             &tx_iq,
@@ -1521,6 +1583,7 @@ fn start_protocol2(
     adc: Arc<AtomicU32>,
     antenna: Arc<AtomicU32>,
     rx_attenuation: Arc<AtomicU32>, // P1-only setting; carried here purely to populate RadioSession's shared field
+    ps_tx_attenuation: Arc<AtomicU32>, // P1-only setting; carried here purely to populate RadioSession's shared field
     mox: Arc<AtomicBool>,
     tx_iq: Arc<Mutex<VecDeque<f32>>>,
     tci_tx_audio: Arc<Mutex<VecDeque<f32>>>,
@@ -1605,6 +1668,7 @@ fn start_protocol2(
     let sender_tx_power_watts = Arc::clone(&tx_power_watts);
     let sender_pa_gain_db = Arc::clone(&pa_gain_db);
     let sender_hp_request = Arc::clone(&hp_request);
+    let sender_ps_tx_attenuation = Arc::clone(&ps_tx_attenuation);
     let num_adcs = device.adcs;
     let sender_thread = thread::spawn(move || {
         p2_sender_loop(
@@ -1624,6 +1688,7 @@ fn start_protocol2(
             sender_pa_gain_db,
             sender_hp_request,
             puresignal_enabled,
+            sender_ps_tx_attenuation,
             sender_stop,
         );
     });
@@ -1667,6 +1732,7 @@ fn start_protocol2(
         adc,
         antenna,
         rx_attenuation,
+        ps_tx_attenuation,
         extra_frequencies_hz,
         extra_sample_rates_hz,
         extra_adcs,
@@ -1841,6 +1907,7 @@ fn p2_high_priority_packet(
     mox_on: bool,
     tx_freq_hz: u32,
     tx_drive: u8,
+    ps_tx_attenuation: u8,
 ) -> [u8; P2_PACKET_SIZE] {
     let mut p = [0u8; P2_PACKET_SIZE];
     p[0..4].copy_from_slice(&seq.to_be_bytes());
@@ -1875,6 +1942,20 @@ fn p2_high_priority_packet(
     // while keyed.
     p[329..333].copy_from_slice(&phase_word(tx_freq_hz).to_be_bytes());
     p[345] = if mox_on { tx_drive } else { 0 };
+
+    // BUG FIX: bytes 1442/1443 (ADC1/ADC0 step attenuators) were never
+    // written at all, staying at the zero-initialized default -- a real
+    // gap matching the one found and fixed on Protocol 1 (see
+    // RadioSession::ps_tx_attenuation's doc comment). Confirmed against
+    // piHPSDR's new_protocol.c: "Upon transmitting, set the attenuator
+    // of ADC0 to the 'transmitter attenuation' (used in PURESIGNAL
+    // signal strength adjustment) and the attenuator of ADC1 to the
+    // maximum value (to protect RX2 in DIVERSITY setups)." This project
+    // has no P2 RX-attenuation setting yet (unlike P1's rx_attenuation),
+    // so the non-transmitting byte 1443 case is left at 0 for now --
+    // only the TX-time PureSignal attenuation path is implemented here.
+    p[1443] = if mox_on { ps_tx_attenuation } else { 0 };
+    p[1442] = if mox_on { 31 } else { 0 };
 
     // Antenna/filter selection is driven by receiver 0's frequency --
     // there's only one Alex front end, shared across all DDCs.
@@ -2004,6 +2085,8 @@ fn p2_sender_loop(
     // respectively) ahead of any real receivers -- confirmed universal
     // on P2 regardless of board, unlike P1's board-dependent table.
     puresignal_enabled: bool,
+    // See RadioSession::ps_tx_attenuation's doc comment.
+    ps_tx_attenuation: Arc<AtomicU32>,
     stop: Arc<AtomicBool>,
 ) {
     let mut general_seq: u32 = 0;
@@ -2117,12 +2200,14 @@ fn p2_sender_loop(
             f32::from_bits(pa_gain_db.load(Ordering::Relaxed)),
         );
         let ps_mox_gate = puresignal_enabled.then_some(mox_on);
+        let ps_tx_atten = ps_tx_attenuation.load(Ordering::Relaxed) as u8;
 
         if due_for_keepalive {
             let general = p2_general_packet(general_seq, num_adcs);
             let ddc = p2_ddc_specific_packet(ddc_seq, &rates, &adcs, num_adcs, ps_mox_gate);
             let tx = p2_tx_specific_packet(tx_seq);
-            let hp = p2_high_priority_packet(hp_seq, &freqs, antenna_now, mox_on, tx_freq_hz, drive);
+            let hp =
+                p2_high_priority_packet(hp_seq, &freqs, antenna_now, mox_on, tx_freq_hz, drive, ps_tx_atten);
 
             let sends: [(&[u8], u16); 5] = [
                 (&general[..], P2_GENERAL_PORT),
@@ -2153,7 +2238,8 @@ fn p2_sender_loop(
             // deliberately minimal (not resending all four) to match
             // what was actually confirmed in the reference source
             // rather than guessing it should be more than that.
-            let hp = p2_high_priority_packet(hp_seq, &freqs, antenna_now, mox_on, tx_freq_hz, drive);
+            let hp =
+                p2_high_priority_packet(hp_seq, &freqs, antenna_now, mox_on, tx_freq_hz, drive, ps_tx_atten);
             if socket.send_to(&hp, (radio_ip, P2_HIGH_PRIORITY_PORT)).is_err() {
                 return;
             }

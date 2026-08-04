@@ -209,6 +209,18 @@ struct ConnectedState {
     device: Device,
     session: RadioSession,
     spectrum: SpectrumHandle,
+    /// A SEPARATE analyzer fed with the actual generated TX IQ (via
+    /// TxHandle's tx_spectrum_iq queue), not RX ADC samples -- matches
+    /// piHPSDR/rustyHPSDR's own TX-spectrum architecture. `spectrum`
+    /// (the RX analyzer) can't double as a TX monitor: it only ever
+    /// sees whatever the receiver itself picks up over the air, which
+    /// depends entirely on antenna/relay coupling and can be weak,
+    /// badly overloaded (showing as a comb pattern), or simply absent
+    /// depending on the radio's T/R isolation -- not a meaningful "is
+    /// my transmitted signal clean" signal. Rendered in place of
+    /// `spectrum` whenever `session.mox_active()` is true (see the
+    /// main panel's spectrum-drawing code).
+    tx_spectrum: SpectrumHandle,
     audio_output: Option<AudioOutput>,
     rigctl_server: Option<RigctlServer>,
     tci_server: Option<TciServer>,
@@ -294,6 +306,8 @@ struct ConnectedState {
     ps_mox_delay: f64,
     ps_loop_delay: f64,
     ps_tx_delay_ns: f64,
+    /// See tx::PsParams::ptol's doc comment.
+    ps_ptol: f64,
     /// Per-band PA gain (dB), keyed by band name. See
     /// Config::pa_calibration and radio::drive_byte_for_watts. Resolved
     /// to the current band and pushed into session.pa_gain_db once per
@@ -325,6 +339,15 @@ struct ConnectedState {
     /// temporarily overwritten with the reduced tune wattage while
     /// tuning. None whenever tune_active is false.
     pre_tune_power_watts: Option<u32>,
+    /// Whether the Two-Tone test button is currently engaged --
+    /// mutually exclusive with tune_active (mirrors it structurally,
+    /// including reusing pre_tune_power_watts/tune_power_percent for
+    /// the same "reduced power while testing" mechanism). See
+    /// tx::PsParams::two_tone's doc comment for why this exists as a
+    /// DISTINCT control from Tune, not just a variant of it --
+    /// PureSignal calibration actually requires a varying-envelope
+    /// signal that a steady Tune tone can never provide.
+    two_tone_active: bool,
     /// Exponentially-smoothed forward/reverse power ADC counts (same
     /// raw units as session.tx_forward_power/tx_reverse_power), used
     /// only for the TX meter display -- NOT written back to the
@@ -397,6 +420,9 @@ impl eframe::App for HpsdrApp {
                     settings.puresignal_enabled = cfg.puresignal_enabled.unwrap_or(false);
                     if let Some(atten) = cfg.rx_attenuation {
                         settings.rx_attenuation = atten;
+                    }
+                    if let Some(atten) = cfg.ps_tx_attenuation {
+                        settings.ps_tx_attenuation = atten;
                     }
                     match RadioSession::start(&device, settings) {
                         Ok(session) => {
@@ -531,10 +557,11 @@ impl eframe::App for HpsdrApp {
                             // one's PsParams's fallback for a session that
                             // skips Config loading entirely).
                             let ps_enabled = true;
-                            let ps_hw_peak = cfg.ps_hw_peak.unwrap_or(0.2899);
+                            let ps_hw_peak = cfg.ps_hw_peak.unwrap_or_else(|| default_ps_hw_peak(device.protocol));
                             let ps_mox_delay = cfg.ps_mox_delay.unwrap_or(0.2);
                             let ps_loop_delay = cfg.ps_loop_delay.unwrap_or(0.0);
                             let ps_tx_delay_ns = cfg.ps_tx_delay_ns.unwrap_or(150.0);
+                            let ps_ptol = cfg.ps_ptol.unwrap_or(0.8);
 
                             let settings_dirty = Arc::new(std::sync::atomic::AtomicBool::new(false));
                             let mut extra_receivers = Vec::new();
@@ -563,6 +590,16 @@ impl eframe::App for HpsdrApp {
                             } else {
                                 settings.sample_rate as i32
                             };
+                            // Fed by TxHandle with the actual generated TX
+                            // IQ (not RX ADC samples) -- see
+                            // ConnectedState::tx_spectrum's doc comment.
+                            let tx_spectrum_iq: Arc<Mutex<VecDeque<IqSample>>> =
+                                Arc::new(Mutex::new(VecDeque::new()));
+                            let tx_spectrum = SpectrumHandle::start(
+                                session.iq_buffers.len() as i32 + 1,
+                                Arc::clone(&tx_spectrum_iq),
+                                duc_rate,
+                            );
                             let mic_buffer = Arc::new(Mutex::new(VecDeque::new()));
                             let (tx_enabled, mic_input, tx_handle) = match MicInput::start(Arc::clone(&mic_buffer)) {
                                 Ok(mic) => {
@@ -570,6 +607,7 @@ impl eframe::App for HpsdrApp {
                                         mic_buffer,
                                         Arc::clone(&session.tci_tx_audio),
                                         Arc::clone(&session.tx_iq),
+                                        Arc::clone(&tx_spectrum_iq),
                                         Arc::clone(&session.mox),
                                         session.iq_buffers.len() as i32,
                                         device.protocol,
@@ -587,6 +625,7 @@ impl eframe::App for HpsdrApp {
                                     tx_handle.set_ps_mox_delay(ps_mox_delay);
                                     tx_handle.set_ps_loop_delay(ps_loop_delay);
                                     tx_handle.set_ps_tx_delay_ns(ps_tx_delay_ns);
+                                    tx_handle.set_ps_ptol(ps_ptol);
                                     (true, Some(mic), Some(tx_handle))
                                 }
                                 Err(e) => {
@@ -608,6 +647,7 @@ impl eframe::App for HpsdrApp {
                                 device,
                                 session,
                                 spectrum,
+                                tx_spectrum,
                                 audio_output,
                                 rigctl_server,
                                 tci_server,
@@ -655,6 +695,7 @@ impl eframe::App for HpsdrApp {
                                 ps_mox_delay,
                                 ps_loop_delay,
                                 ps_tx_delay_ns,
+                                ps_ptol,
                                 pa_calibration: cfg.pa_calibration.clone(),
                                 max_tx_power_watts: cfg
                                     .max_tx_power_watts
@@ -662,6 +703,7 @@ impl eframe::App for HpsdrApp {
                                 tune_power_percent: cfg.tune_power_percent.unwrap_or(20),
                                 tune_active: false,
                                 pre_tune_power_watts: None,
+                                two_tone_active: false,
                                 smoothed_fwd_power: 0.0,
                                 smoothed_rev_power: 0.0,
                                 puresignal_enabled: settings.puresignal_enabled,
@@ -732,8 +774,21 @@ impl eframe::App for HpsdrApp {
                 connected.spectrum.set_ctun(connected.ctun, ctun_offset_hz);
                 let dial_freq_hz = if connected.ctun { connected.ctun_frequency_hz } else { freq_hz };
 
+                // While transmitting, show tx_spectrum (fed with the
+                // actual generated TX IQ -- see ConnectedState::tx_spectrum's
+                // doc comment) instead of the RX analyzer: the RX buffer
+                // only ever shows whatever the receiver happens to pick up
+                // over the air, which is not a reliable "is my transmitted
+                // signal clean" signal at all. No LO/CTUN translation
+                // applied to tx_spectrum -- it's raw generated baseband,
+                // not a wideband capture that needs retuning within.
+                let transmitting = connected.session.mox_active();
                 let (spectrum_row, meter_db, waterfall_data_revision) = {
-                    let d = connected.spectrum.display.lock().unwrap();
+                    let d = if transmitting {
+                        connected.tx_spectrum.display.lock().unwrap()
+                    } else {
+                        connected.spectrum.display.lock().unwrap()
+                    };
                     (d.spectrum.clone(), d.meter_db, d.revision)
                 };
 
@@ -746,7 +801,6 @@ impl eframe::App for HpsdrApp {
                 // signals the RX range is normally tuned for, so they
                 // need independent headroom rather than sharing one
                 // range or a fixed offset applied at render time.
-                let transmitting = connected.session.mox_active();
                 let (rx_low, rx_high) = (connected.db_low, connected.db_high);
                 let (tx_low, tx_high) = (connected.tx_db_low, connected.tx_db_high);
                 let (base_low, base_high) = if transmitting { (tx_low, tx_high) } else { (rx_low, rx_high) };
@@ -780,7 +834,11 @@ impl eframe::App for HpsdrApp {
                 let wanted_signature = (waterfall_data_revision, connected.waterfall_palette, wf_db_low, wf_db_high);
                 if connected.waterfall_signature != Some(wanted_signature) {
                     let waterfall_rows: Vec<Vec<f32>> = {
-                        let d = connected.spectrum.display.lock().unwrap();
+                        let d = if transmitting {
+                            connected.tx_spectrum.display.lock().unwrap()
+                        } else {
+                            connected.spectrum.display.lock().unwrap()
+                        };
                         d.waterfall_rows.iter().cloned().collect()
                     };
                     let waterfall_image =
@@ -993,6 +1051,17 @@ impl eframe::App for HpsdrApp {
                             ) {
                                 connected.session.tx_power_watts.store(watts as u32, Ordering::Relaxed);
                                 settings_changed = true;
+                                // A manual adjustment while Tune is active is
+                                // a real, intentional power change (e.g.
+                                // gradually raising drive while watching SWR
+                                // on an antenna tuner) -- it should stick
+                                // when Tune ends, not get silently discarded
+                                // by the Tune button's restore-previous-value
+                                // logic. Clearing pre_tune_power_watts makes
+                                // that restore a no-op.
+                                if connected.tune_active || connected.two_tone_active {
+                                    connected.pre_tune_power_watts = None;
+                                }
                             }
                         }
                     });
@@ -1137,7 +1206,8 @@ impl eframe::App for HpsdrApp {
                             // transmission; still clickable to turn
                             // OFF if tune itself is what's currently
                             // keying.
-                            let tune_may_start = !mox_now || connected.tune_active;
+                            let tune_may_start =
+                                (!mox_now || connected.tune_active) && !connected.two_tone_active;
                             let tune_label = if connected.tune_active { "TUNE ON" } else { "TUNE" };
                             let tune_color = if connected.tune_active {
                                 egui::Color32::from_rgb(230, 140, 20)
@@ -1203,6 +1273,73 @@ impl eframe::App for HpsdrApp {
                                     connected.session.tx_power_watts.store(prev, Ordering::Relaxed);
                                 }
                                 connected.tune_active = false;
+                            }
+
+                            // Two-Tone: see tx::PsParams::two_tone's doc
+                            // comment for why this is a distinct control
+                            // from Tune, not just a variant of it --
+                            // PureSignal calibration requires a varying-
+                            // envelope test signal a steady tone can
+                            // never provide. Mutually exclusive with
+                            // Tune (tune_may_start above already
+                            // excludes two_tone_active; mirrored here).
+                            let two_tone_may_start =
+                                (!mox_now || connected.two_tone_active) && !connected.tune_active;
+                            let two_tone_label =
+                                if connected.two_tone_active { "TWO TONE ON" } else { "TWO TONE" };
+                            let two_tone_color = if connected.two_tone_active {
+                                egui::Color32::from_rgb(230, 140, 20)
+                            } else {
+                                egui::Color32::from_gray(60)
+                            };
+                            let two_tone_resp = ui
+                                .add_enabled(
+                                    two_tone_may_start,
+                                    egui::Button::new(
+                                        egui::RichText::new(two_tone_label)
+                                            .strong()
+                                            .color(egui::Color32::WHITE),
+                                    )
+                                    .fill(two_tone_color),
+                                )
+                                .on_hover_text(
+                                    "Click to toggle a two-tone test signal, at Tune Power \
+                                     (Settings -> TX) -- required for PureSignal calibration, \
+                                     which a steady Tune tone can't provide",
+                                );
+                            if two_tone_resp.clicked() {
+                                if connected.two_tone_active {
+                                    connected.session.set_mox(false);
+                                    if let Some(tx) = &connected.tx_handle {
+                                        tx.set_two_tone(false);
+                                    }
+                                    if let Some(prev) = connected.pre_tune_power_watts.take() {
+                                        connected.session.tx_power_watts.store(prev, Ordering::Relaxed);
+                                    }
+                                    connected.two_tone_active = false;
+                                } else {
+                                    let current_watts =
+                                        connected.session.tx_power_watts.load(Ordering::Relaxed);
+                                    connected.pre_tune_power_watts = Some(current_watts);
+                                    let tune_watts = current_watts * connected.tune_power_percent / 100;
+                                    connected.session.tx_power_watts.store(tune_watts, Ordering::Relaxed);
+                                    if let Some(tx) = &connected.tx_handle {
+                                        tx.set_two_tone(true);
+                                    }
+                                    connected.session.set_mox(true);
+                                    connected.two_tone_active = true;
+                                }
+                            }
+
+                            // Safety net: mirrors Tune's own, above.
+                            if connected.two_tone_active && !connected.session.mox_active() {
+                                if let Some(tx) = &connected.tx_handle {
+                                    tx.set_two_tone(false);
+                                }
+                                if let Some(prev) = connected.pre_tune_power_watts.take() {
+                                    connected.session.tx_power_watts.store(prev, Ordering::Relaxed);
+                                }
+                                connected.two_tone_active = false;
                             }
 
                             // Spacebar: hold-to-talk, the traditional
@@ -2288,6 +2425,17 @@ impl eframe::App for HpsdrApp {
                                             } else {
                                                 connected.sample_rate as i32
                                             };
+                                            // Tear down the old tx_spectrum before creating a
+                                            // replacement -- same reasoning as the RX
+                                            // SpectrumHandle rebuild in change_sample_rate.
+                                            connected.tx_spectrum.stop();
+                                            let tx_spectrum_iq: Arc<Mutex<VecDeque<IqSample>>> =
+                                                Arc::new(Mutex::new(VecDeque::new()));
+                                            connected.tx_spectrum = SpectrumHandle::start(
+                                                connected.session.iq_buffers.len() as i32 + 1,
+                                                Arc::clone(&tx_spectrum_iq),
+                                                duc_rate,
+                                            );
                                             let mic_buffer = Arc::new(Mutex::new(VecDeque::new()));
                                             match MicInput::start(Arc::clone(&mic_buffer)) {
                                                 Ok(mic) => {
@@ -2295,6 +2443,7 @@ impl eframe::App for HpsdrApp {
                                                         mic_buffer,
                                                         Arc::clone(&connected.session.tci_tx_audio),
                                                         Arc::clone(&connected.session.tx_iq),
+                                                        Arc::clone(&tx_spectrum_iq),
                                                         Arc::clone(&connected.session.mox),
                                                         connected.session.iq_buffers.len() as i32,
                                                         connected.device.protocol,
@@ -2312,6 +2461,7 @@ impl eframe::App for HpsdrApp {
                                                     tx_handle.set_ps_mox_delay(connected.ps_mox_delay);
                                                     tx_handle.set_ps_loop_delay(connected.ps_loop_delay);
                                                     tx_handle.set_ps_tx_delay_ns(connected.ps_tx_delay_ns);
+                                                    tx_handle.set_ps_ptol(connected.ps_ptol);
                                                     connected.mic_input = Some(mic);
                                                     connected.tx_handle = Some(tx_handle);
                                                     connected.tx_enabled = true;
@@ -2331,14 +2481,16 @@ impl eframe::App for HpsdrApp {
                                             connected.mic_input = None;
                                             connected.tx_enabled = false;
                                             // tx_handle is gone regardless, but tune_active/
-                                            // pre_tune_power_watts live on ConnectedState and
-                                            // would otherwise survive a disarm -- restore the
-                                            // real TX Power rather than leaving it at whatever
-                                            // reduced tune wattage happened to be active.
+                                            // two_tone_active/pre_tune_power_watts live on
+                                            // ConnectedState and would otherwise survive a
+                                            // disarm -- restore the real TX Power rather than
+                                            // leaving it at whatever reduced tune/two-tone
+                                            // wattage happened to be active.
                                             if let Some(prev) = connected.pre_tune_power_watts.take() {
                                                 connected.session.tx_power_watts.store(prev, Ordering::Relaxed);
                                             }
                                             connected.tune_active = false;
+                                            connected.two_tone_active = false;
                                         }
                                         settings_changed = true;
                                     }
@@ -2452,6 +2604,46 @@ impl eframe::App for HpsdrApp {
                                             });
                                             ui.label(format!("Measured peak TX: {:.4}", status.max_tx));
 
+                                            // Standard (non-HermesLite) boards only, both protocols
+                                            // -- see radio::RadioSession::ps_tx_attenuation's doc
+                                            // comment. This, not HW Peak, is the real per-session
+                                            // tuning knob for bringing Feedback level above into
+                                            // the ideal 128-181 range -- confirmed against
+                                            // piHPSDR's own "Auto Attenuate" logic, which adjusts
+                                            // exactly this value (not HW Peak) to target a
+                                            // feedback level near 152.
+                                            if !matches!(
+                                                connected.device.board,
+                                                Boards::HermesLite | Boards::HermesLite2
+                                            ) {
+                                                let mut ps_atten = connected
+                                                    .session
+                                                    .ps_tx_attenuation
+                                                    .load(Ordering::Relaxed)
+                                                    as i32;
+                                                ui.horizontal(|ui| {
+                                                    ui.label("Feedback Attenuation:");
+                                                    if scroll_slider_i32(
+                                                        ui,
+                                                        &mut connected.slider_scroll_accum,
+                                                        &mut ps_atten,
+                                                        0..=31,
+                                                        1,
+                                                        " dB",
+                                                    ) {
+                                                        connected
+                                                            .session
+                                                            .ps_tx_attenuation
+                                                            .store(ps_atten as u32, Ordering::Relaxed);
+                                                        settings_changed = true;
+                                                    }
+                                                });
+                                                ui.weak(
+                                                    "Raise this if Feedback level above reads too high \
+                                                     (near/over 256) -- target the 128-181 range.",
+                                                );
+                                            }
+
                                             ui.add_space(4.0);
                                             let mut hw_peak = connected.ps_hw_peak;
                                             ui.horizontal(|ui| {
@@ -2522,6 +2714,28 @@ impl eframe::App for HpsdrApp {
                                                     settings_changed = true;
                                                 }
                                             });
+                                            ui.horizontal(|ui| {
+                                                ui.label("Ptol:");
+                                                let mut ptol = connected.ps_ptol;
+                                                if scroll_slider_f64(
+                                                    ui,
+                                                    &mut connected.slider_scroll_accum,
+                                                    &mut ptol,
+                                                    0.0..=1.0,
+                                                    0.01,
+                                                    "",
+                                                ) {
+                                                    connected.ps_ptol = ptol;
+                                                    tx.set_ps_ptol(ptol);
+                                                    settings_changed = true;
+                                                }
+                                            });
+                                            ui.weak(
+                                                "Correction-table outlier tolerance -- lower this if \
+                                                 Correcting never turns on despite Feedback level \
+                                                 looking reasonable and Calibrate Now running \
+                                                 repeatedly (WDSP default 0.8).",
+                                            );
                                             ui.weak("Advanced -- rarely need changing from the defaults.");
                                         } else {
                                             ui.weak("TX must be enabled for PureSignal calibration controls.");
@@ -2621,10 +2835,14 @@ impl eframe::App for HpsdrApp {
                         rx_attenuation: Some(
                             connected.session.rx_attenuation.load(std::sync::atomic::Ordering::Relaxed),
                         ),
+                        ps_tx_attenuation: Some(
+                            connected.session.ps_tx_attenuation.load(std::sync::atomic::Ordering::Relaxed),
+                        ),
                         ps_hw_peak: Some(connected.ps_hw_peak),
                         ps_mox_delay: Some(connected.ps_mox_delay),
                         ps_loop_delay: Some(connected.ps_loop_delay),
                         ps_tx_delay_ns: Some(connected.ps_tx_delay_ns),
+                        ps_ptol: Some(connected.ps_ptol),
                     }
                     .save(connected.device.mac);
                 }
@@ -2865,6 +3083,25 @@ fn scroll_slider_i32(
         }
     }
     changed
+}
+
+/// PureSignal HW Peak's confirmed reference default, per protocol --
+/// see tx::PsParams::hw_peak's doc comment for what this represents.
+/// BUG FIX: this used to be hardcoded to the P2 value (0.2899)
+/// regardless of protocol -- confirmed via real hardware testing
+/// (ANAN-100D/Angelia, Protocol 1) that this miscalibration pins
+/// GetPSInfo's reported feedback level at its maximum display value
+/// (255) REGARDLESS of actual drive level (raising or lowering TX
+/// power made no difference at all, which is the signature of a
+/// scaling/reference-point error, not a genuinely-too-strong signal --
+/// a real overload would track drive level, not sit pinned at a
+/// constant). Confirmed Thetis defaults: P1/USB 0.4072, P2 0.2899.
+fn default_ps_hw_peak(protocol: u8) -> f64 {
+    if protocol == 1 {
+        0.4072
+    } else {
+        0.2899
+    }
 }
 
 /// Starting guess for the main panel's TX Power slider's upper bound,
@@ -3908,11 +4145,21 @@ fn change_sample_rate(connected: &mut ConnectedState, new_rate: u32) {
         if let Some(old_tx) = connected.tx_handle.take() {
             let mic_gain = connected.mic_gain;
             drop(old_tx); // stop the old TXA thread before opening a new one on the same WDSP TX channel
+            // Same reasoning as the RX SpectrumHandle rebuild above --
+            // tear down before creating a replacement on the same channel.
+            connected.tx_spectrum.stop();
+            let tx_spectrum_iq: Arc<Mutex<VecDeque<IqSample>>> = Arc::new(Mutex::new(VecDeque::new()));
+            connected.tx_spectrum = SpectrumHandle::start(
+                connected.session.iq_buffers.len() as i32 + 1,
+                Arc::clone(&tx_spectrum_iq),
+                new_rate as i32,
+            );
             if let Some(mic) = &connected.mic_input {
                 let tx_handle = TxHandle::start(
                     Arc::clone(mic.buffer()),
                     Arc::clone(&connected.session.tci_tx_audio),
                     Arc::clone(&connected.session.tx_iq),
+                    Arc::clone(&tx_spectrum_iq),
                     Arc::clone(&connected.session.mox),
                     connected.session.iq_buffers.len() as i32,
                     connected.device.protocol,
@@ -3930,6 +4177,7 @@ fn change_sample_rate(connected: &mut ConnectedState, new_rate: u32) {
                 tx_handle.set_ps_mox_delay(connected.ps_mox_delay);
                 tx_handle.set_ps_loop_delay(connected.ps_loop_delay);
                 tx_handle.set_ps_tx_delay_ns(connected.ps_tx_delay_ns);
+                tx_handle.set_ps_ptol(connected.ps_ptol);
                 connected.tx_handle = Some(tx_handle);
             }
         }

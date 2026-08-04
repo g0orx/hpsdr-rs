@@ -120,6 +120,10 @@ const TX_IQ_BUFFER_CAPACITY: usize = 100_000;
 /// scaling a 24-bit signed sample to [-1.0, 1.0].
 const PS_IQ_NORM: f32 = 8_388_608.0;
 
+/// ~0.25s of TX spectrum-display IQ at a typical 192ksps DUC rate --
+/// same "small ring buffer, drop oldest" reasoning as TX_IQ_BUFFER_CAPACITY.
+const TX_SPECTRUM_IQ_CAPACITY: usize = 50_000;
+
 /// How many raw samples PureSignal's RX-feedback queue (radio.rs's
 /// ps_rx_feedback_iq) delivers per matching TX-feedback/DUC-rate pair,
 /// on Protocol 2 only. NOT a protocol requirement -- an empirically
@@ -183,6 +187,20 @@ pub struct PsParams {
     /// compensation. Confirmed reference default: 150ns (Apache Labs
     /// hardware).
     pub tx_delay_ns: f64,
+    /// `SetPSPtol` -- outlier tolerance (0.0-1.0) for the correction-
+    /// table curve fit's culling step. Confirmed reference default:
+    /// 0.8 (TXA.c's create_calcc call), previously never exposed/set
+    /// by this project at all (left at that WDSP-internal default).
+    /// LOWER values allow culling MORE outlier samples before fitting
+    /// (`cull()`'s allowed-cull-count is proportional to `1.0-ptol`) --
+    /// worth lowering if `Correcting` never turns on despite
+    /// calibration attempts completing: WDSP's own scheck() function
+    /// (which gates whether a computed correction table is trusted
+    /// enough to apply) can reject an otherwise-valid table if the fit
+    /// overshoots full scale anywhere, which noisy/imprecise
+    /// calibration data (e.g. from feedback with reduced time
+    /// resolution) can cause even when the underlying signal is fine.
+    pub ptol: f64,
 }
 
 impl Default for PsParams {
@@ -194,6 +212,7 @@ impl Default for PsParams {
             mox_delay: 0.2,
             loop_delay: 0.0,
             tx_delay_ns: 150.0,
+            ptol: 0.8,
         }
     }
 }
@@ -229,6 +248,23 @@ pub struct TxParams {
     /// see TxProcessor::process()'s PostGen update for the mechanism
     /// (confirmed against rustyHPSDR's own Tune implementation).
     pub tune: bool,
+    /// When true, WDSP's PostGen replaces mic audio with a two-tone
+    /// test signal instead of Tune's steady single tone. NOT just a
+    /// cosmetic alternative to Tune -- PureSignal calibration actually
+    /// REQUIRES this: confirmed by reading WDSP's calcc.c LCOLLECT
+    /// state directly, PS bins TX envelope samples into 16 amplitude
+    /// buckets spanning 0..HW Peak and only progresses once every
+    /// bucket has collected enough samples. A steady tone has a
+    /// CONSTANT envelope, so it only ever fills one bucket -- collect
+    /// can never complete, regardless of drive level, HW Peak, or
+    /// feedback attenuation (confirmed via real hardware testing: PS
+    /// stuck in the COLLECT state indefinitely, on both P1 and P2,
+    /// while testing with Tune). A two-tone signal's envelope beats
+    /// between the two tones' magnitudes, continuously sweeping the
+    /// full amplitude range -- exactly what calibration needs, and
+    /// exactly why every reference PS implementation calibrates with a
+    /// two-tone generator, never a steady carrier.
+    pub two_tone: bool,
 }
 
 impl Default for TxParams {
@@ -251,6 +287,7 @@ impl Default for TxParams {
             mic_gain: 0.5,
             width_hz: crate::spectrum::default_width_hz(Mode::Usb),
             tune: false,
+            two_tone: false,
         }
     }
 }
@@ -262,7 +299,9 @@ struct TxProcessor {
     last_mode: Option<Mode>,
     last_gain: Option<f32>,
     last_passband: Option<(f64, f64)>,
-    last_tune: Option<bool>,
+    /// (tune, two_tone) as last applied to WDSP's PostGen -- see
+    /// process()'s PostGen update for why these are tracked together.
+    last_post_gen: Option<(bool, bool)>,
     /// See set_ps_mox's doc comment.
     last_ps_mox: Option<bool>,
     /// See apply_ps_params's doc comment.
@@ -272,6 +311,7 @@ struct TxProcessor {
     last_ps_mox_delay: Option<f64>,
     last_ps_loop_delay: Option<f64>,
     last_ps_tx_delay_ns: Option<f64>,
+    last_ps_ptol: Option<f64>,
 }
 
 impl TxProcessor {
@@ -442,6 +482,25 @@ impl TxProcessor {
             wdsp::SetTXAPostGenToneFreq(channel, 0.0);
             wdsp::SetTXAPostGenRun(channel, 0);
 
+            // PureSignal: BUG FIX -- this was never called at all.
+            // Confirmed against Thetis's cmaster.cs (SetPSFeedbackRate
+            // (txch, ps_rate) with a dedicated ps_rate = 192000,
+            // completely separate from TXA's own internal DSP rate).
+            // Without it, WDSP's calcc engine keeps using create_calcc's
+            // initial "rate" parameter (TXA's own dsp_rate above -- 96000
+            // for P2, HALF the real feedback rate) for every internal
+            // seconds-to-samples conversion (SetPSMoxDelay/SetPSLoopDelay
+            // -> a->ctrl.moxsamps/waitsamps = rate*delay), making those
+            // timing windows silently half as long as configured. That's
+            // a real, plausible source of "calibration keeps calling
+            // itself unstable between attempts" (WDSP's own scheck()
+            // rejects a correction table that changed too much from the
+            // previous one) -- rushed collection/settling windows would
+            // produce noisier, less consistent measurements each cycle.
+            // `duc_rate` is exactly right here: it's the same rate
+            // psccF's feedback buffers are actually paired/fed at.
+            wdsp::SetPSFeedbackRate(channel, duc_rate);
+
             // Panel gain: WDSP's own dedicated mic gain stage. This
             // project previously applied mic_gain by scaling raw
             // sample values itself before ever handing them to WDSP,
@@ -529,14 +588,25 @@ impl TxProcessor {
             last_mode: None,
             last_gain: None,
             last_passband: Some(default_passband),
-            last_tune: None,
+            last_post_gen: None,
             last_ps_mox: None,
             last_ps_enabled: None,
-            last_ps_calibrate_request: None,
+            // BUG FIX: was `None`, but PsParams::calibrate_request
+            // starts at 0, not absent -- `None != Some(0)` is true, so
+            // the very first apply_ps_params call spuriously fired a
+            // one-shot manual-calibration trigger (SetPSControl's
+            // mancal=1, automode=0), UNDOING the enable call's
+            // automode=1 moments earlier (both fire in the same call,
+            // calibrate_request's check runs second and wins). Matches
+            // PsParams::default's own starting value so the first real
+            // comparison is a true no-op, only firing on an actual
+            // Calibrate Now click.
+            last_ps_calibrate_request: Some(0),
             last_ps_hw_peak: None,
             last_ps_mox_delay: None,
             last_ps_loop_delay: None,
             last_ps_tx_delay_ns: None,
+            last_ps_ptol: None,
         }
     }
 
@@ -552,6 +622,7 @@ impl TxProcessor {
         mic_gain: f32,
         width_hz: f64,
         tune: bool,
+        two_tone: bool,
     ) -> (Vec<f32>, c_int) {
         debug_assert_eq!(mic_samples.len(), TX_BUFFER_SIZE);
 
@@ -577,20 +648,52 @@ impl TxProcessor {
             self.last_passband = Some(passband);
         }
 
-        // Tune: WDSP's PostGen tone generator runs AFTER the ALC/AM/FM
-        // stages in xtxa()'s processing order (confirmed in TXA.c),
-        // so it overwrites whatever the normal mic->Panel-gain->ALC
-        // chain produced -- no interaction with mic input or ALC to
-        // worry about, matches rustyHPSDR's own Tune mechanism
-        // (set_tuning: ToneMag 0.99999, Mode 0 = Tone, Run toggles the
-        // generator on/off).
-        if self.last_tune != Some(tune) {
+        // Tune/Two-Tone: WDSP's PostGen generator runs AFTER the
+        // ALC/AM/FM stages in xtxa()'s processing order (confirmed in
+        // TXA.c), so it overwrites whatever the normal
+        // mic->Panel-gain->ALC chain produced -- no interaction with
+        // mic input or ALC to worry about, matches rustyHPSDR's own
+        // Tune mechanism (set_tuning: ToneMag 0.99999, Mode 0 = Tone,
+        // Run toggles the generator on/off).
+        //
+        // Two-Tone (mode 1, confirmed against WDSP's gen.c) is NOT
+        // just an alternative to Tune -- see TxParams::two_tone's doc
+        // comment for why PureSignal calibration actually requires it
+        // (a steady tone's constant envelope can never fill PS's 16
+        // amplitude-bucket collection, so calibration hangs forever
+        // regardless of drive/HW Peak/feedback attenuation). Two_tone
+        // takes priority if both are somehow set (shouldn't happen --
+        // the UI treats them as mutually exclusive). TTMag left at
+        // open()'s conservative 0.2/0.2 default rather than Tune's
+        // near-max 0.99999 -- two tones summing at max magnitude each
+        // would clip.
+        let desired = (tune, two_tone);
+        if self.last_post_gen != Some(desired) {
             unsafe {
-                wdsp::SetTXAPostGenMode(self.channel, 0);
-                wdsp::SetTXAPostGenToneMag(self.channel, 0.99999);
-                wdsp::SetTXAPostGenRun(self.channel, tune as c_int);
+                if two_tone {
+                    // BUG FIX: TTMag was never set here at all, so it
+                    // stayed at open()'s conservative 0.2/0.2 init value
+                    // (peak sum only 0.4, vs Tune's near-max 0.99999)
+                    // forever -- confirmed via real hardware testing:
+                    // ~0W output with Two-Tone vs ~100W with Tune at
+                    // the same TX Power, and a correspondingly tiny
+                    // measured envelope (0.0198 vs an expected several
+                    // times that). 0.45/0.45 (peak sum 0.9) mirrors
+                    // Tune's "near max but leave a little headroom"
+                    // choice, adapted for two tones summing instead of
+                    // one.
+                    wdsp::SetTXAPostGenMode(self.channel, 1);
+                    wdsp::SetTXAPostGenTTMag(self.channel, 0.45, 0.45);
+                    wdsp::SetTXAPostGenRun(self.channel, 1);
+                } else if tune {
+                    wdsp::SetTXAPostGenMode(self.channel, 0);
+                    wdsp::SetTXAPostGenToneMag(self.channel, 0.99999);
+                    wdsp::SetTXAPostGenRun(self.channel, 1);
+                } else {
+                    wdsp::SetTXAPostGenRun(self.channel, 0);
+                }
             }
-            self.last_tune = Some(tune);
+            self.last_post_gen = Some(desired);
         }
 
         if self.last_mode != Some(mode) {
@@ -710,6 +813,12 @@ impl TxProcessor {
             }
             self.last_ps_tx_delay_ns = Some(ps.tx_delay_ns);
         }
+        if self.last_ps_ptol != Some(ps.ptol) {
+            unsafe {
+                wdsp::SetPSPtol(self.channel, ps.ptol);
+            }
+            self.last_ps_ptol = Some(ps.ptol);
+        }
     }
 
     /// PureSignal: reads back live status for the UI (Settings ->
@@ -823,6 +932,16 @@ fn run(
     mic_buffer: Arc<Mutex<VecDeque<f32>>>,
     tci_tx_audio: Arc<Mutex<VecDeque<f32>>>,
     tx_iq_out: Arc<Mutex<VecDeque<f32>>>,
+    // Fed with the SAME generated TX IQ that goes out over the wire
+    // (tx_iq_out), for a dedicated TX spectrum display -- see main.rs's
+    // ConnectedState::tx_spectrum doc comment for why this exists:
+    // piHPSDR/rustyHPSDR both feed their TX spectrum from the actual
+    // generated IQ samples, not from whatever the receiver happens to
+    // pick up over the air (which depends on antenna coupling/leakage
+    // and can be weak, overloaded, or entirely absent depending on the
+    // radio's T/R relay isolation -- not a reliable "am I transmitting
+    // cleanly" signal at all).
+    tx_spectrum_iq: Arc<Mutex<VecDeque<IqSample>>>,
     mox: Arc<AtomicBool>,
     params: Arc<Mutex<TxParams>>,
     display: Arc<Mutex<TxDisplay>>,
@@ -905,6 +1024,25 @@ fn run(
     // pacing was already confirmed to spur the RF output on the
     // consumer side.
     let mut next_chunk = Instant::now();
+    // PureSignal: when MOX went active most recently -- None while
+    // idle. See below for why this matters.
+    let mut mox_active_since: Option<Instant> = None;
+    // piHPSDR's transmitter.c documents a real ordering requirement
+    // that isn't optional: "enabling should restart feedback streams
+    // first, wait ~100ms, then turn PS on" -- ROOT CAUSE FIX for
+    // "feedback level stays at 0" despite real, strong feedback signal
+    // confirmed reaching WDSP (verified via a real-hardware test: raw
+    // feedback amplitude hit 3-4 million out of a possible 8388607
+    // once transmitting). An earlier version of this loop called
+    // apply_ps_params's SetPSControl enable in the SAME chunk as
+    // set_ps_mox(true), before any real feedback data could possibly
+    // have arrived yet -- plausibly latching WDSP's internal PS state
+    // machine into a stuck state it never recovers from even once real
+    // feedback starts flowing moments later, since nothing here ever
+    // retries the enable call once already sent (apply_ps_params is
+    // edge-triggered on ps.enabled's value, not on time or on whether
+    // the previous attempt actually took).
+    const PS_ENABLE_SETTLE: Duration = Duration::from_millis(100);
 
     while !stop.load(Ordering::Relaxed) {
         if !mox.load(Ordering::Relaxed) {
@@ -922,6 +1060,7 @@ fn run(
                 ps_tx_feedback_iq.lock().unwrap().clear();
                 processor.set_ps_mox(false);
             }
+            mox_active_since = None;
             thread::sleep(Duration::from_millis(20));
             // Resync so the first chunk after PTT is produced against a
             // fresh schedule, not delayed by however long MOX was off --
@@ -930,8 +1069,15 @@ fn run(
             continue;
         }
         if puresignal_enabled {
+            // set_ps_mox(true) is what (re)starts feedback streaming --
+            // send it as soon as MOX goes active, same as before. Only
+            // apply_ps_params (which can turn PS ON) waits for the
+            // settle delay above.
             processor.set_ps_mox(true);
-            processor.apply_ps_params(&ps_params.lock().unwrap());
+            let settled_since = *mox_active_since.get_or_insert_with(Instant::now);
+            if settled_since.elapsed() >= PS_ENABLE_SETTLE {
+                processor.apply_ps_params(&ps_params.lock().unwrap());
+            }
         }
 
         {
@@ -975,7 +1121,8 @@ fn run(
         }
 
         let p = *params.lock().unwrap();
-        let (iq, exch_error) = processor.process(&chunk, p.mode, p.mic_gain, p.width_hz, p.tune);
+        let (iq, exch_error) =
+            processor.process(&chunk, p.mode, p.mic_gain, p.width_hz, p.tune, p.two_tone);
         if exch_error != 0 {
             exch_errors_this_window += 1;
         }
@@ -1009,8 +1156,24 @@ fn run(
 
             // Read back regardless of whether this chunk's feed
             // succeeded above -- reflects WDSP's own ongoing internal
-            // state, not just this one call.
+            // state, not just this one call. Settings -> PureSignal
+            // reads this live (feedback level, Correcting, measured
+            // peak TX) -- no separate console diagnostic needed on top
+            // of that UI.
             *ps_status.lock().unwrap() = processor.read_ps_status();
+        }
+
+        {
+            let mut spec = tx_spectrum_iq.lock().unwrap();
+            for pair in iq.chunks_exact(2) {
+                if spec.len() >= TX_SPECTRUM_IQ_CAPACITY {
+                    spec.pop_front();
+                }
+                spec.push_back(IqSample {
+                    i: (pair[0] * PS_IQ_NORM) as i32,
+                    q: (pair[1] * PS_IQ_NORM) as i32,
+                });
+            }
         }
 
         {
@@ -1075,6 +1238,8 @@ impl TxHandle {
         mic_buffer: Arc<Mutex<VecDeque<f32>>>,
         tci_tx_audio: Arc<Mutex<VecDeque<f32>>>,
         tx_iq_out: Arc<Mutex<VecDeque<f32>>>,
+        // See run()'s doc comment on the parameter of the same name.
+        tx_spectrum_iq: Arc<Mutex<VecDeque<IqSample>>>,
         mox: Arc<AtomicBool>,
         channel: i32,
         protocol: u8,
@@ -1098,9 +1263,9 @@ impl TxHandle {
             let stop = Arc::clone(&stop);
             thread::spawn(move || {
                 run(
-                    mic_buffer, tci_tx_audio, tx_iq_out, mox, params, display, channel, protocol,
-                    mic_rate, duc_rate, puresignal_enabled, ps_rx_feedback_iq, ps_tx_feedback_iq,
-                    ps_params, ps_status, stop,
+                    mic_buffer, tci_tx_audio, tx_iq_out, tx_spectrum_iq, mox, params, display,
+                    channel, protocol, mic_rate, duc_rate, puresignal_enabled, ps_rx_feedback_iq,
+                    ps_tx_feedback_iq, ps_params, ps_status, stop,
                 )
             })
         };
@@ -1140,6 +1305,11 @@ impl TxHandle {
         self.params.lock().unwrap().tune = tune;
     }
 
+    /// See TxParams::two_tone's doc comment.
+    pub fn set_two_tone(&self, two_tone: bool) {
+        self.params.lock().unwrap().two_tone = two_tone;
+    }
+
     /// Current PureSignal params snapshot, for Settings -> PureSignal
     /// to read on each redraw.
     pub fn ps_params(&self) -> PsParams {
@@ -1165,6 +1335,9 @@ impl TxHandle {
     }
     pub fn set_ps_tx_delay_ns(&self, tx_delay_ns: f64) {
         self.ps_params.lock().unwrap().tx_delay_ns = tx_delay_ns.max(0.0);
+    }
+    pub fn set_ps_ptol(&self, ptol: f64) {
+        self.ps_params.lock().unwrap().ptol = ptol.clamp(0.0, 1.0);
     }
 
     pub fn stop(&mut self) {
