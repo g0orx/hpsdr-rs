@@ -47,6 +47,13 @@ const P2_DDC0_IQ_PORT: u16 = 1035; // DDC1 = 1036, DDC2 = 1037, ...
 // here instead. An earlier version of this file guessed 1026 (reusing
 // the config port) for this, which was wrong -- see p2_tx_iq_loop.
 const P2_TX_IQ_PORT: u16 = 1029;
+// Destination port for streaming locally-demodulated RX audio TO the
+// radio's own local audio output -- confirmed against piHPSDR's
+// new_protocol.c/new_protocol.h (AUDIO_FROM_HOST_PORT). Named "from
+// host" from the radio's perspective (audio flowing FROM the host TO
+// the radio), the mirror image of P2_TX_IQ_PORT's own naming. See
+// p2_rx_audio_loop.
+const P2_AUDIO_PORT: u16 = 1028;
 // Incoming (radio -> host) source port for the radio's own
 // high-priority status packets -- confirmed by the user: the host is
 // expected to respond with a fresh outgoing High Priority packet (port
@@ -83,6 +90,15 @@ const TX_IQ_BUFFER_CAPACITY: usize = 100_000;
 /// own MIC_BUFFER_CAPACITY for the same reason (this is the TCI-client
 /// counterpart of that local-mic buffer).
 const TCI_TX_AUDIO_CAPACITY: usize = 24_000;
+
+/// Just an initial-capacity hint for the queue below (like the other
+/// constants here) -- the actual enforced drop-oldest bound is
+/// spectrum.rs's own AUDIO_BUFFER_CAPACITY (also 14,400, same value),
+/// since that's where samples are pushed in. Kept as its own constant
+/// rather than importing spectrum.rs's private one, matching this
+/// file's existing pattern of not sharing buffer-size constants across
+/// modules.
+const RX_AUDIO_TO_RADIO_CAPACITY: usize = 14_400;
 
 /// Confirmed against rustyHPSDR: TWO complete rotations before the
 /// Start command -- see start_protocol1's pre-config-rotation doc
@@ -310,6 +326,32 @@ pub struct RadioSession {
     /// stable across TX arm/disarm cycles and TCI server restarts,
     /// rather than being recreated each time either does.
     pub tci_tx_audio: Arc<Mutex<VecDeque<f32>>>,
+    /// Locally-demodulated audio for the MAIN receiver only (not extra
+    /// receivers -- the radio has exactly one local audio output,
+    /// matching piHPSDR's "active receiver" concept), fed directly by
+    /// spectrum.rs's analyzer thread (see SpectrumHandle::start's
+    /// `rx_audio_to_radio` parameter) whenever this session's main
+    /// SpectrumHandle was built with it wired up. Consumed by P1's
+    /// sender_loop (interleaved into the same per-sample slot
+    /// fill_tx_payload uses while transmitting -- see
+    /// fill_rx_audio_payload) and P2's p2_rx_audio_loop (a dedicated
+    /// UDP stream to P2_AUDIO_PORT, confirmed against piHPSDR's
+    /// new_protocol.c). Always filled regardless of
+    /// `send_rx_audio_to_radio` below (the queue is capacity-bounded,
+    /// drop-oldest, so leaving it unread when the feature is off just
+    /// means it sits idle) -- only whether it's actually SENT is gated.
+    pub rx_audio_to_radio: Arc<Mutex<VecDeque<f32>>>,
+    /// Live toggle for streaming rx_audio_to_radio back to the radio's
+    /// own local audio output (Settings -> RX -- "Send RX audio to
+    /// radio"). Default off: most setups have no use for a radio-side
+    /// headphone/speaker jack and this adds continuous extra traffic.
+    /// No effect on HermesLite/HermesLite2 over Protocol 1 regardless
+    /// of this setting -- see p1_build_packet's send_rx_audio note
+    /// (that board's firmware repurposes the same wire bytes for
+    /// extended-address writes, confirmed via piHPSDR's own explicit
+    /// precaution). Protocol 2 has no such restriction (separate UDP
+    /// port, not sharing bytes with anything else).
+    pub send_rx_audio_to_radio: Arc<AtomicBool>,
     /// Desired TX output power in watts, converted to each protocol's
     /// actual drive byte via drive_byte_for_watts -- see that
     /// function's doc comment. Confirmed by the user to belong at byte
@@ -352,6 +394,10 @@ pub struct RadioSession {
     /// stream; P2's isn't, hence the separate thread -- see
     /// p2_tx_iq_loop's doc comment).
     tx_iq_thread: Option<JoinHandle<()>>,
+    /// P2 only -- p2_rx_audio_loop's handle. Always None on P1, which
+    /// streams RX audio through the existing sender_loop instead (same
+    /// reasoning as tx_iq_thread being P2-only).
+    rx_audio_thread: Option<JoinHandle<()>>,
     protocol: u8,
     radio_ip: std::net::IpAddr,
 }
@@ -383,16 +429,20 @@ impl RadioSession {
         let tx_reverse_power = Arc::new(AtomicU32::new(0));
         let ps_rx_feedback_iq = Arc::new(Mutex::new(VecDeque::with_capacity(PS_FEEDBACK_BUFFER_CAPACITY)));
         let ps_tx_feedback_iq = Arc::new(Mutex::new(VecDeque::with_capacity(PS_FEEDBACK_BUFFER_CAPACITY)));
+        let rx_audio_to_radio = Arc::new(Mutex::new(VecDeque::with_capacity(RX_AUDIO_TO_RADIO_CAPACITY)));
+        let send_rx_audio_to_radio = Arc::new(AtomicBool::new(false));
         match device.protocol {
             1 => start_protocol1(
                 device, settings, frequency_hz, sample_rate, adc, antenna, rx_attenuation,
                 ps_tx_attenuation, mox, tx_iq, tci_tx_audio, tx_power_watts, pa_gain_db,
                 tx_forward_power, tx_reverse_power, ps_rx_feedback_iq, ps_tx_feedback_iq,
+                rx_audio_to_radio, send_rx_audio_to_radio,
             ),
             2 => start_protocol2(
                 device, settings, frequency_hz, sample_rate, adc, antenna, rx_attenuation,
                 ps_tx_attenuation, mox, tx_iq, tci_tx_audio, tx_power_watts, pa_gain_db,
                 tx_forward_power, tx_reverse_power, ps_rx_feedback_iq, ps_tx_feedback_iq,
+                rx_audio_to_radio, send_rx_audio_to_radio,
             ),
             p => Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -471,6 +521,9 @@ impl RadioSession {
         if let Some(t) = self.tx_iq_thread.take() {
             let _ = t.join();
         }
+        if let Some(t) = self.rx_audio_thread.take() {
+            let _ = t.join();
+        }
         self.send_stop_command();
         if let Some(t) = self.receiver_thread.take() {
             let _ = t.join();
@@ -528,6 +581,8 @@ fn start_protocol1(
     tx_reverse_power: Arc<AtomicU32>,
     ps_rx_feedback_iq: Arc<Mutex<VecDeque<IqSample>>>,
     ps_tx_feedback_iq: Arc<Mutex<VecDeque<IqSample>>>,
+    rx_audio_to_radio: Arc<Mutex<VecDeque<f32>>>,
+    send_rx_audio_to_radio: Arc<AtomicBool>,
 ) -> io::Result<RadioSession> {
     let socket = UdpSocket::bind(("0.0.0.0", 0))?;
     socket.set_read_timeout(Some(Duration::from_millis(500)))?;
@@ -630,6 +685,8 @@ fn start_protocol1(
     let sender_ps_tx_attenuation = Arc::clone(&ps_tx_attenuation);
     let sender_is_hermes_lite = matches!(device.board, Boards::HermesLite | Boards::HermesLite2);
     let sender_num_adcs = device.adcs;
+    let sender_rx_audio_to_radio = Arc::clone(&rx_audio_to_radio);
+    let sender_send_rx_audio_to_radio = Arc::clone(&send_rx_audio_to_radio);
     let sender_thread = thread::spawn(move || {
         sender_loop(
             sender_socket,
@@ -647,6 +704,8 @@ fn start_protocol1(
             sender_is_hermes_lite,
             sender_num_adcs,
             ps_wire_total,
+            sender_rx_audio_to_radio,
+            sender_send_rx_audio_to_radio,
             sender_stop,
         );
     });
@@ -693,6 +752,8 @@ fn start_protocol1(
         mox,
         tx_iq,
         tci_tx_audio,
+        rx_audio_to_radio,
+        send_rx_audio_to_radio,
         tx_power_watts,
         pa_gain_db,
         tx_forward_power,
@@ -701,6 +762,7 @@ fn start_protocol1(
         sender_thread: Some(sender_thread),
         receiver_thread: Some(receiver_thread),
         tx_iq_thread: None, // P1 streams TX audio through sender_thread itself
+        rx_audio_thread: None, // P1 streams RX audio through sender_thread itself
         protocol: 1,
         radio_ip: device.address.ip(),
     })
@@ -774,6 +836,73 @@ fn fill_tx_payload(frame: &mut [u8; USB_FRAME_SIZE], tx_iq: &Mutex<VecDeque<f32>
         frame[b + 5] = i_sample as u8;
         frame[b + 6] = (q_sample >> 8) as u8;
         frame[b + 7] = q_sample as u8;
+        b += 8;
+    }
+}
+
+/// Zero-order-hold pacing state for fill_rx_audio_payload -- see that
+/// function's doc comment for why this is needed at all: the 8-byte
+/// slot cadence sender_loop sends at tracks the RX ADC sample rate (and
+/// receiver count), NOT the fixed 48kHz spectrum.rs's demod audio is
+/// actually produced at. Popping a "new" queued sample on every single
+/// slot regardless of that mismatch drains rx_audio_to_radio far faster
+/// than it's filled whenever the slot rate exceeds 48kHz (the common
+/// case -- anything other than exactly 48kHz/1 receiver), so most slots
+/// fall back to silence -- confirmed as the cause of a real report of
+/// scratchy/staticky audio at the radio's own local output, while the
+/// local PC speaker path (fed and drained at the same true 48kHz rate
+/// throughout) sounded fine. Owned by sender_loop for the whole
+/// session so the pacing ratio can change live (sample rate change,
+/// Add Receiver) without more than the one glitch the change itself
+/// would cause anyway.
+struct RxAudioPacer {
+    accum: f64,
+    held: i16,
+}
+
+impl RxAudioPacer {
+    fn new() -> Self {
+        Self { accum: 0.0, held: 0 }
+    }
+}
+
+/// Fills the same 8-byte-per-sample slot fill_tx_payload uses (see its
+/// doc comment for the reference's own naming: "dummy RX audio" while
+/// transmitting), but for the receive side -- confirmed against
+/// piHPSDR's old_protocol.c (old_protocol_audio_samples): mono
+/// demodulated audio (L=R) in the first 4 bytes, big-endian 16-bit,
+/// scaled by 32767, with the trailing 4 IQ bytes left zero (no IQ goes
+/// out in this slot while not transmitting). Only ever called while
+/// !mox_on -- see p1_build_packet's call site.
+///
+/// `slots_per_sample` (>= 1.0, see RxAudioPacer's doc comment): a new
+/// sample is only actually popped from the queue once per this many
+/// slots; slots in between repeat `pacer.held` (zero-order hold) rather
+/// than draining the queue empty and falling back to silence.
+fn fill_rx_audio_payload(
+    frame: &mut [u8; USB_FRAME_SIZE],
+    rx_audio: &Mutex<VecDeque<f32>>,
+    pacer: &mut RxAudioPacer,
+    slots_per_sample: f64,
+) {
+    let mut buf = rx_audio.lock().unwrap();
+    let mut b = HEADER_SIZE;
+    while b + 8 <= USB_FRAME_SIZE {
+        pacer.accum += 1.0;
+        if pacer.accum >= slots_per_sample {
+            pacer.accum -= slots_per_sample;
+            let sample = buf.pop_front().unwrap_or(0.0);
+            pacer.held = (sample.clamp(-1.0, 1.0) * 32767.0) as i16;
+        }
+        let s = pacer.held;
+        frame[b] = (s >> 8) as u8;
+        frame[b + 1] = s as u8;
+        frame[b + 2] = (s >> 8) as u8;
+        frame[b + 3] = s as u8;
+        frame[b + 4] = 0;
+        frame[b + 5] = 0;
+        frame[b + 6] = 0;
+        frame[b + 7] = 0;
         b += 8;
     }
 }
@@ -853,6 +982,7 @@ fn p1_send_preconfig_and_start(
     let mut pre_ozy_command: u8 = 1;
     let mut pre_current_receiver: u8 = 0;
     let mut rotations = 0;
+    let mut dummy_rx_audio_pacer = RxAudioPacer::new(); // send_rx_audio is false below -- never actually read
     while rotations < PRE_CONFIG_ROTATIONS {
         let packet = p1_build_packet(
             pre_seq,
@@ -872,6 +1002,10 @@ fn p1_send_preconfig_and_start(
             &[], // no extra receivers active yet this early -- falls back to the main frequency
             tx_iq,
             ps_wire_total.is_some(),
+            tx_iq, // send_rx_audio is false below, so this is never actually read -- reusing tx_iq's Mutex just to satisfy the type, not a real audio source
+            false, // send_rx_audio: never during startup config, nothing keyed yet
+            &mut dummy_rx_audio_pacer,
+            1.0,
         );
         socket.send(&packet)?;
         pre_seq = pre_seq.wrapping_add(1);
@@ -922,6 +1056,13 @@ fn p1_build_packet(
     // PureSignal: command 10 (0x24)'s C2 bit 0x40 -- see that command's
     // own doc comment below for what it does and why it matters.
     puresignal_enabled: bool,
+    rx_audio: &Mutex<VecDeque<f32>>,
+    // Already resolved by the caller (not mox_on, not is_hermes_lite,
+    // and the live setting itself) -- see
+    // RadioSession::send_rx_audio_to_radio's doc comment.
+    send_rx_audio: bool,
+    rx_audio_pacer: &mut RxAudioPacer,
+    rx_audio_slots_per_sample: f64,
 ) -> [u8; PACKET_SIZE] {
     // MOX/PTT bit: inferred to be C0's bit 0 on both frames, based
     // on every register value used elsewhere in this file (0x00,
@@ -1217,6 +1358,18 @@ fn p1_build_packet(
     if mox_on {
         fill_tx_payload(&mut frame0, tx_iq);
         fill_tx_payload(&mut frame1, tx_iq);
+    } else if send_rx_audio {
+        // Same 8-byte-per-sample slot fill_tx_payload uses while
+        // transmitting, but for the receive side: local audio in
+        // bytes 0..4 (see fill_rx_audio_payload), no IQ in bytes
+        // 4..8 -- confirmed against piHPSDR's old_protocol.c
+        // (old_protocol_audio_samples, sent continuously whenever
+        // NOT transmitting). Paced via rx_audio_pacer -- see its doc
+        // comment for why a straight one-sample-per-slot pop would
+        // starve/glitch at any ADC rate other than exactly 48kHz with
+        // 1 receiver.
+        fill_rx_audio_payload(&mut frame0, rx_audio, rx_audio_pacer, rx_audio_slots_per_sample);
+        fill_rx_audio_payload(&mut frame1, rx_audio, rx_audio_pacer, rx_audio_slots_per_sample);
     }
 
     packet[HEADER_SIZE..HEADER_SIZE + USB_FRAME_SIZE].copy_from_slice(&frame0);
@@ -1246,11 +1399,14 @@ fn sender_loop(
     // on; the wire-level total must stay fixed so the feedback indices
     // always land at the same position regardless of that).
     ps_wire_total: Option<u8>,
+    rx_audio_to_radio: Arc<Mutex<VecDeque<f32>>>,
+    send_rx_audio_to_radio: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
 ) {
     let mut seq: u32 = 0;
     let mut ozy_command: u8 = 1;
     let mut current_receiver: u8 = 0;
+    let mut rx_audio_pacer = RxAudioPacer::new();
 
     // Absolute-deadline pacing, not `thread::sleep(interval)` computed
     // fresh each iteration (which this loop used until now) -- same
@@ -1311,6 +1467,20 @@ fn sender_loop(
         let samples_per_packet = samples_per_frame * 2; // two USB frames per packet
         let interval = Duration::from_secs_f64(samples_per_packet as f64 / current_rate as f64);
         let mox_on = mox.load(Ordering::Relaxed);
+        // See RadioSession::send_rx_audio_to_radio's doc comment --
+        // never sent while transmitting (fill_tx_payload owns this
+        // slot then) or on HermesLite/HermesLite2 (firmware repurposes
+        // these bytes for extended-address writes there).
+        let send_rx_audio = !mox_on && !is_hermes_lite && send_rx_audio_to_radio.load(Ordering::Relaxed);
+        // See RxAudioPacer's doc comment -- the true per-slot rate this
+        // packet cadence works out to (126 fixed slots/packet, see
+        // fill_rx_audio_payload's HEADER_SIZE-based stride), versus the
+        // fixed 48kHz rate rx_audio_to_radio is actually filled at.
+        // Always >= 1.0 in any realistic configuration (current_rate is
+        // always >= 48000), but clamped defensively regardless.
+        const SLOTS_PER_PACKET: f64 = 126.0;
+        let rx_audio_slots_per_sample =
+            (SLOTS_PER_PACKET * current_rate as f64 / (samples_per_packet as f64 * 48_000.0)).max(1.0);
 
         let packet = p1_build_packet(
             seq,
@@ -1330,6 +1500,10 @@ fn sender_loop(
             &extra_frequencies_hz,
             &tx_iq,
             ps_wire_total.is_some(),
+            &rx_audio_to_radio,
+            send_rx_audio,
+            &mut rx_audio_pacer,
+            rx_audio_slots_per_sample,
         );
 
         if socket.send(&packet).is_err() {
@@ -1346,6 +1520,131 @@ fn sender_loop(
             // Fell behind real time -- resync to now rather than
             // bursting several packets back-to-back to "catch up",
             // same reasoning as p2_tx_iq_loop's own fallback.
+            next_send = now;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------
+// RX audio -> radio (P2). Separate UDP stream to P2_AUDIO_PORT, NOT
+// part of the DDC-specific/High-Priority C&C cadence -- confirmed
+// against piHPSDR's new_protocol.c (new_protocol_audio_samples/
+// AUDIO_FROM_HOST_PORT): a 4-byte sequence number followed by 64
+// interleaved 16-bit L/R samples (4 + 64*4 = 260 bytes), sent
+// continuously at the audio production rate whenever not transmitting.
+// Mono here (spectrum.rs's demod output), so L=R same as P1's own
+// fill_rx_audio_payload.
+// ---------------------------------------------------------------------
+
+const P2_AUDIO_SAMPLES_PER_FRAME: usize = 64;
+const P2_AUDIO_PACKET_SIZE: usize = 4 + P2_AUDIO_SAMPLES_PER_FRAME * 4;
+const P2_AUDIO_RATE_HZ: f64 = 48_000.0; // matches spectrum.rs's OUTPUT_RATE
+
+/// Cushion p2_rx_audio_loop waits for rx_audio_to_radio to accumulate
+/// before it starts actually draining it, each time streaming (re)starts
+/// -- same "absorb scheduling jitter with a buffer instead of relying on
+/// razor-precise sub-millisecond thread::sleep pacing" reasoning as
+/// p2_tx_iq_loop's own TX_PREBUFFER_PAIRS (see its doc comment). Without
+/// this, any momentary scheduling delay on this ~1.33ms-interval loop
+/// (contending with several other real-time-ish threads in this
+/// process) immediately either starves the queue into silence or -- once
+/// it falls behind -- lets the writer's own drop-oldest overflow handling
+/// discard chunks of real audio, both of which are exactly what a real
+/// report of scratchy/staticky RX audio at the radio's local output
+/// sounds like. 50ms (2400 samples @ 48kHz) is a small, inaudible extra
+/// latency for a monitor-audio feature (unlike TX IQ, this isn't
+/// real-time-critical the way keying a transmitter is).
+const AUDIO_PREBUFFER_SAMPLES: usize = 2_400;
+
+fn p2_audio_packet(seq: u32, rx_audio: &Mutex<VecDeque<f32>>) -> [u8; P2_AUDIO_PACKET_SIZE] {
+    let mut p = [0u8; P2_AUDIO_PACKET_SIZE];
+    p[0..4].copy_from_slice(&seq.to_be_bytes());
+
+    let mut buf = rx_audio.lock().unwrap();
+    let mut b = 4;
+    for _ in 0..P2_AUDIO_SAMPLES_PER_FRAME {
+        let sample = buf.pop_front().unwrap_or(0.0);
+        let s = (sample.clamp(-1.0, 1.0) * 32767.0) as i16;
+        p[b] = (s >> 8) as u8;
+        p[b + 1] = s as u8;
+        p[b + 2] = (s >> 8) as u8;
+        p[b + 3] = s as u8;
+        b += 4;
+    }
+    p
+}
+
+/// Streams locally-demodulated RX audio to the radio's own local audio
+/// output while (and only while) MOX is clear and
+/// send_rx_audio_to_radio is on -- see RadioSession::
+/// send_rx_audio_to_radio's doc comment. Same absolute-deadline pacing
+/// approach as p2_tx_iq_loop, for the same reason (avoid jitter baked
+/// into the send schedule); no prebuffer/warm-up needed here the way
+/// p2_tx_iq_loop has one, since this isn't a real-time-sensitive RF
+/// signal and a brief startup gap of silence is harmless.
+fn p2_rx_audio_loop(
+    socket: UdpSocket,
+    radio_ip: std::net::IpAddr,
+    mox: Arc<AtomicBool>,
+    send_rx_audio_to_radio: Arc<AtomicBool>,
+    rx_audio_to_radio: Arc<Mutex<VecDeque<f32>>>,
+    stop: Arc<AtomicBool>,
+) {
+    let mut seq: u32 = 0;
+    let interval = Duration::from_secs_f64(P2_AUDIO_SAMPLES_PER_FRAME as f64 / P2_AUDIO_RATE_HZ);
+    let mut next_send = Instant::now();
+    // See AUDIO_PREBUFFER_SAMPLES's doc comment. Reset false whenever
+    // streaming (re)starts (mox clears or the setting is turned back on)
+    // so each fresh start gets its own cushion rather than trusting
+    // whatever's left in the queue from before.
+    let mut warmed_up = false;
+
+    while !stop.load(Ordering::Relaxed) {
+        if mox.load(Ordering::Relaxed) || !send_rx_audio_to_radio.load(Ordering::Relaxed) {
+            thread::sleep(Duration::from_millis(20));
+            next_send = Instant::now();
+            warmed_up = false;
+            continue;
+        }
+
+        if !warmed_up {
+            if rx_audio_to_radio.lock().unwrap().len() >= AUDIO_PREBUFFER_SAMPLES {
+                warmed_up = true;
+            } else {
+                // Still building the cushion -- send silence without
+                // touching the queue, so it actually accumulates instead
+                // of being drained back down as fast as it fills (same
+                // approach as p2_tx_iq_loop's own warm-up).
+                let mut p = [0u8; P2_AUDIO_PACKET_SIZE];
+                p[0..4].copy_from_slice(&seq.to_be_bytes());
+                if let Err(e) = socket.send_to(&p, (radio_ip, P2_AUDIO_PORT)) {
+                    eprintln!("radio: RX audio socket.send_to failed, stopping RX audio streaming: {e}");
+                    return;
+                }
+                seq = seq.wrapping_add(1);
+                next_send += interval;
+                let now = Instant::now();
+                if next_send > now {
+                    thread::sleep(next_send - now);
+                } else {
+                    next_send = now;
+                }
+                continue;
+            }
+        }
+
+        let packet = p2_audio_packet(seq, &rx_audio_to_radio);
+        if let Err(e) = socket.send_to(&packet, (radio_ip, P2_AUDIO_PORT)) {
+            eprintln!("radio: RX audio socket.send_to failed, stopping RX audio streaming: {e}");
+            return; // socket closed or radio gone; stop this thread
+        }
+        seq = seq.wrapping_add(1);
+
+        next_send += interval;
+        let now = Instant::now();
+        if next_send > now {
+            thread::sleep(next_send - now);
+        } else {
             next_send = now;
         }
     }
@@ -1636,6 +1935,8 @@ fn start_protocol2(
     tx_reverse_power: Arc<AtomicU32>,
     ps_rx_feedback_iq: Arc<Mutex<VecDeque<IqSample>>>,
     ps_tx_feedback_iq: Arc<Mutex<VecDeque<IqSample>>>,
+    rx_audio_to_radio: Arc<Mutex<VecDeque<f32>>>,
+    send_rx_audio_to_radio: Arc<AtomicBool>,
 ) -> io::Result<RadioSession> {
     // PureSignal (P2): see ps_feedback_config's doc comment. DDC0/DDC1
     // are reserved ahead of real receivers, which start at DDC2 instead
@@ -1763,6 +2064,15 @@ fn start_protocol2(
         p2_tx_iq_loop(tx_iq_socket, radio_ip, tx_iq_mox, tx_iq_buffer, tx_iq_stop);
     });
 
+    let rx_audio_socket = socket.try_clone()?;
+    let rx_audio_stop = Arc::clone(&stop_flag);
+    let rx_audio_mox = Arc::clone(&mox);
+    let rx_audio_send_flag = Arc::clone(&send_rx_audio_to_radio);
+    let rx_audio_buffer = Arc::clone(&rx_audio_to_radio);
+    let rx_audio_thread = thread::spawn(move || {
+        p2_rx_audio_loop(rx_audio_socket, radio_ip, rx_audio_mox, rx_audio_send_flag, rx_audio_buffer, rx_audio_stop);
+    });
+
     let receiver_socket = socket.try_clone()?;
     let receiver_stop = Arc::clone(&stop_flag);
     let receiver_buffers = iq_buffers.clone();
@@ -1804,6 +2114,8 @@ fn start_protocol2(
         mox,
         tx_iq,
         tci_tx_audio,
+        rx_audio_to_radio,
+        send_rx_audio_to_radio,
         tx_power_watts,
         pa_gain_db,
         tx_forward_power,
@@ -1812,6 +2124,7 @@ fn start_protocol2(
         sender_thread: Some(sender_thread),
         receiver_thread: Some(receiver_thread),
         tx_iq_thread: Some(tx_iq_thread),
+        rx_audio_thread: Some(rx_audio_thread),
         protocol: 2,
         radio_ip,
     })

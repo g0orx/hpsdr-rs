@@ -354,6 +354,32 @@ impl Default for DemodParams {
 // correcting. A small cap bounds worst-case audio delay directly.
 const AUDIO_BUFFER_CAPACITY: usize = 14_400;
 
+/// Two cascaded single-pole lowpass stages (~12dB/octave) -- see run()'s
+/// doc comment on radio_audio_lpf for why this exists at all and how the
+/// 4kHz cutoff was chosen/verified. `feed` is called once per audio
+/// sample; state persists across calls (owned by run()'s loop for the
+/// life of the SpectrumHandle).
+struct RxAudioLowpass {
+    alpha: f32,
+    y1: f32,
+    y2: f32,
+}
+
+impl RxAudioLowpass {
+    const CUTOFF_HZ: f32 = 4_000.0;
+
+    fn new(sample_rate_hz: f32) -> Self {
+        let alpha = 1.0 - (-2.0 * std::f32::consts::PI * Self::CUTOFF_HZ / sample_rate_hz).exp();
+        Self { alpha, y1: 0.0, y2: 0.0 }
+    }
+
+    fn feed(&mut self, x: f32) -> f32 {
+        self.y1 += self.alpha * (x - self.y1);
+        self.y2 += self.alpha * (self.y1 - self.y2);
+        self.y2
+    }
+}
+
 // Same "small, bounded, drop-oldest" reasoning as AUDIO_BUFFER_CAPACITY
 // above -- a TCI client that isn't draining fast enough (or isn't
 // streaming at all) shouldn't cause unbounded growth here. Sized more
@@ -462,6 +488,29 @@ impl SpectrumAnalyzer {
             // resampling is needed anyway) came out distorted --
             // consistent with the resampler running uninitialized.
             wdsp::SetInputSamplerate(channel, sample_rate);
+
+            // ROOT CAUSE FIX: RXA's PatchPanel output stage defaults to
+            // "binaural" mode (confirmed via the WDSP Guide: fexchange0's
+            // "out" buffer is documented as interleaved I/Q even for
+            // audio, and SetRXAPanelCopy/SetRXAPanelBinaural's own
+            // documented default is copy=0/bin=1, i.e. binaural -- I and
+            // Q are genuinely DIFFERENT audio content by design, an
+            // intentional SDR "phasing" stereo-listening effect, not a
+            // duplicated mono signal). demod()'s output was previously
+            // read assuming I and Q were interchangeable/duplicate mono
+            // -- confirmed via a real packet capture of the RX-audio-to-
+            // radio feature that they are not (a strong near-Nyquist
+            // artifact from treating two genuinely different interleaved
+            // channels as one flat stream), and averaging them (a first
+            // attempted fix) also sounded wrong, since averaging two
+            // signals with a real phase/content relationship isn't the
+            // same as them being identical. This project has no UI for
+            // binaural listening, and every consumer (local playback,
+            // TCI, radio-audio) expects a single real mono channel --
+            // forcing monaural mode at the source (copy I to Q) is the
+            // correct fix, matching demod()'s own doc comment on why it
+            // can safely read either interleaved slot once this is set.
+            wdsp::SetRXAPanelBinaural(channel, 0);
 
             // Creates the noise blanker DSP objects themselves -- must
             // happen before the Set*Samplerate calls below, since those
@@ -859,7 +908,19 @@ impl SpectrumAnalyzer {
             self.last_fexchange_error = Some(now_erroring);
         }
 
-        self.demod_audio_scratch.iter().map(|&v| v as f32).collect()
+        // fexchange0 writes interleaved I/Q (WDSP's generic complex
+        // buffer convention, per the WDSP Guide -- used even for a real
+        // audio signal, not a true I-Q signal) into demod_audio_scratch,
+        // confirmed by its own allocation above (`output_samples * 2`).
+        // Safe to take just the first (I) element of each pair and
+        // discard the second (Q) here BECAUSE `open()` above forces
+        // RXA's PatchPanel into monaural mode (SetRXAPanelBinaural(ch,
+        // 0)) -- see that call's doc comment for why this project reads
+        // it this way instead of the "binaural"/stereo interpretation
+        // WDSP defaults to (which produced a real, measured near-Nyquist
+        // artifact when the two channels were incorrectly treated as
+        // interchangeable/duplicate before this fix).
+        self.demod_audio_scratch.iter().step_by(2).map(|&v| v as f32).collect()
     }
 
     /// Reads the RXA S-meter (averaged). Must be called from the same
@@ -889,10 +950,28 @@ fn run(
     audio_out: Arc<Mutex<VecDeque<f32>>>,
     tci_audio_out: Arc<Mutex<VecDeque<f32>>>,
     iq_out: Arc<Mutex<VecDeque<(f32, f32)>>>,
+    rx_audio_to_radio: Option<Arc<Mutex<VecDeque<f32>>>>,
     stop: Arc<AtomicBool>,
 ) {
     let mut analyzer = SpectrumAnalyzer::open(channel, sample_rate);
     let mut chunk = Vec::with_capacity(BUFFER_SIZE);
+    // Anti-aliasing lowpass for rx_audio_to_radio only -- confirmed via a
+    // real packet capture (radio.rs's RX-audio-to-radio feature) that
+    // WDSP's raw 48kHz RXA output carries a large, persistent near-
+    // Nyquist component (~22-23kHz, comparable in amplitude to the real
+    // demodulated tone itself) that's audible as static/scratchiness --
+    // and, riding right next to a narrow tone like FT8's, throws off its
+    // perceived pitch too. The local AudioOutput/cpal path and TCI don't
+    // exhibit this audibly, almost certainly because the OS audio stack's
+    // own sample-rate-conversion to the sound card's native rate applies
+    // a proper reconstruction filter along the way; the radio's own local
+    // audio DAC, fed these raw samples directly over the network with no
+    // such filtering, has nothing to remove it. Two cascaded single-pole
+    // stages (RxAudioLowpass::feed, ~12dB/octave) at a 4kHz cutoff --
+    // generous headroom above any voice/digital-mode passband, verified
+    // against the actual captured samples to fully remove the ~22-23kHz
+    // component while leaving a real ~1.3kHz tone untouched.
+    let mut radio_audio_lpf = RxAudioLowpass::new(OUTPUT_RATE as f32);
 
     while !stop.load(Ordering::Relaxed) {
         chunk.clear();
@@ -953,6 +1032,12 @@ fn run(
             // its own copy rather than a second reader of that same
             // queue (which would steal samples from local playback).
             let mut tci_out = tci_audio_out.lock().unwrap();
+            // Third dedicated tap, main receiver only (see
+            // RadioSession::rx_audio_to_radio's doc comment) -- radio.rs
+            // streams this back to the radio's own local audio output
+            // when send_rx_audio_to_radio is on. Same "own copy, not a
+            // second reader" reasoning as tci_out.
+            let mut radio_out = rx_audio_to_radio.as_ref().map(|q| q.lock().unwrap());
             for sample in audio {
                 let sample = (sample * params.gain).clamp(-1.0, 1.0);
                 if out.len() >= AUDIO_BUFFER_CAPACITY {
@@ -963,6 +1048,13 @@ fn run(
                     tci_out.pop_front();
                 }
                 tci_out.push_back(sample);
+                if let Some(radio_out) = radio_out.as_mut() {
+                    let filtered = radio_audio_lpf.feed(sample);
+                    if radio_out.len() >= AUDIO_BUFFER_CAPACITY {
+                        radio_out.pop_front();
+                    }
+                    radio_out.push_back(filtered);
+                }
             }
         }
     }
@@ -988,7 +1080,16 @@ pub struct SpectrumHandle {
 }
 
 impl SpectrumHandle {
-    pub fn start(channel: i32, iq_buffer: Arc<Mutex<VecDeque<IqSample>>>, sample_rate: i32) -> Self {
+    /// `rx_audio_to_radio`: main receiver only -- pass `None` for extra
+    /// receivers and the TX spectrum tap (see RadioSession::
+    /// rx_audio_to_radio's doc comment for why only the main receiver
+    /// feeds this).
+    pub fn start(
+        channel: i32,
+        iq_buffer: Arc<Mutex<VecDeque<IqSample>>>,
+        sample_rate: i32,
+        rx_audio_to_radio: Option<Arc<Mutex<VecDeque<f32>>>>,
+    ) -> Self {
         let display = Arc::new(Mutex::new(SpectrumDisplay::default()));
         let demod_params = Arc::new(Mutex::new(DemodParams::default()));
         let audio_out = Arc::new(Mutex::new(VecDeque::with_capacity(AUDIO_BUFFER_CAPACITY)));
@@ -1012,6 +1113,7 @@ impl SpectrumHandle {
                     audio_out,
                     tci_audio_out,
                     iq_out,
+                    rx_audio_to_radio,
                     stop,
                 )
             })

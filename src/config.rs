@@ -156,6 +156,11 @@ pub struct Config {
     /// WDSP's own reference default (0.8).
     #[serde(default)]
     pub ps_ptol: Option<f64>,
+    /// See radio::RadioSession::send_rx_audio_to_radio's doc comment
+    /// (Settings -> RX). Missing/never set falls back to off, same as
+    /// the live default.
+    #[serde(default)]
+    pub send_rx_audio_to_radio: Option<bool>,
 }
 
 fn default_nb_threshold() -> f64 {

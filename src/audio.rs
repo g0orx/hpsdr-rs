@@ -60,10 +60,25 @@ impl AudioOutput {
         let stream = device
             .build_output_stream(
                 &config,
+                // BUG FIX: `data` is cpal's interleaved STEREO buffer
+                // (OUTPUT_CHANNELS=2), but `buffer` (audio_out) is MONO
+                // content at 48kHz. This used to pop a fresh value from
+                // the mono queue for every interleaved slot (both L and
+                // R independently) instead of once per frame -- draining
+                // the queue at 2x its true production rate, playing
+                // local audio at roughly double speed/pitch. Confirmed
+                // via a real report: WSJT-X (fed from this output via a
+                // loopback device) showed known signals at the wrong
+                // audio frequency, consistent with 2x speed. Each mono
+                // sample must be duplicated across the frame's channels,
+                // not treated as filling one channel slot at a time.
                 move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
                     let mut buf = buffer.lock().unwrap();
-                    for sample in data.iter_mut() {
-                        *sample = buf.pop_front().unwrap_or(0.0); // silence on underrun
+                    for frame in data.chunks_mut(OUTPUT_CHANNELS as usize) {
+                        let sample = buf.pop_front().unwrap_or(0.0); // silence on underrun
+                        for channel in frame.iter_mut() {
+                            *channel = sample;
+                        }
                     }
                 },
                 move |err| {

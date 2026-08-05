@@ -445,10 +445,15 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
             session
                 .tx_power_watts
                 .store(cfg.tx_power_watts.unwrap_or(2), Ordering::Relaxed);
+            session.send_rx_audio_to_radio.store(
+                cfg.send_rx_audio_to_radio.unwrap_or(false),
+                Ordering::Relaxed,
+            );
             let spectrum = SpectrumHandle::start(
                 0,
                 Arc::clone(&session.iq_buffers[0]),
                 settings.sample_rate as i32,
+                Some(Arc::clone(&session.rx_audio_to_radio)),
             );
             let audio_output =
                 match AudioOutput::start(Arc::clone(&spectrum.audio_out)) {
@@ -610,6 +615,7 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                 session.iq_buffers.len() as i32 + 1,
                 Arc::clone(&tx_spectrum_iq),
                 duc_rate,
+                None,
             );
             let mic_buffer = Arc::new(Mutex::new(VecDeque::new()));
             let (tx_enabled, mic_input, tx_handle) = match MicInput::start(Arc::clone(&mic_buffer)) {
@@ -2236,6 +2242,41 @@ impl eframe::App for HpsdrApp {
                                         ui.separator();
                                     }
 
+                                    // Streams the main receiver's demodulated audio back to the
+                                    // radio's own local audio output (a headphone/speaker jack
+                                    // driven by the radio's own DAC, independent of this PC's
+                                    // sound card) -- see radio::RadioSession::
+                                    // send_rx_audio_to_radio's doc comment. Off by default:
+                                    // most setups have no local audio output in use, and this
+                                    // adds continuous extra network/USB traffic for no benefit
+                                    // otherwise.
+                                    {
+                                        let mut send_rx_audio = connected
+                                            .session
+                                            .send_rx_audio_to_radio
+                                            .load(Ordering::Relaxed);
+                                        if ui.checkbox(&mut send_rx_audio, "Send RX audio to radio").changed() {
+                                            connected
+                                                .session
+                                                .send_rx_audio_to_radio
+                                                .store(send_rx_audio, Ordering::Relaxed);
+                                            settings_changed = true;
+                                        }
+                                        if send_rx_audio
+                                            && connected.device.protocol == 1
+                                            && matches!(
+                                                connected.device.board,
+                                                Boards::HermesLite | Boards::HermesLite2
+                                            )
+                                        {
+                                            ui.weak(
+                                                "No effect on this board over Protocol 1 -- its \
+                                                 firmware reuses this slot for something else.",
+                                            );
+                                        }
+                                        ui.separator();
+                                    }
+
                                     ui.horizontal_wrapped(|ui| {
                                         let mut attack = agc_params.agc_attack_ms;
                                         ui.label("Attack:");
@@ -2586,6 +2627,7 @@ impl eframe::App for HpsdrApp {
                                                 connected.session.iq_buffers.len() as i32 + 1,
                                                 Arc::clone(&tx_spectrum_iq),
                                                 duc_rate,
+                                                None,
                                             );
                                             let mic_buffer = Arc::new(Mutex::new(VecDeque::new()));
                                             match MicInput::start(Arc::clone(&mic_buffer)) {
@@ -3010,6 +3052,12 @@ impl eframe::App for HpsdrApp {
                         ps_loop_delay: Some(connected.ps_loop_delay),
                         ps_tx_delay_ns: Some(connected.ps_tx_delay_ns),
                         ps_ptol: Some(connected.ps_ptol),
+                        send_rx_audio_to_radio: Some(
+                            connected
+                                .session
+                                .send_rx_audio_to_radio
+                                .load(std::sync::atomic::Ordering::Relaxed),
+                        ),
                     }
                     .save(connected.device.mac);
                 }
@@ -4217,7 +4265,7 @@ fn spawn_extra_receiver(
     let rate_val = rate_arc.load(Ordering::Relaxed);
 
     let iq_buffer = Arc::clone(&session.iq_buffers[idx]);
-    let spectrum = SpectrumHandle::start(idx as i32, Arc::clone(&iq_buffer), rate_val as i32);
+    let spectrum = SpectrumHandle::start(idx as i32, Arc::clone(&iq_buffer), rate_val as i32, None);
 
     if let Some(s) = saved {
         spectrum.set_mode(s.mode);
@@ -4297,7 +4345,12 @@ fn change_sample_rate(connected: &mut ConnectedState, new_rate: u32) {
     connected.audio_output = None;
     connected.spectrum.stop();
 
-    let spectrum = SpectrumHandle::start(0, Arc::clone(&connected.session.iq_buffers[0]), new_rate as i32);
+    let spectrum = SpectrumHandle::start(
+        0,
+        Arc::clone(&connected.session.iq_buffers[0]),
+        new_rate as i32,
+        Some(Arc::clone(&connected.session.rx_audio_to_radio)),
+    );
     spectrum.set_mode(mode);
     spectrum.set_width_hz(width_hz);
     spectrum.set_gain(gain);
@@ -4356,6 +4409,7 @@ fn change_sample_rate(connected: &mut ConnectedState, new_rate: u32) {
                 connected.session.iq_buffers.len() as i32 + 1,
                 Arc::clone(&tx_spectrum_iq),
                 new_rate as i32,
+                None,
             );
             if let Some(mic) = &connected.mic_input {
                 let tx_handle = TxHandle::start(
@@ -4433,7 +4487,7 @@ fn change_extra_receiver_sample_rate(rx: &mut ExtraReceiver, new_rate: u32) {
     rx.audio_output = None;
     rx.spectrum.stop();
 
-    let spectrum = SpectrumHandle::start(rx.ddc_index as i32, Arc::clone(&rx.iq_buffer), new_rate as i32);
+    let spectrum = SpectrumHandle::start(rx.ddc_index as i32, Arc::clone(&rx.iq_buffer), new_rate as i32, None);
     spectrum.set_mode(mode);
     spectrum.set_width_hz(width_hz);
     spectrum.set_gain(gain);
