@@ -395,324 +395,348 @@ impl HpsdrApp {
     }
 }
 
+/// Builds a fresh `ConnectedState` for `device`, applying every saved
+/// setting from `cfg` -- the full connect sequence (RadioSession,
+/// SpectrumHandle, AudioOutput, rigctl/TCI, extra receivers, TX chain).
+/// Used both for the initial discovery -> connect transition and to
+/// rebuild the whole session in place when a setting that can't be
+/// changed live needs a fresh connect to apply -- currently just
+/// PureSignal's enable/disable, since it changes the wire-level
+/// receiver/DDC layout `RadioSession::start` negotiates once at
+/// connect time (see the PureSignal checkbox handler's
+/// `ps_reconnect_requested` for the call site).
+fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, String> {
+    let mut settings = RadioSettings::default();
+    if let Some(sr) = cfg.sample_rate {
+        settings.sample_rate = sr;
+    }
+    // Pre-size for multiple receivers, per whatever the
+    // radio's own discovery reply reported supporting --
+    // both protocols now genuinely support independent
+    // per-receiver tuning (P1: start_protocol1's
+    // extra_frequencies_hz + p1_build_packet's
+    // ozy_command==2 branch; this used to be gated to P2
+    // only, which is why iq_buffers/Add Receiver stayed
+    // stuck at 1 for every P1 radio regardless of what it
+    // actually supports).
+    settings.receivers = device.supported_receivers.max(1);
+    settings.puresignal_enabled = cfg.puresignal_enabled.unwrap_or(false);
+    if let Some(atten) = cfg.rx_attenuation {
+        settings.rx_attenuation = atten;
+    }
+    if let Some(atten) = cfg.ps_tx_attenuation {
+        settings.ps_tx_attenuation = atten;
+    }
+    match RadioSession::start(&device, settings) {
+        Ok(session) => {
+            // Override RadioSession::start's hardcoded
+            // conservative default with whatever was
+            // last saved, if anything -- otherwise TX
+            // would reset to a token power level every
+            // single session despite this now being
+            // persisted.
+            session
+                .tx_power_watts
+                .store(cfg.tx_power_watts.unwrap_or(2), Ordering::Relaxed);
+            let spectrum = SpectrumHandle::start(
+                0,
+                Arc::clone(&session.iq_buffers[0]),
+                settings.sample_rate as i32,
+            );
+            let audio_output =
+                match AudioOutput::start(Arc::clone(&spectrum.audio_out)) {
+                    Ok(a) => Some(a),
+                    Err(e) => {
+                        eprintln!("audio output unavailable: {e}");
+                        None
+                    }
+                };
+            let rigctl_addr =
+                cfg.rigctl_addr.clone().unwrap_or_else(|| rigctl::DEFAULT_ADDR.to_string());
+            let tci_addr =
+                cfg.tci_addr.clone().unwrap_or_else(|| tci::DEFAULT_ADDR.to_string());
+            // rigctl/TCI are started/stopped manually from the Network
+            // settings tab rather than always-on, but their run state
+            // is still persisted -- so a fresh connect restores
+            // whichever ones were actually running last time, instead
+            // of always coming back stopped (or always grabbing the
+            // port regardless of whether the user ever used them).
+            let mut rigctl_server: Option<RigctlServer> = None;
+            let mut rigctl_error: Option<String> = None;
+            if cfg.rigctl_running.unwrap_or(false) {
+                rigctl_server = match RigctlServer::start(
+                    &rigctl_addr,
+                    Arc::clone(&session.frequency_hz),
+                    spectrum.demod_params_handle(),
+                    Arc::clone(&spectrum.display),
+                    Arc::clone(&session.mox),
+                ) {
+                    Ok(s) => Some(s),
+                    Err(e) => {
+                        let msg = format!("couldn't listen on {rigctl_addr}: {e}");
+                        eprintln!("rigctl: {msg}");
+                        rigctl_error = Some(msg);
+                        None
+                    }
+                };
+            }
+            let mut tci_server: Option<TciServer> = None;
+            let mut tci_error: Option<String> = None;
+            if cfg.tci_running.unwrap_or(false) {
+                tci_server = match TciServer::start(
+                    &tci_addr,
+                    Arc::clone(&session.frequency_hz),
+                    Arc::clone(&session.sample_rate),
+                    spectrum.demod_params_handle(),
+                    Arc::clone(&session.mox),
+                    Arc::clone(&spectrum.tci_audio_out),
+                    Arc::clone(&spectrum.iq_out),
+                    Arc::clone(&session.tci_tx_audio),
+                ) {
+                    Ok(s) => Some(s),
+                    Err(e) => {
+                        let msg = format!("couldn't listen on {tci_addr}: {e}");
+                        eprintln!("tci: {msg}");
+                        tci_error = Some(msg);
+                        None
+                    }
+                };
+            }
+            if let Some(f) = cfg.frequency_hz {
+                session.set_frequency(f);
+            }
+            if let Some(a) = cfg.adc {
+                session.adc.store(a as u32, Ordering::Relaxed);
+            }
+            if let Some(a) = cfg.antenna {
+                session.antenna.store(a as u32, Ordering::Relaxed);
+            }
+            if let Some(m) = cfg.mode {
+                spectrum.set_mode(m);
+            }
+            if let Some(w) = cfg.width_hz {
+                spectrum.set_width_hz(w);
+            }
+            if let Some(g) = cfg.gain {
+                spectrum.set_gain(g);
+            }
+            if let Some(a) = cfg.agc {
+                spectrum.set_agc(a);
+            }
+            if let Some(v) = cfg.agc_attack_ms {
+                spectrum.set_agc_attack_ms(v);
+            }
+            if let Some(v) = cfg.agc_decay_ms {
+                spectrum.set_agc_decay_ms(v);
+            }
+            if let Some(v) = cfg.agc_hang_ms {
+                spectrum.set_agc_hang_ms(v);
+            }
+            if let Some(v) = cfg.agc_top_db {
+                spectrum.set_agc_top_db(v);
+            }
+            if let Some(v) = cfg.agc_slope_db {
+                spectrum.set_agc_slope_db(v);
+            }
+            if let Some(v) = cfg.agc_thresh_db {
+                spectrum.set_agc_thresh_db(v);
+            }
+            if let Some(v) = cfg.noise_blanker {
+                spectrum.set_noise_blanker(v);
+            }
+            if let Some(v) = cfg.nb_threshold {
+                spectrum.set_nb_threshold(v);
+            }
+            if let Some(v) = cfg.noise_reduction {
+                spectrum.set_noise_reduction(v);
+            }
+            if let Some(v) = cfg.snb {
+                spectrum.set_snb(v);
+            }
+            let mic_gain = cfg.mic_gain.unwrap_or(0.5);
+            // See tx::PsParams::default for these same
+            // fallback values -- kept in sync deliberately
+            // (both are "reference default if never
+            // calibrated", just one's Config's fallback,
+            // one's PsParams's fallback for a session that
+            // skips Config loading entirely).
+            let ps_enabled = true;
+            let ps_hw_peak = cfg.ps_hw_peak.unwrap_or_else(|| default_ps_hw_peak(device.protocol));
+            let ps_mox_delay = cfg.ps_mox_delay.unwrap_or(0.2);
+            let ps_loop_delay = cfg.ps_loop_delay.unwrap_or(0.0);
+            let ps_tx_delay_ns = cfg.ps_tx_delay_ns.unwrap_or(150.0);
+            let ps_ptol = cfg.ps_ptol.unwrap_or(0.8);
+
+            let settings_dirty = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let mut extra_receivers = Vec::new();
+            for saved in &cfg.extra_receivers {
+                if let Some(rx) = spawn_extra_receiver(
+                    &session,
+                    device.adcs,
+                    device.protocol,
+                    Arc::clone(&settings_dirty),
+                    Some(saved),
+                ) {
+                    extra_receivers.push(rx);
+                }
+            }
+
+            // TX is now armed automatically on connect, at the
+            // user's request, rather than requiring the
+            // "Enable Transmit" checkbox each session. Mirrors
+            // that checkbox's logic exactly (see Settings ->
+            // TX) -- the checkbox itself is still there and
+            // can still be used to disarm mid-session if
+            // wanted; this just changes the default from off
+            // to on rather than removing the control.
+            let duc_rate = if device.protocol == 2 {
+                192_000
+            } else {
+                settings.sample_rate as i32
+            };
+            // Fed by TxHandle with the actual generated TX
+            // IQ (not RX ADC samples) -- see
+            // ConnectedState::tx_spectrum's doc comment.
+            let tx_spectrum_iq: Arc<Mutex<VecDeque<IqSample>>> =
+                Arc::new(Mutex::new(VecDeque::new()));
+            let tx_spectrum = SpectrumHandle::start(
+                session.iq_buffers.len() as i32 + 1,
+                Arc::clone(&tx_spectrum_iq),
+                duc_rate,
+            );
+            let mic_buffer = Arc::new(Mutex::new(VecDeque::new()));
+            let (tx_enabled, mic_input, tx_handle) = match MicInput::start(Arc::clone(&mic_buffer)) {
+                Ok(mic) => {
+                    let tx_handle = TxHandle::start(
+                        mic_buffer,
+                        Arc::clone(&session.tci_tx_audio),
+                        Arc::clone(&session.tx_iq),
+                        Arc::clone(&tx_spectrum_iq),
+                        Arc::clone(&session.mox),
+                        session.iq_buffers.len() as i32,
+                        device.protocol,
+                        48_000,
+                        duc_rate,
+                        settings.puresignal_enabled,
+                        Arc::clone(&session.ps_rx_feedback_iq),
+                        Arc::clone(&session.ps_tx_feedback_iq),
+                    );
+                    tx_handle.set_mic_gain(mic_gain);
+                    tx_handle.set_mode(spectrum.mode());
+                    tx_handle.set_width_hz(spectrum.width_hz());
+                    tx_handle.set_ps_enabled(ps_enabled);
+                    tx_handle.set_ps_hw_peak(ps_hw_peak);
+                    tx_handle.set_ps_mox_delay(ps_mox_delay);
+                    tx_handle.set_ps_loop_delay(ps_loop_delay);
+                    tx_handle.set_ps_tx_delay_ns(ps_tx_delay_ns);
+                    tx_handle.set_ps_ptol(ps_ptol);
+                    (true, Some(mic), Some(tx_handle))
+                }
+                Err(e) => {
+                    eprintln!("mic input unavailable, TX not armed: {e}");
+                    (false, None, None)
+                }
+            };
+
+            println!(
+                "Started {:?} at {} (protocol {}, {} ADC(s), reports supporting {} receiver(s))",
+                device.board,
+                device.address.ip(),
+                device.protocol,
+                device.adcs,
+                device.supported_receivers,
+            );
+            let initial_frequency_hz = session.frequency_hz.load(Ordering::Relaxed);
+            Ok(ConnectedState {
+                device,
+                session,
+                spectrum,
+                tx_spectrum,
+                audio_output,
+                rigctl_server,
+                tci_server,
+                waterfall_texture: None,
+                waterfall_signature: None,
+                scroll_accum: 0.0,
+                zoom_accum: 0.0,
+                sample_rate: settings.sample_rate,
+                db_low: cfg.db_low.unwrap_or(-140.0),
+                db_high: cfg.db_high.unwrap_or(-40.0),
+                waterfall_db_low: cfg.waterfall_db_low.unwrap_or(-140.0),
+                waterfall_db_high: cfg.waterfall_db_high.unwrap_or(-60.0),
+                tx_db_low: cfg.tx_db_low.unwrap_or(cfg.db_low.unwrap_or(-140.0)),
+                tx_db_high: cfg.tx_db_high.unwrap_or(cfg.db_high.unwrap_or(-40.0) + 60.0),
+                tx_waterfall_db_low: cfg
+                    .tx_waterfall_db_low
+                    .unwrap_or(cfg.waterfall_db_low.unwrap_or(-140.0)),
+                tx_waterfall_db_high: cfg
+                    .tx_waterfall_db_high
+                    .unwrap_or(cfg.waterfall_db_high.unwrap_or(-60.0) + 60.0),
+                waterfall_palette: cfg.waterfall_palette.unwrap_or(Palette::Ocean),
+                spectrum_waterfall_ratio: cfg
+                    .spectrum_waterfall_ratio
+                    .unwrap_or(150.0 / 350.0),
+                slider_scroll_accum: 0.0,
+                show_settings_window: false,
+                settings_tab: SettingsTab::Agc,
+                extra_receivers,
+                settings_dirty,
+                band_memory: cfg.band_settings.clone(),
+                width_memory: cfg.width_memory.clone(),
+                ctun: false,
+                ctun_frequency_hz: initial_frequency_hz,
+                rigctl_addr,
+                tci_addr,
+                rigctl_error,
+                tci_error,
+                tx_enabled,
+                mic_input,
+                tx_handle,
+                ptt_held: false,
+                mic_gain,
+                ps_enabled,
+                ps_hw_peak,
+                ps_mox_delay,
+                ps_loop_delay,
+                ps_tx_delay_ns,
+                ps_ptol,
+                pa_calibration: cfg.pa_calibration.clone(),
+                max_tx_power_watts: cfg
+                    .max_tx_power_watts
+                    .unwrap_or_else(|| default_max_tx_power_watts(device.board)),
+                tune_power_percent: cfg.tune_power_percent.unwrap_or(20),
+                tune_active: false,
+                pre_tune_power_watts: None,
+                two_tone_active: false,
+                smoothed_fwd_power: 0.0,
+                smoothed_rev_power: 0.0,
+                puresignal_enabled: settings.puresignal_enabled,
+            })
+        }
+        Err(e) => Err(format!("Failed to start radio: {e}")),
+    }
+}
+
 impl eframe::App for HpsdrApp {
     // eframe 0.35 replaced `update(&Context)` with `ui(&mut Ui)` -- see
     // https://github.com/emilk/egui/blob/main/CHANGELOG.md (0.35.0).
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        // Set (from deep inside the Connected arm, via connect_error)
+        // when a PS-toggle-triggered reconnect fails -- can't assign
+        // self.state directly from there since `connected` still
+        // borrows it at that point. Checked once after the whole match
+        // below, same reasoning as stop_clicked/retry_clicked's own
+        // deferred-to-end-of-arm handling, just one level further out
+        // since this needs to switch to a DIFFERENT enum variant than
+        // the arm it's set from.
+        let mut connect_error: Option<String> = None;
         match &mut self.state {
             AppState::Discovering(window) => match window.show(ui) {
                 DiscoveryAction::Start(device) => {
                     let cfg = Config::load(device.mac);
-                    let mut settings = RadioSettings::default();
-                    if let Some(sr) = cfg.sample_rate {
-                        settings.sample_rate = sr;
-                    }
-                    // Pre-size for multiple receivers, per whatever the
-                    // radio's own discovery reply reported supporting --
-                    // both protocols now genuinely support independent
-                    // per-receiver tuning (P1: start_protocol1's
-                    // extra_frequencies_hz + p1_build_packet's
-                    // ozy_command==2 branch; this used to be gated to P2
-                    // only, which is why iq_buffers/Add Receiver stayed
-                    // stuck at 1 for every P1 radio regardless of what it
-                    // actually supports).
-                    settings.receivers = device.supported_receivers.max(1);
-                    settings.puresignal_enabled = cfg.puresignal_enabled.unwrap_or(false);
-                    if let Some(atten) = cfg.rx_attenuation {
-                        settings.rx_attenuation = atten;
-                    }
-                    if let Some(atten) = cfg.ps_tx_attenuation {
-                        settings.ps_tx_attenuation = atten;
-                    }
-                    match RadioSession::start(&device, settings) {
-                        Ok(session) => {
-                            // Override RadioSession::start's hardcoded
-                            // conservative default with whatever was
-                            // last saved, if anything -- otherwise TX
-                            // would reset to a token power level every
-                            // single session despite this now being
-                            // persisted.
-                            session
-                                .tx_power_watts
-                                .store(cfg.tx_power_watts.unwrap_or(2), Ordering::Relaxed);
-                            let spectrum = SpectrumHandle::start(
-                                0,
-                                Arc::clone(&session.iq_buffers[0]),
-                                settings.sample_rate as i32,
-                            );
-                            let audio_output =
-                                match AudioOutput::start(Arc::clone(&spectrum.audio_out)) {
-                                    Ok(a) => Some(a),
-                                    Err(e) => {
-                                        eprintln!("audio output unavailable: {e}");
-                                        None
-                                    }
-                                };
-                            let rigctl_addr =
-                                cfg.rigctl_addr.clone().unwrap_or_else(|| rigctl::DEFAULT_ADDR.to_string());
-                            let tci_addr =
-                                cfg.tci_addr.clone().unwrap_or_else(|| tci::DEFAULT_ADDR.to_string());
-                            // rigctl/TCI are started/stopped manually from the Network
-                            // settings tab rather than always-on, but their run state
-                            // is still persisted -- so a fresh connect restores
-                            // whichever ones were actually running last time, instead
-                            // of always coming back stopped (or always grabbing the
-                            // port regardless of whether the user ever used them).
-                            let mut rigctl_server: Option<RigctlServer> = None;
-                            let mut rigctl_error: Option<String> = None;
-                            if cfg.rigctl_running.unwrap_or(false) {
-                                rigctl_server = match RigctlServer::start(
-                                    &rigctl_addr,
-                                    Arc::clone(&session.frequency_hz),
-                                    spectrum.demod_params_handle(),
-                                    Arc::clone(&spectrum.display),
-                                    Arc::clone(&session.mox),
-                                ) {
-                                    Ok(s) => Some(s),
-                                    Err(e) => {
-                                        let msg = format!("couldn't listen on {rigctl_addr}: {e}");
-                                        eprintln!("rigctl: {msg}");
-                                        rigctl_error = Some(msg);
-                                        None
-                                    }
-                                };
-                            }
-                            let mut tci_server: Option<TciServer> = None;
-                            let mut tci_error: Option<String> = None;
-                            if cfg.tci_running.unwrap_or(false) {
-                                tci_server = match TciServer::start(
-                                    &tci_addr,
-                                    Arc::clone(&session.frequency_hz),
-                                    Arc::clone(&session.sample_rate),
-                                    spectrum.demod_params_handle(),
-                                    Arc::clone(&session.mox),
-                                    Arc::clone(&spectrum.tci_audio_out),
-                                    Arc::clone(&spectrum.iq_out),
-                                    Arc::clone(&session.tci_tx_audio),
-                                ) {
-                                    Ok(s) => Some(s),
-                                    Err(e) => {
-                                        let msg = format!("couldn't listen on {tci_addr}: {e}");
-                                        eprintln!("tci: {msg}");
-                                        tci_error = Some(msg);
-                                        None
-                                    }
-                                };
-                            }
-                            if let Some(f) = cfg.frequency_hz {
-                                session.set_frequency(f);
-                            }
-                            if let Some(a) = cfg.adc {
-                                session.adc.store(a as u32, Ordering::Relaxed);
-                            }
-                            if let Some(a) = cfg.antenna {
-                                session.antenna.store(a as u32, Ordering::Relaxed);
-                            }
-                            if let Some(m) = cfg.mode {
-                                spectrum.set_mode(m);
-                            }
-                            if let Some(w) = cfg.width_hz {
-                                spectrum.set_width_hz(w);
-                            }
-                            if let Some(g) = cfg.gain {
-                                spectrum.set_gain(g);
-                            }
-                            if let Some(a) = cfg.agc {
-                                spectrum.set_agc(a);
-                            }
-                            if let Some(v) = cfg.agc_attack_ms {
-                                spectrum.set_agc_attack_ms(v);
-                            }
-                            if let Some(v) = cfg.agc_decay_ms {
-                                spectrum.set_agc_decay_ms(v);
-                            }
-                            if let Some(v) = cfg.agc_hang_ms {
-                                spectrum.set_agc_hang_ms(v);
-                            }
-                            if let Some(v) = cfg.agc_top_db {
-                                spectrum.set_agc_top_db(v);
-                            }
-                            if let Some(v) = cfg.agc_slope_db {
-                                spectrum.set_agc_slope_db(v);
-                            }
-                            if let Some(v) = cfg.agc_thresh_db {
-                                spectrum.set_agc_thresh_db(v);
-                            }
-                            if let Some(v) = cfg.noise_blanker {
-                                spectrum.set_noise_blanker(v);
-                            }
-                            if let Some(v) = cfg.nb_threshold {
-                                spectrum.set_nb_threshold(v);
-                            }
-                            if let Some(v) = cfg.noise_reduction {
-                                spectrum.set_noise_reduction(v);
-                            }
-                            if let Some(v) = cfg.snb {
-                                spectrum.set_snb(v);
-                            }
-                            let mic_gain = cfg.mic_gain.unwrap_or(0.5);
-                            // See tx::PsParams::default for these same
-                            // fallback values -- kept in sync deliberately
-                            // (both are "reference default if never
-                            // calibrated", just one's Config's fallback,
-                            // one's PsParams's fallback for a session that
-                            // skips Config loading entirely).
-                            let ps_enabled = true;
-                            let ps_hw_peak = cfg.ps_hw_peak.unwrap_or_else(|| default_ps_hw_peak(device.protocol));
-                            let ps_mox_delay = cfg.ps_mox_delay.unwrap_or(0.2);
-                            let ps_loop_delay = cfg.ps_loop_delay.unwrap_or(0.0);
-                            let ps_tx_delay_ns = cfg.ps_tx_delay_ns.unwrap_or(150.0);
-                            let ps_ptol = cfg.ps_ptol.unwrap_or(0.8);
-
-                            let settings_dirty = Arc::new(std::sync::atomic::AtomicBool::new(false));
-                            let mut extra_receivers = Vec::new();
-                            for saved in &cfg.extra_receivers {
-                                if let Some(rx) = spawn_extra_receiver(
-                                    &session,
-                                    device.adcs,
-                                    device.protocol,
-                                    Arc::clone(&settings_dirty),
-                                    Some(saved),
-                                ) {
-                                    extra_receivers.push(rx);
-                                }
-                            }
-
-                            // TX is now armed automatically on connect, at the
-                            // user's request, rather than requiring the
-                            // "Enable Transmit" checkbox each session. Mirrors
-                            // that checkbox's logic exactly (see Settings ->
-                            // TX) -- the checkbox itself is still there and
-                            // can still be used to disarm mid-session if
-                            // wanted; this just changes the default from off
-                            // to on rather than removing the control.
-                            let duc_rate = if device.protocol == 2 {
-                                192_000
-                            } else {
-                                settings.sample_rate as i32
-                            };
-                            // Fed by TxHandle with the actual generated TX
-                            // IQ (not RX ADC samples) -- see
-                            // ConnectedState::tx_spectrum's doc comment.
-                            let tx_spectrum_iq: Arc<Mutex<VecDeque<IqSample>>> =
-                                Arc::new(Mutex::new(VecDeque::new()));
-                            let tx_spectrum = SpectrumHandle::start(
-                                session.iq_buffers.len() as i32 + 1,
-                                Arc::clone(&tx_spectrum_iq),
-                                duc_rate,
-                            );
-                            let mic_buffer = Arc::new(Mutex::new(VecDeque::new()));
-                            let (tx_enabled, mic_input, tx_handle) = match MicInput::start(Arc::clone(&mic_buffer)) {
-                                Ok(mic) => {
-                                    let tx_handle = TxHandle::start(
-                                        mic_buffer,
-                                        Arc::clone(&session.tci_tx_audio),
-                                        Arc::clone(&session.tx_iq),
-                                        Arc::clone(&tx_spectrum_iq),
-                                        Arc::clone(&session.mox),
-                                        session.iq_buffers.len() as i32,
-                                        device.protocol,
-                                        48_000,
-                                        duc_rate,
-                                        settings.puresignal_enabled,
-                                        Arc::clone(&session.ps_rx_feedback_iq),
-                                        Arc::clone(&session.ps_tx_feedback_iq),
-                                    );
-                                    tx_handle.set_mic_gain(mic_gain);
-                                    tx_handle.set_mode(spectrum.mode());
-                                    tx_handle.set_width_hz(spectrum.width_hz());
-                                    tx_handle.set_ps_enabled(ps_enabled);
-                                    tx_handle.set_ps_hw_peak(ps_hw_peak);
-                                    tx_handle.set_ps_mox_delay(ps_mox_delay);
-                                    tx_handle.set_ps_loop_delay(ps_loop_delay);
-                                    tx_handle.set_ps_tx_delay_ns(ps_tx_delay_ns);
-                                    tx_handle.set_ps_ptol(ps_ptol);
-                                    (true, Some(mic), Some(tx_handle))
-                                }
-                                Err(e) => {
-                                    eprintln!("mic input unavailable, TX not armed: {e}");
-                                    (false, None, None)
-                                }
-                            };
-
-                            println!(
-                                "Started {:?} at {} (protocol {}, {} ADC(s), reports supporting {} receiver(s))",
-                                device.board,
-                                device.address.ip(),
-                                device.protocol,
-                                device.adcs,
-                                device.supported_receivers,
-                            );
-                            let initial_frequency_hz = session.frequency_hz.load(Ordering::Relaxed);
-                            self.state = AppState::Connected(ConnectedState {
-                                device,
-                                session,
-                                spectrum,
-                                tx_spectrum,
-                                audio_output,
-                                rigctl_server,
-                                tci_server,
-                                waterfall_texture: None,
-                                waterfall_signature: None,
-                                scroll_accum: 0.0,
-                                zoom_accum: 0.0,
-                                sample_rate: settings.sample_rate,
-                                db_low: cfg.db_low.unwrap_or(-140.0),
-                                db_high: cfg.db_high.unwrap_or(-40.0),
-                                waterfall_db_low: cfg.waterfall_db_low.unwrap_or(-140.0),
-                                waterfall_db_high: cfg.waterfall_db_high.unwrap_or(-60.0),
-                                tx_db_low: cfg.tx_db_low.unwrap_or(cfg.db_low.unwrap_or(-140.0)),
-                                tx_db_high: cfg.tx_db_high.unwrap_or(cfg.db_high.unwrap_or(-40.0) + 60.0),
-                                tx_waterfall_db_low: cfg
-                                    .tx_waterfall_db_low
-                                    .unwrap_or(cfg.waterfall_db_low.unwrap_or(-140.0)),
-                                tx_waterfall_db_high: cfg
-                                    .tx_waterfall_db_high
-                                    .unwrap_or(cfg.waterfall_db_high.unwrap_or(-60.0) + 60.0),
-                                waterfall_palette: cfg.waterfall_palette.unwrap_or(Palette::Ocean),
-                                spectrum_waterfall_ratio: cfg
-                                    .spectrum_waterfall_ratio
-                                    .unwrap_or(150.0 / 350.0),
-                                slider_scroll_accum: 0.0,
-                                show_settings_window: false,
-                                settings_tab: SettingsTab::Agc,
-                                extra_receivers,
-                                settings_dirty,
-                                band_memory: cfg.band_settings.clone(),
-                                width_memory: cfg.width_memory.clone(),
-                                ctun: false,
-                                ctun_frequency_hz: initial_frequency_hz,
-                                rigctl_addr,
-                                tci_addr,
-                                rigctl_error,
-                                tci_error,
-                                tx_enabled,
-                                mic_input,
-                                tx_handle,
-                                ptt_held: false,
-                                mic_gain,
-                                ps_enabled,
-                                ps_hw_peak,
-                                ps_mox_delay,
-                                ps_loop_delay,
-                                ps_tx_delay_ns,
-                                ps_ptol,
-                                pa_calibration: cfg.pa_calibration.clone(),
-                                max_tx_power_watts: cfg
-                                    .max_tx_power_watts
-                                    .unwrap_or_else(|| default_max_tx_power_watts(device.board)),
-                                tune_power_percent: cfg.tune_power_percent.unwrap_or(20),
-                                tune_active: false,
-                                pre_tune_power_watts: None,
-                                two_tone_active: false,
-                                smoothed_fwd_power: 0.0,
-                                smoothed_rev_power: 0.0,
-                                puresignal_enabled: settings.puresignal_enabled,
-                            });
-                        }
-                        Err(e) => {
-                            self.state = AppState::Error(format!("Failed to start radio: {e}"));
-                        }
+                    match connect_to_device(device, &cfg) {
+                        Ok(connected) => self.state = AppState::Connected(connected),
+                        Err(e) => self.state = AppState::Error(e),
                     }
                 }
                 DiscoveryAction::Cancelled => {
@@ -867,6 +891,13 @@ impl eframe::App for HpsdrApp {
 
                 let mut stop_clicked = false;
                 let mut settings_changed = false;
+                // Set when the "Enable PureSignal" checkbox changes --
+                // see its own handler below and the teardown+rebuild
+                // near stop_clicked's own handling for why this can't
+                // just be a live setting (it changes the wire-level
+                // receiver/DDC layout RadioSession::start negotiates
+                // once at connect time).
+                let mut ps_reconnect_requested = false;
 
                 egui::CentralPanel::default().show(ui, |ui| {
                     ui.add_space(4.0);
@@ -1153,6 +1184,34 @@ impl eframe::App for HpsdrApp {
                         ui.add_space(12.0);
                         ui.colored_label(network_status_color(tci_status), "TCI")
                             .on_hover_text(network_status_hover("TCI", tci_status, &connected.tci_addr));
+                        // PureSignal: only shown when actually enabled for
+                        // this session (see ConnectedState::puresignal_enabled's
+                        // doc comment -- a connect-time setting, not live).
+                        // Same green/gray "Correcting" convention as the
+                        // Settings -> PureSignal panel's own indicator,
+                        // just compact enough for the main toolbar --
+                        // added so PS state is visible at a glance without
+                        // opening Settings, per a real report that this
+                        // was hard to tell at a glance while testing.
+                        if connected.puresignal_enabled {
+                            ui.add_space(12.0);
+                            let status = connected.tx_handle.as_ref().map(|tx| *tx.ps_status.lock().unwrap());
+                            let (color, hover) = match status {
+                                Some(s) if s.correcting => (
+                                    egui::Color32::from_rgb(80, 200, 80),
+                                    format!("PureSignal: Correcting (feedback level {})", s.feedback_level),
+                                ),
+                                Some(s) => (
+                                    egui::Color32::GRAY,
+                                    format!(
+                                        "PureSignal: enabled, not yet correcting (feedback level {})",
+                                        s.feedback_level
+                                    ),
+                                ),
+                                None => (egui::Color32::GRAY, "PureSignal: enabled".to_string()),
+                            };
+                            ui.colored_label(color, "PS").on_hover_text(hover);
+                        }
                     });
 
                     if connected.tx_enabled {
@@ -2548,10 +2607,11 @@ impl eframe::App for HpsdrApp {
                                     {
                                         connected.puresignal_enabled = puresignal_enabled;
                                         settings_changed = true;
+                                        ps_reconnect_requested = true;
                                     }
                                     ui.weak(
                                         "Reserves 2 extra feedback receivers from the radio -- \
-                                         takes effect on next connect, not live.",
+                                         changing this briefly reconnects to apply.",
                                     );
 
                                     if connected.puresignal_enabled {
@@ -2863,6 +2923,43 @@ impl eframe::App for HpsdrApp {
                     connected.spectrum.stop();
                     let ctx = ui.ctx().clone();
                     self.state = AppState::Discovering(DiscoveryWindow::new(&ctx));
+                } else if ps_reconnect_requested {
+                    // Full teardown -- matching stop_clicked's own
+                    // explicit-stop-before-drop discipline just above,
+                    // extended to every subsystem PureSignal's wire-
+                    // level receiver/DDC layout touches (SpectrumHandle
+                    // channels and rigctl/TCI's bound ports both need
+                    // the OLD one actually gone before connect_to_device
+                    // opens/binds a new one, not just eventually-dropped
+                    // via *connected being overwritten below). Rebuilds
+                    // from the config the settings_changed save above
+                    // (this same frame) already wrote to disk, which
+                    // already reflects the new puresignal_enabled.
+                    connected.session.stop();
+                    connected.spectrum.stop();
+                    connected.tx_spectrum.stop();
+                    for rx in &connected.extra_receivers {
+                        rx.lock().unwrap().spectrum.stop();
+                    }
+                    connected.extra_receivers.clear();
+                    connected.tx_handle = None;
+                    connected.mic_input = None;
+                    connected.audio_output = None;
+                    connected.rigctl_server = None;
+                    connected.tci_server = None;
+                    let device = connected.device;
+                    let cfg = Config::load(device.mac);
+                    match connect_to_device(device, &cfg) {
+                        Ok(new_connected) => *connected = new_connected,
+                        // Old session is already fully torn down above;
+                        // the whole ConnectedState is about to be
+                        // replaced by AppState::Error via connect_error
+                        // (set here since self.state can't be assigned
+                        // directly while `connected` still borrows it),
+                        // so leaving `connected` in this stopped state
+                        // is harmless.
+                        Err(e) => connect_error = Some(e),
+                    }
                 }
             }
             AppState::Error(message) => {
@@ -2881,6 +2978,9 @@ impl eframe::App for HpsdrApp {
                     self.state = AppState::Discovering(DiscoveryWindow::new(&ctx));
                 }
             }
+        }
+        if let Some(e) = connect_error {
+            self.state = AppState::Error(e);
         }
     }
 }

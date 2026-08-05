@@ -168,10 +168,23 @@ impl Default for RadioSettings {
 ///   feedback occupying the last 2), so real RX is capped at
 ///   `total - 2`. On the smallest boards (Metis/HermesLite, total=2)
 ///   this is 0 -- no real RX at all while PS is active.
-/// - P2: always `None` (no cap) -- DDC0/DDC1 are simply reserved for
-///   feedback and real receivers are offset to start at DDC2, but the
-///   total is otherwise just "however many the user wants" like normal,
-///   bounded only by the board's own supported_receivers maximum.
+/// - P2: always `None` here -- DDC0/DDC1 are reserved for feedback and
+///   real receivers are offset to start at DDC2, but unlike P1 the cap
+///   isn't a fixed board constant (P2's DDC count varies by board), so
+///   it can't be encoded in this table. BUG FIX: this used to be
+///   (wrongly) documented as "bounded only by the board's own
+///   supported_receivers maximum" -- it was NOT actually bounded at
+///   all: `settings.receivers` (from the board's discovery reply) was
+///   used unreduced for both `iq_buffers` sizing and the "Add
+///   Receiver" UI cap, while p2_sender_loop separately ADDS 2 reserved
+///   DDCs on top whenever PS is active. A user could "Add Receiver" up
+///   to the board's full advertised DDC count and PS enabled would
+///   then request `count + 2` DDCs -- a real over-request past what
+///   the board actually has. Fixed at the call site instead
+///   (start_protocol2 reduces `settings.receivers` by 2 up front when
+///   PS is active, before it ever reaches `iq_buffers`/"Add Receiver"),
+///   since the actual cap value needs the board's live discovered
+///   receiver count, which this function doesn't have.
 ///
 /// Both protocols agree on one more thing this function doesn't encode
 /// (handled at the call site instead, since it needs the live TX
@@ -1639,13 +1652,31 @@ fn start_protocol2(
     ps_rx_feedback_iq: Arc<Mutex<VecDeque<IqSample>>>,
     ps_tx_feedback_iq: Arc<Mutex<VecDeque<IqSample>>>,
 ) -> io::Result<RadioSession> {
-    // PureSignal (P2): see ps_feedback_config's doc comment. Unlike P1,
-    // real-receiver capacity isn't capped -- DDC0/DDC1 are simply
-    // reserved ahead of real receivers, which start at DDC2 instead of
-    // DDC0 (p2_sender_loop/p2_receiver_loop), so `settings.receivers`
-    // itself is unaffected here.
+    // PureSignal (P2): see ps_feedback_config's doc comment. DDC0/DDC1
+    // are reserved ahead of real receivers, which start at DDC2 instead
+    // of DDC0 (p2_sender_loop/p2_receiver_loop) -- so real-receiver
+    // capacity (and therefore the "Add Receiver" UI cap, which derives
+    // from iq_buffers.len()) is reduced by 2 here when PS is active.
+    //
+    // BUG FIX: this used to leave `settings.receivers` (from the
+    // board's discovery reply) unreduced, on the wrong assumption that
+    // PS's 2 reserved DDCs came out of that same total "for free". They
+    // don't -- p2_sender_loop ADDS 2 reserved entries on top of however
+    // many real receivers are active. A user could "Add Receiver" up to
+    // the board's full advertised DDC count (e.g. 7) and PS enabled
+    // would then request 9 DDCs from a 7-DDC board -- a real wire-level
+    // over-request, not just a theoretical one. `.max(1)` after the
+    // subtraction matches P1's own equivalent cap (`ps_feedback_config`'s
+    // `max_real_receivers`), which also never allows zero real
+    // receivers even on boards where PS's fixed reservation would
+    // otherwise imply it.
     let puresignal_enabled =
         settings.puresignal_enabled && ps_feedback_config(2, device.board).is_some();
+    let real_receivers = if puresignal_enabled {
+        settings.receivers.max(1).saturating_sub(2).max(1)
+    } else {
+        settings.receivers.max(1)
+    };
 
     // Confirmed against a working reference (rustyHPSDR): it explicitly
     // sets SO_REUSEADDR and (on Unix) SO_REUSEPORT before binding, via
@@ -1675,15 +1706,16 @@ fn start_protocol2(
     let radio_ip = device.address.ip();
 
     let stop_flag = Arc::new(AtomicBool::new(false));
-    let iq_buffers: Vec<Arc<Mutex<VecDeque<IqSample>>>> = (0..settings.receivers.max(1))
+    let iq_buffers: Vec<Arc<Mutex<VecDeque<IqSample>>>> = (0..real_receivers)
         .map(|_| Arc::new(Mutex::new(VecDeque::with_capacity(IQ_BUFFER_CAPACITY))))
         .collect();
 
     // Extra receivers beyond the first, pre-sized to whatever was
     // requested (the caller sets settings.receivers from the board's
-    // reported capability for P2). None are active until add_receiver()
-    // is called -- active_receiver_count starts at 1.
-    let extra_count = settings.receivers.max(1).saturating_sub(1) as usize;
+    // reported capability for P2, reduced above by PS's 2 reserved DDCs
+    // when active). None are active until add_receiver() is called --
+    // active_receiver_count starts at 1.
+    let extra_count = real_receivers.saturating_sub(1) as usize;
     let extra_frequencies_hz: Vec<Arc<AtomicU32>> = (0..extra_count)
         .map(|_| Arc::new(AtomicU32::new(settings.frequency_hz)))
         .collect();
