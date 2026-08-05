@@ -79,11 +79,20 @@ impl DiscoveryWindow {
         let mut action = DiscoveryAction::None;
         let mut still_open = self.open;
 
+        // Light theme, matching the Settings window's own override (see
+        // its doc comment in main.rs) -- for the same reason: egui only
+        // tints a window's title bar while focused, so overriding the
+        // whole window's visuals is the only way to keep it consistently
+        // white regardless of focus.
+        let light_visuals = egui::Visuals::light();
+        let light_style = egui::Style { visuals: light_visuals.clone(), ..Default::default() };
         egui::Window::new("Discover HPSDR Radios")
             .open(&mut still_open)
             .resizable(true)
             .collapsible(false)
+            .frame(egui::Frame::window(&light_style))
             .show(ui, |ui| {
+                ui.visuals_mut().clone_from(&light_visuals);
                 let discovering = *self.discovering.lock().unwrap();
 
                 if discovering {
