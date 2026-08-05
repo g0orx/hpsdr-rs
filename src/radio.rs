@@ -1367,14 +1367,6 @@ fn receiver_loop(
     stop: Arc<AtomicBool>,
 ) {
     let mut buf = [0u8; PACKET_SIZE + 64]; // a little slack in case of larger packets
-    // DIAGNOSTIC (Phase 1 -- remove once PS's real WDSP consumer exists
-    // and this has been confirmed working against real hardware): once-
-    // per-second summary of how many samples actually arrived in each
-    // PS feedback queue, so it's possible to tell "feedback IQ is really
-    // flowing" apart from "silently empty" from the console alone.
-    let mut ps_rx_fb_window: u32 = 0;
-    let mut ps_tx_fb_window: u32 = 0;
-    let mut ps_window_start = Instant::now();
     // Persistent byte-stream parse state for parse_iq_stream -- see its
     // doc comment. Owned here (not per-packet) because a "frame" can
     // straddle two packets once the discovered sync phase isn't a
@@ -1397,7 +1389,13 @@ fn receiver_loop(
                     // agree on the stride.
                     let receivers = ps_wire_total
                         .unwrap_or_else(|| (active_receiver_count.load(Ordering::Relaxed) as u8).max(1));
-                    let (rx_fb, tx_fb) = parse_iq_stream(
+                    // Return value (rx/tx feedback sample counts) was
+                    // only ever consumed by a since-removed once/sec
+                    // diagnostic -- see parse_iq_stream's own doc
+                    // comment, kept returning the tuple regardless
+                    // since it's cheap and harmless to leave bound to
+                    // real behavior other callers might want later.
+                    let _ = parse_iq_stream(
                         &buf[HEADER_SIZE..PACKET_SIZE],
                         receivers,
                         &buffers,
@@ -1410,8 +1408,6 @@ fn receiver_loop(
                         &mut carry,
                         &mut frame_synced,
                     );
-                    ps_rx_fb_window += rx_fb;
-                    ps_tx_fb_window += tx_fb;
                 }
                 // EP_WIDEBAND (0x04) and anything else: ignored for now.
             }
@@ -1422,17 +1418,6 @@ fn receiver_loop(
                 continue
             }
             Err(_) => break,
-        }
-        if ps_feedback_indices.is_some() && ps_window_start.elapsed() >= Duration::from_secs(1) {
-            if ps_rx_fb_window > 0 || ps_tx_fb_window > 0 {
-                eprintln!(
-                    "radio: PS feedback this second -- rx={ps_rx_fb_window} samples, \
-                     tx={ps_tx_fb_window} samples"
-                );
-            }
-            ps_rx_fb_window = 0;
-            ps_tx_fb_window = 0;
-            ps_window_start = Instant::now();
         }
     }
 }
@@ -2355,13 +2340,6 @@ fn p2_receiver_loop(
     // check and demod()'s fexchange0 error check).
     let ddc_reserved = if puresignal_enabled { 2 } else { 0 };
     let mut ddc_seen = vec![false; buffers.len() + ddc_reserved];
-    // DIAGNOSTIC (Phase 1 -- remove once PS's real WDSP consumer exists
-    // and this has been confirmed working against real hardware): once-
-    // per-second summary of how many DDC0/DDC1 (feedback) packets
-    // actually arrived, same reasoning as receiver_loop's P1 equivalent.
-    let mut ps_rx_fb_window: u32 = 0;
-    let mut ps_tx_fb_window: u32 = 0;
-    let mut ps_window_start = Instant::now();
     while !stop.load(Ordering::Relaxed) {
         match socket.recv_from(&mut buf) {
             Ok((n, src)) => {
@@ -2378,10 +2356,8 @@ fn p2_receiver_loop(
                         let capacity = iq_buffer_capacity_for_rate(sample_rate.load(Ordering::Relaxed));
                         if puresignal_enabled && ddc == 0 {
                             p2_parse_ddc_iq_packet(&buf[..n], &ps_rx_feedback_iq, PS_FEEDBACK_BUFFER_CAPACITY);
-                            ps_rx_fb_window += 1;
                         } else if puresignal_enabled && ddc == 1 {
                             p2_parse_ddc_iq_packet(&buf[..n], &ps_tx_feedback_iq, PS_FEEDBACK_BUFFER_CAPACITY);
-                            ps_tx_fb_window += 1;
                         } else {
                             p2_parse_ddc_iq_packet(&buf[..n], &buffers[ddc - ddc_reserved], capacity);
                         }
@@ -2417,17 +2393,6 @@ fn p2_receiver_loop(
                 continue
             }
             Err(_) => break,
-        }
-        if puresignal_enabled && ps_window_start.elapsed() >= Duration::from_secs(1) {
-            if ps_rx_fb_window > 0 || ps_tx_fb_window > 0 {
-                eprintln!(
-                    "radio: PS feedback this second -- rx={ps_rx_fb_window} packets, \
-                     tx={ps_tx_fb_window} packets"
-                );
-            }
-            ps_rx_fb_window = 0;
-            ps_tx_fb_window = 0;
-            ps_window_start = Instant::now();
         }
     }
 }
