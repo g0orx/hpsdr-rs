@@ -67,7 +67,9 @@ use crate::radio::IqSample;
 use crate::spectrum::Mode;
 use crate::wdsp_sys as wdsp;
 use std::collections::VecDeque;
+use std::ffi::CString;
 use std::os::raw::c_int;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -201,6 +203,23 @@ pub struct PsParams {
     /// calibration data (e.g. from feedback with reduced time
     /// resolution) can cause even when the underlying signal is fine.
     pub ptol: f64,
+    /// Incremented to trigger an async save of the current correction
+    /// table (`PSSaveCorr`) to the fixed per-radio path `TxProcessor`
+    /// was opened with -- see `TxHandle::save_ps_corr`'s doc comment
+    /// for when this actually gets called (auto, on a `Correcting`
+    /// false->true edge). Same monotonic-counter-not-a-bool shape as
+    /// `calibrate_request`, for the same reason: never miss/coalesce a
+    /// request within one chunk.
+    pub save_corr_request: u32,
+    /// Incremented to trigger an async load+apply of a previously-saved
+    /// correction table (`PSRestoreCorr`) from that same path -- see
+    /// `TxHandle::restore_ps_corr`'s doc comment. `PSRestoreCorr` sets
+    /// WDSP's internal `turnon` flag, which clears `automode` once
+    /// applied (a one-shot "use this table" mode, not continuous
+    /// recalibration) -- so continuous auto-calibrate (`enabled` above)
+    /// needs re-asserting afterward if that's wanted, same as
+    /// piHPSDR/Thetis's own restore-then-resume-automode pattern.
+    pub restore_corr_request: u32,
 }
 
 impl Default for PsParams {
@@ -213,6 +232,8 @@ impl Default for PsParams {
             loop_delay: 0.0,
             tx_delay_ns: 150.0,
             ptol: 0.8,
+            save_corr_request: 0,
+            restore_corr_request: 0,
         }
     }
 }
@@ -292,6 +313,10 @@ impl Default for TxParams {
     }
 }
 
+/// Shared signature of PSSaveCorr/PSRestoreCorr -- see
+/// TxProcessor::ps_corr_action.
+type PsCorrFn = unsafe extern "C" fn(c_int, *mut std::os::raw::c_char);
+
 struct TxProcessor {
     channel: i32,
     mic_scratch: Vec<f64>,
@@ -312,10 +337,18 @@ struct TxProcessor {
     last_ps_loop_delay: Option<f64>,
     last_ps_tx_delay_ns: Option<f64>,
     last_ps_ptol: Option<f64>,
+    last_ps_save_corr_request: Option<u32>,
+    last_ps_restore_corr_request: Option<u32>,
+    /// Fixed for the whole session (set once at open(), from the same
+    /// per-radio path save_ps_corr/restore_ps_corr trigger against) --
+    /// None if unavailable (e.g. $HOME unset), in which case save/
+    /// restore requests are silently skipped rather than attempted
+    /// against a made-up path.
+    ps_corr_path: Option<PathBuf>,
 }
 
 impl TxProcessor {
-    fn open(channel: i32, protocol: u8, mic_rate: i32, duc_rate: i32) -> Self {
+    fn open(channel: i32, protocol: u8, mic_rate: i32, duc_rate: i32, ps_corr_path: Option<PathBuf>) -> Self {
         // Confirmed against the reference: internal TXA processing rate
         // is protocol-dependent -- 96000 for Protocol 2, 48000 for
         // Protocol 1. An earlier version of this file fixed this at
@@ -607,6 +640,13 @@ impl TxProcessor {
             last_ps_loop_delay: None,
             last_ps_tx_delay_ns: None,
             last_ps_ptol: None,
+            // Same Some(0)-matches-PsParams::default reasoning as
+            // last_ps_calibrate_request above -- both save_corr_request
+            // and restore_corr_request also start at 0 in PsParams, so
+            // this avoids an equivalent spurious first-apply trigger.
+            last_ps_save_corr_request: Some(0),
+            last_ps_restore_corr_request: Some(0),
+            ps_corr_path,
         }
     }
 
@@ -851,6 +891,38 @@ impl TxProcessor {
             }
             self.last_ps_ptol = Some(ps.ptol);
         }
+        if self.last_ps_save_corr_request != Some(ps.save_corr_request) {
+            self.ps_corr_action(wdsp::PSSaveCorr as PsCorrFn);
+            self.last_ps_save_corr_request = Some(ps.save_corr_request);
+        }
+        if self.last_ps_restore_corr_request != Some(ps.restore_corr_request) {
+            self.ps_corr_action(wdsp::PSRestoreCorr as PsCorrFn);
+            self.last_ps_restore_corr_request = Some(ps.restore_corr_request);
+        }
+    }
+
+    /// Shared body for the save/restore edge-triggers above -- both
+    /// take the same (channel, *mut c_char) shape, differing only in
+    /// which WDSP function to call. No-ops (doesn't call into WDSP at
+    /// all) if `ps_corr_path` is None (e.g. $HOME unset at connect
+    /// time) rather than attempting a call with a made-up path.
+    fn ps_corr_action(&self, f: PsCorrFn) {
+        let Some(path) = &self.ps_corr_path else { return };
+        let Some(path_str) = path.to_str() else { return };
+        let Ok(c_path) = CString::new(path_str) else { return };
+        // into_raw (not as_ptr): calcc.c's PSSaveCorr/PSRestoreCorr copy
+        // the filename into their own fixed-size internal buffer
+        // (`while (a->util.savefile[i++] = *filename++);`) synchronously
+        // before returning -- confirmed via source, not just assumed --
+        // so a short-lived pointer from as_ptr() would already be valid
+        // for the whole call. into_raw()+from_raw() here anyway, purely
+        // to make the ownership/cleanup explicit rather than relying on
+        // CString's Drop timing relative to the FFI call.
+        let ptr = c_path.into_raw();
+        unsafe {
+            f(self.channel, ptr);
+            drop(CString::from_raw(ptr));
+        }
     }
 
     /// PureSignal: reads back live status for the UI (Settings ->
@@ -986,9 +1058,10 @@ fn run(
     ps_tx_feedback_iq: Arc<Mutex<VecDeque<IqSample>>>,
     ps_params: Arc<Mutex<PsParams>>,
     ps_status: Arc<Mutex<PsStatus>>,
+    ps_corr_path: Option<PathBuf>,
     stop: Arc<AtomicBool>,
 ) {
-    let mut processor = TxProcessor::open(channel, protocol, mic_rate, duc_rate);
+    let mut processor = TxProcessor::open(channel, protocol, mic_rate, duc_rate, ps_corr_path);
     // PureSignal: RX-feedback (DDC0) delivers at 2x DDC1's rate on
     // Protocol 2 only -- see PS_P2_RX_FEEDBACK_DECIMATION's doc comment.
     let ps_rx_feedback_decimation = if puresignal_enabled && protocol == 2 {
@@ -1280,6 +1353,12 @@ impl TxHandle {
         puresignal_enabled: bool,
         ps_rx_feedback_iq: Arc<Mutex<VecDeque<IqSample>>>,
         ps_tx_feedback_iq: Arc<Mutex<VecDeque<IqSample>>>,
+        // Fixed per-radio correction-table file (config::ps_corr_path) --
+        // see save_ps_corr/restore_ps_corr's doc comments. Passed
+        // unconditionally (not just when puresignal_enabled) since it's
+        // harmless to have set even when unused; nothing reads it unless
+        // save_ps_corr/restore_ps_corr are actually called.
+        ps_corr_path: Option<PathBuf>,
     ) -> Self {
         let display = Arc::new(Mutex::new(TxDisplay::default()));
         let params = Arc::new(Mutex::new(TxParams::default()));
@@ -1297,7 +1376,7 @@ impl TxHandle {
                 run(
                     mic_buffer, tci_tx_audio, tx_iq_out, tx_spectrum_iq, mox, params, display,
                     channel, protocol, mic_rate, duc_rate, puresignal_enabled, ps_rx_feedback_iq,
-                    ps_tx_feedback_iq, ps_params, ps_status, stop,
+                    ps_tx_feedback_iq, ps_params, ps_status, ps_corr_path, stop,
                 )
             })
         };
@@ -1355,6 +1434,28 @@ impl TxHandle {
     /// counter bump rather than a plain flag.
     pub fn ps_calibrate(&self) {
         self.ps_params.lock().unwrap().calibrate_request += 1;
+    }
+    /// Triggers an async save of the current correction table to this
+    /// session's fixed per-radio path (`PsParams::save_corr_request`'s
+    /// doc comment) -- called automatically by main.rs on a
+    /// `Correcting` false->true edge, so a good table is never lost
+    /// just because the app was closed before the user thought to save
+    /// it manually. Harmless to call when there's nothing meaningful to
+    /// save yet (e.g. before calibration first converges) -- WDSP just
+    /// writes out whatever the current (possibly all-zero/default)
+    /// table is.
+    pub fn save_ps_corr(&self) {
+        self.ps_params.lock().unwrap().save_corr_request += 1;
+    }
+    /// Triggers an async load+apply of a previously-saved correction
+    /// table from this session's fixed per-radio path
+    /// (`PsParams::restore_corr_request`'s doc comment) -- called once
+    /// automatically right after a PureSignal-enabled session connects,
+    /// if a saved file exists for this radio, so `Correcting` can be
+    /// true immediately without needing to re-run Two-Tone every
+    /// session.
+    pub fn restore_ps_corr(&self) {
+        self.ps_params.lock().unwrap().restore_corr_request += 1;
     }
     pub fn set_ps_hw_peak(&self, hw_peak: f64) {
         self.ps_params.lock().unwrap().hw_peak = hw_peak.clamp(0.0, 1.0);

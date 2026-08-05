@@ -857,6 +857,23 @@ unsafe extern "C" {
     pub fn GetPSMaxTX(channel: ::std::os::raw::c_int, maxtx: *mut f64);
 }
 unsafe extern "C" {
+    /// Queues an async save of the current correction table to
+    /// `filename` (confirmed via calcc.c: this just signals a
+    /// background WDSP-internal thread via a semaphore and returns
+    /// immediately, not a blocking file write on the calling thread).
+    pub fn PSSaveCorr(channel: ::std::os::raw::c_int, filename: *mut ::std::os::raw::c_char);
+}
+unsafe extern "C" {
+    /// Queues an async load of a previously-saved correction table from
+    /// `filename` and applies it -- confirmed via calcc.c: this also
+    /// sets WDSP's internal `turnon` flag, which puts the engine into a
+    /// one-shot "apply this table, don't (re)calibrate" mode (distinct
+    /// from continuous auto-calibrate) and clears `automode` once
+    /// applied, so continuous auto-calibrate needs re-enabling
+    /// separately afterward if wanted.
+    pub fn PSRestoreCorr(channel: ::std::os::raw::c_int, filename: *mut ::std::os::raw::c_char);
+}
+unsafe extern "C" {
     pub fn pscc(
         channel: ::std::os::raw::c_int,
         size: ::std::os::raw::c_int,

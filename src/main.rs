@@ -10,7 +10,7 @@ mod tx;
 mod wdsp_sys;
 
 use audio::{AudioOutput, MicInput};
-use config::{Config, ExtraReceiverConfig};
+use config::{ps_corr_path, Config, ExtraReceiverConfig};
 use discovery::{Boards, Device};
 use discovery_ui::{DiscoveryAction, DiscoveryWindow};
 use eframe::egui;
@@ -375,6 +375,13 @@ struct ConnectedState {
     /// wire-level receiver/DDC count is fixed for the life of the
     /// sender/receiver threads).
     puresignal_enabled: bool,
+    /// Edge-detection for auto-saving the PS correction table -- see
+    /// the "PS" badge's own doc comment (main panel toolbar) for where
+    /// this is checked each frame. True once a false->true
+    /// `PsStatus::correcting` transition has been seen and saved this
+    /// session, so it only saves once per transition, not every frame
+    /// `correcting` stays true.
+    ps_was_correcting: bool,
 }
 
 enum AppState {
@@ -620,6 +627,7 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                         settings.puresignal_enabled,
                         Arc::clone(&session.ps_rx_feedback_iq),
                         Arc::clone(&session.ps_tx_feedback_iq),
+                        ps_corr_path(device.mac),
                     );
                     tx_handle.set_mic_gain(mic_gain);
                     tx_handle.set_mode(spectrum.mode());
@@ -630,6 +638,18 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                     tx_handle.set_ps_loop_delay(ps_loop_delay);
                     tx_handle.set_ps_tx_delay_ns(ps_tx_delay_ns);
                     tx_handle.set_ps_ptol(ps_ptol);
+                    // Apply a previously-saved correction table
+                    // immediately, if PS is enabled and one exists for
+                    // this radio -- see TxHandle::restore_ps_corr's doc
+                    // comment. Correcting can be true right away, no
+                    // Two-Tone needed every session.
+                    if settings.puresignal_enabled {
+                        if let Some(path) = ps_corr_path(device.mac) {
+                            if path.exists() {
+                                tx_handle.restore_ps_corr();
+                            }
+                        }
+                    }
                     (true, Some(mic), Some(tx_handle))
                 }
                 Err(e) => {
@@ -711,6 +731,7 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                 smoothed_fwd_power: 0.0,
                 smoothed_rev_power: 0.0,
                 puresignal_enabled: settings.puresignal_enabled,
+                ps_was_correcting: false,
             })
         }
         Err(e) => Err(format!("Failed to start radio: {e}")),
@@ -1196,6 +1217,24 @@ impl eframe::App for HpsdrApp {
                         if connected.puresignal_enabled {
                             ui.add_space(12.0);
                             let status = connected.tx_handle.as_ref().map(|tx| *tx.ps_status.lock().unwrap());
+                            let correcting_now = status.is_some_and(|s| s.correcting);
+                            // Auto-save on a false->true edge (not
+                            // "every frame it's true") so a good table
+                            // is persisted without a manual save
+                            // button, but without spamming a disk write
+                            // every frame while it stays true. Reset on
+                            // the trailing edge (true->false) rather
+                            // than latching "saved once ever this
+                            // session", so a LATER re-calibration (e.g.
+                            // after Calibrate Now) that converges again
+                            // also gets saved, capturing whatever the
+                            // most recent good table actually is.
+                            if correcting_now && !connected.ps_was_correcting {
+                                if let Some(tx) = &connected.tx_handle {
+                                    tx.save_ps_corr();
+                                }
+                            }
+                            connected.ps_was_correcting = correcting_now;
                             let (color, hover) = match status {
                                 Some(s) if s.correcting => (
                                     egui::Color32::from_rgb(80, 200, 80),
@@ -2513,6 +2552,7 @@ impl eframe::App for HpsdrApp {
                                                         connected.puresignal_enabled,
                                                         Arc::clone(&connected.session.ps_rx_feedback_iq),
                                                         Arc::clone(&connected.session.ps_tx_feedback_iq),
+                                                        ps_corr_path(connected.device.mac),
                                                     );
                                                     tx_handle.set_mic_gain(connected.mic_gain);
                                                     tx_handle.set_mode(connected.spectrum.mode());
@@ -2523,6 +2563,16 @@ impl eframe::App for HpsdrApp {
                                                     tx_handle.set_ps_loop_delay(connected.ps_loop_delay);
                                                     tx_handle.set_ps_tx_delay_ns(connected.ps_tx_delay_ns);
                                                     tx_handle.set_ps_ptol(connected.ps_ptol);
+                                                    // See connect_to_device's identical restore --
+                                                    // this rebuild also opens a fresh WDSP channel
+                                                    // with no calibration history of its own.
+                                                    if connected.puresignal_enabled {
+                                                        if let Some(path) = ps_corr_path(connected.device.mac) {
+                                                            if path.exists() {
+                                                                tx_handle.restore_ps_corr();
+                                                            }
+                                                        }
+                                                    }
                                                     connected.mic_input = Some(mic);
                                                     connected.tx_handle = Some(tx_handle);
                                                     connected.tx_enabled = true;
@@ -4271,6 +4321,7 @@ fn change_sample_rate(connected: &mut ConnectedState, new_rate: u32) {
                     connected.puresignal_enabled,
                     Arc::clone(&connected.session.ps_rx_feedback_iq),
                     Arc::clone(&connected.session.ps_tx_feedback_iq),
+                    ps_corr_path(connected.device.mac),
                 );
                 tx_handle.set_mic_gain(mic_gain);
                 tx_handle.set_mode(connected.spectrum.mode());
@@ -4281,6 +4332,16 @@ fn change_sample_rate(connected: &mut ConnectedState, new_rate: u32) {
                 tx_handle.set_ps_loop_delay(connected.ps_loop_delay);
                 tx_handle.set_ps_tx_delay_ns(connected.ps_tx_delay_ns);
                 tx_handle.set_ps_ptol(connected.ps_ptol);
+                // See connect_to_device's identical restore -- this
+                // rebuild also opens a fresh WDSP channel with no
+                // calibration history of its own.
+                if connected.puresignal_enabled {
+                    if let Some(path) = ps_corr_path(connected.device.mac) {
+                        if path.exists() {
+                            tx_handle.restore_ps_corr();
+                        }
+                    }
+                }
                 connected.tx_handle = Some(tx_handle);
             }
         }

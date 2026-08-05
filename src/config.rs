@@ -222,6 +222,24 @@ fn config_path(mac: [u8; 6]) -> Option<PathBuf> {
     Some(path)
 }
 
+/// Per-radio PureSignal correction-table file, same MAC-keyed directory
+/// convention as `config_path` -- written/read via WDSP's own
+/// `PSSaveCorr`/`PSRestoreCorr` (tx.rs), not this project's own
+/// serialization, so the `.dat` extension and internal format are
+/// whatever WDSP itself uses, not something to parse here.
+pub fn ps_corr_path(mac: [u8; 6]) -> Option<PathBuf> {
+    let home = std::env::var_os("HOME")?;
+    let mut path = PathBuf::from(home);
+    path.push(".config");
+    path.push("hpsdr-rs");
+    if std::fs::create_dir_all(&path).is_err() {
+        return None;
+    }
+    let [a, b, c, d, e, f] = mac;
+    path.push(format!("ps_corr-{a:02x}-{b:02x}-{c:02x}-{d:02x}-{e:02x}-{f:02x}.dat"));
+    Some(path)
+}
+
 impl Config {
     /// Loads the saved config for this specific radio (by MAC address),
     /// or a blank/default one if there isn't one yet (first run for
