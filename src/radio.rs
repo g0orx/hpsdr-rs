@@ -858,6 +858,7 @@ fn p1_send_preconfig_and_start(
             num_adcs,
             &[], // no extra receivers active yet this early -- falls back to the main frequency
             tx_iq,
+            ps_wire_total.is_some(),
         );
         socket.send(&packet)?;
         pre_seq = pre_seq.wrapping_add(1);
@@ -905,6 +906,9 @@ fn p1_build_packet(
     num_adcs: u8,
     extra_frequencies_hz: &[Arc<AtomicU32>],
     tx_iq: &Mutex<VecDeque<f32>>,
+    // PureSignal: command 10 (0x24)'s C2 bit 0x40 -- see that command's
+    // own doc comment below for what it does and why it matters.
+    puresignal_enabled: bool,
 ) -> [u8; PACKET_SIZE] {
     // MOX/PTT bit: inferred to be C0's bit 0 on both frames, based
     // on every register value used elsewhere in this file (0x00,
@@ -1090,28 +1094,40 @@ fn p1_build_packet(
             // CW keyer settings (C2-C4) -- this project has no CW
             // keyer, so all inert/off.
             //
-            // CANDIDATE FIX (C1), not yet confirmed against real
-            // hardware: piHPSDR's old_protocol.c (case 5) shows that
-            // on 2-ADC boards (Angelia, Orion, Orion2) C1 is the
-            // SECOND ADC's step attenuator, and bit 5 (0x20, "Att
-            // enable") "must be set all the time" per that
-            // reference's own comment, regardless of whether the
-            // second ADC is actually in use. This project previously
-            // left C1 hardcoded to 0x00 unconditionally -- leaving the
-            // second ADC's attenuator circuit unconfigured/floating on
-            // every 2-ADC board. Worth testing as the cause of a
-            // persistent comb-pattern spectrum + sawtooth-sounding
-            // audio seen on ANAN-100D/Angelia (ruled out to be RX
-            // overload or a connect-time transient by two other real-
-            // hardware tests, and confirmed absent when the identical
-            // radio is driven by piHPSDR instead -- i.e. real, this
-            // project's bug, not the hardware) -- an unconfigured
-            // second-ADC attenuator is a plausible source of analog
-            // crosstalk into the first ADC's signal path, which only
-            // 2-ADC boards have a second ADC to produce. No per-ADC1
-            // attenuation value tracked yet (unlike rx_attenuation for
-            // ADC0) -- just the required enable bit, at 0dB.
-            let c1: u8 = if num_adcs == 2 { 0x20 } else { 0x00 };
+            // piHPSDR's old_protocol.c (case 5) shows that on 2-ADC
+            // boards (Angelia, Orion, Orion2) C1 is the SECOND ADC's
+            // step attenuator, and bit 5 (0x20, "Att enable") "must be
+            // set all the time" regardless of whether the second ADC
+            // is actually in use. This project previously left C1
+            // hardcoded to 0x00 unconditionally -- an unconfigured
+            // second-ADC attenuator circuit was the confirmed real
+            // cause of a persistent comb-pattern spectrum + sawtooth-
+            // sounding audio on ANAN-100D/Angelia (fixed by always
+            // setting the enable bit, at 0dB, below).
+            //
+            // BUG FIX: a later pass wrongly flattened this to an
+            // unconditional 0x20 in every case, based on a (correct)
+            // observation that command 4/0x14's C4 byte does NOT use
+            // 0x3F while transmitting -- but conflated that with THIS
+            // byte, which per the same reference DOES: `if
+            // (isTransmitting()) { output_buffer[C1] = 0x3F; }` (max
+            // attenuation, "to protect the second ADC from strong
+            // signals"). Confirmed via a real packet capture of
+            // piHPSDR driving this exact radio with PureSignal active:
+            // C1 reads 0x3F throughout the TX+PS session, never 0x20.
+            // RX5 (this board family's TX-feedback receiver, see
+            // ps_feedback_config) very plausibly taps this second ADC
+            // -- sending 0dB instead of the expected max attenuation
+            // during TX would let the TX-feedback signal run far
+            // hotter into that ADC than intended, quite possibly
+            // clipping it and corrupting exactly the kind of curve fit
+            // PureSignal's calibration depends on. See the PureSignal
+            // plan doc's real-hardware-findings section.
+            let c1: u8 = if num_adcs == 2 {
+                if mox_on { 0x3F } else { 0x20 }
+            } else {
+                0x00
+            };
             (0x16, c1, 0x00, 0x00, 0x00)
         }
         6 => {
@@ -1143,7 +1159,35 @@ fn p1_build_packet(
         // never sent at all before this fix.
         8 => (0x20, 0x00, 0x00, 0x28, 0x0A),
         9 => (0x22, 0x19, 0x00, 0xC8, 0x00),
-        10 => (0x24, 0x00, 0x00, 0x00, 0x00),
+        10 => {
+            // BUG FIX: C2 bit 0x40 ("Synchronize RX5 and TX frequency
+            // on transmit (ANAN-7000)") was never set at all -- this
+            // command was hardcoded to all-zeros. Confirmed via a real
+            // packet capture of piHPSDR driving the same ANAN-8000DLE
+            // over P1 with PureSignal enabled: this exact byte reads
+            // 0x40 throughout the session (piHPSDR's old_protocol.c:
+            // `if (transmitter->puresignal) { output_buffer[C2] |=
+            // 0x40; }`, sent unconditionally whenever PS is enabled,
+            // not gated on mox). RX5 is this board family's TX-feedback
+            // receiver (see ps_feedback_config) -- without this bit,
+            // firmware has no reason to keep it tracking the actual TX
+            // frequency, so the "TX feedback" signal PureSignal
+            // calibrates against may not even be tuned to the right
+            // passband. This was found only by comparing wire bytes
+            // directly against a confirmed-working reference; see the
+            // PureSignal plan doc's real-hardware-findings section.
+            //
+            // C1 bit 0x80 ("ground RX2 on transmit") -- same capture,
+            // same command, also never implemented (was hardcoded to
+            // 0x00 always). piHPSDR: `if (isTransmitting()) {
+            // output_buffer[C1] |= 0x80; }`, unconditional on any
+            // board, not just PS -- included alongside the PS fix
+            // above since it's the same command and equally confirmed,
+            // even though it isn't itself PS-specific.
+            let c1 = if mox_on { 0x80 } else { 0x00 };
+            let c2 = if puresignal_enabled { 0x40 } else { 0x00 };
+            (0x24, c1, c2, 0x00, 0x00)
+        }
         _ => (0x2E, 0x00, 0x00, 0x04, 0x15),
     };
     if *current_receiver == 0 {
@@ -1272,6 +1316,7 @@ fn sender_loop(
             num_adcs,
             &extra_frequencies_hz,
             &tx_iq,
+            ps_wire_total.is_some(),
         );
 
         if socket.send(&packet).is_err() {

@@ -697,8 +697,25 @@ impl TxProcessor {
                     // for calibration to complete at all; the 0x0010
                     // cause is still unresolved (see the PureSignal plan
                     // doc's real-hardware-findings section).
+                    //
+                    // BUG FIX: SetTXAPostGenTTFreq was never called at
+                    // all, meaning the two tones ran at whatever WDSP's
+                    // internal default/uninitialized frequencies are --
+                    // NOT a real, properly-spread two-tone test signal.
+                    // Confirmed via piHPSDR's tx_set_twotone
+                    // (transmitter.c): it explicitly sets 900/1700 Hz
+                    // (negated for LSB-ish modes) before enabling. Magnitude
+                    // also nudged from 0.45 to piHPSDR's own 0.49 for a
+                    // full match while chasing the remaining PS
+                    // calibration issue on P1/Orion2 -- see the plan
+                    // doc's real-hardware-findings section.
+                    let (f1, f2) = match mode {
+                        Mode::Cwl | Mode::Lsb | Mode::Digl => (-900.0, -1700.0),
+                        _ => (900.0, 1700.0),
+                    };
+                    wdsp::SetTXAPostGenTTFreq(self.channel, f1, f2);
+                    wdsp::SetTXAPostGenTTMag(self.channel, 0.49, 0.49);
                     wdsp::SetTXAPostGenMode(self.channel, 1);
-                    wdsp::SetTXAPostGenTTMag(self.channel, 0.45, 0.45);
                     wdsp::SetTXAPostGenRun(self.channel, 1);
                 } else if tune {
                     wdsp::SetTXAPostGenMode(self.channel, 0);
