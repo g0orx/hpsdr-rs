@@ -1911,6 +1911,12 @@ impl eframe::App for HpsdrApp {
                                     let (meter_rect, _resp) =
                                         ui.allocate_exact_size(egui::vec2(180.0, 110.0), egui::Sense::hover());
                                     draw_s_meter(ui, meter_rect, meter_db);
+
+                                    ui.add_space(4.0);
+                                    if ui.button("Settings...").clicked() {
+                                        let mut rx = rx_for_closure.lock().unwrap();
+                                        rx.show_settings_window = !rx.show_settings_window;
+                                    }
                                 });
 
                             egui::CentralPanel::default().show(ui, |ui| {
@@ -1919,13 +1925,42 @@ impl eframe::App for HpsdrApp {
 
                             let show_settings = rx_for_closure.lock().unwrap().show_settings_window;
                             if show_settings {
-                                let mut still_open = show_settings;
-                                egui::Window::new(format!("Receiver {} Settings", ddc_index + 1))
-                                    .open(&mut still_open)
-                                    .show(ui, |ui| {
-                                        render_extra_receiver_settings(ui, &rx_for_closure);
-                                    });
-                                rx_for_closure.lock().unwrap().show_settings_window = still_open;
+                                // Own OS-level viewport, not nested inside
+                                // this receiver's window -- matches the
+                                // main Settings window's own treatment
+                                // (see its doc comment for why a light
+                                // theme override is needed) rather than
+                                // being confined to this receiver's own
+                                // viewport.
+                                let light_visuals = egui::Visuals::light();
+                                let light_style = egui::Style {
+                                    visuals: light_visuals.clone(),
+                                    ..Default::default()
+                                };
+                                let settings_viewport_id = egui::ViewportId::from_hash_of((
+                                    "extra_receiver_settings",
+                                    ddc_index,
+                                ));
+                                let rx_for_settings = Arc::clone(&rx_for_closure);
+                                let settings_title = format!("Receiver {} Settings", ddc_index + 1);
+                                ui.ctx().show_viewport_deferred(
+                                    settings_viewport_id,
+                                    egui::ViewportBuilder::default()
+                                        .with_title(settings_title)
+                                        .with_inner_size([420.0, 500.0]),
+                                    move |ui: &mut egui::Ui, _class: egui::ViewportClass| {
+                                        if ui.input(|i| i.viewport().close_requested()) {
+                                            rx_for_settings.lock().unwrap().show_settings_window = false;
+                                            return;
+                                        }
+                                        egui::CentralPanel::default()
+                                            .frame(egui::Frame::central_panel(&light_style))
+                                            .show(ui, |ui| {
+                                                ui.visuals_mut().clone_from(&light_visuals);
+                                                render_extra_receiver_settings(ui, &rx_for_settings);
+                                            });
+                                    },
+                                );
                             }
                         },
                     );
@@ -3680,11 +3715,6 @@ fn render_extra_receiver_ui(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceiver>>) {
             rx.settings_dirty.store(true, Ordering::Relaxed);
         }
     });
-
-    ui.add_space(4.0);
-    if ui.button("Settings...").clicked() {
-        rx.show_settings_window = !rx.show_settings_window;
-    }
 
     ui.add_space(4.0);
     ui.label("Spectrum");
