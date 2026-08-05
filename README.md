@@ -19,6 +19,7 @@ A Rust/egui desktop client for [openHPSDR](https://openhpsdr.org/) Protocol 1 an
 - Noise blanker (NB/NB2), noise reduction (NR/NR2/NR3/NR4), and SNB (spectral noise blanker), independently switchable
 - AGC with selectable Off/Long/Slow/Medium/Fast modes
 - TX: mic audio through WDSP's TXA chain, ALC, TX power/SWR meter with per-band PA calibration, and a Tune button (WDSP PostGen tone centered in the passband, at a separate reduced "Tune Power" for safe antenna/PA tuning)
+- PureSignal (PA linearization/predistortion), on both Protocol 1 and Protocol 2 — see [PureSignal calibration](#puresignal-calibration) below for how to set it up
 - rigctl (Hamlib-compatible) and TCI (WebSocket) control servers, for use with WSJT-X and similar digital-mode software
 - Per-radio settings persistence (keyed by the radio's MAC address, so multiple physical radios each keep their own saved configuration)
 
@@ -49,9 +50,21 @@ cargo run --release
 
 The app opens a discovery window that listens for radios on the network; select one to connect. Settings (frequency, mode, filter width, TX power, calibration, etc.) are saved automatically per-radio under `~/.config/hpsdr-rs/`.
 
+## PureSignal calibration
+
+PureSignal is enabled in Settings (takes effect on the next connect), then configured live in Settings → PureSignal while transmitting. The one setting that actually matters — and the thing to change first if calibration won't complete or `Correcting` never turns on — is **HW Peak**, which has to track the *real* envelope peak your radio produces at whatever drive level you're actually calibrating at. It is not a fixed per-board constant to leave alone, and the **Feedback Level** meter's "ideal" 90-256 range is only a rough guide, not a hard requirement — calibration has been confirmed working on real hardware at feedback levels both far below (single digits) and far above (thousands) that range, as long as HW Peak itself is right.
+
+Procedure, on any radio:
+1. Set **Tune Power %** low (start around 10-15%) — PureSignal calibration works best at a low real TX drive level, not a normal operating power.
+2. Press **Two Tone** (not Tune — a steady tone's constant envelope can never fill PureSignal's calibration buckets) and watch **Measured Peak TX** in the PureSignal panel for a few seconds.
+3. Set **HW Peak** to just above whatever Measured Peak TX settled at.
+4. Re-engage Two Tone. `Correcting` should turn on within a few seconds. If it doesn't:
+   - Stuck with Feedback Level at 0 and no progress: HW Peak is likely still too far from the true peak — recheck Measured Peak TX and adjust again.
+   - `Correcting` flickers on/off or never turns on despite Feedback Level being nonzero: try nudging Tune Power % up or down a little and repeat from step 2 — the exact drive level a clean calibration converges at is somewhat radio-dependent.
+
 ## Roadmap
 
-PureSignal (PA linearization/predistortion) is planned but not yet implemented — current focus is on stabilizing and testing Protocol 1 and Protocol 2 operation across different radios first.
+Current focus is on stabilizing and testing Protocol 1 and Protocol 2 operation, including PureSignal, across more radios.
 
 ## Contributing
 
