@@ -3,6 +3,7 @@ use eframe::egui;
 use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::Instant;
 
 /// Render one grid cell as a selectable widget rather than a plain label,
 /// so every column in a row participates in click-to-select and shows the
@@ -30,6 +31,16 @@ pub struct DiscoveryWindow {
     selected: Option<usize>,
     manual_ip: String,
     manual_error: Option<String>,
+    /// When this window was created -- used to keep re-sending a focus
+    /// command for a short window after creation (see `show`'s doc
+    /// comment on why a single one-shot Focus isn't reliable enough: the
+    /// main/root window is a genuinely separate OS window that can get
+    /// mapped/raised by the window manager slightly *after* this one,
+    /// re-covering it even though this window already received focus a
+    /// moment earlier). `None` once that grace period has ended so the
+    /// window stops stealing focus back if the user deliberately clicks
+    /// the main window during that window.
+    focus_deadline: Option<Instant>,
 }
 
 impl DiscoveryWindow {
@@ -43,6 +54,7 @@ impl DiscoveryWindow {
             selected: None,
             manual_ip: String::new(),
             manual_error: None,
+            focus_deadline: Some(Instant::now() + std::time::Duration::from_millis(1500)),
         };
         window.spawn_discovery(ctx.clone());
         window
@@ -86,12 +98,52 @@ impl DiscoveryWindow {
         // white regardless of focus.
         let light_visuals = egui::Visuals::light();
         let light_style = egui::Style { visuals: light_visuals.clone(), ..Default::default() };
-        egui::Window::new("Discover HPSDR Radios")
-            .open(&mut still_open)
-            .resizable(true)
-            .collapsible(false)
-            .frame(egui::Frame::window(&light_style))
-            .show(ui, |ui| {
+        // Rendered in its own OS-level viewport (like the extra receiver
+        // windows and the Settings window -- see its doc comment in
+        // main.rs) rather than an embedded egui::Window, so it can be
+        // dragged outside the main window's bounds. show_viewport_immediate
+        // (not _deferred) since this closure borrows `self`/`action`
+        // directly by reference rather than through an Arc<Mutex<>>.
+        // While `focus_deadline` is still active, also force the window
+        // level to AlwaysOnTop -- a plain Focus command only asks for
+        // keyboard focus, but the actual symptom here is the *main*
+        // window's own initial show/raise (eframe reveals its root
+        // window only after the first frame paints, and most window
+        // managers raise a window when it's newly shown) re-covering
+        // this one in stacking order a moment later regardless of which
+        // window has focus. AlwaysOnTop guarantees stacking order
+        // directly instead of depending on that race. Dropped back to
+        // Normal once the deadline passes so this window doesn't stay
+        // pinned above everything (e.g. the Settings window) forever.
+        let window_level = if self.focus_deadline.is_some() {
+            egui::WindowLevel::AlwaysOnTop
+        } else {
+            egui::WindowLevel::Normal
+        };
+        ui.ctx().show_viewport_immediate(
+            egui::ViewportId::from_hash_of("discovery_window"),
+            egui::ViewportBuilder::default()
+                .with_title("Discover HPSDR Radios")
+                .with_inner_size([700.0, 500.0])
+                .with_active(true)
+                .with_window_level(window_level),
+            |ui, _class| {
+                if let Some(deadline) = self.focus_deadline {
+                    let focused = ui.input(|i| i.viewport().focused).unwrap_or(false);
+                    if focused || Instant::now() >= deadline {
+                        self.focus_deadline = None;
+                    } else {
+                        ui.ctx().send_viewport_cmd(egui::ViewportCommand::Focus);
+                        ui.ctx().request_repaint();
+                    }
+                }
+                if ui.input(|i| i.viewport().close_requested()) {
+                    still_open = false;
+                    return;
+                }
+                egui::CentralPanel::default().frame(egui::Frame::central_panel(&light_style)).show(
+                    ui,
+                    |ui| {
                 ui.visuals_mut().clone_from(&light_visuals);
                 let discovering = *self.discovering.lock().unwrap();
 
@@ -247,9 +299,11 @@ impl DiscoveryWindow {
                         action = DiscoveryAction::Cancelled;
                     }
                 });
-            });
-
+                });
+            },
+        );
         self.open = still_open;
+
         if !still_open {
             action = DiscoveryAction::Cancelled;
         }

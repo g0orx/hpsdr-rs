@@ -1932,7 +1932,6 @@ impl eframe::App for HpsdrApp {
                 }
 
                 if connected.show_settings_window {
-                    let mut still_open = connected.show_settings_window;
                     // Light theme for this window specifically (white
                     // title bar/background, dark text) rather than the
                     // app's normal dark theme -- egui only paints a
@@ -1946,10 +1945,27 @@ impl eframe::App for HpsdrApp {
                     // regardless of focus.
                     let light_visuals = egui::Visuals::light();
                     let light_style = egui::Style { visuals: light_visuals.clone(), ..Default::default() };
-                    egui::Window::new("Settings")
-                        .open(&mut still_open)
-                        .frame(egui::Frame::window(&light_style))
-                        .show(ui, |ui| {
+                    // Rendered in its own OS-level viewport (like the
+                    // extra receiver windows) rather than an
+                    // embedded egui::Window, so it can be dragged
+                    // outside the main window's bounds -- see
+                    // show_viewport_immediate (not _deferred, since
+                    // this closure borrows `connected` directly by
+                    // reference rather than through an Arc<Mutex<>>).
+                    let mut close_requested = false;
+                    ui.ctx().show_viewport_immediate(
+                        egui::ViewportId::from_hash_of("settings_window"),
+                        egui::ViewportBuilder::default()
+                            .with_title("Settings")
+                            .with_inner_size([600.0, 700.0]),
+                        |ui, _class| {
+                            if ui.input(|i| i.viewport().close_requested()) {
+                                close_requested = true;
+                                return;
+                            }
+                            egui::CentralPanel::default()
+                                .frame(egui::Frame::central_panel(&light_style))
+                                .show(ui, |ui| {
                             ui.visuals_mut().clone_from(&light_visuals);
                             ui.horizontal(|ui| {
                                 for (tab, label) in [
@@ -2856,7 +2872,11 @@ impl eframe::App for HpsdrApp {
                                 }
                             }
                         });
-                    connected.show_settings_window = still_open;
+                        },
+                    );
+                    if close_requested {
+                        connected.show_settings_window = false;
+                    }
                 }
 
                 if settings_changed
