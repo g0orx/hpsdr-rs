@@ -1035,6 +1035,13 @@ fn drain_ps_feedback(
 fn run(
     mic_buffer: Arc<Mutex<VecDeque<f32>>>,
     tci_tx_audio: Arc<Mutex<VecDeque<f32>>>,
+    // Radio's own mic input (Settings -> TX -- "TX audio source: Radio
+    // Mic") -- see radio.rs's RadioSession::radio_mic_audio/
+    // use_radio_mic doc comments. An either/or SOURCE SELECTION, not
+    // another priority tier alongside tci_tx_audio/mic_buffer: when
+    // use_radio_mic is on, this is the ONLY source consulted below.
+    radio_mic_audio: Arc<Mutex<VecDeque<f32>>>,
+    use_radio_mic: Arc<AtomicBool>,
     tx_iq_out: Arc<Mutex<VecDeque<f32>>>,
     // Fed with the SAME generated TX IQ that goes out over the wire
     // (tx_iq_out), for a dedicated TX spectrum display -- see main.rs's
@@ -1157,6 +1164,7 @@ fn run(
             // running the TXA chain on nothing.
             mic_buffer.lock().unwrap().clear();
             tci_tx_audio.lock().unwrap().clear();
+            radio_mic_audio.lock().unwrap().clear();
             if puresignal_enabled {
                 // Same reasoning as the mic/TCI clears above -- a
                 // feedback backlog from before this idle period is
@@ -1185,7 +1193,19 @@ fn run(
             }
         }
 
-        {
+        if use_radio_mic.load(Ordering::Relaxed) {
+            // Explicit either/or source selection (Settings -> TX) --
+            // bypasses TCI/local mic entirely while on, rather than
+            // adding a third implicit-priority tier alongside them. See
+            // radio.rs's RadioSession::use_radio_mic doc comment.
+            let mut buf = radio_mic_audio.lock().unwrap();
+            if buf.len() < TX_BUFFER_SIZE {
+                starved_chunks_this_window += 1;
+            }
+            for slot in chunk.iter_mut() {
+                *slot = buf.pop_front().unwrap_or(0.0); // silence on underrun, not silence on stall
+            }
+        } else {
             // TCI-sourced audio takes priority over the local mic for
             // any chunk where it has a full chunk's worth available --
             // see radio.rs's tci_tx_audio doc comment for why this is
@@ -1342,6 +1362,9 @@ impl TxHandle {
     pub fn start(
         mic_buffer: Arc<Mutex<VecDeque<f32>>>,
         tci_tx_audio: Arc<Mutex<VecDeque<f32>>>,
+        // See run()'s doc comment on the parameters of the same name.
+        radio_mic_audio: Arc<Mutex<VecDeque<f32>>>,
+        use_radio_mic: Arc<AtomicBool>,
         tx_iq_out: Arc<Mutex<VecDeque<f32>>>,
         // See run()'s doc comment on the parameter of the same name.
         tx_spectrum_iq: Arc<Mutex<VecDeque<IqSample>>>,
@@ -1374,9 +1397,10 @@ impl TxHandle {
             let stop = Arc::clone(&stop);
             thread::spawn(move || {
                 run(
-                    mic_buffer, tci_tx_audio, tx_iq_out, tx_spectrum_iq, mox, params, display,
-                    channel, protocol, mic_rate, duc_rate, puresignal_enabled, ps_rx_feedback_iq,
-                    ps_tx_feedback_iq, ps_params, ps_status, ps_corr_path, stop,
+                    mic_buffer, tci_tx_audio, radio_mic_audio, use_radio_mic, tx_iq_out,
+                    tx_spectrum_iq, mox, params, display, channel, protocol, mic_rate, duc_rate,
+                    puresignal_enabled, ps_rx_feedback_iq, ps_tx_feedback_iq, ps_params, ps_status,
+                    ps_corr_path, stop,
                 )
             })
         };

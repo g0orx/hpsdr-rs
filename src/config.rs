@@ -161,6 +161,21 @@ pub struct Config {
     /// the live default.
     #[serde(default)]
     pub send_rx_audio_to_radio: Option<bool>,
+    /// See radio::RadioSession::use_radio_mic's doc comment (Settings ->
+    /// TX). Missing/never set falls back to off (local mic), same as
+    /// the live default.
+    #[serde(default)]
+    pub use_radio_mic: Option<bool>,
+    /// See radio::RadioSession::mic_ptt_enabled/mic_bias_enabled/
+    /// mic_ptt_on_tip's doc comments (Settings -> TX, standard boards
+    /// only). Missing/never set falls back to off/off/"PTT on Ring",
+    /// same as the live defaults.
+    #[serde(default)]
+    pub mic_ptt_enabled: Option<bool>,
+    #[serde(default)]
+    pub mic_bias_enabled: Option<bool>,
+    #[serde(default)]
+    pub mic_ptt_on_tip: Option<bool>,
 }
 
 fn default_nb_threshold() -> f64 {

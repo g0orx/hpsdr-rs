@@ -91,6 +91,10 @@ const TX_IQ_BUFFER_CAPACITY: usize = 100_000;
 /// counterpart of that local-mic buffer).
 const TCI_TX_AUDIO_CAPACITY: usize = 24_000;
 
+/// Same "small, bounded, drop-oldest" reasoning as TCI_TX_AUDIO_CAPACITY
+/// above -- radio-sourced mic audio (see RadioSession::radio_mic_audio).
+const RADIO_MIC_AUDIO_CAPACITY: usize = 24_000;
+
 /// Just an initial-capacity hint for the queue below (like the other
 /// constants here) -- the actual enforced drop-oldest bound is
 /// spectrum.rs's own AUDIO_BUFFER_CAPACITY (also 14,400, same value),
@@ -326,6 +330,48 @@ pub struct RadioSession {
     /// stable across TX arm/disarm cycles and TCI server restarts,
     /// rather than being recreated each time either does.
     pub tci_tx_audio: Arc<Mutex<VecDeque<f32>>>,
+    /// Mic audio digitized by the RADIO'S OWN mic input (as opposed to
+    /// this PC's local mic/sound card) and sent to the host as part of
+    /// the normal incoming stream -- confirmed against piHPSDR's
+    /// old_protocol.c/new_protocol.c (`local_microphone` flag: false =
+    /// use this radio-sourced sample instead of the local one). P1:
+    /// interleaved into the SAME per-sample-group 2-byte slot as every
+    /// other RX IQ sample (parse_iq_stream already skipped past this
+    /// slot before this feature existed -- see its own doc comment).
+    /// P2: a dedicated incoming UDP stream on P2_TX_SPECIFIC_PORT
+    /// (source port, distinct from that same port's OUTGOING use for
+    /// TX-specific config -- see p2_receiver_loop). Always filled
+    /// regardless of `use_radio_mic` below, same "cheap to fill, gate
+    /// consumption instead" convention as rx_audio_to_radio.
+    pub radio_mic_audio: Arc<Mutex<VecDeque<f32>>>,
+    /// Live toggle (Settings -> TX -- "TX audio source: Radio Mic"):
+    /// when true, tx.rs's run() sources TX audio exclusively from
+    /// radio_mic_audio instead of tci_tx_audio/mic_buffer (a plain
+    /// either/or selection, not another priority tier -- see run()'s
+    /// own doc comment). Default off (local mic), matching every other
+    /// opt-in feature added so far.
+    pub use_radio_mic: Arc<AtomicBool>,
+    /// Radio's mic-jack PTT input enabled/disabled -- confirmed against
+    /// piHPSDR (`mic_ptt_enabled`, its own default off). Standard
+    /// (Angelia/Orion/Orion2) boards only. P1: command 4 (0x14)'s C1
+    /// bit 0x40 -- inverted logic, set means DISABLED (this project
+    /// previously hardcoded that bit permanently set, i.e. permanently
+    /// disabled, before this control existed -- see p1_build_packet's
+    /// command-4 doc comment). P2: TX-specific packet byte 50 bit 0x04,
+    /// same inverted logic, confirmed against new_protocol.c.
+    pub mic_ptt_enabled: Arc<AtomicBool>,
+    /// Radio's mic-jack bias voltage (for electret mic elements)
+    /// enabled/disabled -- confirmed against piHPSDR (`mic_bias_enabled`,
+    /// its own default off). Standard boards only. P1: command 4's C1
+    /// bit 0x20. P2: TX-specific packet byte 50 bit 0x10.
+    pub mic_bias_enabled: Arc<AtomicBool>,
+    /// Mic connector wiring: false (default, matches piHPSDR's own
+    /// default) = "PTT on Ring, Mic and Bias on Tip"; true = "PTT on
+    /// Tip, Mic and Bias on Ring" -- confirmed against piHPSDR
+    /// (`mic_ptt_tip_bias_ring`, radio_menu.c's own exact button
+    /// labels). Standard boards only. P1: command 4's C1 bit 0x10. P2:
+    /// TX-specific packet byte 50 bit 0x08.
+    pub mic_ptt_on_tip: Arc<AtomicBool>,
     /// Locally-demodulated audio for the MAIN receiver only (not extra
     /// receivers -- the radio has exactly one local audio output,
     /// matching piHPSDR's "active receiver" concept), fed directly by
@@ -431,18 +477,25 @@ impl RadioSession {
         let ps_tx_feedback_iq = Arc::new(Mutex::new(VecDeque::with_capacity(PS_FEEDBACK_BUFFER_CAPACITY)));
         let rx_audio_to_radio = Arc::new(Mutex::new(VecDeque::with_capacity(RX_AUDIO_TO_RADIO_CAPACITY)));
         let send_rx_audio_to_radio = Arc::new(AtomicBool::new(false));
+        let radio_mic_audio = Arc::new(Mutex::new(VecDeque::with_capacity(RADIO_MIC_AUDIO_CAPACITY)));
+        let use_radio_mic = Arc::new(AtomicBool::new(false));
+        let mic_ptt_enabled = Arc::new(AtomicBool::new(false));
+        let mic_bias_enabled = Arc::new(AtomicBool::new(false));
+        let mic_ptt_on_tip = Arc::new(AtomicBool::new(false));
         match device.protocol {
             1 => start_protocol1(
                 device, settings, frequency_hz, sample_rate, adc, antenna, rx_attenuation,
                 ps_tx_attenuation, mox, tx_iq, tci_tx_audio, tx_power_watts, pa_gain_db,
                 tx_forward_power, tx_reverse_power, ps_rx_feedback_iq, ps_tx_feedback_iq,
-                rx_audio_to_radio, send_rx_audio_to_radio,
+                rx_audio_to_radio, send_rx_audio_to_radio, radio_mic_audio, use_radio_mic,
+                mic_ptt_enabled, mic_bias_enabled, mic_ptt_on_tip,
             ),
             2 => start_protocol2(
                 device, settings, frequency_hz, sample_rate, adc, antenna, rx_attenuation,
                 ps_tx_attenuation, mox, tx_iq, tci_tx_audio, tx_power_watts, pa_gain_db,
                 tx_forward_power, tx_reverse_power, ps_rx_feedback_iq, ps_tx_feedback_iq,
-                rx_audio_to_radio, send_rx_audio_to_radio,
+                rx_audio_to_radio, send_rx_audio_to_radio, radio_mic_audio, use_radio_mic,
+                mic_ptt_enabled, mic_bias_enabled, mic_ptt_on_tip,
             ),
             p => Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -583,6 +636,11 @@ fn start_protocol1(
     ps_tx_feedback_iq: Arc<Mutex<VecDeque<IqSample>>>,
     rx_audio_to_radio: Arc<Mutex<VecDeque<f32>>>,
     send_rx_audio_to_radio: Arc<AtomicBool>,
+    radio_mic_audio: Arc<Mutex<VecDeque<f32>>>,
+    use_radio_mic: Arc<AtomicBool>,
+    mic_ptt_enabled: Arc<AtomicBool>,
+    mic_bias_enabled: Arc<AtomicBool>,
+    mic_ptt_on_tip: Arc<AtomicBool>,
 ) -> io::Result<RadioSession> {
     let socket = UdpSocket::bind(("0.0.0.0", 0))?;
     socket.set_read_timeout(Some(Duration::from_millis(500)))?;
@@ -642,6 +700,9 @@ fn start_protocol1(
         ps_tx_attenuation.load(Ordering::Relaxed) as u8,
         device.adcs,
         &tx_iq,
+        mic_ptt_enabled.load(Ordering::Relaxed),
+        mic_bias_enabled.load(Ordering::Relaxed),
+        mic_ptt_on_tip.load(Ordering::Relaxed),
     )?;
 
     let stop_flag = Arc::new(AtomicBool::new(false));
@@ -687,6 +748,9 @@ fn start_protocol1(
     let sender_num_adcs = device.adcs;
     let sender_rx_audio_to_radio = Arc::clone(&rx_audio_to_radio);
     let sender_send_rx_audio_to_radio = Arc::clone(&send_rx_audio_to_radio);
+    let sender_mic_ptt_enabled = Arc::clone(&mic_ptt_enabled);
+    let sender_mic_bias_enabled = Arc::clone(&mic_bias_enabled);
+    let sender_mic_ptt_on_tip = Arc::clone(&mic_ptt_on_tip);
     let sender_thread = thread::spawn(move || {
         sender_loop(
             sender_socket,
@@ -706,6 +770,9 @@ fn start_protocol1(
             ps_wire_total,
             sender_rx_audio_to_radio,
             sender_send_rx_audio_to_radio,
+            sender_mic_ptt_enabled,
+            sender_mic_bias_enabled,
+            sender_mic_ptt_on_tip,
             sender_stop,
         );
     });
@@ -719,6 +786,7 @@ fn start_protocol1(
     let receiver_tx_reverse_power = Arc::clone(&tx_reverse_power);
     let receiver_ps_rx_feedback_iq = Arc::clone(&ps_rx_feedback_iq);
     let receiver_ps_tx_feedback_iq = Arc::clone(&ps_tx_feedback_iq);
+    let receiver_radio_mic_audio = Arc::clone(&radio_mic_audio);
     let receiver_thread = thread::spawn(move || {
         receiver_loop(
             receiver_socket,
@@ -731,6 +799,7 @@ fn start_protocol1(
             ps_feedback_indices,
             receiver_ps_rx_feedback_iq,
             receiver_ps_tx_feedback_iq,
+            receiver_radio_mic_audio,
             receiver_stop,
         );
     });
@@ -754,6 +823,11 @@ fn start_protocol1(
         tci_tx_audio,
         rx_audio_to_radio,
         send_rx_audio_to_radio,
+        radio_mic_audio,
+        use_radio_mic,
+        mic_ptt_enabled,
+        mic_bias_enabled,
+        mic_ptt_on_tip,
         tx_power_watts,
         pa_gain_db,
         tx_forward_power,
@@ -977,6 +1051,9 @@ fn p1_send_preconfig_and_start(
     ps_tx_attenuation: u8,
     num_adcs: u8,
     tx_iq: &Mutex<VecDeque<f32>>,
+    mic_ptt_enabled: bool,
+    mic_bias_enabled: bool,
+    mic_ptt_on_tip: bool,
 ) -> io::Result<()> {
     let mut pre_seq: u32 = 0;
     let mut pre_ozy_command: u8 = 1;
@@ -1006,6 +1083,9 @@ fn p1_send_preconfig_and_start(
             false, // send_rx_audio: never during startup config, nothing keyed yet
             &mut dummy_rx_audio_pacer,
             1.0,
+            mic_ptt_enabled,
+            mic_bias_enabled,
+            mic_ptt_on_tip,
         );
         socket.send(&packet)?;
         pre_seq = pre_seq.wrapping_add(1);
@@ -1063,6 +1143,11 @@ fn p1_build_packet(
     send_rx_audio: bool,
     rx_audio_pacer: &mut RxAudioPacer,
     rx_audio_slots_per_sample: f64,
+    // See RadioSession::mic_ptt_enabled/mic_bias_enabled/mic_ptt_on_tip's
+    // doc comments.
+    mic_ptt_enabled: bool,
+    mic_bias_enabled: bool,
+    mic_ptt_on_tip: bool,
 ) -> [u8; PACKET_SIZE] {
     // MOX/PTT bit: inferred to be C0's bit 0 on both frames, based
     // on every register value used elsewhere in this file (0x00,
@@ -1191,18 +1276,19 @@ fn p1_build_packet(
             // Mic bias/PTT-source config (C1) and RX/TX
             // attenuation (C4).
             //
-            // BUG FIX: C1 was hardcoded to 0x00 entirely, on the
-            // (wrong) assumption there was nothing to track here.
-            // piHPSDR's C1 bit 0x40 is set whenever `mic_ptt_enabled`
-            // (a physical mic-connector PTT switch) is FALSE -- which
-            // is piHPSDR's own default (`int mic_ptt_enabled=0;` in
-            // radio.c), i.e. the bit is set in typical/default usage.
-            // This project has no physical-mic-PTT concept at all (TX
-            // audio comes from software/TCI, not a mic jack), so this
-            // is unconditionally the "no mic PTT" case -- the bit
-            // should always be set, not left at 0. Bits 0x20 (mic
-            // bias) and 0x10 (mic PTT tip/ring) stay 0 -- no mic bias
-            // or physical mic connector exists here either.
+            // C1 bits confirmed against piHPSDR's old_protocol.c
+            // (command-4 case) and radio_menu.c (exact UI labels/
+            // semantics) -- see RadioSession::mic_ptt_enabled/
+            // mic_bias_enabled/mic_ptt_on_tip's doc comments. Live,
+            // user-configurable settings (Settings -> TX, standard
+            // Angelia/Orion/Orion2 boards -- matching piHPSDR's own UI
+            // gating, though the wire encoding itself isn't board-
+            // gated, same as ps_tx_attenuation). Default false/false/
+            // false (PTT disabled, bias off, PTT-on-Ring) matches both
+            // piHPSDR's own defaults and this project's prior hardcoded
+            // "always 0x40, no mic PTT" behavior, so existing setups
+            // see zero behavior change until this is explicitly turned
+            // on.
             //
             // BUG FIX: an earlier session's "ROOT CAUSE FIX" claimed
             // piHPSDR sends 0x3F (all attenuator bits set) here while
@@ -1242,7 +1328,17 @@ fn p1_build_packet(
             // gain boost" default otherwise.
             let c4: u8 =
                 if is_hermes_lite { 0x40 } else { 0x20 | (rx_attenuation & 0x1F) };
-            (0x14, 0x40, 0x00, 0x00, c4)
+            let mut c1 = 0u8;
+            if !mic_ptt_enabled {
+                c1 |= 0x40;
+            }
+            if mic_bias_enabled {
+                c1 |= 0x20;
+            }
+            if mic_ptt_on_tip {
+                c1 |= 0x10;
+            }
+            (0x14, c1, 0x00, 0x00, c4)
         }
         5 => {
             // CW keyer settings (C2-C4) -- this project has no CW
@@ -1401,6 +1497,9 @@ fn sender_loop(
     ps_wire_total: Option<u8>,
     rx_audio_to_radio: Arc<Mutex<VecDeque<f32>>>,
     send_rx_audio_to_radio: Arc<AtomicBool>,
+    mic_ptt_enabled: Arc<AtomicBool>,
+    mic_bias_enabled: Arc<AtomicBool>,
+    mic_ptt_on_tip: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
 ) {
     let mut seq: u32 = 0;
@@ -1504,6 +1603,9 @@ fn sender_loop(
             send_rx_audio,
             &mut rx_audio_pacer,
             rx_audio_slots_per_sample,
+            mic_ptt_enabled.load(Ordering::Relaxed),
+            mic_bias_enabled.load(Ordering::Relaxed),
+            mic_ptt_on_tip.load(Ordering::Relaxed),
         );
 
         if socket.send(&packet).is_err() {
@@ -1663,6 +1765,7 @@ fn receiver_loop(
     ps_feedback_indices: Option<(u8, u8)>,
     ps_rx_feedback_iq: Arc<Mutex<VecDeque<IqSample>>>,
     ps_tx_feedback_iq: Arc<Mutex<VecDeque<IqSample>>>,
+    radio_mic_audio: Arc<Mutex<VecDeque<f32>>>,
     stop: Arc<AtomicBool>,
 ) {
     let mut buf = [0u8; PACKET_SIZE + 64]; // a little slack in case of larger packets
@@ -1704,6 +1807,7 @@ fn receiver_loop(
                         ps_feedback_indices,
                         &ps_rx_feedback_iq,
                         &ps_tx_feedback_iq,
+                        &radio_mic_audio,
                         &mut carry,
                         &mut frame_synced,
                     );
@@ -1778,6 +1882,7 @@ fn parse_iq_stream(
     ps_feedback_indices: Option<(u8, u8)>,
     ps_rx_feedback_iq: &Arc<Mutex<VecDeque<IqSample>>>,
     ps_tx_feedback_iq: &Arc<Mutex<VecDeque<IqSample>>>,
+    radio_mic_audio: &Arc<Mutex<VecDeque<f32>>>,
     // DIAGNOSTIC (Phase 1 -- protocol plumbing verification, see
     // receiver_loop's per-second summary): returns how many samples
     // this call routed into (ps_rx_feedback_iq, ps_tx_feedback_iq), so
@@ -1871,7 +1976,14 @@ fn parse_iq_stream(
                     _ => push_sample(&buffers[rx], sample, capacity),
                 }
             }
-            b += 2; // mic sample, unused on receive side
+            // Radio's own mic ADC sample -- confirmed against piHPSDR's
+            // old_protocol.c: signed 16-bit big-endian, immediately
+            // after this sample-group's IQ data (same slot this project
+            // previously just skipped past). See
+            // RadioSession::radio_mic_audio's doc comment.
+            let mic_sample = i16::from_be_bytes([frame[b], frame[b + 1]]);
+            b += 2;
+            push_audio_sample(radio_mic_audio, mic_sample as f32 / 32767.0, RADIO_MIC_AUDIO_CAPACITY);
         }
 
         carry.drain(0..USB_FRAME_SIZE);
@@ -1889,6 +2001,14 @@ fn sign_extend_24(b0: u8, b1: u8, b2: u8) -> i32 {
 }
 
 fn push_sample(buf: &Arc<Mutex<VecDeque<IqSample>>>, s: IqSample, capacity: usize) {
+    let mut q = buf.lock().unwrap();
+    if q.len() >= capacity {
+        q.pop_front();
+    }
+    q.push_back(s);
+}
+
+fn push_audio_sample(buf: &Arc<Mutex<VecDeque<f32>>>, s: f32, capacity: usize) {
     let mut q = buf.lock().unwrap();
     if q.len() >= capacity {
         q.pop_front();
@@ -1937,6 +2057,11 @@ fn start_protocol2(
     ps_tx_feedback_iq: Arc<Mutex<VecDeque<IqSample>>>,
     rx_audio_to_radio: Arc<Mutex<VecDeque<f32>>>,
     send_rx_audio_to_radio: Arc<AtomicBool>,
+    radio_mic_audio: Arc<Mutex<VecDeque<f32>>>,
+    use_radio_mic: Arc<AtomicBool>,
+    mic_ptt_enabled: Arc<AtomicBool>,
+    mic_bias_enabled: Arc<AtomicBool>,
+    mic_ptt_on_tip: Arc<AtomicBool>,
 ) -> io::Result<RadioSession> {
     // PureSignal (P2): see ps_feedback_config's doc comment. DDC0/DDC1
     // are reserved ahead of real receivers, which start at DDC2 instead
@@ -2032,6 +2157,9 @@ fn start_protocol2(
     let sender_pa_gain_db = Arc::clone(&pa_gain_db);
     let sender_hp_request = Arc::clone(&hp_request);
     let sender_ps_tx_attenuation = Arc::clone(&ps_tx_attenuation);
+    let sender_mic_ptt_enabled = Arc::clone(&mic_ptt_enabled);
+    let sender_mic_bias_enabled = Arc::clone(&mic_bias_enabled);
+    let sender_mic_ptt_on_tip = Arc::clone(&mic_ptt_on_tip);
     let num_adcs = device.adcs;
     let sender_thread = thread::spawn(move || {
         p2_sender_loop(
@@ -2052,6 +2180,9 @@ fn start_protocol2(
             sender_hp_request,
             puresignal_enabled,
             sender_ps_tx_attenuation,
+            sender_mic_ptt_enabled,
+            sender_mic_bias_enabled,
+            sender_mic_ptt_on_tip,
             sender_stop,
         );
     });
@@ -2082,6 +2213,7 @@ fn start_protocol2(
     let receiver_tx_reverse_power = Arc::clone(&tx_reverse_power);
     let receiver_ps_rx_feedback_iq = Arc::clone(&ps_rx_feedback_iq);
     let receiver_ps_tx_feedback_iq = Arc::clone(&ps_tx_feedback_iq);
+    let receiver_radio_mic_audio = Arc::clone(&radio_mic_audio);
     let receiver_thread = thread::spawn(move || {
         p2_receiver_loop(
             receiver_socket,
@@ -2093,6 +2225,7 @@ fn start_protocol2(
             puresignal_enabled,
             receiver_ps_rx_feedback_iq,
             receiver_ps_tx_feedback_iq,
+            receiver_radio_mic_audio,
             receiver_stop,
         );
     });
@@ -2116,6 +2249,11 @@ fn start_protocol2(
         tci_tx_audio,
         rx_audio_to_radio,
         send_rx_audio_to_radio,
+        radio_mic_audio,
+        use_radio_mic,
+        mic_ptt_enabled,
+        mic_bias_enabled,
+        mic_ptt_on_tip,
         tx_power_watts,
         pa_gain_db,
         tx_forward_power,
@@ -2242,7 +2380,12 @@ fn p2_ddc_specific_packet(
 // -- see p2_tx_specific_packet.
 const P2_TX_SPECIFIC_PACKET_SIZE: usize = 60;
 
-fn p2_tx_specific_packet(seq: u32) -> [u8; P2_TX_SPECIFIC_PACKET_SIZE] {
+fn p2_tx_specific_packet(
+    seq: u32,
+    mic_ptt_enabled: bool,
+    mic_bias_enabled: bool,
+    mic_ptt_on_tip: bool,
+) -> [u8; P2_TX_SPECIFIC_PACKET_SIZE] {
     let mut p = [0u8; P2_TX_SPECIFIC_PACKET_SIZE];
     p[0..4].copy_from_slice(&seq.to_be_bytes());
     // Number of DACs -- confirmed by the user: always 1, not gated on
@@ -2265,13 +2408,29 @@ fn p2_tx_specific_packet(seq: u32) -> [u8; P2_TX_SPECIFIC_PACKET_SIZE] {
     // sidetone volume (0x14 observed); bytes 7-8 -- sidetone frequency
     // (0x028a = 650Hz observed); byte 9 -- keyer speed (0x0c = 12wpm
     // observed); byte 10 -- keyer weight (0x1e observed); bytes 11-12
-    // -- keyer hang time (0x012c = 300ms observed); byte 50 -- mic/line
-    // routing flags (0x12 observed); byte 51 -- line-in gain (0x10
-    // observed). None of these looked related to the "no state
-    // transition" symptom (they're CW/audio-routing config, not
+    // -- keyer hang time (0x012c = 300ms observed); byte 51 -- line-in
+    // gain (0x10 observed). None of these looked related to the "no
+    // state transition" symptom (they're CW/audio-routing config, not
     // TX-enable), so still left as a follow-up rather than guessed at
     // -- but now with real confirmed values to match if it turns out
     // to matter, rather than needing to reverse-engineer them blind.
+    //
+    // Byte 50 -- mic/line routing flags: bits 0x01 (mic_linein) and
+    // 0x02 (mic_boost) still left at 0/unimplemented (not requested).
+    // Bits 0x04/0x08/0x10 confirmed against piHPSDR's new_protocol.c --
+    // see RadioSession::mic_ptt_enabled/mic_bias_enabled/
+    // mic_ptt_on_tip's doc comments for what each means.
+    let mut b50 = 0u8;
+    if !mic_ptt_enabled {
+        b50 |= 0x04;
+    }
+    if mic_ptt_on_tip {
+        b50 |= 0x08;
+    }
+    if mic_bias_enabled {
+        b50 |= 0x10;
+    }
+    p[50] = b50;
     p
 }
 
@@ -2462,6 +2621,11 @@ fn p2_sender_loop(
     puresignal_enabled: bool,
     // See RadioSession::ps_tx_attenuation's doc comment.
     ps_tx_attenuation: Arc<AtomicU32>,
+    // See RadioSession::mic_ptt_enabled/mic_bias_enabled/mic_ptt_on_tip's
+    // doc comments.
+    mic_ptt_enabled: Arc<AtomicBool>,
+    mic_bias_enabled: Arc<AtomicBool>,
+    mic_ptt_on_tip: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
 ) {
     let mut general_seq: u32 = 0;
@@ -2580,7 +2744,12 @@ fn p2_sender_loop(
         if due_for_keepalive {
             let general = p2_general_packet(general_seq, num_adcs);
             let ddc = p2_ddc_specific_packet(ddc_seq, &rates, &adcs, num_adcs, ps_mox_gate);
-            let tx = p2_tx_specific_packet(tx_seq);
+            let tx = p2_tx_specific_packet(
+                tx_seq,
+                mic_ptt_enabled.load(Ordering::Relaxed),
+                mic_bias_enabled.load(Ordering::Relaxed),
+                mic_ptt_on_tip.load(Ordering::Relaxed),
+            );
             let hp =
                 p2_high_priority_packet(hp_seq, &freqs, antenna_now, mox_on, tx_freq_hz, drive, ps_tx_atten);
 
@@ -2639,6 +2808,7 @@ fn p2_receiver_loop(
     puresignal_enabled: bool,
     ps_rx_feedback_iq: Arc<Mutex<VecDeque<IqSample>>>,
     ps_tx_feedback_iq: Arc<Mutex<VecDeque<IqSample>>>,
+    radio_mic_audio: Arc<Mutex<VecDeque<f32>>>,
     stop: Arc<AtomicBool>,
 ) {
     let mut buf = [0u8; P2_PACKET_SIZE + 64];
@@ -2696,9 +2866,18 @@ fn p2_receiver_loop(
                         tx_reverse_power.store(reverse as u32, Ordering::Relaxed);
                     }
                     hp_request.store(true, Ordering::Relaxed);
+                } else if port == P2_TX_SPECIFIC_PORT {
+                    // Radio's own mic ADC samples -- confirmed against
+                    // piHPSDR's new_protocol.c (process_mic_data): this
+                    // SOURCE port (distinct from this same port number's
+                    // OUTGOING use for TX-specific config, same "reused
+                    // number, different direction" convention as
+                    // P2_HP_STATUS_SOURCE_PORT above). See
+                    // RadioSession::radio_mic_audio's doc comment.
+                    p2_parse_mic_packet(&buf[..n], &radio_mic_audio);
                 }
-                // mic (1026), wideband (1027), command replies (1024):
-                // still not consumed.
+                // wideband (1027), command replies (1024): still not
+                // consumed.
             }
             Err(e)
                 if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut =>
@@ -2727,6 +2906,24 @@ fn p2_parse_ddc_iq_packet(packet: &[u8], buffer: &Arc<Mutex<VecDeque<IqSample>>>
         let q = sign_extend_24(packet[b + 3], packet[b + 4], packet[b + 5]);
         b += 6;
         push_sample(buffer, IqSample { i, q }, capacity);
+    }
+}
+
+/// Radio's own mic ADC packet: 4-byte seq, then P2_MIC_SAMPLES_PER_FRAME
+/// interleaved signed 16-bit big-endian samples -- confirmed against
+/// piHPSDR's new_protocol.c (process_mic_data/MIC_SAMPLES=64, matching
+/// this project's own 4+64*2=132-byte expectation).
+const P2_MIC_SAMPLES_PER_FRAME: usize = 64;
+
+fn p2_parse_mic_packet(packet: &[u8], radio_mic_audio: &Arc<Mutex<VecDeque<f32>>>) {
+    if packet.len() < 4 + P2_MIC_SAMPLES_PER_FRAME * 2 {
+        return;
+    }
+    let mut b = 4;
+    for _ in 0..P2_MIC_SAMPLES_PER_FRAME {
+        let sample = i16::from_be_bytes([packet[b], packet[b + 1]]);
+        b += 2;
+        push_audio_sample(radio_mic_audio, sample as f32 / 32767.0, RADIO_MIC_AUDIO_CAPACITY);
     }
 }
 

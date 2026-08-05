@@ -449,6 +449,14 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                 cfg.send_rx_audio_to_radio.unwrap_or(false),
                 Ordering::Relaxed,
             );
+            session.use_radio_mic.store(cfg.use_radio_mic.unwrap_or(false), Ordering::Relaxed);
+            session
+                .mic_ptt_enabled
+                .store(cfg.mic_ptt_enabled.unwrap_or(false), Ordering::Relaxed);
+            session
+                .mic_bias_enabled
+                .store(cfg.mic_bias_enabled.unwrap_or(false), Ordering::Relaxed);
+            session.mic_ptt_on_tip.store(cfg.mic_ptt_on_tip.unwrap_or(false), Ordering::Relaxed);
             let spectrum = SpectrumHandle::start(
                 0,
                 Arc::clone(&session.iq_buffers[0]),
@@ -623,6 +631,8 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                     let tx_handle = TxHandle::start(
                         mic_buffer,
                         Arc::clone(&session.tci_tx_audio),
+                        Arc::clone(&session.radio_mic_audio),
+                        Arc::clone(&session.use_radio_mic),
                         Arc::clone(&session.tx_iq),
                         Arc::clone(&tx_spectrum_iq),
                         Arc::clone(&session.mox),
@@ -2635,6 +2645,8 @@ impl eframe::App for HpsdrApp {
                                                     let tx_handle = TxHandle::start(
                                                         mic_buffer,
                                                         Arc::clone(&connected.session.tci_tx_audio),
+                                                        Arc::clone(&connected.session.radio_mic_audio),
+                                                        Arc::clone(&connected.session.use_radio_mic),
                                                         Arc::clone(&connected.session.tx_iq),
                                                         Arc::clone(&tx_spectrum_iq),
                                                         Arc::clone(&connected.session.mox),
@@ -2697,6 +2709,87 @@ impl eframe::App for HpsdrApp {
                                             connected.two_tone_active = false;
                                         }
                                         settings_changed = true;
+                                    }
+
+                                    // Either/or TX audio source selection --
+                                    // see radio::RadioSession::use_radio_mic's
+                                    // doc comment. Off (local mic/TCI, the
+                                    // existing behavior) by default.
+                                    ui.add_space(8.0);
+                                    let mut use_radio_mic =
+                                        connected.session.use_radio_mic.load(Ordering::Relaxed);
+                                    if ui
+                                        .checkbox(&mut use_radio_mic, "Use radio's mic input for TX audio")
+                                        .changed()
+                                    {
+                                        connected.session.use_radio_mic.store(use_radio_mic, Ordering::Relaxed);
+                                        settings_changed = true;
+                                    }
+                                    ui.weak(
+                                        "When on, audio from the radio's own mic jack replaces the \
+                                         local PC mic (and TCI audio) as the TX source.",
+                                    );
+
+                                    // Radio mic connector config (PTT enable, tip/ring wiring,
+                                    // bias) -- standard Angelia/Orion/Orion2 boards only, matching
+                                    // piHPSDR's own UI gating (radio_menu.c) for the same controls.
+                                    // See radio::RadioSession::mic_ptt_enabled/mic_bias_enabled/
+                                    // mic_ptt_on_tip's doc comments for the exact wire encoding.
+                                    if matches!(
+                                        connected.device.board,
+                                        Boards::Angelia | Boards::Orion | Boards::Orion2
+                                    ) {
+                                        ui.add_space(8.0);
+                                        ui.separator();
+                                        ui.label("Radio Mic Connector:");
+
+                                        let mut ptt_on_tip =
+                                            connected.session.mic_ptt_on_tip.load(Ordering::Relaxed);
+                                        ui.horizontal(|ui| {
+                                            if ui
+                                                .add(egui::Button::selectable(
+                                                    !ptt_on_tip,
+                                                    "PTT on Ring, Mic/Bias on Tip",
+                                                ))
+                                                .clicked()
+                                                && ptt_on_tip
+                                            {
+                                                ptt_on_tip = false;
+                                                connected.session.mic_ptt_on_tip.store(false, Ordering::Relaxed);
+                                                settings_changed = true;
+                                            }
+                                            if ui
+                                                .add(egui::Button::selectable(
+                                                    ptt_on_tip,
+                                                    "PTT on Tip, Mic/Bias on Ring",
+                                                ))
+                                                .clicked()
+                                                && !ptt_on_tip
+                                            {
+                                                connected.session.mic_ptt_on_tip.store(true, Ordering::Relaxed);
+                                                settings_changed = true;
+                                            }
+                                        });
+
+                                        let mut mic_ptt_enabled =
+                                            connected.session.mic_ptt_enabled.load(Ordering::Relaxed);
+                                        if ui.checkbox(&mut mic_ptt_enabled, "Mic PTT Enabled").changed() {
+                                            connected
+                                                .session
+                                                .mic_ptt_enabled
+                                                .store(mic_ptt_enabled, Ordering::Relaxed);
+                                            settings_changed = true;
+                                        }
+
+                                        let mut mic_bias_enabled =
+                                            connected.session.mic_bias_enabled.load(Ordering::Relaxed);
+                                        if ui.checkbox(&mut mic_bias_enabled, "Mic Bias Enabled").changed() {
+                                            connected
+                                                .session
+                                                .mic_bias_enabled
+                                                .store(mic_bias_enabled, Ordering::Relaxed);
+                                            settings_changed = true;
+                                        }
                                     }
                                 }
                                 SettingsTab::PaCalibration => {
@@ -3057,6 +3150,18 @@ impl eframe::App for HpsdrApp {
                                 .session
                                 .send_rx_audio_to_radio
                                 .load(std::sync::atomic::Ordering::Relaxed),
+                        ),
+                        use_radio_mic: Some(
+                            connected.session.use_radio_mic.load(std::sync::atomic::Ordering::Relaxed),
+                        ),
+                        mic_ptt_enabled: Some(
+                            connected.session.mic_ptt_enabled.load(std::sync::atomic::Ordering::Relaxed),
+                        ),
+                        mic_bias_enabled: Some(
+                            connected.session.mic_bias_enabled.load(std::sync::atomic::Ordering::Relaxed),
+                        ),
+                        mic_ptt_on_tip: Some(
+                            connected.session.mic_ptt_on_tip.load(std::sync::atomic::Ordering::Relaxed),
                         ),
                     }
                     .save(connected.device.mac);
@@ -4415,6 +4520,8 @@ fn change_sample_rate(connected: &mut ConnectedState, new_rate: u32) {
                 let tx_handle = TxHandle::start(
                     Arc::clone(mic.buffer()),
                     Arc::clone(&connected.session.tci_tx_audio),
+                    Arc::clone(&connected.session.radio_mic_audio),
+                    Arc::clone(&connected.session.use_radio_mic),
                     Arc::clone(&connected.session.tx_iq),
                     Arc::clone(&tx_spectrum_iq),
                     Arc::clone(&connected.session.mox),
