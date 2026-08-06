@@ -1054,12 +1054,12 @@ impl eframe::App for HpsdrApp {
                     ui.horizontal_wrapped(|ui| {
                         ui.label("Audio gain:");
                         let mut gain = current_gain;
-                        if scroll_slider_f32(
+                        if scroll_slider_f32_log(
                             ui,
                             &mut connected.slider_scroll_accum,
                             &mut gain,
                             0.0..=1.5,
-                            0.05,
+                            1.08,
                         ) {
                             connected.spectrum.set_gain(gain);
                             settings_changed = true;
@@ -3407,6 +3407,67 @@ fn scroll_slider_f32(
                 let sign = scroll_accum.signum();
                 *scroll_accum -= sign * NOTCH;
                 *value = (*value + step * sign).clamp(*range.start(), *range.end());
+                changed = true;
+            }
+        }
+    }
+    changed
+}
+
+/// Smallest value scroll_slider_f32_log's drag/scroll range actually
+/// resolves to -- without this, egui's own default (1e-6) would spend
+/// most of the slider's width/scroll travel on a range far smaller than
+/// anything this project's gain controls actually use.
+const LOG_SLIDER_SMALLEST_POSITIVE: f32 = 0.001;
+
+/// Same as scroll_slider_f32, but both drag AND scroll-wheel stepping
+/// are logarithmic -- for sliders whose useful range spans orders of
+/// magnitude (e.g. Audio Gain: a real report needed ~0.01 for TCI/
+/// WSJT-X while the slider's range goes up to 1.5, making that low end
+/// both unreachable by drag and unusable by scroll on a linear slider).
+///
+/// `ratio_per_notch` (e.g. 1.08 = 8% per notch) is a MULTIPLICATIVE
+/// step, not an additive one -- an earlier version of this reused the
+/// linear variant's additive step (a fixed absolute amount per notch),
+/// which is backwards for a log control: a fixed absolute step is a
+/// huge relative jump near the low end and imperceptible near the high
+/// end, confirmed by a real report ("scroll step is much finer at the
+/// high end rather than the low end"). Multiplicative stepping gives
+/// the same relative (percentage) resolution at every point on the
+/// range, matching the slider's own logarithmic drag behavior.
+fn scroll_slider_f32_log(
+    ui: &mut egui::Ui,
+    scroll_accum: &mut f32,
+    value: &mut f32,
+    range: std::ops::RangeInclusive<f32>,
+    ratio_per_notch: f32,
+) -> bool {
+    let slider = egui::Slider::new(value, range.clone())
+        .logarithmic(true)
+        .smallest_positive(LOG_SLIDER_SMALLEST_POSITIVE as f64);
+    let resp = ui.add(slider);
+    let mut changed = resp.changed();
+    if resp.hovered() {
+        let scroll_delta = ui.input(|i| i.smooth_scroll_delta);
+        let delta = if scroll_delta.y.abs() >= scroll_delta.x.abs() {
+            scroll_delta.y
+        } else {
+            scroll_delta.x
+        };
+        if delta != 0.0 {
+            *scroll_accum += delta;
+            const NOTCH: f32 = 20.0;
+            while scroll_accum.abs() >= NOTCH {
+                let sign = scroll_accum.signum();
+                *scroll_accum -= sign * NOTCH;
+                *value = if *value <= LOG_SLIDER_SMALLEST_POSITIVE && sign < 0.0 {
+                    0.0
+                } else if *value <= LOG_SLIDER_SMALLEST_POSITIVE && sign > 0.0 {
+                    LOG_SLIDER_SMALLEST_POSITIVE
+                } else {
+                    *value * ratio_per_notch.powf(sign)
+                }
+                .clamp(*range.start(), *range.end());
                 changed = true;
             }
         }

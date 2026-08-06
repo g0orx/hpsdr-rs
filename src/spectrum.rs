@@ -512,6 +512,21 @@ impl SpectrumAnalyzer {
             // can safely read either interleaved slot once this is set.
             wdsp::SetRXAPanelBinaural(channel, 0);
 
+            // RXA PatchPanel's own gain1 also defaults to 4.0 (per the
+            // WDSP Guide's SetRXAPanelGain1 doc: "[default = 4.0]"),
+            // i.e. WDSP itself already amplifies the audio 4x before it
+            // ever reaches this project's own Audio Gain slider (0.0 to
+            // 1.5). Confirmed as a real usability problem via a live
+            // report: even the slider's smallest practical values
+            // (0.05, 0.01 -- both far below its 0.05 step granularity's
+            // natural range) still drove WSJT-X's own level meter to
+            // 30-60dB (uncomfortably hot for its recommended ~30-40dB
+            // range). Resetting WDSP's own gain to unity here means the
+            // Audio Gain slider's already-existing 0.0-1.5 range now
+            // covers the actually-useful levels, instead of everything
+            // being 4x hotter than the slider implies.
+            wdsp::SetRXAPanelGain1(channel, 1.0);
+
             // Creates the noise blanker DSP objects themselves -- must
             // happen before the Set*Samplerate calls below, since those
             // configure an object that has to exist first. Parameters

@@ -298,14 +298,30 @@ fn handle_client(
     }
 
     // Best-effort initial state push -- see module-level note.
+    //
+    // BUG FIX: this used to stop at trx:, missing the `start;`/`ready;`
+    // handshake messages entirely. Confirmed against rustyHPSDR's own
+    // TCI server (~/github/rustyHPSDR/src/tci/mod.rs, proven working
+    // against real TCI clients): its init sequence explicitly sends
+    // `"start;"` then `"ready;"` after the initial state. A real report
+    // of WSJT-X connecting, streaming data successfully for a while,
+    // then showing "TCI SDR is not switched on" is consistent with a
+    // client-side state machine that's waiting for that `start;`
+    // signal and eventually times out/gives up without it -- this
+    // project never sent it at all. `device:` added alongside it since
+    // it's part of the same reference sequence and cheap/harmless for
+    // any client that reads it.
     let freq = frequency_hz.load(Ordering::Relaxed);
     let mode = demod_params.lock().unwrap().clone().lock().unwrap().mode;
     let _ = ws.send(Message::Text(PROTOCOL_NAME.into()));
+    let _ = ws.send(Message::Text("device:hpsdr-rs;".into()));
     let _ = ws.send(Message::Text(format!("vfo:0,0,{freq};").into()));
     let _ = ws.send(Message::Text(format!("modulation:0,{};", mode_to_tci(mode)).into()));
     let _ = ws.send(Message::Text(
         format!("trx:0,{};", mox.load(Ordering::Relaxed)).into(),
     ));
+    let _ = ws.send(Message::Text("start;".into()));
+    let _ = ws.send(Message::Text("ready;".into()));
 
     // Per-client streaming state -- audio defaults to ON (see below),
     // IQ defaults to OFF, only enabled by an explicit iq_start. This
@@ -407,11 +423,30 @@ fn handle_client(
                 // this project's RX audio is mono, so duplicate each
                 // sample to both channels.
                 let stereo: Vec<(f32, f32)> = samples.into_iter().map(|s| (s, s)).collect();
+                // BUG FIX: `length` here used to be stereo.len() (frame-PAIR
+                // count), matching rustyHPSDR's own convention (confirmed
+                // working against TCI Remote). A real report of WSJT-X's
+                // waterfall/decode looking compressed/stretched over TCI
+                // audio led to checking github.com/ftl/tci (an independent
+                // Go client library) directly: its ParseBinaryMessage reads
+                // `data = make([]float32, msg.DataLength)`, i.e. DataLength
+                // is the RAW FLOAT COUNT (both channels included), not a
+                // frame-pair count -- exactly half of what this project was
+                // sending. A client following that convention (apparently
+                // WSJT-X, unlike TCI Remote) would read only half the
+                // intended samples per packet as "the whole chunk", which
+                // is exactly the timing distortion reported. Only the
+                // announced `length` value changes here -- the actual
+                // payload (`&stereo`) and its real sample count are
+                // untouched, so this doesn't affect TCI Remote's own IQ
+                // streaming (still frame-pair count below, unconfirmed
+                // either way and not reported broken) or the real audio
+                // content itself.
                 let msg = encode_binary_message(
                     0,
                     TCI_AUDIO_SAMPLE_RATE,
                     BinaryMessageType::RxAudioStream,
-                    stereo.len() as u32,
+                    stereo.len() as u32 * 2,
                     &stereo,
                 );
                 if ws.send(Message::Binary(msg.into())).is_err() {
@@ -615,29 +650,41 @@ fn handle_command(
             mox.store(on, Ordering::Relaxed);
             Some(format!("trx:{},{};", args.first().unwrap_or(&"0"), on))
         }
-        // audio_start:receiver; / audio_stop:receiver; -- fire-and-
-        // forget, no reply (confirmed against the reference: these are
-        // sent as commands, not requests). Receiver index itself is
-        // ignored -- only the primary receiver is ever exposed here
-        // (see this file's module note), so there's nothing to
+        // audio_start:receiver; / audio_stop:receiver; -- receiver index
+        // itself is ignored (only the primary receiver is ever exposed
+        // here, see this file's module note), so there's nothing to
         // distinguish.
+        //
+        // BUG FIX: these used to return None (no reply) on the theory
+        // that they're fire-and-forget commands, not requests -- true
+        // for rustyHPSDR's own TCI server (confirmed working against
+        // TCI Remote, which has no audio_start handler at all and never
+        // replies to iq_start either). WSJT-X's own TCI client is
+        // stricter: a real report of "TCI Audio could not be switched
+        // on" after WSJT-X sends audio_start is consistent with it
+        // waiting for the same echoed confirmation every OTHER command
+        // here already sends (vfo/modulation/trx all echo back what was
+        // set) and giving up without one. Echoing the command back,
+        // matching that existing convention, costs nothing for clients
+        // that don't need it (TCI Remote/rustyHPSDR ignore replies to
+        // commands they didn't ask a question with).
         "audio_start" => {
             *audio_streaming = true;
-            None
+            Some(format!("audio_start:{};", args.first().unwrap_or(&"0")))
         }
         "audio_stop" => {
             *audio_streaming = false;
-            None
+            Some(format!("audio_stop:{};", args.first().unwrap_or(&"0")))
         }
         // iq_start:receiver; / iq_stop:receiver; -- same reasoning as
         // audio_start/stop above.
         "iq_start" => {
             *iq_streaming = true;
-            None
+            Some(format!("iq_start:{};", args.first().unwrap_or(&"0")))
         }
         "iq_stop" => {
             *iq_streaming = false;
-            None
+            Some(format!("iq_stop:{};", args.first().unwrap_or(&"0")))
         }
         _ => None,
     }
