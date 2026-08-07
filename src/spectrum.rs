@@ -1090,6 +1090,14 @@ pub struct SpectrumHandle {
     /// the same way this file normalizes IQ elsewhere (IQ_NORM).
     pub iq_out: Arc<Mutex<VecDeque<(f32, f32)>>>,
     demod_params: Arc<Mutex<DemodParams>>,
+    /// WDSP analyzer channel this handle's run() thread opened -- kept
+    /// here too (not just inside that thread) so clear_display can
+    /// reach the same WDSP display state from the UI thread. Analyzer
+    /// setters are confirmed thread-safe from the C source itself
+    /// (EnterCriticalSection/LeaveCriticalSection around every mode
+    /// change in analyzer.c), so calling them from a different thread
+    /// than the one that opened the channel is fine.
+    channel: i32,
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
 }
@@ -1139,8 +1147,39 @@ impl SpectrumHandle {
             tci_audio_out,
             iq_out,
             demod_params,
+            channel,
             stop,
             thread: Some(thread),
+        }
+    }
+
+    /// Clears accumulated spectrum/waterfall history and WDSP's own
+    /// internal recursive-average state -- see the call site's doc
+    /// comment (main.rs, tx_spectrum on a fresh PTT) for why this
+    /// exists: a long-lived tx_spectrum handle otherwise keeps
+    /// blending/scrolling in whatever a *previous*, possibly very
+    /// different transmission looked like for many seconds after a
+    /// new one starts, since neither the Rust-side waterfall_rows
+    /// history (WATERFALL_HISTORY = 200 rows, ~20s at this analyzer's
+    /// ~10Hz rate) nor WDSP's own AVERAGE_MODE_LOG_RECURSIVE
+    /// accumulator get reset just because a new PTT began.
+    /// SetDisplayAverageMode's own C source (analyzer.c) only resets
+    /// its internal av_sum accumulator when the mode value actually
+    /// *changes* (`if (a->av_mode[pixout] != mode)`) -- so this
+    /// toggles away to AVERAGE_MODE_NONE and back to force that reset
+    /// rather than calling it once with the same mode, which would be
+    /// a no-op.
+    pub fn clear_display(&self) {
+        *self.display.lock().unwrap() = SpectrumDisplay::default();
+        unsafe {
+            for pixout in 0..2 {
+                wdsp::SetDisplayAverageMode(self.channel, pixout, wdsp::AVERAGE_MODE_NONE as c_int);
+                wdsp::SetDisplayAverageMode(
+                    self.channel,
+                    pixout,
+                    wdsp::AVERAGE_MODE_LOG_RECURSIVE as c_int,
+                );
+            }
         }
     }
 

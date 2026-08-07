@@ -68,6 +68,14 @@ pub struct Config {
     /// -- whether TX was armed (tx_enabled) is intentionally NOT saved
     /// (see main.rs's auto-arm-on-connect comment).
     pub mic_gain: Option<f32>,
+    /// Gain applied specifically to TX audio received from a TCI
+    /// client (WSJT-X, TCI Remote, etc.), independent of mic_gain
+    /// above -- see radio::RadioSession::tci_tx_gain's doc comment for
+    /// why a real test needed these decoupled (WSJT-X's own TCI audio
+    /// arrived roughly 700x quieter than mic_gain's range is
+    /// calibrated for). Defaults to 1.0 (unchanged behavior) when unset.
+    #[serde(default)]
+    pub tci_tx_gain: Option<f32>,
     /// TX power target in watts, both protocols -- see
     /// radio::drive_byte_for_watts for how this becomes each protocol's
     /// actual wire-level drive byte. See mic_gain's note -- same

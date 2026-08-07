@@ -295,6 +295,11 @@ struct ConnectedState {
     /// disable/re-enable of TX within the same session, and so it's
     /// available to persist even while TX is currently disarmed.
     mic_gain: f32,
+    /// Cached UI copy of session.tci_tx_gain -- see that field's doc
+    /// comment (radio.rs) for what it does. Written through to the
+    /// live Arc<Mutex<f32>> on change, same "cache here, write-through"
+    /// pattern as mic_gain above.
+    tci_tx_gain: f32,
     /// PureSignal calibration values (Settings -> PureSignal), same
     /// "tracked here, pushed to TxHandle on change" pattern as
     /// mic_gain above -- see tx::PsParams's field docs for what each
@@ -367,6 +372,12 @@ struct ConnectedState {
     /// ballistic damping for exactly this reason.
     smoothed_fwd_power: f32,
     smoothed_rev_power: f32,
+    /// Edge-tracks session.mox_active() so tx_spectrum.clear_display()
+    /// only fires once per fresh PTT (not every frame while
+    /// transmitting) -- see that method's doc comment for why a long-
+    /// lived tx_spectrum otherwise keeps showing a blend of whatever a
+    /// previous, possibly very different transmission looked like.
+    tx_spectrum_mox_was_active: bool,
     /// PureSignal (experimental, Phase 1 -- protocol plumbing only, see
     /// radio::RadioSettings::puresignal_enabled). Reflects what THIS
     /// session was actually started with -- editable in Settings, but
@@ -512,6 +523,7 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                     Arc::clone(&spectrum.tci_audio_out),
                     Arc::clone(&spectrum.iq_out),
                     Arc::clone(&session.tci_tx_audio),
+                    Arc::clone(&session.tci_tx_gain),
                 ) {
                     Ok(s) => Some(s),
                     Err(e) => {
@@ -574,6 +586,8 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                 spectrum.set_snb(v);
             }
             let mic_gain = cfg.mic_gain.unwrap_or(0.5);
+            let tci_tx_gain = cfg.tci_tx_gain.unwrap_or(1.0);
+            *session.tci_tx_gain.lock().unwrap() = tci_tx_gain;
             // See tx::PsParams::default for these same
             // fallback values -- kept in sync deliberately
             // (both are "reference default if never
@@ -730,6 +744,7 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                 tx_handle,
                 ptt_held: false,
                 mic_gain,
+                tci_tx_gain,
                 ps_enabled,
                 ps_hw_peak,
                 ps_mox_delay,
@@ -746,6 +761,7 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                 two_tone_active: false,
                 smoothed_fwd_power: 0.0,
                 smoothed_rev_power: 0.0,
+                tx_spectrum_mox_was_active: false,
                 puresignal_enabled: settings.puresignal_enabled,
                 ps_was_correcting: false,
             })
@@ -845,6 +861,47 @@ impl eframe::App for HpsdrApp {
                 // applied to tx_spectrum -- it's raw generated baseband,
                 // not a wideband capture that needs retuning within.
                 let transmitting = connected.session.mox_active();
+                if transmitting && !connected.tx_spectrum_mox_was_active {
+                    // Fresh PTT -- see SpectrumHandle::clear_display's
+                    // doc comment for why this can't just be left to
+                    // scroll/blend away naturally.
+                    connected.tx_spectrum.clear_display();
+                }
+                connected.tx_spectrum_mox_was_active = transmitting;
+
+                // ROOT CAUSE FIX for a real, persistent report of a wide
+                // spectral "skirt" appearing on ANY mic-chain TX audio
+                // (WSJT-X/TCI, local USB mic -- confirmed NOT specific to
+                // either) but never on Tune: every frequency-axis and
+                // click-to-tune calculation below this point assumes
+                // `sample_rate` is the true span of whichever analyzer's
+                // data is currently on screen. That's correct for RX
+                // (spectrum's own analyzer is opened at exactly this same
+                // `connected.sample_rate`), but while transmitting, the
+                // data actually being shown is tx_spectrum's -- and that
+                // analyzer is always opened at duc_rate (192kHz for P2,
+                // confirmed via main.rs's own duc_rate formula elsewhere),
+                // completely independent of whatever RX sample rate the
+                // user has selected. Left unshadowed, the axis kept
+                // assuming the RX span while displaying TX data -- e.g. a
+                // real 384kHz RX rate would visually "stretch" a tx_spectrum
+                // signal's true, narrow analyzer bandwidth across a much
+                // wider apparent range. A direct capture of the raw
+                // generated TX IQ (before it ever reaches this display)
+                // confirmed the actual signal is clean -- down at the
+                // FFT noise floor beyond roughly 20kHz of its passband --
+                // proving this was never a real TX-quality issue. This
+                // also explains why Tune never showed it: a single-bin
+                // tone still looks like a narrow line under a wrong axis
+                // scale, but real multi-Hz-wide voice/digital-mode audio
+                // visibly spreads when relabeled onto the wrong (usually
+                // much wider) span.
+                let sample_rate = if transmitting {
+                    if connected.device.protocol == 2 { 192_000 } else { sample_rate }
+                } else {
+                    sample_rate
+                };
+
                 let (spectrum_row, meter_db, waterfall_data_revision) = {
                     let d = if transmitting {
                         connected.tx_spectrum.display.lock().unwrap()
@@ -1081,6 +1138,33 @@ impl eframe::App for HpsdrApp {
                                     if let Some(tx) = &connected.tx_handle {
                                         tx.set_mic_gain(mic_gain);
                                     }
+                                    settings_changed = true;
+                                }
+
+                                // Separate from Mic gain above -- a real
+                                // test against WSJT-X found its TCI TX
+                                // audio arriving at roughly 1/700th the
+                                // amplitude Mic gain's 0.0..=2.0 range is
+                                // calibrated for (confirmed via WSJT-X's
+                                // own source, not an hpsdr-rs decode bug
+                                // -- see radio::RadioSession::
+                                // tci_tx_gain's doc comment). Log-scale
+                                // for the same reason Audio Gain needed
+                                // it: this needs to cover a couple orders
+                                // of magnitude, dialed in by ear/meter
+                                // against real traffic.
+                                ui.add_space(12.0);
+                                ui.label("TCI TX gain:");
+                                let mut tci_tx_gain = connected.tci_tx_gain;
+                                if scroll_slider_f32_log(
+                                    ui,
+                                    &mut connected.slider_scroll_accum,
+                                    &mut tci_tx_gain,
+                                    0.0..=1000.0,
+                                    1.08,
+                                ) {
+                                    connected.tci_tx_gain = tci_tx_gain;
+                                    *connected.session.tci_tx_gain.lock().unwrap() = tci_tx_gain;
                                     settings_changed = true;
                                 }
                             }
@@ -2107,6 +2191,7 @@ impl eframe::App for HpsdrApp {
                                                 Arc::clone(&connected.spectrum.tci_audio_out),
                                                 Arc::clone(&connected.spectrum.iq_out),
                                                 Arc::clone(&connected.session.tci_tx_audio),
+                                                Arc::clone(&connected.session.tci_tx_gain),
                                             ) {
                                                 Ok(s) => Some(s),
                                                 Err(e) => {
@@ -3108,6 +3193,7 @@ impl eframe::App for HpsdrApp {
                         noise_reduction: Some(agc_params_now.noise_reduction),
                         snb: Some(agc_params_now.snb),
                         mic_gain: Some(connected.mic_gain),
+                        tci_tx_gain: Some(connected.tci_tx_gain),
                         tx_power_watts: Some(connected.session.tx_power_watts.load(Ordering::Relaxed)),
                         db_low: Some(connected.db_low),
                         db_high: Some(connected.db_high),

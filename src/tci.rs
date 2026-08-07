@@ -97,7 +97,7 @@ use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tungstenite::Message;
 
 pub const DEFAULT_ADDR: &str = "0.0.0.0:40001";
@@ -161,6 +161,7 @@ impl TciServer {
         tci_audio_out: Arc<Mutex<VecDeque<f32>>>,
         iq_out: Arc<Mutex<VecDeque<(f32, f32)>>>,
         tci_tx_audio: Arc<Mutex<VecDeque<f32>>>,
+        tci_tx_gain: Arc<Mutex<f32>>,
     ) -> std::io::Result<Self> {
         let listener = TcpListener::bind(addr)?;
         listener.set_nonblocking(true)?;
@@ -177,6 +178,7 @@ impl TciServer {
         let accept_demod_params = Arc::clone(&demod_params);
         let accept_audio_iq = Arc::clone(&audio_iq);
         let accept_tci_tx_audio = Arc::clone(&tci_tx_audio);
+        let accept_tci_tx_gain = Arc::clone(&tci_tx_gain);
         let thread = thread::spawn(move || {
             while !accept_stop.load(Ordering::Relaxed) {
                 match listener.accept() {
@@ -187,12 +189,16 @@ impl TciServer {
                         let params = Arc::clone(&accept_demod_params);
                         let audio_iq = Arc::clone(&accept_audio_iq);
                         let tx_audio = Arc::clone(&accept_tci_tx_audio);
+                        let tx_gain = Arc::clone(&accept_tci_tx_gain);
                         let conn_mox = Arc::clone(&mox);
                         let conn_stop = Arc::clone(&accept_stop);
                         let conn_connected = Arc::clone(&accept_connected);
                         let handle = thread::spawn(move || {
                             conn_connected.fetch_add(1, Ordering::Relaxed);
-                            handle_client(stream, freq, rate, params, audio_iq, tx_audio, conn_mox, conn_stop);
+                            handle_client(
+                                stream, freq, rate, params, audio_iq, tx_audio, tx_gain, conn_mox,
+                                conn_stop,
+                            );
                             conn_connected.fetch_sub(1, Ordering::Relaxed);
                         });
                         let mut threads = accept_client_threads.lock().unwrap();
@@ -275,6 +281,7 @@ fn handle_client(
     demod_params: DemodParamsCell,
     audio_iq: AudioIqCell,
     tci_tx_audio: Arc<Mutex<VecDeque<f32>>>,
+    tci_tx_gain: Arc<Mutex<f32>>,
     mox: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
 ) {
@@ -334,6 +341,43 @@ fn handle_client(
     // any other TCI client that relies on that gate.
     let mut audio_streaming = true;
     let mut iq_streaming = false;
+    // See the periodic vfo/modulation/trx heartbeat below.
+    let mut last_status_broadcast = Instant::now();
+    // BUG FIX: TxChrono used to be sent unconditionally once per loop
+    // iteration, on the assumption that the loop's own ~20ms read
+    // timeout paced it -- true only while nothing is arriving to read.
+    // A real WSJT-X capture (tcpdump, reassembled and decoded by hand)
+    // showed this loop actually sending TxChrono and receiving
+    // WSJT-X's near-instant reply back-to-back with ~12 MICROSECONDS
+    // between messages once a session was underway -- ~80,000
+    // messages/sec, versus the ~94/sec real-time playback actually
+    // needs (TCI_TX_AUDIO_CHUNK/TCI_AUDIO_SAMPLE_RATE), because
+    // ws.read() returns immediately whenever a response is already
+    // waiting and never actually blocks for the timeout. This
+    // explains a report of WSJT-X-driven TX (never local Tune, which
+    // doesn't touch this queue at all) sounding wide/noisy and
+    // collapsing to ~0W within 1-2 seconds regardless of any TX-audio-
+    // content fix tried first: WSJT-X's own tone generator (its
+    // internal sample counter advances one TxChrono-response's worth
+    // per call, not per elapsed wall-clock time) gets fast-forwarded
+    // through its entire programmed duration in a couple of seconds
+    // instead of the real tens of seconds, running into its own
+    // tail/Idle-state handling (a separate, already-diagnosed WSJT-X
+    // bug -- see decode_binary_message's doc comment) almost
+    // immediately, while tci_tx_audio's bounded queue on this side
+    // gets so overrun (~860x the real-time rate) that its capacity
+    // trim is constantly discarding samples, feeding tx.rs's
+    // real-time-paced consumer a decimated, discontinuous fraction of
+    // whatever WSJT-X actually generated. Real, explicit pacing here
+    // (absolute-deadline, same pattern as tx.rs's own next_chunk --
+    // see its doc comment for why relative sleep-based pacing isn't
+    // used) rather than leaning on the read timeout fixes the request
+    // rate regardless of how fast a client replies.
+    let tx_chrono_interval = Duration::from_secs_f64(
+        TCI_TX_AUDIO_CHUNK as f64 / TCI_AUDIO_SAMPLE_RATE as f64,
+    );
+    let mut next_tx_chrono = Instant::now();
+    let mut mox_was_active = false;
 
     while !stop.load(Ordering::Relaxed) {
         match ws.read() {
@@ -375,13 +419,56 @@ fn handle_client(
                         // existing precedent to match here (audio.rs's
                         // MicInput requests mono directly from cpal
                         // rather than downmixing stereo in software).
+                        //
+                        // Sanity-check each pair before mixing: a real
+                        // WSJT-X test (see decode_binary_message's doc
+                        // comment) showed every 8th TxAudioStream
+                        // message periodically containing astronomical
+                        // (~1e27+) garbage values on WSJT-X's own side
+                        // -- likely a stale/uninitialized buffer region
+                        // on its end, not a framing bug here (message
+                        // size and payload offset were identical on
+                        // good and bad messages alike).
+                        //
+                        // DROPPING a bad pair, not muting it to 0.0 --
+                        // an earlier version of this substituted hard
+                        // silence instead, on the reasoning that WDSP's
+                        // stateful TXA chain (AGC, IIR filters) would
+                        // ring/saturate from a single insane sample.
+                        // That didn't fix a real report of wide/noisy
+                        // WSJT-X-only TX spectrum with power stuck near
+                        // 0W and ALC pinned heavily negative regardless
+                        // of drive level -- a real A/B test (same TCI
+                        // session, TX audio source switched to the
+                        // radio's own mic input, bypassing this queue
+                        // entirely) confirmed the fault really is in
+                        // this TCI audio content path, not PTT/mox
+                        // sequencing. Forcing silence, THEN jumping back
+                        // to real audio, repeated every 8th message for
+                        // the WHOLE transmission, is itself a periodic
+                        // discontinuity an ALC/leveler never gets to
+                        // settle past -- dropping instead just shrinks
+                        // this cycle's contribution to the queue by a
+                        // pair, seamless as long as the queue has any
+                        // headroom (normal case; the existing capacity
+                        // trim above already handles genuine underrun).
+                        // Applied to the mixed-but-not-yet-gained sample,
+                        // so gain doesn't turn a legitimately-quiet good
+                        // pair into a false positive -- see RadioSession::
+                        // tci_tx_gain's doc comment for why gain is a
+                        // separate control from tx.rs's mic_gain.
+                        let gain = *tci_tx_gain.lock().unwrap();
                         let mut q = tci_tx_audio.lock().unwrap();
                         let capacity = q.capacity(); // matches radio.rs's TCI_TX_AUDIO_CAPACITY
                         for pair in samples.chunks_exact(2) {
+                            let (l, r) = (pair[0], pair[1]);
+                            if !l.is_finite() || !r.is_finite() || l.abs() > 2.0 || r.abs() > 2.0 {
+                                continue;
+                            }
                             if q.len() >= capacity {
                                 q.pop_front();
                             }
-                            q.push_back((pair[0] + pair[1]) * 0.5);
+                            q.push_back((l + r) * 0.5 * gain);
                         }
                     }
                 }
@@ -480,23 +567,93 @@ fn handle_client(
         }
 
         // TxChrono -- requests TX audio from this client while
-        // transmitting. Confirmed working end-to-end against TCI Remote:
-        // sent once per loop tick (the same ~20ms cadence used for RX
-        // streaming above) while mox is active, requesting
-        // TCI_TX_AUDIO_CHUNK samples -- chosen to match tx.rs's own
-        // TX_BUFFER_SIZE. A client that doesn't implement TX audio
-        // simply won't respond to this; harmless either way.
-        if mox.load(Ordering::Relaxed) {
-            let chrono = encode_binary_message(
-                0,
-                TCI_AUDIO_SAMPLE_RATE,
-                BinaryMessageType::TxChrono,
-                TCI_TX_AUDIO_CHUNK,
-                &[],
-            );
-            if ws.send(Message::Binary(chrono.into())).is_err() {
+        // transmitting. Confirmed working end-to-end against TCI Remote,
+        // requesting TCI_TX_AUDIO_CHUNK samples -- chosen to match
+        // tx.rs's own TX_BUFFER_SIZE. Real-time paced now -- see
+        // tx_chrono_interval's doc comment above for why sending on
+        // every loop tick (relying on the read timeout for pacing) was
+        // wrong. A client that doesn't implement TX audio simply won't
+        // respond to this; harmless either way.
+        //
+        // BUG FIX: pure fixed-interval pacing alone still let
+        // tci_tx_audio slowly drain over a real, multi-second WSJT-X
+        // transmission (a real trace showed the "mic buffer underrun"
+        // rate climbing from ~7% to ~20% over a few seconds of steady
+        // Tune) -- expected, not mysterious, once you account for
+        // WSJT-X's own confirmed ~12.5% corrupted-message rate (one of
+        // its 8 ring-buffer slots, dropped by decode_binary_message's
+        // sanity check): requesting at exactly the real-time rate with
+        // ~87.5% of replies actually usable means supply is
+        // structurally ~12.5% short of consumption, a deficit that
+        // only grows the longer a transmission runs. Rather than
+        // baking in a fixed compensation percentage (fragile, and
+        // risks recreating the original runaway-request bug above if
+        // the real loss rate is ever lower than assumed), this reacts
+        // to the queue's actual occupancy: below a small low-water
+        // mark, request immediately (resyncing the schedule from now)
+        // instead of waiting for the next tick, letting the queue
+        // catch up at whatever rate WSJT-X actually replies; once
+        // healthy again, it drops straight back to strict real-time
+        // pacing. Self-limiting either way -- catch-up requests are
+        // still gated one-per-loop-iteration by this same check, so
+        // this can't reproduce the original unpaced-runaway behavior.
+        let mox_active = mox.load(Ordering::Relaxed);
+        if mox_active && !mox_was_active {
+            // Resync on every fresh PTT rather than sending a burst of
+            // "overdue" requests built up while idle -- same reasoning
+            // as tx.rs's own next_chunk resync on mox going active.
+            next_tx_chrono = Instant::now();
+        }
+        mox_was_active = mox_active;
+        if mox_active {
+            let queue_low = tci_tx_audio.lock().unwrap().len() < TX_CHRONO_LOW_WATERMARK;
+            if queue_low || Instant::now() >= next_tx_chrono {
+                next_tx_chrono = if queue_low {
+                    Instant::now() + tx_chrono_interval
+                } else {
+                    next_tx_chrono + tx_chrono_interval
+                };
+                let chrono = encode_binary_message(
+                    0,
+                    TCI_AUDIO_SAMPLE_RATE,
+                    BinaryMessageType::TxChrono,
+                    TCI_TX_AUDIO_CHUNK,
+                    &[],
+                );
+                if ws.send(Message::Binary(chrono.into())).is_err() {
+                    return;
+                }
+            }
+        }
+
+        // BUG FIX: vfo/modulation/trx state was previously only ever
+        // sent once at connect (or in direct reply to a client's own
+        // command) -- never reasserted afterward. A real report of
+        // WSJT-X reporting "TCI failed set mode" consistently ~2s after
+        // PTT engages, despite the initial trx:0,true;/modulation
+        // exchange completing correctly (confirmed via a real capture:
+        // WSJT-X received a proper reply to both), is consistent with a
+        // client-side staleness check that expects to keep seeing
+        // confirmation of the current state, not just a one-time ack.
+        // Resent every second here (piggybacking on this loop's
+        // existing ~20ms tick) as a low-risk heartbeat -- harmless for
+        // clients that don't need it (TCI Remote/rustyHPSDR never
+        // solicited this either, and ignore unsolicited state messages
+        // they don't ask for).
+        if last_status_broadcast.elapsed() >= Duration::from_secs(1) {
+            let freq = frequency_hz.load(Ordering::Relaxed);
+            let mode = demod_params.lock().unwrap().clone().lock().unwrap().mode;
+            let mox_on = mox.load(Ordering::Relaxed);
+            let _ = ws.send(Message::Text(format!("vfo:0,0,{freq};").into()));
+            let _ =
+                ws.send(Message::Text(format!("modulation:0,{};", mode_to_tci(mode)).into()));
+            if ws
+                .send(Message::Text(format!("trx:0,{mox_on};").into()))
+                .is_err()
+            {
                 return;
             }
+            last_status_broadcast = Instant::now();
         }
     }
 }
@@ -504,6 +661,15 @@ fn handle_client(
 /// Matches tx.rs's own TX_BUFFER_SIZE -- see the TxChrono comment
 /// above for why this is what gets requested per chunk.
 const TCI_TX_AUDIO_CHUNK: u32 = 512;
+
+/// Below this many buffered samples, the TxChrono pacing loop above
+/// requests immediately instead of waiting for its next scheduled
+/// tick -- see that comment for why real-time pacing alone still lets
+/// the queue drain over a long transmission. Two chunks' worth: small
+/// enough to only kick in on genuine, sustained shortfall (a single
+/// dropped/corrupted reply is one chunk, ~10.7ms), not on ordinary
+/// per-chunk timing jitter.
+const TX_CHRONO_LOW_WATERMARK: usize = TCI_TX_AUDIO_CHUNK as usize * 2;
 
 /// RX audio's fixed output rate -- must match spectrum.rs's own
 /// OUTPUT_RATE (not imported directly since that constant is private
@@ -597,6 +763,16 @@ fn decode_binary_message(data: &[u8]) -> Option<(u32, Vec<f32>)> {
         return None;
     }
     let msg_type = u32::from_le_bytes(data[24..28].try_into().ok()?);
+    // format/channels (bytes 8-12/28-32) are NOT validated against what
+    // this project's own encode_binary_message assumes (float32, 2
+    // interleaved channels) -- confirmed harmless to skip: a real
+    // packet capture of WSJT-X's own TxAudioStream messages showed its
+    // declared `channels` field is just unwritten reserved padding
+    // (a different garbage value every connection, changing per 8-
+    // message cycle in step with WSJT-X's own internal ring-buffer
+    // reuse -- see the sanity-check below), not a real field, and
+    // `format` isn't otherwise in question (payload starts at the same
+    // fixed 64-byte offset regardless).
     let payload = &data[64..];
     let num_floats = payload.len() / 4; // drops any trailing partial float, if ever present
     let samples = payload[..num_floats * 4]
@@ -636,13 +812,23 @@ fn handle_command(
         }
         // modulation:receiver,mode;
         "modulation" => {
-            let mode = tci_to_mode(args.get(1)?)?;
+            let requested = *args.get(1)?;
+            let mode = tci_to_mode(requested)?;
             demod_params.lock().unwrap().mode = mode;
-            Some(format!(
-                "modulation:{},{};",
-                args.first().unwrap_or(&"0"),
-                mode_to_tci(mode)
-            ))
+            // BUG FIX: this used to echo back mode_to_tci(mode) (this
+            // project's own fixed-case convention, e.g. "USB") instead
+            // of the case the client actually sent (e.g. "usb"). A real
+            // report showed WSJT-X retrying modulation:0,usb; three
+            // times in a row right after PTT, each time getting our
+            // reply back correctly PARSED but in a different case, then
+            // giving up with "TCI failed set mode" -- consistent with a
+            // literal string comparison on the client side rather than
+            // case-insensitive parsing. Echoing the exact string
+            // received guarantees a match regardless of what case
+            // convention any given client uses, at no cost (the parsed
+            // `mode` value -- what actually matters -- is identical
+            // either way).
+            Some(format!("modulation:{},{};", args.first().unwrap_or(&"0"), requested))
         }
         // trx:receiver,state;
         "trx" => {
@@ -690,19 +876,37 @@ fn handle_command(
     }
 }
 
+// BUG FIX: these were uppercase ("USB" etc). Confirmed via WSJT-X's own
+// TCITransceiver.cpp (Transceiver/TCITransceiver.cpp, Cmd_Mode handler):
+// it only lowercases an incoming modulation value when `device:` was
+// exactly "Thetis" or "ExpertSDR3" (an internal ESDR3/HPSDR flag pair
+// set from the Cmd_Version handler) -- any other device string (this
+// project sends "hpsdr-rs") takes the plain `mode_ = args.at(1);`
+// branch, no case-folding. Meanwhile WSJT-X's own OUTGOING/desired mode
+// (`map_mode()`) is unconditionally lowercase ("usb" etc). If this
+// project's own CONNECT-TIME handshake sent uppercase, WSJT-X's
+// internal `mode_` would end up uppercase while its `requested_mode_`
+// stays lowercase -- guaranteeing a mismatch the moment Tune/TX starts,
+// which triggers WSJT-X's own confirmed race-prone blocking mode-set
+// exchange (do_frequency, TCITransceiver.cpp ~line 1155) and a real
+// chance of "TCI failed set mode". Sending lowercase everywhere (this
+// project's own handshake, heartbeat, and command replies) means
+// WSJT-X's `mode_` already matches `requested_mode_` before Tune is
+// ever pressed, avoiding that exchange entirely rather than trying to
+// win its race.
 fn mode_to_tci(mode: Mode) -> &'static str {
     match mode {
-        Mode::Lsb => "LSB",
-        Mode::Usb => "USB",
-        Mode::Dsb => "DSB",
-        Mode::Cwl | Mode::Cwu => "CW",
-        Mode::Fmn => "NFM",
-        Mode::Am => "AM",
-        Mode::Digu => "DIGU",
-        Mode::Digl => "DIGL",
-        Mode::Sam => "SAM",
-        Mode::Drm => "AM",
-        Mode::Spec => "USB",
+        Mode::Lsb => "lsb",
+        Mode::Usb => "usb",
+        Mode::Dsb => "dsb",
+        Mode::Cwl | Mode::Cwu => "cw",
+        Mode::Fmn => "nfm",
+        Mode::Am => "am",
+        Mode::Digu => "digu",
+        Mode::Digl => "digl",
+        Mode::Sam => "sam",
+        Mode::Drm => "am",
+        Mode::Spec => "usb",
     }
 }
 

@@ -330,6 +330,19 @@ pub struct RadioSession {
     /// stable across TX arm/disarm cycles and TCI server restarts,
     /// rather than being recreated each time either does.
     pub tci_tx_audio: Arc<Mutex<VecDeque<f32>>>,
+    /// Gain applied to tci_tx_audio content in tci.rs, before it's
+    /// pushed into the queue above -- separate from tx.rs's mic_gain
+    /// (WDSP's TXAPanelGain1, applied uniformly to whichever source
+    /// fed `chunk` that cycle) because a real test against WSJT-X
+    /// showed its TCI TX audio arriving at roughly 1/700th the
+    /// amplitude mic_gain's existing 0.0..=2.0 range is calibrated
+    /// for (WSJT-X's own TCITransceiver.cpp confirmed this isn't an
+    /// hpsdr-rs decode bug -- its Pwr slider was already at 0dB/max in
+    /// the test that found this). Defaults to 1.0 (no change from
+    /// prior behavior) rather than a guessed large value, matching
+    /// Audio Gain's precedent of needing real-hardware dialing-in
+    /// rather than a hardcoded constant.
+    pub tci_tx_gain: Arc<Mutex<f32>>,
     /// Mic audio digitized by the RADIO'S OWN mic input (as opposed to
     /// this PC's local mic/sound card) and sent to the host as part of
     /// the normal incoming stream -- confirmed against piHPSDR's
@@ -465,6 +478,7 @@ impl RadioSession {
         let mox = Arc::new(AtomicBool::new(false));
         let tx_iq = Arc::new(Mutex::new(VecDeque::with_capacity(TX_IQ_BUFFER_CAPACITY)));
         let tci_tx_audio = Arc::new(Mutex::new(VecDeque::with_capacity(TCI_TX_AUDIO_CAPACITY)));
+        let tci_tx_gain = Arc::new(Mutex::new(1.0f32));
         // Deliberately low rather than defaulting to max power -- easier
         // to notice "too low, turn it up" on a bench test than to start
         // a first-ever TX test at full drive into whatever's connected
@@ -485,14 +499,14 @@ impl RadioSession {
         match device.protocol {
             1 => start_protocol1(
                 device, settings, frequency_hz, sample_rate, adc, antenna, rx_attenuation,
-                ps_tx_attenuation, mox, tx_iq, tci_tx_audio, tx_power_watts, pa_gain_db,
+                ps_tx_attenuation, mox, tx_iq, tci_tx_audio, tci_tx_gain, tx_power_watts, pa_gain_db,
                 tx_forward_power, tx_reverse_power, ps_rx_feedback_iq, ps_tx_feedback_iq,
                 rx_audio_to_radio, send_rx_audio_to_radio, radio_mic_audio, use_radio_mic,
                 mic_ptt_enabled, mic_bias_enabled, mic_ptt_on_tip,
             ),
             2 => start_protocol2(
                 device, settings, frequency_hz, sample_rate, adc, antenna, rx_attenuation,
-                ps_tx_attenuation, mox, tx_iq, tci_tx_audio, tx_power_watts, pa_gain_db,
+                ps_tx_attenuation, mox, tx_iq, tci_tx_audio, tci_tx_gain, tx_power_watts, pa_gain_db,
                 tx_forward_power, tx_reverse_power, ps_rx_feedback_iq, ps_tx_feedback_iq,
                 rx_audio_to_radio, send_rx_audio_to_radio, radio_mic_audio, use_radio_mic,
                 mic_ptt_enabled, mic_bias_enabled, mic_ptt_on_tip,
@@ -628,6 +642,7 @@ fn start_protocol1(
     mox: Arc<AtomicBool>,
     tx_iq: Arc<Mutex<VecDeque<f32>>>,
     tci_tx_audio: Arc<Mutex<VecDeque<f32>>>,
+    tci_tx_gain: Arc<Mutex<f32>>,
     tx_power_watts: Arc<AtomicU32>,
     pa_gain_db: Arc<AtomicU32>,
     tx_forward_power: Arc<AtomicU32>,
@@ -821,6 +836,7 @@ fn start_protocol1(
         mox,
         tx_iq,
         tci_tx_audio,
+        tci_tx_gain,
         rx_audio_to_radio,
         send_rx_audio_to_radio,
         radio_mic_audio,
@@ -2049,6 +2065,7 @@ fn start_protocol2(
     mox: Arc<AtomicBool>,
     tx_iq: Arc<Mutex<VecDeque<f32>>>,
     tci_tx_audio: Arc<Mutex<VecDeque<f32>>>,
+    tci_tx_gain: Arc<Mutex<f32>>,
     tx_power_watts: Arc<AtomicU32>,
     pa_gain_db: Arc<AtomicU32>,
     tx_forward_power: Arc<AtomicU32>,
@@ -2247,6 +2264,7 @@ fn start_protocol2(
         mox,
         tx_iq,
         tci_tx_audio,
+        tci_tx_gain,
         rx_audio_to_radio,
         send_rx_audio_to_radio,
         radio_mic_audio,

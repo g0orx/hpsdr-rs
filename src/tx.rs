@@ -487,6 +487,14 @@ impl TxProcessor {
             // for headroom instead, which is what piHPSDR relies on
             // for the same purpose.
             wdsp::SetTXAALCMaxGain(channel, 0.0);
+            // RULED OUT: ALC gain-pumping as the cause of a persistent
+            // wide spectral "skirt" seen on ANY mic-chain audio (TCI,
+            // local USB mic via pipewire -- confirmed NOT WSJT-X/TCI-
+            // specific) but never on Tune (PostGen bypasses the whole
+            // mic-chain path, including ALC, entirely -- see xtxa()'s
+            // processing order in WDSP's TXA.c). A direct test with ALC
+            // fully disabled (SetTXAALCSt 0) showed the identical skirt,
+            // ruling this stage out; back to its normal enabled state.
             wdsp::SetTXAALCSt(channel, 1);
 
             // Leveler: a separate, slower average-level-normalizing
@@ -1206,17 +1214,45 @@ fn run(
                 *slot = buf.pop_front().unwrap_or(0.0); // silence on underrun, not silence on stall
             }
         } else {
-            // TCI-sourced audio takes priority over the local mic for
-            // any chunk where it has a full chunk's worth available --
+            // TCI-sourced audio takes priority over the local mic --
             // see radio.rs's tci_tx_audio doc comment for why this is
             // a separate queue rather than both sources feeding
             // mic_buffer directly (would interleave/garble if both
             // were ever active at once). No TCI client sending audio
-            // -> this queue never fills -> falls through to mic_buffer
-            // exactly as before, zero behavior change for local-mic
-            // operation.
+            // at all -> this queue stays completely empty -> falls
+            // through to mic_buffer exactly as before, zero behavior
+            // change for local-mic operation.
+            //
+            // BUG FIX: this used to require a FULL chunk's worth
+            // (tci_buf.len() >= TX_BUFFER_SIZE) before touching this
+            // queue at all, falling through to mic_buffer on ANY
+            // shortfall -- indistinguishable from "no TCI client at
+            // all" only when a TCI client's real content is well
+            // ahead of consumption. A real report of WSJT-X's TX
+            // audio producing a wide/noisy TX spectrum persisted
+            // through ruling out audio-content corruption, gain/level,
+            // and PTT-triggering (an A/B test with TX audio source
+            // switched to the radio's own mic, still PTT'd via TCI,
+            // came out clean) -- pointing at this fallback itself:
+            // WSJT-X's real content has frequent natural gaps (its own
+            // TxChrono/ring-buffer pacing isn't perfectly smooth), so
+            // ordinary mid-stream shortfalls here were silently
+            // pulling from mic_buffer instead -- i.e. splicing in
+            // whatever the PC's live local mic is picking up (room
+            // noise, breathing, anything), unrelated in timing/level/
+            // phase to the TCI content, on top of an active TCI
+            // session. That's a highly plausible source of broadband
+            // splatter that none of the TCI-audio-focused fixes above
+            // could have touched. Emptiness (not fullness) is now the
+            // "is a TCI client actually active" signal -- a non-empty
+            // but short queue drains what it has and silence-pads the
+            // rest, same "silence on underrun, not silence on stall"
+            // policy the radio-mic branch above already uses.
             let mut tci_buf = tci_tx_audio.lock().unwrap();
-            if tci_buf.len() >= TX_BUFFER_SIZE {
+            if !tci_buf.is_empty() {
+                if tci_buf.len() < TX_BUFFER_SIZE {
+                    starved_chunks_this_window += 1;
+                }
                 for slot in chunk.iter_mut() {
                     *slot = tci_buf.pop_front().unwrap_or(0.0);
                 }
@@ -1248,6 +1284,7 @@ fn run(
         let p = *params.lock().unwrap();
         let (iq, exch_error) =
             processor.process(&chunk, p.mode, p.mic_gain, p.width_hz, p.tune, p.two_tone);
+
         if exch_error != 0 {
             exch_errors_this_window += 1;
         }
