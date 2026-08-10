@@ -386,6 +386,26 @@ pub struct RadioSession {
     /// third value was added -- see git history if that name shows up
     /// in an old comment/commit.
     pub tx_audio_source: Arc<AtomicU8>,
+    /// Set (and cleared) by tci.rs's `trx` command handler from that
+    /// command's optional 3rd argument, per the official TCI Protocol
+    /// spec (v2.0, section 4.2, TRX command): "arg3 - signal source
+    /// (optional): tci - take signal from TCI audio stream; mic1/mic2/
+    /// micPC/ecoder2 - take signal from that input... If an argument is
+    /// absent, the signal is taken from the microphone." True only when
+    /// a client explicitly names a non-TCI source (mic1/mic2/micPC/
+    /// ecoder2); false when it says `tci`, or omits arg3 entirely.
+    /// Consulted only by tx.rs's Auto branch (TX_AUDIO_SOURCE_AUTO) to
+    /// skip tci_tx_audio even if it currently has content -- explicit
+    /// user selections in Settings -> TX (RADIO_MIC/LOCAL_MIC above)
+    /// already bypass tci_tx_audio unconditionally and don't consult
+    /// this. Deliberately does NOT flip Auto's default the other way
+    /// (i.e. arg3 absent does not disable tci_tx_audio) -- TCI Remote,
+    /// this project's one confirmed-working TCI TX-audio client, never
+    /// sends arg3 at all, so defaulting to "spec-literal: no arg3 means
+    /// don't use TCI audio" would silently break that already-working
+    /// path for the sake of a stricter reading with no reference client
+    /// known to need it.
+    pub tci_wants_mic: Arc<AtomicBool>,
     /// Radio's mic-jack PTT input enabled/disabled -- confirmed against
     /// piHPSDR (`mic_ptt_enabled`, its own default off). Standard
     /// (Angelia/Orion/Orion2) boards only. P1: command 4 (0x14)'s C1
@@ -515,6 +535,7 @@ impl RadioSession {
         let send_rx_audio_to_radio = Arc::new(AtomicBool::new(false));
         let radio_mic_audio = Arc::new(Mutex::new(VecDeque::with_capacity(RADIO_MIC_AUDIO_CAPACITY)));
         let tx_audio_source = Arc::new(AtomicU8::new(TX_AUDIO_SOURCE_AUTO));
+        let tci_wants_mic = Arc::new(AtomicBool::new(false));
         let mic_ptt_enabled = Arc::new(AtomicBool::new(false));
         let mic_bias_enabled = Arc::new(AtomicBool::new(false));
         let mic_ptt_on_tip = Arc::new(AtomicBool::new(false));
@@ -524,14 +545,14 @@ impl RadioSession {
                 ps_tx_attenuation, mox, tx_iq, tci_tx_audio, tci_tx_gain, tx_power_watts, pa_gain_db,
                 tx_forward_power, tx_reverse_power, ps_rx_feedback_iq, ps_tx_feedback_iq,
                 rx_audio_to_radio, send_rx_audio_to_radio, radio_mic_audio, tx_audio_source,
-                mic_ptt_enabled, mic_bias_enabled, mic_ptt_on_tip,
+                tci_wants_mic, mic_ptt_enabled, mic_bias_enabled, mic_ptt_on_tip,
             ),
             2 => start_protocol2(
                 device, settings, frequency_hz, sample_rate, adc, antenna, rx_attenuation,
                 ps_tx_attenuation, mox, tx_iq, tci_tx_audio, tci_tx_gain, tx_power_watts, pa_gain_db,
                 tx_forward_power, tx_reverse_power, ps_rx_feedback_iq, ps_tx_feedback_iq,
                 rx_audio_to_radio, send_rx_audio_to_radio, radio_mic_audio, tx_audio_source,
-                mic_ptt_enabled, mic_bias_enabled, mic_ptt_on_tip,
+                tci_wants_mic, mic_ptt_enabled, mic_bias_enabled, mic_ptt_on_tip,
             ),
             p => Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -675,6 +696,7 @@ fn start_protocol1(
     send_rx_audio_to_radio: Arc<AtomicBool>,
     radio_mic_audio: Arc<Mutex<VecDeque<f32>>>,
     tx_audio_source: Arc<AtomicU8>,
+    tci_wants_mic: Arc<AtomicBool>,
     mic_ptt_enabled: Arc<AtomicBool>,
     mic_bias_enabled: Arc<AtomicBool>,
     mic_ptt_on_tip: Arc<AtomicBool>,
@@ -863,6 +885,7 @@ fn start_protocol1(
         send_rx_audio_to_radio,
         radio_mic_audio,
         tx_audio_source,
+        tci_wants_mic,
         mic_ptt_enabled,
         mic_bias_enabled,
         mic_ptt_on_tip,
@@ -2098,6 +2121,7 @@ fn start_protocol2(
     send_rx_audio_to_radio: Arc<AtomicBool>,
     radio_mic_audio: Arc<Mutex<VecDeque<f32>>>,
     tx_audio_source: Arc<AtomicU8>,
+    tci_wants_mic: Arc<AtomicBool>,
     mic_ptt_enabled: Arc<AtomicBool>,
     mic_bias_enabled: Arc<AtomicBool>,
     mic_ptt_on_tip: Arc<AtomicBool>,
@@ -2291,6 +2315,7 @@ fn start_protocol2(
         send_rx_audio_to_radio,
         radio_mic_audio,
         tx_audio_source,
+        tci_wants_mic,
         mic_ptt_enabled,
         mic_bias_enabled,
         mic_ptt_on_tip,

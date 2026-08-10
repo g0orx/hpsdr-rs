@@ -14,20 +14,30 @@
     CONFIDENCE LEVEL, please read before trusting this blindly:
     - Command syntax (`name:arg1,arg2,...;`, reserved chars :,;) and the
       default port are confirmed from the official protocol README
-      (github.com/ExpertSDR3/TCI).
-    - The specific commands implemented here (vfo, modulation, trx) and
-      their argument order are confirmed against JTDX's actual working
-      TCI client implementation (TCITransceiver.cpp), not guessed.
-    - The *initial handshake sequence* sent on connect (protocol name,
-      then vfo/modulation/trx state) is my best-effort reconstruction of
-      "server pushes current state on connect" per the README -- the
-      full official handshake may include additional fields (device
-      capabilities, channel counts, VFO limits, etc.) that aren't
-      implemented here. If a TCI client fails to fully recognize this
-      as a valid server, this is the first thing to check.
-    - TCI mode-string spellings (LSB/USB/CW/etc.) are assumed similar to
-      the equally-unverified-for-TCI-specifically ones used in rigctl.rs
-      -- not confirmed against a TCI reference for exact spelling.
+      (github.com/ExpertSDR3/TCI), and since then directly against
+      Expert Electronics' own "TCI Protocol Ver. 2.0" PDF (12 Jan 2024)
+      -- the authoritative spec, not a third-party reconstruction.
+    - The specific commands implemented here (vfo, modulation, trx,
+      audio_start/stop, iq_start/stop) and their argument order are
+      confirmed against BOTH that spec and JTDX's actual working TCI
+      client implementation (TCITransceiver.cpp).
+    - The *initial handshake sequence* sent on connect now includes
+      every Initialization command the spec defines (section 4.1):
+      protocol, device, vfo_limits, trx_count, channel_count,
+      receive_only, modulations_list, plus vfo/modulation/trx state and
+      start/ready. if_limits is the one Initialization command still not
+      sent (no IF-shift-within-panorama concept implemented here to
+      report a range for).
+    - TCI mode-string spellings (LSB/USB/CW/etc.) match the spec's own
+      MODULATIONS_LIST example and are cross-checked against JTDX/
+      WSJT-X source for exact case-sensitivity behavior (see
+      mode_to_tci's doc comment).
+    - trx's optional 3rd argument (signal source: tci/mic1/mic2/micPC/
+      ecoder2, spec section 4.2) is now parsed -- see tci_wants_mic's
+      doc comment in radio.rs for what it does and, importantly, what
+      it deliberately does NOT do (flip Auto's default when arg3 is
+      absent, which would break TCI Remote's confirmed-working TX audio
+      path -- that client never sends arg3 at all).
     - tungstenite's exact API surface (accept(), get_ref(), etc.) is
       from general knowledge of the crate, not verified against 0.29
       specifically -- same caveat as every other external-crate API in
@@ -101,7 +111,16 @@ use std::time::{Duration, Instant};
 use tungstenite::Message;
 
 pub const DEFAULT_ADDR: &str = "0.0.0.0:40001";
-const PROTOCOL_NAME: &str = "protocol:hpsdr-rs;";
+/// PROTOCOL:program-name,protocol-version; -- confirmed against the
+/// official TCI Protocol spec (v2.0, section 4.1): arg1 is the program
+/// name, arg2 the TCI protocol version implemented, e.g.
+/// "PROTOCOL:ExpertSDR3,1.9;". Previously sent as a bare "protocol:
+/// hpsdr-rs;" with no version field at all -- a guess made before this
+/// spec was available. "1.9" here is the last version whose full
+/// command set this file implements (VFO_LOCK/RX_CHANNEL_SENSORS were
+/// added in 2.0, KEYER in 1.9.1 -- none of those three are implemented
+/// here yet), not this project's own version.
+const PROTOCOL_MESSAGE: &str = "protocol:hpsdr-rs,1.9;";
 
 /// A swappable reference to "whichever DemodParams is current right
 /// now" -- see TciServer::set_demod_params's doc comment (and
@@ -162,6 +181,7 @@ impl TciServer {
         iq_out: Arc<Mutex<VecDeque<(f32, f32)>>>,
         tci_tx_audio: Arc<Mutex<VecDeque<f32>>>,
         tci_tx_gain: Arc<Mutex<f32>>,
+        tci_wants_mic: Arc<AtomicBool>,
     ) -> std::io::Result<Self> {
         let listener = TcpListener::bind(addr)?;
         listener.set_nonblocking(true)?;
@@ -179,6 +199,7 @@ impl TciServer {
         let accept_audio_iq = Arc::clone(&audio_iq);
         let accept_tci_tx_audio = Arc::clone(&tci_tx_audio);
         let accept_tci_tx_gain = Arc::clone(&tci_tx_gain);
+        let accept_tci_wants_mic = Arc::clone(&tci_wants_mic);
         let thread = thread::spawn(move || {
             while !accept_stop.load(Ordering::Relaxed) {
                 match listener.accept() {
@@ -190,14 +211,15 @@ impl TciServer {
                         let audio_iq = Arc::clone(&accept_audio_iq);
                         let tx_audio = Arc::clone(&accept_tci_tx_audio);
                         let tx_gain = Arc::clone(&accept_tci_tx_gain);
+                        let wants_mic = Arc::clone(&accept_tci_wants_mic);
                         let conn_mox = Arc::clone(&mox);
                         let conn_stop = Arc::clone(&accept_stop);
                         let conn_connected = Arc::clone(&accept_connected);
                         let handle = thread::spawn(move || {
                             conn_connected.fetch_add(1, Ordering::Relaxed);
                             handle_client(
-                                stream, freq, rate, params, audio_iq, tx_audio, tx_gain, conn_mox,
-                                conn_stop,
+                                stream, freq, rate, params, audio_iq, tx_audio, tx_gain, wants_mic,
+                                conn_mox, conn_stop,
                             );
                             conn_connected.fetch_sub(1, Ordering::Relaxed);
                         });
@@ -282,6 +304,7 @@ fn handle_client(
     audio_iq: AudioIqCell,
     tci_tx_audio: Arc<Mutex<VecDeque<f32>>>,
     tci_tx_gain: Arc<Mutex<f32>>,
+    tci_wants_mic: Arc<AtomicBool>,
     mox: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
 ) {
@@ -320,8 +343,31 @@ fn handle_client(
     // any client that reads it.
     let freq = frequency_hz.load(Ordering::Relaxed);
     let mode = demod_params.lock().unwrap().clone().lock().unwrap().mode;
-    let _ = ws.send(Message::Text(PROTOCOL_NAME.into()));
+    let _ = ws.send(Message::Text(PROTOCOL_MESSAGE.into()));
     let _ = ws.send(Message::Text("device:hpsdr-rs;".into()));
+    // Remaining Initialization commands (spec section 4.1) beyond
+    // protocol/device -- previously not sent at all (this file's own
+    // module note flagged the full handshake as an unconfirmed
+    // reconstruction; the real spec fills these in). VFO_LIMITS mirrors
+    // rigctl.rs's own permissive 0Hz-4GHz range (see its dump_state's
+    // doc comment) rather than modeling exact hardware limits, for the
+    // same reason: no single value is right for every supported board/
+    // filter combination, and a wide-open range never incorrectly
+    // rejects a client's request. RECEIVE_ONLY:false -- this project
+    // always has TX support wired up (Settings -> TX gates actual PTT,
+    // not the protocol handshake). TRX_COUNT/CHANNEL_COUNT:1 -- TCI
+    // (unlike rigctl) has no second-VFO/extra-receiver concept
+    // implemented here; see this file's module note on trx always
+    // being 0. MODULATIONS_LIST uses the canonical spellings
+    // tci_to_mode below actually keys on, not its aliases (CWR/PKTUSB/
+    // PKTLSB/WFM).
+    let _ = ws.send(Message::Text("vfo_limits:0,4000000000;".into()));
+    let _ = ws.send(Message::Text("trx_count:1;".into()));
+    let _ = ws.send(Message::Text("channel_count:1;".into()));
+    let _ = ws.send(Message::Text("receive_only:false;".into()));
+    let _ = ws.send(Message::Text(
+        "modulations_list:LSB,USB,DSB,CW,AM,NFM,DIGU,DIGL,SAM;".into(),
+    ));
     let _ = ws.send(Message::Text(format!("vfo:0,0,{freq};").into()));
     let _ = ws.send(Message::Text(format!("modulation:0,{};", mode_to_tci(mode)).into()));
     let _ = ws.send(Message::Text(
@@ -398,6 +444,7 @@ fn handle_client(
                         &frequency_hz,
                         &current_params,
                         &mox,
+                        &tci_wants_mic,
                         &mut audio_streaming,
                         &mut iq_streaming,
                     ) {
@@ -790,6 +837,7 @@ fn handle_command(
     frequency_hz: &Arc<AtomicU32>,
     demod_params: &Arc<Mutex<DemodParams>>,
     mox: &Arc<AtomicBool>,
+    tci_wants_mic: &Arc<AtomicBool>,
     audio_streaming: &mut bool,
     iq_streaming: &mut bool,
 ) -> Option<String> {
@@ -830,10 +878,24 @@ fn handle_command(
             // either way).
             Some(format!("modulation:{},{};", args.first().unwrap_or(&"0"), requested))
         }
-        // trx:receiver,state;
+        // trx:receiver,state,source; -- source (arg3) is optional, per
+        // spec section 4.2: "tci" means take TX audio from the TCI
+        // audio stream; mic1/mic2/micPC/ecoder2 mean take it from that
+        // input instead. Stored in tci_wants_mic (true only for an
+        // explicit non-tci source) -- see that field's doc comment in
+        // radio.rs for why an absent arg3 deliberately does NOT disable
+        // tci_tx_audio the way a strict reading of "signal is always
+        // taken from the microphone... unless TCI is specified" would
+        // suggest: TCI Remote, the one client this project's TX-audio
+        // path is confirmed working against, never sends arg3 at all.
         "trx" => {
             let on = matches!(args.get(1), Some(&"true") | Some(&"1"));
             mox.store(on, Ordering::Relaxed);
+            if let Some(source) = args.get(2) {
+                tci_wants_mic.store(!source.eq_ignore_ascii_case("tci"), Ordering::Relaxed);
+            } else {
+                tci_wants_mic.store(false, Ordering::Relaxed);
+            }
             Some(format!("trx:{},{};", args.first().unwrap_or(&"0"), on))
         }
         // audio_start:receiver; / audio_stop:receiver; -- receiver index

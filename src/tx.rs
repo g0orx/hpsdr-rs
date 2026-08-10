@@ -1053,6 +1053,12 @@ fn run(
     // that one is consulted for the whole chunk.
     radio_mic_audio: Arc<Mutex<VecDeque<f32>>>,
     tx_audio_source: Arc<AtomicU8>,
+    // Set by tci.rs's `trx` command handler from that command's optional
+    // signal-source argument (spec section 4.2) -- true only when a TCI
+    // client explicitly names a non-"tci" source. Consulted only by the
+    // Auto branch below; see radio.rs's RadioSession::tci_wants_mic doc
+    // comment for the full reasoning.
+    tci_wants_mic: Arc<AtomicBool>,
     tx_iq_out: Arc<Mutex<VecDeque<f32>>>,
     // Fed with the SAME generated TX IQ that goes out over the wire
     // (tx_iq_out), for a dedicated TX spectrum display -- see main.rs's
@@ -1274,8 +1280,15 @@ fn run(
             // but short queue drains what it has and silence-pads the
             // rest, same "silence on underrun, not silence on stall"
             // policy the radio-mic branch above already uses.
+            // Spec section 4.2 (TRX command): a client can explicitly
+            // name a non-TCI signal source (mic1/mic2/micPC/ecoder2) for
+            // this transmission -- when it does, tci_tx_audio is skipped
+            // even if it currently has content, same as if no TCI client
+            // were sending audio at all. See tci_wants_mic's doc comment
+            // above for why an absent/​"tci" source does NOT flip this
+            // the other way.
             let mut tci_buf = tci_tx_audio.lock().unwrap();
-            if !tci_buf.is_empty() {
+            if !tci_wants_mic.load(Ordering::Relaxed) && !tci_buf.is_empty() {
                 if tci_buf.len() < TX_BUFFER_SIZE {
                     starved_chunks_this_window += 1;
                 }
@@ -1428,6 +1441,8 @@ impl TxHandle {
         // See run()'s doc comment on the parameters of the same name.
         radio_mic_audio: Arc<Mutex<VecDeque<f32>>>,
         tx_audio_source: Arc<AtomicU8>,
+        // See run()'s doc comment on the parameter of the same name.
+        tci_wants_mic: Arc<AtomicBool>,
         tx_iq_out: Arc<Mutex<VecDeque<f32>>>,
         // See run()'s doc comment on the parameter of the same name.
         tx_spectrum_iq: Arc<Mutex<VecDeque<IqSample>>>,
@@ -1460,10 +1475,10 @@ impl TxHandle {
             let stop = Arc::clone(&stop);
             thread::spawn(move || {
                 run(
-                    mic_buffer, tci_tx_audio, radio_mic_audio, tx_audio_source, tx_iq_out,
-                    tx_spectrum_iq, mox, params, display, channel, protocol, mic_rate, duc_rate,
-                    puresignal_enabled, ps_rx_feedback_iq, ps_tx_feedback_iq, ps_params, ps_status,
-                    ps_corr_path, stop,
+                    mic_buffer, tci_tx_audio, radio_mic_audio, tx_audio_source, tci_wants_mic,
+                    tx_iq_out, tx_spectrum_iq, mox, params, display, channel, protocol, mic_rate,
+                    duc_rate, puresignal_enabled, ps_rx_feedback_iq, ps_tx_feedback_iq, ps_params,
+                    ps_status, ps_corr_path, stop,
                 )
             })
         };

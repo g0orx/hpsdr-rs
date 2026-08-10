@@ -529,6 +529,7 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                     Arc::clone(&spectrum.iq_out),
                     Arc::clone(&session.tci_tx_audio),
                     Arc::clone(&session.tci_tx_gain),
+                    Arc::clone(&session.tci_wants_mic),
                 ) {
                     Ok(s) => Some(s),
                     Err(e) => {
@@ -652,6 +653,7 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                         Arc::clone(&session.tci_tx_audio),
                         Arc::clone(&session.radio_mic_audio),
                         Arc::clone(&session.tx_audio_source),
+                        Arc::clone(&session.tci_wants_mic),
                         Arc::clone(&session.tx_iq),
                         Arc::clone(&tx_spectrum_iq),
                         Arc::clone(&session.mox),
@@ -2197,6 +2199,7 @@ impl eframe::App for HpsdrApp {
                                                 Arc::clone(&connected.spectrum.iq_out),
                                                 Arc::clone(&connected.session.tci_tx_audio),
                                                 Arc::clone(&connected.session.tci_tx_gain),
+                                                Arc::clone(&connected.session.tci_wants_mic),
                                             ) {
                                                 Ok(s) => Some(s),
                                                 Err(e) => {
@@ -2737,6 +2740,7 @@ impl eframe::App for HpsdrApp {
                                                         Arc::clone(&connected.session.tci_tx_audio),
                                                         Arc::clone(&connected.session.radio_mic_audio),
                                                         Arc::clone(&connected.session.tx_audio_source),
+                                                        Arc::clone(&connected.session.tci_wants_mic),
                                                         Arc::clone(&connected.session.tx_iq),
                                                         Arc::clone(&tx_spectrum_iq),
                                                         Arc::clone(&connected.session.mox),
@@ -4698,6 +4702,7 @@ fn change_sample_rate(connected: &mut ConnectedState, new_rate: u32) {
                     Arc::clone(&connected.session.tci_tx_audio),
                     Arc::clone(&connected.session.radio_mic_audio),
                     Arc::clone(&connected.session.tx_audio_source),
+                    Arc::clone(&connected.session.tci_wants_mic),
                     Arc::clone(&connected.session.tx_iq),
                     Arc::clone(&tx_spectrum_iq),
                     Arc::clone(&connected.session.mox),
