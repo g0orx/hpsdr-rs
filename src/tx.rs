@@ -63,14 +63,16 @@
     verification is what actually validates it.
 */
 
-use crate::radio::IqSample;
+use crate::radio::{
+    IqSample, TX_AUDIO_SOURCE_LOCAL_MIC, TX_AUDIO_SOURCE_RADIO_MIC,
+};
 use crate::spectrum::Mode;
 use crate::wdsp_sys as wdsp;
 use std::collections::VecDeque;
 use std::ffi::CString;
 use std::os::raw::c_int;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -1045,11 +1047,12 @@ fn run(
     tci_tx_audio: Arc<Mutex<VecDeque<f32>>>,
     // Radio's own mic input (Settings -> TX -- "TX audio source: Radio
     // Mic") -- see radio.rs's RadioSession::radio_mic_audio/
-    // use_radio_mic doc comments. An either/or SOURCE SELECTION, not
-    // another priority tier alongside tci_tx_audio/mic_buffer: when
-    // use_radio_mic is on, this is the ONLY source consulted below.
+    // tx_audio_source doc comments. An either/or/or SOURCE SELECTION,
+    // not another priority tier alongside tci_tx_audio/mic_buffer: the
+    // TX_AUDIO_SOURCE_* value below picks exactly one source, and only
+    // that one is consulted for the whole chunk.
     radio_mic_audio: Arc<Mutex<VecDeque<f32>>>,
-    use_radio_mic: Arc<AtomicBool>,
+    tx_audio_source: Arc<AtomicU8>,
     tx_iq_out: Arc<Mutex<VecDeque<f32>>>,
     // Fed with the SAME generated TX IQ that goes out over the wire
     // (tx_iq_out), for a dedicated TX spectrum display -- see main.rs's
@@ -1201,11 +1204,12 @@ fn run(
             }
         }
 
-        if use_radio_mic.load(Ordering::Relaxed) {
-            // Explicit either/or source selection (Settings -> TX) --
-            // bypasses TCI/local mic entirely while on, rather than
-            // adding a third implicit-priority tier alongside them. See
-            // radio.rs's RadioSession::use_radio_mic doc comment.
+        let selected_source = tx_audio_source.load(Ordering::Relaxed);
+        if selected_source == TX_AUDIO_SOURCE_RADIO_MIC {
+            // Explicit source selection (Settings -> TX) -- bypasses
+            // TCI/local mic entirely while selected, rather than adding
+            // an implicit-priority tier alongside them. See radio.rs's
+            // RadioSession::tx_audio_source doc comment.
             let mut buf = radio_mic_audio.lock().unwrap();
             if buf.len() < TX_BUFFER_SIZE {
                 starved_chunks_this_window += 1;
@@ -1213,8 +1217,30 @@ fn run(
             for slot in chunk.iter_mut() {
                 *slot = buf.pop_front().unwrap_or(0.0); // silence on underrun, not silence on stall
             }
+        } else if selected_source == TX_AUDIO_SOURCE_LOCAL_MIC {
+            // Explicit source selection -- bypasses tci_tx_audio
+            // ENTIRELY, unlike Auto's fallback below (which only
+            // switches to mic_buffer on a TCI underrun/no-client).
+            // Added specifically for a confirmed real bug in WSJT-X's
+            // own TCI audio generation (TCITransceiver.cpp's tx_fifo
+            // ring buffer resends stale content on roughly 1-in-8
+            // messages -- confirmed via source, and by ear: a real
+            // side-by-side recording of the SAME transmission was
+            // clean via local mic/pipewire, audibly rough via TCI) --
+            // this lets a TCI client keep driving frequency/mode/PTT
+            // while using local mic input (e.g. the TCI client's own
+            // audio output looped back via pipewire) for TX audio
+            // instead of its broken TCI audio path.
+            let mut buf = mic_buffer.lock().unwrap();
+            if buf.len() < TX_BUFFER_SIZE {
+                starved_chunks_this_window += 1;
+            }
+            for slot in chunk.iter_mut() {
+                *slot = buf.pop_front().unwrap_or(0.0); // silence on underrun, not silence on stall
+            }
         } else {
-            // TCI-sourced audio takes priority over the local mic --
+            // Auto (default): TCI-sourced audio takes priority over the
+            // local mic --
             // see radio.rs's tci_tx_audio doc comment for why this is
             // a separate queue rather than both sources feeding
             // mic_buffer directly (would interleave/garble if both
@@ -1401,7 +1427,7 @@ impl TxHandle {
         tci_tx_audio: Arc<Mutex<VecDeque<f32>>>,
         // See run()'s doc comment on the parameters of the same name.
         radio_mic_audio: Arc<Mutex<VecDeque<f32>>>,
-        use_radio_mic: Arc<AtomicBool>,
+        tx_audio_source: Arc<AtomicU8>,
         tx_iq_out: Arc<Mutex<VecDeque<f32>>>,
         // See run()'s doc comment on the parameter of the same name.
         tx_spectrum_iq: Arc<Mutex<VecDeque<IqSample>>>,
@@ -1434,7 +1460,7 @@ impl TxHandle {
             let stop = Arc::clone(&stop);
             thread::spawn(move || {
                 run(
-                    mic_buffer, tci_tx_audio, radio_mic_audio, use_radio_mic, tx_iq_out,
+                    mic_buffer, tci_tx_audio, radio_mic_audio, tx_audio_source, tx_iq_out,
                     tx_spectrum_iq, mox, params, display, channel, protocol, mic_rate, duc_rate,
                     puresignal_enabled, ps_rx_feedback_iq, ps_tx_feedback_iq, ps_params, ps_status,
                     ps_corr_path, stop,

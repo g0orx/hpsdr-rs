@@ -14,7 +14,10 @@ use config::{ps_corr_path, Config, ExtraReceiverConfig};
 use discovery::{Boards, Device};
 use discovery_ui::{DiscoveryAction, DiscoveryWindow};
 use eframe::egui;
-use radio::{IqSample, RadioSession, RadioSettings};
+use radio::{
+    IqSample, RadioSession, RadioSettings, TX_AUDIO_SOURCE_AUTO, TX_AUDIO_SOURCE_LOCAL_MIC,
+    TX_AUDIO_SOURCE_RADIO_MIC,
+};
 use rigctl::RigctlServer;
 use spectrum::{SpectrumHandle, ALL_MODES};
 use std::collections::VecDeque;
@@ -460,7 +463,9 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                 cfg.send_rx_audio_to_radio.unwrap_or(false),
                 Ordering::Relaxed,
             );
-            session.use_radio_mic.store(cfg.use_radio_mic.unwrap_or(false), Ordering::Relaxed);
+            session
+                .tx_audio_source
+                .store(cfg.tx_audio_source.unwrap_or(TX_AUDIO_SOURCE_AUTO), Ordering::Relaxed);
             session
                 .mic_ptt_enabled
                 .store(cfg.mic_ptt_enabled.unwrap_or(false), Ordering::Relaxed);
@@ -646,7 +651,7 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                         mic_buffer,
                         Arc::clone(&session.tci_tx_audio),
                         Arc::clone(&session.radio_mic_audio),
-                        Arc::clone(&session.use_radio_mic),
+                        Arc::clone(&session.tx_audio_source),
                         Arc::clone(&session.tx_iq),
                         Arc::clone(&tx_spectrum_iq),
                         Arc::clone(&session.mox),
@@ -2731,7 +2736,7 @@ impl eframe::App for HpsdrApp {
                                                         mic_buffer,
                                                         Arc::clone(&connected.session.tci_tx_audio),
                                                         Arc::clone(&connected.session.radio_mic_audio),
-                                                        Arc::clone(&connected.session.use_radio_mic),
+                                                        Arc::clone(&connected.session.tx_audio_source),
                                                         Arc::clone(&connected.session.tx_iq),
                                                         Arc::clone(&tx_spectrum_iq),
                                                         Arc::clone(&connected.session.mox),
@@ -2796,24 +2801,48 @@ impl eframe::App for HpsdrApp {
                                         settings_changed = true;
                                     }
 
-                                    // Either/or TX audio source selection --
-                                    // see radio::RadioSession::use_radio_mic's
-                                    // doc comment. Off (local mic/TCI, the
-                                    // existing behavior) by default.
+                                    // TX audio source selection -- see
+                                    // radio::RadioSession::tx_audio_source's
+                                    // doc comment. Auto (existing TCI-
+                                    // preferred-with-local-mic-fallback
+                                    // behavior) by default.
                                     ui.add_space(8.0);
-                                    let mut use_radio_mic =
-                                        connected.session.use_radio_mic.load(Ordering::Relaxed);
-                                    if ui
-                                        .checkbox(&mut use_radio_mic, "Use radio's mic input for TX audio")
-                                        .changed()
-                                    {
-                                        connected.session.use_radio_mic.store(use_radio_mic, Ordering::Relaxed);
-                                        settings_changed = true;
-                                    }
-                                    ui.weak(
-                                        "When on, audio from the radio's own mic jack replaces the \
-                                         local PC mic (and TCI audio) as the TX source.",
-                                    );
+                                    ui.label("TX audio source:");
+                                    let current_source =
+                                        connected.session.tx_audio_source.load(Ordering::Relaxed);
+                                    ui.horizontal(|ui| {
+                                        for (value, label) in [
+                                            (TX_AUDIO_SOURCE_AUTO, "Auto"),
+                                            (TX_AUDIO_SOURCE_RADIO_MIC, "Radio Mic"),
+                                            (TX_AUDIO_SOURCE_LOCAL_MIC, "Local Mic (ignore TCI audio)"),
+                                        ] {
+                                            if ui.selectable_label(current_source == value, label).clicked()
+                                                && current_source != value
+                                            {
+                                                connected.session.tx_audio_source.store(value, Ordering::Relaxed);
+                                                settings_changed = true;
+                                            }
+                                        }
+                                    });
+                                    ui.weak(match current_source {
+                                        TX_AUDIO_SOURCE_RADIO_MIC => {
+                                            "Audio from the radio's own mic jack replaces the local \
+                                             PC mic (and TCI audio) as the TX source."
+                                        }
+                                        TX_AUDIO_SOURCE_LOCAL_MIC => {
+                                            "Local PC mic audio is used for TX regardless of TCI, even \
+                                             while a TCI client is actively sending its own audio -- \
+                                             useful for a TCI client (e.g. WSJT-X) with a known-bad TCI \
+                                             audio path, routing its own audio output back via the \
+                                             system's local mic input (e.g. pipewire) instead while \
+                                             TCI still drives frequency/mode/PTT."
+                                        }
+                                        _ => {
+                                            "TCI-sourced audio is used whenever a TCI client is \
+                                             actively sending it, falling back to the local PC mic \
+                                             otherwise."
+                                        }
+                                    });
 
                                     // Radio mic connector config (PTT enable, tip/ring wiring,
                                     // bias) -- standard Angelia/Orion/Orion2 boards only, matching
@@ -3237,8 +3266,8 @@ impl eframe::App for HpsdrApp {
                                 .send_rx_audio_to_radio
                                 .load(std::sync::atomic::Ordering::Relaxed),
                         ),
-                        use_radio_mic: Some(
-                            connected.session.use_radio_mic.load(std::sync::atomic::Ordering::Relaxed),
+                        tx_audio_source: Some(
+                            connected.session.tx_audio_source.load(std::sync::atomic::Ordering::Relaxed),
                         ),
                         mic_ptt_enabled: Some(
                             connected.session.mic_ptt_enabled.load(std::sync::atomic::Ordering::Relaxed),
@@ -4668,7 +4697,7 @@ fn change_sample_rate(connected: &mut ConnectedState, new_rate: u32) {
                     Arc::clone(mic.buffer()),
                     Arc::clone(&connected.session.tci_tx_audio),
                     Arc::clone(&connected.session.radio_mic_audio),
-                    Arc::clone(&connected.session.use_radio_mic),
+                    Arc::clone(&connected.session.tx_audio_source),
                     Arc::clone(&connected.session.tx_iq),
                     Arc::clone(&tx_spectrum_iq),
                     Arc::clone(&connected.session.mox),

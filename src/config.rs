@@ -169,11 +169,14 @@ pub struct Config {
     /// the live default.
     #[serde(default)]
     pub send_rx_audio_to_radio: Option<bool>,
-    /// See radio::RadioSession::use_radio_mic's doc comment (Settings ->
-    /// TX). Missing/never set falls back to off (local mic), same as
-    /// the live default.
+    /// See radio::RadioSession::tx_audio_source's doc comment (Settings
+    /// -> TX) -- one of radio::TX_AUDIO_SOURCE_AUTO/RADIO_MIC/LOCAL_MIC.
+    /// Missing/never set falls back to Auto, same as the live default.
+    /// Renamed from the old `use_radio_mic: Option<bool>` when a third
+    /// value was added -- an old saved config with that field just
+    /// falls back to Auto once, same as never having been set.
     #[serde(default)]
-    pub use_radio_mic: Option<bool>,
+    pub tx_audio_source: Option<u8>,
     /// See radio::RadioSession::mic_ptt_enabled/mic_bias_enabled/
     /// mic_ptt_on_tip's doc comments (Settings -> TX, standard boards
     /// only). Missing/never set falls back to off/off/"PTT on Ring",
