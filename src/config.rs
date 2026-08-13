@@ -12,7 +12,7 @@
     path convention (e.g. %APPDATA% / ~/Library/Application Support).
 */
 
-use crate::spectrum::{Agc, Mode, NoiseBlanker, NoiseReduction};
+use crate::spectrum::{Agc, EqualizerParams, Mode, NoiseBlanker, NoiseReduction};
 use crate::{BandSettings, Palette};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -64,10 +64,16 @@ pub struct Config {
     /// SNB ("Spectral Noise Blanker") -- independent of noise_reduction
     /// above, see spectrum::DemodParams::snb's doc comment for why.
     pub snb: Option<bool>,
+    /// Main receiver's graphic EQ -- see spectrum::EqualizerParams's doc
+    /// comment. Each extra receiver window persists its own copy
+    /// separately, see ExtraReceiverConfig::eq.
+    pub rx_eq: Option<EqualizerParams>,
     /// TX mic gain. Deliberately one of very few TX settings persisted
     /// -- whether TX was armed (tx_enabled) is intentionally NOT saved
     /// (see main.rs's auto-arm-on-connect comment).
     pub mic_gain: Option<f32>,
+    /// TX graphic EQ -- see spectrum::EqualizerParams's doc comment.
+    pub tx_eq: Option<EqualizerParams>,
     /// Gain applied specifically to TX audio received from a TCI
     /// client (WSJT-X, TCI Remote, etc.), independent of mic_gain
     /// above -- see radio::RadioSession::tci_tx_gain's doc comment for
@@ -249,6 +255,10 @@ pub struct ExtraReceiverConfig {
     /// See Config::spectrum_waterfall_ratio's doc comment.
     #[serde(default = "default_spectrum_waterfall_ratio")]
     pub spectrum_waterfall_ratio: f32,
+    /// See Config::rx_eq's doc comment -- same type, this receiver's own
+    /// independent copy.
+    #[serde(default)]
+    pub eq: EqualizerParams,
 }
 
 fn default_spectrum_waterfall_ratio() -> f32 {

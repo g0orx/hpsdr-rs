@@ -452,6 +452,15 @@ unsafe extern "C" {
     pub fn SetRXAGrphEQ(channel: ::std::os::raw::c_int, rxeq: *mut ::std::os::raw::c_int);
 }
 unsafe extern "C" {
+    // Not declared in the vendored wdsp.h this file was originally
+    // generated from (only the 3-band SetRXAGrphEQ above is) -- but
+    // confirmed present as a real exported symbol in vendor/libwdsp.a
+    // via `nm` (eq.c defines it unconditionally, just without a header
+    // prototype). Same array layout as SetRXAGrphEQ, just 11 entries
+    // (preamp + 10 bands, 32Hz..16kHz) instead of 4.
+    pub fn SetRXAGrphEQ10(channel: ::std::os::raw::c_int, rxeq: *mut ::std::os::raw::c_int);
+}
+unsafe extern "C" {
     pub fn create_divEXT(
         id: ::std::os::raw::c_int,
         run: ::std::os::raw::c_int,
@@ -751,6 +760,10 @@ unsafe extern "C" {
 }
 unsafe extern "C" {
     pub fn SetTXAGrphEQ(channel: ::std::os::raw::c_int, txeq: *mut ::std::os::raw::c_int);
+}
+unsafe extern "C" {
+    // See SetRXAGrphEQ10's doc comment -- same reasoning, TXA side.
+    pub fn SetTXAGrphEQ10(channel: ::std::os::raw::c_int, txeq: *mut ::std::os::raw::c_int);
 }
 unsafe extern "C" {
     pub fn SetTXAFMDeviation(channel: ::std::os::raw::c_int, deviation: f64);

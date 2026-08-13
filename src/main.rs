@@ -149,6 +149,7 @@ enum SettingsTab {
     PaCalibration,
     PureSignal,
     Diversity,
+    Equalizer,
 }
 
 /// A receiver beyond the first, shown in its own native OS window (P2
@@ -397,6 +398,10 @@ struct ConnectedState {
     /// (fixed wire-level DDC layout) -- mutually exclusive with it, see
     /// the Diversity/PureSignal tabs' checkbox handlers.
     diversity_enabled: bool,
+    /// Which side (RX vs TX) the main window's Equalizer tab is
+    /// currently showing -- purely a UI selection, not persisted (always
+    /// reopens on RX). See the SettingsTab::Equalizer match arm.
+    eq_tab_is_tx: bool,
     /// Edge-detection for auto-saving the PS correction table -- see
     /// the "PS" badge's own doc comment (main panel toolbar) for where
     /// this is checked each frame. True once a false->true
@@ -602,6 +607,9 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
             if let Some(v) = cfg.snb {
                 spectrum.set_snb(v);
             }
+            if let Some(v) = cfg.rx_eq {
+                spectrum.set_eq(v);
+            }
             let mic_gain = cfg.mic_gain.unwrap_or(0.5);
             let tci_tx_gain = cfg.tci_tx_gain.unwrap_or(1.0);
             *session.tci_tx_gain.lock().unwrap() = tci_tx_gain;
@@ -686,6 +694,9 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                     tx_handle.set_ps_loop_delay(ps_loop_delay);
                     tx_handle.set_ps_tx_delay_ns(ps_tx_delay_ns);
                     tx_handle.set_ps_ptol(ps_ptol);
+                    if let Some(v) = cfg.tx_eq {
+                        tx_handle.set_eq(v);
+                    }
                     // Apply a previously-saved correction table
                     // immediately, if PS is enabled and one exists for
                     // this radio -- see TxHandle::restore_ps_corr's doc
@@ -782,6 +793,7 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                 tx_spectrum_mox_was_active: false,
                 puresignal_enabled: settings.puresignal_enabled,
                 diversity_enabled: settings.diversity_enabled,
+                eq_tab_is_tx: false,
                 ps_was_correcting: false,
             })
         }
@@ -2147,6 +2159,7 @@ impl eframe::App for HpsdrApp {
                                     (SettingsTab::PaCalibration, "PA Calibration"),
                                     (SettingsTab::PureSignal, "PureSignal"),
                                     (SettingsTab::Diversity, "Diversity"),
+                                    (SettingsTab::Equalizer, "Equalizer"),
                                 ] {
                                     // Diversity requires a 2-ADC board -- see
                                     // radio::RadioSession::diversity_enabled's
@@ -3289,6 +3302,50 @@ impl eframe::App for HpsdrApp {
                                         );
                                     }
                                 }
+                                SettingsTab::Equalizer => {
+                                    // See spectrum::EqualizerParams's doc comment --
+                                    // WDSP's own two graphic-EQ layouts (3-band legacy /
+                                    // 10-band), ported from piHPSDR's equalizer_menu.c
+                                    // (which the user originally wrote, 3-band only --
+                                    // 10-band added here per explicit request).
+                                    if connected.tx_handle.is_some() {
+                                        ui.horizontal(|ui| {
+                                            for (is_tx, label) in [(false, "RX"), (true, "TX")] {
+                                                if ui
+                                                    .selectable_label(connected.eq_tab_is_tx == is_tx, label)
+                                                    .clicked()
+                                                {
+                                                    connected.eq_tab_is_tx = is_tx;
+                                                }
+                                            }
+                                        });
+                                        ui.separator();
+                                    }
+                                    if connected.eq_tab_is_tx && connected.tx_handle.is_some() {
+                                        let tx = connected.tx_handle.as_ref().unwrap();
+                                        let mut eq = tx.eq();
+                                        if render_equalizer_panel(
+                                            ui,
+                                            &mut connected.slider_scroll_accum,
+                                            "TX",
+                                            &mut eq,
+                                        ) {
+                                            tx.set_eq(eq);
+                                            settings_changed = true;
+                                        }
+                                    } else {
+                                        let mut eq = connected.spectrum.eq();
+                                        if render_equalizer_panel(
+                                            ui,
+                                            &mut connected.slider_scroll_accum,
+                                            "RX",
+                                            &mut eq,
+                                        ) {
+                                            connected.spectrum.set_eq(eq);
+                                            settings_changed = true;
+                                        }
+                                    }
+                                }
                             }
                         });
                         },
@@ -3334,6 +3391,7 @@ impl eframe::App for HpsdrApp {
                                 adc: rx.adc.load(std::sync::atomic::Ordering::Relaxed) as u8,
                                 band_settings: rx.band_memory.clone(),
                                 width_memory: rx.width_memory.clone(),
+                                eq: agc_params.eq,
                             }
                         })
                         .collect();
@@ -3356,7 +3414,9 @@ impl eframe::App for HpsdrApp {
                         nb_threshold: Some(agc_params_now.nb_threshold),
                         noise_reduction: Some(agc_params_now.noise_reduction),
                         snb: Some(agc_params_now.snb),
+                        rx_eq: Some(agc_params_now.eq),
                         mic_gain: Some(connected.mic_gain),
+                        tx_eq: connected.tx_handle.as_ref().map(|t| t.eq()),
                         tci_tx_gain: Some(connected.tci_tx_gain),
                         tx_power_watts: Some(connected.session.tx_power_watts.load(Ordering::Relaxed)),
                         db_low: Some(connected.db_low),
@@ -3759,6 +3819,69 @@ fn scroll_slider_i32(
                 *scroll_accum -= sign * NOTCH;
                 *value = (*value + step * sign as i32).clamp(*range.start(), *range.end());
                 changed = true;
+            }
+        }
+    }
+    changed
+}
+
+/// Shared RX/TX graphic-EQ panel -- see spectrum::EqualizerParams's doc
+/// comment for the two band layouts. `side_label` is just the checkbox
+/// wording ("RX"/"TX"); range/step (-12..15dB, step 1) matches piHPSDR's
+/// own equalizer_menu.c exactly. Mutates `eq` in place and returns
+/// whether anything changed, so every call site can decide how to push
+/// the result back (SpectrumHandle::set_eq / TxHandle::set_eq) and mark
+/// its own dirty flag -- same "mutate a local copy, write back on
+/// change" shape as the rest of this file's Settings panels.
+fn render_equalizer_panel(ui: &mut egui::Ui, scroll_accum: &mut f32, side_label: &str, eq: &mut spectrum::EqualizerParams) -> bool {
+    let mut changed = false;
+    if ui.checkbox(&mut eq.enabled, format!("Enable {side_label} Equalizer")).changed() {
+        changed = true;
+    }
+    ui.horizontal(|ui| {
+        ui.label("Bands:");
+        if ui.add(egui::Button::selectable(eq.band_count == spectrum::EqBandCount::Three, "3-Band")).clicked()
+            && eq.band_count != spectrum::EqBandCount::Three
+        {
+            eq.band_count = spectrum::EqBandCount::Three;
+            changed = true;
+        }
+        if ui.add(egui::Button::selectable(eq.band_count == spectrum::EqBandCount::Ten, "10-Band")).clicked()
+            && eq.band_count != spectrum::EqBandCount::Ten
+        {
+            eq.band_count = spectrum::EqBandCount::Ten;
+            changed = true;
+        }
+    });
+    ui.add_space(6.0);
+    ui.horizontal(|ui| {
+        ui.label("Preamp:");
+        if scroll_slider_i32(ui, scroll_accum, &mut eq.preamp_db, -12..=15, 1, " dB") {
+            changed = true;
+        }
+    });
+    match eq.band_count {
+        spectrum::EqBandCount::Three => {
+            const LABELS: [&str; 3] = ["Low", "Mid", "High"];
+            for (label, gain) in LABELS.iter().zip(eq.bands_3_db.iter_mut()) {
+                ui.horizontal(|ui| {
+                    ui.label(format!("{label}:"));
+                    if scroll_slider_i32(ui, scroll_accum, gain, -12..=15, 1, " dB") {
+                        changed = true;
+                    }
+                });
+            }
+        }
+        spectrum::EqBandCount::Ten => {
+            const LABELS: [&str; 10] =
+                ["32Hz", "63Hz", "125Hz", "250Hz", "500Hz", "1kHz", "2kHz", "4kHz", "8kHz", "16kHz"];
+            for (label, gain) in LABELS.iter().zip(eq.bands_10_db.iter_mut()) {
+                ui.horizontal(|ui| {
+                    ui.label(format!("{label}:"));
+                    if scroll_slider_i32(ui, scroll_accum, gain, -12..=15, 1, " dB") {
+                        changed = true;
+                    }
+                });
             }
         }
     }
@@ -4419,7 +4542,11 @@ fn render_extra_receiver_settings(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceive
     let freq_hz = rx.frequency_hz.load(Ordering::Relaxed);
 
     ui.horizontal(|ui| {
-        for (tab, label) in [(SettingsTab::Agc, "RX"), (SettingsTab::Spectrum, "Spectrum")] {
+        for (tab, label) in [
+            (SettingsTab::Agc, "RX"),
+            (SettingsTab::Spectrum, "Spectrum"),
+            (SettingsTab::Equalizer, "EQ"),
+        ] {
             if ui.selectable_label(rx.settings_tab == tab, label).clicked() {
                 rx.settings_tab = tab;
             }
@@ -4610,6 +4737,16 @@ fn render_extra_receiver_settings(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceive
                 }
             });
         }
+
+        SettingsTab::Equalizer => {
+            // No RX/TX selector here -- extra receiver windows never
+            // transmit, see render_equalizer_panel's doc comment.
+            let mut eq = rx.spectrum.eq();
+            if render_equalizer_panel(ui, &mut rx.slider_scroll_accum, "RX", &mut eq) {
+                rx.spectrum.set_eq(eq);
+                rx.settings_dirty.store(true, Ordering::Relaxed);
+            }
+        }
     }
 }
 
@@ -4708,6 +4845,7 @@ fn spawn_extra_receiver(
         spectrum.set_nb_threshold(s.nb_threshold);
         spectrum.set_noise_reduction(s.noise_reduction);
         spectrum.set_snb(s.snb);
+        spectrum.set_eq(s.eq);
     }
 
     let audio_output = AudioOutput::start(Arc::clone(&spectrum.audio_out)).ok();

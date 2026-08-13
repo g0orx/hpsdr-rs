@@ -257,6 +257,59 @@ impl NoiseReduction {
     }
 }
 
+/// WDSP's graphic-EQ stage (`eq.c`) offers two fixed band layouts, both
+/// confirmed by reading the source directly: a legacy 3-band EQ (preamp +
+/// low/mid/high, corners at 150/400/1500/6000Hz -- `SetRXAGrphEQ`/
+/// `SetTXAGrphEQ`) and a 10-band EQ (preamp + 10 bands, 32Hz..16kHz --
+/// `SetRXAGrphEQ10`/`SetTXAGrphEQ10`). Same layout on both RXA and TXA, so
+/// this one enum/struct pair serves both chains (see EqualizerParams).
+#[derive(Copy, Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum EqBandCount {
+    Three,
+    Ten,
+}
+
+impl Default for EqBandCount {
+    fn default() -> Self {
+        EqBandCount::Three
+    }
+}
+
+/// Graphic-EQ settings for one WDSP channel (RXA or TXA -- see
+/// EqBandCount's doc comment for why one type covers both). Mirrors
+/// piHPSDR's own equalizer_menu.c/radio.c defaults and range exactly:
+/// disabled, all-zero (flat) gains, dB values -12..15 (WDSP's own
+/// SetXXAGrphEQ[10] take `int*`, so gains are whole dB, not fractional).
+/// bands_3_db and bands_10_db are kept as two INDEPENDENT arrays (not one
+/// reused buffer) so switching band_count back and forth never clobbers
+/// whichever mode isn't currently active.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct EqualizerParams {
+    pub enabled: bool,
+    pub band_count: EqBandCount,
+    pub preamp_db: i32,
+    /// low, mid, high -- see SetRXAGrphEQ's own doc comment in eq.c: WDSP
+    /// internally duplicates the low gain onto two adjacent corner
+    /// frequencies, this is its own fixed layout, not something to work
+    /// around here.
+    pub bands_3_db: [i32; 3],
+    /// 32/63/125/250/500/1000/2000/4000/8000/16000 Hz, in that order --
+    /// WDSP's own fixed 10-band layout (SetRXAGrphEQ10's F[] table).
+    pub bands_10_db: [i32; 10],
+}
+
+impl Default for EqualizerParams {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            band_count: EqBandCount::default(),
+            preamp_db: 0,
+            bands_3_db: [0; 3],
+            bands_10_db: [0; 10],
+        }
+    }
+}
+
 #[derive(Copy, Clone)]
 pub struct DemodParams {
     pub mode: Mode,
@@ -311,6 +364,10 @@ pub struct DemodParams {
     /// -- radio.rs/main.rs own the real value, this is just a read-only
     /// copy for the analyzer thread.
     pub lo_frequency_hz: f64,
+    /// See EqualizerParams's doc comment. One instance per receiver --
+    /// every extra receiver window has its own DemodParams (and thus its
+    /// own independent EQ), same as it already has its own AGC/NB/NR.
+    pub eq: EqualizerParams,
 }
 
 impl Default for DemodParams {
@@ -341,6 +398,7 @@ impl Default for DemodParams {
             ctun: false,
             ctun_offset_hz: 0.0,
             lo_frequency_hz: 0.0,
+            eq: EqualizerParams::default(),
         }
     }
 }
@@ -411,6 +469,7 @@ struct SpectrumAnalyzer {
     last_ctun: Option<bool>,
     last_ctun_offset: Option<f64>,
     last_lo_frequency: Option<f64>,
+    last_eq: Option<EqualizerParams>,
     /// Edge-triggered diagnostic state for fexchange0's error out-param
     /// -- see its doc comment in demod() for why this exists and why
     /// it's edge- rather than every-call-triggered.
@@ -684,6 +743,7 @@ impl SpectrumAnalyzer {
                 last_ctun: None,
                 last_ctun_offset: None,
                 last_lo_frequency: None,
+                last_eq: None,
                 last_fexchange_error: None,
             }
         }
@@ -837,6 +897,36 @@ impl SpectrumAnalyzer {
                 wdsp::SetRXASNBARun(self.channel, params.snb as c_int);
             }
             self.last_snb_enabled = Some(params.snb);
+        }
+
+        // Graphic EQ -- see EqualizerParams's doc comment for the two
+        // band layouts. Matches piHPSDR's own init sequence
+        // (receiver.c/transmitter.c): coefficients first, Run flag
+        // second, every time ANYTHING changes (enable, band count, or
+        // any single slider) -- all folded into one cheap outer compare
+        // (self.last_eq != Some(params.eq)) same as last_agc_params.
+        if self.last_eq != Some(params.eq) {
+            unsafe {
+                match params.eq.band_count {
+                    EqBandCount::Three => {
+                        let mut coeffs = [
+                            params.eq.preamp_db,
+                            params.eq.bands_3_db[0],
+                            params.eq.bands_3_db[1],
+                            params.eq.bands_3_db[2],
+                        ];
+                        wdsp::SetRXAGrphEQ(self.channel, coeffs.as_mut_ptr());
+                    }
+                    EqBandCount::Ten => {
+                        let mut coeffs = [0i32; 11];
+                        coeffs[0] = params.eq.preamp_db;
+                        coeffs[1..11].copy_from_slice(&params.eq.bands_10_db);
+                        wdsp::SetRXAGrphEQ10(self.channel, coeffs.as_mut_ptr());
+                    }
+                }
+                wdsp::SetRXAEQRun(self.channel, params.eq.enabled as c_int);
+            }
+            self.last_eq = Some(params.eq);
         }
 
         // CTUN ("Click to Tune"): confirmed against a working reference
@@ -1268,6 +1358,13 @@ impl SpectrumHandle {
     }
     pub fn set_snb(&self, v: bool) {
         self.demod_params.lock().unwrap().snb = v;
+    }
+
+    pub fn eq(&self) -> EqualizerParams {
+        self.demod_params.lock().unwrap().eq
+    }
+    pub fn set_eq(&self, eq: EqualizerParams) {
+        self.demod_params.lock().unwrap().eq = eq;
     }
 
     pub fn ctun(&self) -> bool {

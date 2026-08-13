@@ -66,7 +66,7 @@
 use crate::radio::{
     IqSample, TX_AUDIO_SOURCE_LOCAL_MIC, TX_AUDIO_SOURCE_RADIO_MIC,
 };
-use crate::spectrum::Mode;
+use crate::spectrum::{EqBandCount, EqualizerParams, Mode};
 use crate::wdsp_sys as wdsp;
 use std::collections::VecDeque;
 use std::ffi::CString;
@@ -288,6 +288,8 @@ pub struct TxParams {
     /// exactly why every reference PS implementation calibrates with a
     /// two-tone generator, never a steady carrier.
     pub two_tone: bool,
+    /// See spectrum::EqualizerParams's doc comment -- same type, TXA side.
+    pub eq: EqualizerParams,
 }
 
 impl Default for TxParams {
@@ -311,6 +313,7 @@ impl Default for TxParams {
             width_hz: crate::spectrum::default_width_hz(Mode::Usb),
             tune: false,
             two_tone: false,
+            eq: EqualizerParams::default(),
         }
     }
 }
@@ -326,6 +329,7 @@ struct TxProcessor {
     last_mode: Option<Mode>,
     last_gain: Option<f32>,
     last_passband: Option<(f64, f64)>,
+    last_eq: Option<EqualizerParams>,
     /// (tune, two_tone) as last applied to WDSP's PostGen -- see
     /// process()'s PostGen update for why these are tracked together.
     last_post_gen: Option<(bool, bool)>,
@@ -631,6 +635,7 @@ impl TxProcessor {
             last_mode: None,
             last_gain: None,
             last_passband: Some(default_passband),
+            last_eq: None,
             last_post_gen: None,
             last_ps_mox: None,
             last_ps_enabled: None,
@@ -673,6 +678,7 @@ impl TxProcessor {
         width_hz: f64,
         tune: bool,
         two_tone: bool,
+        eq: EqualizerParams,
     ) -> (Vec<f32>, c_int) {
         debug_assert_eq!(mic_samples.len(), TX_BUFFER_SIZE);
 
@@ -790,6 +796,29 @@ impl TxProcessor {
                 wdsp::SetTXAPanelGain1(self.channel, mic_gain as f64);
             }
             self.last_gain = Some(mic_gain);
+        }
+
+        // Graphic EQ -- see spectrum::EqualizerParams's doc comment and
+        // the RX-side equivalent in spectrum.rs's demod() for the shared
+        // reasoning (same WDSP band layouts, same piHPSDR-matching
+        // coefficients-then-Run sequence).
+        if self.last_eq != Some(eq) {
+            unsafe {
+                match eq.band_count {
+                    EqBandCount::Three => {
+                        let mut coeffs = [eq.preamp_db, eq.bands_3_db[0], eq.bands_3_db[1], eq.bands_3_db[2]];
+                        wdsp::SetTXAGrphEQ(self.channel, coeffs.as_mut_ptr());
+                    }
+                    EqBandCount::Ten => {
+                        let mut coeffs = [0i32; 11];
+                        coeffs[0] = eq.preamp_db;
+                        coeffs[1..11].copy_from_slice(&eq.bands_10_db);
+                        wdsp::SetTXAGrphEQ10(self.channel, coeffs.as_mut_ptr());
+                    }
+                }
+                wdsp::SetTXAEQRun(self.channel, eq.enabled as c_int);
+            }
+            self.last_eq = Some(eq);
         }
 
         // Confirmed against the reference: real mono mic sample in the
@@ -1322,7 +1351,7 @@ fn run(
 
         let p = *params.lock().unwrap();
         let (iq, exch_error) =
-            processor.process(&chunk, p.mode, p.mic_gain, p.width_hz, p.tune, p.two_tone);
+            processor.process(&chunk, p.mode, p.mic_gain, p.width_hz, p.tune, p.two_tone, p.eq);
 
         if exch_error != 0 {
             exch_errors_this_window += 1;
@@ -1521,6 +1550,14 @@ impl TxHandle {
     /// See TxParams::two_tone's doc comment.
     pub fn set_two_tone(&self, two_tone: bool) {
         self.params.lock().unwrap().two_tone = two_tone;
+    }
+
+    /// See spectrum::EqualizerParams's doc comment.
+    pub fn eq(&self) -> EqualizerParams {
+        self.params.lock().unwrap().eq
+    }
+    pub fn set_eq(&self, eq: EqualizerParams) {
+        self.params.lock().unwrap().eq = eq;
     }
 
     /// Current PureSignal params snapshot, for Settings -> PureSignal
