@@ -1,0 +1,70 @@
+← [Manual index](README.md)
+
+# Settings: PureSignal
+
+Open **Settings...** from the main window, then the **PureSignal** tab.
+PureSignal predistorts your TX signal to linearize your amplifier, reducing
+splatter/IMD. It's mutually exclusive with [Diversity](09-diversity.md) --
+both reserve extra receiver resources on the radio in incompatible ways, so
+only one can be enabled at a time.
+
+(Screenshot needed: the PureSignal settings tab while correcting, showing feedback level/HW Peak/etc)
+![PureSignal settings tab](images/08-puresignal-tab.png)
+
+## Enabling
+
+Check **Enable PureSignal**. This reserves two extra feedback receivers
+from the radio and briefly reconnects to apply -- unlike most settings in
+this app, it isn't fully live.
+
+Once enabled (and TX armed), the rest of this tab's controls appear:
+
+- **Running (continuous auto-calibrate)** checkbox.
+- **Calibrate Now** -- runs one manual calibration pass immediately.
+- **Feedback level** -- a colored readout of the feedback receiver's signal
+  strength: red below 90 (too weak), yellow 90-127, green 128-181 (ideal),
+  blue 182-256, red above 256 (too strong). Despite the "ideal" range, this
+  is a rough guide, not a hard requirement -- calibration has been
+  confirmed working well outside it, as long as HW Peak (below) is right.
+- **Correcting** -- yes/no, turns green once PureSignal is actively
+  applying correction.
+- **Measured peak TX** -- the actual envelope peak PureSignal is currently
+  measuring.
+- **Feedback Attenuation** (non-HermesLite boards) -- 0-31 dB, adjust to
+  keep Feedback Level in the ideal range.
+- **HW Peak** -- 0.0-1.0. See below; this is the setting that actually
+  matters most.
+- **MOX Delay**, **Loop Delay**, **TX Delay**, **Ptol** -- advanced timing/
+  tolerance parameters, rarely need changing from their defaults.
+
+The correction table auto-saves the first time calibration succeeds each
+session, and auto-restores from disk the next time you enable PureSignal on
+the same radio -- there's no manual save/restore step.
+
+## Calibration procedure
+
+**HW Peak** is the one setting that actually matters, and the first thing
+to change if calibration won't complete or **Correcting** never turns on.
+It has to track the *real* envelope peak your radio produces at whatever
+drive level you're actually calibrating at -- it is **not** a fixed
+per-board constant to leave alone.
+
+1. Set **Tune Power %** (Settings → TX) low -- start around 10-15%.
+   PureSignal calibration works best at a low real TX drive level, not a
+   normal operating power.
+2. Press **TWO TONE** on the main window (not **TUNE** -- a steady tone's
+   constant envelope can never fill PureSignal's calibration buckets) and
+   watch **Measured peak TX** in this tab for a few seconds.
+3. Set **HW Peak** to just above whatever Measured peak TX settled at.
+4. Re-engage **TWO TONE**. **Correcting** should turn on within a few
+   seconds. If it doesn't:
+   - Stuck with Feedback Level at 0 and no progress: HW Peak is likely
+     still too far from the true peak -- recheck Measured peak TX and
+     adjust again.
+   - **Correcting** flickers on/off or never turns on despite Feedback
+     Level being nonzero: try nudging Tune Power % up or down a little and
+     repeat from step 2 -- the exact drive level a clean calibration
+     converges at is somewhat radio-dependent.
+
+(Screenshot needed: Two Tone active with Correcting showing green/true)
+![PureSignal correcting](images/08-puresignal-correcting.png)
