@@ -1864,7 +1864,64 @@ fn p1_build_packet(
             // board, not just PS -- included alongside the PS fix
             // above since it's the same command and equally confirmed,
             // even though it isn't itself PS-specific.
-            let c1 = if mox_on { 0x80 } else { 0x00 };
+            //
+            // C1 bits 0-6 ("BPF2" -- Alex2/RX2 bandpass filter bank,
+            // ANAN-7000/8000DLE (Orion2, num_adcs==2) only): this
+            // project's P1 path never set these at all. Confirmed bit
+            // layout from Thetis (the reference Windows app for this
+            // hardware family) -- Project Files/Source/ChannelMaster/
+            // networkproto1.c, command 0x24 case ("BPF2"):
+            // `C1 = _13MHz_HPF | (_20MHz_HPF<<1) | (_9_5MHz_HPF<<2) |
+            // (_6_5MHz_HPF<<3) | (_1_5MHz_HPF<<4) | (_Bypass<<5) |
+            // (_6M_preamp<<6) | (_rx2_gnd<<7)`, independently
+            // cross-checked against netInterface.c's matching
+            // bit-to-field parse of an incoming BPF2 word. Same
+            // frequency-threshold ladder as alex0_word's HPF bits and
+            // alex1_word's P2 equivalent (1.5M/2.1M/5.5M/11M/22M/35M),
+            // just mapped to bits 0-6 here instead of alex0_word's/
+            // alex1_word's own bit positions. RX2's effective frequency
+            // mirrors p2_sender_loop's rx2_freq_hz (see its doc comment
+            // for the real-hardware finding this priority order is based
+            // on): the main receiver's own frequency whenever the main
+            // receiver's own ADC dropdown is set to 1 (there's only one
+            // physical Alex1 board -- if wire 0 itself is using it,
+            // that's what matters) or diversity is on (both ADCs must
+            // look at the same passband to combine); otherwise wire 1's
+            // own independently-tuned frequency (extra_frequencies_hz[0]),
+            // same as an ordinary "Add Receiver" on ADC1.
+            const BPF2_13MHZ_HPF: u8 = 0x01;
+            const BPF2_20MHZ_HPF: u8 = 0x02;
+            const BPF2_9_5MHZ_HPF: u8 = 0x04;
+            const BPF2_6_5MHZ_HPF: u8 = 0x08;
+            const BPF2_1_5MHZ_HPF: u8 = 0x10;
+            const BPF2_BYPASS: u8 = 0x20;
+            const BPF2_6M_PREAMP: u8 = 0x40;
+            let bpf2 = if num_adcs == 2 {
+                let rx2_freq_hz = if diversity_enabled || adc.load(Ordering::Relaxed) == 1 {
+                    frequency_hz
+                } else {
+                    extra_frequencies_hz.first().map(|f| f.load(Ordering::Relaxed)).unwrap_or(frequency_hz)
+                };
+                let f = rx2_freq_hz as f64;
+                if f < 1_500_000.0 {
+                    BPF2_BYPASS
+                } else if f < 2_100_000.0 {
+                    BPF2_1_5MHZ_HPF
+                } else if f < 5_500_000.0 {
+                    BPF2_6_5MHZ_HPF
+                } else if f < 11_000_000.0 {
+                    BPF2_9_5MHZ_HPF
+                } else if f < 22_000_000.0 {
+                    BPF2_13MHZ_HPF
+                } else if f < 35_000_000.0 {
+                    BPF2_20MHZ_HPF
+                } else {
+                    BPF2_6M_PREAMP
+                }
+            } else {
+                0x00
+            };
+            let c1 = bpf2 | if mox_on { 0x80 } else { 0x00 };
             let c2 = if puresignal_enabled { 0x40 } else { 0x00 };
             (0x24, c1, c2, 0x00, 0x00)
         }
@@ -3449,25 +3506,37 @@ fn p2_sender_loop(
             adcs.push(num_adcs as u32);
         }
         let main_freq = frequency_hz.load(Ordering::Relaxed);
+        let main_adc = adc.load(Ordering::Relaxed);
         // RX2/Alex1 bandpass filter frequency -- see p2_sender_loop's
         // is_orion2 doc comment. Confirmed against piHPSDR: while
         // diversity is enabled, RX2's filter must track the MAIN
         // receiver's frequency (the two ADCs need to be looking at the
-        // same passband to combine meaningfully); otherwise it tracks
-        // wire 1's own independent frequency (extra_frequencies_hz[0]),
-        // same as an ordinary "Add Receiver" tuned to ADC1. Sent
+        // same passband to combine meaningfully). BUG FIX: previously
+        // this only ever considered wire 1 (an added second receiver)
+        // for the non-diversity case, silently ignoring the case where
+        // the MAIN receiver's own ADC dropdown is set to 1 -- a real,
+        // independently-selectable configuration this project already
+        // supports (Settings -> RX -> ADC), and the exact one the user
+        // confirmed exhibits this: 40m->20m produces a relay click when
+        // the MAIN receiver is on ADC1 (proving that click was actually
+        // Alex0 reacting to a frequency change on a receiver whose real
+        // analog front end is Alex1, not evidence Alex1 itself was
+        // tracking correctly). Priority: main receiver on ADC1 wins
+        // (there's only one physical Alex1 board -- if wire 0 itself is
+        // using it, that's what matters); otherwise falls back to wire
+        // 1's own independent frequency (extra_frequencies_hz[0]), same
+        // as an ordinary "Add Receiver" tuned to ADC1. Sent
         // unconditionally whenever this is an Orion2 board, regardless
-        // of whether wire 1 is currently active, matching the
-        // reference's own always-on behavior (harmless when ADC1 isn't
-        // actually in use by anything).
-        let rx2_freq_hz = if now_diversity_enabled {
+        // of whether ADC1 is currently in use by anything, matching the
+        // reference's own always-on behavior (harmless otherwise).
+        let rx2_freq_hz = if now_diversity_enabled || main_adc == 1 {
             main_freq
         } else {
             extra_frequencies_hz.first().map(|f| f.load(Ordering::Relaxed)).unwrap_or(main_freq)
         };
         freqs.push(main_freq);
         rates.push(sample_rate.load(Ordering::Relaxed));
-        adcs.push(adc.load(Ordering::Relaxed));
+        adcs.push(main_adc);
         for i in 0..active.saturating_sub(1) {
             // Diversity: wire 1 (i==0 here) is the reserved ADC1 aux
             // feed -- never independently tunable, and always ADC1
