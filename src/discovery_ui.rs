@@ -157,6 +157,17 @@ impl DiscoveryWindow {
 
                 let devices_snapshot = self.devices.lock().unwrap().clone();
 
+                // Default to the first device in the list as soon as
+                // results land, so a single radio (the common case) is
+                // ready to Start immediately without an extra click.
+                // Only fires while nothing is selected yet -- Rediscover
+                // explicitly resets `selected` to None (below) so this
+                // re-applies to the next batch of results rather than
+                // fighting a deliberate user selection.
+                if self.selected.is_none() && !devices_snapshot.is_empty() {
+                    self.selected = Some(0);
+                }
+
                 egui::Grid::new("discovery_grid")
                     .num_columns(7)
                     .striped(true)
