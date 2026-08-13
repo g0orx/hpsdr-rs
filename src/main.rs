@@ -148,6 +148,7 @@ enum SettingsTab {
     Tx,
     PaCalibration,
     PureSignal,
+    Diversity,
 }
 
 /// A receiver beyond the first, shown in its own native OS window (P2
@@ -389,6 +390,13 @@ struct ConnectedState {
     /// wire-level receiver/DDC count is fixed for the life of the
     /// sender/receiver threads).
     puresignal_enabled: bool,
+    /// Diversity (2-ADC boards, see radio::RadioSession::diversity_enabled).
+    /// Same "reflects what THIS session started with, editable in
+    /// Settings but only takes effect on next connect" staging as
+    /// puresignal_enabled just above, and for the identical reason
+    /// (fixed wire-level DDC layout) -- mutually exclusive with it, see
+    /// the Diversity/PureSignal tabs' checkbox handlers.
+    diversity_enabled: bool,
     /// Edge-detection for auto-saving the PS correction table -- see
     /// the "PS" badge's own doc comment (main panel toolbar) for where
     /// this is checked each frame. True once a false->true
@@ -442,6 +450,9 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
     // actually supports).
     settings.receivers = device.supported_receivers.max(1);
     settings.puresignal_enabled = cfg.puresignal_enabled.unwrap_or(false);
+    settings.diversity_enabled = cfg.diversity_enabled.unwrap_or(false);
+    settings.diversity_gain_db = cfg.diversity_gain_db.unwrap_or(0.0);
+    settings.diversity_phase_deg = cfg.diversity_phase_deg.unwrap_or(0.0);
     if let Some(atten) = cfg.rx_attenuation {
         settings.rx_attenuation = atten;
     }
@@ -770,6 +781,7 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                 smoothed_rev_power: 0.0,
                 tx_spectrum_mox_was_active: false,
                 puresignal_enabled: settings.puresignal_enabled,
+                diversity_enabled: settings.diversity_enabled,
                 ps_was_correcting: false,
             })
         }
@@ -1978,12 +1990,29 @@ impl eframe::App for HpsdrApp {
                 // e.g. closing receiver 1 while receiver 2 stays open
                 // must leave DDC1 enabled too, since DDC2 can't run
                 // without it.
+                //
+                // BUG FIX: floor was unconditionally 1, not accounting
+                // for Diversity's own reserved wire 1 (radio::
+                // RadioSession::diversity_enabled) -- wire 1 has no
+                // ExtraReceiver/window at all (it feeds the diversity
+                // combiner instead, see spawn_diversity_combiner), so
+                // with no "Add Receiver" windows open this ran every
+                // single frame and stomped active_receiver_count back
+                // down to 1 moments after connect, which stops the radio
+                // streaming DDC1 entirely -- the diversity combiner then
+                // starves on its aux input forever (confirmed via a real
+                // per-second diagnostic: main_raw filled to capacity,
+                // aux_raw(buf1) stuck at 0, pushed_last_sec 0), which is
+                // exactly "spectrum and waterfall hang the moment
+                // Diversity is enabled".
+                let diversity_floor =
+                    if connected.session.diversity_enabled.load(Ordering::Relaxed) { 2 } else { 1 };
                 let active_count = connected
                     .extra_receivers
                     .iter()
                     .map(|rx| rx.lock().unwrap().ddc_index)
                     .max()
-                    .map_or(1, |highest| highest + 1);
+                    .map_or(diversity_floor, |highest| (highest + 1).max(diversity_floor));
                 connected
                     .session
                     .active_receiver_count
@@ -2117,7 +2146,17 @@ impl eframe::App for HpsdrApp {
                                     (SettingsTab::Tx, "TX"),
                                     (SettingsTab::PaCalibration, "PA Calibration"),
                                     (SettingsTab::PureSignal, "PureSignal"),
+                                    (SettingsTab::Diversity, "Diversity"),
                                 ] {
+                                    // Diversity requires a 2-ADC board -- see
+                                    // radio::RadioSession::diversity_enabled's
+                                    // doc comment. Hidden entirely rather than
+                                    // shown-disabled on boards that can't use
+                                    // it, same gating style already used for
+                                    // the per-receiver ADC dropdown below.
+                                    if tab == SettingsTab::Diversity && connected.device.adcs != 2 {
+                                        continue;
+                                    }
                                     if ui
                                         .selectable_label(connected.settings_tab == tab, label)
                                         .clicked()
@@ -2955,13 +2994,22 @@ impl eframe::App for HpsdrApp {
                                     // for the live calibration controls.
                                     ui.add_space(4.0);
                                     let mut puresignal_enabled = connected.puresignal_enabled;
-                                    if ui
-                                        .checkbox(&mut puresignal_enabled, "Enable PureSignal")
-                                        .changed()
-                                    {
-                                        connected.puresignal_enabled = puresignal_enabled;
-                                        settings_changed = true;
-                                        ps_reconnect_requested = true;
+                                    // Mutually exclusive with Diversity -- both reserve
+                                    // wire indices at fixed positions that would collide
+                                    // (see radio::RadioSession::diversity_enabled's doc
+                                    // comment). Disabled, not hidden, so it's clear why.
+                                    ui.add_enabled_ui(!connected.diversity_enabled, |ui| {
+                                        if ui
+                                            .checkbox(&mut puresignal_enabled, "Enable PureSignal")
+                                            .changed()
+                                        {
+                                            connected.puresignal_enabled = puresignal_enabled;
+                                            settings_changed = true;
+                                            ps_reconnect_requested = true;
+                                        }
+                                    });
+                                    if connected.diversity_enabled {
+                                        ui.weak("Disabled while Diversity is enabled (Settings -> Diversity).");
                                     }
                                     ui.weak(
                                         "Reserves 2 extra feedback receivers from the radio -- \
@@ -3158,6 +3206,89 @@ impl eframe::App for HpsdrApp {
                                         }
                                     }
                                 }
+                                SettingsTab::Diversity => {
+                                    // Ported from piHPSDR's own diversity feature
+                                    // (diversity_menu.c/receiver.c, which the user
+                                    // originally wrote) -- see radio::RadioSession::
+                                    // diversity_enabled/diversity_gain_db/
+                                    // diversity_phase_deg's doc comments for the
+                                    // combining formula.
+                                    ui.add_space(4.0);
+                                    let mut diversity_enabled = connected.diversity_enabled;
+                                    // Mutually exclusive with PureSignal -- see that
+                                    // tab's own checkbox handler for why.
+                                    ui.add_enabled_ui(!connected.puresignal_enabled, |ui| {
+                                        if ui
+                                            .checkbox(&mut diversity_enabled, "Enable Diversity")
+                                            .changed()
+                                        {
+                                            connected.diversity_enabled = diversity_enabled;
+                                            settings_changed = true;
+                                            // A true live toggle on both protocols -- see
+                                            // RadioSession::set_diversity_enabled's doc
+                                            // comment for why this project moved away from
+                                            // a full reconnect here (confirmed via
+                                            // extensive real-hardware testing that it
+                                            // reliably hung this board's P1 firmware; P2
+                                            // never needed a reconnect for this in the
+                                            // first place -- it just continuously sends
+                                            // updated config packets on a timer, no
+                                            // discrete preconfig/Start handshake to redo).
+                                            connected.session.set_diversity_enabled(diversity_enabled);
+                                        }
+                                    });
+                                    if connected.puresignal_enabled {
+                                        ui.weak("Disabled while PureSignal is enabled (Settings -> PureSignal).");
+                                    }
+                                    ui.weak(
+                                        "Combines ADC1's IQ into ADC0's before demodulation to help \
+                                         null multipath fades/local noise that hit each antenna \
+                                         differently -- reserves ADC1 as a hidden second receiver.",
+                                    );
+                                    ui.weak("Live -- takes effect immediately, no reconnect.");
+
+                                    if connected.session.diversity_enabled.load(Ordering::Relaxed) {
+                                        ui.add_space(6.0);
+                                        let mut gain_db = f32::from_bits(
+                                            connected.session.diversity_gain_db.load(Ordering::Relaxed),
+                                        );
+                                        if ui
+                                            .add(
+                                                egui::Slider::new(&mut gain_db, -27.0..=27.0)
+                                                    .text("Gain")
+                                                    .suffix(" dB"),
+                                            )
+                                            .changed()
+                                        {
+                                            connected
+                                                .session
+                                                .diversity_gain_db
+                                                .store(gain_db.to_bits(), Ordering::Relaxed);
+                                            settings_changed = true;
+                                        }
+                                        let mut phase_deg = f32::from_bits(
+                                            connected.session.diversity_phase_deg.load(Ordering::Relaxed),
+                                        );
+                                        if ui
+                                            .add(
+                                                egui::Slider::new(&mut phase_deg, -180.0..=180.0)
+                                                    .text("Phase")
+                                                    .suffix("\u{b0}"),
+                                            )
+                                            .changed()
+                                        {
+                                            connected
+                                                .session
+                                                .diversity_phase_deg
+                                                .store(phase_deg.to_bits(), Ordering::Relaxed);
+                                            settings_changed = true;
+                                        }
+                                        ui.weak(
+                                            "Tune by ear/S-meter for the best null or peak -- live, no \
+                                             reconnect needed.",
+                                        );
+                                    }
+                                }
                             }
                         });
                         },
@@ -3253,6 +3384,13 @@ impl eframe::App for HpsdrApp {
                         tci_running: Some(connected.tci_server.is_some()),
                         extra_receivers,
                         puresignal_enabled: Some(connected.puresignal_enabled),
+                        diversity_enabled: Some(connected.diversity_enabled),
+                        diversity_gain_db: Some(f32::from_bits(
+                            connected.session.diversity_gain_db.load(std::sync::atomic::Ordering::Relaxed),
+                        )),
+                        diversity_phase_deg: Some(f32::from_bits(
+                            connected.session.diversity_phase_deg.load(std::sync::atomic::Ordering::Relaxed),
+                        )),
                         rx_attenuation: Some(
                             connected.session.rx_attenuation.load(std::sync::atomic::Ordering::Relaxed),
                         ),
@@ -3303,15 +3441,17 @@ impl eframe::App for HpsdrApp {
                 } else if ps_reconnect_requested {
                     // Full teardown -- matching stop_clicked's own
                     // explicit-stop-before-drop discipline just above,
-                    // extended to every subsystem PureSignal's wire-
-                    // level receiver/DDC layout touches (SpectrumHandle
-                    // channels and rigctl/TCI's bound ports both need
-                    // the OLD one actually gone before connect_to_device
-                    // opens/binds a new one, not just eventually-dropped
-                    // via *connected being overwritten below). Rebuilds
-                    // from the config the settings_changed save above
-                    // (this same frame) already wrote to disk, which
-                    // already reflects the new puresignal_enabled.
+                    // for PureSignal's own wire-level receiver/DDC layout
+                    // change (SpectrumHandle channels and rigctl/TCI's
+                    // bound ports both need the OLD one actually gone
+                    // before connect_to_device opens/binds a new one, not
+                    // just eventually-dropped via *connected being
+                    // overwritten below). Rebuilds from the config the
+                    // settings_changed save above (this same frame)
+                    // already wrote to disk, which already reflects the
+                    // new puresignal_enabled. Diversity no longer needs
+                    // this at all -- see its checkbox handler, a live
+                    // toggle on both protocols now.
                     connected.session.stop();
                     connected.spectrum.stop();
                     connected.tx_spectrum.stop();
@@ -4300,6 +4440,7 @@ fn render_extra_receiver_settings(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceive
         SettingsTab::Tx => rx.settings_tab = SettingsTab::Agc,
         SettingsTab::PaCalibration => rx.settings_tab = SettingsTab::Agc,
         SettingsTab::PureSignal => rx.settings_tab = SettingsTab::Agc,
+        SettingsTab::Diversity => rx.settings_tab = SettingsTab::Agc,
 
         SettingsTab::Agc => {
             ui.label("Sample Rate:");

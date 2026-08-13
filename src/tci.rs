@@ -344,7 +344,6 @@ fn handle_client(
     let freq = frequency_hz.load(Ordering::Relaxed);
     let mode = demod_params.lock().unwrap().clone().lock().unwrap().mode;
     let _ = ws.send(Message::Text(PROTOCOL_MESSAGE.into()));
-    let _ = ws.send(Message::Text("device:hpsdr-rs;".into()));
     // Remaining Initialization commands (spec section 4.1) beyond
     // protocol/device -- previously not sent at all (this file's own
     // module note flagged the full handshake as an unconfirmed

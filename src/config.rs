@@ -135,6 +135,21 @@ pub struct Config {
     /// matching field doc comment for why this can't be a live toggle.
     #[serde(default)]
     pub puresignal_enabled: Option<bool>,
+    /// Diversity reception (2-ADC boards only, Settings -> Diversity) --
+    /// see radio::RadioSettings's matching field doc comment. Only takes
+    /// effect on the next connect, same as puresignal_enabled (and
+    /// mutually exclusive with it) -- see main.rs's Settings UI.
+    #[serde(default)]
+    pub diversity_enabled: Option<bool>,
+    /// Diversity gain (dB, -27.0..27.0) / phase (degrees, -180.0..180.0)
+    /// -- unlike diversity_enabled these ARE live-adjustable without a
+    /// reconnect (see RadioSession::diversity_gain_db/diversity_phase_deg's
+    /// doc comments); saved here purely so the last-tuned values survive
+    /// a restart.
+    #[serde(default)]
+    pub diversity_gain_db: Option<f32>,
+    #[serde(default)]
+    pub diversity_phase_deg: Option<f32>,
     /// Protocol 1 RX step attenuator (0-31 dB), standard (non-HermesLite)
     /// boards only -- see radio::RadioSession::rx_attenuation's doc
     /// comment. Missing (e.g. configs saved before this existed)

@@ -174,6 +174,16 @@ pub struct RadioSettings {
     /// Initial value for RadioSession::ps_tx_attenuation (P1, standard
     /// boards only, PureSignal) -- see that field's doc comment.
     pub ps_tx_attenuation: u32,
+    /// Initial value for RadioSession::diversity_enabled -- see that
+    /// field's doc comment. Fixed at session-start time, same as
+    /// `puresignal_enabled` (and mutually exclusive with it -- see
+    /// main.rs's Settings UI).
+    pub diversity_enabled: bool,
+    /// Initial values for RadioSession::diversity_gain_db/
+    /// diversity_phase_deg -- unlike diversity_enabled these ARE live,
+    /// this is just their starting point on connect.
+    pub diversity_gain_db: f32,
+    pub diversity_phase_deg: f32,
 }
 
 impl Default for RadioSettings {
@@ -187,6 +197,11 @@ impl Default for RadioSettings {
             // doc comment for why 0dB caused real front-end overload.
             rx_attenuation: 12,
             ps_tx_attenuation: 0,
+            diversity_enabled: false,
+            // Neutral starting point -- matches piHPSDR's own default,
+            // user tunes by ear/S-meter after enabling.
+            diversity_gain_db: 0.0,
+            diversity_phase_deg: 0.0,
         }
     }
 }
@@ -309,8 +324,12 @@ pub struct RadioSession {
     /// touching HW Peak, which is a fixed per-hardware-model reference
     /// constant, not a per-session tuning knob.
     pub ps_tx_attenuation: Arc<AtomicU32>,
-    /// Additional receivers beyond the first (P2 only -- P1 has no
-    /// confirmed way to enable more than one DDC, see module note).
+    /// Additional receivers beyond the first -- works on both protocols
+    /// (P1's classic Metis/Ozy DDC round-robin genuinely supports
+    /// independent per-receiver tuning too, see p1_build_packet's
+    /// ozy_command==2 branch; this doc comment previously said P1 had no
+    /// confirmed way to do this, which was stale even before this file's
+    /// own "Add Receiver" UI gating was corrected -- see main.rs).
     /// Index 0 here corresponds to receiver index 1 overall (receiver
     /// 0 is frequency_hz/sample_rate/adc above). Pre-sized up to
     /// whatever the board reported supporting; active_receiver_count
@@ -319,6 +338,68 @@ pub struct RadioSession {
     pub extra_sample_rates_hz: Vec<Arc<AtomicU32>>,
     pub extra_adcs: Vec<Arc<AtomicU32>>,
     pub active_receiver_count: Arc<AtomicU32>,
+    /// Diversity reception (2-ADC boards only) -- combines ADC1's IQ into
+    /// ADC0's before demodulation to help null multipath fades/local
+    /// noise that hit each antenna differently. Ported from piHPSDR's own
+    /// diversity feature (`~/github/pihpsdr/diversity_menu.c`,
+    /// `receiver.c: add_div_iq_samples`), which the user originally wrote.
+    ///
+    /// Live on BOTH protocols -- see `RadioSession::set_diversity_enabled`.
+    /// Enabling reserves wire index 1 as a hidden ADC1-only feed (forced
+    /// ADC via p1_build_packet's command 6/extra_adcs override, or P2's
+    /// equivalent; its frequency/rate track `frequency_hz`/`sample_rate`
+    /// directly, never independently tunable). `active_receiver_count`
+    /// gets bumped to at least 2 when this turns on, keeping "Add
+    /// Receiver" from handing wire 1 out to the user.
+    ///
+    /// P1: `sender_loop` watches this itself (comparing against the value
+    /// it last saw) and, on a change, replays the whole preconfig-
+    /// rotations+250ms+Start burst on its OWN existing socket, exactly
+    /// mirroring piHPSDR's own `diversity_cb` (`old_protocol_stop()` +
+    /// flip + `old_protocol_run()` -> `metis_restart()`, all on the one
+    /// socket/thread the app has had since startup, never recreated).
+    /// Confirmed via extensive real-hardware testing that the OLD
+    /// approach here -- a full session teardown+rebuild through
+    /// `connect_to_device()`, mirroring PureSignal's own "Enable"
+    /// checkbox (see commit 7853f60) -- reliably hung this board's P1/
+    /// Metis firmware within about a second, every time, regardless of
+    /// direction (enabling OR disabling), while a fresh connect to
+    /// either state ran indefinitely; four separate wire-level fixes
+    /// (the sync bit itself, ADC1 forcing, preconfig/ongoing receiver-
+    /// count mismatch, the pre-Start settle delay) and a same-port Stop
+    /// packet made no difference, isolating the actual cause to the full
+    /// reconnect's new socket (new ephemeral port) and full subsystem
+    /// teardown (mic/audio/rigctl/TCI/spectrum) -- neither of which
+    /// piHPSDR's own diversity toggle ever does.
+    ///
+    /// P2: `p2_sender_loop`/`p2_receiver_loop` just read this fresh every
+    /// cycle -- P2 has no discrete preconfig/Start handshake to replay
+    /// at all (it continuously sends updated General/DDC-specific/High-
+    /// Priority packets on a timer regardless), so nothing beyond a
+    /// live read was ever needed here.
+    pub diversity_enabled: Arc<AtomicBool>,
+    /// Gain (dB) and phase (degrees) of the ADC1-aux rotate-and-add --
+    /// see the combiner thread (spawned in `RadioSession::start`) for the
+    /// exact formula, identical to piHPSDR's `set_gain_phase()`/
+    /// `add_div_iq_samples`. Bit-cast f32 in an AtomicU32, same pattern
+    /// as `pa_gain_db` -- these ARE truly live, no reconnect needed to
+    /// retune them (the combiner reads them fresh every pass). Range
+    /// -27.0..27.0 dB / -180.0..180.0 degrees, matching piHPSDR's own
+    /// slider ranges. Meaningless (not read) while diversity_enabled is
+    /// false.
+    pub diversity_gain_db: Arc<AtomicU32>,
+    pub diversity_phase_deg: Arc<AtomicU32>,
+    /// Wire 0's (ADC0/main) raw IQ, redirected here instead of
+    /// `iq_buffers[0]` by the demux while diversity is enabled -- the
+    /// combiner thread is the ONLY consumer (mirrors
+    /// `ps_rx_feedback_iq`'s "own dedicated queue, not a second reader"
+    /// shape). The combiner pairs this with `iq_buffers[1]` (wire 1's raw
+    /// ADC1 feed, otherwise unused while reserved) and pushes the
+    /// combined result into `iq_buffers[0]` -- so `SpectrumHandle` for
+    /// receiver 0 needs no changes at all, it just finds the combined
+    /// signal where ADC0's raw signal would normally be. Unused (never
+    /// written to) while diversity_enabled is false.
+    pub diversity_main_raw_iq: Arc<Mutex<VecDeque<IqSample>>>,
     /// PureSignal feedback IQ -- see ps_feedback_config's doc comment
     /// for which receiver/DDC index these actually come from per
     /// protocol/board. Raw ADC-scale IqSample, same as every other
@@ -489,6 +570,18 @@ pub struct RadioSession {
     stop_flag: Arc<AtomicBool>,
     sender_thread: Option<JoinHandle<()>>,
     receiver_thread: Option<JoinHandle<()>>,
+    /// Diversity combiner -- see spawn_diversity_combiner's doc comment.
+    /// Always None unless diversity_enabled (set right after
+    /// start_protocol1/2 returns, see RadioSession::start, or live via
+    /// set_diversity_enabled).
+    diversity_combiner_thread: Option<JoinHandle<()>>,
+    /// Dedicated stop flag for diversity_combiner_thread, separate from
+    /// `stop_flag` (which sender_loop/receiver_loop also use, and which
+    /// must NOT stop just because diversity got toggled off live) --
+    /// see set_diversity_enabled. Fresh Arc each time the combiner is
+    /// (re)spawned, so a stale flag from a previous spawn can never
+    /// leak into a new one. None whenever the combiner isn't running.
+    diversity_combiner_stop: Option<Arc<AtomicBool>>,
     /// P2 only -- p2_tx_iq_loop's handle. Always None on P1, which
     /// streams TX audio through the existing sender_loop instead (its
     /// packet cadence is already fast enough to double as an audio
@@ -501,6 +594,30 @@ pub struct RadioSession {
     rx_audio_thread: Option<JoinHandle<()>>,
     protocol: u8,
     radio_ip: std::net::IpAddr,
+    /// A clone of the session's own socket, kept ONLY so send_stop_command
+    /// can send the Stop packet from the SAME local port the rest of the
+    /// session used, instead of a brand new one. BUG FIX: this used to
+    /// bind a fresh throwaway socket (`UdpSocket::bind(("0.0.0.0", 0))`)
+    /// just for the Stop packet -- confirmed via a real side-by-side
+    /// packet capture (fresh connect with diversity enabled: works
+    /// indefinitely; in-app reconnect to enable/disable it: reliably
+    /// hangs the radio after about a second, every time) that a
+    /// reconnect sends from FOUR different source ports within about a
+    /// second (the ending session's own data port, its own throwaway
+    /// Stop port, the new session's data port, and -- if toggled back --
+    /// another throwaway Stop port), while a fresh connect never sends a
+    /// Stop at all and only ever uses one port. piHPSDR, by contrast,
+    /// keeps one socket for its entire process lifetime and never
+    /// recreates it across a diversity/PureSignal-style reconnect. This
+    /// board's P1/Metis firmware is a plausible candidate for having a
+    /// single-peer assumption that a Stop arriving from an unrelated
+    /// port -- right as a brand new session is also mid-handshake from
+    /// yet another port -- could genuinely confuse. Doesn't fully match
+    /// piHPSDR's approach (this project still opens a new socket, hence
+    /// a new port, for each reconnect's actual data session), but at
+    /// least makes the Stop packet itself consistent with the session it
+    /// belongs to, which is the cheapest testable step toward that.
+    stop_socket: UdpSocket,
 }
 
 impl RadioSession {
@@ -539,13 +656,23 @@ impl RadioSession {
         let mic_ptt_enabled = Arc::new(AtomicBool::new(false));
         let mic_bias_enabled = Arc::new(AtomicBool::new(false));
         let mic_ptt_on_tip = Arc::new(AtomicBool::new(false));
-        match device.protocol {
+        // See RadioSession::diversity_enabled/diversity_gain_db/
+        // diversity_phase_deg/diversity_main_raw_iq's doc comments.
+        // diversity_enabled is live (P1) -- shared with start_protocol1's
+        // sender_loop/receiver_loop so they can react to
+        // set_diversity_enabled without a reconnect.
+        let diversity_enabled = Arc::new(AtomicBool::new(settings.diversity_enabled));
+        let diversity_gain_db = Arc::new(AtomicU32::new(settings.diversity_gain_db.to_bits()));
+        let diversity_phase_deg = Arc::new(AtomicU32::new(settings.diversity_phase_deg.to_bits()));
+        let diversity_main_raw_iq = Arc::new(Mutex::new(VecDeque::with_capacity(IQ_BUFFER_CAPACITY)));
+        let mut result = match device.protocol {
             1 => start_protocol1(
                 device, settings, frequency_hz, sample_rate, adc, antenna, rx_attenuation,
                 ps_tx_attenuation, mox, tx_iq, tci_tx_audio, tci_tx_gain, tx_power_watts, pa_gain_db,
                 tx_forward_power, tx_reverse_power, ps_rx_feedback_iq, ps_tx_feedback_iq,
                 rx_audio_to_radio, send_rx_audio_to_radio, radio_mic_audio, tx_audio_source,
                 tci_wants_mic, mic_ptt_enabled, mic_bias_enabled, mic_ptt_on_tip,
+                diversity_enabled, diversity_gain_db, diversity_phase_deg, diversity_main_raw_iq,
             ),
             2 => start_protocol2(
                 device, settings, frequency_hz, sample_rate, adc, antenna, rx_attenuation,
@@ -553,12 +680,26 @@ impl RadioSession {
                 tx_forward_power, tx_reverse_power, ps_rx_feedback_iq, ps_tx_feedback_iq,
                 rx_audio_to_radio, send_rx_audio_to_radio, radio_mic_audio, tx_audio_source,
                 tci_wants_mic, mic_ptt_enabled, mic_bias_enabled, mic_ptt_on_tip,
+                diversity_enabled, diversity_gain_db, diversity_phase_deg, diversity_main_raw_iq,
             ),
             p => Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!("unknown protocol {p}"),
             )),
+        };
+        // Diversity combiner -- spawned here (not inside start_protocol1/2)
+        // since it's protocol-agnostic: it only touches queues, never the
+        // wire format. See RadioSession::diversity_main_raw_iq's doc
+        // comment for what it does. Needs `session.iq_buffers[1]` to
+        // exist, which real_receivers' `.max(2)` (inside start_protocol1/
+        // 2, see their own diversity_enabled handling) guarantees whenever
+        // diversity_enabled is true.
+        if let Ok(session) = &mut result {
+            if session.diversity_enabled.load(Ordering::Relaxed) {
+                session.spawn_diversity_combiner_now();
+            }
         }
+        result
     }
 
     /// Keys or unkeys the transmitter. See RadioSession::mox's doc
@@ -614,6 +755,58 @@ impl RadioSession {
         Some(current)
     }
 
+    /// Spawns the diversity combiner now, creating a fresh dedicated stop
+    /// flag for it -- see spawn_diversity_combiner's and
+    /// diversity_combiner_stop's doc comments.
+    fn spawn_diversity_combiner_now(&mut self) {
+        let stop = Arc::new(AtomicBool::new(false));
+        let handle = spawn_diversity_combiner(self, Arc::clone(&stop));
+        self.diversity_combiner_thread = Some(handle);
+        self.diversity_combiner_stop = Some(stop);
+    }
+
+    /// Stops and joins the diversity combiner if one is running -- no-op
+    /// otherwise. See diversity_combiner_stop's doc comment for why this
+    /// is a SEPARATE flag from the whole session's stop_flag.
+    fn stop_diversity_combiner_now(&mut self) {
+        if let Some(stop) = self.diversity_combiner_stop.take() {
+            stop.store(true, Ordering::SeqCst);
+        }
+        if let Some(t) = self.diversity_combiner_thread.take() {
+            let _ = t.join();
+        }
+    }
+
+    /// Live toggle for Diversity -- both protocols, see
+    /// RadioSession::diversity_enabled's doc comment for how P1 and P2
+    /// each pick this up. Updates the live flag sender_loop/receiver_loop
+    /// (or p2_sender_loop/p2_receiver_loop) watch, reserves/releases wire
+    /// 1 via active_receiver_count, and spawns/stops the combiner thread
+    /// to match -- does NOT touch the socket/wire protocol directly,
+    /// that's each protocol's own sender loop's job (P1's replays the
+    /// preconfig+Start burst on noticing the change; P2's needs nothing
+    /// beyond its own already-live per-cycle read).
+    pub fn set_diversity_enabled(&mut self, enabled: bool) {
+        self.diversity_enabled.store(enabled, Ordering::SeqCst);
+        if enabled {
+            // Reserve wire 1 immediately (don't wait for the next UI
+            // frame's own floor logic, see main.rs's diversity_floor) so
+            // sender_loop's very next packet already reflects it.
+            if self.active_receiver_count.load(Ordering::Relaxed) < 2 {
+                self.active_receiver_count.store(2, Ordering::Relaxed);
+            }
+            if self.diversity_combiner_thread.is_none() {
+                self.spawn_diversity_combiner_now();
+            }
+        } else {
+            self.stop_diversity_combiner_now();
+            // active_receiver_count's floor back down to 1 (when no
+            // extra receivers are active) is handled every frame by
+            // main.rs's own existing diversity_floor logic -- not
+            // duplicated here.
+        }
+    }
+
     pub fn stop(&mut self) {
         // Unkey first, before anything else -- a session ending (app
         // closing, "Stop" clicked, sample rate change tearing this
@@ -638,13 +831,12 @@ impl RadioSession {
         if let Some(t) = self.receiver_thread.take() {
             let _ = t.join();
         }
+        self.stop_diversity_combiner_now();
     }
 
     fn send_stop_command(&self) {
-        let socket = match UdpSocket::bind(("0.0.0.0", 0)) {
-            Ok(s) => s,
-            Err(_) => return,
-        };
+        // See stop_socket's own doc comment -- sent from the SAME local
+        // port the rest of this session used, not a fresh throwaway one.
         match self.protocol {
             1 => {
                 // Same Start packet shape, Command 0x00 = stop.
@@ -655,12 +847,12 @@ impl RadioSession {
                 pkt[1] = 0xFE;
                 pkt[2] = 0x04;
                 pkt[3] = 0x00;
-                let _ = socket.send_to(&pkt, (self.radio_ip, DATA_PORT));
+                let _ = self.stop_socket.send_to(&pkt, (self.radio_ip, DATA_PORT));
             }
             2 => {
                 // High Priority packet with the run bit cleared.
                 let pkt = [0u8; P2_PACKET_SIZE]; // seq=0, byte4=0 (run=0) is fine for a one-shot goodbye
-                let _ = socket.send_to(&pkt, (self.radio_ip, P2_HIGH_PRIORITY_PORT));
+                let _ = self.stop_socket.send_to(&pkt, (self.radio_ip, P2_HIGH_PRIORITY_PORT));
             }
             _ => {}
         }
@@ -700,6 +892,10 @@ fn start_protocol1(
     mic_ptt_enabled: Arc<AtomicBool>,
     mic_bias_enabled: Arc<AtomicBool>,
     mic_ptt_on_tip: Arc<AtomicBool>,
+    diversity_enabled: Arc<AtomicBool>,
+    diversity_gain_db: Arc<AtomicU32>,
+    diversity_phase_deg: Arc<AtomicU32>,
+    diversity_main_raw_iq: Arc<Mutex<VecDeque<IqSample>>>,
 ) -> io::Result<RadioSession> {
     let socket = UdpSocket::bind(("0.0.0.0", 0))?;
     socket.set_read_timeout(Some(Duration::from_millis(500)))?;
@@ -707,6 +903,10 @@ fn start_protocol1(
     // confirmed streaming traffic stays on the same port 1024.
     let target = std::net::SocketAddr::new(device.address.ip(), DATA_PORT);
     socket.connect(target)?;
+    // See RadioSession::stop_socket's doc comment -- cloned now, before
+    // `socket` itself gets consumed by the sender/receiver threads below,
+    // so send_stop_command can later send from this SAME local port.
+    let stop_socket = socket.try_clone()?;
 
     // PureSignal (P1): see ps_feedback_config's doc comment. `ps_config`
     // is None whenever PS wasn't requested, or this board has no known
@@ -733,12 +933,25 @@ fn start_protocol1(
     } else {
         None
     };
-    let real_receivers = match ps_config {
+    let mut real_receivers = match ps_config {
         Some((_, _, Some(max_real))) => settings.receivers.max(1).min(max_real),
         Some((_, _, None)) | None => settings.receivers.max(1),
     };
+    // Diversity: forces at least 2 wire slots (wire 0 = ADC0/main, wire 1
+    // = the reserved ADC1 aux feed) -- see RadioSession::diversity_enabled's
+    // doc comment. PS and diversity are mutually exclusive (enforced in
+    // main.rs's Settings UI), so no interaction with the ps_config branch
+    // above to worry about here.
+    if settings.diversity_enabled {
+        real_receivers = real_receivers.max(2);
+    }
     let ps_wire_total: Option<u8> = ps_config.map(|(_, tx_idx, _)| tx_idx + 1);
     let ps_feedback_indices: Option<(u8, u8)> = ps_config.map(|(rx_idx, tx_idx, _)| (rx_idx, tx_idx));
+    // Initial value active_receiver_count starts at (see its own
+    // creation just below) -- the count actually being streamed from
+    // the very first packet, as opposed to `real_receivers` (this
+    // board's full reported capacity, used only for buffer sizing).
+    let initial_active_receivers: u32 = if settings.diversity_enabled { 2 } else { 1 };
 
     // Confirmed against a working reference (rustyHPSDR): before
     // sending the actual start command, the client sends TWO COMPLETE
@@ -748,16 +961,34 @@ fn start_protocol1(
     // doc comment -- this is also what's replayed on a detected frame
     // desync (receiver_loop's sync check), not just here at initial
     // connect.
+    //
+    // BUG FIX (diversity): this used to pass `real_receivers` (this
+    // board's full reported capacity -- 7 on the user's Orion2, even
+    // though only 2 are ever actually streamed for diversity), NOT the
+    // count the ongoing stream actually uses. Confirmed via a real
+    // packet capture: preconfig's C4 byte declared "7 receivers, RX
+    // sync bit set" while the ongoing stream immediately afterward
+    // declared "2 receivers, RX sync bit set" -- baseline (non-
+    // diversity) has an analogous 7-vs-1 mismatch that's harmless, but
+    // COMBINED with the sync bit (which asks the radio to pair up its
+    // DDCs), a declared-7-then-actually-2 transition very plausibly
+    // leaves the FPGA's internal dual-DDC pairing setup inconsistent --
+    // a real candidate for the radio going silent about a second into
+    // 2-receiver diversity streaming regardless of sample rate. Now
+    // matches `active_receiver_count`'s own initial value, so preconfig
+    // and the ongoing stream agree on the receiver count from the very
+    // first packet, not just the sync bit.
     p1_send_preconfig_and_start(
         &socket,
         ps_wire_total,
-        settings.receivers.max(1),
+        initial_active_receivers as u8,
         settings.frequency_hz,
         settings.sample_rate,
         matches!(device.board, Boards::HermesLite | Boards::HermesLite2),
         rx_attenuation.load(Ordering::Relaxed) as u8,
         ps_tx_attenuation.load(Ordering::Relaxed) as u8,
         device.adcs,
+        settings.diversity_enabled,
         &tx_iq,
         mic_ptt_enabled.load(Ordering::Relaxed),
         mic_bias_enabled.load(Ordering::Relaxed),
@@ -788,7 +1019,11 @@ fn start_protocol1(
     let extra_sample_rates_hz: Vec<Arc<AtomicU32>> =
         (0..extra_count).map(|_| Arc::new(AtomicU32::new(settings.sample_rate))).collect();
     let extra_adcs: Vec<Arc<AtomicU32>> = (0..extra_count).map(|_| Arc::new(AtomicU32::new(0))).collect();
-    let active_receiver_count = Arc::new(AtomicU32::new(1));
+    // Diversity reserves wire 1 out of "Add Receiver"'s reach the same
+    // way receiver 0 itself is pre-consumed -- see RadioSession::
+    // diversity_enabled's doc comment. Same value preconfig just used
+    // (initial_active_receivers), so both phases agree.
+    let active_receiver_count = Arc::new(AtomicU32::new(initial_active_receivers));
 
     let sender_socket = socket.try_clone()?;
     let sender_stop = Arc::clone(&stop_flag);
@@ -810,6 +1045,11 @@ fn start_protocol1(
     let sender_mic_ptt_enabled = Arc::clone(&mic_ptt_enabled);
     let sender_mic_bias_enabled = Arc::clone(&mic_bias_enabled);
     let sender_mic_ptt_on_tip = Arc::clone(&mic_ptt_on_tip);
+    let sender_adc = Arc::clone(&adc);
+    let sender_extra_adcs = extra_adcs.clone();
+    // Live -- see RadioSession::diversity_enabled's doc comment.
+    // sender_loop watches this itself for changes.
+    let sender_diversity_enabled = Arc::clone(&diversity_enabled);
     let sender_thread = thread::spawn(move || {
         sender_loop(
             sender_socket,
@@ -826,6 +1066,9 @@ fn start_protocol1(
             sender_ps_tx_attenuation,
             sender_is_hermes_lite,
             sender_num_adcs,
+            sender_adc,
+            sender_extra_adcs,
+            sender_diversity_enabled,
             ps_wire_total,
             sender_rx_audio_to_radio,
             sender_send_rx_audio_to_radio,
@@ -846,6 +1089,9 @@ fn start_protocol1(
     let receiver_ps_rx_feedback_iq = Arc::clone(&ps_rx_feedback_iq);
     let receiver_ps_tx_feedback_iq = Arc::clone(&ps_tx_feedback_iq);
     let receiver_radio_mic_audio = Arc::clone(&radio_mic_audio);
+    // Live -- see RadioSession::diversity_enabled's doc comment.
+    let receiver_diversity_enabled = Arc::clone(&diversity_enabled);
+    let receiver_diversity_main_raw_iq = Arc::clone(&diversity_main_raw_iq);
     let receiver_thread = thread::spawn(move || {
         receiver_loop(
             receiver_socket,
@@ -859,6 +1105,8 @@ fn start_protocol1(
             receiver_ps_rx_feedback_iq,
             receiver_ps_tx_feedback_iq,
             receiver_radio_mic_audio,
+            receiver_diversity_enabled,
+            receiver_diversity_main_raw_iq,
             receiver_stop,
         );
     });
@@ -889,6 +1137,10 @@ fn start_protocol1(
         mic_ptt_enabled,
         mic_bias_enabled,
         mic_ptt_on_tip,
+        diversity_enabled,
+        diversity_gain_db,
+        diversity_phase_deg,
+        diversity_main_raw_iq,
         tx_power_watts,
         pa_gain_db,
         tx_forward_power,
@@ -898,8 +1150,11 @@ fn start_protocol1(
         receiver_thread: Some(receiver_thread),
         tx_iq_thread: None, // P1 streams TX audio through sender_thread itself
         rx_audio_thread: None, // P1 streams RX audio through sender_thread itself
+        diversity_combiner_thread: None, // set by RadioSession::start right after this returns, if diversity_enabled
+        diversity_combiner_stop: None,
         protocol: 1,
         radio_ip: device.address.ip(),
+        stop_socket,
     })
 }
 
@@ -1104,6 +1359,16 @@ fn sample_rate_code(rate: u32) -> u8 {
 fn p1_send_preconfig_and_start(
     socket: &UdpSocket,
     ps_wire_total: Option<u8>,
+    // The receiver count actually being streamed from the very first
+    // packet -- start_protocol1's `initial_active_receivers` (the value
+    // `active_receiver_count` itself starts at), NOT `real_receivers`
+    // (this board's full reported capacity, used only for buffer
+    // sizing). See that call site's own BUG FIX comment: passing
+    // `real_receivers` here previously left preconfig declaring a
+    // receiver count the ongoing stream never actually used (e.g. 7 on
+    // a board that only ever streams 2 for diversity), confirmed via a
+    // real packet capture to coincide with the radio going silent about
+    // a second into 2-receiver diversity streaming.
     receivers_fallback: u8,
     frequency_hz: u32,
     sample_rate: u32,
@@ -1111,6 +1376,14 @@ fn p1_send_preconfig_and_start(
     rx_attenuation: u8,
     ps_tx_attenuation: u8,
     num_adcs: u8,
+    // BUG FIX: this used to be hardcoded `false` in this function's own
+    // call to p1_build_packet below, meaning the diversity-only C4 sync
+    // bit (0x80) and C1 ADC1-forcing bit never went out during the
+    // critical two-rotations-plus-Start handshake -- only afterward,
+    // once the ongoing sender_loop took over post-Start. Now threaded
+    // through so preconfig and the ongoing stream present an identical,
+    // consistent diversity state from the very first packet.
+    diversity_enabled: bool,
     tx_iq: &Mutex<VecDeque<f32>>,
     mic_ptt_enabled: bool,
     mic_bias_enabled: bool,
@@ -1121,6 +1394,7 @@ fn p1_send_preconfig_and_start(
     let mut pre_current_receiver: u8 = 0;
     let mut rotations = 0;
     let mut dummy_rx_audio_pacer = RxAudioPacer::new(); // send_rx_audio is false below -- never actually read
+    let dummy_adc = Arc::new(AtomicU32::new(0)); // ADC0 -- nothing keyed yet this early, see extra_frequencies_hz's identical reasoning below
     while rotations < PRE_CONFIG_ROTATIONS {
         let packet = p1_build_packet(
             pre_seq,
@@ -1138,6 +1412,9 @@ fn p1_send_preconfig_and_start(
             ps_tx_attenuation,
             num_adcs,
             &[], // no extra receivers active yet this early -- falls back to the main frequency
+            &dummy_adc,
+            &[], // no extra receivers' ADCs active yet this early either -- diversity_enabled below still forces wire 1 to ADC1 regardless
+            diversity_enabled,
             tx_iq,
             ps_wire_total.is_some(),
             tx_iq, // send_rx_audio is false below, so this is never actually read -- reusing tx_iq's Mutex just to satisfy the type, not a real audio source
@@ -1154,6 +1431,20 @@ fn p1_send_preconfig_and_start(
             rotations += 1;
         }
     }
+
+    // BUG FIX: confirmed against piHPSDR's metis_restart() (the
+    // function behind BOTH a fresh connect and resuming after a stop --
+    // old_protocol_run() calls it directly): `usleep(250000);` right
+    // here, between the preconfig rotations and the actual Start
+    // packet, with the reference's own comment explaining why ("some
+    // apps have very small buffers that over-run if too much data is
+    // sent... before sending a METIS start packet"). This project never
+    // had this delay at all. A fresh connect's own natural human-paced
+    // discovery-screen delay likely papered over its absence there, but
+    // an in-app reconnect (PureSignal/Diversity's "Enable" checkbox)
+    // fires the new Start moments after the OLD session's Stop with
+    // nothing to fill that gap.
+    thread::sleep(Duration::from_millis(250));
 
     // Start command: <0xEF><0xFE><0x04><Command><60 zero bytes>.
     // Command byte and packet size both confirmed against the
@@ -1193,6 +1484,16 @@ fn p1_build_packet(
     ps_tx_attenuation: u8,
     num_adcs: u8,
     extra_frequencies_hz: &[Arc<AtomicU32>],
+    // Diversity: wire 0's (main) ADC assignment, and each extra wire's
+    // (index 0 = wire 1, etc.) -- see command 6/0x1C's own doc comment
+    // below for the byte layout and the prerequisite-bug context.
+    adc: &Arc<AtomicU32>,
+    extra_adcs: &[Arc<AtomicU32>],
+    // Diversity: when true, wire 1 is the reserved ADC1 aux feed -- its
+    // RX frequency (command 2) tracks the main frequency directly
+    // instead of its own independent extra_frequencies_hz entry, and
+    // its ADC (command 6) is forced to 1 regardless of extra_adcs[0].
+    diversity_enabled: bool,
     tx_iq: &Mutex<VecDeque<f32>>,
     // PureSignal: command 10 (0x24)'s C2 bit 0x40 -- see that command's
     // own doc comment below for what it does and why it matters.
@@ -1249,6 +1550,20 @@ fn p1_build_packet(
         _ => 0x00, // ANT1
     };
     c4 |= (receivers.max(1) - 1) << 3;
+    // BUG FIX (diversity): bit 7 was never set at all. Confirmed against
+    // piHPSDR's old_protocol.c: `output_buffer[C4] |= 0x80;` whenever
+    // diversity_enabled, with the comment "used to phase-synchronize RX1
+    // and RX2 on some boards and enforces that the RX1 and RX2
+    // frequencies are the same." Without it the radio has no signal that
+    // the two DDCs it's now streaming need to stay synchronized -- a
+    // very plausible cause for a real report of the radio going
+    // completely silent (confirmed via packet capture: host keeps
+    // sending correctly-paced packets, radio stops replying entirely)
+    // roughly a second into 2-receiver P1 streaming, independent of
+    // sample rate.
+    if diversity_enabled {
+        c4 |= 0x80;
+    }
     let mut frame0 = build_usb_frame(0x00 | mox_bit, c1, 0x00, 0x00, c4);
 
     // USB frame 2: the rotating command. Ported directly from the
@@ -1286,7 +1601,12 @@ fn p1_build_packet(
             if *current_receiver >= receivers.max(1) {
                 *current_receiver = 0;
             }
-            let rx_freq = if rx_index == 0 {
+            let rx_freq = if rx_index == 0 || (diversity_enabled && rx_index == 1) {
+                // Diversity's reserved wire 1 (ADC1 aux feed) is never
+                // independently tunable -- it must stay locked to the
+                // main frequency for the two ADCs' IQ to combine
+                // meaningfully. See this function's diversity_enabled
+                // doc comment.
                 freq
             } else {
                 extra_frequencies_hz
@@ -1442,9 +1762,58 @@ fn p1_build_packet(
             (0x16, c1, 0x00, 0x00, 0x00)
         }
         6 => {
-            // Per-receiver ADC assignment (C1) -- no per-receiver ADC
-            // tracking here yet, both default to ADC0.
+            // Per-receiver ADC assignment (C1), 2 bits per wire index:
+            // adc[chan] << (2*chan) -- confirmed against piHPSDR's
+            // old_protocol.c (command 6/0x1C case): `output_buffer[C1] |=
+            // (receiver[0]->adc<<(2*rx1channel));` etc, gated on
+            // `n_adc > 1` (this project only ever has 1 or 2 ADCs, so
+            // `num_adcs == 2` is the equivalent gate already used for
+            // command 5/0x16's neighboring C1 attenuator byte above).
             //
+            // BUG FIX: this was hardcoded to 0x00 -- i.e. every wire
+            // always read as ADC0 regardless of what the "Add Receiver"
+            // ADC dropdown (extra_adcs) was actually set to, a silent
+            // no-op on Protocol 1 (Protocol 2's equivalent,
+            // p2_ddc_specific_packet, already did this correctly). Found
+            // while implementing diversity, which requires wire 1 to
+            // really land on ADC1 to have any effect at all.
+            //
+            // Diversity: piHPSDR fixes wire 1 to ADC1 unconditionally
+            // while diversity is enabled ("use ADC0 for RX1 and ADC1 for
+            // RX2 (fixed setting)"), overriding whatever extra_adcs[0]
+            // would otherwise say -- matched here the same way.
+            let c1: u8 = if num_adcs == 2 {
+                let mut bits = adc.load(Ordering::Relaxed) & 0x3; // wire 0, bits 0-1
+                // BUG FIX: forcing wire 1 to ADC1 used to happen only
+                // inside the extra_adcs loop below, which the preconfig
+                // handshake (p1_send_preconfig_and_start) always calls
+                // with an EMPTY extra_adcs slice -- so wire 1's bit
+                // never actually got set during that critical
+                // two-rotations-plus-Start sequence, only afterward once
+                // the ongoing sender_loop took over. Forced here
+                // unconditionally instead, independent of extra_adcs'
+                // length, so it's present from the very first packet of
+                // the handshake -- a real, plausible reason the radio
+                // was still going silent ~1s in even after the C4 sync
+                // bit fix: the FPGA may only latch dual-DDC ADC routing
+                // at Start time, not on every packet afterward.
+                if diversity_enabled {
+                    bits |= 1 << 2; // wire 1 (chan=1), bits 2-3 = ADC1
+                }
+                for (i, a) in extra_adcs.iter().enumerate() {
+                    let chan = i + 1; // wire index (extra_adcs[0] = wire 1)
+                    if chan > 3 {
+                        break; // only 2 bits/channel fit in one byte (4 channels)
+                    }
+                    if diversity_enabled && chan == 1 {
+                        continue; // already forced above
+                    }
+                    bits |= (a.load(Ordering::Relaxed) & 0x3) << (2 * chan);
+                }
+                bits as u8
+            } else {
+                0x00
+            };
             // BUG FIX: C3 (step attenuator of the FIRST ADC, applied
             // only while transmitting -- see RadioSession::
             // ps_tx_attenuation's doc comment) was hardcoded to 0x00,
@@ -1455,7 +1824,7 @@ fn p1_build_packet(
             // radio only actually applies it during TX, per the
             // reference's own comment) -- matches this byte's mox-
             // independent send here too.
-            (0x1C, 0x00, 0x00, ps_tx_attenuation & 0x1F, 0x00)
+            (0x1C, c1, 0x00, ps_tx_attenuation & 0x1F, 0x00)
         }
         7 => {
             // CW mode bit (C1) + sidetone volume/PTT delay (C2/C3).
@@ -1549,6 +1918,20 @@ fn sender_loop(
     ps_tx_attenuation: Arc<AtomicU32>,
     is_hermes_lite: bool,
     num_adcs: u8,
+    // See p1_build_packet's identically-named params' doc comments.
+    adc: Arc<AtomicU32>,
+    extra_adcs: Vec<Arc<AtomicU32>>,
+    // Live -- see RadioSession::diversity_enabled's doc comment. This
+    // loop watches it itself (comparing against the value last seen)
+    // and, on a change, replays the whole preconfig+Start burst on its
+    // own socket before resuming normal operation -- see the main loop
+    // body below for the actual edge-detection. Reuses this loop's OWN
+    // socket for the replay (see RadioSession::stop_socket's doc
+    // comment for why port consistency matters here), so it happens
+    // sequentially on the one thread already doing all of this loop's
+    // sending -- no concurrent-sender interleaving risk, exactly
+    // mirroring piHPSDR's own single-threaded diversity_cb.
+    diversity_enabled: Arc<AtomicBool>,
     // PureSignal: overrides active_receiver_count's live value with a
     // FIXED total when Some -- see start_protocol1's ps_wire_total doc
     // comment for why these need to be decoupled (active_receiver_count
@@ -1586,8 +1969,55 @@ fn sender_loop(
     // audio content (matching a report of the same wide/splattering
     // signal from both WDSP's own Tune tone and WSJT-X's).
     let mut next_send = Instant::now();
+    // See diversity_enabled's own doc comment above for the full story
+    // on this edge-detection. Initialized from the CURRENT value (not a
+    // fixed `false`) so a fresh connect that starts with diversity
+    // already on doesn't spuriously replay the burst it just sent
+    // moments ago (in start_protocol1's own p1_send_preconfig_and_start
+    // call, before this thread even existed).
+    let mut last_diversity_enabled = diversity_enabled.load(Ordering::Relaxed);
 
     while !stop.load(Ordering::Relaxed) {
+        let now_diversity_enabled = diversity_enabled.load(Ordering::Relaxed);
+        if now_diversity_enabled != last_diversity_enabled {
+            // Diversity was just toggled live (RadioSession::
+            // set_diversity_enabled) -- replay piHPSDR's own
+            // diversity_cb sequence (Stop, flip, restart) right here,
+            // on this thread's own socket, sequentially: this loop is
+            // the ONLY thing that ever sends on it, so there's no
+            // concurrent-sender interleaving to worry about, exactly
+            // matching the reference's single-threaded model (unlike
+            // the old approach of tearing down this whole thread/socket
+            // and starting a completely new one, which reliably hung
+            // this board's P1 firmware -- see diversity_enabled's doc
+            // comment for the full story).
+            let mut stop_pkt = [0u8; 64];
+            stop_pkt[0] = 0xEF;
+            stop_pkt[1] = 0xFE;
+            stop_pkt[2] = 0x04;
+            stop_pkt[3] = 0x00;
+            let _ = socket.send(&stop_pkt);
+            let receivers_fallback = (active_receiver_count.load(Ordering::Relaxed) as u8).max(1);
+            let _ = p1_send_preconfig_and_start(
+                &socket,
+                ps_wire_total,
+                receivers_fallback,
+                frequency_hz.load(Ordering::Relaxed),
+                sample_rate.load(Ordering::Relaxed),
+                is_hermes_lite,
+                rx_attenuation.load(Ordering::Relaxed) as u8,
+                ps_tx_attenuation.load(Ordering::Relaxed) as u8,
+                num_adcs,
+                now_diversity_enabled,
+                &tx_iq,
+                mic_ptt_enabled.load(Ordering::Relaxed),
+                mic_bias_enabled.load(Ordering::Relaxed),
+                mic_ptt_on_tip.load(Ordering::Relaxed),
+            );
+            last_diversity_enabled = now_diversity_enabled;
+            next_send = Instant::now(); // resync pacing after the burst
+        }
+
         let current_rate = sample_rate.load(Ordering::Relaxed);
 
         // Read live each cycle (not a fixed value captured at session
@@ -1658,6 +2088,9 @@ fn sender_loop(
             ps_tx_attenuation.load(Ordering::Relaxed) as u8,
             num_adcs,
             &extra_frequencies_hz,
+            &adc,
+            &extra_adcs,
+            now_diversity_enabled,
             &tx_iq,
             ps_wire_total.is_some(),
             &rx_audio_to_radio,
@@ -1827,6 +2260,15 @@ fn receiver_loop(
     ps_rx_feedback_iq: Arc<Mutex<VecDeque<IqSample>>>,
     ps_tx_feedback_iq: Arc<Mutex<VecDeque<IqSample>>>,
     radio_mic_audio: Arc<Mutex<VecDeque<f32>>>,
+    // Diversity -- see RadioSession::diversity_main_raw_iq's doc comment.
+    // When enabled, wire 0's samples are redirected here instead of
+    // `buffers[0]` (parse_iq_stream), and the combiner thread (spawned
+    // in RadioSession::start, or live via set_diversity_enabled) is the
+    // one that ends up filling `buffers[0]` with the actual combined
+    // signal. Live -- see RadioSession::diversity_enabled's doc comment;
+    // read fresh each packet, same as active_receiver_count just above.
+    diversity_enabled: Arc<AtomicBool>,
+    diversity_main_raw_iq: Arc<Mutex<VecDeque<IqSample>>>,
     stop: Arc<AtomicBool>,
 ) {
     let mut buf = [0u8; PACKET_SIZE + 64]; // a little slack in case of larger packets
@@ -1869,6 +2311,8 @@ fn receiver_loop(
                         &ps_rx_feedback_iq,
                         &ps_tx_feedback_iq,
                         &radio_mic_audio,
+                        diversity_enabled.load(Ordering::Relaxed),
+                        &diversity_main_raw_iq,
                         &mut carry,
                         &mut frame_synced,
                     );
@@ -1944,6 +2388,14 @@ fn parse_iq_stream(
     ps_rx_feedback_iq: &Arc<Mutex<VecDeque<IqSample>>>,
     ps_tx_feedback_iq: &Arc<Mutex<VecDeque<IqSample>>>,
     radio_mic_audio: &Arc<Mutex<VecDeque<f32>>>,
+    // Diversity: when true, wire 0's samples go to
+    // `diversity_main_raw_iq` instead of `buffers[0]` -- the combiner
+    // thread (spawned in RadioSession::start) pairs them with wire 1's
+    // raw samples (which land in `buffers[1]` completely unchanged, see
+    // RadioSession::diversity_main_raw_iq's doc comment) and fills
+    // `buffers[0]` itself with the combined result.
+    diversity_enabled: bool,
+    diversity_main_raw_iq: &Arc<Mutex<VecDeque<IqSample>>>,
     // DIAGNOSTIC (Phase 1 -- protocol plumbing verification, see
     // receiver_loop's per-second summary): returns how many samples
     // this call routed into (ps_rx_feedback_iq, ps_tx_feedback_iq), so
@@ -2034,6 +2486,15 @@ fn parse_iq_stream(
                         push_sample(ps_tx_feedback_iq, sample, PS_FEEDBACK_BUFFER_CAPACITY);
                         tx_fb_pushed += 1;
                     }
+                    // Diversity: wire 0's raw ADC0 samples go to the
+                    // combiner's input queue instead of buffers[0] --
+                    // see this function's diversity_enabled doc comment.
+                    // Wire 1 (the ADC1 aux feed) needs no special case
+                    // here at all: it already lands in buffers[1], which
+                    // nothing else reads while reserved.
+                    _ if diversity_enabled && rx == 0 => {
+                        push_sample(diversity_main_raw_iq, sample, capacity);
+                    }
                     _ => push_sample(&buffers[rx], sample, capacity),
                 }
             }
@@ -2051,6 +2512,91 @@ fn parse_iq_stream(
     }
 
     (rx_fb_pushed, tx_fb_pushed)
+}
+
+/// Diversity combiner -- pairs ADC0's raw IQ (`diversity_main_raw_iq`,
+/// redirected there by the demux instead of `iq_buffers[0]`, see
+/// parse_iq_stream/p2_receiver_loop) with ADC1's raw IQ (`iq_buffers[1]`,
+/// the reserved wire-1 slot, untouched by the demux) and pushes the
+/// phase/gain-rotated sum into `iq_buffers[0]` -- where SpectrumHandle
+/// for receiver 0 already reads from, unmodified. Ported from piHPSDR's
+/// own diversity feature (`add_div_iq_samples`/`set_gain_phase` in
+/// `~/github/pihpsdr/receiver.c`/`diversity_menu.c`, which the user
+/// originally wrote): same formula, same live-adjustable gain(dB)/
+/// phase(degrees) semantics -- `amp = 10^(gain_db/20)`, combined =
+/// main + amp*(cos(phase)+j*sin(phase))*aux.
+///
+/// Protocol-agnostic: works identically for P1 (wire 0/1's samples
+/// arrive already interleaved, sample-for-sample, within the same USB
+/// frame) and P2 (DDC0/DDC1 arrive as independent, potentially jittered
+/// UDP packet streams) -- pairs whatever's oldest-available from each
+/// side, draining only as many samples as both queues currently have, so
+/// a transient one-sided lead just leaves the surplus queued rather than
+/// desyncing the pairing (same philosophy as tx.rs's drain_ps_feedback:
+/// never touch one queue without the other).
+///
+/// Spawned whenever `session.diversity_enabled` is true -- either at
+/// connect time (see RadioSession::start) or live (P1, see
+/// RadioSession::set_diversity_enabled) -- `iq_buffers[1]` is guaranteed
+/// to exist by then, since start_protocol1/2 both force
+/// `real_receivers.max(2)` whenever diversity is on at connect time (and
+/// live toggling on P1 never changes real_receivers, only which wire is
+/// actively used -- see set_diversity_enabled).
+///
+/// `stop` is a DEDICATED flag for this combiner specifically, not
+/// `session.stop_flag` (which sender_loop/receiver_loop/etc. all share
+/// and which must keep running when diversity is merely toggled off) --
+/// see RadioSession::diversity_combiner_stop's doc comment.
+fn spawn_diversity_combiner(session: &RadioSession, stop: Arc<AtomicBool>) -> JoinHandle<()> {
+    let main_raw = Arc::clone(&session.diversity_main_raw_iq);
+    let aux_raw = Arc::clone(&session.iq_buffers[1]);
+    let output = Arc::clone(&session.iq_buffers[0]);
+    let gain_db = Arc::clone(&session.diversity_gain_db);
+    let phase_deg = Arc::clone(&session.diversity_phase_deg);
+    let sample_rate = Arc::clone(&session.sample_rate);
+    thread::spawn(move || {
+        while !stop.load(Ordering::Relaxed) {
+            let pairs = {
+                let main_q = main_raw.lock().unwrap();
+                let aux_q = aux_raw.lock().unwrap();
+                main_q.len().min(aux_q.len())
+            };
+            if pairs == 0 {
+                // Idle poll -- same interval spectrum.rs's own run() loop
+                // uses while its input queue is empty.
+                thread::sleep(Duration::from_millis(5));
+                continue;
+            }
+            let amp = 10f32.powf(f32::from_bits(gain_db.load(Ordering::Relaxed)) / 20.0);
+            let phase_rad = f32::from_bits(phase_deg.load(Ordering::Relaxed)).to_radians();
+            let (cos, sin) = (amp * phase_rad.cos(), amp * phase_rad.sin());
+            let mut combined = Vec::with_capacity(pairs);
+            {
+                let mut main_q = main_raw.lock().unwrap();
+                let mut aux_q = aux_raw.lock().unwrap();
+                for _ in 0..pairs {
+                    let main = main_q.pop_front().unwrap();
+                    let aux = aux_q.pop_front().unwrap();
+                    let (i0, q0) = (main.i as f32, main.q as f32);
+                    let (i1, q1) = (aux.i as f32, aux.q as f32);
+                    let i_out = i0 + (cos * i1 - sin * q1);
+                    let q_out = q0 + (sin * i1 + cos * q1);
+                    // Clamped to the same +/-8_388_607 (24-bit signed)
+                    // range every other raw IqSample in this file
+                    // represents -- gain > 0dB can genuinely push the sum
+                    // outside it.
+                    combined.push(IqSample {
+                        i: i_out.clamp(-8_388_607.0, 8_388_607.0) as i32,
+                        q: q_out.clamp(-8_388_607.0, 8_388_607.0) as i32,
+                    });
+                }
+            }
+            let capacity = iq_buffer_capacity_for_rate(sample_rate.load(Ordering::Relaxed));
+            for s in combined {
+                push_sample(&output, s, capacity);
+            }
+        }
+    })
 }
 
 fn sign_extend_24(b0: u8, b1: u8, b2: u8) -> i32 {
@@ -2125,6 +2671,10 @@ fn start_protocol2(
     mic_ptt_enabled: Arc<AtomicBool>,
     mic_bias_enabled: Arc<AtomicBool>,
     mic_ptt_on_tip: Arc<AtomicBool>,
+    diversity_enabled: Arc<AtomicBool>,
+    diversity_gain_db: Arc<AtomicU32>,
+    diversity_phase_deg: Arc<AtomicU32>,
+    diversity_main_raw_iq: Arc<Mutex<VecDeque<IqSample>>>,
 ) -> io::Result<RadioSession> {
     // PureSignal (P2): see ps_feedback_config's doc comment. DDC0/DDC1
     // are reserved ahead of real receivers, which start at DDC2 instead
@@ -2146,11 +2696,16 @@ fn start_protocol2(
     // otherwise imply it.
     let puresignal_enabled =
         settings.puresignal_enabled && ps_feedback_config(2, device.board).is_some();
-    let real_receivers = if puresignal_enabled {
+    let mut real_receivers = if puresignal_enabled {
         settings.receivers.max(1).saturating_sub(2).max(1)
     } else {
         settings.receivers.max(1)
     };
+    // Diversity: forces at least 2 wire slots -- see start_protocol1's
+    // identical handling for the full explanation.
+    if settings.diversity_enabled {
+        real_receivers = real_receivers.max(2);
+    }
 
     // Confirmed against a working reference (rustyHPSDR): it explicitly
     // sets SO_REUSEADDR and (on Unix) SO_REUSEPORT before binding, via
@@ -2178,6 +2733,10 @@ fn start_protocol2(
     // different destination ports on the radio and receive from several
     // different source ports (1025 status, 1035+ IQ, etc.) on the radio.
     let radio_ip = device.address.ip();
+    // See RadioSession::stop_socket's doc comment (P1's own copy has the
+    // full story) -- cloned now, before `socket` gets consumed by the
+    // sender/receiver threads below.
+    let stop_socket = socket.try_clone()?;
 
     let stop_flag = Arc::new(AtomicBool::new(false));
     let iq_buffers: Vec<Arc<Mutex<VecDeque<IqSample>>>> = (0..real_receivers)
@@ -2197,7 +2756,10 @@ fn start_protocol2(
         .map(|_| Arc::new(AtomicU32::new(settings.sample_rate)))
         .collect();
     let extra_adcs: Vec<Arc<AtomicU32>> = (0..extra_count).map(|_| Arc::new(AtomicU32::new(0))).collect();
-    let active_receiver_count = Arc::new(AtomicU32::new(1));
+    // Diversity reserves wire 1 out of "Add Receiver"'s reach -- see
+    // start_protocol1's identical handling for the full explanation.
+    let active_receiver_count =
+        Arc::new(AtomicU32::new(if settings.diversity_enabled { 2 } else { 1 }));
     // Shared between the sender and receiver threads: set by
     // p2_receiver_loop when the radio's own high-priority status
     // packet arrives, consumed by p2_sender_loop to send an immediate
@@ -2224,11 +2786,15 @@ fn start_protocol2(
     let sender_mic_bias_enabled = Arc::clone(&mic_bias_enabled);
     let sender_mic_ptt_on_tip = Arc::clone(&mic_ptt_on_tip);
     let num_adcs = device.adcs;
+    let is_orion2 = device.board == Boards::Orion2;
+    // Live -- see RadioSession::diversity_enabled's doc comment.
+    let sender_diversity_enabled = Arc::clone(&diversity_enabled);
     let sender_thread = thread::spawn(move || {
         p2_sender_loop(
             sender_socket,
             radio_ip,
             num_adcs,
+            is_orion2,
             sender_frequency,
             sender_sample_rate,
             sender_adc,
@@ -2246,6 +2812,7 @@ fn start_protocol2(
             sender_mic_ptt_enabled,
             sender_mic_bias_enabled,
             sender_mic_ptt_on_tip,
+            sender_diversity_enabled,
             sender_stop,
         );
     });
@@ -2277,6 +2844,9 @@ fn start_protocol2(
     let receiver_ps_rx_feedback_iq = Arc::clone(&ps_rx_feedback_iq);
     let receiver_ps_tx_feedback_iq = Arc::clone(&ps_tx_feedback_iq);
     let receiver_radio_mic_audio = Arc::clone(&radio_mic_audio);
+    // Live -- see RadioSession::diversity_enabled's doc comment.
+    let receiver_diversity_enabled = Arc::clone(&diversity_enabled);
+    let receiver_diversity_main_raw_iq = Arc::clone(&diversity_main_raw_iq);
     let receiver_thread = thread::spawn(move || {
         p2_receiver_loop(
             receiver_socket,
@@ -2289,6 +2859,8 @@ fn start_protocol2(
             receiver_ps_rx_feedback_iq,
             receiver_ps_tx_feedback_iq,
             receiver_radio_mic_audio,
+            receiver_diversity_enabled,
+            receiver_diversity_main_raw_iq,
             receiver_stop,
         );
     });
@@ -2319,6 +2891,10 @@ fn start_protocol2(
         mic_ptt_enabled,
         mic_bias_enabled,
         mic_ptt_on_tip,
+        diversity_enabled,
+        diversity_gain_db,
+        diversity_phase_deg,
+        diversity_main_raw_iq,
         tx_power_watts,
         pa_gain_db,
         tx_forward_power,
@@ -2328,8 +2904,11 @@ fn start_protocol2(
         receiver_thread: Some(receiver_thread),
         tx_iq_thread: Some(tx_iq_thread),
         rx_audio_thread: Some(rx_audio_thread),
+        diversity_combiner_thread: None, // set by RadioSession::start right after this returns, if diversity_enabled
+        diversity_combiner_stop: None,
         protocol: 2,
         radio_ip,
+        stop_socket,
     })
 }
 
@@ -2507,6 +3086,16 @@ fn p2_high_priority_packet(
     tx_freq_hz: u32,
     tx_drive: u8,
     ps_tx_attenuation: u8,
+    // RX2/Alex1 bandpass-filter selection (bytes 1430-1431) -- Some(freq)
+    // on Orion2-class boards (see p2_sender_loop's is_orion2/rx2_freq_hz
+    // doc comments), None elsewhere (byte pair left at 0, this board
+    // family's own default/no-op state). Confirmed against piHPSDR's
+    // new_protocol.c: without this, ADC1/RX2 has no bandpass filter path
+    // selected at all -- signal-blocking, not just a nicety -- verified
+    // by the user on a real ANAN-8000DLE (Orion2 family): correct
+    // wiring + correct ADC assignment still produced nothing on RX2
+    // until this was identified as the missing piece.
+    alex1_rx2_freq_hz: Option<u32>,
 ) -> [u8; P2_PACKET_SIZE] {
     let mut p = [0u8; P2_PACKET_SIZE];
     p[0..4].copy_from_slice(&seq.to_be_bytes());
@@ -2560,6 +3149,15 @@ fn p2_high_priority_packet(
     // there's only one Alex front end, shared across all DDCs.
     let primary_freq = frequencies_hz.first().copied().unwrap_or(7_100_000);
     p[1432..1436].copy_from_slice(&alex0_word(primary_freq, antenna, mox_on).to_be_bytes());
+
+    // RX2/Alex1 bandpass filter (bytes 1430-1431) -- see this param's own
+    // doc comment. BUG FIX: previously never written at all (stayed
+    // 0x0000), leaving RX2's filter bank in whatever state it powered up
+    // in -- plausibly no signal path selected, matching a real report of
+    // "correct wiring, correct ADC assignment, still nothing on RX2".
+    if let Some(rx2_freq) = alex1_rx2_freq_hz {
+        p[1430..1432].copy_from_slice(&alex1_word(rx2_freq, mox_on).to_be_bytes());
+    }
 
     // Bytes 1428-1429: the v4.3 spec documents this as an "Alex0 TX
     // relay pre-stage" field, and a previous version of this file
@@ -2663,10 +3261,64 @@ fn alex0_word(freq_hz: u32, antenna: u32, mox_on: bool) -> u32 {
     hpf | lpf | ant | tr
 }
 
+/// Alex1 "RX2" bandpass filter register, ANAN-7000/8000DLE (Orion2)
+/// only -- direct port of piHPSDR's new_protocol.c ORION2-specific
+/// block (`alex1|=ALEX_ANAN7000_RX_*`), bit values from its alex.h.
+/// Only the low 16 bits are ever used (written to bytes 1430-1431 of
+/// the High Priority packet, big-endian) -- unlike alex0_word, RX2 has
+/// no separate TX/LPF path of its own to select (its whole purpose is
+/// RX, primarily diversity/second-receiver use), just one BPF ladder
+/// plus a TX-time ground-protection bit.
+fn alex1_word(freq_hz: u32, mox_on: bool) -> u16 {
+    const RX_20_15_BPF: u16 = 0x0002;
+    const RX_12_10_BPF: u16 = 0x0004;
+    const RX_6_PRE_BPF: u16 = 0x0008;
+    const RX_40_30_BPF: u16 = 0x0010;
+    const RX_80_60_BPF: u16 = 0x0020;
+    const RX_160_BPF: u16 = 0x0040;
+    const RX_BYPASS_BPF: u16 = 0x1000;
+    const RX_GND_ON_TX: u16 = 0x0100;
+
+    let f = freq_hz as f64;
+    let bpf = if f < 1_500_000.0 {
+        RX_BYPASS_BPF
+    } else if f < 2_100_000.0 {
+        RX_160_BPF
+    } else if f < 5_500_000.0 {
+        RX_80_60_BPF
+    } else if f < 11_000_000.0 {
+        RX_40_30_BPF
+    } else if f < 22_000_000.0 {
+        RX_20_15_BPF
+    } else if f < 35_000_000.0 {
+        RX_12_10_BPF
+    } else {
+        RX_6_PRE_BPF
+    };
+
+    // "The main purpose of RX2 is DIVERSITY. Therefore, ground RX2 upon
+    // TX *always*" -- piHPSDR's own comment, matched verbatim: protects
+    // RX2's front end from the transmitter's RF regardless of whether
+    // diversity or an independent second receiver is what's actually
+    // using ADC1 right now.
+    let gnd = if mox_on { RX_GND_ON_TX } else { 0 };
+
+    bpf | gnd
+}
+
 fn p2_sender_loop(
     socket: UdpSocket,
     radio_ip: std::net::IpAddr,
     num_adcs: u8,
+    // RX2/Alex1 bandpass-filter word (High Priority packet bytes
+    // 1430-1431) -- Orion2-class boards only (confirmed against
+    // piHPSDR's new_protocol.c: `if (device == NEW_DEVICE_ORION2)`).
+    // See p2_high_priority_packet's alex1_rx2_freq_hz doc comment for
+    // why this is a real, previously-missing gap: without it, ADC1/RX2
+    // has no bandpass filter path selected at all, so nothing gets
+    // through regardless of correct wiring/ADC assignment -- confirmed
+    // by the user on a real ANAN-8000DLE (an Orion2-family board).
+    is_orion2: bool,
     frequency_hz: Arc<AtomicU32>,
     sample_rate: Arc<AtomicU32>,
     adc: Arc<AtomicU32>,
@@ -2691,6 +3343,17 @@ fn p2_sender_loop(
     mic_ptt_enabled: Arc<AtomicBool>,
     mic_bias_enabled: Arc<AtomicBool>,
     mic_ptt_on_tip: Arc<AtomicBool>,
+    // Diversity -- see RadioSession::diversity_enabled's doc comment.
+    // Mutually exclusive with puresignal_enabled (enforced in main.rs's
+    // Settings UI), so no interaction with that reserved-DDC scheme
+    // above to worry about here. Live -- read fresh each cycle, same as
+    // active_receiver_count just above: unlike P1, P2 has no discrete
+    // preconfig/Start handshake to replay at all, it just continuously
+    // sends updated DDC-specific/High-Priority packets on a timer, so a
+    // live toggle needs nothing extra beyond reading this fresh --
+    // RadioSession::set_diversity_enabled (bump active_receiver_count,
+    // spawn/stop the combiner) already covers the rest.
+    diversity_enabled: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
 ) {
     let mut general_seq: u32 = 0;
@@ -2756,6 +3419,8 @@ fn p2_sender_loop(
             eprintln!("radio: requesting {active} active DDC(s) from the radio");
             last_logged_active = Some(active);
         }
+        // Live -- see this function's diversity_enabled doc comment.
+        let now_diversity_enabled = diversity_enabled.load(Ordering::Relaxed);
         let mox_on = mox.load(Ordering::Relaxed);
         // No split VFO support yet -- TX frequency is always the
         // primary receiver's frequency (simplex). Computed up front
@@ -2783,10 +3448,37 @@ fn p2_sender_loop(
             rates.push(192_000);
             adcs.push(num_adcs as u32);
         }
-        freqs.push(frequency_hz.load(Ordering::Relaxed));
+        let main_freq = frequency_hz.load(Ordering::Relaxed);
+        // RX2/Alex1 bandpass filter frequency -- see p2_sender_loop's
+        // is_orion2 doc comment. Confirmed against piHPSDR: while
+        // diversity is enabled, RX2's filter must track the MAIN
+        // receiver's frequency (the two ADCs need to be looking at the
+        // same passband to combine meaningfully); otherwise it tracks
+        // wire 1's own independent frequency (extra_frequencies_hz[0]),
+        // same as an ordinary "Add Receiver" tuned to ADC1. Sent
+        // unconditionally whenever this is an Orion2 board, regardless
+        // of whether wire 1 is currently active, matching the
+        // reference's own always-on behavior (harmless when ADC1 isn't
+        // actually in use by anything).
+        let rx2_freq_hz = if now_diversity_enabled {
+            main_freq
+        } else {
+            extra_frequencies_hz.first().map(|f| f.load(Ordering::Relaxed)).unwrap_or(main_freq)
+        };
+        freqs.push(main_freq);
         rates.push(sample_rate.load(Ordering::Relaxed));
         adcs.push(adc.load(Ordering::Relaxed));
         for i in 0..active.saturating_sub(1) {
+            // Diversity: wire 1 (i==0 here) is the reserved ADC1 aux
+            // feed -- never independently tunable, and always ADC1
+            // regardless of extra_adcs[0]. See RadioSession::
+            // diversity_enabled's doc comment.
+            if now_diversity_enabled && i == 0 {
+                freqs.push(main_freq);
+                rates.push(sample_rate.load(Ordering::Relaxed));
+                adcs.push(1);
+                continue;
+            }
             if let Some(f) = extra_frequencies_hz.get(i) {
                 freqs.push(f.load(Ordering::Relaxed));
             }
@@ -2816,7 +3508,16 @@ fn p2_sender_loop(
                 mic_ptt_on_tip.load(Ordering::Relaxed),
             );
             let hp =
-                p2_high_priority_packet(hp_seq, &freqs, antenna_now, mox_on, tx_freq_hz, drive, ps_tx_atten);
+                p2_high_priority_packet(
+                    hp_seq,
+                    &freqs,
+                    antenna_now,
+                    mox_on,
+                    tx_freq_hz,
+                    drive,
+                    ps_tx_atten,
+                    is_orion2.then_some(rx2_freq_hz),
+                );
 
             let sends: [(&[u8], u16); 5] = [
                 (&general[..], P2_GENERAL_PORT),
@@ -2848,7 +3549,16 @@ fn p2_sender_loop(
             // what was actually confirmed in the reference source
             // rather than guessing it should be more than that.
             let hp =
-                p2_high_priority_packet(hp_seq, &freqs, antenna_now, mox_on, tx_freq_hz, drive, ps_tx_atten);
+                p2_high_priority_packet(
+                    hp_seq,
+                    &freqs,
+                    antenna_now,
+                    mox_on,
+                    tx_freq_hz,
+                    drive,
+                    ps_tx_atten,
+                    is_orion2.then_some(rx2_freq_hz),
+                );
             if socket.send_to(&hp, (radio_ip, P2_HIGH_PRIORITY_PORT)).is_err() {
                 return;
             }
@@ -2874,6 +3584,11 @@ fn p2_receiver_loop(
     ps_rx_feedback_iq: Arc<Mutex<VecDeque<IqSample>>>,
     ps_tx_feedback_iq: Arc<Mutex<VecDeque<IqSample>>>,
     radio_mic_audio: Arc<Mutex<VecDeque<f32>>>,
+    // Diversity -- see RadioSession::diversity_main_raw_iq's doc comment
+    // and parse_iq_stream's identical P1-side handling. Live -- read
+    // fresh each packet, same as p2_sender_loop's own live read.
+    diversity_enabled: Arc<AtomicBool>,
+    diversity_main_raw_iq: Arc<Mutex<VecDeque<IqSample>>>,
     stop: Arc<AtomicBool>,
 ) {
     let mut buf = [0u8; P2_PACKET_SIZE + 64];
@@ -2906,6 +3621,13 @@ fn p2_receiver_loop(
                             p2_parse_ddc_iq_packet(&buf[..n], &ps_rx_feedback_iq, PS_FEEDBACK_BUFFER_CAPACITY);
                         } else if puresignal_enabled && ddc == 1 {
                             p2_parse_ddc_iq_packet(&buf[..n], &ps_tx_feedback_iq, PS_FEEDBACK_BUFFER_CAPACITY);
+                        } else if diversity_enabled.load(Ordering::Relaxed) && ddc - ddc_reserved == 0 {
+                            // Wire 0's raw ADC0 samples go to the
+                            // combiner's input queue instead of
+                            // buffers[0] -- wire 1 (the ADC1 aux feed)
+                            // needs no special case, it already lands in
+                            // buffers[1] untouched.
+                            p2_parse_ddc_iq_packet(&buf[..n], &diversity_main_raw_iq, capacity);
                         } else {
                             p2_parse_ddc_iq_packet(&buf[..n], &buffers[ddc - ddc_reserved], capacity);
                         }
