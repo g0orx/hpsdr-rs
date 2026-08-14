@@ -35,14 +35,14 @@ Any board the standard openHPSDR discovery protocol reports as one of: Metis, He
 
 ## Building
 
-Linux only for now (the config path and a couple of other details are Linux-specific — see the source for notes on what would need to change for Windows/macOS).
+Developed and tested on Linux. A Windows build (via MSYS2/MinGW-w64) is newly in progress and not yet fully verified — the config path (`$HOME`-based) and a couple of other details are still Linux-specific; see the source for notes on what would need to change.
 
 Requirements:
 - A recent Rust toolchain (`rustup` recommended)
-- FFTW3 development headers (e.g. `apt install libfftw3-dev` on Debian/Ubuntu)
-- ALSA development headers for audio I/O (e.g. `apt install libasound2-dev`)
+- FFTW3 development headers (Linux: `apt install libfftw3-dev` or your distro's equivalent; Windows/MSYS2: `pacman -S mingw-w64-x86_64-fftw`)
+- ALSA development headers for audio I/O, Linux only (e.g. `apt install libasound2-dev`)
 
-WDSP and its noise-reduction dependencies (libspecbleach, rnnoise) are vendored as prebuilt static libraries under `vendor/` and linked automatically by `build.rs` — no separate WDSP build step is needed.
+WDSP and its noise-reduction dependencies (libspecbleach, rnnoise) are vendored as C source under `vendor/` and built automatically from source by `build.rs` (via the `cc` crate) — no separate build step, and no prebuilt platform-specific binaries to obtain or keep in sync.
 
 ```sh
 cargo build --release

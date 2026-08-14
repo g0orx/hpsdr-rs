@@ -36,3 +36,10 @@ tungstenite = "0.29"
 # (no Rust toolchain available), so treat these version numbers as a
 # starting point -- run `cargo update` / `cargo check` locally and adjust
 # if crates.io has moved on since.
+
+[build-dependencies]
+# Compile WDSP/libspecbleach/rnnoise from vendored C source (see
+# build.rs's own doc comment) instead of linking prebuilt platform-
+# specific binaries -- needed for this to build on Windows at all.
+cc = "1"
+pkg-config = "0.3"
