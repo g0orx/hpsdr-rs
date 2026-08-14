@@ -15,8 +15,7 @@ window titled **Receiver N** opens. This button disappears (replaced by
 **All N receivers active**) once you've reached the radio's maximum
 receiver count.
 
-(Screenshot needed: main window with an extra Receiver window open alongside it)
-![Extra receiver window](images/11-extra-receiver-window.png)
+![An extra receiver's own window](images/11-extra-receiver-window.png)
 
 ## Using an extra receiver window
 
