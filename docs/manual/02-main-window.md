@@ -134,8 +134,11 @@ Below the meter:
   the radio's maximum receiver count, replaced with **All N receivers
   active**.
 
-(Screenshot needed: S-meter close-up while receiving, and again while transmitting showing power/SWR)
+(Screenshot needed: S-meter close-up while receiving)
 ![S-meter](images/02-s-meter.png)
+
+(Screenshot needed: power/SWR meter close-up while transmitting)
+![TX power/SWR meter](images/02-tx-meter.png)
 
 ## Stopping
 
