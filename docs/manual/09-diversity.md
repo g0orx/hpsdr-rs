@@ -1,4 +1,4 @@
-← [Manual index](README.md)
+[← PureSignal](08-puresignal.md) | [Index](README.md) | [Equalizer →](10-equalizer.md)
 
 # Settings: Diversity
 
@@ -34,3 +34,7 @@ Once enabled, two sliders appear:
 There's no automatic calibration -- tune Gain and Phase by ear (or
 watching the S-meter) for the best null of an interfering signal, or the
 best peak of a wanted one. Both sliders take effect live as you move them.
+
+---
+
+[← PureSignal](08-puresignal.md) | [Index](README.md) | [Equalizer →](10-equalizer.md)

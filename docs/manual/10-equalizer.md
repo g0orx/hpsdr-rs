@@ -1,4 +1,4 @@
-← [Manual index](README.md)
+[← Diversity](09-diversity.md) | [Index](README.md) | [Extra Receivers →](11-extra-receivers.md)
 
 # Settings: Equalizer
 
@@ -33,3 +33,7 @@ doesn't affect them, or each other.
 
 Switching between 3-Band and 10-Band keeps each mode's own dialed-in gains
 independently -- flipping back and forth doesn't lose either set.
+
+---
+
+[← Diversity](09-diversity.md) | [Index](README.md) | [Extra Receivers →](11-extra-receivers.md)

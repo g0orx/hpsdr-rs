@@ -1,4 +1,4 @@
-← [Manual index](README.md)
+[← Spectrum](05-settings-spectrum.md) | [Index](README.md) | [PA Calibration →](07-pa-calibration.md)
 
 # Settings: TX
 
@@ -56,3 +56,7 @@ Two settings for boards with a shared PTT/mic/bias connector:
   connector at all.
 - **Mic Bias Enabled** -- whether to supply bias voltage for an electret
   mic element.
+
+---
+
+[← Spectrum](05-settings-spectrum.md) | [Index](README.md) | [PA Calibration →](07-pa-calibration.md)

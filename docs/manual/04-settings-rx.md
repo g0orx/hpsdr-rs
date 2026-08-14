@@ -1,4 +1,4 @@
-← [Manual index](README.md)
+[← Network](03-settings-network.md) | [Index](README.md) | [Spectrum →](05-settings-spectrum.md)
 
 # Settings: RX
 
@@ -52,3 +52,7 @@ Medium/Fast -- is toggled from the main window, not here):
 **NB Threshold** (0-100) is shared by both blanker stages (NB and NB2,
 toggled from the main window) -- there's only one threshold, whichever
 stage is active uses it.
+
+---
+
+[← Network](03-settings-network.md) | [Index](README.md) | [Spectrum →](05-settings-spectrum.md)

@@ -1,4 +1,4 @@
-← [Manual index](README.md)
+[← Getting Started](01-getting-started.md) | [Index](README.md) | [Network →](03-settings-network.md)
 
 # Main Window
 
@@ -139,3 +139,7 @@ Below the meter:
 
 The **Stop** button at the bottom of the window disconnects from the radio
 and returns to the discovery window.
+
+---
+
+[← Getting Started](01-getting-started.md) | [Index](README.md) | [Network →](03-settings-network.md)

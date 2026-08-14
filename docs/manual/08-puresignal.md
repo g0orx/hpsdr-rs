@@ -1,4 +1,4 @@
-← [Manual index](README.md)
+[← PA Calibration](07-pa-calibration.md) | [Index](README.md) | [Diversity →](09-diversity.md)
 
 # Settings: PureSignal
 
@@ -66,3 +66,7 @@ per-board constant to leave alone.
      converges at is somewhat radio-dependent.
 
 ![PureSignal correcting](images/08-puresignal-correcting.png)
+
+---
+
+[← PA Calibration](07-pa-calibration.md) | [Index](README.md) | [Diversity →](09-diversity.md)

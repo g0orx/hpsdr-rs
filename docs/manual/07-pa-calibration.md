@@ -1,4 +1,4 @@
-← [Manual index](README.md)
+[← TX](06-settings-tx.md) | [Index](README.md) | [PureSignal →](08-puresignal.md)
 
 # Settings: PA Calibration
 
@@ -30,3 +30,7 @@ One row per band, each with:
 
 Settings persist automatically per radio, so this only needs doing once
 per band, per radio.
+
+---
+
+[← TX](06-settings-tx.md) | [Index](README.md) | [PureSignal →](08-puresignal.md)

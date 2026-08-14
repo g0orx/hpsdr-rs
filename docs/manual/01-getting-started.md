@@ -1,4 +1,4 @@
-← [Manual index](README.md)
+[Index](README.md) | [Main Window →](02-main-window.md)
 
 # Getting Started
 
@@ -61,3 +61,7 @@ between radios doesn't mix up their settings.
 
 To disconnect, use the **Stop** button at the bottom of the main window.
 This returns you to the discovery window.
+
+---
+
+[Index](README.md) | [Main Window →](02-main-window.md)

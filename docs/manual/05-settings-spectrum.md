@@ -1,4 +1,4 @@
-← [Manual index](README.md)
+[← RX](04-settings-rx.md) | [Index](README.md) | [TX →](06-settings-tx.md)
 
 # Settings: Spectrum
 
@@ -32,3 +32,7 @@ separately, so tuning your RX display doesn't also require re-tuning it
 every time you key up.
 
 ![TX spectrum display](images/05-tx-spectrum.png)
+
+---
+
+[← RX](04-settings-rx.md) | [Index](README.md) | [TX →](06-settings-tx.md)

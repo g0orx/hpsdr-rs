@@ -1,4 +1,4 @@
-← [Manual index](README.md)
+[← Main Window](02-main-window.md) | [Index](README.md) | [RX →](04-settings-rx.md)
 
 # Settings: Network
 
@@ -39,3 +39,7 @@ for both control and audio streaming.
 
 Neither server auto-starts -- start them explicitly here each session, or
 whenever you need them.
+
+---
+
+[← Main Window](02-main-window.md) | [Index](README.md) | [RX →](04-settings-rx.md)

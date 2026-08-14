@@ -1,4 +1,4 @@
-← [Manual index](README.md)
+[← Equalizer](10-equalizer.md) | [Index](README.md)
 
 # Extra Receivers
 
@@ -48,3 +48,7 @@ Diversity are session-wide, not per-receiver:
 
 Every extra receiver's settings persist per radio, the same as the main
 window's.
+
+---
+
+[← Equalizer](10-equalizer.md) | [Index](README.md)
