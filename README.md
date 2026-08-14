@@ -10,6 +10,12 @@ A Rust/egui desktop client for [openHPSDR](https://openhpsdr.org/) Protocol 1 an
 
 ![hpsdr-rs main window and a second independent receiver, showing the spectrum/waterfall display, S-meter, and TX controls](images/screenshot.png)
 
+## Origins
+
+This project started as an experiment: could Claude port the discovery code from rustyHPSDR -- originally written in GTK4 -- over to Rust's egui framework, which is more portable? That worked remarkably well. The plan at that point was to have Claude port the rest of rustyHPSDR to egui too, but that turned into a different question instead: having pointed Claude at the rustyHPSDR and piHPSDR source as reference, how much of a complete application could it actually develop from there? This project is the result so far. The only code I wrote by hand is the original discovery implementation that was ported to egui -- everything else came out of interacting with Claude and running real-hardware debugging sessions to chase down bugs.
+
+-- John Melton, G0ORX/N6LYT
+
 ## Features
 
 - Protocol 1 (Metis/Ozy) and Protocol 2 (Hermes/Orion) support, with standard openHPSDR UDP discovery (broadcast, port 1024)
