@@ -4,7 +4,6 @@
 
 Open **Settings...** from the main window, then the **Network** tab.
 
-(Screenshot needed: the Network settings tab)
 ![Network settings tab](images/03-network-tab.png)
 
 This tab starts and stops two optional control servers that let other

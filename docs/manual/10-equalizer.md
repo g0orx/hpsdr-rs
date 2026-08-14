@@ -4,8 +4,7 @@
 
 Open **Settings...** from the main window, then the **Equalizer** tab.
 
-(Screenshot needed: the Equalizer tab in 10-band mode with a few bands adjusted)
-![Equalizer settings tab](images/10-equalizer-tab.png)
+![Equalizer settings tab in 10-band mode](images/10-equalizer-tab.png)
 
 hpsdr-rs offers a graphic equalizer for both received audio and (if TX is
 armed) transmitted audio.

@@ -2,7 +2,6 @@
 
 # Main Window
 
-(Screenshot needed: full main window -- frequency display, band/mode rows, spectrum/waterfall, S-meter, PTT row)
 ![Main window overview](images/02-main-window-overview.png)
 
 ## Frequency display and tuning
@@ -61,7 +60,6 @@ A row of cycling buttons, each click advancing to the next state:
 - **AGC** -- cycles Off → Long → Slow → Medium → Fast → Off. Attack/decay/
   hang/top/slope/threshold for AGC are tuned in Settings → RX.
 
-(Screenshot needed: the noise/AGC toggle row with a couple of buttons in a non-default state, to show what "active" looks like)
 ![Noise and AGC toggle row](images/02-toggle-row.png)
 
 ## rigctl / TCI status badges
@@ -104,7 +102,6 @@ alongside Audio gain.
 into a real antenna.** See the [top-level README](../../README.md) for the
 project's current TX verification status.
 
-(Screenshot needed: PTT row while MOX is active, showing "MOX ON" and "TRANSMITTING")
 ![Transmit controls active](images/02-tx-active.png)
 
 ## Spectrum and waterfall
@@ -134,10 +131,8 @@ Below the meter:
   the radio's maximum receiver count, replaced with **All N receivers
   active**.
 
-(Screenshot needed: S-meter close-up while receiving)
 ![S-meter](images/02-s-meter.png)
 
-(Screenshot needed: power/SWR meter close-up while transmitting)
 ![TX power/SWR meter](images/02-tx-meter.png)
 
 ## Stopping

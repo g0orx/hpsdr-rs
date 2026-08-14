@@ -6,7 +6,6 @@ Open **Settings...** from the main window, then the **Diversity** tab. This
 tab only appears on radios with two ADCs. It's mutually exclusive with
 [PureSignal](08-puresignal.md).
 
-(Screenshot needed: the Diversity settings tab, enabled, with Gain/Phase sliders visible)
 ![Diversity settings tab](images/09-diversity-tab.png)
 
 ## What it does

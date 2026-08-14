@@ -4,7 +4,6 @@
 
 Open **Settings...** from the main window, then the **TX** tab.
 
-(Screenshot needed: the TX settings tab)
 ![TX settings tab](images/06-tx-tab.png)
 
 > **Transmit is unverified against your radio's actual protocol.**

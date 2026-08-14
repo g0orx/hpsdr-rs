@@ -4,7 +4,6 @@
 
 Open **Settings...** from the main window, then the **PA Calibration** tab.
 
-(Screenshot needed: the PA Calibration settings tab)
 ![PA Calibration settings tab](images/07-pa-calibration-tab.png)
 
 Every amplifier's actual output power vs. drive-level response varies by

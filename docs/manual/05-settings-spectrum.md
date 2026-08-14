@@ -4,7 +4,6 @@
 
 Open **Settings...** from the main window, then the **Spectrum** tab.
 
-(Screenshot needed: the Spectrum settings tab)
 ![Spectrum settings tab](images/05-spectrum-tab.png)
 
 ## Display range
@@ -32,5 +31,4 @@ you'd receive. A second set of **Low**/**High** sliders (default -180.0 to
 separately, so tuning your RX display doesn't also require re-tuning it
 every time you key up.
 
-(Screenshot needed: spectrum pane while transmitting, showing the TX trace)
 ![TX spectrum display](images/05-tx-spectrum.png)

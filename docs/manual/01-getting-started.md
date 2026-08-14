@@ -19,7 +19,6 @@ On launch, the **Discover HPSDR Radios** window opens automatically and
 immediately starts listening for radios on the network (standard openHPSDR
 UDP discovery broadcast, port 1024).
 
-(Screenshot needed: the Discover HPSDR Radios window with at least one radio listed)
 ![Discovery window](images/01-discovery-window.png)
 
 The window lists every radio that responded, one row per device, with

@@ -8,8 +8,7 @@ splatter/IMD. It's mutually exclusive with [Diversity](09-diversity.md) --
 both reserve extra receiver resources on the radio in incompatible ways, so
 only one can be enabled at a time.
 
-(Screenshot needed: the PureSignal settings tab while correcting, showing feedback level/HW Peak/etc)
-![PureSignal settings tab](images/08-puresignal-tab.png)
+![PureSignal settings tab before enabling](images/08-puresignal-tab.png)
 
 ## Enabling
 
@@ -66,5 +65,4 @@ per-board constant to leave alone.
      repeat from step 2 -- the exact drive level a clean calibration
      converges at is somewhat radio-dependent.
 
-(Screenshot needed: Two Tone active with Correcting showing green/true)
 ![PureSignal correcting](images/08-puresignal-correcting.png)

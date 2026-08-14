@@ -4,7 +4,6 @@
 
 Open **Settings...** from the main window, then the **RX** tab.
 
-(Screenshot needed: the RX settings tab)
 ![RX settings tab](images/04-rx-tab.png)
 
 ## Sample rate
