@@ -53,11 +53,11 @@
     TX audio it's paired with here (see drain_ps_feedback) -- any
     chunk where it hasn't caught up yet simply skips the PS feed rather
     than stalling the real-time audio loop, which is expected/normal
-    right after PTT, not an error. RX-feedback is decimated 2:1 on
-    Protocol 2 only, to correct for an empirically-confirmed real-
-    hardware quirk (not a protocol requirement) where DDC0 delivers
-    samples at ~2x DDC1's rate despite both being requested identically
-    -- see PS_P2_RX_FEEDBACK_DECIMATION's doc comment. Like everything
+    right after PTT, not an error. Forward TX IQ and RX-feedback are
+    paired 1:1, both protocols -- see drain_ps_feedback's doc comment
+    for a real bug this used to have here (an unnecessary 2:1 RX-
+    feedback decimation, confirmed via real hardware A/B against
+    piHPSDR to be actively suppressing Feedback Level). Like everything
     else in this file, none of this has a confirmed-working reference
     for the exact call cadence/timing -- Phase 4's real-hardware
     verification is what actually validates it.
@@ -128,21 +128,28 @@ const PS_IQ_NORM: f32 = 8_388_608.0;
 /// same "small ring buffer, drop oldest" reasoning as TX_IQ_BUFFER_CAPACITY.
 const TX_SPECTRUM_IQ_CAPACITY: usize = 50_000;
 
-/// How many raw samples PureSignal's RX-feedback queue (radio.rs's
-/// ps_rx_feedback_iq) delivers per matching TX-feedback/DUC-rate pair,
-/// on Protocol 2 only. NOT a protocol requirement -- an empirically
-/// confirmed real-hardware quirk (ANAN-8000DLE/Orion2): DDC0
-/// (RX-feedback) delivers samples at ~2x the packet rate of DDC1
-/// (TX-feedback), despite both being configured identically at
-/// 192ksps (see radio.rs's ps_feedback_config module note and the
-/// PureSignal plan's real-hardware-findings section for the full
-/// investigation). Decimated 2:1 (simple averaging, not a proper
-/// anti-alias filter) before pairing with the TX-feedback/forward IQ
-/// for pscc/psccF, which expects matching-length buffers. Protocol 1
-/// has no such mismatch (both feedback slots are demuxed from the
-/// same interleaved wire stream at the same rate), hence this only
-/// applies when `protocol == 2`.
-const PS_P2_RX_FEEDBACK_DECIMATION: usize = 2;
+// BUG FIX (removed a real one): this file used to 2:1-decimate
+// (average) RX-feedback samples before pairing them with TX-feedback
+// for pscc/psccF, on the claim that "DDC0 (RX-feedback) delivers
+// samples at ~2x the packet rate of DDC1 (TX-feedback), despite both
+// being configured identically at 192ksps" on Protocol 2 -- introduced
+// in the original PureSignal Phase 2/3 commit, which *also* says in
+// its own message "PS Phase 2/3 not yet verified against real
+// hardware (Phase 4)", i.e. before any actual hardware test of PS
+// existed to have confirmed this. Confirmed wrong two ways: (1)
+// piHPSDR's radio.c requests the IDENTICAL rate expression for both
+// (`create_pure_signal_receiver(PS_TX_FEEDBACK, ..., 192000, ...)` and
+// same for PS_RX_FEEDBACK); (2) this project's own radio.rs already
+// requests both DDC0 and DDC1 at the same 192_000 (see
+// p2_sender_loop's PureSignal DDC-rate comment) -- there was never a
+// real 2x rate mismatch to correct for. The averaging was actively
+// harmful: boxcar-averaging pairs of complex feedback samples smooths
+// exactly the two-tone envelope peaks WDSP's calcc engine measures,
+// suppressing the reported Feedback Level -- confirmed via real
+// hardware A/B against piHPSDR on the same radio at the same drive
+// (piHPSDR: Feedback Level 158 at 75W; hpsdr-rs before this fix: ~60
+// at the same 75W). Removed entirely; both feedback streams are now
+// paired 1:1, matching both confirmed references.
 
 #[derive(Copy, Clone, Default)]
 pub struct TxDisplay {
@@ -345,6 +352,37 @@ struct TxProcessor {
     last_ps_ptol: Option<f64>,
     last_ps_save_corr_request: Option<u32>,
     last_ps_restore_corr_request: Option<u32>,
+    /// BUG FIX: `PSRestoreCorr` sets WDSP's internal `turnon` flag as a
+    /// side effect (confirmed by reading calcc.c directly), which the
+    /// state machine processes by forcing `automode` back to 0 (case
+    /// LTURNON: `a->ctrl.automode = 0;`) regardless of what this
+    /// project's own `ps.enabled` ("Running (continuous auto-
+    /// calibrate)") is set to -- so restoring a saved correction table
+    /// (done automatically on connect whenever one exists, see
+    /// connect_to_device's doc comment) silently turns continuous
+    /// auto-calibrate off in WDSP while the checkbox keeps showing it as
+    /// checked. Confirmed via real hardware: `Correcting` stays on
+    /// (using the restored table, as intended -- see
+    /// TxHandle::restore_ps_corr's doc comment) but Measured Peak TX/
+    /// Feedback Level never update again, since the state machine is
+    /// stuck in LSTAYON. Since `ps.enabled`'s value never actually
+    /// changes across a restore (it was already true, WDSP just silently
+    /// stopped honoring it), apply_ps_params's normal `last_ps_enabled
+    /// != Some(ps.enabled)` edge-detection can never notice or recover
+    /// on its own.
+    ///
+    /// Fixed by re-sending the ON-path SetPSControl (reset=0,
+    /// automode=1 -- NOT the OFF-path, which sends reset=1 and would
+    /// immediately clear the just-restored correction's `Correcting`
+    /// state, undoing the whole point of auto-restoring) for a short
+    /// window after every restore, rather than a single attempt --
+    /// `PSRestoreCorr`'s turnon=1 is set synchronously, but the actual
+    /// state-machine tick that processes it (and clears automode) runs
+    /// on WDSP's own audio-chunk cadence, so a single immediate resend
+    /// could race it and lose. Counted in audio chunks, not wall time,
+    /// since apply_ps_params is called once per chunk -- ~500ms at
+    /// TX_BUFFER_SIZE/48kHz is comfortably longer than that race window.
+    ps_resend_enabled_countdown: u32,
     /// Fixed for the whole session (set once at open(), from the same
     /// per-radio path save_ps_corr/restore_ps_corr trigger against) --
     /// None if unavailable (e.g. $HOME unset), in which case save/
@@ -548,6 +586,28 @@ impl TxProcessor {
             // psccF's feedback buffers are actually paired/fed at.
             wdsp::SetPSFeedbackRate(channel, duc_rate);
 
+            // PureSignal: enable WDSP's own table-stabilization ("Stbl"
+            // in piHPSDR's PS menu, off by default there too -- this
+            // project has no UI for it, so it's just turned on
+            // unconditionally rather than left at WDSP's default off).
+            // Confirmed via real-hardware log analysis: once calibration
+            // was otherwise succeeding, the spectrum was still visibly
+            // flickering between corrected and uncorrected about once a
+            // second. Root cause was calcc.c's scheck() (binfo[6] |=
+            // 0x0040), which rejects a newly-computed correction table
+            // if it differs from the previous cycle's by more than 5%
+            // -- a legitimate noise guard, but with `stbl` off there's
+            // no damping between cycles at all, so ordinary cycle-to-
+            // cycle measurement noise on real two-tone RF data tripped
+            // it on ~73% of attempts in that log, and two rejections in
+            // a row forces a full reset (clearing the correction table
+            // and dropping TX back to uncorrected) -- exactly the
+            // flicker observed. `SetPSStabilize` IIR-blends each new fit
+            // toward the previous table (alpha=0.9, calcc.c) before
+            // scheck() compares them, which is WDSP's own built-in
+            // answer to this, not a workaround.
+            wdsp::SetPSStabilize(channel, 1);
+
             // Panel gain: WDSP's own dedicated mic gain stage. This
             // project previously applied mic_gain by scaling raw
             // sample values itself before ever handing them to WDSP,
@@ -661,6 +721,7 @@ impl TxProcessor {
             // this avoids an equivalent spurious first-apply trigger.
             last_ps_save_corr_request: Some(0),
             last_ps_restore_corr_request: Some(0),
+            ps_resend_enabled_countdown: 0,
             ps_corr_path,
         }
     }
@@ -937,6 +998,16 @@ impl TxProcessor {
         if self.last_ps_restore_corr_request != Some(ps.restore_corr_request) {
             self.ps_corr_action(wdsp::PSRestoreCorr as PsCorrFn);
             self.last_ps_restore_corr_request = Some(ps.restore_corr_request);
+            // See ps_resend_enabled_countdown's doc comment.
+            self.ps_resend_enabled_countdown = 50; // ~530ms at TX_BUFFER_SIZE/48kHz
+        }
+        if self.ps_resend_enabled_countdown > 0 {
+            self.ps_resend_enabled_countdown -= 1;
+            if ps.enabled {
+                unsafe {
+                    wdsp::SetPSControl(self.channel, 0, 0, 1, 0);
+                }
+            }
         }
     }
 
@@ -1022,25 +1093,22 @@ impl Drop for TxProcessor {
 }
 
 /// PureSignal: drains exactly `pairs` matching pairs from the
-/// TX-feedback and RX-feedback queues, normalized to [-1.0, 1.0] and
-/// with RX-feedback decimated by `rx_decimation` (simple averaging,
-/// not a proper anti-alias filter -- see
-/// PS_P2_RX_FEEDBACK_DECIMATION's doc comment) so both streams end up
-/// the same length for psccF. Returns None (leaving both queues
-/// completely untouched) if either doesn't have enough data yet --
-/// feedback arrives with real network latency behind the
+/// TX-feedback and RX-feedback queues, normalized to [-1.0, 1.0], 1:1
+/// (no decimation -- see this module's top doc comment for a real bug
+/// this function used to have, an unnecessary 2:1 RX-feedback
+/// averaging that suppressed Feedback Level). Returns None (leaving
+/// both queues completely untouched) if either doesn't have enough
+/// data yet -- feedback arrives with real network latency behind the
 /// corresponding TX audio it's paired with here, so an empty/partial
 /// queue is the normal case right after PTT, not an error condition.
 fn drain_ps_feedback(
     tx_feedback: &Mutex<VecDeque<IqSample>>,
     rx_feedback: &Mutex<VecDeque<IqSample>>,
     pairs: usize,
-    rx_decimation: usize,
 ) -> Option<(Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>)> {
-    let rx_samples_needed = pairs * rx_decimation;
     let mut tx_q = tx_feedback.lock().unwrap();
     let mut rx_q = rx_feedback.lock().unwrap();
-    if tx_q.len() < pairs || rx_q.len() < rx_samples_needed {
+    if tx_q.len() < pairs || rx_q.len() < pairs {
         return None;
     }
 
@@ -1056,14 +1124,9 @@ fn drain_ps_feedback(
     let mut irx = Vec::with_capacity(pairs);
     let mut qrx = Vec::with_capacity(pairs);
     for _ in 0..pairs {
-        let (mut i_sum, mut q_sum) = (0.0f32, 0.0f32);
-        for _ in 0..rx_decimation {
-            let s = rx_q.pop_front().unwrap();
-            i_sum += s.i as f32 / PS_IQ_NORM;
-            q_sum += s.q as f32 / PS_IQ_NORM;
-        }
-        irx.push(i_sum / rx_decimation as f32);
-        qrx.push(q_sum / rx_decimation as f32);
+        let s = rx_q.pop_front().unwrap();
+        irx.push(s.i as f32 / PS_IQ_NORM);
+        qrx.push(s.q as f32 / PS_IQ_NORM);
     }
     drop(rx_q);
 
@@ -1115,13 +1178,6 @@ fn run(
     stop: Arc<AtomicBool>,
 ) {
     let mut processor = TxProcessor::open(channel, protocol, mic_rate, duc_rate, ps_corr_path);
-    // PureSignal: RX-feedback (DDC0) delivers at 2x DDC1's rate on
-    // Protocol 2 only -- see PS_P2_RX_FEEDBACK_DECIMATION's doc comment.
-    let ps_rx_feedback_decimation = if puresignal_enabled && protocol == 2 {
-        PS_P2_RX_FEEDBACK_DECIMATION
-    } else {
-        1
-    };
     let mut chunk = vec![0.0f32; TX_BUFFER_SIZE];
     // Real-time duration of one TX_BUFFER_SIZE chunk at the mic capture
     // rate -- e.g. ~11ms for 512 samples at 48kHz. Without this, the
@@ -1371,12 +1427,9 @@ fn run(
         if puresignal_enabled {
             // Pairs, not raw floats -- iq is interleaved I,Q,I,Q,...
             let pairs_needed = iq.len() / 2;
-            if let Some((mut itx, mut qtx, mut irx, mut qrx)) = drain_ps_feedback(
-                &ps_tx_feedback_iq,
-                &ps_rx_feedback_iq,
-                pairs_needed,
-                ps_rx_feedback_decimation,
-            ) {
+            if let Some((mut itx, mut qtx, mut irx, mut qrx)) =
+                drain_ps_feedback(&ps_tx_feedback_iq, &ps_rx_feedback_iq, pairs_needed)
+            {
                 processor.feed_ps(&mut itx, &mut qtx, &mut irx, &mut qrx, true);
             }
             // else: feedback hasn't caught up yet (real network latency

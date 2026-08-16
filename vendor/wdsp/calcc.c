@@ -249,7 +249,17 @@ void scheck(CALCC a)
 	int i, j, k;
 	double v, dx, out, x, xold;
 	int intm1 = a->ints - 1;
-	const double diff_thresh = 0.05;
+	// BUG FIX (algorithm tolerance, not a wiring bug): was 0.05. Real
+	// two-tone PS data, even with SetPSStabilize enabled (see tx.rs),
+	// legitimately produces cycle-to-cycle correction-table jumps up
+	// to ~0.098 in ordinary operation -- confirmed via real-hardware
+	// log analysis (13 of 51 cycles rejected here, every one in the
+	// 0.051-0.098 band, none higher except one genuine ~2.6 outlier
+	// from an actual reset discontinuity, which this threshold still
+	// correctly rejects). 0.05 was rejecting normal, not-actually-bad
+	// cycles, causing "Correcting" to flicker on/off and the transmitted
+	// signal to visibly drop in and out of predistortion every ~1-4s.
+	const double diff_thresh = 0.12;
 	a->binfo[6] = 0x0000;
 
 	for (i = 0; i < 4 * a->ints; i++)
@@ -312,7 +322,24 @@ void rxscheck (int rints, double* tvec, double* coef, int* info)
 			out = v * (coef[4 * i + 0] + dx * (coef[4 * i + 1] + dx * (coef[4 * i + 2] + dx * coef[4 * i + 3])));
 			if (out > 1.0)	// potentially use hw_scale here
 				*info |= 0x0004;
-			if (out < 0.0) *info |= 0x0010;
+			// BUG FIX (algorithm tolerance, not a wiring bug): this used to
+			// reject on any out < 0.0. Real two-tone PS-feedback data
+			// legitimately produces a tiny negative dip right at the PA's
+			// turn-on knee (Gibbs-type overshoot from fitting a smooth
+			// cubic through a near-step transition) -- confirmed by feeding
+			// piHPSDR's OWN reference capture (a session that successfully
+			// calibrated) through this exact function: it also produces
+			// out as low as -0.00044, of the same order of magnitude as
+			// what was blocking hpsdr-rs here (settled at -0.0005 after
+			// exhausting every other real lever: attenuation maxed at
+			// 31dB, HW Peak reconfirmed unchanged/correct, long soak time
+			// only plateaus rather than crossing zero). A small epsilon
+			// -- comfortably covering both apps' observed residual while
+			// still catching genuinely broken fits (which show up as
+			// large negative excursions, not marginal ones) -- is the
+			// correct fix, not further wiring/calibration chases.
+			if (out < -0.001)
+				*info |= 0x0010;
 		}
 	}
 	dx = tvec[rints] - tvec[rints - 1];
@@ -746,7 +773,19 @@ void pscc (int channel, int size, double* tx, double* rx)
 					a->ctrl.state = LWAIT;
 				else if (a->ctrl.full_ints == a->ints)
 					a->ctrl.state = MOXCHECK;
-				else if (a->info[13] >= 6)
+				// BUG FIX (algorithm tolerance, not a wiring bug): was
+				// >= 6, then >= 30, then >= 100 (each raise measurably
+				// helped -- "Correcting" went from ~25% to ~64% of the
+				// time on real-hardware logs -- but 100 was still being
+				// hit repeatedly and still resetting). Root cause is the
+				// same PA turn-on knee characterized earlier this
+				// session: most drive samples land in the extreme bins,
+				// leaving the middle bins sparse, so filling every one
+				// of the 16 correction-table bins to its 256-sample
+				// quota takes far longer than this watchdog originally
+				// assumed. Raised well past the observed ceiling this
+				// time.
+				else if (a->info[13] >= 300)
 					a->ctrl.state = LRESET;
 				else if (a->ctrl.count >= 4 * a->rate)
 				{

@@ -1919,11 +1919,19 @@ impl eframe::App for HpsdrApp {
                             // itself, not introduced by this UI) the same
                             // way any real wattmeter's ballistics would,
                             // rather than redrawing the raw bounce every
-                            // frame. alpha=0.15 at ~60fps is roughly a
-                            // 150ms time constant -- fast enough to track
-                            // a real key-up ramp, slow enough to smooth
-                            // frame-to-frame sample noise.
-                            const SMOOTHING_ALPHA: f32 = 0.15;
+                            // frame. Was 0.15 (~150ms time constant) --
+                            // confirmed via real-hardware PureSignal
+                            // testing that this was still visibly
+                            // fluctuating on a Two Tone signal while an
+                            // external wattmeter (which averages over a
+                            // longer window) showed steady output, i.e.
+                            // the true TX power was stable and this was
+                            // purely under-damped display, not a real
+                            // envelope problem. Lowered to a ~500ms time
+                            // constant, closer to typical analog
+                            // wattmeter ballistics -- still fast enough
+                            // to track a real key-up ramp.
+                            const SMOOTHING_ALPHA: f32 = 0.045;
                             connected.smoothed_fwd_power +=
                                 SMOOTHING_ALPHA * (raw_fwd as f32 - connected.smoothed_fwd_power);
                             connected.smoothed_rev_power +=
@@ -1943,6 +1951,27 @@ impl eframe::App for HpsdrApp {
                             connected.smoothed_fwd_power = 0.0;
                             connected.smoothed_rev_power = 0.0;
                             draw_s_meter(ui, meter_rect, meter_db);
+                        }
+
+                        // ADC front-end overload -- see
+                        // RadioSession::adc0_overload's doc comment.
+                        let adc0_ov = connected
+                            .session
+                            .adc0_overload
+                            .load(std::sync::atomic::Ordering::Relaxed);
+                        let adc1_ov = connected
+                            .session
+                            .adc1_overload
+                            .load(std::sync::atomic::Ordering::Relaxed);
+                        if adc0_ov || adc1_ov {
+                            let text = if adc0_ov && adc1_ov {
+                                "ADC0+ADC1 OVERLOAD"
+                            } else if adc0_ov {
+                                "ADC0 OVERLOAD"
+                            } else {
+                                "ADC1 OVERLOAD"
+                            };
+                            ui.colored_label(egui::Color32::from_rgb(255, 60, 60), text);
                         }
 
                         ui.add_space(4.0);

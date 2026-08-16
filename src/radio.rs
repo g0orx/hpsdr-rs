@@ -411,6 +411,15 @@ pub struct RadioSession {
     /// queue between two independent consumers). Empty/unused
     /// whenever `puresignal_enabled` was false at connect time -- no
     /// behavior change for existing non-PS sessions.
+    ///
+    /// On Protocol 2, both this and `ps_tx_feedback_iq` are populated
+    /// TOGETHER from the same single DDC0 packet stream (see
+    /// p2_parse_ps_feedback_packet's doc comment) -- DDC1 is never
+    /// independently enabled, its samples arrive interleaved within
+    /// DDC0's own packets instead, hardware-synchronized. This is what
+    /// makes tx.rs's drain_ps_feedback's simple positional 1:1 pairing
+    /// correct: both queues fill in lockstep from one source, not from
+    /// two independently-timed streams.
     pub ps_rx_feedback_iq: Arc<Mutex<VecDeque<IqSample>>>,
     pub ps_tx_feedback_iq: Arc<Mutex<VecDeque<IqSample>>>,
     /// PTT/MOX state. Read by both protocols' sender loops (to decide
@@ -567,6 +576,22 @@ pub struct RadioSession {
     /// bytes 22-23 of the High-Priority status packet. Needed together
     /// with forward power to compute SWR.
     pub tx_reverse_power: Arc<AtomicU32>,
+    /// ADC0/ADC1 front-end overload flags -- set when the radio's own
+    /// status packet reports the front end clipping (P1: address 0/4's
+    /// C1/C2 bit 0, confirmed against piHPSDR's old_protocol.c; P2:
+    /// byte 5 bits 0/1 of the incoming High-Priority status packet,
+    /// confirmed against piHPSDR's new_protocol.c -- `adc[0].overload
+    /// |= buffer[5] & 0x01;`/`adc[1].overload |= (buffer[5] & 0x02) >>
+    /// 1;`). Added specifically because PureSignal RX-feedback shares
+    /// ADC0 with the main receiver: real-hardware testing found
+    /// piHPSDR showing an explicit "ADC0 Overload" warning below 24dB
+    /// of Feedback Attenuation on the same radio/antenna hpsdr-rs was
+    /// being tested on, with no equivalent visibility here at all --
+    /// clipped/overloaded samples would plausibly explain much of the
+    /// marginal PS calibration behavior chased this session, and are
+    /// generally useful to surface for ordinary RX too.
+    pub adc0_overload: Arc<AtomicBool>,
+    pub adc1_overload: Arc<AtomicBool>,
     stop_flag: Arc<AtomicBool>,
     sender_thread: Option<JoinHandle<()>>,
     receiver_thread: Option<JoinHandle<()>>,
@@ -665,11 +690,13 @@ impl RadioSession {
         let diversity_gain_db = Arc::new(AtomicU32::new(settings.diversity_gain_db.to_bits()));
         let diversity_phase_deg = Arc::new(AtomicU32::new(settings.diversity_phase_deg.to_bits()));
         let diversity_main_raw_iq = Arc::new(Mutex::new(VecDeque::with_capacity(IQ_BUFFER_CAPACITY)));
+        let adc0_overload = Arc::new(AtomicBool::new(false));
+        let adc1_overload = Arc::new(AtomicBool::new(false));
         let mut result = match device.protocol {
             1 => start_protocol1(
                 device, settings, frequency_hz, sample_rate, adc, antenna, rx_attenuation,
                 ps_tx_attenuation, mox, tx_iq, tci_tx_audio, tci_tx_gain, tx_power_watts, pa_gain_db,
-                tx_forward_power, tx_reverse_power, ps_rx_feedback_iq, ps_tx_feedback_iq,
+                tx_forward_power, tx_reverse_power, adc0_overload, adc1_overload, ps_rx_feedback_iq, ps_tx_feedback_iq,
                 rx_audio_to_radio, send_rx_audio_to_radio, radio_mic_audio, tx_audio_source,
                 tci_wants_mic, mic_ptt_enabled, mic_bias_enabled, mic_ptt_on_tip,
                 diversity_enabled, diversity_gain_db, diversity_phase_deg, diversity_main_raw_iq,
@@ -677,7 +704,7 @@ impl RadioSession {
             2 => start_protocol2(
                 device, settings, frequency_hz, sample_rate, adc, antenna, rx_attenuation,
                 ps_tx_attenuation, mox, tx_iq, tci_tx_audio, tci_tx_gain, tx_power_watts, pa_gain_db,
-                tx_forward_power, tx_reverse_power, ps_rx_feedback_iq, ps_tx_feedback_iq,
+                tx_forward_power, tx_reverse_power, adc0_overload, adc1_overload, ps_rx_feedback_iq, ps_tx_feedback_iq,
                 rx_audio_to_radio, send_rx_audio_to_radio, radio_mic_audio, tx_audio_source,
                 tci_wants_mic, mic_ptt_enabled, mic_bias_enabled, mic_ptt_on_tip,
                 diversity_enabled, diversity_gain_db, diversity_phase_deg, diversity_main_raw_iq,
@@ -882,6 +909,8 @@ fn start_protocol1(
     pa_gain_db: Arc<AtomicU32>,
     tx_forward_power: Arc<AtomicU32>,
     tx_reverse_power: Arc<AtomicU32>,
+    adc0_overload: Arc<AtomicBool>,
+    adc1_overload: Arc<AtomicBool>,
     ps_rx_feedback_iq: Arc<Mutex<VecDeque<IqSample>>>,
     ps_tx_feedback_iq: Arc<Mutex<VecDeque<IqSample>>>,
     rx_audio_to_radio: Arc<Mutex<VecDeque<f32>>>,
@@ -1086,6 +1115,8 @@ fn start_protocol1(
     let receiver_active_receiver_count = Arc::clone(&active_receiver_count);
     let receiver_tx_forward_power = Arc::clone(&tx_forward_power);
     let receiver_tx_reverse_power = Arc::clone(&tx_reverse_power);
+    let receiver_adc0_overload = Arc::clone(&adc0_overload);
+    let receiver_adc1_overload = Arc::clone(&adc1_overload);
     let receiver_ps_rx_feedback_iq = Arc::clone(&ps_rx_feedback_iq);
     let receiver_ps_tx_feedback_iq = Arc::clone(&ps_tx_feedback_iq);
     let receiver_radio_mic_audio = Arc::clone(&radio_mic_audio);
@@ -1100,6 +1131,8 @@ fn start_protocol1(
             receiver_sample_rate,
             receiver_tx_forward_power,
             receiver_tx_reverse_power,
+            receiver_adc0_overload,
+            receiver_adc1_overload,
             ps_wire_total,
             ps_feedback_indices,
             receiver_ps_rx_feedback_iq,
@@ -1145,6 +1178,8 @@ fn start_protocol1(
         pa_gain_db,
         tx_forward_power,
         tx_reverse_power,
+        adc0_overload,
+        adc1_overload,
         stop_flag,
         sender_thread: Some(sender_thread),
         receiver_thread: Some(receiver_thread),
@@ -2310,6 +2345,8 @@ fn receiver_loop(
     sample_rate: Arc<AtomicU32>,
     tx_forward_power: Arc<AtomicU32>,
     tx_reverse_power: Arc<AtomicU32>,
+    adc0_overload: Arc<AtomicBool>,
+    adc1_overload: Arc<AtomicBool>,
     // PureSignal -- see start_protocol1's ps_wire_total/ps_feedback_indices
     // doc comments. All None/unused when PS wasn't requested.
     ps_wire_total: Option<u8>,
@@ -2364,6 +2401,8 @@ fn receiver_loop(
                         capacity,
                         &tx_forward_power,
                         &tx_reverse_power,
+                        &adc0_overload,
+                        &adc1_overload,
                         ps_feedback_indices,
                         &ps_rx_feedback_iq,
                         &ps_tx_feedback_iq,
@@ -2435,6 +2474,12 @@ fn parse_iq_stream(
     capacity: usize,
     tx_forward_power: &Arc<AtomicU32>,
     tx_reverse_power: &Arc<AtomicU32>,
+    // ADC front-end overload flags -- see RadioSession::adc0_overload's
+    // doc comment. P1: confirmed against piHPSDR's old_protocol.c,
+    // address 0's C1 bit 0 (ADC0) and address 4's C1/C2 bit 0
+    // (ADC0/ADC1 respectively).
+    adc0_overload: &Arc<AtomicBool>,
+    adc1_overload: &Arc<AtomicBool>,
     // PureSignal: `ps_feedback_indices` is `Some((rx_feedback_idx,
     // tx_feedback_idx))` when active -- see ps_feedback_config's doc
     // comment. Those two wire indices are diverted into the dedicated
@@ -2522,6 +2567,11 @@ fn parse_iq_stream(
         } else if address == 2 {
             let reverse = u16::from_be_bytes([frame[4], frame[5]]);
             tx_reverse_power.store(reverse as u32, Ordering::Relaxed);
+        } else if address == 0 {
+            adc0_overload.store(frame[4] & 0x01 != 0, Ordering::Relaxed);
+        } else if address == 4 {
+            adc0_overload.store(frame[4] & 0x01 != 0, Ordering::Relaxed);
+            adc1_overload.store(frame[5] & 0x01 != 0, Ordering::Relaxed);
         }
 
         let mut b = 8;
@@ -2718,6 +2768,8 @@ fn start_protocol2(
     pa_gain_db: Arc<AtomicU32>,
     tx_forward_power: Arc<AtomicU32>,
     tx_reverse_power: Arc<AtomicU32>,
+    adc0_overload: Arc<AtomicBool>,
+    adc1_overload: Arc<AtomicBool>,
     ps_rx_feedback_iq: Arc<Mutex<VecDeque<IqSample>>>,
     ps_tx_feedback_iq: Arc<Mutex<VecDeque<IqSample>>>,
     rx_audio_to_radio: Arc<Mutex<VecDeque<f32>>>,
@@ -2898,6 +2950,8 @@ fn start_protocol2(
     let receiver_hp_request = Arc::clone(&hp_request);
     let receiver_tx_forward_power = Arc::clone(&tx_forward_power);
     let receiver_tx_reverse_power = Arc::clone(&tx_reverse_power);
+    let receiver_adc0_overload = Arc::clone(&adc0_overload);
+    let receiver_adc1_overload = Arc::clone(&adc1_overload);
     let receiver_ps_rx_feedback_iq = Arc::clone(&ps_rx_feedback_iq);
     let receiver_ps_tx_feedback_iq = Arc::clone(&ps_tx_feedback_iq);
     let receiver_radio_mic_audio = Arc::clone(&radio_mic_audio);
@@ -2912,6 +2966,8 @@ fn start_protocol2(
             receiver_hp_request,
             receiver_tx_forward_power,
             receiver_tx_reverse_power,
+            receiver_adc0_overload,
+            receiver_adc1_overload,
             puresignal_enabled,
             receiver_ps_rx_feedback_iq,
             receiver_ps_tx_feedback_iq,
@@ -2956,6 +3012,8 @@ fn start_protocol2(
         pa_gain_db,
         tx_forward_power,
         tx_reverse_power,
+        adc0_overload,
+        adc1_overload,
         stop_flag,
         sender_thread: Some(sender_thread),
         receiver_thread: Some(receiver_thread),
@@ -3035,13 +3093,29 @@ fn p2_ddc_specific_packet(
     let n = sample_rates_hz.len().min(8);
     p[7] = match ps_mox_gate {
         Some(mox_on) => {
-            // Bits 0-1 (DDC0/DDC1, the reserved feedback pair) gated on
-            // MOX; bits 2.. (real receivers) always enabled, same as
-            // the non-PS formula below just shifted up by the 2
-            // reserved slots.
+            // BUG FIX: bit 0 (DDC0) only, gated on MOX; bits 2.. (real
+            // receivers) always enabled, same as the non-PS formula
+            // below just shifted up by the 2 reserved slots. Previously
+            // set BOTH bits 0 AND 1 (0x03) -- confirmed wrong against
+            // piHPSDR's new_protocol.c, which sets ONLY
+            // `receive_specific_buffer[7] |= 1` (bit 0) for every
+            // PureSignal-while-transmitting case, relying entirely on
+            // the "sync DDC1 to DDC0" byte below to have the radio's
+            // firmware embed DDC1's (ADC1/TX-feedback loopback) samples
+            // into DDC0's own packet stream, hardware-synchronized --
+            // DDC1 is never independently enabled (`rxcase[1]` stays
+            // `RXACTION_SKIP` in every PS case in
+            // update_action_table()). Explicitly enabling DDC1's own
+            // bit here, on top of the sync byte, produced two
+            // independently-timed streams instead of one truly
+            // hardware-synced one -- confirmed via real hardware A/B
+            // against piHPSDR on the same radio/antenna port/drive
+            // level (piHPSDR: Feedback Level 158 at 75W; hpsdr-rs stuck
+            // at 37-63 with this bug). See p2_parse_ps_feedback_packet's
+            // doc comment for the matching receive-side fix.
             let real_n = n.saturating_sub(2).min(6);
             let real_bits: u8 = if real_n > 0 { (((1u16 << real_n) - 1) << 2) as u8 } else { 0 };
-            let fb_bits: u8 = if mox_on { 0x03 } else { 0x00 };
+            let fb_bits: u8 = if mox_on { 0x01 } else { 0x00 };
             real_bits | fb_bits
         }
         None => {
@@ -3064,7 +3138,27 @@ fn p2_ddc_specific_packet(
         p[base] = adc as u8;
         let rate_ksps = (rate / 1000) as u16;
         p[base + 1..base + 3].copy_from_slice(&rate_ksps.to_be_bytes());
-        p[base + 5] = 24; // sample size, bits
+        // BUG FIX: DDC1's "sample size" byte goes at base+3, NOT base+5
+        // like every other DDC's entry (including DDC0's, right next to
+        // it), when it's the PS-reserved TX-feedback slot (i==1 while
+        // ps_mox_gate is active). Confirmed via a real packet capture
+        // A/B against piHPSDR on the same radio: piHPSDR's own
+        // new_protocol.c writes `receive_specific_buffer[26]=24` for
+        // this entry (base+3, base=23), leaving base+5 (byte 28) at 0 --
+        // NOT the `[28]=24` the general per-DDC pattern (and every other
+        // DDC's own entry, confirmed byte-identical in both captures)
+        // would suggest. Whether that's an intentional protocol quirk
+        // for the synced/virtual DDC1 slot or a piHPSDR-side oddity
+        // doesn't matter -- it's what the confirmed-working reference
+        // actually sends, byte-for-byte, and hpsdr-rs's own PS
+        // calibration reliably failed (WDSP's rxscheck rejecting every
+        // fit attempt) sending the "logically consistent" but different
+        // base+5 position instead.
+        if ps_mox_gate.is_some() && i == 1 {
+            p[base + 3] = 24;
+        } else {
+            p[base + 5] = 24; // sample size, bits
+        }
     }
 
     if ps_mox_gate.is_some() {
@@ -3086,6 +3180,8 @@ fn p2_tx_specific_packet(
     mic_ptt_enabled: bool,
     mic_bias_enabled: bool,
     mic_ptt_on_tip: bool,
+    mox_on: bool,
+    ps_tx_attenuation: u8,
 ) -> [u8; P2_TX_SPECIFIC_PACKET_SIZE] {
     let mut p = [0u8; P2_TX_SPECIFIC_PACKET_SIZE];
     p[0..4].copy_from_slice(&seq.to_be_bytes());
@@ -3132,6 +3228,26 @@ fn p2_tx_specific_packet(
         b50 |= 0x10;
     }
     p[50] = b50;
+
+    // BUG FIX: the ADC0/ADC1 step attenuators (bytes 59/58) were never
+    // written here at all, staying 0 -- meaning PureSignal's "Feedback
+    // Attenuation" setting (already correctly written into the High
+    // Priority packet's byte 1443, see p2_high_priority_packet) never
+    // actually reached the radio on modern firmware. Confirmed by
+    // diffing dl1ycf's more recent piHPSDR fork (~/github/dl1ycf/pihpsdr,
+    // src/new_protocol.c) against the original piHPSDR reference used
+    // earlier in this project: the newer fork's own comment states
+    // outright that the High Priority packet's 1442/1443 attenuator
+    // bytes have "no effect according to the latest protocol
+    // definition" and are only kept for old firmware -- bytes 58/59
+    // here are what current firmware actually uses. This was confirmed
+    // as the real gap via real-hardware evidence: raising Feedback
+    // Attenuation from 0 to 31dB produced zero measurable change in the
+    // RX-feedback envelope actually received (0.40271 vs 0.40270), i.e.
+    // the setting was never reaching the hardware at all.
+    p[59] = if mox_on { ps_tx_attenuation } else { 0 };
+    p[58] = if mox_on { 31 } else { 0 };
+
     p
 }
 
@@ -3575,6 +3691,8 @@ fn p2_sender_loop(
                 mic_ptt_enabled.load(Ordering::Relaxed),
                 mic_bias_enabled.load(Ordering::Relaxed),
                 mic_ptt_on_tip.load(Ordering::Relaxed),
+                mox_on,
+                ps_tx_atten,
             );
             let hp =
                 p2_high_priority_packet(
@@ -3644,11 +3762,15 @@ fn p2_receiver_loop(
     hp_request: Arc<AtomicBool>,
     tx_forward_power: Arc<AtomicU32>,
     tx_reverse_power: Arc<AtomicU32>,
+    adc0_overload: Arc<AtomicBool>,
+    adc1_overload: Arc<AtomicBool>,
     // PureSignal -- see p2_sender_loop's matching doc comment. When
-    // true, DDC0/DDC1's IQ (source ports P2_DDC0_IQ_PORT+0/+1) is
-    // diverted into the two feedback queues instead of `buffers`,
-    // which is sized to real receivers only and indexed 2 lower
-    // (DDC2 -> buffers[0], DDC3 -> buffers[1], ...).
+    // true, DDC0's IQ (source port P2_DDC0_IQ_PORT) is diverted into
+    // BOTH feedback queues at once (see p2_parse_ps_feedback_packet's
+    // doc comment -- DDC0 alone carries both feedback streams
+    // interleaved; DDC1 is never independently enabled) instead of
+    // `buffers`, which is sized to real receivers only and indexed 2
+    // lower (DDC2 -> buffers[0], DDC3 -> buffers[1], ...).
     puresignal_enabled: bool,
     ps_rx_feedback_iq: Arc<Mutex<VecDeque<IqSample>>>,
     ps_tx_feedback_iq: Arc<Mutex<VecDeque<IqSample>>>,
@@ -3687,9 +3809,18 @@ fn p2_receiver_loop(
                     if n == P2_PACKET_SIZE {
                         let capacity = iq_buffer_capacity_for_rate(sample_rate.load(Ordering::Relaxed));
                         if puresignal_enabled && ddc == 0 {
-                            p2_parse_ddc_iq_packet(&buf[..n], &ps_rx_feedback_iq, PS_FEEDBACK_BUFFER_CAPACITY);
-                        } else if puresignal_enabled && ddc == 1 {
-                            p2_parse_ddc_iq_packet(&buf[..n], &ps_tx_feedback_iq, PS_FEEDBACK_BUFFER_CAPACITY);
+                            // See p2_parse_ps_feedback_packet's doc comment --
+                            // DDC0 alone carries both feedback streams,
+                            // interleaved. DDC1 (ddc == 1) is never
+                            // independently enabled (see
+                            // p2_ddc_specific_packet's fb_bits fix), so no
+                            // separate branch for it here.
+                            p2_parse_ps_feedback_packet(
+                                &buf[..n],
+                                &ps_rx_feedback_iq,
+                                &ps_tx_feedback_iq,
+                                PS_FEEDBACK_BUFFER_CAPACITY,
+                            );
                         } else if diversity_enabled.load(Ordering::Relaxed) && ddc - ddc_reserved == 0 {
                             // Wire 0's raw ADC0 samples go to the
                             // combiner's input queue instead of
@@ -3700,6 +3831,10 @@ fn p2_receiver_loop(
                         } else {
                             p2_parse_ddc_iq_packet(&buf[..n], &buffers[ddc - ddc_reserved], capacity);
                         }
+                    } else if puresignal_enabled && ddc == 0 {
+                        // Packet arrived the wrong size (rare -- e.g. a
+                        // truncated/corrupt UDP datagram); nothing to
+                        // parse, drop it.
                     }
                 } else if port == P2_HP_STATUS_SOURCE_PORT {
                     // Confirmed by the user: the radio's own
@@ -3720,6 +3855,14 @@ fn p2_receiver_loop(
                         tx_forward_power.store(forward as u32, Ordering::Relaxed);
                         let reverse = u16::from_be_bytes([buf[22], buf[23]]);
                         tx_reverse_power.store(reverse as u32, Ordering::Relaxed);
+                    }
+                    // ADC0/ADC1 front-end overload -- see
+                    // RadioSession::adc0_overload's doc comment. Byte 5,
+                    // bits 0/1, confirmed against piHPSDR's
+                    // new_protocol.c.
+                    if n >= 6 {
+                        adc0_overload.store(buf[5] & 0x01 != 0, Ordering::Relaxed);
+                        adc1_overload.store(buf[5] & 0x02 != 0, Ordering::Relaxed);
                     }
                     hp_request.store(true, Ordering::Relaxed);
                 } else if port == P2_TX_SPECIFIC_PORT {
@@ -3762,6 +3905,50 @@ fn p2_parse_ddc_iq_packet(packet: &[u8], buffer: &Arc<Mutex<VecDeque<IqSample>>>
         let q = sign_extend_24(packet[b + 3], packet[b + 4], packet[b + 5]);
         b += 6;
         push_sample(buffer, IqSample { i, q }, capacity);
+    }
+}
+
+/// PureSignal (Protocol 2 only): DDC0's packets carry BOTH RX-feedback
+/// and TX-feedback (loopback) samples interleaved, hardware-
+/// synchronized -- see p2_ddc_specific_packet's fb_bits doc comment for
+/// the matching send-side fix (only DDC0's enable bit is set; DDC1's
+/// samples arrive embedded here instead of on its own port). Confirmed
+/// against piHPSDR's process_ps_iq_data: each step of the packet's own
+/// declared samples_per_frame contributes TWO back-to-back IQ pairs --
+/// first RX-feedback (this board's real ADC0), then TX-feedback (the
+/// virtual DUC-loopback ADC) -- not one, unlike every other DDC's
+/// packets (see p2_parse_ddc_iq_packet just above). Since both feedback
+/// streams come from the SAME packet, they're guaranteed sample-for-
+/// sample aligned -- exactly what makes tx.rs's drain_ps_feedback's
+/// simple positional 1:1 pairing correct.
+fn p2_parse_ps_feedback_packet(
+    packet: &[u8],
+    rx_feedback: &Arc<Mutex<VecDeque<IqSample>>>,
+    tx_feedback: &Arc<Mutex<VecDeque<IqSample>>>,
+    capacity: usize,
+) {
+    if packet.len() < 16 {
+        return;
+    }
+    let samples_per_frame = u16::from_be_bytes([packet[14], packet[15]]) as usize;
+    let mut b = 16;
+    let mut i = 0;
+    while i + 1 < samples_per_frame {
+        if b + 12 > packet.len() {
+            break;
+        }
+        let rx = IqSample {
+            i: sign_extend_24(packet[b], packet[b + 1], packet[b + 2]),
+            q: sign_extend_24(packet[b + 3], packet[b + 4], packet[b + 5]),
+        };
+        let tx = IqSample {
+            i: sign_extend_24(packet[b + 6], packet[b + 7], packet[b + 8]),
+            q: sign_extend_24(packet[b + 9], packet[b + 10], packet[b + 11]),
+        };
+        b += 12;
+        i += 2;
+        push_sample(rx_feedback, rx, capacity);
+        push_sample(tx_feedback, tx, capacity);
     }
 }
 
