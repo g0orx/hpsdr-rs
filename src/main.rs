@@ -312,6 +312,9 @@ struct ConnectedState {
     /// enabled), distinct from `puresignal_enabled` above (which only
     /// gates the connect-time feedback-receiver wire request).
     ps_enabled: bool,
+    /// See tx::PsParams::oneshot's doc comment. Not persisted, same as
+    /// ps_enabled -- always starts false (continuous) each session.
+    ps_oneshot: bool,
     ps_hw_peak: f64,
     ps_mox_delay: f64,
     ps_loop_delay: f64,
@@ -775,6 +778,7 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                 mic_gain,
                 tci_tx_gain,
                 ps_enabled,
+                ps_oneshot: false,
                 ps_hw_peak,
                 ps_mox_delay,
                 ps_loop_delay,
@@ -3071,6 +3075,22 @@ impl eframe::App for HpsdrApp {
                                                 tx.set_ps_enabled(ps_enabled);
                                                 settings_changed = true;
                                             }
+
+                                            let mut ps_oneshot = connected.ps_oneshot;
+                                            if ui.checkbox(&mut ps_oneshot, "OneShot").changed() {
+                                                connected.ps_oneshot = ps_oneshot;
+                                                tx.set_ps_oneshot(ps_oneshot);
+                                                settings_changed = true;
+                                            }
+                                            ui.weak(
+                                                "Calibrate with Two Tone (envelope-rich) first, then \
+                                                 enable OneShot before running constant-envelope digital \
+                                                 modes (FT8 etc.) -- their TX envelope can't sweep the \
+                                                 full amplitude range a correction table needs to keep \
+                                                 relearning from, so Running above will never settle on \
+                                                 that traffic. OneShot just applies the last good table \
+                                                 instead of continuing to try.",
+                                            );
 
                                             if ui.button("Calibrate Now").clicked() {
                                                 tx.ps_calibrate();

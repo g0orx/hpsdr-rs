@@ -229,6 +229,25 @@ pub struct PsParams {
     /// needs re-asserting afterward if that's wanted, same as
     /// piHPSDR/Thetis's own restore-then-resume-automode pattern.
     pub restore_corr_request: u32,
+    /// piHPSDR's "OneShot" -- when true, the `enabled` edge (and every
+    /// resend of it -- see `TxProcessor::ps_resend_enabled_countdown`)
+    /// issues a single manual calibration (`SetPSControl(ch,0,1,0,0)`,
+    /// mancal=1/automode=0) instead of continuous auto-calibrate
+    /// (`SetPSControl(ch,0,0,1,0)`). Confirmed against piHPSDR's
+    /// tx_ps_resume: `if (tx->ps_oneshot) SetPSControl(id,0,1,0,0);
+    /// else SetPSControl(id,0,0,1,0);`. Needed for constant-envelope
+    /// digital modes (FT8/FT4 etc.): their TX envelope never sweeps
+    /// through the full amplitude range a correction table needs to
+    /// fill all its bins, so continuous auto-calibrate against that
+    /// audio can never complete a cycle and eventually forces a full
+    /// reset via calcc.c's own watchdogs, dropping predistortion
+    /// entirely (confirmed via real-hardware report: PS worked
+    /// correctly with Two Tone -- envelope-rich -- but showed no
+    /// correction/feedback at all transmitting FT8 via WSJT-X/rigctl).
+    /// The intended workflow (same as piHPSDR): calibrate with Two Tone
+    /// in continuous mode first, then enable OneShot before running
+    /// digital traffic so the already-good table just gets applied.
+    pub oneshot: bool,
 }
 
 impl Default for PsParams {
@@ -243,6 +262,7 @@ impl Default for PsParams {
             ptol: 0.8,
             save_corr_request: 0,
             restore_corr_request: 0,
+            oneshot: false, // matches piHPSDR's own default (unchecked)
         }
     }
 }
@@ -344,6 +364,10 @@ struct TxProcessor {
     last_ps_mox: Option<bool>,
     /// See apply_ps_params's doc comment.
     last_ps_enabled: Option<bool>,
+    /// See apply_ps_params's doc comment -- PsParams::oneshot's edge
+    /// (while already enabled) triggers a reset-then-resume cycle the
+    /// same way piHPSDR's ps_off_on does.
+    last_ps_oneshot: Option<bool>,
     last_ps_calibrate_request: Option<u32>,
     last_ps_hw_peak: Option<f64>,
     last_ps_mox_delay: Option<f64>,
@@ -699,6 +723,7 @@ impl TxProcessor {
             last_post_gen: None,
             last_ps_mox: None,
             last_ps_enabled: None,
+            last_ps_oneshot: None,
             // BUG FIX: was `None`, but PsParams::calibrate_request
             // starts at 0, not absent -- `None != Some(0)` is true, so
             // the very first apply_ps_params call spuriously fired a
@@ -932,8 +957,10 @@ impl TxProcessor {
     /// pattern as last_mode/last_gain elsewhere in this struct) so an
     /// unchanged control costs nothing beyond the comparison. `enabled`
     /// toggling maps to the confirmed Thetis/piHPSDR call patterns:
-    /// `SetPSControl(ch,0,0,1,0)` (continuous auto-calibrate) when
-    /// true, `SetPSControl(ch,1,0,0,0)` (reset/off) when false.
+    /// `SetPSControl(ch,0,1,0,0)` (single manual calibration -- see
+    /// PsParams::oneshot's doc comment) or `SetPSControl(ch,0,0,1,0)`
+    /// (continuous auto-calibrate) when true, depending on `oneshot`;
+    /// `SetPSControl(ch,1,0,0,0)` (reset/off) when false.
     /// `calibrate_request` is a monotonic counter rather than a plain
     /// bool specifically so a click is never missed/coalesced with
     /// another change in the same chunk -- any change in the counter
@@ -943,12 +970,33 @@ impl TxProcessor {
         if self.last_ps_enabled != Some(ps.enabled) {
             unsafe {
                 if ps.enabled {
-                    wdsp::SetPSControl(self.channel, 0, 0, 1, 0);
+                    if ps.oneshot {
+                        wdsp::SetPSControl(self.channel, 0, 1, 0, 0);
+                    } else {
+                        wdsp::SetPSControl(self.channel, 0, 0, 1, 0);
+                    }
                 } else {
                     wdsp::SetPSControl(self.channel, 1, 0, 0, 0);
                 }
             }
             self.last_ps_enabled = Some(ps.enabled);
+            self.last_ps_oneshot = Some(ps.oneshot);
+        } else if self.last_ps_oneshot != Some(ps.oneshot) {
+            // Mode switched while already enabled -- matches piHPSDR's
+            // ps_off_on (tx_ps_reset then tx_ps_resume): reset first so
+            // the state machine doesn't try to carry over
+            // mancal/automode state from the old mode, then resend the
+            // correct resume command via the same short-window resend
+            // mechanism restore_corr_request uses below (the state-
+            // machine tick that processes the reset runs on WDSP's own
+            // audio-chunk cadence, not synchronously with this call).
+            if ps.enabled {
+                unsafe {
+                    wdsp::SetPSControl(self.channel, 1, 0, 0, 0);
+                }
+                self.ps_resend_enabled_countdown = 50; // ~530ms at TX_BUFFER_SIZE/48kHz
+            }
+            self.last_ps_oneshot = Some(ps.oneshot);
         }
         if self.last_ps_calibrate_request != Some(ps.calibrate_request) {
             unsafe {
@@ -998,14 +1046,26 @@ impl TxProcessor {
         if self.last_ps_restore_corr_request != Some(ps.restore_corr_request) {
             self.ps_corr_action(wdsp::PSRestoreCorr as PsCorrFn);
             self.last_ps_restore_corr_request = Some(ps.restore_corr_request);
-            // See ps_resend_enabled_countdown's doc comment.
-            self.ps_resend_enabled_countdown = 50; // ~530ms at TX_BUFFER_SIZE/48kHz
+            // See ps_resend_enabled_countdown's doc comment -- only
+            // needed to re-assert continuous auto-calibrate. In OneShot
+            // mode, PSRestoreCorr's own LTURNON handling already leaves
+            // WDSP exactly where OneShot wants it (LSTAYON: apply the
+            // restored table, don't keep relearning) -- resending
+            // mancal=1 here would instead force a fresh, unwanted
+            // recalibration attempt right after every restore.
+            if !ps.oneshot {
+                self.ps_resend_enabled_countdown = 50; // ~530ms at TX_BUFFER_SIZE/48kHz
+            }
         }
         if self.ps_resend_enabled_countdown > 0 {
             self.ps_resend_enabled_countdown -= 1;
             if ps.enabled {
                 unsafe {
-                    wdsp::SetPSControl(self.channel, 0, 0, 1, 0);
+                    if ps.oneshot {
+                        wdsp::SetPSControl(self.channel, 0, 1, 0, 0);
+                    } else {
+                        wdsp::SetPSControl(self.channel, 0, 0, 1, 0);
+                    }
                 }
             }
         }
@@ -1663,6 +1723,10 @@ impl TxHandle {
     }
     pub fn set_ps_ptol(&self, ptol: f64) {
         self.ps_params.lock().unwrap().ptol = ptol.clamp(0.0, 1.0);
+    }
+    /// See PsParams::oneshot's doc comment.
+    pub fn set_ps_oneshot(&self, oneshot: bool) {
+        self.ps_params.lock().unwrap().oneshot = oneshot;
     }
 
     pub fn stop(&mut self) {
