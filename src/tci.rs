@@ -200,6 +200,19 @@ impl TciServer {
         let accept_tci_tx_audio = Arc::clone(&tci_tx_audio);
         let accept_tci_tx_gain = Arc::clone(&tci_tx_gain);
         let accept_tci_wants_mic = Arc::clone(&tci_wants_mic);
+        // Single-client enforcement -- see the module note on why: every
+        // connected client shares the SAME audio_iq queues (a single
+        // radio has one operator), so two clients connected at once
+        // would each drain(..) the other's samples out from under it,
+        // producing exactly the intermittent/bouncing audio a real
+        // report described (traced to a stale TCI connection -- e.g.
+        // from earlier testing, or one a client didn't cleanly close
+        // when reconfigured -- still alive and draining alongside a
+        // fresh one). Tracks the current client's own stop flag here;
+        // accepting a new connection flips the previous one first so
+        // its loop exits (within its ~20ms read-timeout tick) before
+        // the new client starts pulling from the same queues.
+        let current_client_superseded: Arc<Mutex<Option<Arc<AtomicBool>>>> = Arc::new(Mutex::new(None));
         let thread = thread::spawn(move || {
             while !accept_stop.load(Ordering::Relaxed) {
                 match listener.accept() {
@@ -215,11 +228,18 @@ impl TciServer {
                         let conn_mox = Arc::clone(&mox);
                         let conn_stop = Arc::clone(&accept_stop);
                         let conn_connected = Arc::clone(&accept_connected);
+                        let superseded = Arc::new(AtomicBool::new(false));
+                        {
+                            let mut current = current_client_superseded.lock().unwrap();
+                            if let Some(previous) = current.replace(Arc::clone(&superseded)) {
+                                previous.store(true, Ordering::Relaxed);
+                            }
+                        }
                         let handle = thread::spawn(move || {
                             conn_connected.fetch_add(1, Ordering::Relaxed);
                             handle_client(
                                 stream, freq, rate, params, audio_iq, tx_audio, tx_gain, wants_mic,
-                                conn_mox, conn_stop,
+                                conn_mox, conn_stop, superseded,
                             );
                             conn_connected.fetch_sub(1, Ordering::Relaxed);
                         });
@@ -307,6 +327,11 @@ fn handle_client(
     tci_wants_mic: Arc<AtomicBool>,
     mox: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
+    // Set when a NEWER client has connected -- see TciServer::start's
+    // single-client enforcement doc comment. Checked alongside `stop`
+    // (the whole-server shutdown flag) so this same loop exit path
+    // handles both.
+    superseded: Arc<AtomicBool>,
 ) {
     let _ = stream.set_nodelay(true);
 
@@ -325,6 +350,31 @@ fn handle_client(
     // below). Still just a read timeout, not a hard latency guarantee.
     if let Err(e) = ws.get_ref().set_read_timeout(Some(Duration::from_millis(20))) {
         eprintln!("tci: failed to set read timeout: {e}");
+    }
+
+    // BUG FIX: audio_out/iq_out are shared, continuously-filled taps
+    // (see TciServer::set_audio_iq's doc comment) that keep accumulating
+    // whether or not a client is connected to drain them -- with no
+    // client connected they just overflow and drop the oldest samples
+    // (confirmed via real-hardware log: ~48,000 samples/sec dropped
+    // while idle, harmless on its own). But whatever's sitting in them
+    // at THIS moment is up to their full ~300ms capacity of real audio
+    // that accumulated before this client existed to want it -- without
+    // this clear, the very first drain below delivers all of it in one
+    // oversized burst instead of a normal ~20ms chunk. Investigated
+    // while chasing a report of WSJT-X's RX audio level bouncing/
+    // failing to decode after connecting mid-session -- this burst
+    // turned out NOT to be the actual cause there (steady-state
+    // delivery was already clean either way, and the report was
+    // eventually traced to WSJT-X's own audio subsystem not resetting
+    // cleanly when its Soundcard setting is switched live, not
+    // anything on this side), but delivering ~300ms of audio as one
+    // oversized burst instead of a normal ~20ms chunk on every connect
+    // is still a real, worth-fixing bug in its own right.
+    {
+        let taps = audio_iq.lock().unwrap().clone();
+        taps.audio.lock().unwrap().clear();
+        taps.iq.lock().unwrap().clear();
     }
 
     // Best-effort initial state push -- see module-level note.
@@ -424,7 +474,7 @@ fn handle_client(
     let mut next_tx_chrono = Instant::now();
     let mut mox_was_active = false;
 
-    while !stop.load(Ordering::Relaxed) {
+    while !stop.load(Ordering::Relaxed) && !superseded.load(Ordering::Relaxed) {
         match ws.read() {
             Ok(Message::Text(text)) => {
                 for cmd in text.split(';') {
