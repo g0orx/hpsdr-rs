@@ -437,12 +437,23 @@ enum AppState {
 
 struct HpsdrApp {
     state: AppState,
+    // See the focus-transition check at the top of `ui()` for what this
+    // tracks and why. Starts `true` so the very first frame (window not
+    // focused yet on some platforms/WMs, but nothing was clicked to get
+    // here) never triggers a spurious disable.
+    was_focused: bool,
+    // Interaction is disabled while `Instant::now()` is before this --
+    // see `ui()`'s doc comment for why a single-frame check isn't
+    // enough and this needs to be a short window instead.
+    ignore_interaction_until: Option<Instant>,
 }
 
 impl HpsdrApp {
     fn new(ctx: &egui::Context) -> Self {
         Self {
             state: AppState::Discovering(DiscoveryWindow::new(ctx)),
+            was_focused: true,
+            ignore_interaction_until: None,
         }
     }
 }
@@ -826,6 +837,75 @@ impl eframe::App for HpsdrApp {
     // eframe 0.35 replaced `update(&Context)` with `ui(&mut Ui)` -- see
     // https://github.com/emilk/egui/blob/main/CHANGELOG.md (0.35.0).
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        // BUG FIX: clicking the main window while it's not the active/
+        // focused OS window would both raise/focus it AND process that
+        // same click as normal input to whatever widget happened to be
+        // under the cursor -- e.g. accidentally retuning by clicking
+        // the spectrum/waterfall just to bring the app to the front,
+        // confirmed via a real report. The OS/window manager already
+        // focuses the window on click on its own -- that part isn't
+        // something egui/eframe controls or needs to help with. What IS
+        // controllable is whether THIS frame's widgets treat that same
+        // click as a deliberate interaction.
+        //
+        // BUG FIX (round 2): a plain single-frame "focused && !was
+        // focused" check (comparing only to the immediately preceding
+        // frame) looked right but a real test disproved it -- clicking
+        // the spectrum/waterfall to refocus the window still retuned
+        // the radio. Root cause: while genuinely unfocused, most
+        // window managers/compositors throttle or skip repaints
+        // entirely regardless of this app's own request_repaint_after
+        // calls, so there may be NO intervening frame with
+        // focused=false to compare against -- the first frame that
+        // runs again can already show focused=true with `was_focused`
+        // still stuck at whatever it was before the gap. On top of
+        // that, the OS's WindowFocused event and the click's own
+        // PointerButton event aren't guaranteed to land in the exact
+        // same frame either. Fixed by combining two independent
+        // signals -- the frame-to-frame transition (works whenever the
+        // app IS still repainting through it) and a raw
+        // Event::WindowFocused(true) appearing anywhere in this
+        // frame's input queue (works even after a repaint gap, since
+        // it's a discrete per-frame event log entry, not a state
+        // comparison this project has to have observed changing) --
+        // and, when either fires, disabling interaction for a short
+        // real-time window rather than a single frame, to bridge
+        // ordinary event-queue jitter between the two events landing a
+        // frame or two apart. ui.disable() is the sanctioned public
+        // API for "render normally, but don't accept interaction" --
+        // deliberately not reaching into InputState::pointer's private
+        // fields to suppress the click event directly, which would be
+        // more fragile across egui versions. unwrap_or(true) errors
+        // toward NOT disabling when focus state is unknown (some
+        // platforms/WMs don't always report it), since a false
+        // positive here blocks a real click rather than just failing
+        // to catch a spurious one.
+        let focused = ui.input(|i| i.viewport().focused).unwrap_or(true);
+        let focus_event_this_frame = ui.input(|i| {
+            i.events
+                .iter()
+                .any(|e| matches!(e, egui::Event::WindowFocused(true)))
+        });
+        if (focused && !self.was_focused) || focus_event_this_frame {
+            self.ignore_interaction_until = Some(Instant::now() + Duration::from_millis(200));
+            // Guarantees a follow-up frame runs to clear the disabled
+            // state promptly once the window elapses, even if nothing
+            // else happens to trigger a repaint in the meantime (the
+            // Connected view's own request_repaint_after(33ms) calls
+            // normally cover this, but this doesn't fire from every
+            // AppState).
+            ui.ctx().request_repaint_after(Duration::from_millis(200));
+        }
+        self.was_focused = focused;
+        if self
+            .ignore_interaction_until
+            .is_some_and(|deadline| Instant::now() < deadline)
+        {
+            ui.disable();
+        } else {
+            self.ignore_interaction_until = None;
+        }
+
         // Set (from deep inside the Connected arm, via connect_error)
         // when a PS-toggle-triggered reconnect fails -- can't assign
         // self.state directly from there since `connected` still
