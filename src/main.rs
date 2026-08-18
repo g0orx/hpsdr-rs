@@ -23,7 +23,7 @@ use spectrum::{SpectrumHandle, ALL_MODES};
 use std::collections::VecDeque;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tci::TciServer;
 use tx::TxHandle;
 
@@ -227,6 +227,15 @@ struct ConnectedState {
     /// main panel's spectrum-drawing code).
     tx_spectrum: SpectrumHandle,
     audio_output: Option<AudioOutput>,
+    /// Local playback of TxHandle::tx_audio_monitor -- see that field's
+    /// doc comment. None when not actively monitoring (the common
+    /// case); toggled on/off via Settings -> TX's "Monitor TX Audio"
+    /// checkbox. A SEPARATE AudioOutput instance from `audio_output`
+    /// above (that one is RX; this taps TX audio instead), so both can
+    /// run at once without interfering -- though listening to your own
+    /// TX audio while transmitting is naturally only useful set up
+    /// through headphones/a mixer, not the radio's own speaker path.
+    tx_audio_monitor_output: Option<AudioOutput>,
     rigctl_server: Option<RigctlServer>,
     tci_server: Option<TciServer>,
     waterfall_texture: Option<egui::TextureHandle>,
@@ -380,6 +389,12 @@ struct ConnectedState {
     /// ballistic damping for exactly this reason.
     smoothed_fwd_power: f32,
     smoothed_rev_power: f32,
+    /// See RadioSession::tx_fifo_underrun's doc comment. Latched for a
+    /// couple of seconds after last seen set (same reasoning as
+    /// piHPSDR's own rx_panadapter.c: a single status packet's worth
+    /// of "true" would otherwise be too brief to actually notice at
+    /// this UI's frame rate).
+    tx_fifo_warning_until: Option<Instant>,
     /// Edge-tracks session.mox_active() so tx_spectrum.clear_display()
     /// only fires once per fresh PTT (not every frame while
     /// transmitting) -- see that method's doc comment for why a long-
@@ -735,6 +750,7 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                 spectrum,
                 tx_spectrum,
                 audio_output,
+                tx_audio_monitor_output: None,
                 rigctl_server,
                 tci_server,
                 waterfall_texture: None,
@@ -794,6 +810,7 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                 two_tone_active: false,
                 smoothed_fwd_power: 0.0,
                 smoothed_rev_power: 0.0,
+                tx_fifo_warning_until: None,
                 tx_spectrum_mox_was_active: false,
                 puresignal_enabled: settings.puresignal_enabled,
                 diversity_enabled: settings.diversity_enabled,
@@ -1978,6 +1995,34 @@ impl eframe::App for HpsdrApp {
                             ui.colored_label(egui::Color32::from_rgb(255, 60, 60), text);
                         }
 
+                        // TX FIFO overrun/underrun -- see
+                        // RadioSession::tx_fifo_underrun's doc comment.
+                        let fifo_under = connected
+                            .session
+                            .tx_fifo_underrun
+                            .load(std::sync::atomic::Ordering::Relaxed);
+                        let fifo_over = connected
+                            .session
+                            .tx_fifo_overrun
+                            .load(std::sync::atomic::Ordering::Relaxed);
+                        if fifo_under || fifo_over {
+                            connected.tx_fifo_warning_until = Some(Instant::now() + Duration::from_secs(2));
+                        }
+                        if let Some(until) = connected.tx_fifo_warning_until {
+                            if Instant::now() < until {
+                                let text = if fifo_under && fifo_over {
+                                    "TX Underrun/Overrun"
+                                } else if fifo_under {
+                                    "TX Underrun"
+                                } else {
+                                    "TX Overrun"
+                                };
+                                ui.colored_label(egui::Color32::from_rgb(255, 60, 60), text);
+                            } else {
+                                connected.tx_fifo_warning_until = None;
+                            }
+                        }
+
                         ui.add_space(4.0);
                         if ui.button("Settings...").clicked() {
                             connected.show_settings_window = !connected.show_settings_window;
@@ -2873,6 +2918,7 @@ impl eframe::App for HpsdrApp {
                                             connected.session.set_mox(false);
                                             connected.ptt_held = false;
                                             connected.tx_handle = None;
+                                            connected.tx_audio_monitor_output = None;
                                             connected.mic_input = None;
                                             connected.tx_enabled = false;
                                             // tx_handle is gone regardless, but tune_active/
@@ -2932,6 +2978,33 @@ impl eframe::App for HpsdrApp {
                                              otherwise."
                                         }
                                     });
+
+                                    // TX audio monitor -- see TxHandle::tx_audio_monitor's doc
+                                    // comment. Added while diagnosing a real report of TCI-sourced
+                                    // TX audio producing splatter/no-decode: lets the user hear
+                                    // exactly what's reaching WDSP, to tell "already wrong in the
+                                    // source audio" apart from "introduced downstream".
+                                    if let Some(tx) = &connected.tx_handle {
+                                        ui.add_space(8.0);
+                                        let mut monitoring = connected.tx_audio_monitor_output.is_some();
+                                        if ui.checkbox(&mut monitoring, "Monitor TX Audio").changed() {
+                                            if monitoring {
+                                                match AudioOutput::start(Arc::clone(&tx.tx_audio_monitor)) {
+                                                    Ok(out) => connected.tx_audio_monitor_output = Some(out),
+                                                    Err(e) => eprintln!("tx audio monitor unavailable: {e}"),
+                                                }
+                                            } else {
+                                                connected.tx_audio_monitor_output = None;
+                                            }
+                                        }
+                                        ui.weak(
+                                            "Plays the exact audio being fed to WDSP (post source \
+                                             selection, pre-processing) through the local speaker/ \
+                                             headphones -- useful for telling whether a TX audio \
+                                             problem is already present in the source (mic/TCI) or \
+                                             introduced downstream.",
+                                        );
+                                    }
 
                                     // Radio mic connector config (PTT enable, tip/ring wiring,
                                     // bias) -- standard Angelia/Orion/Orion2 boards only, matching
@@ -3571,6 +3644,7 @@ impl eframe::App for HpsdrApp {
                     connected.tx_handle = None;
                     connected.mic_input = None;
                     connected.audio_output = None;
+                    connected.tx_audio_monitor_output = None;
                     connected.rigctl_server = None;
                     connected.tci_server = None;
                     let device = connected.device;

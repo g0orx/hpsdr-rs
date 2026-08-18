@@ -128,6 +128,28 @@ const PS_IQ_NORM: f32 = 8_388_608.0;
 /// same "small ring buffer, drop oldest" reasoning as TX_IQ_BUFFER_CAPACITY.
 const TX_SPECTRUM_IQ_CAPACITY: usize = 50_000;
 
+/// ~0.3s at 48kHz -- same "small ring buffer, drop oldest" reasoning
+/// as the other capacities above. See TxHandle::tx_audio_monitor's doc
+/// comment for what this is for.
+const TX_AUDIO_MONITOR_CAPACITY: usize = 14_400;
+
+/// Reference ALC decay (ms) -- piHPSDR's own confirmed value.
+///
+/// TRIED AND REVERTED: a TCI-only 300ms override (30x this), on the
+/// theory that slowing how fast ALC gain rides up during TCI's real,
+/// repeating quiet stretches (confirmed via WDSP's own mic_pk meter --
+/// see SetTXAALCMaxGain's doc comment for the pumping mechanism this
+/// retriggers) would reduce the resulting power pumping without
+/// touching attack's fast overdrive protection. Real-hardware test
+/// showed the opposite: mic_pk swung even WIDER (0.57-2.06 vs the
+/// previous 0.57-0.88) and alc_gain never settled back to 0 anymore,
+/// chasing the input with a 300ms lag instead of responding cleanly --
+/// an asymmetric fast-attack/slow-decay pairing made the loop more
+/// underdamped, not less. Reverted; the underlying defect is in
+/// WSJT-X's own TCI Tune-audio generation and isn't fixable by
+/// retuning this project's ALC.
+const ALC_DECAY_DEFAULT_MS: i32 = 10;
+
 // BUG FIX (removed a real one): this file used to 2:1-decimate
 // (average) RX-feedback samples before pairing them with TX-feedback
 // for pscc/psccF, on the claim that "DDC0 (RX-feedback) delivers
@@ -529,7 +551,7 @@ impl TxProcessor {
             // constant -- for actually observing what's happening
             // through the chain during a bouncing transmission.
             wdsp::SetTXAALCAttack(channel, 1);
-            wdsp::SetTXAALCDecay(channel, 10);
+            wdsp::SetTXAALCDecay(channel, ALC_DECAY_DEFAULT_MS);
             // MaxGain: this is the actual root cause of the
             // pumping/power-bouncing-on-real-speech bug (steady on
             // Tune's continuous tone, bouncing on WSJT-X CQ/voice).
@@ -1222,6 +1244,12 @@ fn run(
     // radio's T/R relay isolation -- not a reliable "am I transmitting
     // cleanly" signal at all).
     tx_spectrum_iq: Arc<Mutex<VecDeque<IqSample>>>,
+    // See TxHandle::tx_audio_monitor's doc comment. Fed unconditionally
+    // (cheap -- a bounded ring buffer nobody reads from just sits there
+    // and gets capacity-trimmed like any other unused tap) so main.rs
+    // can start/stop actually listening to it at any time without a
+    // reconnect.
+    tx_audio_monitor: Arc<Mutex<VecDeque<f32>>>,
     mox: Arc<AtomicBool>,
     params: Arc<Mutex<TxParams>>,
     display: Arc<Mutex<TxDisplay>>,
@@ -1451,6 +1479,20 @@ fn run(
                 }
             }
         }
+        // TX audio monitor tap -- the exact content about to be fed to
+        // WDSP's fexchange0 (post source-selection, pre-processing), so
+        // listening to this queue reveals whether a problem is already
+        // present in the source audio or introduced downstream. See
+        // TxHandle::tx_audio_monitor's doc comment.
+        {
+            let mut mon = tx_audio_monitor.lock().unwrap();
+            for &sample in chunk.iter() {
+                if mon.len() >= TX_AUDIO_MONITOR_CAPACITY {
+                    mon.pop_front();
+                }
+                mon.push_back(sample);
+            }
+        }
         chunks_this_window += 1;
         if starve_window_start.elapsed() >= Duration::from_secs(1) {
             if starved_chunks_this_window > 0 {
@@ -1557,6 +1599,17 @@ pub struct TxHandle {
     /// session was connected with PureSignal's feedback plumbing
     /// active; otherwise stays at its Default (all zero/false).
     pub ps_status: Arc<Mutex<PsStatus>>,
+    /// TX audio monitor tap -- the exact audio about to be fed to
+    /// WDSP's fexchange0 (post source-selection between mic/TCI/radio-
+    /// mic, pre-processing), continuously filled whenever transmitting
+    /// regardless of whether anything is reading from it. Added as a
+    /// diagnostic while chasing a real report of TCI-sourced TX audio
+    /// producing splatter/no-decode: play this back locally (e.g.
+    /// `AudioOutput::start(tx_handle.tx_audio_monitor.clone())`) to
+    /// hear exactly what's reaching WDSP, which distinguishes "already
+    /// wrong in the source audio" from "introduced downstream in
+    /// hpsdr-rs's own processing".
+    pub tx_audio_monitor: Arc<Mutex<VecDeque<f32>>>,
     params: Arc<Mutex<TxParams>>,
     ps_params: Arc<Mutex<PsParams>>,
     stop: Arc<AtomicBool>,
@@ -1607,6 +1660,7 @@ impl TxHandle {
         let params = Arc::new(Mutex::new(TxParams::default()));
         let ps_params = Arc::new(Mutex::new(PsParams::default()));
         let ps_status = Arc::new(Mutex::new(PsStatus::default()));
+        let tx_audio_monitor = Arc::new(Mutex::new(VecDeque::with_capacity(TX_AUDIO_MONITOR_CAPACITY)));
         let stop = Arc::new(AtomicBool::new(false));
 
         let thread = {
@@ -1614,11 +1668,12 @@ impl TxHandle {
             let params = Arc::clone(&params);
             let ps_params = Arc::clone(&ps_params);
             let ps_status = Arc::clone(&ps_status);
+            let tx_audio_monitor = Arc::clone(&tx_audio_monitor);
             let stop = Arc::clone(&stop);
             thread::spawn(move || {
                 run(
                     mic_buffer, tci_tx_audio, radio_mic_audio, tx_audio_source, tci_wants_mic,
-                    tx_iq_out, tx_spectrum_iq, mox, params, display, channel, protocol, mic_rate,
+                    tx_iq_out, tx_spectrum_iq, tx_audio_monitor, mox, params, display, channel, protocol, mic_rate,
                     duc_rate, puresignal_enabled, ps_rx_feedback_iq, ps_tx_feedback_iq, ps_params,
                     ps_status, ps_corr_path, stop,
                 )
@@ -1628,6 +1683,7 @@ impl TxHandle {
         Self {
             display,
             ps_status,
+            tx_audio_monitor,
             params,
             ps_params,
             stop,

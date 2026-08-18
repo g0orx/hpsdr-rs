@@ -561,15 +561,21 @@ pub struct RadioSession {
     /// just carries whatever single resolved value main.rs last stored
     /// here. Defaults to DEFAULT_PA_GAIN_DB.
     pub pa_gain_db: Arc<AtomicU32>,
-    /// Raw forward-power ADC reading reported back by the radio itself
+    /// Forward-power ADC reading reported back by the radio itself
     /// while transmitting (P1: confirmed via a working reference --
     /// status address 1, bytes 3-4 of the incoming C&C header. P2:
     /// confirmed via the official protocol spec -- bytes 14-15 of the
-    /// incoming High-Priority status packet). Stored raw here, not
-    /// converted to watts -- that needs board-specific calibration
-    /// constants, confirmed by the user and applied in main.rs's
+    /// incoming High-Priority status packet). NOT converted to watts
+    /// here -- that needs board-specific calibration constants,
+    /// confirmed by the user and applied in main.rs's
     /// power_watts_and_swr (kept at the UI layer since it's a pure,
-    /// board-dependent display-time conversion, not radio state).
+    /// board-dependent display-time conversion, not radio state). P2:
+    /// IS a 16-sample moving average of the raw per-packet reading
+    /// (`p2_receiver_loop`'s own fwd_acc), not the single latest raw
+    /// value -- see that averaging's own doc comment for why (matches
+    /// piHPSDR's identical `fwd_acc` smoothing, confirmed necessary via
+    /// real-hardware diagnostic logging: the true raw single-packet
+    /// reading genuinely alternates between near-zero and full-scale).
     pub tx_forward_power: Arc<AtomicU32>,
     /// Same as tx_forward_power but for reverse (reflected) power --
     /// P1 confirmed at status address 2, bytes 1-2; P2 confirmed at
@@ -592,6 +598,24 @@ pub struct RadioSession {
     /// generally useful to surface for ordinary RX too.
     pub adc0_overload: Arc<AtomicBool>,
     pub adc1_overload: Arc<AtomicBool>,
+    /// P2 only (byte 4, bits 0x40/0x20 of the incoming High-Priority
+    /// status packet, confirmed against piHPSDR's new_protocol.c --
+    /// `tx_fifo_overrun |= (buffer[4] & 0x40) >> 6;`/`tx_fifo_underrun
+    /// |= (buffer[4] & 0x20) >> 5;`). The radio's own signal that its
+    /// TX IQ sample FIFO ran dry (host isn't keeping up) or overflowed
+    /// -- a real, hardware-side pacing problem distinct from any
+    /// software-side queue (e.g. tci_tx_audio), which can be perfectly
+    /// healthy while this still happens downstream. Added while
+    /// investigating a real-hardware report of TX power cycling
+    /// (35-55W instead of a steady level) with an otherwise-clean
+    /// spectrum over TCI-sourced audio -- exactly what a periodically
+    /// starved/overrun TX FIFO would plausibly cause, and something
+    /// this project had no visibility into at all before this. Left
+    /// unset (always false) on P1, which has no general equivalent --
+    /// piHPSDR's own P1 handling of this is HermesLite-II-specific,
+    /// not applicable to other P1 boards.
+    pub tx_fifo_underrun: Arc<AtomicBool>,
+    pub tx_fifo_overrun: Arc<AtomicBool>,
     stop_flag: Arc<AtomicBool>,
     sender_thread: Option<JoinHandle<()>>,
     receiver_thread: Option<JoinHandle<()>>,
@@ -692,11 +716,14 @@ impl RadioSession {
         let diversity_main_raw_iq = Arc::new(Mutex::new(VecDeque::with_capacity(IQ_BUFFER_CAPACITY)));
         let adc0_overload = Arc::new(AtomicBool::new(false));
         let adc1_overload = Arc::new(AtomicBool::new(false));
+        let tx_fifo_underrun = Arc::new(AtomicBool::new(false));
+        let tx_fifo_overrun = Arc::new(AtomicBool::new(false));
         let mut result = match device.protocol {
             1 => start_protocol1(
                 device, settings, frequency_hz, sample_rate, adc, antenna, rx_attenuation,
                 ps_tx_attenuation, mox, tx_iq, tci_tx_audio, tci_tx_gain, tx_power_watts, pa_gain_db,
-                tx_forward_power, tx_reverse_power, adc0_overload, adc1_overload, ps_rx_feedback_iq, ps_tx_feedback_iq,
+                tx_forward_power, tx_reverse_power, adc0_overload, adc1_overload,
+                tx_fifo_underrun, tx_fifo_overrun, ps_rx_feedback_iq, ps_tx_feedback_iq,
                 rx_audio_to_radio, send_rx_audio_to_radio, radio_mic_audio, tx_audio_source,
                 tci_wants_mic, mic_ptt_enabled, mic_bias_enabled, mic_ptt_on_tip,
                 diversity_enabled, diversity_gain_db, diversity_phase_deg, diversity_main_raw_iq,
@@ -704,7 +731,8 @@ impl RadioSession {
             2 => start_protocol2(
                 device, settings, frequency_hz, sample_rate, adc, antenna, rx_attenuation,
                 ps_tx_attenuation, mox, tx_iq, tci_tx_audio, tci_tx_gain, tx_power_watts, pa_gain_db,
-                tx_forward_power, tx_reverse_power, adc0_overload, adc1_overload, ps_rx_feedback_iq, ps_tx_feedback_iq,
+                tx_forward_power, tx_reverse_power, adc0_overload, adc1_overload,
+                tx_fifo_underrun, tx_fifo_overrun, ps_rx_feedback_iq, ps_tx_feedback_iq,
                 rx_audio_to_radio, send_rx_audio_to_radio, radio_mic_audio, tx_audio_source,
                 tci_wants_mic, mic_ptt_enabled, mic_bias_enabled, mic_ptt_on_tip,
                 diversity_enabled, diversity_gain_db, diversity_phase_deg, diversity_main_raw_iq,
@@ -911,6 +939,8 @@ fn start_protocol1(
     tx_reverse_power: Arc<AtomicU32>,
     adc0_overload: Arc<AtomicBool>,
     adc1_overload: Arc<AtomicBool>,
+    tx_fifo_underrun: Arc<AtomicBool>,
+    tx_fifo_overrun: Arc<AtomicBool>,
     ps_rx_feedback_iq: Arc<Mutex<VecDeque<IqSample>>>,
     ps_tx_feedback_iq: Arc<Mutex<VecDeque<IqSample>>>,
     rx_audio_to_radio: Arc<Mutex<VecDeque<f32>>>,
@@ -1180,6 +1210,8 @@ fn start_protocol1(
         tx_reverse_power,
         adc0_overload,
         adc1_overload,
+        tx_fifo_underrun,
+        tx_fifo_overrun,
         stop_flag,
         sender_thread: Some(sender_thread),
         receiver_thread: Some(receiver_thread),
@@ -2770,6 +2802,8 @@ fn start_protocol2(
     tx_reverse_power: Arc<AtomicU32>,
     adc0_overload: Arc<AtomicBool>,
     adc1_overload: Arc<AtomicBool>,
+    tx_fifo_underrun: Arc<AtomicBool>,
+    tx_fifo_overrun: Arc<AtomicBool>,
     ps_rx_feedback_iq: Arc<Mutex<VecDeque<IqSample>>>,
     ps_tx_feedback_iq: Arc<Mutex<VecDeque<IqSample>>>,
     rx_audio_to_radio: Arc<Mutex<VecDeque<f32>>>,
@@ -2952,6 +2986,8 @@ fn start_protocol2(
     let receiver_tx_reverse_power = Arc::clone(&tx_reverse_power);
     let receiver_adc0_overload = Arc::clone(&adc0_overload);
     let receiver_adc1_overload = Arc::clone(&adc1_overload);
+    let receiver_tx_fifo_underrun = Arc::clone(&tx_fifo_underrun);
+    let receiver_tx_fifo_overrun = Arc::clone(&tx_fifo_overrun);
     let receiver_ps_rx_feedback_iq = Arc::clone(&ps_rx_feedback_iq);
     let receiver_ps_tx_feedback_iq = Arc::clone(&ps_tx_feedback_iq);
     let receiver_radio_mic_audio = Arc::clone(&radio_mic_audio);
@@ -2968,6 +3004,8 @@ fn start_protocol2(
             receiver_tx_reverse_power,
             receiver_adc0_overload,
             receiver_adc1_overload,
+            receiver_tx_fifo_underrun,
+            receiver_tx_fifo_overrun,
             puresignal_enabled,
             receiver_ps_rx_feedback_iq,
             receiver_ps_tx_feedback_iq,
@@ -3014,6 +3052,8 @@ fn start_protocol2(
         tx_reverse_power,
         adc0_overload,
         adc1_overload,
+        tx_fifo_underrun,
+        tx_fifo_overrun,
         stop_flag,
         sender_thread: Some(sender_thread),
         receiver_thread: Some(receiver_thread),
@@ -3764,6 +3804,8 @@ fn p2_receiver_loop(
     tx_reverse_power: Arc<AtomicU32>,
     adc0_overload: Arc<AtomicBool>,
     adc1_overload: Arc<AtomicBool>,
+    tx_fifo_underrun: Arc<AtomicBool>,
+    tx_fifo_overrun: Arc<AtomicBool>,
     // PureSignal -- see p2_sender_loop's matching doc comment. When
     // true, DDC0's IQ (source port P2_DDC0_IQ_PORT) is diverted into
     // BOTH feedback queues at once (see p2_parse_ps_feedback_packet's
@@ -3794,6 +3836,27 @@ fn p2_receiver_loop(
     // check and demod()'s fexchange0 error check).
     let ddc_reserved = if puresignal_enabled { 2 } else { 0 };
     let mut ddc_seen = vec![false; buffers.len() + ddc_reserved];
+    // BUG FIX: forward/reverse power used to be stored as the single
+    // latest raw per-packet ADC reading, with only a UI-frame-rate
+    // exponential filter downstream of that. Confirmed against
+    // piHPSDR's new_protocol.c, which reads the exact same bytes but
+    // immediately folds each one into its own 16-sample moving average
+    // right here at the packet layer (`fwd_acc = (15*fwd_acc+val)/16`),
+    // with an explicit comment that the raw per-packet reading needs
+    // this. Real-hardware report: hpsdr-rs's own on-screen TX power
+    // cycling 35-55W (roughly matching a smoothed 0W/100W average)
+    // while an external wattmeter showed a steady 100W -- diagnostic
+    // logging of the raw atomic confirmed it was genuinely alternating
+    // between near-zero and full-scale on almost every consecutive
+    // packet, with every other real pipeline (TCI audio queue, DUC IQ
+    // queue, radio's own TX FIFO) confirmed healthy, i.e. this really
+    // is just the expected raw ADC noise piHPSDR's own comment warns
+    // about, sampled far too sparsely (once per UI frame, not once per
+    // packet) to average out properly. Averaging every packet here
+    // instead fixes it at the source rather than papering over it with
+    // even heavier UI-side smoothing.
+    let mut fwd_acc: u32 = 0;
+    let mut rev_acc: u32 = 0;
     while !stop.load(Ordering::Relaxed) {
         match socket.recv_from(&mut buf) {
             Ok((n, src)) => {
@@ -3851,10 +3914,12 @@ fn p2_receiver_loop(
                     // doc comment on why this isn't converted to real
                     // watts here.
                     if n >= 24 {
-                        let forward = u16::from_be_bytes([buf[14], buf[15]]);
-                        tx_forward_power.store(forward as u32, Ordering::Relaxed);
-                        let reverse = u16::from_be_bytes([buf[22], buf[23]]);
-                        tx_reverse_power.store(reverse as u32, Ordering::Relaxed);
+                        let forward = u16::from_be_bytes([buf[14], buf[15]]) as u32;
+                        fwd_acc = (15 * fwd_acc + forward) / 16;
+                        tx_forward_power.store(fwd_acc, Ordering::Relaxed);
+                        let reverse = u16::from_be_bytes([buf[22], buf[23]]) as u32;
+                        rev_acc = (15 * rev_acc + reverse) / 16;
+                        tx_reverse_power.store(rev_acc, Ordering::Relaxed);
                     }
                     // ADC0/ADC1 front-end overload -- see
                     // RadioSession::adc0_overload's doc comment. Byte 5,
@@ -3863,6 +3928,14 @@ fn p2_receiver_loop(
                     if n >= 6 {
                         adc0_overload.store(buf[5] & 0x01 != 0, Ordering::Relaxed);
                         adc1_overload.store(buf[5] & 0x02 != 0, Ordering::Relaxed);
+                    }
+                    // TX FIFO overrun/underrun -- see
+                    // RadioSession::tx_fifo_underrun's doc comment.
+                    // Byte 4, bits 0x40/0x20, confirmed against
+                    // piHPSDR's new_protocol.c.
+                    if n >= 5 {
+                        tx_fifo_overrun.store(buf[4] & 0x40 != 0, Ordering::Relaxed);
+                        tx_fifo_underrun.store(buf[4] & 0x20 != 0, Ordering::Relaxed);
                     }
                     hp_request.store(true, Ordering::Relaxed);
                 } else if port == P2_TX_SPECIFIC_PORT {

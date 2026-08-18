@@ -113,14 +113,31 @@ use tungstenite::Message;
 pub const DEFAULT_ADDR: &str = "0.0.0.0:40001";
 /// PROTOCOL:program-name,protocol-version; -- confirmed against the
 /// official TCI Protocol spec (v2.0, section 4.1): arg1 is the program
-/// name, arg2 the TCI protocol version implemented, e.g.
-/// "PROTOCOL:ExpertSDR3,1.9;". Previously sent as a bare "protocol:
-/// hpsdr-rs;" with no version field at all -- a guess made before this
-/// spec was available. "1.9" here is the last version whose full
-/// command set this file implements (VFO_LOCK/RX_CHANNEL_SENSORS were
-/// added in 2.0, KEYER in 1.9.1 -- none of those three are implemented
-/// here yet), not this project's own version.
-const PROTOCOL_MESSAGE: &str = "protocol:hpsdr-rs,1.9;";
+/// name, arg2 the TCI protocol version implemented.
+///
+/// BUG FIX: previously sent this project's own name ("protocol:
+/// hpsdr-rs,1.9;"), on the reasonable-looking assumption that a
+/// client wouldn't care what a server calls itself. Root-caused a
+/// real report of WSJT-X-over-TCI TX audio being consistently
+/// splattered/uncopyable regardless of any audio-content fix tried
+/// (gain, clamping, interpolating around WSJT-X's own known ring-
+/// buffer corruption -- all real, all necessary, none sufficient) via
+/// a controlled A/B on completely different hardware/software (Thetis
+/// on a separate laptop, same WSJT-X): Thetis's native "protocol:
+/// Thetis,2.0;" greeting produces the exact same broken TX audio;
+/// switching on Thetis's own "Emulate ExpertSDR3 protocol" option --
+/// confirmed by reading Thetis's TCIServer.cs to change nothing but
+/// this one greeting string, to "protocol:ExpertSDR3,2.0;" -- made TX
+/// audio clean immediately, confirmed via PSKReporter spots and a
+/// clean waterfall on a separate receiving radio. WSJT-X's TCI client
+/// evidently gates its own TX-audio handling on recognizing
+/// "ExpertSDR3" specifically as the declared server, not on anything
+/// about the actual wire content. Mirrors Thetis's exact known-good
+/// string (including its "2.0" version claim) rather than this
+/// project's own real implemented-command-set version, since the
+/// point is to be recognized as ExpertSDR3-compatible, not to
+/// accurately self-describe.
+const PROTOCOL_MESSAGE: &str = "protocol:ExpertSDR3,2.0;";
 
 /// A swappable reference to "whichever DemodParams is current right
 /// now" -- see TciServer::set_demod_params's doc comment (and
@@ -414,6 +431,42 @@ fn handle_client(
     let _ = ws.send(Message::Text("trx_count:1;".into()));
     let _ = ws.send(Message::Text("channel_count:1;".into()));
     let _ = ws.send(Message::Text("receive_only:false;".into()));
+    // BUG FIX: none of these seven were ever sent -- confirmed missing
+    // by direct comparison against Thetis's own TCI server
+    // (TCIServer.cs's sendInitialisationData/sendInitialState), while
+    // chasing a real report of WSJT-X-over-TCI TX audio being
+    // consistently splattered against this project, reproduced
+    // independently against Thetis itself in its NATIVE handshake
+    // (proving it isn't specific to this project's own bugs) but NOT
+    // once Thetis's handshake was complete. TX_ENABLE in particular is
+    // spec-explicit about its purpose (section 4.3): "informs clients
+    // that TX is enabled... sent to the client when connected... in
+    // case transmitter permission was changed" -- i.e. tells the
+    // client whether it's allowed to transmit at all, which this
+    // project never told it. AUDIO_SAMPLERATE/IQ_SAMPLERATE and the
+    // four audio-stream parameters below are, per spec, normally
+    // client-to-server -- but Thetis proactively announces its own
+    // values for them at connect too (sensible defaults a client can
+    // still override), and a client that reads these rather than
+    // assuming its own defaults would otherwise silently disagree with
+    // this project's real values.
+    //
+    // AUDIO_STREAM_SAMPLES tracks TCI_TX_AUDIO_CHUNK (this project's own
+    // real per-reply request size -- see that constant's doc comment for
+    // the full back-and-forth on what value actually belongs here).
+    let _ = ws.send(Message::Text("tx_enable:0,true;".into()));
+    let _ = ws.send(Message::Text(
+        format!("audio_samplerate:{TCI_AUDIO_SAMPLE_RATE};").into(),
+    ));
+    let _ = ws.send(Message::Text(
+        format!("iq_samplerate:{};", sample_rate.load(Ordering::Relaxed)).into(),
+    ));
+    let _ = ws.send(Message::Text("audio_stream_sample_type:float32;".into()));
+    let _ = ws.send(Message::Text("audio_stream_channels:2;".into()));
+    let _ = ws.send(Message::Text(
+        format!("audio_stream_samples:{TCI_TX_AUDIO_CHUNK};").into(),
+    ));
+    let _ = ws.send(Message::Text("tx_stream_audio_buffering:50;".into()));
     let _ = ws.send(Message::Text(
         "modulations_list:LSB,USB,DSB,CW,AM,NFM,DIGU,DIGL,SAM;".into(),
     ));
@@ -436,42 +489,71 @@ fn handle_client(
     // any other TCI client that relies on that gate.
     let mut audio_streaming = true;
     let mut iq_streaming = false;
+    // BUG FIX: a bad (garbage-value) pair used to be dropped outright
+    // (`continue`, pushing nothing), which shortens tci_tx_audio's
+    // effective timeline by one sample every time it fires -- confirmed
+    // via real-hardware log analysis to happen at a real, sometimes
+    // substantial rate (up to ~7% of pairs in one capture), not the
+    // rare edge case it was assumed to be. A real timing discontinuity
+    // repeated at that rate throughout a whole transmission is a
+    // plausible source of real spectral splatter (phase/timing glitches
+    // produce FM-like sidebands), and only affects TCI-sourced TX audio
+    // -- mic/PipeWire audio never touches this path, matching a real
+    // report of splatter/no-decode specific to TCI.
+    //
+    // BUG FIX (round 2): holding the last known-good sample flat for
+    // the whole bad stretch (the first attempt at this) fixed the
+    // timeline-shortening problem but introduced a new, worse one --
+    // confirmed via the message-boundary-jump diagnostic below: it
+    // produced a real, CONSTANT ~1.14 amplitude jump (in a +-1.0-range
+    // signal, over half the full dynamic range) every time real data
+    // resumed after a held stretch, repeating on nearly every single
+    // second of a real capture. That's a much more direct, plausible
+    // cause of the splatter being chased than anything upstream of
+    // this. Fixed properly now: bad pairs are held back (not pushed
+    // yet) until the next good sample arrives, then the whole gap is
+    // linearly interpolated from the last confirmed-good sample to
+    // that new one and pushed as a smooth ramp -- no flat spot, no
+    // jump. pending_bad_count is capped (see PENDING_BAD_LIMIT) so a
+    // long run of consecutive bad messages can't grow this unboundedly
+    // or add unbounded latency; past that point it falls back to the
+    // old hold behavior for the excess, same as before this fix.
+    let mut last_confirmed_good: f32 = 0.0;
+    let mut pending_bad_count: usize = 0;
     // See the periodic vfo/modulation/trx heartbeat below.
     let mut last_status_broadcast = Instant::now();
-    // BUG FIX: TxChrono used to be sent unconditionally once per loop
-    // iteration, on the assumption that the loop's own ~20ms read
-    // timeout paced it -- true only while nothing is arriving to read.
-    // A real WSJT-X capture (tcpdump, reassembled and decoded by hand)
-    // showed this loop actually sending TxChrono and receiving
-    // WSJT-X's near-instant reply back-to-back with ~12 MICROSECONDS
-    // between messages once a session was underway -- ~80,000
-    // messages/sec, versus the ~94/sec real-time playback actually
-    // needs (TCI_TX_AUDIO_CHUNK/TCI_AUDIO_SAMPLE_RATE), because
-    // ws.read() returns immediately whenever a response is already
-    // waiting and never actually blocks for the timeout. This
-    // explains a report of WSJT-X-driven TX (never local Tune, which
-    // doesn't touch this queue at all) sounding wide/noisy and
-    // collapsing to ~0W within 1-2 seconds regardless of any TX-audio-
-    // content fix tried first: WSJT-X's own tone generator (its
-    // internal sample counter advances one TxChrono-response's worth
-    // per call, not per elapsed wall-clock time) gets fast-forwarded
-    // through its entire programmed duration in a couple of seconds
-    // instead of the real tens of seconds, running into its own
-    // tail/Idle-state handling (a separate, already-diagnosed WSJT-X
-    // bug -- see decode_binary_message's doc comment) almost
-    // immediately, while tci_tx_audio's bounded queue on this side
-    // gets so overrun (~860x the real-time rate) that its capacity
-    // trim is constantly discarding samples, feeding tx.rs's
-    // real-time-paced consumer a decimated, discontinuous fraction of
-    // whatever WSJT-X actually generated. Real, explicit pacing here
-    // (absolute-deadline, same pattern as tx.rs's own next_chunk --
-    // see its doc comment for why relative sleep-based pacing isn't
-    // used) rather than leaning on the read timeout fixes the request
-    // rate regardless of how fast a client replies.
-    let tx_chrono_interval = Duration::from_secs_f64(
-        TCI_TX_AUDIO_CHUNK as f64 / TCI_AUDIO_SAMPLE_RATE as f64,
-    );
-    let mut next_tx_chrono = Instant::now();
+    // BUG FIX (round 2 -- replaced fixed-interval pacing entirely):
+    // TxChrono used to be sent one-at-a-time, real-time paced (one
+    // request roughly every TCI_TX_AUDIO_CHUNK/TCI_AUDIO_SAMPLE_RATE),
+    // with a low-water-mark catch-up for the ~12.5% of replies WSJT-X's
+    // own ring-buffer bug corrupts. That fixed the original runaway-
+    // request bug (see git history: sending unconditionally once per
+    // loop iteration let ws.read() returning instantly for a waiting
+    // reply spin this loop at ~80,000 msgs/sec, fast-forwarding WSJT-X's
+    // internal tone generator through an entire transmission in 1-2
+    // real seconds) but kept tci_tx_audio perpetually thin -- never more
+    // than about one chunk ahead of real-time consumption. Splatter
+    // persisted regardless of every audio-CONTENT fix tried (gain,
+    // clamping, interpolating around bad messages, matching every TCI
+    // handshake announcement Thetis sends) until directly comparing
+    // this project's pacing against Thetis's own (cmaster.cs's TCI TX
+    // buffering logic, confirmed via source): Thetis targets a genuine
+    // ~100ms PRE-BUFFERED queue (TX_STREAM_AUDIO_BUFFERING's default
+    // 50ms + its own hardcoded TCI_TX_EXTRA_BUFFER_MS=50), keeping up to
+    // TCI_TX_MAX_OUTSTANDING=64 TxChrono requests pipelined (sent before
+    // their replies arrive) rather than one in flight at a time --
+    // fundamentally a buffer-target control loop, not a real-time
+    // one-for-one pull. tx_chrono_outstanding/TX_CHRONO_MAX_OUTSTANDING/
+    // TX_CHRONO_TARGET_BUFFER_SAMPLES below mirror that: each tick,
+    // enough requests are sent to bring (queued + outstanding*chunk) up
+    // to the target, self-limiting once the buffer is full (steady
+    // state sends nothing) and self-correcting as real consumption
+    // drains it -- not the same failure mode as the original unbounded
+    // flood, which had no target and no cap at all. Decremented back
+    // down in the TxAudioStream handler below as real replies actually
+    // arrive (matching Thetis's own dequeue-and-decrement).
+    let mut tx_chrono_outstanding: u32 = 0;
+    let mut last_tx_chrono_activity = Instant::now();
     let mut mox_was_active = false;
 
     while !stop.load(Ordering::Relaxed) && !superseded.load(Ordering::Relaxed) {
@@ -511,6 +593,12 @@ fn handle_client(
                 // server side of it, unlike RX audio/IQ above).
                 if let Some((msg_type, samples)) = decode_binary_message(&data) {
                     if msg_type == BinaryMessageType::TxAudioStream as u32 {
+                        // One reply consumes one outstanding TxChrono
+                        // request -- see tx_chrono_outstanding's doc
+                        // comment above. Matches Thetis's own
+                        // dequeue-and-decrement (cmaster.cs).
+                        tx_chrono_outstanding = tx_chrono_outstanding.saturating_sub(1);
+                        last_tx_chrono_activity = Instant::now();
                         // Stereo -> mono: simple L/R average. No
                         // existing precedent to match here (audio.rs's
                         // MicInput requests mono directly from cpal
@@ -559,12 +647,56 @@ fn handle_client(
                         for pair in samples.chunks_exact(2) {
                             let (l, r) = (pair[0], pair[1]);
                             if !l.is_finite() || !r.is_finite() || l.abs() > 2.0 || r.abs() > 2.0 {
+                                if pending_bad_count >= PENDING_BAD_LIMIT {
+                                    // Safety fallback -- see
+                                    // PENDING_BAD_LIMIT's doc comment.
+                                    if q.len() >= capacity {
+                                        q.pop_front();
+                                    }
+                                    q.push_back(last_confirmed_good);
+                                } else {
+                                    pending_bad_count += 1;
+                                }
                                 continue;
                             }
+                            // BUG FIX: this used to push the gained
+                            // sample with no clamp at all -- unlike
+                            // spectrum.rs's RX audio path, which clamps
+                            // to +-1.0 after applying its own gain.
+                            // tci_tx_gain's range is 0.0..=1000.0 (see
+                            // its slider's own doc comment -- WSJT-X's
+                            // TCI audio arrives at roughly 1/700th
+                            // normal amplitude, so gain routinely needs
+                            // to be in the hundreds), and the sanity
+                            // check just above only rejects raw samples
+                            // above 2.0 -- so a real, legitimate gain
+                            // setting could easily produce values in the
+                            // hundreds or thousands here, fed straight
+                            // into WDSP's TX chain with nothing to catch
+                            // it. Confirmed via real-hardware report:
+                            // gain=1000, TX power fluctuating 35-55W
+                            // instead of a steady 100W, visibly
+                            // splattered/broadband TX spectrum, and no
+                            // PSKReporter decodes -- all consistent with
+                            // a badly overdriven, clipped signal.
+                            let sample = ((l + r) * 0.5 * gain).clamp(-1.0, 1.0);
+                            // Resolve any held-back bad stretch now that
+                            // we have a real value to ramp toward -- see
+                            // pending_bad_count's doc comment.
+                            for i in 1..=pending_bad_count {
+                                let t = i as f32 / (pending_bad_count + 1) as f32;
+                                let interp = last_confirmed_good + (sample - last_confirmed_good) * t;
+                                if q.len() >= capacity {
+                                    q.pop_front();
+                                }
+                                q.push_back(interp);
+                            }
+                            pending_bad_count = 0;
+                            last_confirmed_good = sample;
                             if q.len() >= capacity {
                                 q.pop_front();
                             }
-                            q.push_back((l + r) * 0.5 * gain);
+                            q.push_back(sample);
                         }
                     }
                 }
@@ -663,61 +795,55 @@ fn handle_client(
         }
 
         // TxChrono -- requests TX audio from this client while
-        // transmitting. Confirmed working end-to-end against TCI Remote,
-        // requesting TCI_TX_AUDIO_CHUNK samples -- chosen to match
-        // tx.rs's own TX_BUFFER_SIZE. Real-time paced now -- see
-        // tx_chrono_interval's doc comment above for why sending on
-        // every loop tick (relying on the read timeout for pacing) was
-        // wrong. A client that doesn't implement TX audio simply won't
-        // respond to this; harmless either way.
-        //
-        // BUG FIX: pure fixed-interval pacing alone still let
-        // tci_tx_audio slowly drain over a real, multi-second WSJT-X
-        // transmission (a real trace showed the "mic buffer underrun"
-        // rate climbing from ~7% to ~20% over a few seconds of steady
-        // Tune) -- expected, not mysterious, once you account for
-        // WSJT-X's own confirmed ~12.5% corrupted-message rate (one of
-        // its 8 ring-buffer slots, dropped by decode_binary_message's
-        // sanity check): requesting at exactly the real-time rate with
-        // ~87.5% of replies actually usable means supply is
-        // structurally ~12.5% short of consumption, a deficit that
-        // only grows the longer a transmission runs. Rather than
-        // baking in a fixed compensation percentage (fragile, and
-        // risks recreating the original runaway-request bug above if
-        // the real loss rate is ever lower than assumed), this reacts
-        // to the queue's actual occupancy: below a small low-water
-        // mark, request immediately (resyncing the schedule from now)
-        // instead of waiting for the next tick, letting the queue
-        // catch up at whatever rate WSJT-X actually replies; once
-        // healthy again, it drops straight back to strict real-time
-        // pacing. Self-limiting either way -- catch-up requests are
-        // still gated one-per-loop-iteration by this same check, so
-        // this can't reproduce the original unpaced-runaway behavior.
+        // transmitting. See tx_chrono_outstanding's doc comment above
+        // for the buffer-target pipelined strategy this uses (mirroring
+        // Thetis's own confirmed-working approach) in place of the
+        // earlier one-request-at-a-time real-time pacing. A client that
+        // doesn't implement TX audio simply won't respond to this;
+        // harmless either way (outstanding just naturally stays at 0
+        // forever, tci_tx_audio stays empty, tx.rs falls through to
+        // mic_buffer exactly as if no TCI client were sending audio).
         let mox_active = mox.load(Ordering::Relaxed);
         if mox_active && !mox_was_active {
-            // Resync on every fresh PTT rather than sending a burst of
-            // "overdue" requests built up while idle -- same reasoning
-            // as tx.rs's own next_chunk resync on mox going active.
-            next_tx_chrono = Instant::now();
+            // Resync on every fresh PTT rather than trusting whatever
+            // outstanding count survived from a previous transmission.
+            tx_chrono_outstanding = 0;
+            last_tx_chrono_activity = Instant::now();
         }
         mox_was_active = mox_active;
         if mox_active {
-            let queue_low = tci_tx_audio.lock().unwrap().len() < TX_CHRONO_LOW_WATERMARK;
-            if queue_low || Instant::now() >= next_tx_chrono {
-                next_tx_chrono = if queue_low {
-                    Instant::now() + tx_chrono_interval
-                } else {
-                    next_tx_chrono + tx_chrono_interval
-                };
-                let chrono = encode_binary_message(
-                    0,
-                    TCI_AUDIO_SAMPLE_RATE,
-                    BinaryMessageType::TxChrono,
-                    TCI_TX_AUDIO_CHUNK,
-                    &[],
-                );
-                if ws.send(Message::Binary(chrono.into())).is_err() {
-                    return;
+            // Staleness reset -- if WSJT-X stops replying entirely
+            // (connection hiccup, client-side stall), outstanding would
+            // otherwise sit stuck at whatever count it last reached,
+            // permanently blocking new requests once
+            // TX_CHRONO_MAX_OUTSTANDING is hit. 500ms mirrors Thetis's
+            // own reset threshold (max(250, bufferingMs*4) with its
+            // 50ms default buffering -- 500ms is that same formula's
+            // result here).
+            if tx_chrono_outstanding > 0
+                && last_tx_chrono_activity.elapsed() >= Duration::from_millis(500)
+            {
+                tx_chrono_outstanding = 0;
+            }
+            let queued = tci_tx_audio.lock().unwrap().len();
+            let future = queued + tx_chrono_outstanding as usize * TCI_TX_AUDIO_CHUNK as usize;
+            if future < TX_CHRONO_TARGET_BUFFER_SAMPLES {
+                let deficit = TX_CHRONO_TARGET_BUFFER_SAMPLES - future;
+                let requests_needed = deficit.div_ceil(TCI_TX_AUDIO_CHUNK as usize) as u32;
+                let requests_needed =
+                    requests_needed.min(TX_CHRONO_MAX_OUTSTANDING.saturating_sub(tx_chrono_outstanding));
+                for _ in 0..requests_needed {
+                    let chrono = encode_binary_message(
+                        0,
+                        TCI_AUDIO_SAMPLE_RATE,
+                        BinaryMessageType::TxChrono,
+                        TCI_TX_AUDIO_CHUNK,
+                        &[],
+                    );
+                    if ws.send(Message::Binary(chrono.into())).is_err() {
+                        return;
+                    }
+                    tx_chrono_outstanding += 1;
                 }
             }
         }
@@ -754,18 +880,73 @@ fn handle_client(
     }
 }
 
-/// Matches tx.rs's own TX_BUFFER_SIZE -- see the TxChrono comment
-/// above for why this is what gets requested per chunk.
-const TCI_TX_AUDIO_CHUNK: u32 = 512;
+/// Samples requested per TxChrono message -- NOT tied to tx.rs's own
+/// TX_BUFFER_SIZE (that's this project's WDSP-consumption granularity;
+/// tci_tx_audio, a plain queue, already decouples producer and consumer
+/// chunk sizes from each other), and NOT tied to TX_CHRONO_TARGET_
+/// BUFFER_SAMPLES either -- request size and standing buffer depth are
+/// independent knobs.
+///
+/// BUG FIX (round 3): raised to 2048, reverted to 512 on a wrong theory
+/// (per-reply envelope shaping), now raised back to 2048 on the real
+/// one. A temporary per-sample-pair silence diagnostic (since removed)
+/// proved neither of those first two theories right: with the queue
+/// confirmed healthy (a temporary outstanding/queued diagnostic, also
+/// since removed, showed it never starving) and 512, 85-90% of
+/// individual TxAudioStream replies came back near-silent
+/// throughout an entire Tune -- WSJT-X legitimately padding most
+/// replies with real silence, not corruption (which the existing
+/// per-pair sanity check already handles separately). The likely cause:
+/// at 512 samples/request, this project's own real-time consumption
+/// (tx.rs draining TX_BUFFER_SIZE every ~10.7ms) forces a fresh
+/// TxChrono roughly every ~10.7ms -- apparently faster than WSJT-X's
+/// own internal Tune-audio generation can keep up with, so most
+/// requests arrive before it has anything new and get silence-padded
+/// (spec explicitly permits this: "may send a signal with zero counts,
+/// which corresponds to no signal"). At 2048, each reply covers
+/// ~42.7ms, so a fresh request is only needed about a quarter as often
+/// -- much closer to Thetis's own proven-working cadence (its default
+/// AUDIO_STREAM_SAMPLES, confirmed via a real captured working
+/// session). The earlier "periodic pulsing" seen at 2048 was recorded
+/// before that silence diagnostic existed to check WHY -- never actually
+/// confirmed to be worse than 512's own pulsing, just assumed so from
+/// an inconclusive visual read of a raw forward-power diagnostic's
+/// bounce pattern; the silence diagnostic's first version also measured
+/// whole-message peak rather than per-sample, which is itself biased
+/// toward making larger chunk sizes look artificially better.
+///
+/// Overall conclusion (also since confirmed directly via WDSP's own
+/// mic_pk meter -- see SetTXAALCMaxGain's doc comment in tx.rs): the
+/// real defect is WSJT-X's own TCI Tune-audio generation genuinely,
+/// repeatedly alternating in level -- not a request-cadence problem
+/// this project can fix by tuning TCI_TX_AUDIO_CHUNK further. 2048 is
+/// kept because it's the best-evidenced value (matches a real working
+/// Thetis session), not because it resolved the underlying issue.
+const TCI_TX_AUDIO_CHUNK: u32 = 2048;
 
-/// Below this many buffered samples, the TxChrono pacing loop above
-/// requests immediately instead of waiting for its next scheduled
-/// tick -- see that comment for why real-time pacing alone still lets
-/// the queue drain over a long transmission. Two chunks' worth: small
-/// enough to only kick in on genuine, sustained shortfall (a single
-/// dropped/corrupted reply is one chunk, ~10.7ms), not on ordinary
-/// per-chunk timing jitter.
-const TX_CHRONO_LOW_WATERMARK: usize = TCI_TX_AUDIO_CHUNK as usize * 2;
+/// Target amount of TX audio to keep pre-buffered in tci_tx_audio while
+/// transmitting -- see tx_chrono_outstanding's doc comment for the full
+/// story. 4800 samples = 100ms at 48kHz, matching Thetis's own default
+/// target exactly (cmaster.cs: TX_STREAM_AUDIO_BUFFERING's 50ms default
+/// + its hardcoded TCI_TX_EXTRA_BUFFER_MS=50).
+const TX_CHRONO_TARGET_BUFFER_SAMPLES: usize = 4_800;
+
+/// Cap on simultaneously outstanding (sent, not yet replied-to) TxChrono
+/// requests -- see tx_chrono_outstanding's doc comment. Matches Thetis's
+/// own TCI_TX_MAX_OUTSTANDING exactly (cmaster.cs).
+const TX_CHRONO_MAX_OUTSTANDING: u32 = 64;
+
+/// Safety cap on how many consecutive bad TxAudioStream pairs get held
+/// back for interpolation (see pending_bad_count's doc comment) before
+/// falling back to holding the last good sample for the excess -- 2048
+/// pairs (~43ms at 48kHz), comfortably more than the observed ~1-in-8
+/// corrupted-message rate, so this only engages on a genuinely abnormal
+/// run of consecutive bad messages, not ordinary operation. Deliberately
+/// NOT tied to TCI_TX_AUDIO_CHUNK (unrelated concepts: that's a TxChrono
+/// request size, this is an interpolation-window safety bound) --
+/// keeping this at its original effective value even after
+/// TCI_TX_AUDIO_CHUNK's own increase above.
+const PENDING_BAD_LIMIT: usize = 2_048;
 
 /// RX audio's fixed output rate -- must match spectrum.rs's own
 /// OUTPUT_RATE (not imported directly since that constant is private
