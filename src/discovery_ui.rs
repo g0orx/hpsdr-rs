@@ -157,15 +157,23 @@ impl DiscoveryWindow {
 
                 let devices_snapshot = self.devices.lock().unwrap().clone();
 
-                // Default to the first device in the list as soon as
-                // results land, so a single radio (the common case) is
-                // ready to Start immediately without an extra click.
-                // Only fires while nothing is selected yet -- Rediscover
+                // Default to the first AVAILABLE device in the list as
+                // soon as results land, so a single radio (the common
+                // case) is ready to Start immediately without an extra
+                // click. Specifically NOT just index 0 -- a radio
+                // already in use by another program (status 3) still
+                // shows up in the list, and defaulting to it would
+                // select something Start can't actually act on (the
+                // button is disabled for non-available rows) instead of
+                // a real radio that's actually usable right now. Only
+                // fires while nothing is selected yet -- Rediscover
                 // explicitly resets `selected` to None (below) so this
                 // re-applies to the next batch of results rather than
                 // fighting a deliberate user selection.
-                if self.selected.is_none() && !devices_snapshot.is_empty() {
-                    self.selected = Some(0);
+                if self.selected.is_none() {
+                    if let Some(i) = devices_snapshot.iter().position(|d| d.status == 2) {
+                        self.selected = Some(i);
+                    }
                 }
 
                 egui::Grid::new("discovery_grid")
