@@ -427,6 +427,19 @@ struct ConnectedState {
     /// session, so it only saves once per transition, not every frame
     /// `correcting` stays true.
     ps_was_correcting: bool,
+    /// General-purpose one-line status message, shown next to the main
+    /// window's Stop button (see its rendering code). Added specifically
+    /// because the existing FFTW-wisdom-generation status (shown as an
+    /// overlay on the waterfall area while no rows have arrived yet --
+    /// see `wisdom_status_text`) went unnoticed in a real report, since
+    /// it only appears somewhere a user might not be looking during
+    /// startup. Any code with a `&mut ConnectedState` can set this to
+    /// surface a message here; `None` shows nothing. No history/queue by
+    /// design -- just the current message, overwritten by the next one
+    /// that gets set (matches how little is actually needed here today;
+    /// revisit if a real future need for multiple/queued messages shows
+    /// up).
+    status_message: Option<String>,
 }
 
 enum AppState {
@@ -826,6 +839,7 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                 diversity_enabled: settings.diversity_enabled,
                 eq_tab_is_tx: false,
                 ps_was_correcting: false,
+                status_message: None,
             })
         }
         Err(e) => Err(format!("Failed to start radio: {e}")),
@@ -1977,9 +1991,25 @@ impl eframe::App for HpsdrApp {
                     }
 
                     ui.add_space(8.0);
-                    if ui.button("Stop").clicked() {
-                        stop_clicked = true;
-                    }
+                    ui.horizontal(|ui| {
+                        if ui.button("Stop").clicked() {
+                            stop_clicked = true;
+                        }
+                        // See ConnectedState::status_message's doc
+                        // comment. Wisdom generation takes priority
+                        // while it's actually relevant (matches the
+                        // waterfall overlay's own condition above) --
+                        // it's the one thing this area was specifically
+                        // added for, and it's already transient/self-
+                        // clearing once the waterfall starts rendering,
+                        // unlike status_message which persists until
+                        // something else overwrites it.
+                        if waterfall_texture_id.is_none() {
+                            ui.weak(wisdom_status_text());
+                        } else if let Some(msg) = &connected.status_message {
+                            ui.weak(msg);
+                        }
+                    });
                 });
 
                 egui::Area::new(egui::Id::new("s_meter_area"))
