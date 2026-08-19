@@ -30,8 +30,19 @@ _Static_assert(sizeof(float) >= 4, "float must be at least 32 bits");
 _Static_assert(sizeof(double) >= 8, "double must be at least 64 bits");
 */
 
+// BUG FIX (hpsdr-rs, Windows/MSVC port): upstream typo -- was
+// "__attibute__" (missing the second 'r'), so this never actually
+// neutralized the real __attribute__ usages below on non-Linux
+// platforms as intended. Harmless under MinGW-w64 (GCC understands
+// __attribute__ natively regardless, so the typo never mattered
+// there), but fatal under MSVC, which doesn't understand
+// __attribute__ at all and needs this to actually expand to nothing --
+// confirmed by a real MSVC build failure (a single "identifier
+// '__attribute__'" syntax error here cascading into hundreds of
+// unrelated-looking errors in downstream system headers, once the
+// parser lost its footing).
 #if !defined(linux)
-#define __attibute__(x) 
+#define __attribute__(x)
 #endif
 
 __attribute__((warn_unused_result)) float sanitize_denormal(float value);
