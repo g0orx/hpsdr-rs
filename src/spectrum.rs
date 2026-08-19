@@ -500,11 +500,10 @@ impl SpectrumAnalyzer {
             // on one run actually speeds up the next one too. First run
             // ever on a given machine may still be slow while wisdom is
             // first computed; subsequent runs should be much faster.
-            if let Some(home) = std::env::var_os("HOME") {
-                let dir = std::path::PathBuf::from(home)
-                    .join(".config")
-                    .join("hpsdr-rs")
-                    .join("wdsp_wisdom");
+            // See config::settings_dir's doc comment -- shared, platform-
+            // correct settings directory logic (this used to duplicate
+            // an $HOME/.config-only version of the same thing here).
+            if let Some(dir) = crate::config::settings_dir().map(|d| d.join("wdsp_wisdom")) {
                 if std::fs::create_dir_all(&dir).is_ok() {
                     if let Ok(cstring) = std::ffi::CString::new(dir.to_string_lossy().as_bytes()) {
                         unsafe {

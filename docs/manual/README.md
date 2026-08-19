@@ -30,4 +30,6 @@ further edits needed.
 - Sliders in this app respond to mouse-wheel scroll while hovered, not just
   dragging -- every slider mentioned in this manual can be adjusted either way.
 - Settings are saved automatically per radio (keyed by its MAC address) under
-  `~/.config/hpsdr-rs/` -- there's no manual "Save" step anywhere in the app.
+  `~/.config/hpsdr-rs/` (Linux), `%APPDATA%\hpsdr-rs\` (Windows), or
+  `~/Library/Application Support/hpsdr-rs/` (macOS) -- there's no manual
+  "Save" step anywhere in the app.

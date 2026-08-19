@@ -6,10 +6,6 @@
     One config file per radio, named after its MAC address, so
     different physical radios keep independent saved settings rather
     than sharing/overwriting one config.
-
-    NOTE: config path uses $HOME directly -- Linux-only for now, same
-    caveat as libwdsp.a itself. Windows/macOS would need a different
-    path convention (e.g. %APPDATA% / ~/Library/Application Support).
 */
 
 use crate::spectrum::{Agc, EqualizerParams, Mode, NoiseBlanker, NoiseReduction};
@@ -265,14 +261,43 @@ fn default_spectrum_waterfall_ratio() -> f32 {
     150.0 / 350.0
 }
 
-fn config_path(mac: [u8; 6]) -> Option<PathBuf> {
-    let home = std::env::var_os("HOME")?;
-    let mut path = PathBuf::from(home);
-    path.push(".config");
+/// Per-platform settings directory, created if it doesn't exist yet.
+/// `config_path`/`ps_corr_path` both build on this rather than each
+/// duplicating their own copy of the same platform logic.
+///
+/// BUG FIX: this used to build `$HOME/.config/hpsdr-rs` unconditionally
+/// on every platform -- correct for Linux (matches the XDG convention),
+/// but `$HOME` isn't normally set outside an MSYS2 shell on Windows
+/// (confirmed via a real Windows/MSVC build+run session: the app ran
+/// fine, but had no way to persist settings between runs), and even
+/// where it is set, `.config` isn't the native Windows convention
+/// anyway. Now branches by `target_os`: Windows uses `%APPDATA%\
+/// hpsdr-rs` (the standard per-user roaming-settings location); macOS
+/// uses `~/Library/Application Support/hpsdr-rs` (matching WDSP's own
+/// C source, which already has a real `__APPLE__` code path -- see
+/// build.rs's doc comment -- even though macOS isn't a built/tested
+/// target yet); everything else (Linux, BSDs) keeps the original
+/// `$HOME/.config/hpsdr-rs` behavior unchanged.
+pub(crate) fn settings_dir() -> Option<PathBuf> {
+    let mut path = if cfg!(target_os = "windows") {
+        PathBuf::from(std::env::var_os("APPDATA")?)
+    } else if cfg!(target_os = "macos") {
+        let mut p = PathBuf::from(std::env::var_os("HOME")?);
+        p.push("Library");
+        p.push("Application Support");
+        p
+    } else {
+        let mut p = PathBuf::from(std::env::var_os("HOME")?);
+        p.push(".config");
+        p
+    };
     path.push("hpsdr-rs");
-    if std::fs::create_dir_all(&path).is_err() {
-        return None;
-    }
+    std::fs::create_dir_all(&path).ok()?;
+    Some(path)
+}
+
+fn config_path(mac: [u8; 6]) -> Option<PathBuf> {
+    let mut path = settings_dir()?;
     let [a, b, c, d, e, f] = mac;
     path.push(format!("config-{a:02x}-{b:02x}-{c:02x}-{d:02x}-{e:02x}-{f:02x}.json"));
     Some(path)
@@ -284,13 +309,7 @@ fn config_path(mac: [u8; 6]) -> Option<PathBuf> {
 /// serialization, so the `.dat` extension and internal format are
 /// whatever WDSP itself uses, not something to parse here.
 pub fn ps_corr_path(mac: [u8; 6]) -> Option<PathBuf> {
-    let home = std::env::var_os("HOME")?;
-    let mut path = PathBuf::from(home);
-    path.push(".config");
-    path.push("hpsdr-rs");
-    if std::fs::create_dir_all(&path).is_err() {
-        return None;
-    }
+    let mut path = settings_dir()?;
     let [a, b, c, d, e, f] = mac;
     path.push(format!("ps_corr-{a:02x}-{b:02x}-{c:02x}-{d:02x}-{e:02x}-{f:02x}.dat"));
     Some(path)

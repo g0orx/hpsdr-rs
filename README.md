@@ -35,10 +35,9 @@ Any board the standard openHPSDR discovery protocol reports as one of: Metis, He
 
 ## Building
 
-Developed and tested on Linux. Windows builds are newly in progress and not
-yet fully verified — the config path (`$HOME`-based) and a couple of other
-details are still Linux-specific; see the source for notes on what would
-need to change. Two Windows toolchains are supported:
+Developed and tested primarily on Linux. A Windows build (via MSVC + vcpkg)
+has also been confirmed to build and run successfully — see below. Two
+Windows toolchains are supported:
 
 **Linux:**
 - A recent Rust toolchain (`rustup` recommended)
@@ -54,7 +53,7 @@ need to change. Two Windows toolchains are supported:
 - Visual Studio Build Tools (C++ workload) — needed for any `x86_64-pc-windows-msvc`-target Rust build regardless of this project
 - [vcpkg](https://vcpkg.io/), with `vcpkg install fftw3:x64-windows-static` (the `vcpkg` crate defaults to looking for the static triplet; static linking also means no `fftw3.dll` to ship alongside the built `.exe`), and either `VCPKG_ROOT` set to your vcpkg checkout or `vcpkg integrate install` run once
 - No `PATH`/pkg-config setup needed — `build.rs` talks to vcpkg and locates MSVC directly
-- Confirmed building successfully this way (2026-08-19); runtime behavior on Windows not yet fully verified
+- Confirmed building AND running successfully this way (2026-08-19)
 
 WDSP and its noise-reduction dependencies (libspecbleach, rnnoise) are vendored as C source under `vendor/` and built automatically from source by `build.rs` (via the `cc` crate) — no separate build step, and no prebuilt platform-specific binaries to obtain or keep in sync.
 
@@ -68,7 +67,7 @@ cargo build --release
 cargo run --release
 ```
 
-The app opens a discovery window that listens for radios on the network; select one to connect. Settings (frequency, mode, filter width, TX power, calibration, etc.) are saved automatically per-radio under `~/.config/hpsdr-rs/`.
+The app opens a discovery window that listens for radios on the network; select one to connect. Settings (frequency, mode, filter width, TX power, calibration, etc.) are saved automatically per-radio under `~/.config/hpsdr-rs/` (Linux), `%APPDATA%\hpsdr-rs\` (Windows), or `~/Library/Application Support/hpsdr-rs/` (macOS).
 
 See the **[User Manual](docs/manual/README.md)** for a full walkthrough of the UI -- every settings tab, tuning gestures, extra receivers, and the PureSignal/Diversity/Equalizer features.
 
