@@ -35,12 +35,25 @@ Any board the standard openHPSDR discovery protocol reports as one of: Metis, He
 
 ## Building
 
-Developed and tested on Linux. A Windows build (via MSYS2/MinGW-w64) is newly in progress and not yet fully verified — the config path (`$HOME`-based) and a couple of other details are still Linux-specific; see the source for notes on what would need to change.
+Developed and tested on Linux. Windows builds are newly in progress and not
+yet fully verified — the config path (`$HOME`-based) and a couple of other
+details are still Linux-specific; see the source for notes on what would
+need to change. Two Windows toolchains are supported:
 
-Requirements:
+**Linux:**
 - A recent Rust toolchain (`rustup` recommended)
-- FFTW3 development headers (Linux: `apt install libfftw3-dev` or your distro's equivalent; Windows/MSYS2: `pacman -S mingw-w64-x86_64-fftw`)
-- ALSA development headers for audio I/O, Linux only (e.g. `apt install libasound2-dev`)
+- FFTW3 development headers (`apt install libfftw3-dev` or your distro's equivalent)
+- ALSA development headers for audio I/O (e.g. `apt install libasound2-dev`)
+
+**Windows via MSYS2/MinGW-w64:**
+- [MSYS2](https://www.msys2.org/), then from an **MSYS2 MinGW64** shell: `pacman -S mingw-w64-x86_64-toolchain mingw-w64-x86_64-fftw mingw-w64-x86_64-pkg-config`
+- Rust's `x86_64-pc-windows-gnu` target (`rustup target add x86_64-pc-windows-gnu`)
+- Build with `gcc`/`pkg-config` reachable on `PATH` (either build from that same MSYS2 MinGW64 shell, or add `<msys2 install dir>\mingw64\bin` to your own shell's `PATH`) and `--target x86_64-pc-windows-gnu`
+
+**Windows via MSVC:**
+- Visual Studio Build Tools (C++ workload) — needed for any `x86_64-pc-windows-msvc`-target Rust build regardless of this project
+- [vcpkg](https://vcpkg.io/), with `vcpkg install fftw3:x64-windows`, and either `VCPKG_ROOT` set to your vcpkg checkout or `vcpkg integrate install` run once
+- No `PATH`/pkg-config setup needed — `build.rs` talks to vcpkg and locates MSVC directly
 
 WDSP and its noise-reduction dependencies (libspecbleach, rnnoise) are vendored as C source under `vendor/` and built automatically from source by `build.rs` (via the `cc` crate) — no separate build step, and no prebuilt platform-specific binaries to obtain or keep in sync.
 

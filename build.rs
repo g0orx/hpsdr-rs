@@ -15,6 +15,12 @@
     Win32-shaped API on Linux/macOS, not the other way around -- so
     building under MinGW-w64 (which defines _WIN32, not linux) takes the
     same real-Windows-API path MSVC would, no extra porting needed here.
+    Confirmed this ALSO means real MSVC (not just MinGW-w64) needs no C
+    source changes at all -- MSVC defines _WIN32 exactly the same way,
+    so it takes the identical code path. The only actual MSVC-specific
+    work in this file is (1) compiler-flag selection, since the GCC-style
+    flags below aren't understood by cl.exe, and (2) fftw3 discovery,
+    since pkg-config isn't a native Windows tool -- see both below.
 
     NOTE on a bug this replaced: the three vendor .a files this used to
     link were confirmed (via `md5sum`/`nm`) to be three byte-identical
@@ -27,9 +33,34 @@
 
 fn main() {
     let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    // "msvc" or "gnu" on Windows (MinGW-w64); empty/irrelevant elsewhere.
+    let target_env = std::env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default();
 
-    let fftw = pkg_config::probe_library("fftw3")
-        .expect("Could not find fftw3. Linux: `apt install libfftw3-dev` (or your distro's equivalent). Windows (MSYS2/MinGW-w64): `pacman -S mingw-w64-x86_64-fftw`.");
+    // fftw3 discovery: pkg-config everywhere EXCEPT MSVC. pkg-config
+    // itself isn't a native Windows/MSVC tool -- getting it to reliably
+    // resolve an MSVC-triplet vcpkg install (rather than some unrelated
+    // pkg-config.exe earlier on PATH, or refusing entirely via its own
+    // cross-compilation guard when Cargo's HOST/TARGET triples don't
+    // match as strings) turned into exactly the kind of PATH/environment
+    // fragility this project wants to avoid asking users to fight
+    // through. The `vcpkg` crate talks to a local vcpkg install
+    // directly (auto-detected via VCPKG_ROOT or `vcpkg integrate
+    // install`'s user-wide registration, no PATH search involved) and
+    // emits its own correct cargo:rustc-link-lib/-search directives, so
+    // it's used instead of pkg-config specifically for the MSVC case.
+    // MinGW-w64 keeps using pkg-config (confirmed working -- MSYS2's own
+    // mingw-w64-x86_64-fftw package ships a normal .pc file).
+    let fftw_include_paths: Vec<std::path::PathBuf> = if target_env == "msvc" {
+        let lib = vcpkg::find_package("fftw3")
+            .expect("Could not find fftw3 via vcpkg. Install it with: vcpkg install fftw3:x64-windows \
+                     -- and either set VCPKG_ROOT to your vcpkg checkout, or run `vcpkg integrate install` \
+                     once so it's found automatically.");
+        lib.include_paths
+    } else {
+        let fftw = pkg_config::probe_library("fftw3")
+            .expect("Could not find fftw3. Linux: `apt install libfftw3-dev` (or your distro's equivalent). Windows (MSYS2/MinGW-w64): `pacman -S mingw-w64-x86_64-fftw`.");
+        fftw.include_paths
+    };
 
     let mut build = cc::Build::new();
     build.files([
@@ -158,16 +189,30 @@ fn main() {
 
     // Same flags rustyHPSDR's own build.rs uses -- MinGW-w64's GCC
     // accepts all of these identically to Linux GCC/Clang, so no
-    // per-OS branching is needed here (confirmed: -pthread and
+    // per-OS branching was needed for it (confirmed: -pthread and
     // -D_GNU_SOURCE are harmless no-ops under MinGW's libc, not
-    // Linux-glibc-only landmines).
-    build.flag("-O3");
-    build.flag("-pthread");
-    build.flag("-D_GNU_SOURCE");
-    build.flag("-Wno-parentheses");
-    build.flag("-march=native");
+    // Linux-glibc-only landmines). None of these are GCC-flag-syntax
+    // that MSVC's cl.exe understands, though (confirmed by a real
+    // build attempt: cl.exe tried to parse "-Wno-parentheses" as its
+    // own "/W<number>" warning-level flag and failed with "invalid
+    // numeric argument"). opt_level(3) is cc-rs's own cross-compiler-
+    // aware API (translates to the right flag per compiler -- /O2 for
+    // MSVC, which has no separate "/O3" the way GCC has -O3) rather
+    // than a hardcoded flag string, so it's unconditional; the other
+    // four are genuinely GCC/Clang-specific with no direct MSVC
+    // equivalent worth replicating (pthread linkage and -D_GNU_SOURCE
+    // are meaningless on Windows regardless of compiler; -march=native
+    // has no real MSVC equivalent; -Wno-parentheses just silences a
+    // benign style warning), so flag_if_supported lets cc-rs itself
+    // test compiler compatibility and silently skip them under MSVC
+    // instead of this file having to hardcode a target_env branch.
+    build.opt_level(3);
+    build.flag_if_supported("-pthread");
+    build.flag_if_supported("-D_GNU_SOURCE");
+    build.flag_if_supported("-Wno-parentheses");
+    build.flag_if_supported("-march=native");
 
-    for path in fftw.include_paths {
+    for path in fftw_include_paths {
         build.include(path);
     }
 
@@ -181,6 +226,14 @@ fn main() {
     // prebuilt-lib build.rs's own undefined-symbol inspection. Not
     // present in rustyHPSDR's own build.rs (it apparently doesn't need
     // the float path), kept here since this project does.
+    //
+    // Left unconditional (not skipped on the MSVC/vcpkg path above) even
+    // though vcpkg::find_package already emits its own
+    // cargo:rustc-link-lib for whatever it found -- redundant link
+    // directives are harmless, and this way fftw3f keeps working
+    // regardless of exactly what vcpkg's own metadata output happens to
+    // name, since it's expected to live in the same lib directory
+    // find_package already added to the search path.
     println!("cargo:rustc-link-lib=fftw3");
     println!("cargo:rustc-link-lib=fftw3f");
 

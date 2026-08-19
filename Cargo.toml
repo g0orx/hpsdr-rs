@@ -43,3 +43,11 @@ tungstenite = "0.29"
 # specific binaries -- needed for this to build on Windows at all.
 cc = "1"
 pkg-config = "0.3"
+# Finds fftw3 via a local vcpkg install -- MSVC-target Windows builds
+# only (see build.rs's fftw3-discovery doc comment for why pkg-config
+# alone isn't enough there: pkg-config can find an MSVC-triplet vcpkg
+# package, but the include/lib paths that comes back are exactly what
+# you'd want anyway, so going through vcpkg's own crate directly is more
+# robust than fighting pkg-config's cross-compilation guard and PATH
+# resolution for what's ultimately the same vcpkg install).
+vcpkg = "0.2"
