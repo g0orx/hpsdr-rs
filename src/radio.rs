@@ -158,13 +158,14 @@ pub struct RadioSettings {
     pub frequency_hz: u32,
     pub sample_rate: u32,
     pub receivers: u8,
-    /// Requests the 2 extra "feedback" pseudo-receivers PureSignal
-    /// needs (TX-DAC loopback + off-air RX feedback) instead of
-    /// `receivers` real, user-visible ones -- see
-    /// RadioSession::ps_rx_feedback_iq/ps_tx_feedback_iq's doc comment
-    /// and ps_feedback_config's doc comment for the full story. Fixed
-    /// at session-start time, same as `receivers` itself -- toggling
-    /// this requires a reconnect, not a live setting.
+    /// PureSignal's INITIAL on/off state for this session. The 2 extra
+    /// "feedback" pseudo-receivers it needs (TX-DAC loopback + off-air RX
+    /// feedback) are reserved unconditionally now, regardless of this
+    /// value -- see RadioSession::puresignal_enabled and
+    /// ps_feedback_config's doc comments for the full story. This value
+    /// only seeds that live flag's starting point; toggling it
+    /// afterward is `RadioSession::set_puresignal_enabled`, a true live
+    /// setting on both protocols (no reconnect).
     pub puresignal_enabled: bool,
     /// Initial value for RadioSession::rx_attenuation (P1, standard
     /// boards only) -- see that field's doc comment. main.rs loads
@@ -378,6 +379,37 @@ pub struct RadioSession {
     /// Priority packets on a timer regardless), so nothing beyond a
     /// live read was ever needed here.
     pub diversity_enabled: Arc<AtomicBool>,
+    /// PureSignal on/off -- live on BOTH protocols, following exactly the
+    /// same precedent as `diversity_enabled` just above (same real bug:
+    /// the old "Enable PureSignal" checkbox did a full session teardown+
+    /// rebuild through `connect_to_device()`, referenced in
+    /// `diversity_enabled`'s own doc comment as the approach diversity
+    /// moved away from -- it drops rigctl/TCI client connections on every
+    /// toggle, and shares the same P1/Metis firmware-hang risk class).
+    ///
+    /// Unlike diversity, PureSignal's 2 feedback-receiver wire slots
+    /// (`ps_feedback_config`) are now reserved UNCONDITIONALLY at connect
+    /// time on any board that supports it, regardless of this flag's
+    /// initial value -- turning PS off live doesn't free that wire
+    /// capacity back up (see `ps_feedback_config`'s doc comment for the
+    /// "Add Receiver" capacity cost this trades for a true live toggle in
+    /// both directions). So unlike `set_diversity_enabled`, flipping this
+    /// never needs to touch `active_receiver_count` -- it's a pure flag
+    /// flip against wire capacity that's already there.
+    ///
+    /// P1: `sender_loop` watches this the same way it watches
+    /// `diversity_enabled` -- comparing against the last-seen value and,
+    /// on a change, replaying the Stop+preconfig-rotations+250ms+Start
+    /// burst on the existing socket (a separate, independent check from
+    /// diversity's own -- if both change in the same tick, two back-to-
+    /// back replay bursts are harmless).
+    ///
+    /// P2: `p2_sender_loop`/`p2_receiver_loop` read this fresh every
+    /// cycle, exactly like `diversity_enabled` -- no replay needed, DDC0/
+    /// DDC1's config-table entries are already sent unconditionally
+    /// (wire capacity is always reserved now), only their enable bits
+    /// depend on this flag's live value.
+    pub puresignal_enabled: Arc<AtomicBool>,
     /// Gain (dB) and phase (degrees) of the ADC1-aux rotate-and-add --
     /// see the combiner thread (spawned in `RadioSession::start`) for the
     /// exact formula, identical to piHPSDR's `set_gain_phase()`/
@@ -408,9 +440,13 @@ pub struct RadioSession {
     /// user-visible receivers only and drives the Add Receiver UI;
     /// these are a separate, always-present pair of dedicated queues
     /// (matching the tx_iq/tci_tx_audio convention: never share a
-    /// queue between two independent consumers). Empty/unused
-    /// whenever `puresignal_enabled` was false at connect time -- no
-    /// behavior change for existing non-PS sessions.
+    /// queue between two independent consumers). The wire-level
+    /// plumbing that feeds these is now reserved for the whole session
+    /// on any board that supports PS, regardless of `puresignal_enabled`'s
+    /// live value (see that field's doc comment) -- so these queues
+    /// keep filling even while PS is live-toggled off; simply empty/
+    /// harmless if nothing (tx.rs, when its own live flag is off) is
+    /// draining them.
     ///
     /// On Protocol 2, both this and `ps_tx_feedback_iq` are populated
     /// TOGETHER from the same single DDC0 packet stream (see
@@ -714,6 +750,9 @@ impl RadioSession {
         let diversity_gain_db = Arc::new(AtomicU32::new(settings.diversity_gain_db.to_bits()));
         let diversity_phase_deg = Arc::new(AtomicU32::new(settings.diversity_phase_deg.to_bits()));
         let diversity_main_raw_iq = Arc::new(Mutex::new(VecDeque::with_capacity(IQ_BUFFER_CAPACITY)));
+        // See RadioSession::puresignal_enabled's doc comment -- live on
+        // both protocols, same pattern as diversity_enabled just above.
+        let puresignal_enabled = Arc::new(AtomicBool::new(settings.puresignal_enabled));
         let adc0_overload = Arc::new(AtomicBool::new(false));
         let adc1_overload = Arc::new(AtomicBool::new(false));
         let tx_fifo_underrun = Arc::new(AtomicBool::new(false));
@@ -727,6 +766,7 @@ impl RadioSession {
                 rx_audio_to_radio, send_rx_audio_to_radio, radio_mic_audio, tx_audio_source,
                 tci_wants_mic, mic_ptt_enabled, mic_bias_enabled, mic_ptt_on_tip,
                 diversity_enabled, diversity_gain_db, diversity_phase_deg, diversity_main_raw_iq,
+                puresignal_enabled,
             ),
             2 => start_protocol2(
                 device, settings, frequency_hz, sample_rate, adc, antenna, rx_attenuation,
@@ -736,6 +776,7 @@ impl RadioSession {
                 rx_audio_to_radio, send_rx_audio_to_radio, radio_mic_audio, tx_audio_source,
                 tci_wants_mic, mic_ptt_enabled, mic_bias_enabled, mic_ptt_on_tip,
                 diversity_enabled, diversity_gain_db, diversity_phase_deg, diversity_main_raw_iq,
+                puresignal_enabled,
             ),
             p => Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -862,6 +903,18 @@ impl RadioSession {
         }
     }
 
+    /// Live toggle for PureSignal -- both protocols, see
+    /// RadioSession::puresignal_enabled's doc comment. Simpler than
+    /// set_diversity_enabled: PureSignal's wire capacity is reserved
+    /// unconditionally at connect time now (see ps_feedback_config's doc
+    /// comment), so this never needs to touch active_receiver_count --
+    /// it's a pure flag flip that sender_loop/receiver_loop (P1) or
+    /// p2_sender_loop/p2_receiver_loop (P2) pick up on their own, exactly
+    /// like set_diversity_enabled's flag flip does.
+    pub fn set_puresignal_enabled(&mut self, enabled: bool) {
+        self.puresignal_enabled.store(enabled, Ordering::SeqCst);
+    }
+
     pub fn stop(&mut self) {
         // Unkey first, before anything else -- a session ending (app
         // closing, "Stop" clicked, sample rate change tearing this
@@ -955,6 +1008,7 @@ fn start_protocol1(
     diversity_gain_db: Arc<AtomicU32>,
     diversity_phase_deg: Arc<AtomicU32>,
     diversity_main_raw_iq: Arc<Mutex<VecDeque<IqSample>>>,
+    puresignal_enabled: Arc<AtomicBool>,
 ) -> io::Result<RadioSession> {
     let socket = UdpSocket::bind(("0.0.0.0", 0))?;
     socket.set_read_timeout(Some(Duration::from_millis(500)))?;
@@ -968,30 +1022,38 @@ fn start_protocol1(
     let stop_socket = socket.try_clone()?;
 
     // PureSignal (P1): see ps_feedback_config's doc comment. `ps_config`
-    // is None whenever PS wasn't requested, or this board has no known
-    // PS support -- everything below falls back to today's exact
-    // behavior in that case. `ps_wire_total` is the FIXED total
-    // receiver count the radio must be told about for the feedback
-    // indices to line up (independent of active_receiver_count/Add
-    // Receiver, which only tracks how many of the REAL slots the UI
-    // has turned on); `real_receivers` is the cap on those real slots.
+    // is None only when this board has no known PS support -- everything
+    // below falls back to today's exact behavior in that case.
+    // `ps_wire_total` is the FIXED total receiver count the radio must be
+    // told about for the feedback indices to line up (independent of
+    // active_receiver_count/Add Receiver, which only tracks how many of
+    // the REAL slots the UI has turned on); `real_receivers` is the cap
+    // on those real slots.
+    //
+    // BUG FIX: this used to be gated on `settings.puresignal_enabled`,
+    // reserving PS's wire capacity only for sessions that started with PS
+    // already on -- which is exactly what made turning PS off live
+    // impossible (there was nowhere to put its feedback samples if the
+    // real-receiver slots had already grown into that space) and forced
+    // a full reconnect to change either direction. Now unconditional
+    // (board-gated only) so the reservation is stable for the session's
+    // whole lifetime and `puresignal_enabled`'s LIVE value (read fresh by
+    // sender_loop/receiver_loop below) is free to flip either way with no
+    // reconnect -- see RadioSession::puresignal_enabled's doc comment for
+    // the "Add Receiver" capacity cost this trades for that.
     //
     // NOT forced to a minimum of 1 real receiver -- on Metis/HermesLite
     // (max_real=0), real receiver indices would otherwise collide with
     // the feedback indices themselves (rx_feedback_idx=0 there), a
     // genuine wire-level correctness bug, not just a UI nicety. This
     // does mean `iq_buffers` can legitimately end up empty on those
-    // smallest boards while PS is active -- main.rs's connect flow
-    // (which assumes iq_buffers[0] always exists for the main
+    // smallest boards now (regardless of whether PS starts on) -- main.rs's
+    // connect flow (which assumes iq_buffers[0] always exists for the main
     // SpectrumHandle) doesn't handle that yet; not a concern for the
     // 2-ADC Angelia/Orion/Orion2-class hardware this was built against,
     // but flagged rather than silently papered over for anyone with
     // one of the smaller boards.
-    let ps_config = if settings.puresignal_enabled {
-        ps_feedback_config(1, device.board)
-    } else {
-        None
-    };
+    let ps_config = ps_feedback_config(1, device.board);
     let mut real_receivers = match ps_config {
         Some((_, _, Some(max_real))) => settings.receivers.max(1).min(max_real),
         Some((_, _, None)) | None => settings.receivers.max(1),
@@ -1048,6 +1110,7 @@ fn start_protocol1(
         ps_tx_attenuation.load(Ordering::Relaxed) as u8,
         device.adcs,
         settings.diversity_enabled,
+        puresignal_enabled.load(Ordering::Relaxed),
         &tx_iq,
         mic_ptt_enabled.load(Ordering::Relaxed),
         mic_bias_enabled.load(Ordering::Relaxed),
@@ -1109,6 +1172,9 @@ fn start_protocol1(
     // Live -- see RadioSession::diversity_enabled's doc comment.
     // sender_loop watches this itself for changes.
     let sender_diversity_enabled = Arc::clone(&diversity_enabled);
+    // Live -- see RadioSession::puresignal_enabled's doc comment.
+    // sender_loop watches this itself for changes, same as diversity.
+    let sender_puresignal_enabled = Arc::clone(&puresignal_enabled);
     let sender_thread = thread::spawn(move || {
         sender_loop(
             sender_socket,
@@ -1129,6 +1195,7 @@ fn start_protocol1(
             sender_extra_adcs,
             sender_diversity_enabled,
             ps_wire_total,
+            sender_puresignal_enabled,
             sender_rx_audio_to_radio,
             sender_send_rx_audio_to_radio,
             sender_mic_ptt_enabled,
@@ -1204,6 +1271,7 @@ fn start_protocol1(
         diversity_gain_db,
         diversity_phase_deg,
         diversity_main_raw_iq,
+        puresignal_enabled,
         tx_power_watts,
         pa_gain_db,
         tx_forward_power,
@@ -1451,6 +1519,15 @@ fn p1_send_preconfig_and_start(
     // through so preconfig and the ongoing stream present an identical,
     // consistent diversity state from the very first packet.
     diversity_enabled: bool,
+    // See sender_loop's identically-reasoned puresignal_enabled param --
+    // this used to be derived as `ps_wire_total.is_some()` right below
+    // (wire capacity was only ever reserved when PS started enabled, so
+    // the two were equivalent); now that wire capacity is reserved
+    // unconditionally on any PS-capable board (see start_protocol1's
+    // ps_config doc comment), `ps_wire_total.is_some()` no longer tracks
+    // whether PS is actually ON, only whether the board supports it --
+    // the caller must pass the real live value.
+    puresignal_enabled: bool,
     tx_iq: &Mutex<VecDeque<f32>>,
     mic_ptt_enabled: bool,
     mic_bias_enabled: bool,
@@ -1483,7 +1560,7 @@ fn p1_send_preconfig_and_start(
             &[], // no extra receivers' ADCs active yet this early either -- diversity_enabled below still forces wire 1 to ADC1 regardless
             diversity_enabled,
             tx_iq,
-            ps_wire_total.is_some(),
+            puresignal_enabled,
             tx_iq, // send_rx_audio is false below, so this is never actually read -- reusing tx_iq's Mutex just to satisfy the type, not a real audio source
             false, // send_rx_audio: never during startup config, nothing keyed yet
             &mut dummy_rx_audio_pacer,
@@ -2063,6 +2140,11 @@ fn sender_loop(
     // on; the wire-level total must stay fixed so the feedback indices
     // always land at the same position regardless of that).
     ps_wire_total: Option<u8>,
+    // Live -- see RadioSession::puresignal_enabled's doc comment. Same
+    // edge-detection-and-replay treatment as diversity_enabled just
+    // above, as an independent check (own last-seen value, own replay
+    // call) -- see the main loop body below.
+    puresignal_enabled: Arc<AtomicBool>,
     rx_audio_to_radio: Arc<Mutex<VecDeque<f32>>>,
     send_rx_audio_to_radio: Arc<AtomicBool>,
     mic_ptt_enabled: Arc<AtomicBool>,
@@ -2100,6 +2182,7 @@ fn sender_loop(
     // moments ago (in start_protocol1's own p1_send_preconfig_and_start
     // call, before this thread even existed).
     let mut last_diversity_enabled = diversity_enabled.load(Ordering::Relaxed);
+    let mut last_puresignal_enabled = puresignal_enabled.load(Ordering::Relaxed);
 
     while !stop.load(Ordering::Relaxed) {
         let now_diversity_enabled = diversity_enabled.load(Ordering::Relaxed);
@@ -2133,12 +2216,53 @@ fn sender_loop(
                 ps_tx_attenuation.load(Ordering::Relaxed) as u8,
                 num_adcs,
                 now_diversity_enabled,
+                puresignal_enabled.load(Ordering::Relaxed),
                 &tx_iq,
                 mic_ptt_enabled.load(Ordering::Relaxed),
                 mic_bias_enabled.load(Ordering::Relaxed),
                 mic_ptt_on_tip.load(Ordering::Relaxed),
             );
             last_diversity_enabled = now_diversity_enabled;
+            next_send = Instant::now(); // resync pacing after the burst
+        }
+
+        // See RadioSession::puresignal_enabled's doc comment -- an
+        // independent edge-check from diversity's own just above (not
+        // merged into one: if both change in the same tick, two
+        // back-to-back Stop+replay bursts are harmless, and keeping them
+        // separate is the smaller diff against the proven diversity
+        // pattern). Initialized from the CURRENT value for the same
+        // reason diversity's is -- a fresh connect that starts with PS
+        // already on already sent this exact state via
+        // p1_send_preconfig_and_start above, moments before this thread
+        // existed.
+        let now_puresignal_enabled = puresignal_enabled.load(Ordering::Relaxed);
+        if now_puresignal_enabled != last_puresignal_enabled {
+            let mut stop_pkt = [0u8; 64];
+            stop_pkt[0] = 0xEF;
+            stop_pkt[1] = 0xFE;
+            stop_pkt[2] = 0x04;
+            stop_pkt[3] = 0x00;
+            let _ = socket.send(&stop_pkt);
+            let receivers_fallback = (active_receiver_count.load(Ordering::Relaxed) as u8).max(1);
+            let _ = p1_send_preconfig_and_start(
+                &socket,
+                ps_wire_total,
+                receivers_fallback,
+                frequency_hz.load(Ordering::Relaxed),
+                sample_rate.load(Ordering::Relaxed),
+                is_hermes_lite,
+                rx_attenuation.load(Ordering::Relaxed) as u8,
+                ps_tx_attenuation.load(Ordering::Relaxed) as u8,
+                num_adcs,
+                diversity_enabled.load(Ordering::Relaxed),
+                now_puresignal_enabled,
+                &tx_iq,
+                mic_ptt_enabled.load(Ordering::Relaxed),
+                mic_bias_enabled.load(Ordering::Relaxed),
+                mic_ptt_on_tip.load(Ordering::Relaxed),
+            );
+            last_puresignal_enabled = now_puresignal_enabled;
             next_send = Instant::now(); // resync pacing after the burst
         }
 
@@ -2216,7 +2340,7 @@ fn sender_loop(
             &extra_adcs,
             now_diversity_enabled,
             &tx_iq,
-            ps_wire_total.is_some(),
+            now_puresignal_enabled,
             &rx_audio_to_radio,
             send_rx_audio,
             &mut rx_audio_pacer,
@@ -2818,12 +2942,15 @@ fn start_protocol2(
     diversity_gain_db: Arc<AtomicU32>,
     diversity_phase_deg: Arc<AtomicU32>,
     diversity_main_raw_iq: Arc<Mutex<VecDeque<IqSample>>>,
+    // Live -- see RadioSession::puresignal_enabled's doc comment.
+    puresignal_enabled: Arc<AtomicBool>,
 ) -> io::Result<RadioSession> {
     // PureSignal (P2): see ps_feedback_config's doc comment. DDC0/DDC1
     // are reserved ahead of real receivers, which start at DDC2 instead
     // of DDC0 (p2_sender_loop/p2_receiver_loop) -- so real-receiver
     // capacity (and therefore the "Add Receiver" UI cap, which derives
-    // from iq_buffers.len()) is reduced by 2 here when PS is active.
+    // from iq_buffers.len()) is reduced by 2 here on any board that
+    // supports PS.
     //
     // BUG FIX: this used to leave `settings.receivers` (from the
     // board's discovery reply) unreduced, on the wrong assumption that
@@ -2837,9 +2964,15 @@ fn start_protocol2(
     // `max_real_receivers`), which also never allows zero real
     // receivers even on boards where PS's fixed reservation would
     // otherwise imply it.
-    let puresignal_enabled =
-        settings.puresignal_enabled && ps_feedback_config(2, device.board).is_some();
-    let mut real_receivers = if puresignal_enabled {
+    //
+    // BUG FIX (round 2): this used to also gate on `settings.
+    // puresignal_enabled`, reserving DDC0/DDC1 only for sessions that
+    // started with PS already on -- see start_protocol1's ps_config doc
+    // comment for why that's exactly what made a live toggle impossible.
+    // `ps_supported` is board support only now, independent of PS's
+    // initial (or current) on/off state.
+    let ps_supported = ps_feedback_config(2, device.board).is_some();
+    let mut real_receivers = if ps_supported {
         settings.receivers.max(1).saturating_sub(2).max(1)
     } else {
         settings.receivers.max(1)
@@ -2932,6 +3065,8 @@ fn start_protocol2(
     let is_orion2 = device.board == Boards::Orion2;
     // Live -- see RadioSession::diversity_enabled's doc comment.
     let sender_diversity_enabled = Arc::clone(&diversity_enabled);
+    // Live -- see RadioSession::puresignal_enabled's doc comment.
+    let sender_puresignal_enabled = Arc::clone(&puresignal_enabled);
     let sender_thread = thread::spawn(move || {
         p2_sender_loop(
             sender_socket,
@@ -2950,7 +3085,7 @@ fn start_protocol2(
             sender_tx_power_watts,
             sender_pa_gain_db,
             sender_hp_request,
-            puresignal_enabled,
+            sender_puresignal_enabled,
             sender_ps_tx_attenuation,
             sender_mic_ptt_enabled,
             sender_mic_bias_enabled,
@@ -2994,6 +3129,8 @@ fn start_protocol2(
     // Live -- see RadioSession::diversity_enabled's doc comment.
     let receiver_diversity_enabled = Arc::clone(&diversity_enabled);
     let receiver_diversity_main_raw_iq = Arc::clone(&diversity_main_raw_iq);
+    // Live -- see RadioSession::puresignal_enabled's doc comment.
+    let receiver_puresignal_enabled = Arc::clone(&puresignal_enabled);
     let receiver_thread = thread::spawn(move || {
         p2_receiver_loop(
             receiver_socket,
@@ -3006,7 +3143,7 @@ fn start_protocol2(
             receiver_adc1_overload,
             receiver_tx_fifo_underrun,
             receiver_tx_fifo_overrun,
-            puresignal_enabled,
+            receiver_puresignal_enabled,
             receiver_ps_rx_feedback_iq,
             receiver_ps_tx_feedback_iq,
             receiver_radio_mic_audio,
@@ -3046,6 +3183,7 @@ fn start_protocol2(
         diversity_gain_db,
         diversity_phase_deg,
         diversity_main_raw_iq,
+        puresignal_enabled,
         tx_power_watts,
         pa_gain_db,
         tx_forward_power,
@@ -3101,15 +3239,20 @@ fn p2_general_packet(seq: u32, num_adcs: u8) -> [u8; P2_GENERAL_PACKET_SIZE] {
     p
 }
 
-/// `ps_mox_gate`: `Some(mox_on)` when PureSignal is active -- the
-/// caller (p2_sender_loop) has then prepended 2 entries to
-/// sample_rates_hz/adcs for DDC0 (RX-feedback)/DDC1 (TX-feedback)
-/// ahead of any real receivers. Confirmed against piHPSDR's
-/// new_protocol.c PS-specific branch: those two DDCs' enable bits are
-/// gated on MOX (only stream feedback while transmitting, unlike real
-/// receivers which stay enabled regardless), and a "sync DDC1 to
-/// DDC0" flag at byte 1363 is required since DDC1 has no independent
-/// enable bit of its own -- it only streams by riding DDC0's.
+/// `ps_mox_gate`: `Some(should_stream)` whenever the caller has
+/// prepended 2 entries to sample_rates_hz/adcs for DDC0 (RX-feedback)/
+/// DDC1 (TX-feedback) ahead of any real receivers -- on P2 this is
+/// unconditional (see start_protocol2's ps_supported doc comment: wire
+/// capacity is always reserved), so in practice `p2_sender_loop` always
+/// passes `Some`, with `should_stream` itself carrying PureSignal's live
+/// on/off flag ANDed with MOX (`None` is only reachable if some future
+/// change reintroduces a genuinely-no-capacity-reserved case). Confirmed
+/// against piHPSDR's new_protocol.c PS-specific branch: those two DDCs'
+/// enable bits are gated on MOX (only stream feedback while
+/// transmitting, unlike real receivers which stay enabled regardless),
+/// and a "sync DDC1 to DDC0" flag at byte 1363 is required since DDC1
+/// has no independent enable bit of its own -- it only streams by
+/// riding DDC0's.
 fn p2_ddc_specific_packet(
     seq: u32,
     sample_rates_hz: &[u32],
@@ -3544,11 +3687,16 @@ fn p2_sender_loop(
     tx_power_watts: Arc<AtomicU32>,
     pa_gain_db: Arc<AtomicU32>,
     hp_request: Arc<AtomicBool>,
-    // PureSignal -- see ps_feedback_config's doc comment. When true,
-    // DDC0/DDC1 are reserved for feedback (RX-feedback/TX-feedback
-    // respectively) ahead of any real receivers -- confirmed universal
-    // on P2 regardless of board, unlike P1's board-dependent table.
-    puresignal_enabled: bool,
+    // PureSignal -- see ps_feedback_config's doc comment. DDC0/DDC1's
+    // config-table entries (frequency/rate/adc) are now sent
+    // UNCONDITIONALLY on any board that supports PS (confirmed universal
+    // on P2 regardless of board, unlike P1's board-dependent table) --
+    // wire capacity for them is reserved for the whole session, see
+    // start_protocol2's ps_supported doc comment. This flag's LIVE value
+    // (read fresh each cycle, same treatment as diversity_enabled just
+    // below) only controls DDC0/DDC1's *enable bits* -- whether they're
+    // actually streaming right now -- via ps_mox_gate below.
+    puresignal_enabled: Arc<AtomicBool>,
     // See RadioSession::ps_tx_attenuation's doc comment.
     ps_tx_attenuation: Arc<AtomicU32>,
     // See RadioSession::mic_ptt_enabled/mic_bias_enabled/mic_ptt_on_tip's
@@ -3653,14 +3801,23 @@ fn p2_sender_loop(
         // pushed to DDC2+ as a result -- see p2_ddc_specific_packet's
         // ps_mox_gate param for how their enable bits get gated on MOX
         // separately from these two.
-        if puresignal_enabled {
-            freqs.push(tx_freq_hz);
-            rates.push(192_000);
-            adcs.push(0);
-            freqs.push(tx_freq_hz);
-            rates.push(192_000);
-            adcs.push(num_adcs as u32);
-        }
+        //
+        // BUG FIX: this used to be gated on `puresignal_enabled`
+        // (skipped entirely while off), matching the old "wire capacity
+        // only reserved when PS starts enabled" scheme -- see
+        // start_protocol2's ps_supported doc comment for why that broke
+        // a live toggle. Sent unconditionally now (P2's ps_feedback_config
+        // has no board exclusion at all, unlike P1's), same as how DDC1's
+        // config-table entry is already sent unconditionally for
+        // Diversity regardless of whether diversity_enabled is currently
+        // true -- only the ENABLE bits (ps_mox_gate below) depend on the
+        // live flag.
+        freqs.push(tx_freq_hz);
+        rates.push(192_000);
+        adcs.push(0);
+        freqs.push(tx_freq_hz);
+        rates.push(192_000);
+        adcs.push(num_adcs as u32);
         let main_freq = frequency_hz.load(Ordering::Relaxed);
         let main_adc = adc.load(Ordering::Relaxed);
         // RX2/Alex1 bandpass filter frequency -- see p2_sender_loop's
@@ -3720,7 +3877,22 @@ fn p2_sender_loop(
             tx_power_watts.load(Ordering::Relaxed) as f32,
             f32::from_bits(pa_gain_db.load(Ordering::Relaxed)),
         );
-        let ps_mox_gate = puresignal_enabled.then_some(mox_on);
+        // BUG FIX: this used to be `puresignal_enabled.then_some(mox_on)`
+        // with `puresignal_enabled` meaning "wire capacity reserved at
+        // all" (only true for sessions that started with PS on) -- so
+        // `None` meant DDC0/DDC1 genuinely weren't in `rates`/`adcs` and
+        // p2_ddc_specific_packet's None branch (enable ALL n DDCs) was
+        // correct. Now that DDC0/DDC1's config-table entries are always
+        // present when wire capacity is reserved (P2 always reserves it,
+        // see start_protocol2's ps_supported doc comment), `Some(...)`
+        // must stay the live-reserved indicator regardless of PS's
+        // current on/off state -- otherwise p2_ddc_specific_packet's
+        // None branch would incorrectly enable DDC0/DDC1's bits too
+        // (they're now 2 of the `n` entries it counts) whenever PS is
+        // simply toggled off. The inner bool -- whether DDC0's enable
+        // bit/sync byte should actually be active right now -- is what
+        // carries the live on/off + MOX state instead.
+        let ps_mox_gate = Some(puresignal_enabled.load(Ordering::Relaxed) && mox_on);
         let ps_tx_atten = ps_tx_attenuation.load(Ordering::Relaxed) as u8;
 
         if due_for_keepalive {
@@ -3806,14 +3978,16 @@ fn p2_receiver_loop(
     adc1_overload: Arc<AtomicBool>,
     tx_fifo_underrun: Arc<AtomicBool>,
     tx_fifo_overrun: Arc<AtomicBool>,
-    // PureSignal -- see p2_sender_loop's matching doc comment. When
-    // true, DDC0's IQ (source port P2_DDC0_IQ_PORT) is diverted into
-    // BOTH feedback queues at once (see p2_parse_ps_feedback_packet's
-    // doc comment -- DDC0 alone carries both feedback streams
-    // interleaved; DDC1 is never independently enabled) instead of
-    // `buffers`, which is sized to real receivers only and indexed 2
-    // lower (DDC2 -> buffers[0], DDC3 -> buffers[1], ...).
-    puresignal_enabled: bool,
+    // PureSignal -- see p2_sender_loop's matching doc comment. DDC0/
+    // DDC1's wire positions are permanently reserved on P2 (ddc_reserved
+    // below is unconditionally 2), so this live flag no longer affects
+    // the port-to-buffer-index mapping at all -- only whether DDC0's IQ
+    // actually gets diverted into the feedback queues (see
+    // p2_parse_ps_feedback_packet's doc comment -- DDC0 alone carries
+    // both feedback streams interleaved; DDC1 is never independently
+    // enabled) versus just being dropped (harmless: nothing else is
+    // indexed at DDC0/DDC1 while they're reserved).
+    puresignal_enabled: Arc<AtomicBool>,
     ps_rx_feedback_iq: Arc<Mutex<VecDeque<IqSample>>>,
     ps_tx_feedback_iq: Arc<Mutex<VecDeque<IqSample>>>,
     radio_mic_audio: Arc<Mutex<VecDeque<f32>>>,
@@ -3834,7 +4008,11 @@ fn p2_receiver_loop(
     // isn't turning it into spectrum/waterfall pixels" (a WDSP-side
     // issue -- see SpectrumAnalyzer::open's XCreateAnalyzer success
     // check and demod()'s fexchange0 error check).
-    let ddc_reserved = if puresignal_enabled { 2 } else { 0 };
+    // Unconditional now -- see start_protocol2's ps_supported doc
+    // comment: P2 always reserves DDC0/DDC1's wire positions regardless
+    // of PureSignal's live on/off state, so real receivers always start
+    // at DDC2.
+    let ddc_reserved: usize = 2;
     let mut ddc_seen = vec![false; buffers.len() + ddc_reserved];
     // BUG FIX: forward/reverse power used to be stored as the single
     // latest raw per-packet ADC reading, with only a UI-frame-rate
@@ -3871,7 +4049,7 @@ fn p2_receiver_loop(
                     }
                     if n == P2_PACKET_SIZE {
                         let capacity = iq_buffer_capacity_for_rate(sample_rate.load(Ordering::Relaxed));
-                        if puresignal_enabled && ddc == 0 {
+                        if puresignal_enabled.load(Ordering::Relaxed) && ddc == 0 {
                             // See p2_parse_ps_feedback_packet's doc comment --
                             // DDC0 alone carries both feedback streams,
                             // interleaved. DDC1 (ddc == 1) is never
@@ -3894,10 +4072,13 @@ fn p2_receiver_loop(
                         } else {
                             p2_parse_ddc_iq_packet(&buf[..n], &buffers[ddc - ddc_reserved], capacity);
                         }
-                    } else if puresignal_enabled && ddc == 0 {
+                    } else if ddc == 0 {
                         // Packet arrived the wrong size (rare -- e.g. a
                         // truncated/corrupt UDP datagram); nothing to
-                        // parse, drop it.
+                        // parse, drop it. DDC0's wire position is always
+                        // reserved now (see ddc_reserved above), so this
+                        // no longer needs to also check the live flag --
+                        // it's a no-op either way.
                     }
                 } else if port == P2_HP_STATUS_SOURCE_PORT {
                     // Confirmed by the user: the radio's own

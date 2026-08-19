@@ -187,12 +187,14 @@ pub struct TxDisplay {
 
 /// PureSignal calibration controls (Settings -> PureSignal), applied
 /// live each chunk while transmitting -- see TxProcessor::apply_ps_params.
-/// Distinct from RadioSettings::puresignal_enabled, which only gates
-/// whether the feedback-receiver wire plumbing gets requested at
-/// connect time and can't be toggled without reconnecting; `enabled`
-/// here is a live on/off for the WDSP engine itself, meaningful only
-/// when the session was actually connected with puresignal_enabled
-/// (otherwise there's no feedback data for it to do anything with).
+/// Distinct from TxHandle::puresignal_enabled (mirroring RadioSession::
+/// puresignal_enabled -- both live now, see that field's doc comment):
+/// this struct's own `enabled` is PureSignal's live on/off for the WDSP
+/// engine itself, meaningful only while the session's feedback-receiver
+/// wire plumbing is actually reserved -- which, since it's now reserved
+/// unconditionally for the whole session on any board that supports it,
+/// just means "this radio/board combination supports PureSignal at all",
+/// not "PureSignal happened to be on when this session connected".
 #[derive(Copy, Clone)]
 pub struct PsParams {
     /// true = continuous auto-calibrate (`SetPSControl(ch,0,0,1,0)`,
@@ -1257,7 +1259,10 @@ fn run(
     protocol: u8,
     mic_rate: i32,
     duc_rate: i32,
-    puresignal_enabled: bool,
+    // Live -- see RadioSession::puresignal_enabled's doc comment (radio.rs)
+    // for the full story on why this is now an Arc<AtomicBool> read fresh
+    // each chunk instead of a bool baked in for this thread's lifetime.
+    puresignal_enabled: Arc<AtomicBool>,
     ps_rx_feedback_iq: Arc<Mutex<VecDeque<IqSample>>>,
     ps_tx_feedback_iq: Arc<Mutex<VecDeque<IqSample>>>,
     ps_params: Arc<Mutex<PsParams>>,
@@ -1355,7 +1360,7 @@ fn run(
             mic_buffer.lock().unwrap().clear();
             tci_tx_audio.lock().unwrap().clear();
             radio_mic_audio.lock().unwrap().clear();
-            if puresignal_enabled {
+            if puresignal_enabled.load(Ordering::Relaxed) {
                 // Same reasoning as the mic/TCI clears above -- a
                 // feedback backlog from before this idle period is
                 // stale by the time the next PTT starts.
@@ -1371,7 +1376,7 @@ fn run(
             next_chunk = Instant::now();
             continue;
         }
-        if puresignal_enabled {
+        if puresignal_enabled.load(Ordering::Relaxed) {
             // set_ps_mox(true) is what (re)starts feedback streaming --
             // send it as soon as MOX goes active, same as before. Only
             // apply_ps_params (which can turn PS ON) waits for the
@@ -1526,7 +1531,7 @@ fn run(
             exch_errors_this_window = 0;
         }
 
-        if puresignal_enabled {
+        if puresignal_enabled.load(Ordering::Relaxed) {
             // Pairs, not raw floats -- iq is interleaved I,Q,I,Q,...
             let pairs_needed = iq.len() / 2;
             if let Some((mut itx, mut qtx, mut irx, mut qrx)) =
@@ -1610,6 +1615,15 @@ pub struct TxHandle {
     /// wrong in the source audio" from "introduced downstream in
     /// hpsdr-rs's own processing".
     pub tx_audio_monitor: Arc<Mutex<VecDeque<f32>>>,
+    /// Live -- see RadioSession::puresignal_enabled's doc comment
+    /// (radio.rs) for the full story. Mirrors that same flag on the TX
+    /// side: WDSP's PS engine is always created (TxProcessor::open, see
+    /// its own doc comment), this just controls whether run()'s per-chunk
+    /// loop actually drives it (SetPSMox/SetPSControl/feed_ps) or leaves
+    /// it idle. Set via TxHandle::set_puresignal_enabled -- normally in
+    /// lockstep with RadioSession::set_puresignal_enabled (main.rs's PS
+    /// checkbox calls both).
+    puresignal_enabled: Arc<AtomicBool>,
     params: Arc<Mutex<TxParams>>,
     ps_params: Arc<Mutex<PsParams>>,
     stop: Arc<AtomicBool>,
@@ -1661,6 +1675,8 @@ impl TxHandle {
         let ps_params = Arc::new(Mutex::new(PsParams::default()));
         let ps_status = Arc::new(Mutex::new(PsStatus::default()));
         let tx_audio_monitor = Arc::new(Mutex::new(VecDeque::with_capacity(TX_AUDIO_MONITOR_CAPACITY)));
+        // Live -- see TxHandle::puresignal_enabled's doc comment.
+        let puresignal_enabled = Arc::new(AtomicBool::new(puresignal_enabled));
         let stop = Arc::new(AtomicBool::new(false));
 
         let thread = {
@@ -1669,6 +1685,7 @@ impl TxHandle {
             let ps_params = Arc::clone(&ps_params);
             let ps_status = Arc::clone(&ps_status);
             let tx_audio_monitor = Arc::clone(&tx_audio_monitor);
+            let puresignal_enabled = Arc::clone(&puresignal_enabled);
             let stop = Arc::clone(&stop);
             thread::spawn(move || {
                 run(
@@ -1684,6 +1701,7 @@ impl TxHandle {
             display,
             ps_status,
             tx_audio_monitor,
+            puresignal_enabled,
             params,
             ps_params,
             stop,
@@ -1736,6 +1754,12 @@ impl TxHandle {
     }
     pub fn set_ps_enabled(&self, enabled: bool) {
         self.ps_params.lock().unwrap().enabled = enabled;
+    }
+    /// Live toggle mirroring RadioSession::set_puresignal_enabled --
+    /// main.rs's PS checkbox calls both together. See TxHandle::
+    /// puresignal_enabled's doc comment.
+    pub fn set_puresignal_enabled(&self, enabled: bool) {
+        self.puresignal_enabled.store(enabled, Ordering::SeqCst);
     }
     /// Triggers one single-shot manual calibration -- see
     /// PsParams::calibrate_request's doc comment for why this is a

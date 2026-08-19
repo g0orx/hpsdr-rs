@@ -461,13 +461,12 @@ impl HpsdrApp {
 /// Builds a fresh `ConnectedState` for `device`, applying every saved
 /// setting from `cfg` -- the full connect sequence (RadioSession,
 /// SpectrumHandle, AudioOutput, rigctl/TCI, extra receivers, TX chain).
-/// Used both for the initial discovery -> connect transition and to
-/// rebuild the whole session in place when a setting that can't be
-/// changed live needs a fresh connect to apply -- currently just
-/// PureSignal's enable/disable, since it changes the wire-level
-/// receiver/DDC layout `RadioSession::start` negotiates once at
-/// connect time (see the PureSignal checkbox handler's
-/// `ps_reconnect_requested` for the call site).
+/// Only called from the initial discovery -> connect transition now --
+/// PureSignal's enable/disable (formerly the one setting that needed a
+/// full reconnect to apply, since it changed the wire-level receiver/DDC
+/// layout `RadioSession::start` negotiates once at connect time) is a
+/// true live toggle on both protocols now, same as Diversity already
+/// was -- see `RadioSession::puresignal_enabled`'s doc comment (radio.rs).
 fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, String> {
     let mut settings = RadioSettings::default();
     if let Some(sr) = cfg.sample_rate {
@@ -906,15 +905,6 @@ impl eframe::App for HpsdrApp {
             self.ignore_interaction_until = None;
         }
 
-        // Set (from deep inside the Connected arm, via connect_error)
-        // when a PS-toggle-triggered reconnect fails -- can't assign
-        // self.state directly from there since `connected` still
-        // borrows it at that point. Checked once after the whole match
-        // below, same reasoning as stop_clicked/retry_clicked's own
-        // deferred-to-end-of-arm handling, just one level further out
-        // since this needs to switch to a DIFFERENT enum variant than
-        // the arm it's set from.
-        let mut connect_error: Option<String> = None;
         match &mut self.state {
             AppState::Discovering(window) => match window.show(ui) {
                 DiscoveryAction::Start(device) => {
@@ -1117,14 +1107,6 @@ impl eframe::App for HpsdrApp {
 
                 let mut stop_clicked = false;
                 let mut settings_changed = false;
-                // Set when the "Enable PureSignal" checkbox changes --
-                // see its own handler below and the teardown+rebuild
-                // near stop_clicked's own handling for why this can't
-                // just be a live setting (it changes the wire-level
-                // receiver/DDC layout RadioSession::start negotiates
-                // once at connect time).
-                let mut ps_reconnect_requested = false;
-
                 egui::CentralPanel::default().show(ui, |ui| {
                     ui.add_space(4.0);
                     let freq_label = ui
@@ -3204,15 +3186,27 @@ impl eframe::App for HpsdrApp {
                                         {
                                             connected.puresignal_enabled = puresignal_enabled;
                                             settings_changed = true;
-                                            ps_reconnect_requested = true;
+                                            // Live toggle -- see RadioSession::
+                                            // puresignal_enabled's doc comment (radio.rs).
+                                            // Both calls needed: the radio-side wire
+                                            // flag (session) and the TX-chain WDSP
+                                            // engine flag (tx_handle) are independent
+                                            // live flags that both need to move together.
+                                            connected.session.set_puresignal_enabled(puresignal_enabled);
+                                            if let Some(tx) = &connected.tx_handle {
+                                                tx.set_puresignal_enabled(puresignal_enabled);
+                                            }
                                         }
                                     });
                                     if connected.diversity_enabled {
                                         ui.weak("Disabled while Diversity is enabled (Settings -> Diversity).");
                                     }
                                     ui.weak(
-                                        "Reserves 2 extra feedback receivers from the radio -- \
-                                         changing this briefly reconnects to apply.",
+                                        "Instant -- no reconnect needed. This radio/board \
+                                         permanently reserves 2 feedback receivers for \
+                                         PureSignal (reducing \"Add Receiver\" capacity by 2) \
+                                         whether or not it's currently enabled, so toggling \
+                                         here can't drop your rigctl/TCI connections.",
                                     );
 
                                     if connected.puresignal_enabled {
@@ -3700,46 +3694,6 @@ impl eframe::App for HpsdrApp {
                     connected.spectrum.stop();
                     let ctx = ui.ctx().clone();
                     self.state = AppState::Discovering(DiscoveryWindow::new(&ctx));
-                } else if ps_reconnect_requested {
-                    // Full teardown -- matching stop_clicked's own
-                    // explicit-stop-before-drop discipline just above,
-                    // for PureSignal's own wire-level receiver/DDC layout
-                    // change (SpectrumHandle channels and rigctl/TCI's
-                    // bound ports both need the OLD one actually gone
-                    // before connect_to_device opens/binds a new one, not
-                    // just eventually-dropped via *connected being
-                    // overwritten below). Rebuilds from the config the
-                    // settings_changed save above (this same frame)
-                    // already wrote to disk, which already reflects the
-                    // new puresignal_enabled. Diversity no longer needs
-                    // this at all -- see its checkbox handler, a live
-                    // toggle on both protocols now.
-                    connected.session.stop();
-                    connected.spectrum.stop();
-                    connected.tx_spectrum.stop();
-                    for rx in &connected.extra_receivers {
-                        rx.lock().unwrap().spectrum.stop();
-                    }
-                    connected.extra_receivers.clear();
-                    connected.tx_handle = None;
-                    connected.mic_input = None;
-                    connected.audio_output = None;
-                    connected.tx_audio_monitor_output = None;
-                    connected.rigctl_server = None;
-                    connected.tci_server = None;
-                    let device = connected.device;
-                    let cfg = Config::load(device.mac);
-                    match connect_to_device(device, &cfg) {
-                        Ok(new_connected) => *connected = new_connected,
-                        // Old session is already fully torn down above;
-                        // the whole ConnectedState is about to be
-                        // replaced by AppState::Error via connect_error
-                        // (set here since self.state can't be assigned
-                        // directly while `connected` still borrows it),
-                        // so leaving `connected` in this stopped state
-                        // is harmless.
-                        Err(e) => connect_error = Some(e),
-                    }
                 }
             }
             AppState::Error(message) => {
@@ -3758,9 +3712,6 @@ impl eframe::App for HpsdrApp {
                     self.state = AppState::Discovering(DiscoveryWindow::new(&ctx));
                 }
             }
-        }
-        if let Some(e) = connect_error {
-            self.state = AppState::Error(e);
         }
     }
 }
