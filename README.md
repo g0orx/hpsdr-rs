@@ -52,8 +52,9 @@ need to change. Two Windows toolchains are supported:
 
 **Windows via MSVC:**
 - Visual Studio Build Tools (C++ workload) — needed for any `x86_64-pc-windows-msvc`-target Rust build regardless of this project
-- [vcpkg](https://vcpkg.io/), with `vcpkg install fftw3:x64-windows`, and either `VCPKG_ROOT` set to your vcpkg checkout or `vcpkg integrate install` run once
+- [vcpkg](https://vcpkg.io/), with `vcpkg install fftw3:x64-windows-static` (the `vcpkg` crate defaults to looking for the static triplet; static linking also means no `fftw3.dll` to ship alongside the built `.exe`), and either `VCPKG_ROOT` set to your vcpkg checkout or `vcpkg integrate install` run once
 - No `PATH`/pkg-config setup needed — `build.rs` talks to vcpkg and locates MSVC directly
+- Confirmed building successfully this way (2026-08-19); runtime behavior on Windows not yet fully verified
 
 WDSP and its noise-reduction dependencies (libspecbleach, rnnoise) are vendored as C source under `vendor/` and built automatically from source by `build.rs` (via the `cc` crate) — no separate build step, and no prebuilt platform-specific binaries to obtain or keep in sync.
 
