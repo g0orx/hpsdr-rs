@@ -32,9 +32,23 @@ enum ZeroPaddingType {
 };
 
 // Compile-time validation of enum values
+//
+// BUG FIX (hpsdr-rs, Windows/MSVC port): skipped under MSVC -- its C11/
+// C17 _Static_assert support has a known limitation at file/global
+// scope (outside a function or struct), confirmed by a real MSVC build
+// failure here ("missing '(' before ')'", not a clean "unrecognized
+// keyword" error, matching that known limitation rather than a missing
+// /std: flag -- already tried /std:c11 with no change). These three
+// checks are a pure compile-time sanity check against the hardcoded
+// literal values two lines above, not functionally load-bearing, so
+// skipping them under MSVC specifically is a safe, narrowly-scoped
+// compatibility patch rather than a functional change. GCC/Clang
+// (MinGW-w64 and Linux) keep the real checks unchanged.
+#ifndef _MSC_VER
 _Static_assert(NEXT_POWER_OF_TWO == 0, "NEXT_POWER_OF_TWO must be 0");
 _Static_assert(FIXED_AMOUNT == 1, "FIXED_AMOUNT must be 1");
 _Static_assert(NO_PADDING == 2, "NO_PADDING must be 2");
+#endif
 
 typedef enum ZeroPaddingType ZeroPaddingType;
 
