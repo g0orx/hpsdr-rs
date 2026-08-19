@@ -211,6 +211,15 @@ fn main() {
     build.flag_if_supported("-D_GNU_SOURCE");
     build.flag_if_supported("-Wno-parentheses");
     build.flag_if_supported("-march=native");
+    // BUG FIX: MSVC's cl.exe, with no explicit /std: flag, defaults to a
+    // pre-C11 dialect and doesn't recognize `_Static_assert` -- confirmed
+    // by a real build failure on libspecbleach's fft_transform.h, which
+    // uses it. GCC/Clang never hit this (they've always recognized
+    // _Static_assert as an extension regardless of -std=, in every
+    // dialect), so this only matters for the MSVC path -- flag_if_supported
+    // means it's silently skipped there anyway if it were ever passed to
+    // a compiler that doesn't understand /std: syntax at all.
+    build.flag_if_supported("/std:c11");
 
     for path in fftw_include_paths {
         build.include(path);
