@@ -38,8 +38,9 @@ Click anywhere on a row to select it -- the whole row highlights. Only
 **Available** radios can be selected and started; a radio already **In Use**
 (by another client, or another instance of this app) is shown but disabled.
 
-If exactly one radio is found, it's selected automatically as soon as
-results land, so you can usually just click **Start**.
+The first **Available** radio in the list is selected automatically as
+soon as results land (skipping over any radio already **In Use**), so you
+can usually just click **Start**.
 
 **Rediscover** clears the current list and scans again -- useful if your
 radio was slow to respond or you just powered it on.

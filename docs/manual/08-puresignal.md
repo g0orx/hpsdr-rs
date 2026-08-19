@@ -12,9 +12,12 @@ only one can be enabled at a time.
 
 ## Enabling
 
-Check **Enable PureSignal**. This reserves two extra feedback receivers
-from the radio and briefly reconnects to apply -- unlike most settings in
-this app, it isn't fully live.
+Check **Enable PureSignal**. This takes effect immediately -- no
+reconnect needed, and it can be toggled on/off freely. Note that on a
+PureSignal-capable radio, the two feedback receivers PureSignal needs are
+reserved for the whole session as soon as you connect, whether or not
+PureSignal is actually enabled -- so [Extra Receivers](11-extra-receivers.md)'
+maximum count is 2 lower than the radio's full capacity on any such radio.
 
 Once enabled (and TX armed), the rest of this tab's controls appear:
 

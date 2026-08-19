@@ -20,9 +20,9 @@ extra receiver behind the scenes.
 
 ## Enabling
 
-Check **Enable Diversity**. Unlike PureSignal, this takes effect
-immediately -- no reconnect needed, and it can be toggled on/off freely
-while listening.
+Check **Enable Diversity**. This takes effect immediately -- no reconnect
+needed, and it can be toggled on/off freely while listening (same as
+PureSignal).
 
 Once enabled, two sliders appear:
 

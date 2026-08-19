@@ -15,6 +15,11 @@ window titled **Receiver N** opens. This button disappears (replaced by
 **All N receivers active**) once you've reached the radio's maximum
 receiver count.
 
+On a [PureSignal](08-puresignal.md)-capable radio, "max" here is 2 lower
+than the radio's full receiver capacity -- PureSignal's two feedback
+receivers are reserved for the whole session as soon as you connect,
+whether or not PureSignal is actually enabled.
+
 ![An extra receiver's own window](images/11-extra-receiver-window.png)
 
 ## Using an extra receiver window
