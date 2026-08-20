@@ -1123,6 +1123,12 @@ impl eframe::App for HpsdrApp {
                 let mut settings_changed = false;
                 egui::CentralPanel::default().show(ui, |ui| {
                     ui.add_space(4.0);
+                    // Red while transmitting -- a clear, glanceable
+                    // "you're on the air" signal right where the eye
+                    // already goes to read the frequency, not just the
+                    // separate TRANSMITTING label elsewhere in the row.
+                    let freq_color =
+                        if transmitting { egui::Color32::RED } else { egui::Color32::GREEN };
                     let freq_label = ui
                         .add(
                             egui::Label::new(
@@ -1130,7 +1136,7 @@ impl eframe::App for HpsdrApp {
                                     .monospace()
                                     .size(28.0)
                                     .strong()
-                                    .color(egui::Color32::GREEN),
+                                    .color(freq_color),
                             )
                             .sense(egui::Sense::hover()),
                         )
