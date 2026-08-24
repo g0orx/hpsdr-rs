@@ -5459,10 +5459,19 @@ fn main() -> eframe::Result<()> {
     // deliberate margin rather than an exact fit, since content height
     // varies a little with things like whether TX is armed (extra
     // Mic gain/TX Power controls on the Audio gain row).
+    // Window/taskbar icon -- also the source PNG for the .desktop entry's
+    // app-menu icon installed by `cargo deb` (see assets/icons/hpsdr-rs.png
+    // and assets/hpsdr-rs.desktop). Embedded at compile time so the running
+    // app always shows an icon even when launched via `cargo run` outside
+    // any package install.
+    let icon = eframe::icon_data::from_png_bytes(include_bytes!("../assets/icons/hpsdr-rs.png"))
+        .expect("bundled icon PNG failed to decode");
+
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1200.0, 660.0])
-            .with_min_inner_size([900.0, 520.0]),
+            .with_min_inner_size([900.0, 520.0])
+            .with_icon(icon),
         ..Default::default()
     };
     eframe::run_native(

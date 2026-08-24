@@ -3,6 +3,9 @@ name = "hpsdr-rs"
 version = "0.1.0"
 edition = "2021"
 license = "GPL-2.0-or-later"
+authors = ["John Melton <john.d.melton@googlemail.com>"]
+description = "Desktop client for openHPSDR Protocol 1/2 SDR radios"
+repository = "https://github.com/g0orx/hpsdr-rs"
 
 [dependencies]
 # default-features disabled specifically to drop "accesskit" (Linux
@@ -51,3 +54,32 @@ pkg-config = "0.3"
 # robust than fighting pkg-config's cross-compilation guard and PATH
 # resolution for what's ultimately the same vcpkg install).
 vcpkg = "0.2"
+
+# `cargo deb` (https://crates.io/crates/cargo-deb) reads this to build a
+# .deb -- Linux only, hence no attempt to also cover Windows/macOS
+# packaging here. `depends` is left as the default "$auto": cargo-deb runs
+# dpkg-shlibdeps against the built binary to work out the real runtime
+# shared-lib dependencies (libfftw3-3, libasound2, libx11-6/libwayland,
+# etc.) rather than this list drifting out of sync by hand.
+[package.metadata.deb]
+maintainer = "John Melton <john.d.melton@googlemail.com>"
+copyright = "2026, John Melton <john.d.melton@googlemail.com>"
+license-file = ["LICENSE", "4"]
+extended-description = """\
+hpsdr-rs is a desktop client for openHPSDR Protocol 1 and Protocol 2 \
+software-defined radios (Metis/Ozy-style and Hermes/Orion-style boards, \
+including the ANAN series), using WDSP for DSP. \
+Features include spectrum/waterfall display, multiple simultaneous \
+receivers, PureSignal PA linearization, diversity reception, a graphic \
+equalizer, and rigctl/TCI control servers for use with WSJT-X and similar \
+digital-mode software."""
+section = "hamradio"
+priority = "optional"
+assets = [
+    ["target/release/hpsdr-rs", "usr/bin/", "755"],
+    ["README.md", "usr/share/doc/hpsdr-rs/README.md", "644"],
+    ["docs/manual/*.md", "usr/share/doc/hpsdr-rs/manual/", "644"],
+    ["docs/manual/images/*", "usr/share/doc/hpsdr-rs/manual/images/", "644"],
+    ["assets/hpsdr-rs.desktop", "usr/share/applications/hpsdr-rs.desktop", "644"],
+    ["assets/icons/hpsdr-rs.png", "usr/share/icons/hicolor/256x256/apps/hpsdr-rs.png", "644"],
+]

@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=hpsdr-rs
+Comment=Desktop client for openHPSDR Protocol 1/2 SDR radios
+Exec=hpsdr-rs
+Icon=hpsdr-rs
+Terminal=false
+Categories=HamRadio;Network;
+Keywords=SDR;HPSDR;Ham Radio;Amateur Radio;Software Defined Radio;
