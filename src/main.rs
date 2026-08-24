@@ -938,12 +938,16 @@ impl eframe::App for HpsdrApp {
                 // in-UI heading -- frees up vertical space for the
                 // spectrum/waterfall, which is at a premium in the
                 // main window (see the initial-size note in main()).
-                let window_title = format!(
-                    "hpsdr-rs -- {:?} at {}",
+                // Also reused (with " - RX N" appended) as each extra
+                // receiver window's title further down, so both windows
+                // are identifiable by board/protocol/IP at a glance.
+                let base_title = format!(
+                    "hpsdr-rs -- {:?} (P{}) at {}",
                     connected.device.board,
+                    connected.device.protocol,
                     connected.device.address.ip()
                 );
-                ui.ctx().send_viewport_cmd(egui::ViewportCommand::Title(window_title));
+                ui.ctx().send_viewport_cmd(egui::ViewportCommand::Title(base_title.clone()));
                 // None = not running, Some(false) = listening/idle,
                 // Some(true) = a client is currently connected. Drives
                 // the gray/green/red status text in the main panel.
@@ -2208,7 +2212,7 @@ impl eframe::App for HpsdrApp {
                 for rx in connected.extra_receivers.clone() {
                     let ddc_index = rx.lock().unwrap().ddc_index;
                     let viewport_id = egui::ViewportId::from_hash_of(("extra_receiver", ddc_index));
-                    let title = format!("Receiver {}", ddc_index + 1);
+                    let title = format!("{} - RX {}", base_title, ddc_index + 1);
                     let rx_for_closure = Arc::clone(&rx);
                     ui.ctx().show_viewport_deferred(
                         viewport_id,
