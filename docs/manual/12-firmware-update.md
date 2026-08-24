@@ -96,8 +96,7 @@ reconnected.
 A failed in-application update does **not** reconnect automatically --
 check the error shown before trying again.
 
-(Screenshot needed: the Firmware Update section under Settings -> Network)
-![Firmware Update -- in-application, Settings -> Network](images/12-firmware-update-inapp.png)
+![Firmware Update window -- in-application update](images/12-firmware-update-inapp.png)
 
 ## Both paths
 
