@@ -10,7 +10,7 @@ mod tx;
 mod wdsp_sys;
 
 use audio::{AudioOutput, MicInput};
-use config::{ps_corr_path, Config, ExtraReceiverConfig, WindowGeometry, WindowLayout};
+use config::{ps_corr_path, Config, ExtraReceiverConfig, WindowGeometry};
 use discovery::{Boards, Device};
 use discovery_ui::{DiscoveryAction, DiscoveryWindow};
 use eframe::egui;
@@ -209,10 +209,36 @@ struct ExtraReceiver {
     ctun_frequency_hz: u32,
     open: bool,
     /// This window's current on-screen position/size, refreshed every
-    /// frame it's rendered -- see HpsdrApp::save_window_layout's doc
-    /// comment for why this is tracked continuously rather than read
-    /// only at exit.
+    /// frame it's rendered so the periodic per-radio Config save (see
+    /// ui()'s AppState::Connected arm) always has a current value to
+    /// write back out. Deliberately NOT what seeds the viewport's
+    /// position/size on creation -- see initial_window_geometry's doc
+    /// comment for why a live-changing value can't be used for that.
     window_geometry: Option<WindowGeometry>,
+    /// This radio's saved position/size for this receiver (from
+    /// ExtraReceiverConfig), set once at spawn_extra_receiver time and
+    /// never touched again. Used only to seed the ViewportBuilder that
+    /// creates this window's OS-level viewport.
+    ///
+    /// BUG FIX: this used to reuse the live-tracked window_geometry
+    /// above for that too, rebuilding `.with_position()`/
+    /// `.with_inner_size()` from its current value every frame -- looked
+    /// harmless (a real ViewportBuilder position hint only actually
+    /// moves an already-existing OS window at creation time, confirmed
+    /// by reading eframe's `initialize_window`), but that's not the
+    /// whole story: eframe ALSO diffs each frame's requested builder
+    /// against the previous frame's via `viewport.builder.patch()`
+    /// (glow_integration.rs's `initialize_or_update_viewport`) and
+    /// issues an explicit OuterPosition/InnerSize command for whatever
+    /// changed, even on an existing window. Feeding in a value that's
+    /// different every frame (because it's read from the window's own
+    /// live position) meant every single frame requested a "move" to
+    /// wherever the window was roughly one frame ago -- fighting the
+    /// user's own drag/resize in real time (confirmed via a real
+    /// report: the window kept jumping around while being dragged).
+    /// A seed value that's set once and never changes again is what
+    /// keeps `patch()` from ever seeing a diff after that first frame.
+    initial_window_geometry: Option<WindowGeometry>,
 }
 
 struct ConnectedState {
@@ -464,50 +490,26 @@ struct HpsdrApp {
     // see `ui()`'s doc comment for why a single-frame check isn't
     // enough and this needs to be a short window instead.
     ignore_interaction_until: Option<Instant>,
-    /// Snapshot read once at startup (see main()) -- used only to seed
-    /// each extra receiver's ViewportBuilder with a saved position/size
-    /// the first time its window is created (see the
-    /// show_viewport_deferred call site). The main window's own saved
-    /// geometry is applied even earlier, directly to the initial
-    /// NativeOptions in main(), since that window exists before
-    /// HpsdrApp does.
-    window_layout: WindowLayout,
     /// This window's current on-screen position/size, refreshed every
-    /// frame -- see save_window_layout's doc comment.
+    /// frame (see `ui()`) so it's always ready to persist into the
+    /// connected radio's own Config -- see Config::window_geometry's doc
+    /// comment for why this lives per-radio rather than globally, and
+    /// why it's applied via an explicit ViewportCommand at connect time
+    /// (in the DiscoveryAction::Start handler) instead of a
+    /// ViewportBuilder hint like every other window here: this one
+    /// already exists (it's also the Discovery screen) by the time a
+    /// radio -- and so its saved geometry -- is even known.
     main_window_geometry: Option<WindowGeometry>,
 }
 
 impl HpsdrApp {
-    fn new(ctx: &egui::Context, window_layout: WindowLayout) -> Self {
+    fn new(ctx: &egui::Context) -> Self {
         Self {
             state: AppState::Discovering(DiscoveryWindow::new(ctx)),
             was_focused: true,
             ignore_interaction_until: None,
-            window_layout,
             main_window_geometry: None,
         }
-    }
-
-    /// Writes the main window's and every currently-open extra
-    /// receiver's last-known position/size to disk, so the next launch
-    /// can reopen them in the same place. Called once, when the main
-    /// window's close is requested (see `ui()`) -- geometry itself is
-    /// refreshed every frame *before* that point (both here and in each
-    /// extra receiver's own viewport closure) rather than read fresh
-    /// only at exit, because by the time the root viewport's close is
-    /// requested, child viewports may no longer run their own closure
-    /// this pass to report a final value.
-    fn save_window_layout(&self) {
-        let mut layout = WindowLayout { main: self.main_window_geometry, ..Default::default() };
-        if let AppState::Connected(connected) = &self.state {
-            for rx in &connected.extra_receivers {
-                let rx = rx.lock().unwrap();
-                if let Some(geometry) = rx.window_geometry {
-                    layout.extra_receivers.insert(rx.ddc_index.to_string(), geometry);
-                }
-            }
-        }
-        layout.save();
     }
 }
 
@@ -892,14 +894,16 @@ impl eframe::App for HpsdrApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         // Track this window's current position/size every frame (cheap --
         // just copying floats already computed by egui-winit) so a final
-        // value is always ready by the time the close below fires, rather
-        // than trying to read it fresh in that same last frame. outer_rect
-        // (position, includes window-manager chrome) pairs with
-        // ViewportBuilder::with_position; inner_rect (content size, no
-        // chrome) pairs with with_inner_size -- see main()/
-        // save_window_layout. Both are None on Wayland, but this app
-        // already forces X11 (see main()'s WAYLAND_DISPLAY workaround),
-        // so that doesn't apply here.
+        // value is always ready whenever the periodic per-radio Config
+        // save below actually fires, rather than trying to read it fresh
+        // only in that one frame. outer_rect (position, includes window-
+        // manager chrome) pairs with ViewportBuilder::with_position/
+        // ViewportCommand::OuterPosition; inner_rect (content size, no
+        // chrome) pairs with with_inner_size/InnerSize -- see
+        // Config::window_geometry and the DiscoveryAction::Start handler
+        // below. Both are None on Wayland, but this app already forces
+        // X11 (see main()'s WAYLAND_DISPLAY workaround), so that doesn't
+        // apply here.
         if let (Some(outer), Some(inner)) =
             (ui.input(|i| i.viewport().outer_rect), ui.input(|i| i.viewport().inner_rect))
         {
@@ -985,6 +989,23 @@ impl eframe::App for HpsdrApp {
             AppState::Discovering(window) => match window.show(ui) {
                 DiscoveryAction::Start(device) => {
                     let cfg = Config::load(device.mac);
+                    // Move/resize the main window to wherever it was
+                    // last left for THIS radio -- see
+                    // Config::window_geometry's doc comment for why this
+                    // is an explicit command rather than a
+                    // ViewportBuilder hint (the window already exists).
+                    // Sent once, here, not every frame -- unlike a
+                    // ViewportBuilder field, a ViewportCommand actually
+                    // re-applies every time it's sent, which would fight
+                    // the user moving/resizing the window themselves.
+                    if let Some(g) = cfg.window_geometry {
+                        ui.ctx().send_viewport_cmd(egui::ViewportCommand::OuterPosition(
+                            egui::pos2(g.x, g.y),
+                        ));
+                        ui.ctx().send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(
+                            g.width, g.height,
+                        )));
+                    }
                     match connect_to_device(device, &cfg) {
                         Ok(connected) => self.state = AppState::Connected(connected),
                         Err(e) => self.state = AppState::Error(e),
@@ -1909,6 +1930,8 @@ impl eframe::App for HpsdrApp {
                     // first thing to check.
                     let half_span_hz = sample_rate as f64 / 2.0;
 
+                    draw_band_edge_markers(ui.painter(), rect, freq_hz, half_span_hz, sample_rate);
+
                     // Filter passband overlay: shaded region between the
                     // current mode's filter edges, plus a line marking
                     // the dial (tuned) frequency itself. Same freq-to-x
@@ -2276,16 +2299,16 @@ impl eframe::App for HpsdrApp {
                     let viewport_id = egui::ViewportId::from_hash_of(("extra_receiver", ddc_index));
                     let title = format!("{} - RX {}", base_title, ddc_index + 1);
                     let rx_for_closure = Arc::clone(&rx);
-                    // Saved position/size from the last run, if any --
-                    // see WindowLayout's doc comment. Only takes effect
-                    // the first time this window is actually created
-                    // (see main()'s doc comment on why re-passing this
-                    // every frame afterward doesn't fight the user
-                    // resizing/moving it).
-                    let saved_geometry = self.window_layout.extra_receivers.get(&ddc_index.to_string());
+                    // Position/size seed from this radio's saved config --
+                    // see ExtraReceiver::initial_window_geometry's doc
+                    // comment for why this MUST be a value that stays
+                    // constant across frames (a one-time seed, not the
+                    // live-tracked window_geometry) to avoid fighting the
+                    // user dragging/resizing the window themselves.
+                    let seed_geometry = rx_for_closure.lock().unwrap().initial_window_geometry;
                     let mut viewport_builder =
                         egui::ViewportBuilder::default().with_title(title).with_inner_size([1024.0, 500.0]);
-                    if let Some(g) = saved_geometry {
+                    if let Some(g) = seed_geometry {
                         viewport_builder =
                             viewport_builder.with_position([g.x, g.y]).with_inner_size([g.width, g.height]);
                     }
@@ -2293,9 +2316,10 @@ impl eframe::App for HpsdrApp {
                         viewport_id,
                         viewport_builder,
                         move |ui: &mut egui::Ui, _class: egui::ViewportClass| {
-                            // Tracked every frame (not just at close) for
-                            // the same reason as the main window's own
-                            // geometry -- see save_window_layout's doc
+                            // Tracked every frame (not just when the
+                            // periodic Config save fires) for the same
+                            // reason as the main window's own geometry --
+                            // see ExtraReceiver::window_geometry's doc
                             // comment.
                             if let (Some(outer), Some(inner)) = (
                                 ui.input(|i| i.viewport().outer_rect),
@@ -3680,8 +3704,17 @@ impl eframe::App for HpsdrApp {
                     }
                 }
 
+                // root_close_requested/stop_clicked (computed earlier
+                // this frame -- see their own declarations) also force a
+                // save here rather than relying on settings_dirty alone,
+                // since moving/resizing a window doesn't set that flag
+                // but should still be persisted before the app exits or
+                // this radio is disconnected (see main_window_geometry's
+                // doc comment).
                 if settings_changed
                     || connected.settings_dirty.swap(false, std::sync::atomic::Ordering::Relaxed)
+                    || root_close_requested
+                    || stop_clicked
                 {
                     let agc_params_now = connected.spectrum.agc_params();
                     let extra_receivers: Vec<ExtraReceiverConfig> = connected
@@ -3717,6 +3750,7 @@ impl eframe::App for HpsdrApp {
                                 band_settings: rx.band_memory.clone(),
                                 width_memory: rx.width_memory.clone(),
                                 eq: agc_params.eq,
+                                window_geometry: rx.window_geometry,
                             }
                         })
                         .collect();
@@ -3805,6 +3839,7 @@ impl eframe::App for HpsdrApp {
                         mic_ptt_on_tip: Some(
                             connected.session.mic_ptt_on_tip.load(std::sync::atomic::Ordering::Relaxed),
                         ),
+                        window_geometry: self.main_window_geometry,
                     }
                     .save(connected.device.mac);
                 }
@@ -3841,10 +3876,6 @@ impl eframe::App for HpsdrApp {
                     self.state = AppState::Discovering(DiscoveryWindow::new(&ctx));
                 }
             }
-        }
-
-        if root_close_requested {
-            self.save_window_layout();
         }
     }
 }
@@ -3916,6 +3947,41 @@ fn draw_freq_hover_tooltip(painter: &egui::Painter, pos: egui::Pos2, freq_hz: u3
         egui::FontId::monospace(12.0),
         egui::Color32::WHITE,
     );
+}
+
+/// Vertical orange markers on the spectrum plot at any amateur band edge
+/// (BANDS' low_hz/high_hz) that falls within the currently visible span
+/// -- e.g. tuned near the top of 40m shows a line at 7.300MHz, or near a
+/// WARC band shows both its edges. Deliberately spectrum-only (not the
+/// waterfall) and drawn early, right after the black background, so the
+/// spectrum trace/dial line/passband overlay all stay visually on top
+/// of it rather than the reverse. Recomputes the same offset-from-dial-
+/// frequency-to-x mapping the caller builds separately (as `x_for_offset`)
+/// for its own passband overlay/axis ticks, rather than threading that
+/// closure through -- this runs before `x_for_offset` even exists at
+/// either call site.
+fn draw_band_edge_markers(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    freq_hz: u32,
+    half_span_hz: f64,
+    sample_rate: u32,
+) {
+    const BAND_EDGE_COLOR: egui::Color32 = egui::Color32::from_rgb(255, 140, 0);
+    for band in &BANDS {
+        for edge_hz in [band.low_hz, band.high_hz] {
+            let offset_hz = edge_hz as f64 - freq_hz as f64;
+            if offset_hz.abs() > half_span_hz {
+                continue;
+            }
+            let frac = ((offset_hz + half_span_hz) / sample_rate as f64) as f32;
+            let x = rect.left() + frac * rect.width();
+            painter.line_segment(
+                [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
+                egui::Stroke::new(1.0, BAND_EDGE_COLOR),
+            );
+        }
+    }
 }
 
 /// Status color for the rigctl/TCI indicators in the main panel:
@@ -4666,6 +4732,9 @@ fn render_extra_receiver_ui(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceiver>>) {
 
     // Frequency axis ticks -- same mapping as the main receiver window.
     let half_span_hz = sample_rate as f64 / 2.0;
+
+    draw_band_edge_markers(ui.painter(), rect, freq_hz, half_span_hz, sample_rate);
+
     let num_freq_ticks = 5;
     for t in 0..num_freq_ticks {
         let frac = t as f32 / (num_freq_ticks - 1) as f32;
@@ -5167,7 +5236,14 @@ fn spawn_extra_receiver(
         ctun: false,
         ctun_frequency_hz: initial_frequency_hz,
         open: true,
-        window_geometry: None,
+        // Live-tracked every frame from here on (see this receiver's
+        // viewport closure) -- seeded from saved config too, purely so
+        // there's a sane value to write back out if the app exits
+        // before this window ever renders a frame.
+        window_geometry: saved.and_then(|s| s.window_geometry),
+        // Set once, here, and never touched again -- see its own doc
+        // comment for why.
+        initial_window_geometry: saved.and_then(|s| s.window_geometry),
     })))
 }
 
@@ -5565,25 +5641,21 @@ fn main() -> eframe::Result<()> {
     let icon = eframe::icon_data::from_png_bytes(include_bytes!("../assets/icons/hpsdr-rs.png"))
         .expect("bundled icon PNG failed to decode");
 
-    // Restore the main window's last position/size, if one was saved on a
-    // previous exit (see WindowLayout/HpsdrApp::save_window_layout) --
-    // this window exists (and is where Discovery happens) before any
-    // radio is chosen, so it has to be seeded here rather than after a
-    // ConnectedState exists. Falls back to the hardcoded size below when
-    // there's no saved layout yet (first run).
-    let window_layout = WindowLayout::load();
-    let mut viewport = egui::ViewportBuilder::default()
-        .with_inner_size([1200.0, 660.0])
-        .with_min_inner_size([900.0, 520.0])
-        .with_icon(icon);
-    if let Some(g) = window_layout.main {
-        viewport = viewport.with_position([g.x, g.y]).with_inner_size([g.width, g.height]);
-    }
-
-    let options = eframe::NativeOptions { viewport, ..Default::default() };
+    // No saved position to restore here -- unlike everything else this
+    // window shows (it's also the Discovery screen), its geometry is
+    // now keyed per-radio (see Config::window_geometry's doc comment),
+    // so there's nothing to seed until a specific radio is chosen; see
+    // the DiscoveryAction::Start handler in ui() for where that happens.
+    let options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size([1200.0, 660.0])
+            .with_min_inner_size([900.0, 520.0])
+            .with_icon(icon),
+        ..Default::default()
+    };
     eframe::run_native(
         "hpsdr-rs",
         options,
-        Box::new(move |cc| Ok(Box::new(HpsdrApp::new(&cc.egui_ctx, window_layout)))),
+        Box::new(|cc| Ok(Box::new(HpsdrApp::new(&cc.egui_ctx)))),
     )
 }
