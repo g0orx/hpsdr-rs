@@ -809,6 +809,14 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                 device.supported_receivers,
             );
             let initial_frequency_hz = session.frequency_hz.load(Ordering::Relaxed);
+            // Restore CTUN (see ConnectedState::ctun's doc comment) --
+            // ctun_frequency_hz is only meaningful/saved-and-restored
+            // while ctun was actually on; otherwise fall back to the
+            // dial frequency, matching a fresh/never-used CTUN's own
+            // "off" state.
+            let ctun = cfg.ctun.unwrap_or(false);
+            let ctun_frequency_hz =
+                if ctun { cfg.ctun_frequency_hz.unwrap_or(initial_frequency_hz) } else { initial_frequency_hz };
             Ok(ConnectedState {
                 device,
                 session,
@@ -846,8 +854,8 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                 settings_dirty,
                 band_memory: cfg.band_settings.clone(),
                 width_memory: cfg.width_memory.clone(),
-                ctun: false,
-                ctun_frequency_hz: initial_frequency_hz,
+                ctun,
+                ctun_frequency_hz,
                 rigctl_addr,
                 tci_addr,
                 rigctl_error,
@@ -3751,6 +3759,8 @@ impl eframe::App for HpsdrApp {
                                 width_memory: rx.width_memory.clone(),
                                 eq: agc_params.eq,
                                 window_geometry: rx.window_geometry,
+                                ctun: rx.ctun,
+                                ctun_frequency_hz: rx.ctun_frequency_hz,
                             }
                         })
                         .collect();
@@ -3840,6 +3850,8 @@ impl eframe::App for HpsdrApp {
                             connected.session.mic_ptt_on_tip.load(std::sync::atomic::Ordering::Relaxed),
                         ),
                         window_geometry: self.main_window_geometry,
+                        ctun: Some(connected.ctun),
+                        ctun_frequency_hz: Some(connected.ctun_frequency_hz),
                     }
                     .save(connected.device.mac);
                 }
@@ -5206,6 +5218,11 @@ fn spawn_extra_receiver(
 
     let audio_output = AudioOutput::start(Arc::clone(&spectrum.audio_out)).ok();
     let initial_frequency_hz = freq_arc.load(Ordering::Relaxed);
+    // Restore CTUN -- see Config::ctun's doc comment (same reasoning,
+    // per receiver).
+    let ctun = saved.map(|s| s.ctun).unwrap_or(false);
+    let ctun_frequency_hz =
+        if ctun { saved.map(|s| s.ctun_frequency_hz).unwrap_or(initial_frequency_hz) } else { initial_frequency_hz };
 
     Some(Arc::new(Mutex::new(ExtraReceiver {
         ddc_index: idx,
@@ -5233,8 +5250,8 @@ fn spawn_extra_receiver(
         settings_dirty,
         band_memory: saved.map(|s| s.band_settings.clone()).unwrap_or_default(),
         width_memory: saved.map(|s| s.width_memory.clone()).unwrap_or_default(),
-        ctun: false,
-        ctun_frequency_hz: initial_frequency_hz,
+        ctun,
+        ctun_frequency_hz,
         open: true,
         // Live-tracked every frame from here on (see this receiver's
         // viewport closure) -- seeded from saved config too, purely so

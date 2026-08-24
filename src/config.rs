@@ -214,6 +214,16 @@ pub struct Config {
     /// this can't just be an initial hint.
     #[serde(default)]
     pub window_geometry: Option<WindowGeometry>,
+    /// CTUN ("Click to Tune") state for the main receiver -- see
+    /// ConnectedState::ctun's doc comment (main.rs) for what this
+    /// actually does. `ctun_frequency_hz` is only meaningful/restored
+    /// when `ctun` is `Some(true)`; otherwise a fresh connect just uses
+    /// the dial frequency (`frequency_hz` above) for both, same as
+    /// CTUN's own live "off" behavior.
+    #[serde(default)]
+    pub ctun: Option<bool>,
+    #[serde(default)]
+    pub ctun_frequency_hz: Option<u32>,
 }
 
 fn default_nb_threshold() -> f64 {
@@ -272,6 +282,11 @@ pub struct ExtraReceiverConfig {
     /// (see main.rs's spawn_extra_receiver/show_viewport_deferred).
     #[serde(default)]
     pub window_geometry: Option<WindowGeometry>,
+    /// See Config::ctun's doc comment -- same thing, this receiver's own.
+    #[serde(default)]
+    pub ctun: bool,
+    #[serde(default)]
+    pub ctun_frequency_hz: u32,
 }
 
 fn default_spectrum_waterfall_ratio() -> f32 {
