@@ -52,6 +52,10 @@ that doesn't forward broadcasts). Type the address into the field and click
 **Add**; if a radio responds there, it's added to the list the same as a
 broadcast-discovered one.
 
+**Firmware Update...** opens a separate window for updating a radio's FPGA
+firmware or changing its IP address while it's in bootloader mode -- see
+[Firmware Update](12-firmware-update.md).
+
 ## Connecting
 
 With a radio selected, click **Start**. The app connects, opens the main

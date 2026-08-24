@@ -17,6 +17,7 @@ from source and project status, see the [top-level README](../../README.md).
 9. [Settings: Diversity](09-diversity.md) -- 2-ADC diversity reception
 10. [Settings: Equalizer](10-equalizer.md) -- RX/TX graphic EQ
 11. [Extra Receivers](11-extra-receivers.md) -- adding independent receiver windows
+12. [Firmware Update](12-firmware-update.md) -- updating FPGA firmware and changing a radio's IP, in bootloader mode or in-application
 
 Every page notes where a screenshot would help; those are marked
 `(Screenshot needed: ...)` with a broken image link pointing at

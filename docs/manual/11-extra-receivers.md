@@ -1,4 +1,4 @@
-[← Equalizer](10-equalizer.md) | [Index](README.md)
+[← Equalizer](10-equalizer.md) | [Index](README.md) | [Firmware Update →](12-firmware-update.md)
 
 # Extra Receivers
 
@@ -56,4 +56,4 @@ window's.
 
 ---
 
-[← Equalizer](10-equalizer.md) | [Index](README.md)
+[← Equalizer](10-equalizer.md) | [Index](README.md) | [Firmware Update →](12-firmware-update.md)

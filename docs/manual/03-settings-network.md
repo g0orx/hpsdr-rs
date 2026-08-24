@@ -40,6 +40,14 @@ for both control and audio streaming.
 Neither server auto-starts -- start them explicitly here each session, or
 whenever you need them.
 
+## Firmware Update
+
+Also on this tab: **Firmware Update...** updates this radio's FPGA
+firmware or changes its IP address while it stays normally connected
+(Protocol 2 only) -- see [Firmware Update](12-firmware-update.md) for the
+full procedure and important warnings. Bootloader-mode update (recommended
+when your radio supports it) is reached from the Discovery screen instead.
+
 ---
 
 [← Main Window](02-main-window.md) | [Index](README.md) | [RX →](04-settings-rx.md)

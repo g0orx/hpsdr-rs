@@ -84,7 +84,9 @@ Two independent, unrelated ways to update a radio's FPGA firmware (`.rbf` file) 
   
   If an upload is interrupted (dropped packet, timeout, cancelled) the radio's bootloader firmware itself has no way to recover — **power-cycle the radio before trying again**. This can't brick the radio permanently: Erase/Program can only reach the separate "Application" flash region, never the bootloader/recovery image itself.
 
-- **In-application update** (while connected → Settings → Network → **Firmware Update...**) — works against a normally-running, already-connected radio, no physical switch needed. Less thoroughly verified than bootloader mode (the only reference for this path is dead code in piHPSDR, never exercised against real firmware) — prefer bootloader mode when available.
+- **In-application update** (while connected → Settings → Network → **Firmware Update...**) — works against a normally-running, already-connected radio, no physical switch needed. Less thoroughly verified than bootloader mode — prefer bootloader mode when available. Automatically stops this radio's active session first (required for the radio to actually respond) and reconnects once the update completes.
+
+See the manual's **[Firmware Update](docs/manual/12-firmware-update.md)** page for the full step-by-step procedure and warnings.
 
 ## Packaging (Debian/Ubuntu)
 
