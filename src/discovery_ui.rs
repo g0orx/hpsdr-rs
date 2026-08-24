@@ -1,3 +1,4 @@
+use crate::bootloader_ui::FirmwareUpdateWindow;
 use crate::discovery::{discover, manual_discovery, Device};
 use eframe::egui;
 use std::net::IpAddr;
@@ -41,6 +42,12 @@ pub struct DiscoveryWindow {
     /// window stops stealing focus back if the user deliberately clicks
     /// the main window during that window.
     focus_deadline: Option<Instant>,
+    /// Bootloader-mode radios never answer normal discovery (see
+    /// bootloader.rs's own doc comment), so this is a standalone entry
+    /// point independent of the `devices` list -- same
+    /// `Option<...Window>` toggle idiom as every other secondary window
+    /// in this app (e.g. ConnectedState::show_settings_window).
+    firmware_update: Option<FirmwareUpdateWindow>,
 }
 
 impl DiscoveryWindow {
@@ -55,6 +62,7 @@ impl DiscoveryWindow {
             manual_ip: String::new(),
             manual_error: None,
             focus_deadline: Some(Instant::now() + std::time::Duration::from_millis(1500)),
+            firmware_update: None,
         };
         window.spawn_discovery(ctx.clone());
         window
@@ -317,7 +325,24 @@ impl DiscoveryWindow {
                     if ui.button("Cancel").clicked() {
                         action = DiscoveryAction::Cancelled;
                     }
+
+                    ui.separator();
+
+                    if ui.button("Firmware Update...").on_hover_text(
+                        "Update FPGA firmware or change the static IP of a radio in bootloader mode \
+                         (Metis/Hermes/Hermes2/Angelia/Orion/Orion2). The radio must already be \
+                         physically switched into bootloader mode and power-cycled.",
+                    ).clicked() {
+                        self.firmware_update = Some(FirmwareUpdateWindow::new_raw_ethernet());
+                    }
                 });
+
+                if let Some(fw) = &mut self.firmware_update {
+                    fw.show(ui);
+                    if !fw.open {
+                        self.firmware_update = None;
+                    }
+                }
                 });
             },
         );

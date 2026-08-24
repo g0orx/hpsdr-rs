@@ -34,6 +34,24 @@ serde = { version = "1", features = ["derive"] }
 cpal = "0.17"
 serde_json = "1"
 tungstenite = "0.29"
+# Raw Ethernet send/receive for the P1 bootloader-mode firmware-upload
+# protocol (see bootloader.rs's own doc comment) -- NOT the same thing as
+# ordinary UDP discovery/radio traffic elsewhere in this project. Chosen
+# over hand-rolled libc/socket2 AF_PACKET because that's Linux-only;
+# pnet_datalink has its own per-platform backend (raw AF_PACKET on Linux,
+# direct /dev/bpf* on macOS, Npcap's WinPcap-compatible mode on Windows --
+# see build.rs/README for the Npcap SDK requirement that adds to Windows
+# builds specifically). Default features are already just "std" -- the
+# optional "pcap"/"netmap"/"netmap_sys" backends and "serde" are opt-in,
+# not default, so no feature overrides needed.
+pnet_datalink = "0.35.0"
+# Native file-open dialog, for picking a .rbf firmware file (bootloader.rs/
+# bootloader_ui.rs) -- nothing else in this project has needed one before.
+# Default features already use the xdg-portal backend on Linux (no GTK/
+# glib/gobject pulled in -- "gtk3" is opt-in, not default), matching this
+# project's existing GTK-avoidance elsewhere (see eframe's own feature list
+# above -- no GTK anywhere in this app), so no feature overrides needed.
+rfd = "0.17.2"
 
 # NOTE: I could not compile-check this in the sandbox this was written in
 # (no Rust toolchain available), so treat these version numbers as a

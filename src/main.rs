@@ -1,4 +1,6 @@
 mod audio;
+mod bootloader;
+mod bootloader_ui;
 mod config;
 mod discovery;
 mod discovery_ui;
@@ -298,6 +300,11 @@ struct ConnectedState {
     slider_scroll_accum: f32,
     show_settings_window: bool,
     settings_tab: SettingsTab,
+    /// P2 in-application firmware update against THIS connected radio --
+    /// see bootloader_ui::FirmwareUpdateWindow/bootloader.rs's own doc
+    /// comments. `None` = not open, same toggle idiom as
+    /// show_settings_window above.
+    firmware_update: Option<bootloader_ui::FirmwareUpdateWindow>,
     extra_receivers: Vec<Arc<Mutex<ExtraReceiver>>>,
     settings_dirty: Arc<std::sync::atomic::AtomicBool>,
     band_memory: std::collections::HashMap<String, BandSettings>,
@@ -850,6 +857,7 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                 slider_scroll_accum: 0.0,
                 show_settings_window: false,
                 settings_tab: SettingsTab::Agc,
+                firmware_update: None,
                 extra_receivers,
                 settings_dirty,
                 band_memory: cfg.band_settings.clone(),
@@ -2586,6 +2594,26 @@ impl eframe::App for HpsdrApp {
                                          authentication, so only expose this on networks you trust. Both \
                                          are RX only -- PTT is accepted but not implemented.",
                                     );
+
+                                    ui.add_space(12.0);
+                                    ui.separator();
+                                    ui.add_space(8.0);
+                                    ui.label("Firmware / IP configuration:");
+                                    if ui
+                                        .button("Firmware Update...")
+                                        .on_hover_text(
+                                            "Update this radio's FPGA firmware or change its static IP \
+                                             while it's normally running -- see also the Discovery \
+                                             screen's bootloader-mode Firmware Update, which is more \
+                                             thoroughly verified.",
+                                        )
+                                        .clicked()
+                                    {
+                                        connected.firmware_update = Some(bootloader_ui::FirmwareUpdateWindow::new_in_app(
+                                            connected.device.address.ip(),
+                                            connected.device.mac,
+                                        ));
+                                    }
                                 }
 
                                 SettingsTab::Agc => {
@@ -2621,42 +2649,61 @@ impl eframe::App for HpsdrApp {
                                     );
                                     ui.separator();
 
-                                    if connected.device.protocol == 2 {
-                                        let current_adc = connected.session.adc.load(Ordering::Relaxed);
-                                        ui.label("ADC:");
+                                    // BUG FIX: this used to be gated on
+                                    // `connected.device.protocol == 2`,
+                                    // hiding ADC/Antenna selection for
+                                    // any Protocol 1 board -- but Angelia/
+                                    // Orion/Orion2 have 2 ADCs and Alex
+                                    // antenna relays on P1 too (both are
+                                    // already wired into P1's own
+                                    // p1_build_packet -- see radio.rs's
+                                    // wire-0 ADC bits and antenna_val/c4
+                                    // handling), and the extra-receiver
+                                    // settings panel already shows this
+                                    // unconditionally (render_extra_receiver_settings,
+                                    // no protocol check at all) -- a real
+                                    // report confirmed a real Angelia was
+                                    // missing both controls. Same recurring
+                                    // pattern as Add Receiver/extra_frequencies_hz/
+                                    // RX2 filter tracking before it -- check
+                                    // for a bare `protocol == 2` gate first
+                                    // whenever a P1 feature seems mysteriously
+                                    // capped/missing while the P2 equivalent
+                                    // works fine.
+                                    let current_adc = connected.session.adc.load(Ordering::Relaxed);
+                                    ui.label("ADC:");
+                                    ui.horizontal_wrapped(|ui| {
+                                        for adc in 0..connected.device.adcs as u32 {
+                                            let selected = adc == current_adc;
+                                            if ui
+                                                .add(egui::Button::selectable(selected, format!("ADC{adc}")))
+                                                .clicked()
+                                                && !selected
+                                            {
+                                                connected.session.adc.store(adc, Ordering::Relaxed);
+                                                settings_changed = true;
+                                            }
+                                        }
+                                    });
+
+                                    if current_adc == 0 {
+                                        let current_ant = connected.session.antenna.load(Ordering::Relaxed);
+                                        ui.label("Antenna (shared across all ADC0 receivers):");
                                         ui.horizontal_wrapped(|ui| {
-                                            for adc in 0..connected.device.adcs as u32 {
-                                                let selected = adc == current_adc;
+                                            for (ant, label) in [(0u32, "ANT1"), (1, "ANT2"), (2, "ANT3")] {
+                                                let selected = ant == current_ant;
                                                 if ui
-                                                    .add(egui::Button::selectable(selected, format!("ADC{adc}")))
+                                                    .add(egui::Button::selectable(selected, label))
                                                     .clicked()
                                                     && !selected
                                                 {
-                                                    connected.session.adc.store(adc, Ordering::Relaxed);
+                                                    connected.session.antenna.store(ant, Ordering::Relaxed);
                                                     settings_changed = true;
                                                 }
                                             }
                                         });
-
-                                        if current_adc == 0 {
-                                            let current_ant = connected.session.antenna.load(Ordering::Relaxed);
-                                            ui.label("Antenna (shared across all ADC0 receivers):");
-                                            ui.horizontal_wrapped(|ui| {
-                                                for (ant, label) in [(0u32, "ANT1"), (1, "ANT2"), (2, "ANT3")] {
-                                                    let selected = ant == current_ant;
-                                                    if ui
-                                                        .add(egui::Button::selectable(selected, label))
-                                                        .clicked()
-                                                        && !selected
-                                                    {
-                                                        connected.session.antenna.store(ant, Ordering::Relaxed);
-                                                        settings_changed = true;
-                                                    }
-                                                }
-                                            });
-                                        }
-                                        ui.separator();
                                     }
+                                    ui.separator();
 
                                     // Protocol 1, standard (non-HermesLite) boards only --
                                     // HermesLite/HermesLite2 use a different RX gain mechanism
@@ -3702,6 +3749,13 @@ impl eframe::App for HpsdrApp {
                                             settings_changed = true;
                                         }
                                     }
+                                }
+                            }
+
+                            if let Some(fw) = &mut connected.firmware_update {
+                                fw.show(ui);
+                                if !fw.open {
+                                    connected.firmware_update = None;
                                 }
                             }
                         });

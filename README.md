@@ -28,6 +28,7 @@ This project started as an experiment: could Claude port the discovery code from
 - PureSignal (PA linearization/predistortion), on both Protocol 1 and Protocol 2 — see [PureSignal calibration](#puresignal-calibration) below for how to set it up
 - rigctl (Hamlib-compatible) and TCI (WebSocket) control servers, for use with WSJT-X and similar digital-mode software
 - Per-radio settings persistence (keyed by the radio's MAC address, so multiple physical radios each keep their own saved configuration)
+- FPGA firmware upload and static IP configuration — see [Firmware update](#firmware-update) below
 
 ## Supported hardware
 
@@ -54,6 +55,7 @@ Windows toolchains are supported:
 - [vcpkg](https://vcpkg.io/), with `vcpkg install fftw3:x64-windows-static` (the `vcpkg` crate defaults to looking for the static triplet; static linking also means no `fftw3.dll` to ship alongside the built `.exe`), and either `VCPKG_ROOT` set to your vcpkg checkout or `vcpkg integrate install` run once
 - No `PATH`/pkg-config setup needed — `build.rs` talks to vcpkg and locates MSVC directly
 - Confirmed building AND running successfully this way (2026-08-19)
+- The [Firmware update](#firmware-update) feature additionally needs the [Npcap SDK](https://npcap.com/#download) at build time (its `Packet.lib`, discoverable on the linker's `LIB` path) — unlike vcpkg/fftw3 above, this hasn't been build-tested on Windows; if the linker can't find `Packet.lib`, point `LIB` at the SDK's `Lib/x64` directory
 
 WDSP and its noise-reduction dependencies (libspecbleach, rnnoise) are vendored as C source under `vendor/` and built automatically from source by `build.rs` (via the `cc` crate) — no separate build step, and no prebuilt platform-specific binaries to obtain or keep in sync.
 
@@ -70,6 +72,19 @@ cargo run --release
 The app opens a discovery window that listens for radios on the network; select one to connect. Settings (frequency, mode, filter width, TX power, calibration, etc.) are saved automatically per-radio under `~/.config/hpsdr-rs/` (Linux), `%APPDATA%\hpsdr-rs\` (Windows), or `~/Library/Application Support/hpsdr-rs/` (macOS).
 
 See the **[User Manual](docs/manual/README.md)** for a full walkthrough of the UI -- every settings tab, tuning gestures, extra receivers, and the PureSignal/Diversity/Equalizer features.
+
+## Firmware update
+
+Two independent, unrelated ways to update a radio's FPGA firmware (`.rbf` file) or change its static IP, matching how the openHPSDR reference tools (Apache Labs' `HPSDRBootloader`/`HPSDRProgrammer`) split this into two separate utilities:
+
+- **Bootloader mode** (Discovery screen → **Firmware Update...**) — for Metis, Hermes, Hermes2, Angelia, Orion, and Orion2. The radio must already be physically switched into bootloader mode (a jumper or slide switch, board-dependent) and power-cycled — nothing over the network can do this for you. Uses raw Ethernet frames, **not** IP/UDP, so it only works over a direct cable or a plain unmanaged switch (not through a router, VPN, or most managed switches), and needs elevated privileges on every platform:
+  - **Linux**: run as root, or grant the built binary the capability once: `sudo setcap cap_net_raw+ep target/release/hpsdr-rs`
+  - **Windows**: install [Npcap](https://npcap.com/) (in "WinPcap API-compatible mode") and run hpsdr-rs as Administrator
+  - **macOS**: run as root, or grant access to `/dev/bpf*`
+  
+  If an upload is interrupted (dropped packet, timeout, cancelled) the radio's bootloader firmware itself has no way to recover — **power-cycle the radio before trying again**. This can't brick the radio permanently: Erase/Program can only reach the separate "Application" flash region, never the bootloader/recovery image itself.
+
+- **In-application update** (while connected → Settings → Network → **Firmware Update...**) — works against a normally-running, already-connected radio, no physical switch needed. Less thoroughly verified than bootloader mode (the only reference for this path is dead code in piHPSDR, never exercised against real firmware) — prefer bootloader mode when available.
 
 ## Packaging (Debian/Ubuntu)
 
