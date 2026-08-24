@@ -460,6 +460,13 @@ fn open_inapp_socket() -> io::Result<UdpSocket> {
 /// byte (offset 4, right after the echoed 4-byte sequence number -- see
 /// this section's own doc comment on why that offset is inferred, not
 /// confirmed) equals `expect_code`.
+///
+/// DIAGNOSTIC LOGGING: every packet received during the wait is logged to
+/// stderr (source, length, first 16 bytes), matching or not, and a final
+/// line notes whether NOTHING at all arrived before the timeout -- this
+/// section's byte-offset assumptions are unconfirmed (see the module doc
+/// comment above), so when this fails in the field the actual bytes on
+/// the wire are what's needed to fix it, not another guess.
 fn inapp_wait_for_ack(
     socket: &UdpSocket,
     target: SocketAddr,
@@ -469,16 +476,34 @@ fn inapp_wait_for_ack(
 ) -> io::Result<()> {
     let deadline = Instant::now() + timeout;
     let mut buf = [0u8; 1024];
+    let mut saw_any_packet = false;
     loop {
         if stop.load(Ordering::Relaxed) {
             return Err(io::Error::new(io::ErrorKind::Interrupted, "cancelled"));
         }
         if Instant::now() >= deadline {
+            if !saw_any_packet {
+                eprintln!(
+                    "bootloader (in-app): no UDP packet at all arrived from {target} while waiting \
+                     for ack {expect_code:#04x} -- the radio may not be replying to this command, \
+                     or may be replying from a different address/port."
+                );
+            }
             return Err(io::Error::new(io::ErrorKind::TimedOut, "no reply from radio"));
         }
         match socket.recv_from(&mut buf) {
-            Ok((amt, src)) if src == target && amt > 4 && buf[4] == expect_code => return Ok(()),
-            Ok(_) => continue,
+            Ok((amt, src)) => {
+                saw_any_packet = true;
+                let dump_len = amt.min(16);
+                eprintln!(
+                    "bootloader (in-app): received {amt} bytes from {src} (expecting from {target}): {:02x?}{}",
+                    &buf[..dump_len],
+                    if amt > dump_len { "..." } else { "" }
+                );
+                if src == target && amt > 4 && buf[4] == expect_code {
+                    return Ok(());
+                }
+            }
             Err(e) if matches!(e.kind(), io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock) => continue,
             Err(e) => return Err(e),
         }
@@ -507,6 +532,7 @@ impl InAppUpdate {
         packet[4] = INAPP_CMD_SET_IP;
         packet[5..11].copy_from_slice(&target_mac);
         packet[11..15].copy_from_slice(&new_ip);
+        eprintln!("bootloader (in-app): sending SetIP {new_ip:?} to {} for MAC {target_mac:02x?}", self.target);
         socket.send_to(&packet, self.target)?;
         Ok(())
     }
@@ -522,10 +548,13 @@ impl InAppUpdate {
         *progress.lock().unwrap() = UploadStage::Erasing;
         let mut erase_packet = [0u8; 60];
         erase_packet[4] = INAPP_CMD_ERASE;
+        eprintln!("bootloader (in-app): sending Erase to {} (local {:?})", self.target, socket.local_addr());
         socket.send_to(&erase_packet, self.target)?;
         // Two acks per the reference: receipt, then completion.
         inapp_wait_for_ack(&socket, self.target, INAPP_ACK_ERASE, Duration::from_secs(120), stop)?;
+        eprintln!("bootloader (in-app): got erase receipt ack, waiting for completion ack");
         inapp_wait_for_ack(&socket, self.target, INAPP_ACK_ERASE, Duration::from_secs(120), stop)?;
+        eprintln!("bootloader (in-app): erase complete");
 
         let padded = pad_firmware(firmware);
         let total_blocks = padded.len() / PAGE_SIZE;

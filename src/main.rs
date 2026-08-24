@@ -13,7 +13,7 @@ mod wdsp_sys;
 
 use audio::{AudioOutput, MicInput};
 use config::{ps_corr_path, Config, ExtraReceiverConfig, WindowGeometry};
-use discovery::{Boards, Device};
+use discovery::{manual_discovery, Boards, Device};
 use discovery_ui::{DiscoveryAction, DiscoveryWindow};
 use eframe::egui;
 use radio::{
@@ -1041,9 +1041,11 @@ impl eframe::App for HpsdrApp {
                 // receiver window's title further down, so both windows
                 // are identifiable by board/protocol/IP at a glance.
                 let base_title = format!(
-                    "hpsdr-rs -- {:?} (P{}) at {}",
+                    "hpsdr-rs -- {:?} (P{} v{}.{}) at {}",
                     connected.device.board,
                     connected.device.protocol,
+                    connected.device.version / 10,
+                    connected.device.version % 10,
                     connected.device.address.ip()
                 );
                 ui.ctx().send_viewport_cmd(egui::ViewportCommand::Title(base_title.clone()));
@@ -1224,6 +1226,14 @@ impl eframe::App for HpsdrApp {
 
                 let mut stop_clicked = false;
                 let mut settings_changed = false;
+                // Set from deep inside the Settings window's nested
+                // closure (same capture-a-local-flag pattern as
+                // close_requested/settings_changed) once an in-app
+                // firmware update finishes successfully -- handled at the
+                // end of this match arm, alongside stop_clicked, since
+                // reassigning self.state can't happen while `connected`
+                // (borrowed from it) is still needed by code below.
+                let mut restart_after_firmware_update: Option<Device> = None;
                 egui::CentralPanel::default().show(ui, |ui| {
                     ui.add_space(4.0);
                     // Red while transmitting -- a clear, glanceable
@@ -3758,6 +3768,31 @@ impl eframe::App for HpsdrApp {
                                     connected.firmware_update = None;
                                 }
                             }
+                            // In-app firmware update (P2) needs this radio
+                            // genuinely idle to actually erase anything --
+                            // a real report confirmed it just echoes a
+                            // generic busy-status reply instead while
+                            // we're actively streaming it. RadioSession::stop
+                            // sends the real "run bit cleared" stop command
+                            // (same as clicking the main Stop button), which
+                            // is what should make the radio treat itself as
+                            // idle/available again. Deliberately done here
+                            // (not inside bootloader_ui.rs, which has no
+                            // access to the live RadioSession) right after
+                            // confirming Erase && Program, rather than
+                            // fully disconnecting/returning to Discovery --
+                            // simpler than handing the window off across an
+                            // AppState transition, at the cost of this
+                            // radio's Connected view going stale/frozen for
+                            // the rest of the update (acceptable for a rare,
+                            // deliberate action like this).
+                            if connected.firmware_update.as_ref().is_some_and(|fw| fw.has_pending_inapp_start()) {
+                                connected.session.stop();
+                                connected.firmware_update.as_mut().unwrap().begin_pending_inapp_upload();
+                            }
+                            if connected.firmware_update.as_ref().is_some_and(|fw| fw.finished_in_app_upload()) {
+                                restart_after_firmware_update = Some(connected.device);
+                            }
                         });
                         },
                     );
@@ -3924,6 +3959,61 @@ impl eframe::App for HpsdrApp {
                     connected.spectrum.stop();
                     let ctx = ui.ctx().clone();
                     self.state = AppState::Discovering(DiscoveryWindow::new(&ctx));
+                } else if let Some(device) = restart_after_firmware_update {
+                    // Reconnects automatically once an in-app firmware
+                    // update finishes, loading the same saved Config a
+                    // manual Stop-then-rediscover-then-Start would have --
+                    // this is exactly that flow automated, not a shortcut
+                    // that skips anything.
+                    //
+                    // BUG FIX: this used to call connect_to_device directly
+                    // here and only THEN assign the result to self.state,
+                    // which -- since Rust evaluates the right-hand side of
+                    // an assignment before dropping the old value being
+                    // replaced -- builds the entire new ConnectedState
+                    // while the OLD one (this `connected` binding) was
+                    // still alive. connected.session.stop() above only
+                    // covers the radio session itself (stopped earlier to
+                    // let the update run at all -- see
+                    // has_pending_inapp_start's doc comment in
+                    // bootloader_ui.rs); connected.spectrum/tx_spectrum
+                    // and every extra receiver's own SpectrumHandle still
+                    // each held their own WDSP channel open by index, and
+                    // connect_to_device immediately tries to reopen those
+                    // same channel numbers -- exactly the double-open
+                    // hazard change_sample_rate's own doc comment already
+                    // warns about ("WDSP isn't confirmed thread-safe for
+                    // concurrent access to the same channel"), confirmed
+                    // as the real cause via a real segfault report. Fixed
+                    // by dropping the whole old ConnectedState FIRST (via
+                    // an intermediate Discovering state, same as
+                    // stop_clicked above -- its Drop impls close every
+                    // WDSP channel/audio device/socket correctly) before
+                    // constructing the replacement, rather than trying to
+                    // hand-replicate that teardown field-by-field here.
+                    let ctx = ui.ctx().clone();
+                    self.state = AppState::Discovering(DiscoveryWindow::new(&ctx));
+                    // Re-query the radio rather than reusing `device` as-is
+                    // -- it's a snapshot from BEFORE the update, so its
+                    // `version` byte (shown in the title bar, see
+                    // base_title above) would otherwise keep showing the
+                    // old firmware version after a successful update. Only
+                    // the version realistically changes here (board/MAC/
+                    // protocol don't change from a firmware flash), but a
+                    // fresh discovery reply is simpler and more honest than
+                    // patching just that one field. Falls back to the
+                    // stale `device` if the radio doesn't answer yet (e.g.
+                    // still finishing its own reboot) so reconnecting still
+                    // succeeds either way -- see manual_discovery's own
+                    // short (250ms) timeout.
+                    let discovered = Arc::new(Mutex::new(Vec::new()));
+                    manual_discovery(Arc::clone(&discovered), device.address.ip());
+                    let device = discovered.lock().unwrap().first().copied().unwrap_or(device);
+                    let cfg = Config::load(device.mac);
+                    self.state = match connect_to_device(device, &cfg) {
+                        Ok(new_connected) => AppState::Connected(new_connected),
+                        Err(e) => AppState::Error(e),
+                    };
                 }
             }
             AppState::Error(message) => {

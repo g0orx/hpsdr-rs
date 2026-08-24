@@ -85,6 +85,15 @@ pub struct FirmwareUpdateWindow {
     firmware_read_error: Option<String>,
     upload: Option<UploadHandle>,
     confirm: bool,
+    /// InApp path only: firmware bytes already read from disk, waiting on
+    /// the caller (main.rs, which has access to the live RadioSession this
+    /// window doesn't) to stop this radio's active session before the
+    /// upload actually starts -- see has_pending_inapp_start/
+    /// begin_pending_inapp_upload's own doc comments for why. Always
+    /// `None` for the RawEthernet path, which starts immediately (there's
+    /// no live session of ours to stop -- see bootloader.rs's own module
+    /// doc comment on why these are two unrelated mechanisms).
+    pending_inapp_firmware: Option<Vec<u8>>,
 }
 
 impl FirmwareUpdateWindow {
@@ -100,6 +109,7 @@ impl FirmwareUpdateWindow {
             firmware_read_error: None,
             upload: None,
             confirm: false,
+            pending_inapp_firmware: None,
         }
     }
 
@@ -115,7 +125,47 @@ impl FirmwareUpdateWindow {
             firmware_read_error: None,
             upload: None,
             confirm: false,
+            pending_inapp_firmware: None,
         }
+    }
+
+    /// True once the user has confirmed Erase && Program on the InApp path
+    /// and the firmware file has been read -- the caller (main.rs) must
+    /// stop this radio's live RadioSession (a real report confirmed the
+    /// radio just echoes a generic busy-status reply instead of actually
+    /// erasing anything while a client -- this app itself -- is actively
+    /// streaming it; sending the same "run bit cleared" stop command
+    /// RadioSession::stop already sends on a normal Stop is what should
+    /// make the radio treat itself as idle/available again) and then call
+    /// begin_pending_inapp_upload. Always `false` for the RawEthernet
+    /// path, which has no live session of ours to stop.
+    pub fn has_pending_inapp_start(&self) -> bool {
+        self.pending_inapp_firmware.is_some()
+    }
+
+    /// Actually starts the InApp upload -- call only after the caller has
+    /// stopped the live session (see has_pending_inapp_start's doc
+    /// comment). No-op if there's nothing pending.
+    pub fn begin_pending_inapp_upload(&mut self) {
+        let (Some(firmware), Target::InApp { radio_ip, .. }) = (self.pending_inapp_firmware.take(), &self.target)
+        else {
+            return;
+        };
+        self.upload = Some(bootloader::spawn_inapp_upload(*radio_ip, firmware));
+    }
+
+    /// True once an InApp upload (see begin_pending_inapp_upload) has
+    /// finished successfully -- the caller (main.rs) uses this to
+    /// reconnect automatically, since it already had to stop the live
+    /// session to let the update run in the first place (see
+    /// has_pending_inapp_start's doc comment) and there's no reason to
+    /// leave the user stranded on a stale Connected view needing a manual
+    /// Stop/rediscover/Start afterward. Always `false` for the
+    /// RawEthernet path -- that one's target radio was never this app's
+    /// own live session, so there's nothing of ours to reconnect.
+    pub fn finished_in_app_upload(&self) -> bool {
+        matches!(self.target, Target::InApp { .. })
+            && self.upload.as_ref().is_some_and(|h| matches!(*h.progress.lock().unwrap(), UploadStage::Done))
     }
 
     /// Draw the window for this frame -- same viewport/light-theme
@@ -145,7 +195,7 @@ impl FirmwareUpdateWindow {
     }
 
     fn show_contents(&mut self, ui: &mut egui::Ui) {
-        let uploading = self.upload.is_some();
+        let uploading = self.upload.is_some() || self.pending_inapp_firmware.is_some();
 
         ui.colored_label(
             WARNING_COLOR,
@@ -368,6 +418,12 @@ impl FirmwareUpdateWindow {
             "This update method is less thoroughly verified against real firmware than \
              bootloader-mode update -- prefer that when available.",
         );
+        ui.colored_label(
+            WARNING_COLOR,
+            "Erase && Program will stop this radio's active session first (the radio needs \
+             to be idle to actually respond) -- the rest of this window's Connected view will \
+             go stale until you reconnect afterward.",
+        );
         ui.add_space(6.0);
         ui.label(format!(
             "Target radio: {radio_ip} (MAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x})",
@@ -403,6 +459,12 @@ impl FirmwareUpdateWindow {
     }
 
     fn show_upload_progress(&mut self, ui: &mut egui::Ui) {
+        if self.pending_inapp_firmware.is_some() {
+            ui.add_space(12.0);
+            ui.label("Stopping this radio's active session before erasing...");
+            ui.ctx().request_repaint_after(Duration::from_millis(100));
+            return;
+        }
         let Some(handle) = &self.upload else { return };
         let stage = handle.progress.lock().unwrap().clone();
 
@@ -467,8 +529,11 @@ impl FirmwareUpdateWindow {
                     self.upload = Some(bootloader::spawn_raw_upload(iface, firmware));
                 }
             }
-            Target::InApp { radio_ip, .. } => {
-                self.upload = Some(bootloader::spawn_inapp_upload(*radio_ip, firmware));
+            Target::InApp { .. } => {
+                // Deferred -- see has_pending_inapp_start's doc comment.
+                // The caller (main.rs) picks this up, stops the live
+                // session, and calls begin_pending_inapp_upload.
+                self.pending_inapp_firmware = Some(firmware);
             }
         }
         ctx.request_repaint();
