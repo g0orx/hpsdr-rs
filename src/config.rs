@@ -296,6 +296,60 @@ pub(crate) fn settings_dir() -> Option<PathBuf> {
     Some(path)
 }
 
+/// A window's on-screen position and content size, in egui points
+/// (matches `egui::ViewportBuilder::with_position`/`with_inner_size`'s
+/// units -- see main.rs's WindowLayout usage).
+#[derive(Serialize, Deserialize, Clone, Copy)]
+pub struct WindowGeometry {
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
+}
+
+/// Saved window positions/sizes, restored on the next launch so windows
+/// reopen where the user left them. Deliberately NOT part of the
+/// per-radio `Config` above -- the main window exists (and is
+/// positionable) before any radio is chosen at the Discovery screen, so
+/// this is one global file rather than keyed by MAC address.
+#[derive(Serialize, Deserialize, Default)]
+pub struct WindowLayout {
+    pub main: Option<WindowGeometry>,
+    /// Extra receiver windows, keyed by their `ddc_index` (as a string --
+    /// serde_json object keys must be strings) formatted with
+    /// `.to_string()`. A receiver with no saved entry (never opened
+    /// before, or a layout file saved before this existed) just falls
+    /// back to main.rs's hardcoded default size with no forced position.
+    #[serde(default)]
+    pub extra_receivers: std::collections::HashMap<String, WindowGeometry>,
+}
+
+fn window_layout_path() -> Option<PathBuf> {
+    let mut path = settings_dir()?;
+    path.push("window_layout.json");
+    Some(path)
+}
+
+impl WindowLayout {
+    pub fn load() -> WindowLayout {
+        window_layout_path()
+            .and_then(|p| std::fs::read_to_string(p).ok())
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default()
+    }
+
+    pub fn save(&self) {
+        let Some(path) = window_layout_path() else {
+            return;
+        };
+        if let Ok(json) = serde_json::to_string_pretty(self) {
+            if let Err(e) = std::fs::write(&path, json) {
+                eprintln!("failed to save window layout to {}: {e}", path.display());
+            }
+        }
+    }
+}
+
 fn config_path(mac: [u8; 6]) -> Option<PathBuf> {
     let mut path = settings_dir()?;
     let [a, b, c, d, e, f] = mac;

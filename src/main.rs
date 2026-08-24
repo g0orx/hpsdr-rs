@@ -10,7 +10,7 @@ mod tx;
 mod wdsp_sys;
 
 use audio::{AudioOutput, MicInput};
-use config::{ps_corr_path, Config, ExtraReceiverConfig};
+use config::{ps_corr_path, Config, ExtraReceiverConfig, WindowGeometry, WindowLayout};
 use discovery::{Boards, Device};
 use discovery_ui::{DiscoveryAction, DiscoveryWindow};
 use eframe::egui;
@@ -208,6 +208,11 @@ struct ExtraReceiver {
     ctun: bool,
     ctun_frequency_hz: u32,
     open: bool,
+    /// This window's current on-screen position/size, refreshed every
+    /// frame it's rendered -- see HpsdrApp::save_window_layout's doc
+    /// comment for why this is tracked continuously rather than read
+    /// only at exit.
+    window_geometry: Option<WindowGeometry>,
 }
 
 struct ConnectedState {
@@ -459,15 +464,50 @@ struct HpsdrApp {
     // see `ui()`'s doc comment for why a single-frame check isn't
     // enough and this needs to be a short window instead.
     ignore_interaction_until: Option<Instant>,
+    /// Snapshot read once at startup (see main()) -- used only to seed
+    /// each extra receiver's ViewportBuilder with a saved position/size
+    /// the first time its window is created (see the
+    /// show_viewport_deferred call site). The main window's own saved
+    /// geometry is applied even earlier, directly to the initial
+    /// NativeOptions in main(), since that window exists before
+    /// HpsdrApp does.
+    window_layout: WindowLayout,
+    /// This window's current on-screen position/size, refreshed every
+    /// frame -- see save_window_layout's doc comment.
+    main_window_geometry: Option<WindowGeometry>,
 }
 
 impl HpsdrApp {
-    fn new(ctx: &egui::Context) -> Self {
+    fn new(ctx: &egui::Context, window_layout: WindowLayout) -> Self {
         Self {
             state: AppState::Discovering(DiscoveryWindow::new(ctx)),
             was_focused: true,
             ignore_interaction_until: None,
+            window_layout,
+            main_window_geometry: None,
         }
+    }
+
+    /// Writes the main window's and every currently-open extra
+    /// receiver's last-known position/size to disk, so the next launch
+    /// can reopen them in the same place. Called once, when the main
+    /// window's close is requested (see `ui()`) -- geometry itself is
+    /// refreshed every frame *before* that point (both here and in each
+    /// extra receiver's own viewport closure) rather than read fresh
+    /// only at exit, because by the time the root viewport's close is
+    /// requested, child viewports may no longer run their own closure
+    /// this pass to report a final value.
+    fn save_window_layout(&self) {
+        let mut layout = WindowLayout { main: self.main_window_geometry, ..Default::default() };
+        if let AppState::Connected(connected) = &self.state {
+            for rx in &connected.extra_receivers {
+                let rx = rx.lock().unwrap();
+                if let Some(geometry) = rx.window_geometry {
+                    layout.extra_receivers.insert(rx.ddc_index.to_string(), geometry);
+                }
+            }
+        }
+        layout.save();
     }
 }
 
@@ -850,6 +890,28 @@ impl eframe::App for HpsdrApp {
     // eframe 0.35 replaced `update(&Context)` with `ui(&mut Ui)` -- see
     // https://github.com/emilk/egui/blob/main/CHANGELOG.md (0.35.0).
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        // Track this window's current position/size every frame (cheap --
+        // just copying floats already computed by egui-winit) so a final
+        // value is always ready by the time the close below fires, rather
+        // than trying to read it fresh in that same last frame. outer_rect
+        // (position, includes window-manager chrome) pairs with
+        // ViewportBuilder::with_position; inner_rect (content size, no
+        // chrome) pairs with with_inner_size -- see main()/
+        // save_window_layout. Both are None on Wayland, but this app
+        // already forces X11 (see main()'s WAYLAND_DISPLAY workaround),
+        // so that doesn't apply here.
+        if let (Some(outer), Some(inner)) =
+            (ui.input(|i| i.viewport().outer_rect), ui.input(|i| i.viewport().inner_rect))
+        {
+            self.main_window_geometry = Some(WindowGeometry {
+                x: outer.min.x,
+                y: outer.min.y,
+                width: inner.width(),
+                height: inner.height(),
+            });
+        }
+        let root_close_requested = ui.input(|i| i.viewport().close_requested());
+
         // BUG FIX: clicking the main window while it's not the active/
         // focused OS window would both raise/focus it AND process that
         // same click as normal input to whatever widget happened to be
@@ -2214,12 +2276,39 @@ impl eframe::App for HpsdrApp {
                     let viewport_id = egui::ViewportId::from_hash_of(("extra_receiver", ddc_index));
                     let title = format!("{} - RX {}", base_title, ddc_index + 1);
                     let rx_for_closure = Arc::clone(&rx);
+                    // Saved position/size from the last run, if any --
+                    // see WindowLayout's doc comment. Only takes effect
+                    // the first time this window is actually created
+                    // (see main()'s doc comment on why re-passing this
+                    // every frame afterward doesn't fight the user
+                    // resizing/moving it).
+                    let saved_geometry = self.window_layout.extra_receivers.get(&ddc_index.to_string());
+                    let mut viewport_builder =
+                        egui::ViewportBuilder::default().with_title(title).with_inner_size([1024.0, 500.0]);
+                    if let Some(g) = saved_geometry {
+                        viewport_builder =
+                            viewport_builder.with_position([g.x, g.y]).with_inner_size([g.width, g.height]);
+                    }
                     ui.ctx().show_viewport_deferred(
                         viewport_id,
-                        egui::ViewportBuilder::default()
-                            .with_title(title)
-                            .with_inner_size([1024.0, 500.0]),
+                        viewport_builder,
                         move |ui: &mut egui::Ui, _class: egui::ViewportClass| {
+                            // Tracked every frame (not just at close) for
+                            // the same reason as the main window's own
+                            // geometry -- see save_window_layout's doc
+                            // comment.
+                            if let (Some(outer), Some(inner)) = (
+                                ui.input(|i| i.viewport().outer_rect),
+                                ui.input(|i| i.viewport().inner_rect),
+                            ) {
+                                rx_for_closure.lock().unwrap().window_geometry = Some(WindowGeometry {
+                                    x: outer.min.x,
+                                    y: outer.min.y,
+                                    width: inner.width(),
+                                    height: inner.height(),
+                                });
+                            }
+
                             if ui.input(|i| i.viewport().close_requested()) {
                                 let mut rx = rx_for_closure.lock().unwrap();
                                 rx.open = false;
@@ -3753,6 +3842,10 @@ impl eframe::App for HpsdrApp {
                 }
             }
         }
+
+        if root_close_requested {
+            self.save_window_layout();
+        }
     }
 }
 
@@ -5074,6 +5167,7 @@ fn spawn_extra_receiver(
         ctun: false,
         ctun_frequency_hz: initial_frequency_hz,
         open: true,
+        window_geometry: None,
     })))
 }
 
@@ -5471,16 +5565,25 @@ fn main() -> eframe::Result<()> {
     let icon = eframe::icon_data::from_png_bytes(include_bytes!("../assets/icons/hpsdr-rs.png"))
         .expect("bundled icon PNG failed to decode");
 
-    let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1200.0, 660.0])
-            .with_min_inner_size([900.0, 520.0])
-            .with_icon(icon),
-        ..Default::default()
-    };
+    // Restore the main window's last position/size, if one was saved on a
+    // previous exit (see WindowLayout/HpsdrApp::save_window_layout) --
+    // this window exists (and is where Discovery happens) before any
+    // radio is chosen, so it has to be seeded here rather than after a
+    // ConnectedState exists. Falls back to the hardcoded size below when
+    // there's no saved layout yet (first run).
+    let window_layout = WindowLayout::load();
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_inner_size([1200.0, 660.0])
+        .with_min_inner_size([900.0, 520.0])
+        .with_icon(icon);
+    if let Some(g) = window_layout.main {
+        viewport = viewport.with_position([g.x, g.y]).with_inner_size([g.width, g.height]);
+    }
+
+    let options = eframe::NativeOptions { viewport, ..Default::default() };
     eframe::run_native(
         "hpsdr-rs",
         options,
-        Box::new(|cc| Ok(Box::new(HpsdrApp::new(&cc.egui_ctx)))),
+        Box::new(move |cc| Ok(Box::new(HpsdrApp::new(&cc.egui_ctx, window_layout)))),
     )
 }
