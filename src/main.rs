@@ -1,6 +1,7 @@
 mod audio;
 mod bootloader;
 mod bootloader_ui;
+mod cat;
 mod config;
 mod debug_log;
 mod discovery;
@@ -13,6 +14,7 @@ mod tx;
 mod wdsp_sys;
 
 use audio::{AudioOutput, MicInput};
+use cat::CatServer;
 use config::{ps_corr_path, Config, ExtraReceiverConfig, WindowGeometry};
 use discovery::{manual_discovery, Boards, Device};
 use discovery_ui::{DiscoveryAction, DiscoveryWindow};
@@ -154,6 +156,7 @@ enum SettingsTab {
     PureSignal,
     Diversity,
     Equalizer,
+    Firmware,
 }
 
 /// A receiver beyond the first, shown in its own native OS window (P2
@@ -294,6 +297,7 @@ struct ConnectedState {
     tx_audio_monitor_output: Option<AudioOutput>,
     rigctl_server: Option<RigctlServer>,
     tci_server: Option<TciServer>,
+    cat_server: Option<CatServer>,
     waterfall_texture: Option<egui::TextureHandle>,
     /// (SpectrumDisplay::revision, palette, db_low, db_high) the
     /// waterfall texture was last built from -- lets the UI skip
@@ -347,20 +351,23 @@ struct ConnectedState {
     ctun_frequency_hz: u32,
     rigctl_addr: String,
     tci_addr: String,
+    cat_addr: String,
     /// Debug logging toggles (Settings -> Network) -- see
     /// debug_log.rs's own doc comment. Constructed once per connection
     /// (not per Start/Stop of the server itself), and handed (cloned) to
-    /// whichever RigctlServer/TciServer is currently running so toggling
-    /// the checkbox takes effect immediately without needing to restart
-    /// either server.
+    /// whichever RigctlServer/TciServer/CatServer is currently running so
+    /// toggling the checkbox takes effect immediately without needing to
+    /// restart that server.
     rigctl_debug_log: debug_log::DebugLog,
     tci_debug_log: debug_log::DebugLog,
+    cat_debug_log: debug_log::DebugLog,
     /// Set when a manual Start from the Network tab fails (e.g. port
-    /// already in use); cleared on the next Start attempt. rigctl/TCI
+    /// already in use); cleared on the next Start attempt. rigctl/TCI/CAT
     /// no longer auto-start on connect, so there's no "unavailable at
     /// startup" case to report here -- only ones the user triggered.
     rigctl_error: Option<String>,
     tci_error: Option<String>,
+    cat_error: Option<String>,
     /// TX is armed automatically on connect (MicInput/TxHandle created
     /// right away, PTT control visible immediately) -- this flag is
     /// still tracked (and can still be turned off mid-session via
@@ -635,13 +642,14 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                 cfg.rigctl_addr.clone().unwrap_or_else(|| rigctl::DEFAULT_ADDR.to_string());
             let tci_addr =
                 cfg.tci_addr.clone().unwrap_or_else(|| tci::DEFAULT_ADDR.to_string());
+            let cat_addr = cfg.cat_addr.clone().unwrap_or_else(|| cat::DEFAULT_ADDR.to_string());
             // Debug logging (Settings -> Network) -- see debug_log.rs's
             // own doc comment. Constructed once per connection (not per
             // Start/Stop of the server itself) so toggling the checkbox
             // takes effect immediately without needing to restart
-            // rigctl/TCI, and so the SAME instance can be handed to
-            // whichever RigctlServer/TciServer gets started below or
-            // later from Settings -> Network.
+            // rigctl/TCI/CAT, and so the SAME instance can be handed to
+            // whichever RigctlServer/TciServer/CatServer gets started
+            // below or later from Settings -> Network.
             let rigctl_debug_log = debug_log::DebugLog::new(
                 debug_log::log_path("rigctl_log.txt").unwrap_or_else(|| "rigctl_log.txt".into()),
             );
@@ -650,6 +658,10 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                 debug_log::log_path("tci_log.txt").unwrap_or_else(|| "tci_log.txt".into()),
             );
             tci_debug_log.set_enabled(cfg.tci_logging_enabled.unwrap_or(false));
+            let cat_debug_log = debug_log::DebugLog::new(
+                debug_log::log_path("cat_log.txt").unwrap_or_else(|| "cat_log.txt".into()),
+            );
+            cat_debug_log.set_enabled(cfg.cat_logging_enabled.unwrap_or(false));
 
             // rigctl/TCI are started/stopped manually from the Network
             // settings tab rather than always-on, but their run state
@@ -698,6 +710,26 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                         let msg = format!("couldn't listen on {tci_addr}: {e}");
                         eprintln!("tci: {msg}");
                         tci_error = Some(msg);
+                        None
+                    }
+                };
+            }
+            let mut cat_server: Option<CatServer> = None;
+            let mut cat_error: Option<String> = None;
+            if cfg.cat_running.unwrap_or(false) {
+                cat_server = match CatServer::start(
+                    &cat_addr,
+                    Arc::clone(&session.frequency_hz),
+                    spectrum.demod_params_handle(),
+                    Arc::clone(&spectrum.display),
+                    Arc::clone(&session.mox),
+                    cat_debug_log.clone(),
+                ) {
+                    Ok(s) => Some(s),
+                    Err(e) => {
+                        let msg = format!("couldn't listen on {cat_addr}: {e}");
+                        eprintln!("cat: {msg}");
+                        cat_error = Some(msg);
                         None
                     }
                 };
@@ -893,6 +925,7 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                 tx_audio_monitor_output: None,
                 rigctl_server,
                 tci_server,
+                cat_server,
                 waterfall_texture: None,
                 waterfall_signature: None,
                 scroll_accum: 0.0,
@@ -926,10 +959,13 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                 ctun_frequency_hz,
                 rigctl_addr,
                 tci_addr,
+                cat_addr,
                 rigctl_debug_log,
                 tci_debug_log,
+                cat_debug_log,
                 rigctl_error,
                 tci_error,
+                cat_error,
                 tx_enabled,
                 mic_input,
                 mic_input_device,
@@ -1122,6 +1158,7 @@ impl eframe::App for HpsdrApp {
                 // the gray/green/red status text in the main panel.
                 let rigctl_status: Option<bool> = connected.rigctl_server.as_ref().map(|s| s.is_connected());
                 let tci_status: Option<bool> = connected.tci_server.as_ref().map(|s| s.is_connected());
+                let cat_status: Option<bool> = connected.cat_server.as_ref().map(|s| s.is_connected());
                 let freq_hz = connected
                     .session
                     .frequency_hz
@@ -1631,6 +1668,9 @@ impl eframe::App for HpsdrApp {
                         ui.add_space(12.0);
                         ui.colored_label(network_status_color(tci_status), "TCI")
                             .on_hover_text(network_status_hover("TCI", tci_status, &connected.tci_addr));
+                        ui.add_space(12.0);
+                        ui.colored_label(network_status_color(cat_status), "CAT")
+                            .on_hover_text(network_status_hover("CAT", cat_status, &connected.cat_addr));
                         // PureSignal: only shown when actually enabled for
                         // this session (see ConnectedState::puresignal_enabled's
                         // doc comment -- a connect-time setting, not live).
@@ -2542,7 +2582,7 @@ impl eframe::App for HpsdrApp {
                         egui::ViewportId::from_hash_of("settings_window"),
                         egui::ViewportBuilder::default()
                             .with_title("Settings")
-                            .with_inner_size([600.0, 700.0]),
+                            .with_inner_size([860.0, 700.0]),
                         |ui, _class| {
                             if ui.input(|i| i.viewport().close_requested()) {
                                 close_requested = true;
@@ -2563,6 +2603,7 @@ impl eframe::App for HpsdrApp {
                                     (SettingsTab::PureSignal, "PureSignal"),
                                     (SettingsTab::Diversity, "Diversity"),
                                     (SettingsTab::Equalizer, "Equalizer"),
+                                    (SettingsTab::Firmware, "Firmware"),
                                 ] {
                                     // Diversity requires a 2-ADC board -- see
                                     // radio::RadioSession::diversity_enabled's
@@ -2593,11 +2634,11 @@ impl eframe::App for HpsdrApp {
                                             egui::TextEdit::singleline(&mut connected.rigctl_addr),
                                         );
                                         if running {
-                                            if ui.button("Stop").clicked() {
+                                            if start_stop_button(ui, true) {
                                                 connected.rigctl_server = None;
                                                 settings_changed = true;
                                             }
-                                        } else if ui.button("Start").clicked() {
+                                        } else if start_stop_button(ui, false) {
                                             connected.rigctl_error = None;
                                             connected.rigctl_server = match RigctlServer::start(
                                                 &connected.rigctl_addr,
@@ -2653,11 +2694,11 @@ impl eframe::App for HpsdrApp {
                                             egui::TextEdit::singleline(&mut connected.tci_addr),
                                         );
                                         if running {
-                                            if ui.button("Stop").clicked() {
+                                            if start_stop_button(ui, true) {
                                                 connected.tci_server = None;
                                                 settings_changed = true;
                                             }
-                                        } else if ui.button("Start").clicked() {
+                                        } else if start_stop_button(ui, false) {
                                             connected.tci_error = None;
                                             connected.tci_server = match TciServer::start(
                                                 &connected.tci_addr,
@@ -2710,18 +2751,82 @@ impl eframe::App for HpsdrApp {
                                     }
 
                                     ui.add_space(8.0);
-                                    ui.weak(
-                                        "Format: address:port, e.g. 0.0.0.0:4532 (the default -- listens on \
-                                         every network interface, so another machine on your network can \
-                                         connect too, not just this one). Use 127.0.0.1:PORT instead to \
-                                         restrict it to this machine only. Neither protocol has any \
-                                         authentication, so only expose this on networks you trust. Both \
-                                         are RX only -- PTT is accepted but not implemented.",
+                                    ui.label(
+                                        "CAT (Kenwood TS-2000 emulation, for loggers/rig-control software \
+                                         e.g. N1MM+, Log4OM, DXLab Commander, Ham Radio Deluxe):",
                                     );
+                                    ui.horizontal(|ui| {
+                                        let running = connected.cat_server.is_some();
+                                        ui.add_enabled(
+                                            !running,
+                                            egui::TextEdit::singleline(&mut connected.cat_addr),
+                                        );
+                                        if running {
+                                            if start_stop_button(ui, true) {
+                                                connected.cat_server = None;
+                                                settings_changed = true;
+                                            }
+                                        } else if start_stop_button(ui, false) {
+                                            connected.cat_error = None;
+                                            connected.cat_server = match CatServer::start(
+                                                &connected.cat_addr,
+                                                Arc::clone(&connected.session.frequency_hz),
+                                                connected.spectrum.demod_params_handle(),
+                                                Arc::clone(&connected.spectrum.display),
+                                                Arc::clone(&connected.session.mox),
+                                                connected.cat_debug_log.clone(),
+                                            ) {
+                                                Ok(s) => Some(s),
+                                                Err(e) => {
+                                                    let msg = format!(
+                                                        "couldn't listen on {}: {e}",
+                                                        connected.cat_addr
+                                                    );
+                                                    eprintln!("cat: {msg}");
+                                                    connected.cat_error = Some(msg);
+                                                    None
+                                                }
+                                            };
+                                            settings_changed = true;
+                                        }
+                                    });
+                                    ui.weak(if connected.cat_server.is_some() {
+                                        "Running -- Stop before changing the address."
+                                    } else {
+                                        "Stopped"
+                                    });
+                                    if let Some(err) = &connected.cat_error {
+                                        ui.colored_label(egui::Color32::from_rgb(220, 60, 60), err);
+                                    }
+                                    {
+                                        let mut logging = connected.cat_debug_log.is_enabled();
+                                        if ui
+                                            .checkbox(&mut logging, "Log to file (cat_log.txt)")
+                                            .on_hover_text(
+                                                "Logs every command received and reply sent, for debugging a \
+                                                 client's behavior -- saved alongside this radio's settings.",
+                                            )
+                                            .changed()
+                                        {
+                                            connected.cat_debug_log.set_enabled(logging);
+                                            settings_changed = true;
+                                        }
+                                    }
 
-                                    ui.add_space(12.0);
-                                    ui.separator();
                                     ui.add_space(8.0);
+                                    ui.weak(
+                                        "Format: address:port -- each protocol above shows its own default \
+                                         (0.0.0.0 listens on every network interface, so another machine on \
+                                         your network can connect too, not just this one). Use 127.0.0.1:PORT \
+                                         instead to restrict it to this machine only. None of these have any \
+                                         authentication, so only expose them on networks you trust. rigctl \
+                                         and TCI are RX only -- PTT is accepted but not implemented. CAT's \
+                                         TX;/RX; commands do drive real PTT (same as the on-screen PTT \
+                                         button), but only while Settings -> TX -> Enable Transmit is on.",
+                                    );
+                                }
+
+                                SettingsTab::Firmware => {
                                     ui.label("Firmware / IP configuration:");
                                     if ui
                                         .button("Firmware Update...")
@@ -4129,10 +4234,13 @@ impl eframe::App for HpsdrApp {
                         tune_power_percent: Some(connected.tune_power_percent),
                         rigctl_addr: Some(connected.rigctl_addr.clone()),
                         tci_addr: Some(connected.tci_addr.clone()),
+                        cat_addr: Some(connected.cat_addr.clone()),
                         rigctl_running: Some(connected.rigctl_server.is_some()),
                         tci_running: Some(connected.tci_server.is_some()),
+                        cat_running: Some(connected.cat_server.is_some()),
                         rigctl_logging_enabled: Some(connected.rigctl_debug_log.is_enabled()),
                         tci_logging_enabled: Some(connected.tci_debug_log.is_enabled()),
+                        cat_logging_enabled: Some(connected.cat_debug_log.is_enabled()),
                         extra_receivers,
                         puresignal_enabled: Some(connected.puresignal_enabled),
                         diversity_enabled: Some(connected.diversity_enabled),
@@ -4378,6 +4486,20 @@ fn draw_band_edge_markers(
 /// actively connected. `None` means the server isn't running at all
 /// (start/stop is manual now, from Settings -> Network); `Some(bool)`
 /// is whether a client is currently connected.
+/// Renders a "Start"/"Stop" button (Settings -> Network's rigctl/TCI/CAT
+/// rows) with a colored background matching network_status_color's own
+/// green/red convention below, so the button's action is visible at a
+/// glance rather than needing to read its label. Returns whether it was
+/// clicked this frame, same as `ui.button(..).clicked()`.
+fn start_stop_button(ui: &mut egui::Ui, running: bool) -> bool {
+    let (label, color) = if running {
+        ("Stop", egui::Color32::from_rgb(220, 60, 60))
+    } else {
+        ("Start", egui::Color32::from_rgb(50, 160, 50))
+    };
+    ui.add(egui::Button::new(egui::RichText::new(label).color(egui::Color32::WHITE)).fill(color)).clicked()
+}
+
 fn network_status_color(status: Option<bool>) -> egui::Color32 {
     match status {
         None => egui::Color32::from_gray(120),
@@ -5323,6 +5445,9 @@ fn render_extra_receiver_settings(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceive
         SettingsTab::PaCalibration => rx.settings_tab = SettingsTab::Agc,
         SettingsTab::PureSignal => rx.settings_tab = SettingsTab::Agc,
         SettingsTab::Diversity => rx.settings_tab = SettingsTab::Agc,
+        // Firmware update is against the whole radio, not a per-receiver
+        // concept -- redirect same as Network.
+        SettingsTab::Firmware => rx.settings_tab = SettingsTab::Agc,
 
         SettingsTab::Agc => {
             ui.label("Sample Rate:");
@@ -5762,6 +5887,10 @@ fn change_sample_rate(connected: &mut ConnectedState, new_rate: u32) {
         // comment for why this can't be skipped the same way
         // set_demod_params can't be.
         s.set_audio_iq(Arc::clone(&spectrum.tci_audio_out), Arc::clone(&spectrum.iq_out));
+    }
+    if let Some(s) = &connected.cat_server {
+        s.set_demod_params(spectrum.demod_params_handle());
+        s.set_display(Arc::clone(&spectrum.display));
     }
 
     connected.spectrum = spectrum;

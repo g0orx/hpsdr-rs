@@ -59,7 +59,15 @@ pub struct Config {
     pub antenna: Option<u8>,
     pub rigctl_addr: Option<String>,
     pub tci_addr: Option<String>,
-    /// Whether rigctl/TCI were running at last save -- since starting
+    /// Kenwood TS-2000 CAT emulation address -- see cat.rs's module doc
+    /// comment. Same `#[serde(default)]`/missing-means-off treatment as
+    /// rigctl_running/tci_running below (this field predates their
+    /// addition, so it can't share their attribute, but the same
+    /// reasoning applies: a config saved before CAT existed has no
+    /// value here).
+    #[serde(default)]
+    pub cat_addr: Option<String>,
+    /// Whether rigctl/TCI/CAT were running at last save -- since starting
     /// them is now a manual action (Settings -> Network) rather than
     /// automatic, this is what lets a reconnect restore "was running"
     /// state instead of always coming back stopped. `None`/missing
@@ -69,14 +77,19 @@ pub struct Config {
     pub rigctl_running: Option<bool>,
     #[serde(default)]
     pub tci_running: Option<bool>,
-    /// Debug logging to rigctl_log.txt/tci_log.txt (Settings -> Network)
-    /// -- see debug_log.rs's own doc comment. Off by default (missing =
-    /// `false`), same reasoning as every other Option<bool> here: a
-    /// config saved before this existed shouldn't suddenly start logging.
+    #[serde(default)]
+    pub cat_running: Option<bool>,
+    /// Debug logging to rigctl_log.txt/tci_log.txt/cat_log.txt (Settings
+    /// -> Network) -- see debug_log.rs's own doc comment. Off by default
+    /// (missing = `false`), same reasoning as every other Option<bool>
+    /// here: a config saved before this existed shouldn't suddenly start
+    /// logging.
     #[serde(default)]
     pub rigctl_logging_enabled: Option<bool>,
     #[serde(default)]
     pub tci_logging_enabled: Option<bool>,
+    #[serde(default)]
+    pub cat_logging_enabled: Option<bool>,
     /// Noise blanker (NB/NB2, mutually exclusive) and noise reduction
     /// (NR/NR2, mutually exclusive) state -- see the field docs on
     /// spectrum::DemodParams and the NoiseBlanker/NoiseReduction enums
