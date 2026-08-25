@@ -962,19 +962,27 @@ impl eframe::App for HpsdrApp {
         // Event::WindowFocused(true) appearing anywhere in this
         // frame's input queue (works even after a repaint gap, since
         // it's a discrete per-frame event log entry, not a state
-        // comparison this project has to have observed changing) --
-        // and, when either fires, disabling interaction for a short
-        // real-time window rather than a single frame, to bridge
-        // ordinary event-queue jitter between the two events landing a
-        // frame or two apart. ui.disable() is the sanctioned public
-        // API for "render normally, but don't accept interaction" --
-        // deliberately not reaching into InputState::pointer's private
-        // fields to suppress the click event directly, which would be
-        // more fragile across egui versions. unwrap_or(true) errors
-        // toward NOT disabling when focus state is unknown (some
-        // platforms/WMs don't always report it), since a false
-        // positive here blocks a real click rather than just failing
-        // to catch a spurious one.
+        // comparison this project has to have observed changing).
+        // unwrap_or(true) errors toward NOT suppressing when focus state
+        // is unknown (some platforms/WMs don't always report it), since
+        // a false positive here blocks a real click rather than just
+        // failing to catch a spurious one.
+        //
+        // BUG FIX (round 3): this used to call ui.disable() on the whole
+        // window for the real-time window below, which also blocked
+        // ordinary controls (e.g. the TX row's TWO TONE button) that
+        // happen to sit in this same root Ui -- a real report: with the
+        // Settings window open and focused for PureSignal calibration,
+        // clicking TWO TONE in the (unfocused) main window to both
+        // refocus it and fire the button just silently refocused it
+        // instead, every time. The actual reported bug this was fixed
+        // for was specifically about the spectrum/waterfall retuning
+        // itself on a refocus click, not about buttons in general, so
+        // this no longer disables anything globally -- `suppress_refocus_click`
+        // is instead checked directly at the two click-to-tune sites
+        // (spectrum and waterfall) further down, leaving every other
+        // control free to respond to the very click that refocuses the
+        // window, same as any normal application.
         let focused = ui.input(|i| i.viewport().focused).unwrap_or(true);
         let focus_event_this_frame = ui.input(|i| {
             i.events
@@ -983,21 +991,18 @@ impl eframe::App for HpsdrApp {
         });
         if (focused && !self.was_focused) || focus_event_this_frame {
             self.ignore_interaction_until = Some(Instant::now() + Duration::from_millis(200));
-            // Guarantees a follow-up frame runs to clear the disabled
-            // state promptly once the window elapses, even if nothing
-            // else happens to trigger a repaint in the meantime (the
-            // Connected view's own request_repaint_after(33ms) calls
-            // normally cover this, but this doesn't fire from every
-            // AppState).
+            // Guarantees a follow-up frame runs to clear this promptly
+            // once the window elapses, even if nothing else happens to
+            // trigger a repaint in the meantime (the Connected view's
+            // own request_repaint_after(33ms) calls normally cover this,
+            // but this doesn't fire from every AppState).
             ui.ctx().request_repaint_after(Duration::from_millis(200));
         }
         self.was_focused = focused;
-        if self
+        let suppress_refocus_click = self
             .ignore_interaction_until
-            .is_some_and(|deadline| Instant::now() < deadline)
-        {
-            ui.disable();
-        } else {
+            .is_some_and(|deadline| Instant::now() < deadline);
+        if !suppress_refocus_click {
             self.ignore_interaction_until = None;
         }
 
@@ -1845,7 +1850,10 @@ impl eframe::App for HpsdrApp {
                     );
 
                     if let Some(pos) = spectrum_resp.interact_pointer_pos() {
-                        if spectrum_resp.clicked() {
+                        // See suppress_refocus_click's own doc comment --
+                        // this is the one thing that click-to-refocus the
+                        // window must NOT also do.
+                        if spectrum_resp.clicked() && !suppress_refocus_click {
                             let new_freq = freq_at_x(pos.x, rect, freq_hz, sample_rate);
                             let (effective_freq, retune) =
                                 resolve_tune(connected.ctun, freq_hz, sample_rate, passband, new_freq);
@@ -2082,7 +2090,8 @@ impl eframe::App for HpsdrApp {
                         egui::Sense::click(),
                     );
                     if let Some(pos) = waterfall_click_resp.interact_pointer_pos() {
-                        if waterfall_click_resp.clicked() {
+                        // See suppress_refocus_click's own doc comment.
+                        if waterfall_click_resp.clicked() && !suppress_refocus_click {
                             let new_freq = freq_at_x(pos.x, rect, freq_hz, sample_rate);
                             let (effective_freq, retune) =
                                 resolve_tune(connected.ctun, freq_hz, sample_rate, passband, new_freq);
