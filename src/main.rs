@@ -174,6 +174,13 @@ struct ExtraReceiver {
     /// Shared with every other receiver (including the primary) --
     /// Alex's antenna relays are one physical resource, not per-DDC.
     antenna: Arc<std::sync::atomic::AtomicU32>,
+    /// Same Arc as RadioSession::mox -- MOX is a whole-session concept,
+    /// not per-receiver. Kept here (not just read once at spawn time) so
+    /// change_extra_receiver_sample_rate can pass it to a rebuilt
+    /// SpectrumHandle too -- see SpectrumHandle::start's doc comment for
+    /// why this receiver's own audio_output (local playback) needs it
+    /// just as much as the main receiver does.
+    mox: Arc<std::sync::atomic::AtomicBool>,
     spectrum: SpectrumHandle,
     audio_output: Option<AudioOutput>,
     waterfall_texture: Option<egui::TextureHandle>,
@@ -584,6 +591,7 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                 Arc::clone(&session.iq_buffers[0]),
                 settings.sample_rate as i32,
                 Some(Arc::clone(&session.rx_audio_to_radio)),
+                Arc::clone(&session.mox),
             );
             let audio_output =
                 match AudioOutput::start(Arc::clone(&spectrum.audio_out)) {
@@ -753,6 +761,7 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                 Arc::clone(&tx_spectrum_iq),
                 duc_rate,
                 None,
+                Arc::clone(&session.mox),
             );
             let mic_buffer = Arc::new(Mutex::new(VecDeque::new()));
             let (tx_enabled, mic_input, tx_handle) = match MicInput::start(Arc::clone(&mic_buffer)) {
@@ -3150,6 +3159,7 @@ impl eframe::App for HpsdrApp {
                                                 Arc::clone(&tx_spectrum_iq),
                                                 duc_rate,
                                                 None,
+                                                Arc::clone(&connected.session.mox),
                                             );
                                             let mic_buffer = Arc::new(Mutex::new(VecDeque::new()));
                                             match MicInput::start(Arc::clone(&mic_buffer)) {
@@ -5349,7 +5359,13 @@ fn spawn_extra_receiver(
     let rate_val = rate_arc.load(Ordering::Relaxed);
 
     let iq_buffer = Arc::clone(&session.iq_buffers[idx]);
-    let spectrum = SpectrumHandle::start(idx as i32, Arc::clone(&iq_buffer), rate_val as i32, None);
+    let spectrum = SpectrumHandle::start(
+        idx as i32,
+        Arc::clone(&iq_buffer),
+        rate_val as i32,
+        None,
+        Arc::clone(&session.mox),
+    );
 
     if let Some(s) = saved {
         spectrum.set_mode(s.mode);
@@ -5386,6 +5402,7 @@ fn spawn_extra_receiver(
         num_adcs,
         protocol,
         antenna: antenna_arc,
+        mox: Arc::clone(&session.mox),
         spectrum,
         audio_output,
         waterfall_texture: None,
@@ -5448,6 +5465,7 @@ fn change_sample_rate(connected: &mut ConnectedState, new_rate: u32) {
         Arc::clone(&connected.session.iq_buffers[0]),
         new_rate as i32,
         Some(Arc::clone(&connected.session.rx_audio_to_radio)),
+        Arc::clone(&connected.session.mox),
     );
     spectrum.set_mode(mode);
     spectrum.set_width_hz(width_hz);
@@ -5508,6 +5526,7 @@ fn change_sample_rate(connected: &mut ConnectedState, new_rate: u32) {
                 Arc::clone(&tx_spectrum_iq),
                 new_rate as i32,
                 None,
+                Arc::clone(&connected.session.mox),
             );
             if let Some(mic) = &connected.mic_input {
                 let tx_handle = TxHandle::start(
@@ -5588,7 +5607,13 @@ fn change_extra_receiver_sample_rate(rx: &mut ExtraReceiver, new_rate: u32) {
     rx.audio_output = None;
     rx.spectrum.stop();
 
-    let spectrum = SpectrumHandle::start(rx.ddc_index as i32, Arc::clone(&rx.iq_buffer), new_rate as i32, None);
+    let spectrum = SpectrumHandle::start(
+        rx.ddc_index as i32,
+        Arc::clone(&rx.iq_buffer),
+        new_rate as i32,
+        None,
+        Arc::clone(&rx.mox),
+    );
     spectrum.set_mode(mode);
     spectrum.set_width_hz(width_hz);
     spectrum.set_gain(gain);

@@ -1055,6 +1055,9 @@ fn run(
     tci_audio_out: Arc<Mutex<VecDeque<f32>>>,
     iq_out: Arc<Mutex<VecDeque<(f32, f32)>>>,
     rx_audio_to_radio: Option<Arc<Mutex<VecDeque<f32>>>>,
+    // Muted (not pushed to any of the three audio outputs above) while
+    // MOX is active -- see SpectrumHandle::start's doc comment on why.
+    mox: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
 ) {
     let mut analyzer = SpectrumAnalyzer::open(channel, sample_rate);
@@ -1142,7 +1145,34 @@ fn run(
             // when send_rx_audio_to_radio is on. Same "own copy, not a
             // second reader" reasoning as tci_out.
             let mut radio_out = rx_audio_to_radio.as_ref().map(|q| q.lock().unwrap());
+            // ROOT CAUSE FIX: RX audio (all three taps -- local speaker,
+            // TCI, and the radio's own local output) used to keep
+            // flowing completely unmuted through TX, same as the RX ADC
+            // itself genuinely does (PureSignal's feedback receiver
+            // relies on that continuing) -- but unlike PureSignal's
+            // feedback, which goes through a dedicated, deliberately
+            // attenuated path, this is the MAIN receiver's normal,
+            // full-gain audio output picking up whatever the antenna/T-R
+            // relay leaks back from your own transmission. A real report
+            // confirmed this as an actual acoustic feedback loop using
+            // TCI Remote (an Android app) for TX: the phone's speaker
+            // played this leaked audio back into its own mic while
+            // transmitting. TCI Remote's own log confirmed it never asks
+            // for RX audio to be gated during TX at all (only iq_stop/
+            // iq_start around PTT, no audio_stop -- matching this
+            // project's TCI server, which (see this file's own doc
+            // comment on tci_audio_out) streams audio unconditionally
+            // with no audio_start/audio_stop gate, mirroring rustyHPSDR's
+            // confirmed-working reference behavior) -- so muting has to
+            // happen here, at the source, not by expecting any TCI
+            // client to ask for it. Spectrum/waterfall display and
+            // PureSignal's own feedback path are untouched -- this only
+            // gates the three post-demod AUDIO taps below.
+            let mox_active = mox.load(Ordering::Relaxed);
             for sample in audio {
+                if mox_active {
+                    continue;
+                }
                 let sample = (sample * params.gain).clamp(-1.0, 1.0);
                 if out.len() >= AUDIO_BUFFER_CAPACITY {
                     out.pop_front();
@@ -1196,11 +1226,21 @@ impl SpectrumHandle {
     /// receivers and the TX spectrum tap (see RadioSession::
     /// rx_audio_to_radio's doc comment for why only the main receiver
     /// feeds this).
+    ///
+    /// `mox`: this handle's three audio outputs (audio_out, tci_audio_out,
+    /// and rx_audio_to_radio if present) are muted while it's true -- see
+    /// run()'s doc comment for why. Always the session's real mox flag in
+    /// practice (every call site has one -- MOX is a whole-session
+    /// concept, not per-receiver), even for extra receivers/the TX
+    /// spectrum tap, where muting is harmless (their audio_out/
+    /// tci_audio_out aren't wired to anything that plays them back) --
+    /// simpler than threading an Option through just to skip it there.
     pub fn start(
         channel: i32,
         iq_buffer: Arc<Mutex<VecDeque<IqSample>>>,
         sample_rate: i32,
         rx_audio_to_radio: Option<Arc<Mutex<VecDeque<f32>>>>,
+        mox: Arc<AtomicBool>,
     ) -> Self {
         let display = Arc::new(Mutex::new(SpectrumDisplay::default()));
         let demod_params = Arc::new(Mutex::new(DemodParams::default()));
@@ -1226,6 +1266,7 @@ impl SpectrumHandle {
                     tci_audio_out,
                     iq_out,
                     rx_audio_to_radio,
+                    mox,
                     stop,
                 )
             })
