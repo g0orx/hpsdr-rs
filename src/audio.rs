@@ -38,6 +38,23 @@ const OUTPUT_CHANNELS: u16 = 2; // interleaved stereo, matches fexchange0's outp
 const INPUT_SAMPLE_RATE: u32 = 48_000;
 const INPUT_CHANNELS: u16 = 1;
 
+/// Names of every currently available output-capable device (e.g. real
+/// speakers/headphones, and on Windows, virtual devices like "CABLE
+/// Input (VB-Audio Virtual Cable)" if installed) -- for the output
+/// device picker in Settings (RX tab, main and extra receivers). Skips
+/// any device whose name can't be queried (a disconnected/erroring
+/// device) rather than failing the whole list over one bad entry.
+pub fn list_output_devices() -> Vec<String> {
+    let host = cpal::default_host();
+    match host.output_devices() {
+        Ok(devices) => devices.filter_map(|d| d.description().ok().map(|desc| desc.name().to_string())).collect(),
+        Err(e) => {
+            eprintln!("audio: failed to enumerate output devices: {e}");
+            Vec::new()
+        }
+    }
+}
+
 pub struct AudioOutput {
     // Kept alive for as long as playback should continue; dropping this
     // stops the stream.
@@ -45,11 +62,30 @@ pub struct AudioOutput {
 }
 
 impl AudioOutput {
-    pub fn start(buffer: Arc<Mutex<VecDeque<f32>>>) -> Result<Self, String> {
+    /// `device_name`: `None` (or a name that no longer matches any
+    /// currently available device, e.g. a saved selection for a virtual
+    /// cable that isn't installed on this machine) falls back to the
+    /// system default output device, same as this always did before
+    /// device selection existed -- never a hard error just because a
+    /// specific device isn't found.
+    pub fn start(buffer: Arc<Mutex<VecDeque<f32>>>, device_name: Option<&str>) -> Result<Self, String> {
         let host = cpal::default_host();
-        let device = host
-            .default_output_device()
-            .ok_or_else(|| "no default audio output device found".to_string())?;
+        let device = match device_name {
+            Some(name) => host
+                .output_devices()
+                .ok()
+                .and_then(|mut devices| {
+                    devices.find(|d| d.description().is_ok_and(|desc| desc.name() == name))
+                })
+                .or_else(|| {
+                    eprintln!(
+                        "audio: output device \"{name}\" not found -- falling back to the system default"
+                    );
+                    host.default_output_device()
+                }),
+            None => host.default_output_device(),
+        }
+        .ok_or_else(|| "no default audio output device found".to_string())?;
 
         let config = cpal::StreamConfig {
             channels: OUTPUT_CHANNELS,

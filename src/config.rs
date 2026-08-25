@@ -20,6 +20,17 @@ pub struct Config {
     pub mode: Option<Mode>,
     pub width_hz: Option<f64>,
     pub gain: Option<f32>,
+    /// Output device for local RX audio playback (Settings -> RX's
+    /// "Output device" picker), by name -- e.g. "CABLE Input (VB-Audio
+    /// Virtual Cable)" to feed a decoder instead of/alongside real
+    /// speakers. `None`/missing (configs saved before this existed)
+    /// falls back to the system default, same as this always did before
+    /// device selection existed. An unrecognized name (the saved device
+    /// no longer present on this machine) also falls back to the
+    /// default rather than erroring -- see AudioOutput::start's doc
+    /// comment.
+    #[serde(default)]
+    pub audio_output_device: Option<String>,
     pub agc: Option<Agc>,
     pub agc_attack_ms: Option<i32>,
     pub agc_decay_ms: Option<i32>,
@@ -252,6 +263,10 @@ pub struct ExtraReceiverConfig {
     pub mode: Mode,
     pub width_hz: f64,
     pub gain: f32,
+    /// See Config::audio_output_device's doc comment -- same thing, this
+    /// receiver's own independent output device selection.
+    #[serde(default)]
+    pub audio_output_device: Option<String>,
     pub agc: Agc,
     pub agc_attack_ms: i32,
     pub agc_decay_ms: i32,

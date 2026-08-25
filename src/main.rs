@@ -184,6 +184,13 @@ struct ExtraReceiver {
     mox: Arc<std::sync::atomic::AtomicBool>,
     spectrum: SpectrumHandle,
     audio_output: Option<AudioOutput>,
+    /// Selected output device name (Settings -> RX's "Output device"
+    /// picker) -- `None` = system default, same as this always used
+    /// before device selection existed. See AudioOutput::start's own
+    /// doc comment for why an unrecognized/no-longer-present name (e.g.
+    /// a saved VB-Cable selection on a machine that doesn't have it
+    /// installed) falls back to the default rather than erroring.
+    audio_output_device: Option<String>,
     waterfall_texture: Option<egui::TextureHandle>,
     /// (SpectrumDisplay::revision, palette, db_low, db_high) the
     /// waterfall texture was last built from -- lets the UI skip
@@ -268,6 +275,13 @@ struct ConnectedState {
     /// main panel's spectrum-drawing code).
     tx_spectrum: SpectrumHandle,
     audio_output: Option<AudioOutput>,
+    /// Selected output device name for `audio_output` above (Settings ->
+    /// RX's "Output device" picker) -- see ExtraReceiver's identical
+    /// field doc comment. Deliberately NOT used for tx_audio_monitor_output
+    /// below -- monitoring your own TX audio should go to your own
+    /// speakers/headphones, not wherever RX audio's been routed (e.g. a
+    /// virtual cable feeding a decoder).
+    audio_output_device: Option<String>,
     /// Local playback of TxHandle::tx_audio_monitor -- see that field's
     /// doc comment. None when not actively monitoring (the common
     /// case); toggled on/off via Settings -> TX's "Monitor TX Audio"
@@ -602,8 +616,9 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                 Some(Arc::clone(&session.rx_audio_to_radio)),
                 Arc::clone(&session.mox),
             );
+            let audio_output_device = cfg.audio_output_device.clone();
             let audio_output =
-                match AudioOutput::start(Arc::clone(&spectrum.audio_out)) {
+                match AudioOutput::start(Arc::clone(&spectrum.audio_out), audio_output_device.as_deref()) {
                     Ok(a) => Some(a),
                     Err(e) => {
                         eprintln!("audio output unavailable: {e}");
@@ -866,6 +881,7 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                 spectrum,
                 tx_spectrum,
                 audio_output,
+                audio_output_device,
                 tx_audio_monitor_output: None,
                 rigctl_server,
                 tci_server,
@@ -1422,6 +1438,47 @@ impl eframe::App for HpsdrApp {
                             connected.spectrum.set_gain(gain);
                             settings_changed = true;
                         }
+
+                        ui.add_space(12.0);
+                        ui.label("Output device:");
+                        let devices = audio::list_output_devices();
+                        let current_label =
+                            connected.audio_output_device.clone().unwrap_or_else(|| "(System Default)".to_string());
+                        egui::ComboBox::from_id_salt("audio_output_device")
+                            .selected_text(current_label)
+                            .show_ui(ui, |ui| {
+                                if ui
+                                    .selectable_label(connected.audio_output_device.is_none(), "(System Default)")
+                                    .clicked()
+                                    && connected.audio_output_device.is_some()
+                                {
+                                    connected.audio_output_device = None;
+                                    connected.audio_output = AudioOutput::start(
+                                        Arc::clone(&connected.spectrum.audio_out),
+                                        None,
+                                    )
+                                    .ok();
+                                    settings_changed = true;
+                                }
+                                for name in &devices {
+                                    let selected = connected.audio_output_device.as_deref() == Some(name.as_str());
+                                    if ui.selectable_label(selected, name).clicked() && !selected {
+                                        connected.audio_output_device = Some(name.clone());
+                                        connected.audio_output = AudioOutput::start(
+                                            Arc::clone(&connected.spectrum.audio_out),
+                                            Some(name),
+                                        )
+                                        .ok();
+                                        settings_changed = true;
+                                    }
+                                }
+                            })
+                            .response
+                            .on_hover_text(
+                                "Where local RX audio plays -- e.g. a virtual cable (VB-Audio Virtual \
+                                 Cable on Windows) to feed a decoder like WSJT-X instead of/alongside \
+                                 real speakers.",
+                            );
 
                         if connected.tx_enabled {
                             if connected.tx_handle.is_some() {
@@ -3358,7 +3415,11 @@ impl eframe::App for HpsdrApp {
                                         let mut monitoring = connected.tx_audio_monitor_output.is_some();
                                         if ui.checkbox(&mut monitoring, "Monitor TX Audio").changed() {
                                             if monitoring {
-                                                match AudioOutput::start(Arc::clone(&tx.tx_audio_monitor)) {
+                                                // Always the system default (None) -- see
+                                                // ConnectedState::audio_output_device's doc comment on
+                                                // why this doesn't follow the RX output device
+                                                // selection.
+                                                match AudioOutput::start(Arc::clone(&tx.tx_audio_monitor), None) {
                                                     Ok(out) => connected.tx_audio_monitor_output = Some(out),
                                                     Err(e) => eprintln!("tx audio monitor unavailable: {e}"),
                                                 }
@@ -3915,6 +3976,7 @@ impl eframe::App for HpsdrApp {
                                 mode: rx.spectrum.mode(),
                                 width_hz: rx.spectrum.width_hz(),
                                 gain: rx.spectrum.gain(),
+                                audio_output_device: rx.audio_output_device.clone(),
                                 agc: rx.spectrum.agc(),
                                 agc_attack_ms: agc_params.agc_attack_ms,
                                 agc_decay_ms: agc_params.agc_decay_ms,
@@ -3950,6 +4012,7 @@ impl eframe::App for HpsdrApp {
                         mode: Some(connected.spectrum.mode()),
                         width_hz: Some(connected.spectrum.width_hz()),
                         gain: Some(connected.spectrum.gain()),
+                        audio_output_device: connected.audio_output_device.clone(),
                         agc: Some(connected.spectrum.agc()),
                         agc_attack_ms: Some(agc_params_now.agc_attack_ms),
                         agc_decay_ms: Some(agc_params_now.agc_decay_ms),
@@ -4863,6 +4926,34 @@ fn render_extra_receiver_ui(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceiver>>) {
             rx.settings_dirty.store(true, Ordering::Relaxed);
         }
     });
+    ui.horizontal(|ui| {
+        // Same picker as the main window's identical control -- see its
+        // own doc comment (main.rs) -- independent per receiver, so e.g.
+        // the main receiver can go to real speakers while this one feeds
+        // a virtual cable for a second decoder, or vice versa.
+        ui.label("Output device:");
+        let devices = audio::list_output_devices();
+        let current_label = rx.audio_output_device.clone().unwrap_or_else(|| "(System Default)".to_string());
+        egui::ComboBox::from_id_salt(("extra_receiver_audio_output_device", rx.ddc_index))
+            .selected_text(current_label)
+            .show_ui(ui, |ui| {
+                if ui.selectable_label(rx.audio_output_device.is_none(), "(System Default)").clicked()
+                    && rx.audio_output_device.is_some()
+                {
+                    rx.audio_output_device = None;
+                    rx.audio_output = AudioOutput::start(Arc::clone(&rx.spectrum.audio_out), None).ok();
+                    rx.settings_dirty.store(true, Ordering::Relaxed);
+                }
+                for name in &devices {
+                    let selected = rx.audio_output_device.as_deref() == Some(name.as_str());
+                    if ui.selectable_label(selected, name).clicked() && !selected {
+                        rx.audio_output_device = Some(name.clone());
+                        rx.audio_output = AudioOutput::start(Arc::clone(&rx.spectrum.audio_out), Some(name)).ok();
+                        rx.settings_dirty.store(true, Ordering::Relaxed);
+                    }
+                }
+            });
+    });
 
     ui.horizontal_wrapped(|ui| {
         if ui
@@ -5461,7 +5552,9 @@ fn spawn_extra_receiver(
         spectrum.set_eq(s.eq);
     }
 
-    let audio_output = AudioOutput::start(Arc::clone(&spectrum.audio_out)).ok();
+    let audio_output_device = saved.and_then(|s| s.audio_output_device.clone());
+    let audio_output =
+        AudioOutput::start(Arc::clone(&spectrum.audio_out), audio_output_device.as_deref()).ok();
     let initial_frequency_hz = freq_arc.load(Ordering::Relaxed);
     // Restore CTUN -- see Config::ctun's doc comment (same reasoning,
     // per receiver).
@@ -5481,6 +5574,7 @@ fn spawn_extra_receiver(
         mox: Arc::clone(&session.mox),
         spectrum,
         audio_output,
+        audio_output_device,
         waterfall_texture: None,
         waterfall_signature: None,
         scroll_accum: 0.0,
@@ -5558,7 +5652,10 @@ fn change_sample_rate(connected: &mut ConnectedState, new_rate: u32) {
     spectrum.set_noise_reduction(agc_params.noise_reduction);
     spectrum.set_snb(agc_params.snb);
 
-    connected.audio_output = match AudioOutput::start(Arc::clone(&spectrum.audio_out)) {
+    connected.audio_output = match AudioOutput::start(
+        Arc::clone(&spectrum.audio_out),
+        connected.audio_output_device.as_deref(),
+    ) {
         Ok(a) => Some(a),
         Err(e) => {
             eprintln!("audio output unavailable after sample rate change: {e}");
@@ -5705,7 +5802,7 @@ fn change_extra_receiver_sample_rate(rx: &mut ExtraReceiver, new_rate: u32) {
     spectrum.set_noise_reduction(agc_params.noise_reduction);
     spectrum.set_snb(agc_params.snb);
 
-    rx.audio_output = match AudioOutput::start(Arc::clone(&spectrum.audio_out)) {
+    rx.audio_output = match AudioOutput::start(Arc::clone(&spectrum.audio_out), rx.audio_output_device.as_deref()) {
         Ok(a) => Some(a),
         Err(e) => {
             eprintln!("audio output unavailable after sample rate change: {e}");
