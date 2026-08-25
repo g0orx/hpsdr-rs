@@ -5005,34 +5005,6 @@ fn render_extra_receiver_ui(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceiver>>) {
             rx.settings_dirty.store(true, Ordering::Relaxed);
         }
     });
-    ui.horizontal(|ui| {
-        // Same picker as the main window's identical control -- see its
-        // own doc comment (main.rs) -- independent per receiver, so e.g.
-        // the main receiver can go to real speakers while this one feeds
-        // a virtual cable for a second decoder, or vice versa.
-        ui.label("Output device:");
-        let devices = audio::list_output_devices();
-        let current_label = rx.audio_output_device.clone().unwrap_or_else(|| "(System Default)".to_string());
-        egui::ComboBox::from_id_salt(("extra_receiver_audio_output_device", rx.ddc_index))
-            .selected_text(current_label)
-            .show_ui(ui, |ui| {
-                if ui.selectable_label(rx.audio_output_device.is_none(), "(System Default)").clicked()
-                    && rx.audio_output_device.is_some()
-                {
-                    rx.audio_output_device = None;
-                    rx.audio_output = AudioOutput::start(Arc::clone(&rx.spectrum.audio_out), None).ok();
-                    rx.settings_dirty.store(true, Ordering::Relaxed);
-                }
-                for name in &devices {
-                    let selected = rx.audio_output_device.as_deref() == Some(name.as_str());
-                    if ui.selectable_label(selected, name).clicked() && !selected {
-                        rx.audio_output_device = Some(name.clone());
-                        rx.audio_output = AudioOutput::start(Arc::clone(&rx.spectrum.audio_out), Some(name)).ok();
-                        rx.settings_dirty.store(true, Ordering::Relaxed);
-                    }
-                }
-            });
-    });
 
     ui.horizontal_wrapped(|ui| {
         if ui
@@ -5337,10 +5309,10 @@ fn render_extra_receiver_settings(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceive
         // -- fall back to AGC if this is ever somehow selected.
         SettingsTab::Network => rx.settings_tab = SettingsTab::Agc,
 
-        // Output device selection lives in the main window's own
-        // Settings -> Audio tab (this receiver has its own separate
-        // Output device picker inline in its RX tab below, and has no
-        // mic/TX concept at all) -- redirect same as Network.
+        // No standalone Audio tab for extra receivers -- this receiver's
+        // own Output device picker lives inline at the bottom of its RX
+        // tab below (and it has no mic/TX concept at all) -- redirect
+        // same as Network.
         SettingsTab::Audio => rx.settings_tab = SettingsTab::Agc,
 
         // TX (and PA Calibration/PureSignal, split out of it) are all
@@ -5467,6 +5439,38 @@ fn render_extra_receiver_settings(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceive
                 }
             });
             ui.weak("Shared by both NB and NB2 (toggle either on this window's main panel).");
+            ui.separator();
+
+            ui.horizontal(|ui| {
+                // Same picker/behavior as the main window's Settings ->
+                // Audio "Output device" -- independent per receiver, so
+                // e.g. the main receiver can go to real speakers while
+                // this one feeds a virtual cable for a second decoder,
+                // or vice versa.
+                ui.label("Output device:");
+                let devices = audio::list_output_devices();
+                let current_label =
+                    rx.audio_output_device.clone().unwrap_or_else(|| "(System Default)".to_string());
+                egui::ComboBox::from_id_salt(("extra_receiver_audio_output_device", rx.ddc_index))
+                    .selected_text(current_label)
+                    .show_ui(ui, |ui| {
+                        if ui.selectable_label(rx.audio_output_device.is_none(), "(System Default)").clicked()
+                            && rx.audio_output_device.is_some()
+                        {
+                            rx.audio_output_device = None;
+                            rx.audio_output = AudioOutput::start(Arc::clone(&rx.spectrum.audio_out), None).ok();
+                            rx.settings_dirty.store(true, Ordering::Relaxed);
+                        }
+                        for name in &devices {
+                            let selected = rx.audio_output_device.as_deref() == Some(name.as_str());
+                            if ui.selectable_label(selected, name).clicked() && !selected {
+                                rx.audio_output_device = Some(name.clone());
+                                rx.audio_output = AudioOutput::start(Arc::clone(&rx.spectrum.audio_out), Some(name)).ok();
+                                rx.settings_dirty.store(true, Ordering::Relaxed);
+                            }
+                        }
+                    });
+            });
         }
 
         SettingsTab::Spectrum => {
