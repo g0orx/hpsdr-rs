@@ -55,7 +55,7 @@ Windows toolchains are supported:
 - [vcpkg](https://vcpkg.io/), with `vcpkg install fftw3:x64-windows-static` (the `vcpkg` crate defaults to looking for the static triplet; static linking also means no `fftw3.dll` to ship alongside the built `.exe`), and either `VCPKG_ROOT` set to your vcpkg checkout or `vcpkg integrate install` run once
 - No `PATH`/pkg-config setup needed — `build.rs` talks to vcpkg and locates MSVC directly
 - Confirmed building AND running successfully this way (2026-08-19)
-- The [Firmware update](#firmware-update) feature additionally needs the [Npcap SDK](https://npcap.com/#download) at build time (its `Packet.lib`, discoverable on the linker's `LIB` path) — unlike vcpkg/fftw3 above, this hasn't been build-tested on Windows; if the linker can't find `Packet.lib`, point `LIB` at the SDK's `Lib/x64` directory
+- The [Firmware update](#firmware-update) feature additionally needs the [Npcap SDK](https://npcap.com/#download) at build time (its `Packet.lib`) — download and extract it, then set `NPCAP_SDK_DIR` to that folder; `build.rs` adds its `Lib/x64` to the linker's search path automatically (same idea as `VCPKG_ROOT` above, not a native cargo/MSVC mechanism). A real "`Packet.lib` not found" link error on a fresh Windows build confirmed this step is actually needed — if it still can't be found with `NPCAP_SDK_DIR` set, double check the SDK zip's actual internal folder layout against `<NPCAP_SDK_DIR>\Lib\x64\Packet.lib`
 
 WDSP and its noise-reduction dependencies (libspecbleach, rnnoise) are vendored as C source under `vendor/` and built automatically from source by `build.rs` (via the `cc` crate) — no separate build step, and no prebuilt platform-specific binaries to obtain or keep in sync.
 

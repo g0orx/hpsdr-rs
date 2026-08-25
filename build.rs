@@ -62,6 +62,31 @@ fn main() {
         fftw.include_paths
     };
 
+    // Npcap SDK discovery, Windows only -- needed for pnet_datalink's raw-
+    // Ethernet backend (bootloader.rs's firmware-upload feature), NOT
+    // this file's own vendored C sources above. pnet_datalink's own
+    // Windows code links `Packet.lib` directly via `#[link(name =
+    // "Packet")]` (confirmed by reading its bindings/winpcap.rs source),
+    // which the final link step can't find unless something adds the
+    // Npcap SDK's Lib/x64 directory to the linker's search path -- cargo
+    // has no way to know that on its own the way it does for a crate's
+    // OWN declared dependencies, since this is a THIRD-PARTY crate's
+    // link requirement, not this project's. Same shape as the vcpkg/
+    // fftw3 discovery above (an env var pointing at a local SDK
+    // checkout, rather than requiring the user hand-edit their global
+    // LIB environment variable), but UNVERIFIED end-to-end on a real
+    // Windows build (unlike vcpkg/fftw3, which is confirmed working) --
+    // a real report hit exactly the "Packet.lib not found" link error
+    // this is meant to fix; if NPCAP_SDK_DIR is set but this still
+    // doesn't resolve it, double check the actual subdirectory layout of
+    // your specific SDK download against what's assumed here.
+    if target_os == "windows" {
+        if let Ok(npcap_sdk) = std::env::var("NPCAP_SDK_DIR") {
+            let lib_dir = std::path::Path::new(&npcap_sdk).join("Lib").join("x64");
+            println!("cargo:rustc-link-search=native={}", lib_dir.display());
+        }
+    }
+
     let mut build = cc::Build::new();
     build.files([
         "vendor/libspecbleach/src/processors/specbleach_adenoiser.c",
