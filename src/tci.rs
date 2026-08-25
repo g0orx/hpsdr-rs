@@ -495,6 +495,20 @@ fn handle_client(
     // any other TCI client that relies on that gate.
     let mut audio_streaming = true;
     let mut iq_streaming = false;
+    // ROOT CAUSE INVESTIGATION continued: the superseded connections in
+    // a real Windows report never logged a read error either (see
+    // "connection error, closing" above) -- consistent with the OLD
+    // connection just going quiet (no read error, no data) until TCI
+    // Remote gives up and opens a NEW one, which supersedes it before it
+    // ever hits an error path at all. These one-shot markers narrow down
+    // WHERE that quiet actually starts: logged the first time each
+    // stream actually sends real data, so comparing against "iq_start"/
+    // "audio_start" timestamps already logged shows whether data flows
+    // at all before the ~2s reconnect, or never starts flowing in the
+    // first place (which would point at the RX pipeline itself, not
+    // networking).
+    let mut audio_first_sent = false;
+    let mut iq_first_sent = false;
     // BUG FIX: a bad (garbage-value) pair used to be dropped outright
     // (`continue`, pushing nothing), which shortens tci_tx_audio's
     // effective timeline by one sample every time it fires -- confirmed
@@ -792,8 +806,13 @@ fn handle_client(
                     stereo.len() as u32 * 2,
                     &stereo,
                 );
-                if ws.send(Message::Binary(msg.into())).is_err() {
+                if let Err(e) = ws.send(Message::Binary(msg.into())) {
+                    logging.log(&format!("audio stream send failed, closing: {e:?}"));
                     return;
+                }
+                if !audio_first_sent {
+                    audio_first_sent = true;
+                    logging.log("first audio data sent");
                 }
             }
         }
@@ -816,8 +835,13 @@ fn handle_client(
                     swapped.len() as u32,
                     &swapped,
                 );
-                if ws.send(Message::Binary(msg.into())).is_err() {
+                if let Err(e) = ws.send(Message::Binary(msg.into())) {
+                    logging.log(&format!("IQ stream send failed, closing: {e:?}"));
                     return;
+                }
+                if !iq_first_sent {
+                    iq_first_sent = true;
+                    logging.log("first IQ data sent");
                 }
             }
         }
