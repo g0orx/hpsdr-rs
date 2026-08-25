@@ -36,6 +36,7 @@
     `rigctl -m 2 -r 127.0.0.1:4532 f`
 */
 
+use crate::debug_log::DebugLog;
 use crate::spectrum::{DemodParams, Mode, SpectrumDisplay};
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
@@ -96,6 +97,7 @@ impl RigctlServer {
         demod_params: Arc<Mutex<DemodParams>>,
         display: Arc<Mutex<SpectrumDisplay>>,
         mox: Arc<AtomicBool>,
+        logging: DebugLog,
     ) -> std::io::Result<Self> {
         let listener = TcpListener::bind(addr)?;
         listener.set_nonblocking(true)?;
@@ -111,11 +113,13 @@ impl RigctlServer {
         let accept_client_threads = Arc::clone(&client_threads);
         let accept_demod_params = Arc::clone(&demod_params);
         let accept_display = Arc::clone(&display);
+        let accept_logging = logging.clone();
         let thread = thread::spawn(move || {
             while !accept_stop.load(Ordering::Relaxed) {
                 match listener.accept() {
                     Ok((stream, peer)) => {
                         println!("rigctl: client connected from {peer}");
+                        accept_logging.log(&format!("client connected from {peer}"));
                         // Matches tci.rs's already-proven approach: a
                         // read timeout so handle_client's loop notices
                         // `stop` promptly instead of blocking forever
@@ -132,9 +136,10 @@ impl RigctlServer {
                         let conn_mox = Arc::clone(&mox);
                         let conn_stop = Arc::clone(&accept_stop);
                         let conn_connected = Arc::clone(&accept_connected);
+                        let conn_logging = accept_logging.clone();
                         let handle = thread::spawn(move || {
                             conn_connected.fetch_add(1, Ordering::Relaxed);
-                            handle_client(stream, freq, params, disp, conn_mox, conn_stop);
+                            handle_client(stream, freq, params, disp, conn_mox, conn_stop, conn_logging);
                             conn_connected.fetch_sub(1, Ordering::Relaxed);
                         });
                         let mut threads = accept_client_threads.lock().unwrap();
@@ -222,6 +227,7 @@ fn handle_client(
     display: DisplayCell,
     mox: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
+    logging: DebugLog,
 ) {
     let _ = stream.set_nodelay(true);
     let mut writer = match stream.try_clone() {
@@ -234,12 +240,16 @@ fn handle_client(
     while !stop.load(Ordering::Relaxed) {
         line.clear();
         match reader.read_line(&mut line) {
-            Ok(0) => break, // client closed the connection
+            Ok(0) => {
+                logging.log("client closed the connection");
+                break;
+            }
             Ok(_) => {
                 let cmd = line.trim();
                 if cmd.is_empty() {
                     continue;
                 }
+                logging.log(&format!("<< {cmd}"));
                 // Resolved fresh on every command (not once per
                 // connection) so a sample-rate change mid-session -- see
                 // set_demod_params -- takes effect immediately for
@@ -248,11 +258,15 @@ fn handle_client(
                 let current_display = display.lock().unwrap().clone();
                 match handle_command(cmd, &frequency_hz, &current_params, &current_display, &mox) {
                     Some(response) => {
+                        logging.log(&format!(">> {}", response.trim_end()));
                         if writer.write_all(response.as_bytes()).is_err() {
                             break;
                         }
                     }
-                    None => break, // quit command
+                    None => {
+                        logging.log("client sent quit");
+                        break; // quit command
+                    }
                 }
             }
             // Read timeout (see start()'s set_read_timeout) -- expected

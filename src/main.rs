@@ -2,6 +2,7 @@ mod audio;
 mod bootloader;
 mod bootloader_ui;
 mod config;
+mod debug_log;
 mod discovery;
 mod discovery_ui;
 mod radio;
@@ -331,6 +332,14 @@ struct ConnectedState {
     ctun_frequency_hz: u32,
     rigctl_addr: String,
     tci_addr: String,
+    /// Debug logging toggles (Settings -> Network) -- see
+    /// debug_log.rs's own doc comment. Constructed once per connection
+    /// (not per Start/Stop of the server itself), and handed (cloned) to
+    /// whichever RigctlServer/TciServer is currently running so toggling
+    /// the checkbox takes effect immediately without needing to restart
+    /// either server.
+    rigctl_debug_log: debug_log::DebugLog,
+    tci_debug_log: debug_log::DebugLog,
     /// Set when a manual Start from the Network tab fails (e.g. port
     /// already in use); cleared on the next Start attempt. rigctl/TCI
     /// no longer auto-start on connect, so there's no "unavailable at
@@ -605,6 +614,22 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                 cfg.rigctl_addr.clone().unwrap_or_else(|| rigctl::DEFAULT_ADDR.to_string());
             let tci_addr =
                 cfg.tci_addr.clone().unwrap_or_else(|| tci::DEFAULT_ADDR.to_string());
+            // Debug logging (Settings -> Network) -- see debug_log.rs's
+            // own doc comment. Constructed once per connection (not per
+            // Start/Stop of the server itself) so toggling the checkbox
+            // takes effect immediately without needing to restart
+            // rigctl/TCI, and so the SAME instance can be handed to
+            // whichever RigctlServer/TciServer gets started below or
+            // later from Settings -> Network.
+            let rigctl_debug_log = debug_log::DebugLog::new(
+                debug_log::log_path("rigctl_log.txt").unwrap_or_else(|| "rigctl_log.txt".into()),
+            );
+            rigctl_debug_log.set_enabled(cfg.rigctl_logging_enabled.unwrap_or(false));
+            let tci_debug_log = debug_log::DebugLog::new(
+                debug_log::log_path("tci_log.txt").unwrap_or_else(|| "tci_log.txt".into()),
+            );
+            tci_debug_log.set_enabled(cfg.tci_logging_enabled.unwrap_or(false));
+
             // rigctl/TCI are started/stopped manually from the Network
             // settings tab rather than always-on, but their run state
             // is still persisted -- so a fresh connect restores
@@ -620,6 +645,7 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                     spectrum.demod_params_handle(),
                     Arc::clone(&spectrum.display),
                     Arc::clone(&session.mox),
+                    rigctl_debug_log.clone(),
                 ) {
                     Ok(s) => Some(s),
                     Err(e) => {
@@ -644,6 +670,7 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                     Arc::clone(&session.tci_tx_audio),
                     Arc::clone(&session.tci_tx_gain),
                     Arc::clone(&session.tci_wants_mic),
+                    tci_debug_log.clone(),
                 ) {
                     Ok(s) => Some(s),
                     Err(e) => {
@@ -875,6 +902,8 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                 ctun_frequency_hz,
                 rigctl_addr,
                 tci_addr,
+                rigctl_debug_log,
+                tci_debug_log,
                 rigctl_error,
                 tci_error,
                 tx_enabled,
@@ -1372,11 +1401,22 @@ impl eframe::App for HpsdrApp {
                     ui.horizontal_wrapped(|ui| {
                         ui.label("Audio gain:");
                         let mut gain = current_gain;
+                        // ROOT CAUSE FIX: max raised from 1.5 -- a real
+                        // report needed more than that even with the
+                        // system output already at 100%/0dB (pavucontrol).
+                        // WDSP's RXA output level is apparently on the
+                        // conservative side for this radio/setup, and
+                        // this is a plain linear multiply against that
+                        // sample before the -1.0..1.0 clamp (see
+                        // spectrum.rs's run()), so there's no correctness
+                        // reason to cap it as low as 1.5 -- just headroom
+                        // the log slider (see its own doc comment) makes
+                        // easy to use across regardless of how high it goes.
                         if scroll_slider_f32_log(
                             ui,
                             &mut connected.slider_scroll_accum,
                             &mut gain,
-                            0.0..=1.5,
+                            0.0..=8.0,
                             1.08,
                         ) {
                             connected.spectrum.set_gain(gain);
@@ -2539,6 +2579,7 @@ impl eframe::App for HpsdrApp {
                                                 connected.spectrum.demod_params_handle(),
                                                 Arc::clone(&connected.spectrum.display),
                                                 Arc::clone(&connected.session.mox),
+                                                connected.rigctl_debug_log.clone(),
                                             ) {
                                                 Ok(s) => Some(s),
                                                 Err(e) => {
@@ -2561,6 +2602,20 @@ impl eframe::App for HpsdrApp {
                                     });
                                     if let Some(err) = &connected.rigctl_error {
                                         ui.colored_label(egui::Color32::from_rgb(220, 60, 60), err);
+                                    }
+                                    {
+                                        let mut logging = connected.rigctl_debug_log.is_enabled();
+                                        if ui
+                                            .checkbox(&mut logging, "Log to file (rigctl_log.txt)")
+                                            .on_hover_text(
+                                                "Logs every command received and reply sent, for debugging a \
+                                                 client's behavior -- saved alongside this radio's settings.",
+                                            )
+                                            .changed()
+                                        {
+                                            connected.rigctl_debug_log.set_enabled(logging);
+                                            settings_changed = true;
+                                        }
                                     }
 
                                     ui.add_space(8.0);
@@ -2589,6 +2644,7 @@ impl eframe::App for HpsdrApp {
                                                 Arc::clone(&connected.session.tci_tx_audio),
                                                 Arc::clone(&connected.session.tci_tx_gain),
                                                 Arc::clone(&connected.session.tci_wants_mic),
+                                                connected.tci_debug_log.clone(),
                                             ) {
                                                 Ok(s) => Some(s),
                                                 Err(e) => {
@@ -2611,6 +2667,20 @@ impl eframe::App for HpsdrApp {
                                     });
                                     if let Some(err) = &connected.tci_error {
                                         ui.colored_label(egui::Color32::from_rgb(220, 60, 60), err);
+                                    }
+                                    {
+                                        let mut logging = connected.tci_debug_log.is_enabled();
+                                        if ui
+                                            .checkbox(&mut logging, "Log to file (tci_log.txt)")
+                                            .on_hover_text(
+                                                "Logs every command received and reply sent, for debugging a \
+                                                 client's behavior -- saved alongside this radio's settings.",
+                                            )
+                                            .changed()
+                                        {
+                                            connected.tci_debug_log.set_enabled(logging);
+                                            settings_changed = true;
+                                        }
                                     }
 
                                     ui.add_space(8.0);
@@ -3919,6 +3989,8 @@ impl eframe::App for HpsdrApp {
                         tci_addr: Some(connected.tci_addr.clone()),
                         rigctl_running: Some(connected.rigctl_server.is_some()),
                         tci_running: Some(connected.tci_server.is_some()),
+                        rigctl_logging_enabled: Some(connected.rigctl_debug_log.is_enabled()),
+                        tci_logging_enabled: Some(connected.tci_debug_log.is_enabled()),
                         extra_receivers,
                         puresignal_enabled: Some(connected.puresignal_enabled),
                         diversity_enabled: Some(connected.diversity_enabled),
@@ -4782,7 +4854,11 @@ fn render_extra_receiver_ui(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceiver>>) {
     ui.horizontal(|ui| {
         ui.label("Audio gain:");
         let mut gain = current_gain;
-        if scroll_slider_f32(ui, &mut rx.slider_scroll_accum, &mut gain, 0.0..=1.5, 0.05) {
+        // Same range/log-slider treatment as the main window's identical
+        // control -- see its own doc comment (main.rs) for why: was
+        // capped at 1.5, too low for a real report, and a linear slider/
+        // fixed scroll step makes a wide range awkward at both ends.
+        if scroll_slider_f32_log(ui, &mut rx.slider_scroll_accum, &mut gain, 0.0..=8.0, 1.08) {
             rx.spectrum.set_gain(gain);
             rx.settings_dirty.store(true, Ordering::Relaxed);
         }

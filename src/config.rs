@@ -50,6 +50,14 @@ pub struct Config {
     pub rigctl_running: Option<bool>,
     #[serde(default)]
     pub tci_running: Option<bool>,
+    /// Debug logging to rigctl_log.txt/tci_log.txt (Settings -> Network)
+    /// -- see debug_log.rs's own doc comment. Off by default (missing =
+    /// `false`), same reasoning as every other Option<bool> here: a
+    /// config saved before this existed shouldn't suddenly start logging.
+    #[serde(default)]
+    pub rigctl_logging_enabled: Option<bool>,
+    #[serde(default)]
+    pub tci_logging_enabled: Option<bool>,
     /// Noise blanker (NB/NB2, mutually exclusive) and noise reduction
     /// (NR/NR2, mutually exclusive) state -- see the field docs on
     /// spectrum::DemodParams and the NoiseBlanker/NoiseReduction enums

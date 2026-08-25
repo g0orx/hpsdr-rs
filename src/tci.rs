@@ -101,6 +101,7 @@
     unaffected whenever no TCI client is actively sending audio.
 */
 
+use crate::debug_log::DebugLog;
 use crate::spectrum::{DemodParams, Mode};
 use std::collections::VecDeque;
 use std::net::{TcpListener, TcpStream};
@@ -199,6 +200,7 @@ impl TciServer {
         tci_tx_audio: Arc<Mutex<VecDeque<f32>>>,
         tci_tx_gain: Arc<Mutex<f32>>,
         tci_wants_mic: Arc<AtomicBool>,
+        logging: DebugLog,
     ) -> std::io::Result<Self> {
         let listener = TcpListener::bind(addr)?;
         listener.set_nonblocking(true)?;
@@ -217,6 +219,7 @@ impl TciServer {
         let accept_tci_tx_audio = Arc::clone(&tci_tx_audio);
         let accept_tci_tx_gain = Arc::clone(&tci_tx_gain);
         let accept_tci_wants_mic = Arc::clone(&tci_wants_mic);
+        let accept_logging = logging.clone();
         // Single-client enforcement -- see the module note on why: every
         // connected client shares the SAME audio_iq queues (a single
         // radio has one operator), so two clients connected at once
@@ -235,6 +238,7 @@ impl TciServer {
                 match listener.accept() {
                     Ok((stream, peer)) => {
                         println!("tci: client connected from {peer}");
+                        accept_logging.log(&format!("client connected from {peer}"));
                         let freq = Arc::clone(&frequency_hz);
                         let rate = Arc::clone(&sample_rate);
                         let params = Arc::clone(&accept_demod_params);
@@ -245,6 +249,7 @@ impl TciServer {
                         let conn_mox = Arc::clone(&mox);
                         let conn_stop = Arc::clone(&accept_stop);
                         let conn_connected = Arc::clone(&accept_connected);
+                        let conn_logging = accept_logging.clone();
                         let superseded = Arc::new(AtomicBool::new(false));
                         {
                             let mut current = current_client_superseded.lock().unwrap();
@@ -256,7 +261,7 @@ impl TciServer {
                             conn_connected.fetch_add(1, Ordering::Relaxed);
                             handle_client(
                                 stream, freq, rate, params, audio_iq, tx_audio, tx_gain, wants_mic,
-                                conn_mox, conn_stop, superseded,
+                                conn_mox, conn_stop, superseded, conn_logging,
                             );
                             conn_connected.fetch_sub(1, Ordering::Relaxed);
                         });
@@ -349,6 +354,7 @@ fn handle_client(
     // (the whole-server shutdown flag) so this same loop exit path
     // handles both.
     superseded: Arc<AtomicBool>,
+    logging: DebugLog,
 ) {
     let _ = stream.set_nodelay(true);
 
@@ -564,6 +570,7 @@ fn handle_client(
                     if cmd.is_empty() {
                         continue;
                     }
+                    logging.log(&format!("<< {cmd};"));
                     // Resolved fresh on every command (not once per
                     // connection) so a sample-rate change mid-session --
                     // see set_demod_params -- takes effect immediately
@@ -579,13 +586,17 @@ fn handle_client(
                         &mut audio_streaming,
                         &mut iq_streaming,
                     ) {
+                        logging.log(&format!(">> {response}"));
                         if ws.send(Message::Text(response.into())).is_err() {
                             return;
                         }
                     }
                 }
             }
-            Ok(Message::Close(_)) => break,
+            Ok(Message::Close(_)) => {
+                logging.log("client closed the connection");
+                break;
+            }
             Ok(Message::Binary(data)) => {
                 // A client sending TX audio -- see decode_binary_message's
                 // doc comment for the confidence caveat on this whole
