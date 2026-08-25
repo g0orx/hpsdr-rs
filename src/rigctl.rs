@@ -282,7 +282,15 @@ fn handle_client(
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock || e.kind() == std::io::ErrorKind::TimedOut => {
                 continue;
             }
-            Err(_) => break,
+            // See tci.rs's identical arm's doc comment -- same read-
+            // timeout pattern, same investigation into a real report of
+            // Windows silently dropping a connection this way that Linux
+            // doesn't; logging here in case WSJT-X-over-rigctl hits the
+            // same thing.
+            Err(e) => {
+                logging.log(&format!("connection error, closing: {e:?}"));
+                break;
+            }
         }
     }
 }

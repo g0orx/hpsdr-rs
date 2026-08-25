@@ -725,7 +725,24 @@ fn handle_client(
                 // whether a text command happened to arrive this
                 // cycle.
             }
-            Err(_) => break,
+            Err(e) => {
+                // ROOT CAUSE INVESTIGATION: a real report of TCI Remote
+                // reconnecting every ~2s on Windows (never on Linux, same
+                // build otherwise) with no "client closed the connection"
+                // ever logged points straight at this arm -- the only
+                // other way this loop exits without logging something.
+                // ~2s is suspiciously close to this read's own 20ms
+                // timeout ticking over many times right after the
+                // handshake goes quiet, which is consistent with Windows
+                // surfacing a DIFFERENT io::ErrorKind (or a non-Io
+                // tungstenite::Error variant entirely) for what's
+                // actually just an ordinary idle-read timeout than Linux
+                // does for the exact same socket state -- but logging the
+                // real error here beats guessing further at which kind
+                // that might be.
+                logging.log(&format!("connection error, closing: {e:?}"));
+                break;
+            }
         }
 
         // Streaming taps re-resolved fresh each tick (not once per
