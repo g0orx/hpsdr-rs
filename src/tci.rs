@@ -338,6 +338,31 @@ impl Drop for TciServer {
     }
 }
 
+/// ROOT CAUSE FIX: `ws.send(...)` failing with `WouldBlock` used to be
+/// treated as fatal (tearing down the whole connection) everywhere it's
+/// called below -- confirmed via a real Windows report + the debug-log
+/// error text (`Io(Os { code: 10035, kind: WouldBlock, ... })`, WinSock's
+/// WSAEWOULDBLOCK) as the actual cause of TCI Remote reconnecting every
+/// ~2s on Windows (never on Linux, same build otherwise): the socket's
+/// send buffer was only ever momentarily full, not actually broken --
+/// this project only sets a READ timeout on the stream (see
+/// set_read_timeout above), not a write one, so a send "should" just
+/// block until buffer space frees up the way it apparently does on
+/// Linux, but Windows evidently doesn't honor that the same way here.
+/// A `WouldBlock` send is now just skipped (the caller drops that one
+/// chunk/reply and tries again next tick) rather than closing the
+/// connection -- fine for audio/IQ streaming samples (a dropped chunk
+/// beats added latency from retrying synchronously) and for command
+/// replies/TxChrono (both already tolerate occasional loss elsewhere in
+/// this file's own logic, e.g. tx_chrono_outstanding's staleness reset).
+fn send_is_fatal(result: &tungstenite::Result<()>) -> bool {
+    match result {
+        Ok(()) => false,
+        Err(tungstenite::Error::Io(e)) if e.kind() == std::io::ErrorKind::WouldBlock => false,
+        Err(_) => true,
+    }
+}
+
 fn handle_client(
     stream: TcpStream,
     frequency_hz: Arc<AtomicU32>,
@@ -601,7 +626,9 @@ fn handle_client(
                         &mut iq_streaming,
                     ) {
                         logging.log(&format!(">> {response}"));
-                        if ws.send(Message::Text(response.into())).is_err() {
+                        let result = ws.send(Message::Text(response.into()));
+                        if send_is_fatal(&result) {
+                            logging.log(&format!("reply send failed, closing: {:?}", result.unwrap_err()));
                             return;
                         }
                     }
@@ -806,11 +833,12 @@ fn handle_client(
                     stereo.len() as u32 * 2,
                     &stereo,
                 );
-                if let Err(e) = ws.send(Message::Binary(msg.into())) {
-                    logging.log(&format!("audio stream send failed, closing: {e:?}"));
+                let result = ws.send(Message::Binary(msg.into()));
+                if send_is_fatal(&result) {
+                    logging.log(&format!("audio stream send failed, closing: {:?}", result.unwrap_err()));
                     return;
                 }
-                if !audio_first_sent {
+                if result.is_ok() && !audio_first_sent {
                     audio_first_sent = true;
                     logging.log("first audio data sent");
                 }
@@ -835,11 +863,12 @@ fn handle_client(
                     swapped.len() as u32,
                     &swapped,
                 );
-                if let Err(e) = ws.send(Message::Binary(msg.into())) {
-                    logging.log(&format!("IQ stream send failed, closing: {e:?}"));
+                let result = ws.send(Message::Binary(msg.into()));
+                if send_is_fatal(&result) {
+                    logging.log(&format!("IQ stream send failed, closing: {:?}", result.unwrap_err()));
                     return;
                 }
-                if !iq_first_sent {
+                if result.is_ok() && !iq_first_sent {
                     iq_first_sent = true;
                     logging.log("first IQ data sent");
                 }
@@ -892,8 +921,21 @@ fn handle_client(
                         TCI_TX_AUDIO_CHUNK,
                         &[],
                     );
-                    if ws.send(Message::Binary(chrono.into())).is_err() {
+                    let result = ws.send(Message::Binary(chrono.into()));
+                    if send_is_fatal(&result) {
+                        logging.log(&format!("TxChrono send failed, closing: {:?}", result.unwrap_err()));
                         return;
+                    }
+                    if result.is_err() {
+                        // WouldBlock -- the send buffer is full, so the
+                        // rest of this batch would almost certainly hit
+                        // the same thing; stop for this tick rather than
+                        // spinning through requests_needed more attempts
+                        // that will likely all fail too. tx_chrono_outstanding
+                        // is deliberately NOT incremented for this one --
+                        // it was never actually sent, so there's no real
+                        // reply to wait for.
+                        break;
                     }
                     tx_chrono_outstanding += 1;
                 }
