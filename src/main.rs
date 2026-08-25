@@ -146,6 +146,7 @@ fn width_for_mode(width_memory: &std::collections::HashMap<String, f64>, mode: s
 #[derive(Copy, Clone, PartialEq, Eq)]
 enum SettingsTab {
     Network,
+    Audio,
     Agc,
     Spectrum,
     Tx,
@@ -276,7 +277,7 @@ struct ConnectedState {
     tx_spectrum: SpectrumHandle,
     audio_output: Option<AudioOutput>,
     /// Selected output device name for `audio_output` above (Settings ->
-    /// RX's "Output device" picker) -- see ExtraReceiver's identical
+    /// Audio's "Output device" picker) -- see ExtraReceiver's identical
     /// field doc comment. Deliberately NOT used for tx_audio_monitor_output
     /// below -- monitoring your own TX audio should go to your own
     /// speakers/headphones, not wherever RX audio's been routed (e.g. a
@@ -367,6 +368,11 @@ struct ConnectedState {
     /// arming step by default.
     tx_enabled: bool,
     mic_input: Option<MicInput>,
+    /// Selected input device name for `mic_input` above (Settings ->
+    /// Audio's "Input device" picker) -- `None` = system default. Same
+    /// fallback-to-default contract as `audio_output_device` (see its doc
+    /// comment) via MicInput::start.
+    mic_input_device: Option<String>,
     tx_handle: Option<TxHandle>,
     /// Tracks spacebar's own press/release edges for hold-to-talk PTT
     /// (separate from the MOX button, which is a plain toggle) -- see
@@ -806,7 +812,9 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                 Arc::clone(&session.mox),
             );
             let mic_buffer = Arc::new(Mutex::new(VecDeque::new()));
-            let (tx_enabled, mic_input, tx_handle) = match MicInput::start(Arc::clone(&mic_buffer)) {
+            let mic_input_device = cfg.mic_input_device.clone();
+            let (tx_enabled, mic_input, tx_handle) =
+                match MicInput::start(Arc::clone(&mic_buffer), mic_input_device.as_deref()) {
                 Ok(mic) => {
                     let tx_handle = TxHandle::start(
                         mic_buffer,
@@ -924,6 +932,7 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                 tci_error,
                 tx_enabled,
                 mic_input,
+                mic_input_device,
                 tx_handle,
                 ptt_held: false,
                 mic_gain,
@@ -1438,47 +1447,6 @@ impl eframe::App for HpsdrApp {
                             connected.spectrum.set_gain(gain);
                             settings_changed = true;
                         }
-
-                        ui.add_space(12.0);
-                        ui.label("Output device:");
-                        let devices = audio::list_output_devices();
-                        let current_label =
-                            connected.audio_output_device.clone().unwrap_or_else(|| "(System Default)".to_string());
-                        egui::ComboBox::from_id_salt("audio_output_device")
-                            .selected_text(current_label)
-                            .show_ui(ui, |ui| {
-                                if ui
-                                    .selectable_label(connected.audio_output_device.is_none(), "(System Default)")
-                                    .clicked()
-                                    && connected.audio_output_device.is_some()
-                                {
-                                    connected.audio_output_device = None;
-                                    connected.audio_output = AudioOutput::start(
-                                        Arc::clone(&connected.spectrum.audio_out),
-                                        None,
-                                    )
-                                    .ok();
-                                    settings_changed = true;
-                                }
-                                for name in &devices {
-                                    let selected = connected.audio_output_device.as_deref() == Some(name.as_str());
-                                    if ui.selectable_label(selected, name).clicked() && !selected {
-                                        connected.audio_output_device = Some(name.clone());
-                                        connected.audio_output = AudioOutput::start(
-                                            Arc::clone(&connected.spectrum.audio_out),
-                                            Some(name),
-                                        )
-                                        .ok();
-                                        settings_changed = true;
-                                    }
-                                }
-                            })
-                            .response
-                            .on_hover_text(
-                                "Where local RX audio plays -- e.g. a virtual cable (VB-Audio Virtual \
-                                 Cable on Windows) to feed a decoder like WSJT-X instead of/alongside \
-                                 real speakers.",
-                            );
 
                         if connected.tx_enabled {
                             if connected.tx_handle.is_some() {
@@ -2587,6 +2555,7 @@ impl eframe::App for HpsdrApp {
                             ui.horizontal(|ui| {
                                 for (tab, label) in [
                                     (SettingsTab::Network, "Network"),
+                                    (SettingsTab::Audio, "Audio"),
                                     (SettingsTab::Agc, "RX"),
                                     (SettingsTab::Spectrum, "Spectrum"),
                                     (SettingsTab::Tx, "TX"),
@@ -2769,6 +2738,112 @@ impl eframe::App for HpsdrApp {
                                             connected.device.mac,
                                         ));
                                     }
+                                }
+
+                                SettingsTab::Audio => {
+                                    ui.label("RX audio:");
+                                    ui.horizontal(|ui| {
+                                        ui.label("Output device:");
+                                        let devices = audio::list_output_devices();
+                                        let current_label = connected
+                                            .audio_output_device
+                                            .clone()
+                                            .unwrap_or_else(|| "(System Default)".to_string());
+                                        egui::ComboBox::from_id_salt("main_audio_output_device")
+                                            .selected_text(current_label)
+                                            .show_ui(ui, |ui| {
+                                                if ui
+                                                    .selectable_label(
+                                                        connected.audio_output_device.is_none(),
+                                                        "(System Default)",
+                                                    )
+                                                    .clicked()
+                                                    && connected.audio_output_device.is_some()
+                                                {
+                                                    connected.audio_output_device = None;
+                                                    connected.audio_output =
+                                                        AudioOutput::start(Arc::clone(&connected.spectrum.audio_out), None)
+                                                            .ok();
+                                                    settings_changed = true;
+                                                }
+                                                for name in &devices {
+                                                    let selected =
+                                                        connected.audio_output_device.as_deref() == Some(name.as_str());
+                                                    if ui.selectable_label(selected, name).clicked() && !selected {
+                                                        connected.audio_output_device = Some(name.clone());
+                                                        connected.audio_output = AudioOutput::start(
+                                                            Arc::clone(&connected.spectrum.audio_out),
+                                                            Some(name),
+                                                        )
+                                                        .ok();
+                                                        settings_changed = true;
+                                                    }
+                                                }
+                                            })
+                                            .response
+                                            .on_hover_text(
+                                                "Where local RX audio plays -- e.g. a virtual cable \
+                                                 (VB-Audio Virtual Cable on Windows) to feed a decoder \
+                                                 like WSJT-X instead of/alongside real speakers.",
+                                            );
+                                    });
+
+                                    ui.add_space(8.0);
+                                    ui.separator();
+                                    ui.add_space(8.0);
+
+                                    ui.label("TX audio:");
+                                    ui.horizontal(|ui| {
+                                        ui.label("Input device:");
+                                        let devices = audio::list_input_devices();
+                                        let current_label = connected
+                                            .mic_input_device
+                                            .clone()
+                                            .unwrap_or_else(|| "(System Default)".to_string());
+                                        egui::ComboBox::from_id_salt("main_mic_input_device")
+                                            .selected_text(current_label)
+                                            .show_ui(ui, |ui| {
+                                                if ui
+                                                    .selectable_label(
+                                                        connected.mic_input_device.is_none(),
+                                                        "(System Default)",
+                                                    )
+                                                    .clicked()
+                                                    && connected.mic_input_device.is_some()
+                                                {
+                                                    connected.mic_input_device = None;
+                                                    if let Some(mic) = &connected.mic_input {
+                                                        let buffer = Arc::clone(mic.buffer());
+                                                        match MicInput::start(buffer, None) {
+                                                            Ok(new_mic) => connected.mic_input = Some(new_mic),
+                                                            Err(e) => eprintln!("mic input unavailable: {e}"),
+                                                        }
+                                                    }
+                                                    settings_changed = true;
+                                                }
+                                                for name in &devices {
+                                                    let selected =
+                                                        connected.mic_input_device.as_deref() == Some(name.as_str());
+                                                    if ui.selectable_label(selected, name).clicked() && !selected {
+                                                        connected.mic_input_device = Some(name.clone());
+                                                        if let Some(mic) = &connected.mic_input {
+                                                            let buffer = Arc::clone(mic.buffer());
+                                                            match MicInput::start(buffer, Some(name)) {
+                                                                Ok(new_mic) => connected.mic_input = Some(new_mic),
+                                                                Err(e) => eprintln!("mic input unavailable: {e}"),
+                                                            }
+                                                        }
+                                                        settings_changed = true;
+                                                    }
+                                                }
+                                            })
+                                            .response
+                                            .on_hover_text(
+                                                "Where TX audio is captured from -- e.g. a virtual cable \
+                                                 (VB-Audio Virtual Cable on Windows) to feed TX audio from \
+                                                 another application instead of a real mic.",
+                                            );
+                                    });
                                 }
 
                                 SettingsTab::Agc => {
@@ -3289,7 +3364,10 @@ impl eframe::App for HpsdrApp {
                                                 Arc::clone(&connected.session.mox),
                                             );
                                             let mic_buffer = Arc::new(Mutex::new(VecDeque::new()));
-                                            match MicInput::start(Arc::clone(&mic_buffer)) {
+                                            match MicInput::start(
+                                                Arc::clone(&mic_buffer),
+                                                connected.mic_input_device.as_deref(),
+                                            ) {
                                                 Ok(mic) => {
                                                     let tx_handle = TxHandle::start(
                                                         mic_buffer,
@@ -4013,6 +4091,7 @@ impl eframe::App for HpsdrApp {
                         width_hz: Some(connected.spectrum.width_hz()),
                         gain: Some(connected.spectrum.gain()),
                         audio_output_device: connected.audio_output_device.clone(),
+                        mic_input_device: connected.mic_input_device.clone(),
                         agc: Some(connected.spectrum.agc()),
                         agc_attack_ms: Some(agc_params_now.agc_attack_ms),
                         agc_decay_ms: Some(agc_params_now.agc_decay_ms),
@@ -5257,6 +5336,12 @@ fn render_extra_receiver_settings(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceive
         // primary receiver is exposed there), so there's no Network tab
         // -- fall back to AGC if this is ever somehow selected.
         SettingsTab::Network => rx.settings_tab = SettingsTab::Agc,
+
+        // Output device selection lives in the main window's own
+        // Settings -> Audio tab (this receiver has its own separate
+        // Output device picker inline in its RX tab below, and has no
+        // mic/TX concept at all) -- redirect same as Network.
+        SettingsTab::Audio => rx.settings_tab = SettingsTab::Agc,
 
         // TX (and PA Calibration/PureSignal, split out of it) are all
         // global (one radio, one PA/mic path), not per-receiver -- no

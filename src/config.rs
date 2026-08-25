@@ -20,7 +20,7 @@ pub struct Config {
     pub mode: Option<Mode>,
     pub width_hz: Option<f64>,
     pub gain: Option<f32>,
-    /// Output device for local RX audio playback (Settings -> RX's
+    /// Output device for local RX audio playback (Settings -> Audio's
     /// "Output device" picker), by name -- e.g. "CABLE Input (VB-Audio
     /// Virtual Cable)" to feed a decoder instead of/alongside real
     /// speakers. `None`/missing (configs saved before this existed)
@@ -31,6 +31,14 @@ pub struct Config {
     /// comment.
     #[serde(default)]
     pub audio_output_device: Option<String>,
+    /// Input device for TX mic audio (Settings -> Audio's "Input device"
+    /// picker), by name -- e.g. "CABLE Output (VB-Audio Virtual Cable)"
+    /// to feed TX audio from a virtual cable instead of/alongside a real
+    /// mic. Same `None`/unrecognized-name fallback-to-default contract
+    /// as `audio_output_device` above -- see MicInput::start's doc
+    /// comment.
+    #[serde(default)]
+    pub mic_input_device: Option<String>,
     pub agc: Option<Agc>,
     pub agc_attack_ms: Option<i32>,
     pub agc_decay_ms: Option<i32>,

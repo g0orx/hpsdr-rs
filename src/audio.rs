@@ -40,16 +40,31 @@ const INPUT_CHANNELS: u16 = 1;
 
 /// Names of every currently available output-capable device (e.g. real
 /// speakers/headphones, and on Windows, virtual devices like "CABLE
-/// Input (VB-Audio Virtual Cable)" if installed) -- for the output
-/// device picker in Settings (RX tab, main and extra receivers). Skips
-/// any device whose name can't be queried (a disconnected/erroring
-/// device) rather than failing the whole list over one bad entry.
+/// Input (VB-Audio Virtual Cable)" if installed) -- for the RX output
+/// device picker in Settings -> Audio (main and extra receivers each
+/// have their own). Skips any device whose name can't be queried (a
+/// disconnected/erroring device) rather than failing the whole list
+/// over one bad entry.
 pub fn list_output_devices() -> Vec<String> {
     let host = cpal::default_host();
     match host.output_devices() {
         Ok(devices) => devices.filter_map(|d| d.description().ok().map(|desc| desc.name().to_string())).collect(),
         Err(e) => {
             eprintln!("audio: failed to enumerate output devices: {e}");
+            Vec::new()
+        }
+    }
+}
+
+/// Same as list_output_devices, for input-capable devices (e.g. a real
+/// mic, or on Windows, "CABLE Output (VB-Audio Virtual Cable)" if
+/// installed) -- for the TX audio source picker in Settings -> Audio.
+pub fn list_input_devices() -> Vec<String> {
+    let host = cpal::default_host();
+    match host.input_devices() {
+        Ok(devices) => devices.filter_map(|d| d.description().ok().map(|desc| desc.name().to_string())).collect(),
+        Err(e) => {
+            eprintln!("audio: failed to enumerate input devices: {e}");
             Vec::new()
         }
     }
@@ -398,11 +413,27 @@ impl MicInput {
     /// hardware, or an audio server without a fixed shared clock) where
     /// resampling is actually necessary rather than a self-inflicted
     /// mismatch.
-    pub fn start(buffer: Arc<Mutex<VecDeque<f32>>>) -> Result<Self, String> {
+    /// `device_name`: same "fall back to the system default, never a
+    /// hard error just because a specific device isn't found" contract
+    /// as AudioOutput::start -- e.g. a saved "CABLE Output (VB-Audio
+    /// Virtual Cable)" selection on a machine that doesn't have it
+    /// installed just uses the default mic instead.
+    pub fn start(buffer: Arc<Mutex<VecDeque<f32>>>, selected_device_name: Option<&str>) -> Result<Self, String> {
         let host = cpal::default_host();
-        let device = host
-            .default_input_device()
-            .ok_or_else(|| "no default audio input device found".to_string())?;
+        let device = match selected_device_name {
+            Some(name) => host
+                .input_devices()
+                .ok()
+                .and_then(|mut devices| devices.find(|d| d.description().is_ok_and(|desc| desc.name() == name)))
+                .or_else(|| {
+                    eprintln!(
+                        "audio: input device \"{name}\" not found -- falling back to the system default"
+                    );
+                    host.default_input_device()
+                }),
+            None => host.default_input_device(),
+        }
+        .ok_or_else(|| "no default audio input device found".to_string())?;
 
         let device_name = device
             .description()
