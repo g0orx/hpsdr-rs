@@ -1443,11 +1443,26 @@ impl eframe::App for HpsdrApp {
                                         .on_hover_text("Retune VFO A to VFO B's frequency")
                                         .clicked()
                                     {
-                                        connected.session.set_frequency(connected.vfo_b_frequency_hz);
-                                        // Keep CTUN on but re-center it at
-                                        // the new frequency -- same idiom
-                                        // as the Band buttons below.
-                                        connected.ctun_frequency_hz = connected.vfo_b_frequency_hz;
+                                        // While CTUN is on, "A" is the
+                                        // CTUN'd listen frequency, not the
+                                        // parked hardware LO -- move that
+                                        // (clamped to stay within the
+                                        // current passband, same as
+                                        // scroll-tuning) rather than
+                                        // retuning the real hardware. See
+                                        // resolve_tune's doc comment.
+                                        let (effective_freq, retune) = resolve_tune(
+                                            connected.ctun,
+                                            freq_hz,
+                                            sample_rate,
+                                            passband,
+                                            connected.vfo_b_frequency_hz,
+                                        );
+                                        if let Some(lo) = retune {
+                                            connected.session.set_frequency(lo);
+                                        } else {
+                                            connected.ctun_frequency_hz = effective_freq;
+                                        }
                                         settings_changed = true;
                                     }
                                 });
@@ -1457,9 +1472,21 @@ impl eframe::App for HpsdrApp {
                                         .on_hover_text("Swap VFO A and VFO B")
                                         .clicked()
                                     {
+                                        // Same CTUN-aware handling as B>A
+                                        // above.
                                         let new_b = dial_freq_hz;
-                                        connected.session.set_frequency(connected.vfo_b_frequency_hz);
-                                        connected.ctun_frequency_hz = connected.vfo_b_frequency_hz;
+                                        let (effective_freq, retune) = resolve_tune(
+                                            connected.ctun,
+                                            freq_hz,
+                                            sample_rate,
+                                            passband,
+                                            connected.vfo_b_frequency_hz,
+                                        );
+                                        if let Some(lo) = retune {
+                                            connected.session.set_frequency(lo);
+                                        } else {
+                                            connected.ctun_frequency_hz = effective_freq;
+                                        }
                                         connected.vfo_b_frequency_hz = new_b;
                                         settings_changed = true;
                                     }
@@ -2289,7 +2316,7 @@ impl eframe::App for HpsdrApp {
                     }
                     let x_dial = x_for_offset(ctun_offset_hz);
 
-                    let num_freq_ticks = 5;
+                    let num_freq_ticks = 10;
                     for t in 0..num_freq_ticks {
                         let frac = t as f32 / (num_freq_ticks - 1) as f32;
                         let x = rect.left() + frac * rect.width();
@@ -5433,7 +5460,7 @@ fn render_extra_receiver_ui(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceiver>>) {
 
     draw_band_edge_markers(ui.painter(), rect, freq_hz, half_span_hz, sample_rate);
 
-    let num_freq_ticks = 5;
+    let num_freq_ticks = 10;
     for t in 0..num_freq_ticks {
         let frac = t as f32 / (num_freq_ticks - 1) as f32;
         let x = rect.left() + frac * rect.width();
