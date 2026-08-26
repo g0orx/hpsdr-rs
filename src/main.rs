@@ -5362,8 +5362,14 @@ fn render_extra_receiver_ui(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceiver>>) {
     rx.spectrum.set_ctun(rx.ctun, ctun_offset_hz);
     let dial_freq_hz = if rx.ctun { rx.ctun_frequency_hz } else { freq_hz };
 
-    ui.heading(egui::RichText::new(format_frequency(dial_freq_hz)).color(egui::Color32::GREEN))
-        .on_hover_text("Scroll to tune -- Shift: 100 Hz, none: 1 kHz. Click spectrum/waterfall to jump.");
+    ui.label(
+        egui::RichText::new(format_frequency(dial_freq_hz))
+            .monospace()
+            .size(28.0)
+            .strong()
+            .color(egui::Color32::GREEN),
+    )
+    .on_hover_text("Scroll to tune -- Shift: 100 Hz, none: 1 kHz. Click spectrum/waterfall to jump.");
 
     ui.horizontal_wrapped(|ui| {
         let current_band = band_for_frequency(dial_freq_hz).map(|b| b.name);
