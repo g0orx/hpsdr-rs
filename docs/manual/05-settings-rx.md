@@ -1,4 +1,4 @@
-[← Network](03-settings-network.md) | [Index](README.md) | [Spectrum →](05-settings-spectrum.md)
+[← Audio](04-settings-audio.md) | [Index](README.md) | [Spectrum →](06-settings-spectrum.md)
 
 # Settings: RX
 
@@ -55,4 +55,4 @@ stage is active uses it.
 
 ---
 
-[← Network](03-settings-network.md) | [Index](README.md) | [Spectrum →](05-settings-spectrum.md)
+[← Audio](04-settings-audio.md) | [Index](README.md) | [Spectrum →](06-settings-spectrum.md)

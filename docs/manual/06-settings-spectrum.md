@@ -1,4 +1,4 @@
-[← RX](04-settings-rx.md) | [Index](README.md) | [TX →](06-settings-tx.md)
+[← RX](05-settings-rx.md) | [Index](README.md) | [TX →](07-settings-tx.md)
 
 # Settings: Spectrum
 
@@ -31,8 +31,14 @@ you'd receive. A second set of **Low**/**High** sliders (default -180.0 to
 separately, so tuning your RX display doesn't also require re-tuning it
 every time you key up.
 
+The shaded filter-passband overlay also switches to red/orange while
+transmitting (blue for RX) and reflects the actual TX filter -- so it
+shows what's really being transmitted, which can land on a different part
+of the display than the RX passband once [Split](02-main-window.md#vfo-a--vfo-b--split)
+is engaged.
+
 ![TX spectrum display](images/05-tx-spectrum.png)
 
 ---
 
-[← RX](04-settings-rx.md) | [Index](README.md) | [TX →](06-settings-tx.md)
+[← RX](05-settings-rx.md) | [Index](README.md) | [TX →](07-settings-tx.md)

@@ -7,17 +7,18 @@ from source and project status, see the [top-level README](../../README.md).
 ## Contents
 
 1. [Getting Started](01-getting-started.md) -- installing, launching, discovering and connecting to a radio
-2. [Main Window](02-main-window.md) -- tuning, bands/modes, PTT, spectrum/waterfall, S-meter
-3. [Settings: Network](03-settings-network.md) -- rigctl and TCI control servers
-4. [Settings: RX](04-settings-rx.md) -- sample rate, ADC/antenna, AGC, noise blanker/reduction
-5. [Settings: Spectrum](05-settings-spectrum.md) -- display range, waterfall palette
-6. [Settings: TX](06-settings-tx.md) -- TX power, mic source, safety notes
-7. [Settings: PA Calibration](07-pa-calibration.md) -- per-band power calibration
-8. [Settings: PureSignal](08-puresignal.md) -- PA linearization setup and calibration procedure
-9. [Settings: Diversity](09-diversity.md) -- 2-ADC diversity reception
-10. [Settings: Equalizer](10-equalizer.md) -- RX/TX graphic EQ
-11. [Extra Receivers](11-extra-receivers.md) -- adding independent receiver windows
-12. [Firmware Update](12-firmware-update.md) -- updating FPGA firmware and changing a radio's IP, in bootloader mode or in-application
+2. [Main Window](02-main-window.md) -- tuning, VFO A/B and Split, bands/modes, PTT, spectrum/waterfall, S-meter
+3. [Settings: Network](03-settings-network.md) -- rigctl, TCI, and CAT control servers
+4. [Settings: Audio](04-settings-audio.md) -- RX output device, TX input device
+5. [Settings: RX](05-settings-rx.md) -- sample rate, ADC/antenna, AGC, noise blanker/reduction
+6. [Settings: Spectrum](06-settings-spectrum.md) -- display range, waterfall palette
+7. [Settings: TX](07-settings-tx.md) -- TX power, mic source, safety notes
+8. [Settings: PA Calibration](08-pa-calibration.md) -- per-band power calibration
+9. [Settings: PureSignal](09-puresignal.md) -- PA linearization setup and calibration procedure
+10. [Settings: Diversity](10-diversity.md) -- 2-ADC diversity reception
+11. [Settings: Equalizer](11-equalizer.md) -- RX/TX graphic EQ
+12. [Extra Receivers](12-extra-receivers.md) -- adding independent receiver windows
+13. [Firmware Update](13-firmware-update.md) -- updating FPGA firmware and changing a radio's IP, in bootloader mode or in-application
 
 Every page notes where a screenshot would help; those are marked
 `(Screenshot needed: ...)` with a broken image link pointing at

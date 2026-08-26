@@ -1,4 +1,4 @@
-[← Equalizer](10-equalizer.md) | [Index](README.md) | [Firmware Update →](12-firmware-update.md)
+[← Equalizer](11-equalizer.md) | [Index](README.md) | [Firmware Update →](13-firmware-update.md)
 
 # Extra Receivers
 
@@ -15,7 +15,7 @@ window titled **Receiver N** opens. This button disappears (replaced by
 **All N receivers active**) once you've reached the radio's maximum
 receiver count.
 
-On a [PureSignal](08-puresignal.md)-capable radio, "max" here is 2 lower
+On a [PureSignal](09-puresignal.md)-capable radio, "max" here is 2 lower
 than the radio's full receiver capacity -- PureSignal's two feedback
 receivers are reserved for the whole session as soon as you connect,
 whether or not PureSignal is actually enabled.
@@ -35,17 +35,20 @@ Ctrl+scroll zoom-tuning isn't available here), and its own S-meter with a
 
 Each extra receiver's **Settings...** opens its own settings window with
 three tabs -- **RX**, **Spectrum**, **EQ** -- a subset of the main window's
-tabs, since things like Network, TX, PA Calibration, PureSignal, and
-Diversity are session-wide, not per-receiver:
+tabs, since things like Network, Audio (main output only), TX, PA
+Calibration, PureSignal, and Diversity are session-wide, not per-receiver:
 
 - **RX** -- sample rate (Protocol 1 boards follow the main receiver's
   rate, since P1 has one shared clock rather than per-receiver rates),
-  ADC/antenna selection, and the same AGC attack/decay/hang/top/slope/
-  thresh and NB threshold controls as the main window's RX tab.
+  ADC/antenna selection, the same AGC attack/decay/hang/top/slope/thresh
+  and NB threshold controls as the main window's RX tab, and its own
+  independent **Output device** picker (same device list and fallback
+  behavior as the main window's [Audio tab](04-settings-audio.md)) -- so
+  this receiver can play to a different device than the main receiver.
 - **Spectrum** -- display range and waterfall palette, same as the main
   window's Spectrum tab (no separate TX range here, since extra receivers
   never transmit).
-- **EQ** -- its own independent [graphic equalizer](10-equalizer.md),
+- **EQ** -- its own independent [graphic equalizer](11-equalizer.md),
   RX-only.
 
 (Screenshot needed: an extra receiver's own Settings window)
@@ -56,4 +59,4 @@ window's.
 
 ---
 
-[← Equalizer](10-equalizer.md) | [Index](README.md) | [Firmware Update →](12-firmware-update.md)
+[← Equalizer](11-equalizer.md) | [Index](README.md) | [Firmware Update →](13-firmware-update.md)

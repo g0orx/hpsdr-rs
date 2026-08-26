@@ -54,7 +54,7 @@ broadcast-discovered one.
 
 **Firmware Update...** opens a separate window for updating a radio's FPGA
 firmware or changing its IP address while it's in bootloader mode -- see
-[Firmware Update](12-firmware-update.md).
+[Firmware Update](13-firmware-update.md).
 
 ## Connecting
 

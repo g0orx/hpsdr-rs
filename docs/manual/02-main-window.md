@@ -6,8 +6,10 @@
 
 ## Frequency display and tuning
 
-The large green number near the top is the current VFO frequency
-(comma-grouped, in Hz). You can tune it several ways:
+The large number near the top, in its own **VFO-A** box, is the current
+main VFO frequency (comma-grouped, in Hz) -- green normally, red while
+that VFO is the one actually transmitting (see
+[Split](#vfo-a--vfo-b--split) below). You can tune it several ways:
 
 - **Scroll** while hovering the frequency display, or the spectrum/waterfall
   panes: steps by 1 kHz per notch. Hold **Shift** while scrolling for 100 Hz
@@ -26,6 +28,31 @@ tuned frequency stays fixed. This is useful for quickly browsing around a
 band without the radio re-locking/re-settling each time. The CTUN dial is
 clamped so the current mode's filter passband always stays fully within the
 visible spectrum span.
+
+While CTUN is on, VFO B's **B>A** and **A<>B** buttons (below) move the
+CTUN listen point the same clamped way, rather than retuning the radio's
+actual hardware oscillator.
+
+## VFO A / VFO B / Split
+
+![VFO A and VFO B boxes with buttons between them](images/02-vfo-ab.png)
+
+Next to the **VFO-A** box is a second, independent **VFO-B** box -- a
+second remembered frequency with no receiver of its own (this app doesn't
+receive on two frequencies at once). You can scroll on the VFO-B box the
+same way as VFO-A (Shift for 100 Hz steps, otherwise 1 kHz) to change its
+stored value directly, or use the buttons between the two boxes:
+
+- **A>B** -- copies VFO A's current frequency into VFO B.
+- **B>A** -- retunes VFO A to VFO B's frequency (moving the CTUN listen
+  point instead of the real hardware frequency if CTUN is on -- see
+  above).
+- **A<>B** -- swaps VFO A and VFO B.
+- **Split** -- while enabled, transmit uses VFO B's frequency instead of
+  VFO A's, while reception continues on VFO A as normal. The box that's
+  actually red while transmitting follows whichever VFO is really in use
+  -- VFO A normally, VFO B when Split is on -- so the highlight always
+  points at what's really going out over the air.
 
 ## Bands and modes
 
@@ -62,9 +89,9 @@ A row of cycling buttons, each click advancing to the next state:
 
 ![Noise and AGC toggle row](images/02-toggle-row.png)
 
-## rigctl / TCI status badges
+## rigctl / TCI / CAT status badges
 
-Small colored badges show whether the rigctl and TCI control servers
+Small colored badges show whether the rigctl, TCI, and CAT control servers
 (configured in Settings → Network) are running:
 
 - Gray -- not running.
@@ -90,7 +117,7 @@ Transmit**):
   TX Power) -- for safely tuning an antenna or amplifier.
 - **TWO TONE** -- transmits a two-tone test signal instead of a steady
   tone, also at Tune Power. This is required (not just an alternative) for
-  PureSignal calibration -- see [PureSignal](08-puresignal.md).
+  PureSignal calibration -- see [PureSignal](09-puresignal.md).
 - **Spacebar** is a hold-to-talk shortcut for MOX, active whenever no text
   field has keyboard focus.
 
@@ -107,9 +134,14 @@ project's current TX verification status.
 ## Spectrum and waterfall
 
 The spectrum pane shows the live signal trace with a shaded band marking
-the current filter passband and a vertical line marking the dial frequency.
-The waterfall pane below it shows the same signal scrolling over time,
-colored by the selected palette (Settings → Spectrum).
+the current filter passband and a vertical line marking the dial frequency
+-- blue while receiving, red/orange while transmitting (see
+[Settings: Spectrum](06-settings-spectrum.md#while-transmitting) for what
+changes about this while Split is in use). Ten frequency-axis gridlines
+span the pane; the label at the very first and last one is skipped (the
+gridline itself still draws) since it would otherwise get clipped or hang
+off the edge. The waterfall pane below it shows the same signal scrolling
+over time, colored by the selected palette (Settings → Spectrum).
 
 Drag the thin divider between the two panes to adjust how much vertical
 space each gets.
@@ -127,7 +159,7 @@ Below the meter:
 
 - **Settings...** opens the [Settings window](03-settings-network.md).
 - **Add Receiver (n/max)** adds another independent receiver window (see
-  [Extra Receivers](11-extra-receivers.md)) -- hidden once you've reached
+  [Extra Receivers](12-extra-receivers.md)) -- hidden once you've reached
   the radio's maximum receiver count, replaced with **All N receivers
   active**.
 

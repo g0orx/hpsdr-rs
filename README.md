@@ -26,7 +26,9 @@ This project started as an experiment: could Claude port the discovery code from
 - AGC with selectable Off/Long/Slow/Medium/Fast modes
 - TX: mic audio through WDSP's TXA chain, ALC, TX power/SWR meter with per-band PA calibration, and a Tune button (WDSP PostGen tone centered in the passband, at a separate reduced "Tune Power" for safe antenna/PA tuning)
 - PureSignal (PA linearization/predistortion), on both Protocol 1 and Protocol 2 — see [PureSignal calibration](#puresignal-calibration) below for how to set it up
-- rigctl (Hamlib-compatible) and TCI (WebSocket) control servers, for use with WSJT-X and similar digital-mode software
+- rigctl (Hamlib-compatible), TCI (WebSocket), and CAT (Kenwood TS-2000 emulation) control servers, for use with WSJT-X, N1MM+, Log4OM, and similar logging/digital-mode software
+- Dual VFO (VFO A/B) with Split -- transmit on VFO B while receiving on VFO A
+- Selectable RX output / TX input audio devices (independent of the OS default), for routing through virtual audio cables
 - Per-radio settings persistence (keyed by the radio's MAC address, so multiple physical radios each keep their own saved configuration)
 - FPGA firmware upload and static IP configuration — see [Firmware update](#firmware-update) below
 
@@ -86,7 +88,7 @@ Two independent, unrelated ways to update a radio's FPGA firmware (`.rbf` file) 
 
 - **In-application update** (while connected → Settings → Network → **Firmware Update...**) — works against a normally-running, already-connected radio, no physical switch needed. Less thoroughly verified than bootloader mode — prefer bootloader mode when available. Automatically stops this radio's active session first (required for the radio to actually respond) and reconnects once the update completes.
 
-See the manual's **[Firmware Update](docs/manual/12-firmware-update.md)** page for the full step-by-step procedure and warnings.
+See the manual's **[Firmware Update](docs/manual/13-firmware-update.md)** page for the full step-by-step procedure and warnings.
 
 ## Packaging (Debian/Ubuntu)
 

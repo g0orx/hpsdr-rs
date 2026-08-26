@@ -1,4 +1,4 @@
-[← Diversity](09-diversity.md) | [Index](README.md) | [Extra Receivers →](11-extra-receivers.md)
+[← Diversity](10-diversity.md) | [Index](README.md) | [Extra Receivers →](12-extra-receivers.md)
 
 # Settings: Equalizer
 
@@ -15,7 +15,7 @@ If TX is armed, an **RX** / **TX** selector at the top of the tab chooses
 which one the rest of the panel edits -- they have entirely independent
 settings. If TX isn't armed, only the RX equalizer is shown.
 
-Each independently-added [extra receiver window](11-extra-receivers.md)
+Each independently-added [extra receiver window](12-extra-receivers.md)
 has its own equalizer too, in its own Settings window's **EQ** tab (RX
 only -- extra receivers never transmit) -- adjusting the main receiver's EQ
 doesn't affect them, or each other.
@@ -36,4 +36,4 @@ independently -- flipping back and forth doesn't lose either set.
 
 ---
 
-[← Diversity](09-diversity.md) | [Index](README.md) | [Extra Receivers →](11-extra-receivers.md)
+[← Diversity](10-diversity.md) | [Index](README.md) | [Extra Receivers →](12-extra-receivers.md)

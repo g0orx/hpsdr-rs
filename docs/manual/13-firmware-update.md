@@ -1,4 +1,4 @@
-[← Extra Receivers](11-extra-receivers.md) | [Index](README.md)
+[← Extra Receivers](12-extra-receivers.md) | [Index](README.md)
 
 # Firmware Update
 
@@ -10,7 +10,7 @@ whether the radio is in **bootloader mode** or **normally running**:
 |---|---|---|
 | Works with | Metis, Hermes, Hermes2, Angelia, Orion, Orion2 | A radio you're already connected to (Protocol 2) |
 | Radio state required | Physically switched into bootloader mode, power-cycled | Normally running (hpsdr-rs stops its own session first, automatically) |
-| Reached from | Discovery screen → **Firmware Update...** | Settings → Network → **Firmware Update...** |
+| Reached from | Discovery screen → **Firmware Update...** | Settings → Firmware tab → **Firmware Update...** |
 | Confidence | Well-documented, hardware-confirmed | Less thoroughly verified -- prefer bootloader mode when available |
 
 **Read this whole page before starting an update**, especially the warnings
@@ -77,8 +77,8 @@ bootloader mode and trying again is always possible.
 
 ## In-application update
 
-Reached from **Settings → Network → Firmware Update...** while connected to
-a Protocol 2 radio. No physical mode switch needed -- but this path is
+Reached from **Settings → Firmware tab → Firmware Update...** while
+connected to a Protocol 2 radio. No physical mode switch needed -- but this path is
 **less thoroughly verified** against real firmware than bootloader mode, so
 prefer that when your radio supports it (i.e. whenever you can get a direct
 cable/switch connection to it).
@@ -111,4 +111,4 @@ check the error shown before trying again.
 
 ---
 
-[← Extra Receivers](11-extra-receivers.md) | [Index](README.md)
+[← Extra Receivers](12-extra-receivers.md) | [Index](README.md)

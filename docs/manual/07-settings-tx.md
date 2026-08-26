@@ -1,4 +1,4 @@
-[← Spectrum](05-settings-spectrum.md) | [Index](README.md) | [PA Calibration →](07-pa-calibration.md)
+[← Spectrum](06-settings-spectrum.md) | [Index](README.md) | [PA Calibration →](08-pa-calibration.md)
 
 # Settings: TX
 
@@ -59,4 +59,4 @@ Two settings for boards with a shared PTT/mic/bias connector:
 
 ---
 
-[← Spectrum](05-settings-spectrum.md) | [Index](README.md) | [PA Calibration →](07-pa-calibration.md)
+[← Spectrum](06-settings-spectrum.md) | [Index](README.md) | [PA Calibration →](08-pa-calibration.md)
