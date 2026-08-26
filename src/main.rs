@@ -2324,6 +2324,12 @@ impl eframe::App for HpsdrApp {
                             [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
                             egui::Stroke::new(1.0, egui::Color32::from_gray(55)),
                         );
+                        // Skip the label at the first/last tick -- right at
+                        // the plot's edge, it either gets clipped or hangs
+                        // off into the surrounding UI.
+                        if t == 0 || t == num_freq_ticks - 1 {
+                            continue;
+                        }
                         let tick_freq_hz =
                             freq_hz as f64 - half_span_hz + frac as f64 * sample_rate as f64;
                         ui.painter().text(
@@ -5468,6 +5474,11 @@ fn render_extra_receiver_ui(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceiver>>) {
             [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
             egui::Stroke::new(1.0, egui::Color32::from_gray(55)),
         );
+        // Skip the label at the first/last tick -- see the main window's
+        // identical treatment.
+        if t == 0 || t == num_freq_ticks - 1 {
+            continue;
+        }
         let tick_freq_hz = freq_hz as f64 - half_span_hz + frac as f64 * sample_rate as f64;
         ui.painter().text(
             egui::pos2(x + 2.0, rect.bottom() - 2.0),
