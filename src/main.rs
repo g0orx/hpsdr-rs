@@ -2288,14 +2288,47 @@ impl eframe::App for HpsdrApp {
 
                     draw_band_edge_markers(ui.painter(), rect, freq_hz, half_span_hz, sample_rate);
 
+                    // While transmitting, this displays tx_spectrum --
+                    // generated TX IQ that's always centered on the real
+                    // TX carrier by construction (tx_spectrum never has
+                    // set_ctun called on it, unlike the RX analyzer), with
+                    // no RX-style CTUN shift concept of its own. Force the
+                    // offset to 0 here so the filter overlay/dial marker
+                    // below land at the TX carrier's actual position
+                    // (screen center) rather than a stale RX/CTUN offset
+                    // -- which, now that Split/CTUN can put TX on a
+                    // different frequency than RX (see
+                    // RadioSession::tx_frequency_hz's doc comment), is not
+                    // guaranteed to be anywhere near the current TX
+                    // frequency at all.
+                    let ctun_offset_hz = if transmitting { 0.0 } else { ctun_offset_hz };
+
                     // Filter passband overlay: shaded region between the
-                    // current mode's filter edges, plus a line marking
-                    // the dial (tuned) frequency itself. Same freq-to-x
-                    // mapping as the axis ticks below.
+                    // current mode's filter edges (mirrored onto TXA --
+                    // see tx_handle.set_width_hz's call sites -- so this
+                    // is genuinely the TX filter while transmitting, not
+                    // just a repurposed RX one), plus a line marking the
+                    // dial (tuned) frequency itself. Same freq-to-x
+                    // mapping as the axis ticks below. Colored red while
+                    // transmitting, matching the frequency display's own
+                    // TX color, so it reads as "this is what's actually
+                    // going out" rather than looking like the ordinary RX
+                    // passband indicator.
                     let x_for_offset = |offset_hz: f64| -> f32 {
                         let frac = ((offset_hz + half_span_hz) / sample_rate as f64)
                             .clamp(0.0, 1.0) as f32;
                         rect.left() + frac * rect.width()
+                    };
+                    let (passband_fill, passband_line) = if transmitting {
+                        (
+                            egui::Color32::from_rgba_unmultiplied(230, 90, 70, 60),
+                            egui::Color32::from_rgb(255, 120, 90),
+                        )
+                    } else {
+                        (
+                            egui::Color32::from_rgba_unmultiplied(70, 150, 230, 50),
+                            egui::Color32::from_rgb(100, 180, 255),
+                        )
                     };
                     let (pb_low, pb_high) = passband;
                     let x_low = x_for_offset(pb_low + ctun_offset_hz);
@@ -2306,12 +2339,12 @@ impl eframe::App for HpsdrApp {
                             egui::pos2(x_high, rect.bottom()),
                         ),
                         0.0,
-                        egui::Color32::from_rgba_unmultiplied(70, 150, 230, 50),
+                        passband_fill,
                     );
                     for x in [x_low, x_high] {
                         ui.painter().line_segment(
                             [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
-                            egui::Stroke::new(1.0, egui::Color32::from_rgb(100, 180, 255)),
+                            egui::Stroke::new(1.0, passband_line),
                         );
                     }
                     let x_dial = x_for_offset(ctun_offset_hz);
