@@ -270,6 +270,22 @@ fn ps_feedback_config(protocol: u8, board: Boards) -> Option<(u8, u8, Option<u8>
 pub struct RadioSession {
     pub iq_buffers: Vec<Arc<Mutex<VecDeque<IqSample>>>>,
     pub frequency_hz: Arc<AtomicU32>,
+    /// The frequency actually programmed into the radio's TX
+    /// register/NCO -- separate from `frequency_hz` (the RX0/dial
+    /// frequency the hardware LO stays parked at) specifically so CTUN
+    /// can be honored for TX: while CTUN is on, this tracks
+    /// ConnectedState::ctun_frequency_hz (the frequency you're actually
+    /// listening to within the passband) rather than the parked dial
+    /// frequency, so pressing PTT transmits where you're listening, not
+    /// wherever the LO happens to be sitting. Kept in sync once per
+    /// frame from main.rs's dial_freq_hz (see the CTUN block in ui())
+    /// rather than at each individual call site that can change
+    /// ctun_frequency_hz, so no call site can forget to update it.
+    /// Equals `frequency_hz` whenever CTUN is off, preserving this
+    /// project's existing simplex-only assumption (see p1_build_packet's
+    /// TX-frequency command / p2_high_priority_packet's tx_freq_hz doc
+    /// comments) for the common case.
+    pub tx_frequency_hz: Arc<AtomicU32>,
     pub sample_rate: Arc<AtomicU32>,
     /// Which ADC (0-indexed) the primary receiver's DDC pulls from.
     pub adc: Arc<AtomicU32>,
@@ -708,6 +724,9 @@ pub struct RadioSession {
 impl RadioSession {
     pub fn start(device: &Device, settings: RadioSettings) -> io::Result<Self> {
         let frequency_hz = Arc::new(AtomicU32::new(settings.frequency_hz));
+        // See RadioSession::tx_frequency_hz's doc comment. Starts equal
+        // to frequency_hz (no CTUN offset yet at connect time).
+        let tx_frequency_hz = Arc::new(AtomicU32::new(settings.frequency_hz));
         let sample_rate = Arc::new(AtomicU32::new(settings.sample_rate));
         let adc = Arc::new(AtomicU32::new(0));
         let antenna = Arc::new(AtomicU32::new(0));
@@ -759,7 +778,7 @@ impl RadioSession {
         let tx_fifo_overrun = Arc::new(AtomicBool::new(false));
         let mut result = match device.protocol {
             1 => start_protocol1(
-                device, settings, frequency_hz, sample_rate, adc, antenna, rx_attenuation,
+                device, settings, frequency_hz, tx_frequency_hz, sample_rate, adc, antenna, rx_attenuation,
                 ps_tx_attenuation, mox, tx_iq, tci_tx_audio, tci_tx_gain, tx_power_watts, pa_gain_db,
                 tx_forward_power, tx_reverse_power, adc0_overload, adc1_overload,
                 tx_fifo_underrun, tx_fifo_overrun, ps_rx_feedback_iq, ps_tx_feedback_iq,
@@ -769,7 +788,7 @@ impl RadioSession {
                 puresignal_enabled,
             ),
             2 => start_protocol2(
-                device, settings, frequency_hz, sample_rate, adc, antenna, rx_attenuation,
+                device, settings, frequency_hz, tx_frequency_hz, sample_rate, adc, antenna, rx_attenuation,
                 ps_tx_attenuation, mox, tx_iq, tci_tx_audio, tci_tx_gain, tx_power_watts, pa_gain_db,
                 tx_forward_power, tx_reverse_power, adc0_overload, adc1_overload,
                 tx_fifo_underrun, tx_fifo_overrun, ps_rx_feedback_iq, ps_tx_feedback_iq,
@@ -977,6 +996,7 @@ fn start_protocol1(
     device: &Device,
     settings: RadioSettings,
     frequency_hz: Arc<AtomicU32>,
+    tx_frequency_hz: Arc<AtomicU32>,
     sample_rate: Arc<AtomicU32>,
     adc: Arc<AtomicU32>,
     antenna: Arc<AtomicU32>,
@@ -1150,6 +1170,7 @@ fn start_protocol1(
     let sender_socket = socket.try_clone()?;
     let sender_stop = Arc::clone(&stop_flag);
     let sender_frequency = Arc::clone(&frequency_hz);
+    let sender_tx_frequency = Arc::clone(&tx_frequency_hz);
     let sender_sample_rate = Arc::clone(&sample_rate);
     let sender_mox = Arc::clone(&mox);
     let sender_tx_iq = Arc::clone(&tx_iq);
@@ -1179,6 +1200,7 @@ fn start_protocol1(
         sender_loop(
             sender_socket,
             sender_frequency,
+            sender_tx_frequency,
             sender_sample_rate,
             sender_mox,
             sender_tx_iq,
@@ -1244,6 +1266,7 @@ fn start_protocol1(
     Ok(RadioSession {
         iq_buffers,
         frequency_hz,
+        tx_frequency_hz,
         sample_rate,
         adc,
         antenna,
@@ -1546,6 +1569,7 @@ fn p1_send_preconfig_and_start(
             &mut pre_current_receiver,
             ps_wire_total.unwrap_or(receivers_fallback),
             frequency_hz,
+            frequency_hz, // tx_frequency_hz: nothing keyed yet this early (mox false below), so this value is never actually used
             0, // antenna: ANT1 default: nothing to key yet, live antenna updates once running
             0, // tx_power_watts: not transmitting during startup config
             DEFAULT_PA_GAIN_DB, // irrelevant while not transmitting (drive forced to 0 above)
@@ -1618,6 +1642,10 @@ fn p1_build_packet(
     current_receiver: &mut u8,
     receivers: u8,
     frequency_hz: u32,
+    // See RadioSession::tx_frequency_hz's doc comment -- the value
+    // actually programmed into command 1 (TX frequency) below, distinct
+    // from `frequency_hz` (RX0/dial) so CTUN can be honored for TX.
+    tx_frequency_hz: u32,
     antenna_val: u32,
     tx_power_watts_val: u32,
     pa_gain_db: f32,
@@ -1717,14 +1745,17 @@ fn p1_build_packet(
     // offset/attenuation, per-receiver ADC assignment) -- flagged
     // per-command below, not silently guessed.
     let freq = frequency_hz as i32;
+    let tx_freq = tx_frequency_hz as i32;
     let (c0b, c1b, c2b, c3b, c4b) = match *ozy_command {
         1 => {
-            // TX frequency. No split-VFO support yet, so this is
-            // always the same frequency as RX -- matches this
-            // project's existing simplex-only assumption elsewhere
-            // (see radio.rs's P2 TX-freq handling). No per-band LO
-            // offset applied (not tracked here).
-            (0x02, (freq >> 24) as u8, (freq >> 16) as u8, (freq >> 8) as u8, freq as u8)
+            // TX frequency. Still no independent split-VFO control (no
+            // way to set a TX frequency other than by CTUN-ing) -- but
+            // when CTUN is on, this follows the CTUN frequency rather
+            // than staying parked at RX0's dial frequency, so PTT
+            // transmits where you're actually listening. See
+            // RadioSession::tx_frequency_hz's doc comment. No per-band
+            // LO offset applied (not tracked here).
+            (0x02, (tx_freq >> 24) as u8, (tx_freq >> 16) as u8, (tx_freq >> 8) as u8, tx_freq as u8)
         }
         2 => {
             // RX frequency for current_receiver. ROOT CAUSE FIX:
@@ -2107,6 +2138,7 @@ fn p1_build_packet(
 fn sender_loop(
     socket: UdpSocket,
     frequency_hz: Arc<AtomicU32>,
+    tx_frequency_hz: Arc<AtomicU32>,
     sample_rate: Arc<AtomicU32>,
     mox: Arc<AtomicBool>,
     tx_iq: Arc<Mutex<VecDeque<f32>>>,
@@ -2326,6 +2358,7 @@ fn sender_loop(
             &mut current_receiver,
             receivers,
             frequency_hz.load(Ordering::Relaxed),
+            tx_frequency_hz.load(Ordering::Relaxed),
             antenna.load(Ordering::Relaxed),
             tx_power_watts.load(Ordering::Relaxed),
             f32::from_bits(pa_gain_db.load(Ordering::Relaxed)),
@@ -2911,6 +2944,7 @@ fn start_protocol2(
     device: &Device,
     settings: RadioSettings,
     frequency_hz: Arc<AtomicU32>,
+    tx_frequency_hz: Arc<AtomicU32>,
     sample_rate: Arc<AtomicU32>,
     adc: Arc<AtomicU32>,
     antenna: Arc<AtomicU32>,
@@ -3046,6 +3080,7 @@ fn start_protocol2(
     let sender_socket = socket.try_clone()?;
     let sender_stop = Arc::clone(&stop_flag);
     let sender_frequency = Arc::clone(&frequency_hz);
+    let sender_tx_frequency = Arc::clone(&tx_frequency_hz);
     let sender_sample_rate = Arc::clone(&sample_rate);
     let sender_adc = Arc::clone(&adc);
     let sender_antenna = Arc::clone(&antenna);
@@ -3074,6 +3109,7 @@ fn start_protocol2(
             num_adcs,
             is_orion2,
             sender_frequency,
+            sender_tx_frequency,
             sender_sample_rate,
             sender_adc,
             sender_antenna,
@@ -3156,6 +3192,7 @@ fn start_protocol2(
     Ok(RadioSession {
         iq_buffers,
         frequency_hz,
+        tx_frequency_hz,
         sample_rate,
         adc,
         antenna,
@@ -3676,6 +3713,10 @@ fn p2_sender_loop(
     // by the user on a real ANAN-8000DLE (an Orion2-family board).
     is_orion2: bool,
     frequency_hz: Arc<AtomicU32>,
+    // See RadioSession::tx_frequency_hz's doc comment -- what actually
+    // feeds p2_high_priority_packet's tx_freq_hz below, distinct from
+    // `frequency_hz` (RX0/dial) so CTUN can be honored for TX.
+    tx_frequency_hz: Arc<AtomicU32>,
     sample_rate: Arc<AtomicU32>,
     adc: Arc<AtomicU32>,
     antenna: Arc<AtomicU32>,
@@ -3783,12 +3824,15 @@ fn p2_sender_loop(
         // Live -- see this function's diversity_enabled doc comment.
         let now_diversity_enabled = diversity_enabled.load(Ordering::Relaxed);
         let mox_on = mox.load(Ordering::Relaxed);
-        // No split VFO support yet -- TX frequency is always the
-        // primary receiver's frequency (simplex). Computed up front
-        // (not derived from freqs[0] further down) since PureSignal's
-        // reserved DDC0/DDC1 entries need this same value prepended
-        // ahead of the real receiver frequencies below.
-        let tx_freq_hz = frequency_hz.load(Ordering::Relaxed);
+        // Still no independent split-VFO control (no way to set a TX
+        // frequency other than by CTUN-ing) -- but see
+        // RadioSession::tx_frequency_hz's doc comment: this tracks the
+        // CTUN frequency while CTUN is on, rather than always mirroring
+        // the primary receiver's parked dial frequency. Computed up
+        // front (not derived from freqs[0] further down) since
+        // PureSignal's reserved DDC0/DDC1 entries need this same value
+        // prepended ahead of the real receiver frequencies below.
+        let tx_freq_hz = tx_frequency_hz.load(Ordering::Relaxed);
 
         let mut freqs = Vec::with_capacity(active + 2);
         let mut rates = Vec::with_capacity(active + 2);

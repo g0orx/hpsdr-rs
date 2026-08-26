@@ -1197,6 +1197,13 @@ impl eframe::App for HpsdrApp {
                 connected.spectrum.set_lo_frequency_hz(freq_hz as f64);
                 connected.spectrum.set_ctun(connected.ctun, ctun_offset_hz);
                 let dial_freq_hz = if connected.ctun { connected.ctun_frequency_hz } else { freq_hz };
+                // See RadioSession::tx_frequency_hz's doc comment --
+                // kept in sync every frame here (same "cheap, no call
+                // site can forget it" reasoning as ctun_offset_hz just
+                // above) so PTT transmits on the CTUN frequency while
+                // CTUN is engaged, not wherever the hardware LO is
+                // parked.
+                connected.session.tx_frequency_hz.store(dial_freq_hz, std::sync::atomic::Ordering::Relaxed);
 
                 // While transmitting, show tx_spectrum (fed with the
                 // actual generated TX IQ -- see ConnectedState::tx_spectrum's
