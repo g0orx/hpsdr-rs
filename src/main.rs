@@ -603,6 +603,30 @@ impl HpsdrApp {
 /// was -- see `RadioSession::puresignal_enabled`'s doc comment (radio.rs).
 fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, String> {
     let mut settings = RadioSettings::default();
+    // ROOT CAUSE FIX: this used to stay at RadioSettings::default()'s
+    // hardcoded 7.1MHz here, with the real saved frequency only applied
+    // afterward via a separate session.set_frequency(cfg.frequency_hz)
+    // call once RadioSession::start returned. That left a real gap: P1's
+    // initial preconfig burst went out at 7.1MHz regardless of what was
+    // actually saved (briefly mistuning real hardware before the sender
+    // loop's next iteration corrected it), and -- the concrete bug this
+    // was confirmed to cause -- RadioSession::start also seeds
+    // tx_frequency_hz/rx_frequency_hz/requested_frequency_hz from this
+    // same (still-7.1MHz) settings.frequency_hz. requested_frequency_hz
+    // in particular is never corrected afterward the way frequency_hz
+    // is, so main.rs's own per-frame reconciliation (see
+    // RadioSession::requested_frequency_hz's doc comment) saw a stale
+    // 7.1MHz "request" on the very first frame after every connect and
+    // resolved it through resolve_tune -- while CTUN was on, clamping
+    // ctun_frequency_hz down to the bottom edge of the current passband
+    // window instead of leaving the just-restored CTUN frequency alone
+    // (confirmed by a real report: CTUN frequency reset to "the lowest
+    // frequency" on every restart). Setting it here instead means every
+    // frequency-tracking field RadioSession::start creates already
+    // starts correct, with nothing left to reconcile away.
+    if let Some(f) = cfg.frequency_hz {
+        settings.frequency_hz = f;
+    }
     if let Some(sr) = cfg.sample_rate {
         settings.sample_rate = sr;
     }
@@ -766,9 +790,9 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                     }
                 };
             }
-            if let Some(f) = cfg.frequency_hz {
-                session.set_frequency(f);
-            }
+            // cfg.frequency_hz is now applied earlier, via
+            // settings.frequency_hz before RadioSession::start -- see
+            // that assignment's doc comment for why.
             if let Some(a) = cfg.adc {
                 session.adc.store(a as u32, Ordering::Relaxed);
             }
