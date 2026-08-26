@@ -349,6 +349,27 @@ struct ConnectedState {
     /// Only meaningful while ctun is true; kept in sync with
     /// session.frequency_hz otherwise (see resolve_tune).
     ctun_frequency_hz: u32,
+    /// VFO B -- a second, independently-remembered frequency. Set via
+    /// the Copy A->B/Copy B->A/Swap A<->B buttons, or by scrolling
+    /// directly on its own box (see vfo_b_scroll_accum below) -- unlike
+    /// VFO A, this never drives a live receiver (this app has no second
+    /// RX chain), so scrolling it just changes the stored value with no
+    /// retune/CTUN/passband-clamp concerns. Used for TX when `split` is
+    /// on (see that field's doc comment).
+    vfo_b_frequency_hz: u32,
+    /// Scroll accumulator for VFO B's own box -- same NOTCH-based
+    /// accumulate-then-step scheme as `scroll_accum` below, kept
+    /// separate so scrolling VFO A and VFO B can never cross-contaminate
+    /// each other's pending sub-step motion.
+    vfo_b_scroll_accum: f32,
+    /// Split: when on, TX uses `vfo_b_frequency_hz` instead of the
+    /// normal dial/CTUN frequency -- see the per-frame CTUN block in
+    /// ui() where session.tx_frequency_hz is resolved (Split takes
+    /// priority over CTUN there, matching standard rig convention:
+    /// Split is a deliberate, explicit TX-frequency override). RX is
+    /// unaffected -- this app has no dual-watch/second-RX-chain
+    /// concept, so VFO A keeps receiving regardless of Split.
+    split: bool,
     rigctl_addr: String,
     tci_addr: String,
     cat_addr: String,
@@ -915,6 +936,12 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
             let ctun = cfg.ctun.unwrap_or(false);
             let ctun_frequency_hz =
                 if ctun { cfg.ctun_frequency_hz.unwrap_or(initial_frequency_hz) } else { initial_frequency_hz };
+            // VFO B / Split -- see ConnectedState's own doc comments.
+            // VFO B falls back to A's frequency (matches a real rig's
+            // typical power-on state, and this project's own convention
+            // of never leaving a frequency field at a meaningless 0).
+            let vfo_b_frequency_hz = cfg.vfo_b_frequency_hz.unwrap_or(initial_frequency_hz);
+            let split = cfg.split.unwrap_or(false);
             Ok(ConnectedState {
                 device,
                 session,
@@ -957,6 +984,9 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                 width_memory: cfg.width_memory.clone(),
                 ctun,
                 ctun_frequency_hz,
+                vfo_b_frequency_hz,
+                vfo_b_scroll_accum: 0.0,
+                split,
                 rigctl_addr,
                 tci_addr,
                 cat_addr,
@@ -1200,10 +1230,14 @@ impl eframe::App for HpsdrApp {
                 // See RadioSession::tx_frequency_hz's doc comment --
                 // kept in sync every frame here (same "cheap, no call
                 // site can forget it" reasoning as ctun_offset_hz just
-                // above) so PTT transmits on the CTUN frequency while
-                // CTUN is engaged, not wherever the hardware LO is
-                // parked.
-                connected.session.tx_frequency_hz.store(dial_freq_hz, std::sync::atomic::Ordering::Relaxed);
+                // above) so PTT transmits on the right frequency
+                // regardless of which of CTUN/Split (if either) is
+                // active. Split takes priority over CTUN when both are
+                // somehow on at once -- see ConnectedState::split's doc
+                // comment for why that's the correct precedence.
+                let tx_dial_freq_hz =
+                    if connected.split { connected.vfo_b_frequency_hz } else { dial_freq_hz };
+                connected.session.tx_frequency_hz.store(tx_dial_freq_hz, std::sync::atomic::Ordering::Relaxed);
 
                 // While transmitting, show tx_spectrum (fed with the
                 // actual generated TX IQ -- see ConnectedState::tx_spectrum's
@@ -1352,20 +1386,123 @@ impl eframe::App for HpsdrApp {
                     // "you're on the air" signal right where the eye
                     // already goes to read the frequency, not just the
                     // separate TRANSMITTING label elsewhere in the row.
-                    let freq_color =
-                        if transmitting { egui::Color32::RED } else { egui::Color32::GREEN };
-                    let freq_label = ui
-                        .add(
-                            egui::Label::new(
-                                egui::RichText::new(format_frequency(dial_freq_hz))
-                                    .monospace()
-                                    .size(28.0)
-                                    .strong()
-                                    .color(freq_color),
-                            )
-                            .sense(egui::Sense::hover()),
-                        )
-                        .on_hover_text("Scroll to tune -- Shift: 100 Hz, Ctrl: 10 kHz, none: 1 kHz");
+                    // While Split is on, TX actually goes out on VFO B
+                    // (see ConnectedState::split's doc comment), so the
+                    // red highlight follows VFO B instead of VFO A --
+                    // otherwise it would point at the wrong box.
+                    let freq_a_color = if transmitting && !connected.split {
+                        egui::Color32::RED
+                    } else {
+                        egui::Color32::GREEN
+                    };
+                    let freq_b_color = if transmitting && connected.split {
+                        egui::Color32::RED
+                    } else {
+                        egui::Color32::GRAY
+                    };
+                    let (freq_label, vfo_b_label) = ui
+                        .horizontal(|ui| {
+                            // VFO A, boxed and labeled to match VFO B's own
+                            // box below -- see ConnectedState::
+                            // vfo_b_frequency_hz/split's doc comments for
+                            // what the buttons between the two boxes do.
+                            let freq_label = ui
+                                .group(|ui| {
+                                    ui.vertical(|ui| {
+                                        ui.label("VFO-A");
+                                        ui.add(
+                                            egui::Label::new(
+                                                egui::RichText::new(format_frequency(dial_freq_hz))
+                                                    .monospace()
+                                                    .size(28.0)
+                                                    .strong()
+                                                    .color(freq_a_color),
+                                            )
+                                            .sense(egui::Sense::hover()),
+                                        )
+                                        .on_hover_text(
+                                            "Scroll to tune -- Shift: 100 Hz, Ctrl: 10 kHz, none: 1 kHz",
+                                        )
+                                    })
+                                    .inner
+                                })
+                                .inner;
+
+                            ui.vertical(|ui| {
+                                ui.horizontal(|ui| {
+                                    if ui
+                                        .button("A>B")
+                                        .on_hover_text("Copy VFO A's frequency to VFO B")
+                                        .clicked()
+                                    {
+                                        connected.vfo_b_frequency_hz = dial_freq_hz;
+                                        settings_changed = true;
+                                    }
+                                    if ui
+                                        .button("B>A")
+                                        .on_hover_text("Retune VFO A to VFO B's frequency")
+                                        .clicked()
+                                    {
+                                        connected.session.set_frequency(connected.vfo_b_frequency_hz);
+                                        // Keep CTUN on but re-center it at
+                                        // the new frequency -- same idiom
+                                        // as the Band buttons below.
+                                        connected.ctun_frequency_hz = connected.vfo_b_frequency_hz;
+                                        settings_changed = true;
+                                    }
+                                });
+                                ui.horizontal(|ui| {
+                                    if ui
+                                        .button("A<>B")
+                                        .on_hover_text("Swap VFO A and VFO B")
+                                        .clicked()
+                                    {
+                                        let new_b = dial_freq_hz;
+                                        connected.session.set_frequency(connected.vfo_b_frequency_hz);
+                                        connected.ctun_frequency_hz = connected.vfo_b_frequency_hz;
+                                        connected.vfo_b_frequency_hz = new_b;
+                                        settings_changed = true;
+                                    }
+                                    if ui
+                                        .add(egui::Button::selectable(connected.split, "Split"))
+                                        .on_hover_text(
+                                            "Transmit on VFO B while continuing to receive on VFO A",
+                                        )
+                                        .clicked()
+                                    {
+                                        connected.split = !connected.split;
+                                        settings_changed = true;
+                                    }
+                                });
+                            });
+
+                            let vfo_b_label = ui
+                                .group(|ui| {
+                                    ui.vertical(|ui| {
+                                        ui.label("VFO-B");
+                                        ui.add(
+                                            egui::Label::new(
+                                                egui::RichText::new(format_frequency(
+                                                    connected.vfo_b_frequency_hz,
+                                                ))
+                                                .monospace()
+                                                .size(28.0)
+                                                .strong()
+                                                .color(freq_b_color),
+                                            )
+                                            .sense(egui::Sense::hover()),
+                                        )
+                                        .on_hover_text(
+                                            "Scroll to tune -- Shift: 100 Hz, none: 1 kHz",
+                                        )
+                                    })
+                                    .inner
+                                })
+                                .inner;
+
+                            (freq_label, vfo_b_label)
+                        })
+                        .inner;
 
                     ui.add_space(8.0);
                     ui.horizontal_wrapped(|ui| {
@@ -2071,6 +2208,43 @@ impl eframe::App for HpsdrApp {
                                     connected.ctun_frequency_hz = effective_freq;
                                 }
                                 remember_band_settings(&mut connected.band_memory, effective_freq, connected.db_low, connected.db_high, connected.waterfall_db_low, connected.waterfall_db_high, current_mode);
+                                settings_changed = true;
+                            }
+                        }
+                    }
+
+                    // VFO B: scroll directly on its own box to change its
+                    // stored frequency. No live receiver sits behind it
+                    // (see ConnectedState::vfo_b_frequency_hz's doc
+                    // comment), so unlike VFO A's block above there's no
+                    // CTUN/passband/retune handling needed here -- just a
+                    // plain accumulate-then-step onto the stored value.
+                    if vfo_b_label.hovered() {
+                        let scroll_delta = ui.input(|i| i.smooth_scroll_delta);
+                        let delta = if scroll_delta.y.abs() >= scroll_delta.x.abs() {
+                            scroll_delta.y
+                        } else {
+                            scroll_delta.x
+                        };
+
+                        if delta != 0.0 {
+                            connected.vfo_b_scroll_accum += delta;
+                            // Same NOTCH/step convention as VFO A's block
+                            // above.
+                            const NOTCH: f32 = 50.0;
+                            let shift = ui.input(|i| i.modifiers.shift);
+                            let step: i64 = if shift { 100 } else { 1_000 };
+
+                            let mut new_freq = connected.vfo_b_frequency_hz as i64;
+                            while connected.vfo_b_scroll_accum.abs() >= NOTCH {
+                                let sign = connected.vfo_b_scroll_accum.signum();
+                                connected.vfo_b_scroll_accum -= sign * NOTCH;
+                                new_freq += step * sign as i64;
+                            }
+                            new_freq = new_freq.max(0);
+
+                            if new_freq as u32 != connected.vfo_b_frequency_hz {
+                                connected.vfo_b_frequency_hz = new_freq as u32;
                                 settings_changed = true;
                             }
                         }
@@ -4289,6 +4463,8 @@ impl eframe::App for HpsdrApp {
                         window_geometry: self.main_window_geometry,
                         ctun: Some(connected.ctun),
                         ctun_frequency_hz: Some(connected.ctun_frequency_hz),
+                        vfo_b_frequency_hz: Some(connected.vfo_b_frequency_hz),
+                        split: Some(connected.split),
                     }
                     .save(connected.device.mac);
                 }

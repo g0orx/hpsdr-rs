@@ -264,6 +264,16 @@ pub struct Config {
     pub ctun: Option<bool>,
     #[serde(default)]
     pub ctun_frequency_hz: Option<u32>,
+    /// VFO B / Split -- see ConnectedState::vfo_b_frequency_hz/split's
+    /// doc comments (main.rs). `None`/missing falls back to A's
+    /// frequency and Split off, respectively -- same "never leave a
+    /// frequency field at a meaningless 0, and a config saved before
+    /// this existed shouldn't suddenly start in Split" reasoning as
+    /// ctun/ctun_frequency_hz above.
+    #[serde(default)]
+    pub vfo_b_frequency_hz: Option<u32>,
+    #[serde(default)]
+    pub split: Option<bool>,
 }
 
 fn default_nb_threshold() -> f64 {
