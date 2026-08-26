@@ -349,6 +349,14 @@ struct ConnectedState {
     /// Only meaningful while ctun is true; kept in sync with
     /// session.frequency_hz otherwise (see resolve_tune).
     ctun_frequency_hz: u32,
+    /// The last value of session.requested_frequency_hz this app has
+    /// already handled -- see that field's doc comment. Compared against
+    /// its live value once per frame; a mismatch means a network client
+    /// (rigctl/CAT/TCI) has requested a new frequency since, which gets
+    /// reconciled through the same CTUN-aware resolve_tune path any
+    /// other frequency change goes through, then this is updated to
+    /// match so the same request isn't reapplied every frame.
+    last_requested_frequency_hz: u32,
     /// VFO B -- a second, independently-remembered frequency. Set via
     /// the Copy A->B/Copy B->A/Swap A<->B buttons, or by scrolling
     /// directly on its own box (see vfo_b_scroll_accum below) -- unlike
@@ -695,7 +703,8 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
             if cfg.rigctl_running.unwrap_or(false) {
                 rigctl_server = match RigctlServer::start(
                     &rigctl_addr,
-                    Arc::clone(&session.frequency_hz),
+                    Arc::clone(&session.requested_frequency_hz),
+                    Arc::clone(&session.rx_frequency_hz),
                     spectrum.demod_params_handle(),
                     Arc::clone(&spectrum.display),
                     Arc::clone(&session.mox),
@@ -715,7 +724,8 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
             if cfg.tci_running.unwrap_or(false) {
                 tci_server = match TciServer::start(
                     &tci_addr,
-                    Arc::clone(&session.frequency_hz),
+                    Arc::clone(&session.requested_frequency_hz),
+                    Arc::clone(&session.rx_frequency_hz),
                     Arc::clone(&session.sample_rate),
                     spectrum.demod_params_handle(),
                     Arc::clone(&session.mox),
@@ -740,7 +750,8 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
             if cfg.cat_running.unwrap_or(false) {
                 cat_server = match CatServer::start(
                     &cat_addr,
-                    Arc::clone(&session.frequency_hz),
+                    Arc::clone(&session.requested_frequency_hz),
+                    Arc::clone(&session.rx_frequency_hz),
                     spectrum.demod_params_handle(),
                     Arc::clone(&spectrum.display),
                     Arc::clone(&session.mox),
@@ -984,6 +995,7 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                 width_memory: cfg.width_memory.clone(),
                 ctun,
                 ctun_frequency_hz,
+                last_requested_frequency_hz: initial_frequency_hz,
                 vfo_b_frequency_hz,
                 vfo_b_scroll_accum: 0.0,
                 split,
@@ -1208,6 +1220,34 @@ impl eframe::App for HpsdrApp {
                 // overlay drawn below -- computed once here rather than
                 // separately in both places.
                 let passband = spectrum::passband_for(current_mode, current_width);
+
+                // See RadioSession::requested_frequency_hz's doc comment.
+                // A network client (rigctl/CAT/TCI) requesting a new
+                // frequency lands here, not directly on the hardware --
+                // reconcile it exactly like any other frequency change
+                // that needs to respect CTUN (same resolve_tune call the
+                // scroll-tune/VFO-B-button handlers use).
+                let requested_freq_hz = connected
+                    .session
+                    .requested_frequency_hz
+                    .load(std::sync::atomic::Ordering::Relaxed);
+                if requested_freq_hz != connected.last_requested_frequency_hz {
+                    let (effective_freq, retune) =
+                        resolve_tune(connected.ctun, freq_hz, sample_rate, passband, requested_freq_hz);
+                    if let Some(lo) = retune {
+                        connected.session.set_frequency(lo);
+                    } else {
+                        connected.ctun_frequency_hz = effective_freq;
+                    }
+                    connected.last_requested_frequency_hz = requested_freq_hz;
+                    // settings_changed isn't declared yet at this point in
+                    // the frame -- settings_dirty is the established
+                    // mechanism for marking a save needed from outside its
+                    // scope (see e.g. the rigctl/TCI/CAT Start buttons'
+                    // own use of it).
+                    connected.settings_dirty.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+
                 let current_gain = connected.spectrum.gain();
                 let current_agc = connected.spectrum.agc();
                 let agc_params = connected.spectrum.agc_params();
@@ -1227,6 +1267,10 @@ impl eframe::App for HpsdrApp {
                 connected.spectrum.set_lo_frequency_hz(freq_hz as f64);
                 connected.spectrum.set_ctun(connected.ctun, ctun_offset_hz);
                 let dial_freq_hz = if connected.ctun { connected.ctun_frequency_hz } else { freq_hz };
+                // See RadioSession::rx_frequency_hz's doc comment -- kept
+                // in sync every frame here so rigctl/TCI/CAT report the
+                // CTUN'd listen frequency, not the parked hardware LO.
+                connected.session.rx_frequency_hz.store(dial_freq_hz, std::sync::atomic::Ordering::Relaxed);
                 // See RadioSession::tx_frequency_hz's doc comment --
                 // kept in sync every frame here (same "cheap, no call
                 // site can forget it" reasoning as ctun_offset_hz just
@@ -2889,7 +2933,8 @@ impl eframe::App for HpsdrApp {
                                             connected.rigctl_error = None;
                                             connected.rigctl_server = match RigctlServer::start(
                                                 &connected.rigctl_addr,
-                                                Arc::clone(&connected.session.frequency_hz),
+                                                Arc::clone(&connected.session.requested_frequency_hz),
+                                                Arc::clone(&connected.session.rx_frequency_hz),
                                                 connected.spectrum.demod_params_handle(),
                                                 Arc::clone(&connected.spectrum.display),
                                                 Arc::clone(&connected.session.mox),
@@ -2949,7 +2994,8 @@ impl eframe::App for HpsdrApp {
                                             connected.tci_error = None;
                                             connected.tci_server = match TciServer::start(
                                                 &connected.tci_addr,
-                                                Arc::clone(&connected.session.frequency_hz),
+                                                Arc::clone(&connected.session.requested_frequency_hz),
+                                                Arc::clone(&connected.session.rx_frequency_hz),
                                                 Arc::clone(&connected.session.sample_rate),
                                                 connected.spectrum.demod_params_handle(),
                                                 Arc::clone(&connected.session.mox),
@@ -3017,7 +3063,8 @@ impl eframe::App for HpsdrApp {
                                             connected.cat_error = None;
                                             connected.cat_server = match CatServer::start(
                                                 &connected.cat_addr,
-                                                Arc::clone(&connected.session.frequency_hz),
+                                                Arc::clone(&connected.session.requested_frequency_hz),
+                                                Arc::clone(&connected.session.rx_frequency_hz),
                                                 connected.spectrum.demod_params_handle(),
                                                 Arc::clone(&connected.spectrum.display),
                                                 Arc::clone(&connected.session.mox),

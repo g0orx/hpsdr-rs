@@ -191,7 +191,18 @@ impl TciServer {
     /// the port is already in use.
     pub fn start(
         addr: &str,
-        frequency_hz: Arc<AtomicU32>,
+        // Where an incoming `vfo` (set) command writes its request --
+        // NOT the raw hardware frequency. See RadioSession::
+        // requested_frequency_hz's doc comment: main.rs's own per-frame
+        // loop reconciles this (moving the CTUN target if CTUN is on,
+        // retuning the real hardware otherwise), since CTUN state lives
+        // in the UI layer, not anywhere reachable from this server
+        // thread.
+        requested_frequency_hz: Arc<AtomicU32>,
+        // See RadioSession::rx_frequency_hz's doc comment -- used for the
+        // vfo/heartbeat frequency reports so a CTUN'd listen frequency is
+        // reported correctly, not the parked hardware LO.
+        rx_frequency_hz: Arc<AtomicU32>,
         sample_rate: Arc<AtomicU32>,
         demod_params: Arc<Mutex<DemodParams>>,
         mox: Arc<AtomicBool>,
@@ -239,7 +250,8 @@ impl TciServer {
                     Ok((stream, peer)) => {
                         println!("tci: client connected from {peer}");
                         accept_logging.log(&format!("client connected from {peer}"));
-                        let freq = Arc::clone(&frequency_hz);
+                        let freq = Arc::clone(&requested_frequency_hz);
+                        let rx_freq = Arc::clone(&rx_frequency_hz);
                         let rate = Arc::clone(&sample_rate);
                         let params = Arc::clone(&accept_demod_params);
                         let audio_iq = Arc::clone(&accept_audio_iq);
@@ -260,7 +272,7 @@ impl TciServer {
                         let handle = thread::spawn(move || {
                             conn_connected.fetch_add(1, Ordering::Relaxed);
                             handle_client(
-                                stream, freq, rate, params, audio_iq, tx_audio, tx_gain, wants_mic,
+                                stream, freq, rx_freq, rate, params, audio_iq, tx_audio, tx_gain, wants_mic,
                                 conn_mox, conn_stop, superseded, conn_logging,
                             );
                             conn_connected.fetch_sub(1, Ordering::Relaxed);
@@ -365,7 +377,8 @@ fn send_is_fatal(result: &tungstenite::Result<()>) -> bool {
 
 fn handle_client(
     stream: TcpStream,
-    frequency_hz: Arc<AtomicU32>,
+    requested_frequency_hz: Arc<AtomicU32>,
+    rx_frequency_hz: Arc<AtomicU32>,
     sample_rate: Arc<AtomicU32>,
     demod_params: DemodParamsCell,
     audio_iq: AudioIqCell,
@@ -439,7 +452,7 @@ fn handle_client(
     // project never sent it at all. `device:` added alongside it since
     // it's part of the same reference sequence and cheap/harmless for
     // any client that reads it.
-    let freq = frequency_hz.load(Ordering::Relaxed);
+    let freq = rx_frequency_hz.load(Ordering::Relaxed);
     let mode = demod_params.lock().unwrap().clone().lock().unwrap().mode;
     let _ = ws.send(Message::Text(PROTOCOL_MESSAGE.into()));
     // Remaining Initialization commands (spec section 4.1) beyond
@@ -618,7 +631,7 @@ fn handle_client(
                     let current_params = demod_params.lock().unwrap().clone();
                     if let Some(response) = handle_command(
                         cmd,
-                        &frequency_hz,
+                        &requested_frequency_hz,
                         &current_params,
                         &mox,
                         &tci_wants_mic,
@@ -957,7 +970,7 @@ fn handle_client(
         // solicited this either, and ignore unsolicited state messages
         // they don't ask for).
         if last_status_broadcast.elapsed() >= Duration::from_secs(1) {
-            let freq = frequency_hz.load(Ordering::Relaxed);
+            let freq = rx_frequency_hz.load(Ordering::Relaxed);
             let mode = demod_params.lock().unwrap().clone().lock().unwrap().mode;
             let mox_on = mox.load(Ordering::Relaxed);
             let _ = ws.send(Message::Text(format!("vfo:0,0,{freq};").into()));
@@ -1158,7 +1171,7 @@ fn decode_binary_message(data: &[u8]) -> Option<(u32, Vec<f32>)> {
 /// protocol itself says invalid commands should just be ignored.
 fn handle_command(
     cmd: &str,
-    frequency_hz: &Arc<AtomicU32>,
+    requested_frequency_hz: &Arc<AtomicU32>,
     demod_params: &Arc<Mutex<DemodParams>>,
     mox: &Arc<AtomicBool>,
     tci_wants_mic: &Arc<AtomicBool>,
@@ -1174,7 +1187,7 @@ fn handle_command(
         "vfo" => {
             let f = args.get(2)?.parse::<f64>().ok()?;
             let f = f.round().max(0.0) as u32;
-            frequency_hz.store(f, Ordering::Relaxed);
+            requested_frequency_hz.store(f, Ordering::Relaxed);
             Some(format!(
                 "vfo:{},{},{};",
                 args.first().unwrap_or(&"0"),

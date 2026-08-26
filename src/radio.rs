@@ -286,6 +286,32 @@ pub struct RadioSession {
     /// TX-frequency command / p2_high_priority_packet's tx_freq_hz doc
     /// comments) for the common case.
     pub tx_frequency_hz: Arc<AtomicU32>,
+    /// The frequency the user should currently perceive as "where I am"
+    /// -- `ConnectedState::ctun_frequency_hz` while CTUN is on, otherwise
+    /// equal to `frequency_hz`. Same "kept in sync once per frame from
+    /// main.rs's dial_freq_hz" reasoning as `tx_frequency_hz` above, but
+    /// for reporting purposes rather than driving TX: rigctl/CAT/TCI's
+    /// "get frequency" queries read this instead of the raw `frequency_hz`
+    /// so they report the CTUN'd listen frequency (what's actually being
+    /// heard) rather than the parked hardware LO. See
+    /// `requested_frequency_hz` below for the "set" side of this.
+    pub rx_frequency_hz: Arc<AtomicU32>,
+    /// Where rigctl/CAT/TCI's "set frequency" commands write their
+    /// request, instead of `frequency_hz` directly -- CTUN state
+    /// (`ConnectedState::ctun`/`ctun_frequency_hz`) lives in the UI layer,
+    /// not here, so a server thread can't apply CTUN-aware clamping
+    /// itself. main.rs's per-frame update loop watches this for changes
+    /// (comparing against `ConnectedState::last_requested_frequency_hz`)
+    /// and reconciles them the same way any other UI-driven frequency
+    /// change is handled -- via `resolve_tune`, moving the CTUN target
+    /// (clamped to the current passband) if CTUN is on, or retuning the
+    /// real hardware directly if not. ROOT CAUSE FIX for a real report:
+    /// network clients setting frequency while CTUN was on used to
+    /// retune the real LO out from under CTUN, corrupting its offset
+    /// tracking (the RXA shift is computed from `ctun_frequency_hz -
+    /// frequency_hz`, so moving `frequency_hz` alone desyncs it) as well
+    /// as ignoring the user's CTUN intent entirely.
+    pub requested_frequency_hz: Arc<AtomicU32>,
     pub sample_rate: Arc<AtomicU32>,
     /// Which ADC (0-indexed) the primary receiver's DDC pulls from.
     pub adc: Arc<AtomicU32>,
@@ -727,6 +753,13 @@ impl RadioSession {
         // See RadioSession::tx_frequency_hz's doc comment. Starts equal
         // to frequency_hz (no CTUN offset yet at connect time).
         let tx_frequency_hz = Arc::new(AtomicU32::new(settings.frequency_hz));
+        // See RadioSession::rx_frequency_hz's doc comment. Same starting
+        // value/reasoning as tx_frequency_hz above.
+        let rx_frequency_hz = Arc::new(AtomicU32::new(settings.frequency_hz));
+        // See RadioSession::requested_frequency_hz's doc comment. Starts
+        // equal to frequency_hz so the very first per-frame reconcile
+        // sees no pending request.
+        let requested_frequency_hz = Arc::new(AtomicU32::new(settings.frequency_hz));
         let sample_rate = Arc::new(AtomicU32::new(settings.sample_rate));
         let adc = Arc::new(AtomicU32::new(0));
         let antenna = Arc::new(AtomicU32::new(0));
@@ -778,7 +811,7 @@ impl RadioSession {
         let tx_fifo_overrun = Arc::new(AtomicBool::new(false));
         let mut result = match device.protocol {
             1 => start_protocol1(
-                device, settings, frequency_hz, tx_frequency_hz, sample_rate, adc, antenna, rx_attenuation,
+                device, settings, frequency_hz, tx_frequency_hz, rx_frequency_hz, requested_frequency_hz, sample_rate, adc, antenna, rx_attenuation,
                 ps_tx_attenuation, mox, tx_iq, tci_tx_audio, tci_tx_gain, tx_power_watts, pa_gain_db,
                 tx_forward_power, tx_reverse_power, adc0_overload, adc1_overload,
                 tx_fifo_underrun, tx_fifo_overrun, ps_rx_feedback_iq, ps_tx_feedback_iq,
@@ -788,7 +821,7 @@ impl RadioSession {
                 puresignal_enabled,
             ),
             2 => start_protocol2(
-                device, settings, frequency_hz, tx_frequency_hz, sample_rate, adc, antenna, rx_attenuation,
+                device, settings, frequency_hz, tx_frequency_hz, rx_frequency_hz, requested_frequency_hz, sample_rate, adc, antenna, rx_attenuation,
                 ps_tx_attenuation, mox, tx_iq, tci_tx_audio, tci_tx_gain, tx_power_watts, pa_gain_db,
                 tx_forward_power, tx_reverse_power, adc0_overload, adc1_overload,
                 tx_fifo_underrun, tx_fifo_overrun, ps_rx_feedback_iq, ps_tx_feedback_iq,
@@ -997,6 +1030,8 @@ fn start_protocol1(
     settings: RadioSettings,
     frequency_hz: Arc<AtomicU32>,
     tx_frequency_hz: Arc<AtomicU32>,
+    rx_frequency_hz: Arc<AtomicU32>,
+    requested_frequency_hz: Arc<AtomicU32>,
     sample_rate: Arc<AtomicU32>,
     adc: Arc<AtomicU32>,
     antenna: Arc<AtomicU32>,
@@ -1267,6 +1302,8 @@ fn start_protocol1(
         iq_buffers,
         frequency_hz,
         tx_frequency_hz,
+        rx_frequency_hz,
+        requested_frequency_hz,
         sample_rate,
         adc,
         antenna,
@@ -2945,6 +2982,8 @@ fn start_protocol2(
     settings: RadioSettings,
     frequency_hz: Arc<AtomicU32>,
     tx_frequency_hz: Arc<AtomicU32>,
+    rx_frequency_hz: Arc<AtomicU32>,
+    requested_frequency_hz: Arc<AtomicU32>,
     sample_rate: Arc<AtomicU32>,
     adc: Arc<AtomicU32>,
     antenna: Arc<AtomicU32>,
@@ -3193,6 +3232,8 @@ fn start_protocol2(
         iq_buffers,
         frequency_hz,
         tx_frequency_hz,
+        rx_frequency_hz,
+        requested_frequency_hz,
         sample_rate,
         adc,
         antenna,

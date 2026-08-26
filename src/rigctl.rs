@@ -93,7 +93,17 @@ impl RigctlServer {
     /// in this app.
     pub fn start(
         addr: &str,
-        frequency_hz: Arc<AtomicU32>,
+        // Where `F`/`\set_freq` writes its request -- NOT the raw
+        // hardware frequency. See RadioSession::requested_frequency_hz's
+        // doc comment: main.rs's own per-frame loop reconciles this
+        // (moving the CTUN target if CTUN is on, retuning the real
+        // hardware otherwise), since CTUN state lives in the UI layer,
+        // not anywhere reachable from this server thread.
+        requested_frequency_hz: Arc<AtomicU32>,
+        // See RadioSession::rx_frequency_hz's doc comment -- used for
+        // `f`/`\get_freq` so a CTUN'd listen frequency is reported
+        // correctly, not the parked hardware LO.
+        rx_frequency_hz: Arc<AtomicU32>,
         demod_params: Arc<Mutex<DemodParams>>,
         display: Arc<Mutex<SpectrumDisplay>>,
         mox: Arc<AtomicBool>,
@@ -130,7 +140,8 @@ impl RigctlServer {
                         if let Err(e) = stream.set_read_timeout(Some(Duration::from_millis(250))) {
                             eprintln!("rigctl: failed to set read timeout: {e}");
                         }
-                        let freq = Arc::clone(&frequency_hz);
+                        let freq = Arc::clone(&requested_frequency_hz);
+                        let rx_freq = Arc::clone(&rx_frequency_hz);
                         let params = Arc::clone(&accept_demod_params);
                         let disp = Arc::clone(&accept_display);
                         let conn_mox = Arc::clone(&mox);
@@ -139,7 +150,7 @@ impl RigctlServer {
                         let conn_logging = accept_logging.clone();
                         let handle = thread::spawn(move || {
                             conn_connected.fetch_add(1, Ordering::Relaxed);
-                            handle_client(stream, freq, params, disp, conn_mox, conn_stop, conn_logging);
+                            handle_client(stream, freq, rx_freq, params, disp, conn_mox, conn_stop, conn_logging);
                             conn_connected.fetch_sub(1, Ordering::Relaxed);
                         });
                         let mut threads = accept_client_threads.lock().unwrap();
@@ -173,7 +184,7 @@ impl RigctlServer {
     /// RigctlServer, which tore down the TCP listener and forcibly
     /// disconnected any client (e.g. WSJT-X) that happened to be
     /// connected at the time -- confirmed as the cause of a reported
-    /// "rigctl disconnects on sample rate change". frequency_hz and mox
+    /// "rigctl disconnects on sample rate change". requested_frequency_hz and mox
     /// don't need this treatment since they're the same Arc from
     /// RadioSession across a sample-rate change; only DemodParams gets
     /// replaced.
@@ -222,7 +233,8 @@ impl Drop for RigctlServer {
 
 fn handle_client(
     stream: TcpStream,
-    frequency_hz: Arc<AtomicU32>,
+    requested_frequency_hz: Arc<AtomicU32>,
+    rx_frequency_hz: Arc<AtomicU32>,
     demod_params: DemodParamsCell,
     display: DisplayCell,
     mox: Arc<AtomicBool>,
@@ -256,7 +268,7 @@ fn handle_client(
                 // already-connected clients too, not just new ones.
                 let current_params = demod_params.lock().unwrap().clone();
                 let current_display = display.lock().unwrap().clone();
-                match handle_command(cmd, &frequency_hz, &current_params, &current_display, &mox) {
+                match handle_command(cmd, &requested_frequency_hz, &rx_frequency_hz, &current_params, &current_display, &mox) {
                     Some(response) => {
                         logging.log(&format!(">> {}", response.trim_end()));
                         if writer.write_all(response.as_bytes()).is_err() {
@@ -297,7 +309,8 @@ fn handle_client(
 
 fn handle_command(
     cmd: &str,
-    frequency_hz: &Arc<AtomicU32>,
+    requested_frequency_hz: &Arc<AtomicU32>,
+    rx_frequency_hz: &Arc<AtomicU32>,
     demod_params: &Arc<Mutex<DemodParams>>,
     display: &Arc<Mutex<SpectrumDisplay>>,
     mox: &Arc<AtomicBool>,
@@ -307,12 +320,12 @@ fn handle_command(
 
     let response = match op {
         "f" | "\\get_freq" => {
-            let f = frequency_hz.load(Ordering::Relaxed);
+            let f = rx_frequency_hz.load(Ordering::Relaxed);
             format!("{f}\n")
         }
         "F" | "\\set_freq" => match parts.next().and_then(|s| s.parse::<f64>().ok()) {
             Some(f) => {
-                frequency_hz.store(f.round().max(0.0) as u32, Ordering::Relaxed);
+                requested_frequency_hz.store(f.round().max(0.0) as u32, Ordering::Relaxed);
                 "RPRT 0\n".to_string()
             }
             None => "RPRT -1\n".to_string(),

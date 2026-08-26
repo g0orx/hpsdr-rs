@@ -96,7 +96,17 @@ impl CatServer {
     /// caller should treat that as non-fatal.
     pub fn start(
         addr: &str,
-        frequency_hz: Arc<AtomicU32>,
+        // Where FA's "set" form writes its request -- NOT the raw
+        // hardware frequency. See RadioSession::requested_frequency_hz's
+        // doc comment: main.rs's own per-frame loop reconciles this
+        // (moving the CTUN target if CTUN is on, retuning the real
+        // hardware otherwise), since CTUN state lives in the UI layer,
+        // not anywhere reachable from this server thread.
+        requested_frequency_hz: Arc<AtomicU32>,
+        // See RadioSession::rx_frequency_hz's doc comment -- used for
+        // FA/IF's frequency-read fields so a CTUN'd listen frequency is
+        // reported correctly, not the parked hardware LO.
+        rx_frequency_hz: Arc<AtomicU32>,
         demod_params: Arc<Mutex<DemodParams>>,
         display: Arc<Mutex<SpectrumDisplay>>,
         mox: Arc<AtomicBool>,
@@ -126,7 +136,8 @@ impl CatServer {
                         if let Err(e) = stream.set_read_timeout(Some(Duration::from_millis(250))) {
                             eprintln!("cat: failed to set read timeout: {e}");
                         }
-                        let freq = Arc::clone(&frequency_hz);
+                        let freq = Arc::clone(&requested_frequency_hz);
+                        let rx_freq = Arc::clone(&rx_frequency_hz);
                         let params = Arc::clone(&accept_demod_params);
                         let disp = Arc::clone(&accept_display);
                         let conn_mox = Arc::clone(&mox);
@@ -135,7 +146,7 @@ impl CatServer {
                         let conn_logging = accept_logging.clone();
                         let handle = thread::spawn(move || {
                             conn_connected.fetch_add(1, Ordering::Relaxed);
-                            handle_client(stream, freq, params, disp, conn_mox, conn_stop, conn_logging);
+                            handle_client(stream, freq, rx_freq, params, disp, conn_mox, conn_stop, conn_logging);
                             conn_connected.fetch_sub(1, Ordering::Relaxed);
                         });
                         let mut threads = accept_client_threads.lock().unwrap();
@@ -197,7 +208,8 @@ impl Drop for CatServer {
 
 fn handle_client(
     stream: TcpStream,
-    frequency_hz: Arc<AtomicU32>,
+    requested_frequency_hz: Arc<AtomicU32>,
+    rx_frequency_hz: Arc<AtomicU32>,
     demod_params: DemodParamsCell,
     display: DisplayCell,
     mox: Arc<AtomicBool>,
@@ -246,7 +258,8 @@ fn handle_client(
                     let current_display = display.lock().unwrap().clone();
                     if let Some(response) = handle_command(
                         cmd,
-                        &frequency_hz,
+                        &requested_frequency_hz,
+                        &rx_frequency_hz,
                         &current_params,
                         &current_display,
                         &mox,
@@ -279,7 +292,8 @@ fn handle_client(
 /// comment on Kenwood CAT's request/reply asymmetry).
 fn handle_command(
     cmd: &str,
-    frequency_hz: &Arc<AtomicU32>,
+    requested_frequency_hz: &Arc<AtomicU32>,
+    rx_frequency_hz: &Arc<AtomicU32>,
     demod_params: &Arc<Mutex<DemodParams>>,
     display: &Arc<Mutex<SpectrumDisplay>>,
     mox: &Arc<AtomicBool>,
@@ -305,29 +319,33 @@ fn handle_command(
         }
         "IF" => {
             if suffix.is_empty() {
-                Some(build_if_response(frequency_hz, demod_params, mox))
+                Some(build_if_response(rx_frequency_hz, demod_params, mox))
             } else {
                 None
             }
         }
         "FA" => {
             if suffix.is_empty() {
-                let f = frequency_hz.load(Ordering::Relaxed);
+                // rx_frequency_hz, not requested_frequency_hz -- see this
+                // module's doc comment: reports the CTUN'd listen
+                // frequency, not the parked hardware LO.
+                let f = rx_frequency_hz.load(Ordering::Relaxed);
                 Some(format!("FA{f:011};"))
             } else if let Ok(f) = suffix.parse::<u32>() {
-                frequency_hz.store(f, Ordering::Relaxed);
+                requested_frequency_hz.store(f, Ordering::Relaxed);
                 None
             } else {
                 None
             }
         }
-        // No independent VFO-B in this app -- read mirrors FA's current
-        // frequency; a set is accepted (no reply, matching a real "set"
-        // command's silence) but otherwise a no-op. See this module's
-        // doc comment.
+        // This app's own VFO-B/Split (main window) isn't exposed
+        // through CAT yet -- read mirrors FA's current frequency; a set
+        // is accepted (no reply, matching a real "set" command's
+        // silence) but otherwise a no-op. See this module's doc
+        // comment.
         "FB" => {
             if suffix.is_empty() {
-                let f = frequency_hz.load(Ordering::Relaxed);
+                let f = rx_frequency_hz.load(Ordering::Relaxed);
                 Some(format!("FB{f:011};"))
             } else {
                 None
@@ -506,21 +524,21 @@ mod tests {
     fn id_reports_ts2000() {
         let (f, p, d, m) = fixture();
         let mut ai = 0;
-        assert_eq!(handle_command("ID", &f, &p, &d, &m, &mut ai), Some("ID019;".to_string()));
+        assert_eq!(handle_command("ID", &f, &f, &p, &d, &m, &mut ai), Some("ID019;".to_string()));
     }
 
     #[test]
     fn fa_read_reflects_current_frequency() {
         let (f, p, d, m) = fixture();
         let mut ai = 0;
-        assert_eq!(handle_command("FA", &f, &p, &d, &m, &mut ai), Some("FA00014074000;".to_string()));
+        assert_eq!(handle_command("FA", &f, &f, &p, &d, &m, &mut ai), Some("FA00014074000;".to_string()));
     }
 
     #[test]
     fn fa_set_updates_frequency_and_sends_no_reply() {
         let (f, p, d, m) = fixture();
         let mut ai = 0;
-        assert_eq!(handle_command("FA00007074000", &f, &p, &d, &m, &mut ai), None);
+        assert_eq!(handle_command("FA00007074000", &f, &f, &p, &d, &m, &mut ai), None);
         assert_eq!(f.load(Ordering::Relaxed), 7_074_000);
     }
 
@@ -528,7 +546,7 @@ mod tests {
     fn fb_read_mirrors_fa() {
         let (f, p, d, m) = fixture();
         let mut ai = 0;
-        assert_eq!(handle_command("FB", &f, &p, &d, &m, &mut ai), Some("FB00014074000;".to_string()));
+        assert_eq!(handle_command("FB", &f, &f, &p, &d, &m, &mut ai), Some("FB00014074000;".to_string()));
     }
 
     #[test]
@@ -536,19 +554,19 @@ mod tests {
         let (f, p, d, m) = fixture();
         let mut ai = 0;
         // Default DemodParams starts at USB (code 2).
-        assert_eq!(handle_command("MD", &f, &p, &d, &m, &mut ai), Some("MD2;".to_string()));
-        assert_eq!(handle_command("MD3", &f, &p, &d, &m, &mut ai), None); // CWU
+        assert_eq!(handle_command("MD", &f, &f, &p, &d, &m, &mut ai), Some("MD2;".to_string()));
+        assert_eq!(handle_command("MD3", &f, &f, &p, &d, &m, &mut ai), None); // CWU
         assert_eq!(p.lock().unwrap().mode, Mode::Cwu);
-        assert_eq!(handle_command("MD", &f, &p, &d, &m, &mut ai), Some("MD3;".to_string()));
+        assert_eq!(handle_command("MD", &f, &f, &p, &d, &m, &mut ai), Some("MD3;".to_string()));
     }
 
     #[test]
     fn tx_rx_drive_mox() {
         let (f, p, d, m) = fixture();
         let mut ai = 0;
-        assert_eq!(handle_command("TX", &f, &p, &d, &m, &mut ai), None);
+        assert_eq!(handle_command("TX", &f, &f, &p, &d, &m, &mut ai), None);
         assert!(m.load(Ordering::Relaxed));
-        assert_eq!(handle_command("RX", &f, &p, &d, &m, &mut ai), None);
+        assert_eq!(handle_command("RX", &f, &f, &p, &d, &m, &mut ai), None);
         assert!(!m.load(Ordering::Relaxed));
     }
 
@@ -569,7 +587,7 @@ mod tests {
         let mut ai = 0;
         // fixture() sets meter_db to -73 (S9); piHPSDR's formula maps
         // that to roughly the middle of the 0-30 scale.
-        let resp = handle_command("SM0", &f, &p, &d, &m, &mut ai).unwrap();
+        let resp = handle_command("SM0", &f, &f, &p, &d, &m, &mut ai).unwrap();
         assert!(resp.starts_with("SM0"), "{resp}");
         assert!(resp.ends_with(';'));
     }
@@ -578,26 +596,26 @@ mod tests {
     fn ai_get_set_round_trip() {
         let (f, p, d, m) = fixture();
         let mut ai = 0;
-        assert_eq!(handle_command("AI", &f, &p, &d, &m, &mut ai), Some("AI0;".to_string()));
-        assert_eq!(handle_command("AI2", &f, &p, &d, &m, &mut ai), None);
+        assert_eq!(handle_command("AI", &f, &f, &p, &d, &m, &mut ai), Some("AI0;".to_string()));
+        assert_eq!(handle_command("AI2", &f, &f, &p, &d, &m, &mut ai), None);
         assert_eq!(ai, 2);
-        assert_eq!(handle_command("AI", &f, &p, &d, &m, &mut ai), Some("AI2;".to_string()));
+        assert_eq!(handle_command("AI", &f, &f, &p, &d, &m, &mut ai), Some("AI2;".to_string()));
     }
 
     #[test]
     fn ps_read_always_reports_on_and_set_is_ignored() {
         let (f, p, d, m) = fixture();
         let mut ai = 0;
-        assert_eq!(handle_command("PS", &f, &p, &d, &m, &mut ai), Some("PS1;".to_string()));
+        assert_eq!(handle_command("PS", &f, &f, &p, &d, &m, &mut ai), Some("PS1;".to_string()));
         // "PS0;" (power off) is deliberately a no-op, not a shutdown --
         // see this module's doc comment.
-        assert_eq!(handle_command("PS0", &f, &p, &d, &m, &mut ai), None);
+        assert_eq!(handle_command("PS0", &f, &f, &p, &d, &m, &mut ai), None);
     }
 
     #[test]
     fn unknown_command_gets_question_mark() {
         let (f, p, d, m) = fixture();
         let mut ai = 0;
-        assert_eq!(handle_command("ZZ", &f, &p, &d, &m, &mut ai), Some("?;".to_string()));
+        assert_eq!(handle_command("ZZ", &f, &f, &p, &d, &m, &mut ai), Some("?;".to_string()));
     }
 }
