@@ -71,8 +71,9 @@ in Hz (50-5000 Hz). Each mode remembers its own last-used width.
 
 **Audio gain** controls the speaker/headphone volume for the received
 audio (this is WDSP's own output gain stage, not your OS/sound-card
-volume). It's a log-scale slider, so small movements near the low end make
-a bigger audible difference than the same movement near the top.
+volume). The slider is scaled in dB (-100 to +18), so each step is an equal
+relative loudness change across the whole range rather than the low end
+being too coarse and the high end too fine on a plain linear scale.
 
 ## Noise/AGC toggles
 

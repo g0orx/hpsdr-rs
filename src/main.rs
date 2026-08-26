@@ -1686,15 +1686,19 @@ impl eframe::App for HpsdrApp {
                         // this is a plain linear multiply against that
                         // sample before the -1.0..1.0 clamp (see
                         // spectrum.rs's run()), so there's no correctness
-                        // reason to cap it as low as 1.5 -- just headroom
-                        // the log slider (see its own doc comment) makes
-                        // easy to use across regardless of how high it goes.
-                        if scroll_slider_f32_log(
+                        // reason to cap it as low as 1.5 -- just headroom.
+                        // Displayed/dragged in dB (see scroll_slider_f32_db's
+                        // doc comment) -- +18dB ceiling matches the old
+                        // 8.0 linear max; -100dB floor is effectively
+                        // silent (0.00001 linear) while still being a
+                        // finite, draggable slider position.
+                        if scroll_slider_f32_db(
                             ui,
                             &mut connected.slider_scroll_accum,
                             &mut gain,
-                            0.0..=8.0,
-                            1.08,
+                            -100.0,
+                            18.0,
+                            1.0,
                         ) {
                             connected.spectrum.set_gain(gain);
                             settings_changed = true;
@@ -1705,12 +1709,17 @@ impl eframe::App for HpsdrApp {
                                 ui.add_space(12.0);
                                 ui.label("Mic gain:");
                                 let mut mic_gain = connected.mic_gain;
-                                if scroll_slider_f32(
+                                // Displayed/dragged in dB (see
+                                // scroll_slider_f32_db's doc comment) --
+                                // +6dB ceiling matches the old 2.0 linear
+                                // max, -60dB floor matches Audio gain's own.
+                                if scroll_slider_f32_db(
                                     ui,
                                     &mut connected.slider_scroll_accum,
                                     &mut mic_gain,
-                                    0.0..=2.0,
-                                    0.05,
+                                    -60.0,
+                                    6.0,
+                                    1.0,
                                 ) {
                                     connected.mic_gain = mic_gain;
                                     if let Some(tx) = &connected.tx_handle {
@@ -1726,20 +1735,24 @@ impl eframe::App for HpsdrApp {
                                 // calibrated for (confirmed via WSJT-X's
                                 // own source, not an hpsdr-rs decode bug
                                 // -- see radio::RadioSession::
-                                // tci_tx_gain's doc comment). Log-scale
-                                // for the same reason Audio Gain needed
-                                // it: this needs to cover a couple orders
-                                // of magnitude, dialed in by ear/meter
-                                // against real traffic.
+                                // tci_tx_gain's doc comment). Displayed/
+                                // dragged in dB for the same reason Audio
+                                // Gain needed it: this needs to cover a
+                                // couple orders of magnitude, dialed in by
+                                // ear/meter against real traffic -- +60dB
+                                // ceiling matches the old 1000.0 linear
+                                // max exactly, -60dB floor matches Audio
+                                // gain's own.
                                 ui.add_space(12.0);
                                 ui.label("TCI TX gain:");
                                 let mut tci_tx_gain = connected.tci_tx_gain;
-                                if scroll_slider_f32_log(
+                                if scroll_slider_f32_db(
                                     ui,
                                     &mut connected.slider_scroll_accum,
                                     &mut tci_tx_gain,
-                                    0.0..=1000.0,
-                                    1.08,
+                                    -60.0,
+                                    60.0,
+                                    1.0,
                                 ) {
                                     connected.tci_tx_gain = tci_tx_gain;
                                     *connected.session.tci_tx_gain.lock().unwrap() = tci_tx_gain;
@@ -4893,38 +4906,25 @@ fn scroll_slider_f32(
     changed
 }
 
-/// Smallest value scroll_slider_f32_log's drag/scroll range actually
-/// resolves to -- without this, egui's own default (1e-6) would spend
-/// most of the slider's width/scroll travel on a range far smaller than
-/// anything this project's gain controls actually use.
-const LOG_SLIDER_SMALLEST_POSITIVE: f32 = 0.001;
-
-/// Same as scroll_slider_f32, but both drag AND scroll-wheel stepping
-/// are logarithmic -- for sliders whose useful range spans orders of
-/// magnitude (e.g. Audio Gain: a real report needed ~0.01 for TCI/
-/// WSJT-X while the slider's range goes up to 1.5, making that low end
-/// both unreachable by drag and unusable by scroll on a linear slider).
-///
-/// `ratio_per_notch` (e.g. 1.08 = 8% per notch) is a MULTIPLICATIVE
-/// step, not an additive one -- an earlier version of this reused the
-/// linear variant's additive step (a fixed absolute amount per notch),
-/// which is backwards for a log control: a fixed absolute step is a
-/// huge relative jump near the low end and imperceptible near the high
-/// end, confirmed by a real report ("scroll step is much finer at the
-/// high end rather than the low end"). Multiplicative stepping gives
-/// the same relative (percentage) resolution at every point on the
-/// range, matching the slider's own logarithmic drag behavior.
-fn scroll_slider_f32_log(
+/// Displays and drags in dB for a gain control whose useful range spans
+/// orders of magnitude (e.g. Audio Gain, Mic Gain, TCI TX Gain) -- `gain`
+/// is still the actual linear amplitude value mutated in place (this
+/// app's gain fields are a plain `sample * gain` multiply, see
+/// SpectrumHandle::set_gain's doc comment), so nothing downstream of the
+/// slider needs to change, only how the UI reads. `min_db` doubles as
+/// the effective floor/mute point -- 0.0 linear gain is -infinity dB,
+/// not representable, so dragging/scrolling to the bottom of the range
+/// lands on `min_db` rather than true silence.
+fn scroll_slider_f32_db(
     ui: &mut egui::Ui,
     scroll_accum: &mut f32,
-    value: &mut f32,
-    range: std::ops::RangeInclusive<f32>,
-    ratio_per_notch: f32,
+    gain: &mut f32,
+    min_db: f32,
+    max_db: f32,
+    step_db: f32,
 ) -> bool {
-    let slider = egui::Slider::new(value, range.clone())
-        .logarithmic(true)
-        .smallest_positive(LOG_SLIDER_SMALLEST_POSITIVE as f64);
-    let resp = ui.add(slider);
+    let mut db = if *gain > 0.0 { 20.0 * gain.log10() } else { min_db };
+    let resp = ui.add(egui::Slider::new(&mut db, min_db..=max_db).suffix(" dB"));
     let mut changed = resp.changed();
     if resp.hovered() {
         let scroll_delta = ui.input(|i| i.smooth_scroll_delta);
@@ -4939,17 +4939,13 @@ fn scroll_slider_f32_log(
             while scroll_accum.abs() >= NOTCH {
                 let sign = scroll_accum.signum();
                 *scroll_accum -= sign * NOTCH;
-                *value = if *value <= LOG_SLIDER_SMALLEST_POSITIVE && sign < 0.0 {
-                    0.0
-                } else if *value <= LOG_SLIDER_SMALLEST_POSITIVE && sign > 0.0 {
-                    LOG_SLIDER_SMALLEST_POSITIVE
-                } else {
-                    *value * ratio_per_notch.powf(sign)
-                }
-                .clamp(*range.start(), *range.end());
+                db = (db + step_db * sign).clamp(min_db, max_db);
                 changed = true;
             }
         }
+    }
+    if changed {
+        *gain = 10f32.powf(db / 20.0);
     }
     changed
 }
@@ -5414,11 +5410,9 @@ fn render_extra_receiver_ui(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceiver>>) {
     ui.horizontal(|ui| {
         ui.label("Audio gain:");
         let mut gain = current_gain;
-        // Same range/log-slider treatment as the main window's identical
-        // control -- see its own doc comment (main.rs) for why: was
-        // capped at 1.5, too low for a real report, and a linear slider/
-        // fixed scroll step makes a wide range awkward at both ends.
-        if scroll_slider_f32_log(ui, &mut rx.slider_scroll_accum, &mut gain, 0.0..=8.0, 1.08) {
+        // Same dB-displayed treatment as the main window's identical
+        // control -- see scroll_slider_f32_db's doc comment (main.rs).
+        if scroll_slider_f32_db(ui, &mut rx.slider_scroll_accum, &mut gain, -100.0, 18.0, 1.0) {
             rx.spectrum.set_gain(gain);
             rx.settings_dirty.store(true, Ordering::Relaxed);
         }
