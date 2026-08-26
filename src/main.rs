@@ -5396,9 +5396,10 @@ fn render_extra_receiver_ui(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceiver>>) {
                 rx.settings_dirty.store(true, Ordering::Relaxed);
             }
         }
-    });
 
-    ui.horizontal(|ui| {
+        // Same row as the mode buttons, matching the main window's
+        // identical placement.
+        ui.add_space(12.0);
         ui.label("Filter width:");
         let mut width = current_width;
         if scroll_slider_f64(ui, &mut rx.slider_scroll_accum, &mut width, 50.0..=5000.0, 50.0, " Hz") {
@@ -5407,6 +5408,7 @@ fn render_extra_receiver_ui(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceiver>>) {
             rx.settings_dirty.store(true, Ordering::Relaxed);
         }
     });
+
     ui.horizontal(|ui| {
         ui.label("Audio gain:");
         let mut gain = current_gain;
