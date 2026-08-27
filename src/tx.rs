@@ -133,6 +133,16 @@ const TX_SPECTRUM_IQ_CAPACITY: usize = 50_000;
 /// comment for what this is for.
 const TX_AUDIO_MONITOR_CAPACITY: usize = 14_400;
 
+/// Capacity for waveform_tap specifically -- NOT shared with
+/// TX_AUDIO_MONITOR_CAPACITY above, deliberately: that one feeds real
+/// listen-through-speakers playback, so it's kept small on purpose
+/// (backlog there is real added latency), but waveform_tap is a
+/// display-only, never-drained peek tap (see main.rs's
+/// draw_audio_waveform) where a longer window is purely cosmetic -- see
+/// spectrum.rs's identical WAVEFORM_TAP_CAPACITY for the RX side of the
+/// same display. ~500ms at 48kHz.
+const WAVEFORM_TAP_CAPACITY: usize = 24_000;
+
 /// Reference ALC decay (ms) -- piHPSDR's own confirmed value.
 ///
 /// TRIED AND REVERTED: a TCI-only 300ms override (30x this), on the
@@ -1252,6 +1262,9 @@ fn run(
     // can start/stop actually listening to it at any time without a
     // reconnect.
     tx_audio_monitor: Arc<Mutex<VecDeque<f32>>>,
+    // See TxHandle::waveform_tap's doc comment. Fed alongside
+    // tx_audio_monitor, same source content, independent capacity.
+    waveform_tap: Arc<Mutex<VecDeque<f32>>>,
     mox: Arc<AtomicBool>,
     params: Arc<Mutex<TxParams>>,
     display: Arc<Mutex<TxDisplay>>,
@@ -1491,11 +1504,16 @@ fn run(
         // TxHandle::tx_audio_monitor's doc comment.
         {
             let mut mon = tx_audio_monitor.lock().unwrap();
+            let mut wave = waveform_tap.lock().unwrap();
             for &sample in chunk.iter() {
                 if mon.len() >= TX_AUDIO_MONITOR_CAPACITY {
                     mon.pop_front();
                 }
                 mon.push_back(sample);
+                if wave.len() >= WAVEFORM_TAP_CAPACITY {
+                    wave.pop_front();
+                }
+                wave.push_back(sample);
             }
         }
         chunks_this_window += 1;
@@ -1615,6 +1633,12 @@ pub struct TxHandle {
     /// wrong in the source audio" from "introduced downstream in
     /// hpsdr-rs's own processing".
     pub tx_audio_monitor: Arc<Mutex<VecDeque<f32>>>,
+    /// Same content as tx_audio_monitor above, fed at the same point --
+    /// but a separate, independently-capacitied tap (see main.rs's
+    /// draw_audio_waveform, WAVEFORM_TAP_CAPACITY's doc comment) so
+    /// giving the waveform display a longer window doesn't also inflate
+    /// tx_audio_monitor's real listen-through-speakers latency.
+    pub waveform_tap: Arc<Mutex<VecDeque<f32>>>,
     /// Live -- see RadioSession::puresignal_enabled's doc comment
     /// (radio.rs) for the full story. Mirrors that same flag on the TX
     /// side: WDSP's PS engine is always created (TxProcessor::open, see
@@ -1675,6 +1699,7 @@ impl TxHandle {
         let ps_params = Arc::new(Mutex::new(PsParams::default()));
         let ps_status = Arc::new(Mutex::new(PsStatus::default()));
         let tx_audio_monitor = Arc::new(Mutex::new(VecDeque::with_capacity(TX_AUDIO_MONITOR_CAPACITY)));
+        let waveform_tap = Arc::new(Mutex::new(VecDeque::with_capacity(WAVEFORM_TAP_CAPACITY)));
         // Live -- see TxHandle::puresignal_enabled's doc comment.
         let puresignal_enabled = Arc::new(AtomicBool::new(puresignal_enabled));
         let stop = Arc::new(AtomicBool::new(false));
@@ -1685,14 +1710,15 @@ impl TxHandle {
             let ps_params = Arc::clone(&ps_params);
             let ps_status = Arc::clone(&ps_status);
             let tx_audio_monitor = Arc::clone(&tx_audio_monitor);
+            let waveform_tap = Arc::clone(&waveform_tap);
             let puresignal_enabled = Arc::clone(&puresignal_enabled);
             let stop = Arc::clone(&stop);
             thread::spawn(move || {
                 run(
                     mic_buffer, tci_tx_audio, radio_mic_audio, tx_audio_source, tci_wants_mic,
-                    tx_iq_out, tx_spectrum_iq, tx_audio_monitor, mox, params, display, channel, protocol, mic_rate,
-                    duc_rate, puresignal_enabled, ps_rx_feedback_iq, ps_tx_feedback_iq, ps_params,
-                    ps_status, ps_corr_path, stop,
+                    tx_iq_out, tx_spectrum_iq, tx_audio_monitor, waveform_tap, mox, params, display, channel,
+                    protocol, mic_rate, duc_rate, puresignal_enabled, ps_rx_feedback_iq, ps_tx_feedback_iq,
+                    ps_params, ps_status, ps_corr_path, stop,
                 )
             })
         };
@@ -1701,6 +1727,7 @@ impl TxHandle {
             display,
             ps_status,
             tx_audio_monitor,
+            waveform_tap,
             puresignal_enabled,
             params,
             ps_params,

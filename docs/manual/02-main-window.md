@@ -147,6 +147,13 @@ over time, colored by the selected palette (Settings → Spectrum).
 Drag the thin divider between the two panes to adjust how much vertical
 space each gets.
 
+A small waveform display sits in the top-right corner of the spectrum
+pane -- a quick visual check that audio is actually flowing, and roughly
+what level it's at, without needing an external scope. It shows the
+output audio while receiving, and while transmitting switches to whatever
+is actually feeding TX right now (local mic, TCI, or the radio's own mic,
+whichever is currently selected/active).
+
 ### Zoom and Pan
 
 Below the waterfall, **Zoom** (1x-16x, scroll-adjustable like every other

@@ -426,6 +426,16 @@ impl Default for DemodParams {
 // correcting. A small cap bounds worst-case audio delay directly.
 const AUDIO_BUFFER_CAPACITY: usize = 14_400;
 
+/// Capacity for waveform_out specifically -- NOT shared with
+/// AUDIO_BUFFER_CAPACITY above, deliberately: that constant is sized
+/// small on purpose (its own doc comment: backlog there is real added
+/// playback latency), but waveform_out is a display-only, never-drained
+/// peek tap where a longer window is purely cosmetic (a real report:
+/// the default ~200ms window felt too fast/frantic; longer shows more
+/// history per frame so it reads as calmer without changing anything
+/// about actual audio latency). ~500ms at 48kHz.
+const WAVEFORM_TAP_CAPACITY: usize = 24_000;
+
 /// Two cascaded single-pole lowpass stages (~12dB/octave) -- see run()'s
 /// doc comment on radio_audio_lpf for why this exists at all and how the
 /// 4kHz cutoff was chosen/verified. `feed` is called once per audio
@@ -1199,9 +1209,10 @@ fn run(
     demod_params: Arc<Mutex<DemodParams>>,
     audio_out: Arc<Mutex<VecDeque<f32>>>,
     tci_audio_out: Arc<Mutex<VecDeque<f32>>>,
+    waveform_out: Arc<Mutex<VecDeque<f32>>>,
     iq_out: Arc<Mutex<VecDeque<(f32, f32)>>>,
     rx_audio_to_radio: Option<Arc<Mutex<VecDeque<f32>>>>,
-    // Muted (not pushed to any of the three audio outputs above) while
+    // Muted (not pushed to any of the four audio outputs above) while
     // MOX is active -- see SpectrumHandle::start's doc comment on why.
     mox: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
@@ -1291,6 +1302,16 @@ fn run(
             // its own copy rather than a second reader of that same
             // queue (which would steal samples from local playback).
             let mut tci_out = tci_audio_out.lock().unwrap();
+            // Dedicated tap for the small audio-waveform display (see
+            // main.rs's draw_audio_waveform) -- same "own copy, not a
+            // second reader" reasoning as tci_out, and never drained by
+            // anything except its own drop-oldest-on-overflow below, so
+            // the UI can safely peek the most recent samples without
+            // popping. Fed from the RAW pre-gain sample below (not
+            // out/tci_out's Audio Gain-scaled one) so the display's
+            // amplitude reflects the actual signal, not the speaker
+            // volume control -- see the push site's own doc comment.
+            let mut waveform_out = waveform_out.lock().unwrap();
             // Third dedicated tap, main receiver only (see
             // RadioSession::rx_audio_to_radio's doc comment) -- radio.rs
             // streams this back to the radio's own local audio output
@@ -1319,12 +1340,23 @@ fn run(
             // happen here, at the source, not by expecting any TCI
             // client to ask for it. Spectrum/waterfall display and
             // PureSignal's own feedback path are untouched -- this only
-            // gates the three post-demod AUDIO taps below.
+            // gates the post-demod AUDIO taps below.
             let mox_active = mox.load(Ordering::Relaxed);
             for sample in audio {
                 if mox_active {
                     continue;
                 }
+                // Waveform tap fed from the RAW (pre-gain) sample, not
+                // the Audio Gain-scaled one below -- a real report:
+                // tapping post-gain meant the display's amplitude
+                // tracked the speaker volume control, not the actual
+                // signal, so a normal listening gain showed a flat line
+                // and only cranking Audio Gain to an uncomfortably loud
+                // level made anything visible.
+                if waveform_out.len() >= WAVEFORM_TAP_CAPACITY {
+                    waveform_out.pop_front();
+                }
+                waveform_out.push_back(sample.clamp(-1.0, 1.0));
                 let sample = (sample * params.gain).clamp(-1.0, 1.0);
                 if out.len() >= AUDIO_BUFFER_CAPACITY {
                     out.pop_front();
@@ -1357,6 +1389,16 @@ pub struct SpectrumHandle {
     /// playback already drains); see run()'s doc comment on why a
     /// second consumer of that same queue would glitch both.
     pub tci_audio_out: Arc<Mutex<VecDeque<f32>>>,
+    /// Recent-history tap for the small audio-waveform display (see
+    /// main.rs's draw_audio_waveform) -- never drained by anything but
+    /// its own drop-oldest-on-overflow, so the UI thread can peek the
+    /// tail of it each frame without disturbing audio_out/tci_audio_out's
+    /// real consumers. Fed from the raw, pre-Audio-Gain sample (unlike
+    /// audio_out/tci_audio_out), so the display's amplitude reflects the
+    /// actual demodulated signal rather than the speaker volume control.
+    /// Same ~300ms capacity as tx.rs's tx_audio_monitor, which the TX
+    /// side of the same display reads from directly.
+    pub waveform_out: Arc<Mutex<VecDeque<f32>>>,
     /// Raw wideband IQ tap for TCI's iq_start streaming, normalized
     /// the same way this file normalizes IQ elsewhere (IQ_NORM).
     pub iq_out: Arc<Mutex<VecDeque<(f32, f32)>>>,
@@ -1398,6 +1440,7 @@ impl SpectrumHandle {
         let demod_params = Arc::new(Mutex::new(DemodParams::default()));
         let audio_out = Arc::new(Mutex::new(VecDeque::with_capacity(AUDIO_BUFFER_CAPACITY)));
         let tci_audio_out = Arc::new(Mutex::new(VecDeque::with_capacity(AUDIO_BUFFER_CAPACITY)));
+        let waveform_out = Arc::new(Mutex::new(VecDeque::with_capacity(WAVEFORM_TAP_CAPACITY)));
         let iq_out = Arc::new(Mutex::new(VecDeque::with_capacity(IQ_OUT_CAPACITY)));
         let stop = Arc::new(AtomicBool::new(false));
         let thread = {
@@ -1405,6 +1448,7 @@ impl SpectrumHandle {
             let demod_params = Arc::clone(&demod_params);
             let audio_out = Arc::clone(&audio_out);
             let tci_audio_out = Arc::clone(&tci_audio_out);
+            let waveform_out = Arc::clone(&waveform_out);
             let iq_out = Arc::clone(&iq_out);
             let stop = Arc::clone(&stop);
             thread::spawn(move || {
@@ -1416,6 +1460,7 @@ impl SpectrumHandle {
                     demod_params,
                     audio_out,
                     tci_audio_out,
+                    waveform_out,
                     iq_out,
                     rx_audio_to_radio,
                     mox,
@@ -1427,6 +1472,7 @@ impl SpectrumHandle {
             display,
             audio_out,
             tci_audio_out,
+            waveform_out,
             iq_out,
             demod_params,
             channel,

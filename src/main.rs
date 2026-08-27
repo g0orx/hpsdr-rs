@@ -2662,6 +2662,24 @@ impl eframe::App for HpsdrApp {
                         egui::Stroke::new(2.0, egui::Color32::RED),
                     );
 
+                    // Small audio-waveform overlay -- output audio while
+                    // receiving, whatever's actually feeding TX while
+                    // transmitting (see TxHandle::waveform_tap's doc
+                    // comment: fed at the same point as tx_audio_monitor,
+                    // post source selection, so this reflects mic/TCI/
+                    // radio-mic alike regardless of which is in use).
+                    let waveform_samples = if transmitting {
+                        connected
+                            .tx_handle
+                            .as_ref()
+                            .map(|tx| peek_recent_samples(&tx.waveform_tap, WAVEFORM_WINDOW_SAMPLES))
+                    } else {
+                        Some(peek_recent_samples(&connected.spectrum.waveform_out, WAVEFORM_WINDOW_SAMPLES))
+                    };
+                    if let Some(samples) = waveform_samples {
+                        draw_audio_waveform(ui.painter(), rect, &samples);
+                    }
+
                     if let Some(pos) = spectrum_resp.hover_pos() {
                         let hover_freq = freq_at_x(pos.x, rect, freq_hz, sample_rate, connected.spectrum_zoom, pan_offset_hz);
                         draw_freq_hover_tooltip(ui.painter(), pos, hover_freq);
@@ -5031,6 +5049,109 @@ fn draw_freq_hover_tooltip(painter: &egui::Painter, pos: egui::Pos2, freq_hz: u3
     );
 }
 
+/// How many trailing samples draw_audio_waveform reads each frame --
+/// ~500ms at 48kHz. A real report: an earlier, shorter ~200ms window
+/// felt too fast/frantic (nearly all of it fresh content every frame);
+/// this shows more history per frame so it reads as calmer. Comfortably
+/// inside both source taps' own ~500ms capacity (spectrum.rs's
+/// WAVEFORM_TAP_CAPACITY / tx.rs's WAVEFORM_TAP_CAPACITY -- each
+/// dedicated to this display alone, not shared with the smaller
+/// latency-sensitive playback/monitor buffers), so there's always a
+/// full window's worth available rather than reading right up against
+/// the producer.
+const WAVEFORM_WINDOW_SAMPLES: usize = 24_000;
+
+/// Read-only snapshot of the most recent `max_samples` values in `buf`,
+/// oldest first. Never pops -- `buf` is a tap fed independently of
+/// whatever else might be consuming it (or, for the waveform taps
+/// specifically, fed to nobody else at all), so peeking here can't
+/// steal samples from real audio playback/TX modulation.
+fn peek_recent_samples(buf: &Arc<Mutex<VecDeque<f32>>>, max_samples: usize) -> Vec<f32> {
+    let b = buf.lock().unwrap();
+    let skip = b.len().saturating_sub(max_samples);
+    b.iter().skip(skip).copied().collect()
+}
+
+/// Small audio-waveform display drawn in the top-right corner of the
+/// spectrum plot `rect` -- output audio while receiving, whatever's
+/// actually feeding TX (mic/TCI/radio-mic) while transmitting. A quick
+/// visual check that audio is actually flowing and roughly what level
+/// it's at, without needing an external scope.
+///
+/// `samples` is recent history in chronological order (oldest first).
+/// Drawn as a per-pixel-column RMS envelope rather than a plain
+/// connect-the-dots line (since `samples` normally holds far more points
+/// than the panel is wide, that would just alias) or raw min/max peaks
+/// (tried first -- looked like a solid filled block for any continuous
+/// voice/mic audio, since a peak trace touches close to full-scale on
+/// nearly every column once each column spans more than about one pitch
+/// period; see the per-column comment below for the full reasoning).
+fn draw_audio_waveform(painter: &egui::Painter, rect: egui::Rect, samples: &[f32]) {
+    const MARGIN: f32 = 8.0;
+    const WIDTH: f32 = 160.0;
+    const HEIGHT: f32 = 50.0;
+    let panel = egui::Rect::from_min_size(
+        egui::pos2(rect.right() - MARGIN - WIDTH, rect.top() + MARGIN),
+        egui::vec2(WIDTH, HEIGHT),
+    );
+    painter.rect_filled(panel, 3.0, egui::Color32::from_rgba_unmultiplied(20, 20, 20, 220));
+
+    let mid_y = panel.center().y;
+    if samples.len() < 2 {
+        painter.line_segment(
+            [egui::pos2(panel.left(), mid_y), egui::pos2(panel.right(), mid_y)],
+            egui::Stroke::new(1.0, egui::Color32::from_gray(80)),
+        );
+        return;
+    }
+
+    // Auto-scale to the loudest sample in this window, like a scope on
+    // auto-range, floored so near-silence doesn't get amplified into
+    // looking like a full-scale signal. Without this, RX audio (whose
+    // linear amplitude at a normal listening volume is typically well
+    // under the raw +-1.0 range) looked like a flat line, and TX audio
+    // (much closer to true full-scale already) looked permanently
+    // clipped/filled -- confirmed by a real report of exactly that on
+    // both sides. Also makes this robust to the two taps turning out to
+    // carry genuinely different absolute scales, since normalizing to
+    // each window's own peak maps whichever value is loudest to the
+    // panel's full height regardless of the raw units underneath.
+    const SILENCE_FLOOR: f32 = 0.05;
+    let peak = samples.iter().fold(SILENCE_FLOOR, |acc, &s| acc.max(s.abs()));
+    let norm = 1.0 / peak;
+
+    let cols = panel.width().round().max(1.0) as usize;
+    let half_height = panel.height() / 2.0 - 2.0;
+    let samples_per_col = samples.len() as f32 / cols as f32;
+    for col in 0..cols {
+        let start = ((col as f32 * samples_per_col) as usize).min(samples.len());
+        let end = (((col + 1) as f32 * samples_per_col) as usize).min(samples.len());
+        if start >= end {
+            continue;
+        }
+        let slice = &samples[start..end];
+        // RMS per column, not min/max peak -- a real report: with each
+        // column now spanning ~3ms of continuous voice/mic audio (up
+        // from the shorter window before "slow it down"), a peak trace
+        // reached close to this window's own normalized max on nearly
+        // every column (voiced speech rarely goes a full pitch period
+        // without a swing that wide), rendering as a solid filled block
+        // rather than a readable waveform. RMS instead tracks the
+        // column's loudness envelope, which varies meaningfully with
+        // syllables/level even when the instantaneous peak doesn't, and
+        // is inherently below the window's peak (a sine wave's RMS is
+        // ~0.707x its peak, real speech usually further below that), so
+        // it naturally leaves headroom instead of pinning to the edges.
+        let sum_sq: f32 = slice.iter().map(|&s| { let s = s * norm; s * s }).sum();
+        let rms = (sum_sq / slice.len() as f32).sqrt().min(1.0);
+        let x = panel.left() + col as f32 + 0.5;
+        painter.line_segment(
+            [egui::pos2(x, mid_y - rms * half_height), egui::pos2(x, mid_y + rms * half_height)],
+            egui::Stroke::new(1.0, egui::Color32::from_rgb(80, 220, 160)),
+        );
+    }
+}
+
 /// Vertical orange markers on the spectrum plot at any amateur band edge
 /// (BANDS' low_hz/high_hz) that falls within the currently visible span
 /// -- e.g. tuned near the top of 40m shows a line at 7.300MHz, or near a
@@ -5949,6 +6070,12 @@ fn render_extra_receiver_ui(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceiver>>) {
         [egui::pos2(x_dial, rect.top()), egui::pos2(x_dial, rect.bottom())],
         egui::Stroke::new(2.0, egui::Color32::RED),
     );
+
+    // Small audio-waveform overlay -- output audio, same as the main
+    // receiver's RX case (extra receivers never transmit, so there's no
+    // TX case to switch on here).
+    let waveform_samples = peek_recent_samples(&rx.spectrum.waveform_out, WAVEFORM_WINDOW_SAMPLES);
+    draw_audio_waveform(ui.painter(), rect, &waveform_samples);
 
     if let Some(pos) = spectrum_resp.hover_pos() {
         let hover_freq = freq_at_x(pos.x, rect, freq_hz, sample_rate, rx.spectrum_zoom, pan_offset_hz);
