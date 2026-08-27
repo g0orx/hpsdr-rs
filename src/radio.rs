@@ -33,6 +33,9 @@ const PACKET_SIZE: usize = HEADER_SIZE + USB_FRAME_SIZE * 2; // 1032
 
 const EP_COMMAND_AUDIO: u8 = 0x02; // host -> radio
 const EP_IQ_DATA: u8 = 0x06; // radio -> host, narrowband IQ
+// Kept for the endpoint-ID reference even though unused -- real
+// protocol constant, not scaffolding.
+#[allow(dead_code)]
 const EP_WIDEBAND: u8 = 0x04; // radio -> host, wideband (ignored for now)
 
 // Protocol 2 -- fixed ports per the openHPSDR Ethernet Protocol v4.3 spec.
@@ -882,12 +885,6 @@ impl RadioSession {
     /// this for the whole pipeline to stay consistent.
     pub fn set_sample_rate(&self, hz: u32) {
         self.sample_rate.store(hz, Ordering::Relaxed);
-    }
-
-    /// Total buffered samples across all receivers -- handy for a simple
-    /// "is data flowing" indicator in the UI before real DSP consumes this.
-    pub fn total_buffered_samples(&self) -> usize {
-        self.iq_buffers.iter().map(|b| b.lock().unwrap().len()).sum()
     }
 
     /// Activates the next configured-but-inactive receiver (P2 only --

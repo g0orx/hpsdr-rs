@@ -18,6 +18,11 @@ that VFO is the one actually transmitting (see
   10 kHz per notch.
 - **Click** directly on the spectrum or waterfall: retunes straight to the
   clicked frequency (rounded to the nearest kHz).
+- **Click and drag** across the spectrum or waterfall: retunes by however
+  far you've dragged, in whichever direction -- like grabbing and moving
+  the display itself (drag right to bring lower frequencies into view,
+  left for higher), rather than jumping straight to wherever the cursor
+  ends up.
 
 ### CTUN (Click to Tune)
 

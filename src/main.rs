@@ -45,21 +45,20 @@ struct Band {
     high_hz: u32,
     default_hz: u32,
     default_mode: spectrum::Mode,
-    default_width_hz: f64,
 }
 
 const BANDS: [Band; 11] = [
-    Band { name: "160m", low_hz: 1_800_000, high_hz: 2_000_000, default_hz: 1_900_000, default_mode: spectrum::Mode::Lsb, default_width_hz: 2700.0 },
-    Band { name: "80m", low_hz: 3_500_000, high_hz: 4_000_000, default_hz: 3_573_000, default_mode: spectrum::Mode::Lsb, default_width_hz: 2700.0 },
-    Band { name: "60m", low_hz: 5_330_000, high_hz: 5_406_000, default_hz: 5_357_000, default_mode: spectrum::Mode::Usb, default_width_hz: 2700.0 }, // USB by regulatory convention despite being below 10MHz
-    Band { name: "40m", low_hz: 7_000_000, high_hz: 7_300_000, default_hz: 7_074_000, default_mode: spectrum::Mode::Lsb, default_width_hz: 2700.0 },
-    Band { name: "30m", low_hz: 10_100_000, high_hz: 10_150_000, default_hz: 10_136_000, default_mode: spectrum::Mode::Usb, default_width_hz: 2700.0 },
-    Band { name: "20m", low_hz: 14_000_000, high_hz: 14_350_000, default_hz: 14_074_000, default_mode: spectrum::Mode::Usb, default_width_hz: 2700.0 },
-    Band { name: "17m", low_hz: 18_068_000, high_hz: 18_168_000, default_hz: 18_100_000, default_mode: spectrum::Mode::Usb, default_width_hz: 2700.0 },
-    Band { name: "15m", low_hz: 21_000_000, high_hz: 21_450_000, default_hz: 21_074_000, default_mode: spectrum::Mode::Usb, default_width_hz: 2700.0 },
-    Band { name: "12m", low_hz: 24_890_000, high_hz: 24_990_000, default_hz: 24_915_000, default_mode: spectrum::Mode::Usb, default_width_hz: 2700.0 },
-    Band { name: "10m", low_hz: 28_000_000, high_hz: 29_700_000, default_hz: 28_074_000, default_mode: spectrum::Mode::Usb, default_width_hz: 2700.0 },
-    Band { name: "6m", low_hz: 50_000_000, high_hz: 54_000_000, default_hz: 50_313_000, default_mode: spectrum::Mode::Usb, default_width_hz: 2700.0 },
+    Band { name: "160m", low_hz: 1_800_000, high_hz: 2_000_000, default_hz: 1_900_000, default_mode: spectrum::Mode::Lsb },
+    Band { name: "80m", low_hz: 3_500_000, high_hz: 4_000_000, default_hz: 3_573_000, default_mode: spectrum::Mode::Lsb },
+    Band { name: "60m", low_hz: 5_330_000, high_hz: 5_406_000, default_hz: 5_357_000, default_mode: spectrum::Mode::Usb }, // USB by regulatory convention despite being below 10MHz
+    Band { name: "40m", low_hz: 7_000_000, high_hz: 7_300_000, default_hz: 7_074_000, default_mode: spectrum::Mode::Lsb },
+    Band { name: "30m", low_hz: 10_100_000, high_hz: 10_150_000, default_hz: 10_136_000, default_mode: spectrum::Mode::Usb },
+    Band { name: "20m", low_hz: 14_000_000, high_hz: 14_350_000, default_hz: 14_074_000, default_mode: spectrum::Mode::Usb },
+    Band { name: "17m", low_hz: 18_068_000, high_hz: 18_168_000, default_hz: 18_100_000, default_mode: spectrum::Mode::Usb },
+    Band { name: "15m", low_hz: 21_000_000, high_hz: 21_450_000, default_hz: 21_074_000, default_mode: spectrum::Mode::Usb },
+    Band { name: "12m", low_hz: 24_890_000, high_hz: 24_990_000, default_hz: 24_915_000, default_mode: spectrum::Mode::Usb },
+    Band { name: "10m", low_hz: 28_000_000, high_hz: 29_700_000, default_hz: 28_074_000, default_mode: spectrum::Mode::Usb },
+    Band { name: "6m", low_hz: 50_000_000, high_hz: 54_000_000, default_hz: 50_313_000, default_mode: spectrum::Mode::Usb },
 ];
 
 fn band_for_frequency(freq_hz: u32) -> Option<&'static Band> {
@@ -204,6 +203,9 @@ struct ExtraReceiver {
     waterfall_signature: Option<(u64, Palette, f32, f32)>,
     scroll_accum: f32,
     slider_scroll_accum: f32,
+    /// See ConnectedState::drag_tune_accum_hz's doc comment -- same
+    /// thing, per extra receiver instead of shared.
+    drag_tune_accum_hz: f64,
     db_low: f32,
     /// See ConnectedState::db_low_auto's doc comment -- same thing, per
     /// extra receiver instead of shared.
@@ -317,6 +319,14 @@ struct ConnectedState {
     waterfall_signature: Option<(u64, Palette, f32, f32)>,
     scroll_accum: f32,
     zoom_accum: f32,
+    /// Fractional-Hz leftover for click-and-drag tuning on the spectrum/
+    /// waterfall -- same "accumulate the sub-step remainder across
+    /// frames" pattern as scroll_accum, applied to drag_delta() instead
+    /// of scroll input. Needed (not just rounding each frame's delta to
+    /// the nearest 1kHz step outright) so a slow drag at high zoom --
+    /// where a single frame's pixel delta can correspond to well under
+    /// 1kHz -- doesn't just get truncated to a dead no-op every frame.
+    drag_tune_accum_hz: f64,
     sample_rate: u32,
     db_low: f32,
     /// "Auto" mode for the Spectrum Low slider (Settings -> Spectrum):
@@ -1056,6 +1066,7 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                 waterfall_signature: None,
                 scroll_accum: 0.0,
                 zoom_accum: 0.0,
+                drag_tune_accum_hz: 0.0,
                 sample_rate: settings.sample_rate,
                 db_low: cfg.db_low.unwrap_or(-140.0),
                 db_low_auto: cfg.db_low_auto.unwrap_or(true),
@@ -2345,7 +2356,7 @@ impl eframe::App for HpsdrApp {
                         (spectrum_waterfall_height * connected.spectrum_waterfall_ratio).max(80.0);
                     let (rect, spectrum_resp) = ui.allocate_exact_size(
                         egui::vec2(ui.available_width(), spectrum_height),
-                        egui::Sense::click(),
+                        egui::Sense::click_and_drag(),
                     );
 
                     if let Some(pos) = spectrum_resp.interact_pointer_pos() {
@@ -2356,6 +2367,45 @@ impl eframe::App for HpsdrApp {
                             let new_freq = freq_at_x(pos.x, rect, freq_hz, sample_rate, connected.spectrum_zoom, pan_offset_hz);
                             let (effective_freq, retune) =
                                 resolve_tune(connected.ctun, freq_hz, sample_rate, passband, new_freq);
+                            if let Some(lo) = retune {
+                                connected.session.set_frequency(lo);
+                            } else {
+                                connected.ctun_frequency_hz = effective_freq;
+                            }
+                            remember_band_settings(&mut connected.band_memory, effective_freq, connected.db_low, connected.db_high, connected.waterfall_db_low, connected.waterfall_db_high, current_mode);
+                            settings_changed = true;
+                        }
+                    }
+                    // Click-and-drag: moves the dial by however far the
+                    // cursor has actually moved (drag_delta(), zero once
+                    // the pointer stops), NOT by re-deriving an absolute
+                    // frequency from the current cursor position each
+                    // frame the way the plain click above does -- that
+                    // approach fed back on itself here, since retuning
+                    // re-centers the spectrum on the new dial frequency,
+                    // which shifts what a STATIONARY cursor maps to on
+                    // the very next frame, so the frequency kept drifting
+                    // even after the drag stopped moving (a real report).
+                    if spectrum_resp.dragged() && !suppress_refocus_click {
+                        let hz_per_px = (2.0 * visible_half_span_hz) / rect.width().max(1.0) as f64;
+                        // Negated: dragging right pulls lower frequencies
+                        // in from the right edge, the same way dragging a
+                        // map or a scrollable view does -- content moves
+                        // right = the reference point tracks left. A real
+                        // report: the unnegated version (drag right ->
+                        // frequency up, like a tuning knob) felt backwards.
+                        connected.drag_tune_accum_hz += -spectrum_resp.drag_delta().x as f64 * hz_per_px;
+                        const STEP_HZ: i64 = 1_000;
+                        let mut new_freq = dial_freq_hz as i64;
+                        while connected.drag_tune_accum_hz.abs() >= STEP_HZ as f64 {
+                            let sign = connected.drag_tune_accum_hz.signum();
+                            connected.drag_tune_accum_hz -= sign * STEP_HZ as f64;
+                            new_freq += STEP_HZ * sign as i64;
+                        }
+                        new_freq = new_freq.max(0);
+                        if new_freq as u32 != dial_freq_hz {
+                            let (effective_freq, retune) =
+                                resolve_tune(connected.ctun, freq_hz, sample_rate, passband, new_freq as u32);
                             if let Some(lo) = retune {
                                 connected.session.set_frequency(lo);
                             } else {
@@ -2695,7 +2745,7 @@ impl eframe::App for HpsdrApp {
                     let waterfall_height = (spectrum_waterfall_height - spectrum_height).max(80.0);
                     let (rect, waterfall_click_resp) = ui.allocate_exact_size(
                         egui::vec2(ui.available_width(), waterfall_height),
-                        egui::Sense::click(),
+                        egui::Sense::click_and_drag(),
                     );
                     if let Some(pos) = waterfall_click_resp.interact_pointer_pos() {
                         // See suppress_refocus_click's own doc comment.
@@ -2703,6 +2753,32 @@ impl eframe::App for HpsdrApp {
                             let new_freq = freq_at_x(pos.x, rect, freq_hz, sample_rate, connected.spectrum_zoom, pan_offset_hz);
                             let (effective_freq, retune) =
                                 resolve_tune(connected.ctun, freq_hz, sample_rate, passband, new_freq);
+                            if let Some(lo) = retune {
+                                connected.session.set_frequency(lo);
+                            } else {
+                                connected.ctun_frequency_hz = effective_freq;
+                            }
+                            remember_band_settings(&mut connected.band_memory, effective_freq, connected.db_low, connected.db_high, connected.waterfall_db_low, connected.waterfall_db_high, current_mode);
+                            settings_changed = true;
+                        }
+                    }
+                    // Click-and-drag -- see the spectrum pane's identical
+                    // treatment above for why this uses drag_delta()
+                    // rather than an absolute cursor-position mapping.
+                    if waterfall_click_resp.dragged() && !suppress_refocus_click {
+                        let hz_per_px = (2.0 * visible_half_span_hz) / rect.width().max(1.0) as f64;
+                        connected.drag_tune_accum_hz += -waterfall_click_resp.drag_delta().x as f64 * hz_per_px;
+                        const STEP_HZ: i64 = 1_000;
+                        let mut new_freq = dial_freq_hz as i64;
+                        while connected.drag_tune_accum_hz.abs() >= STEP_HZ as f64 {
+                            let sign = connected.drag_tune_accum_hz.signum();
+                            connected.drag_tune_accum_hz -= sign * STEP_HZ as f64;
+                            new_freq += STEP_HZ * sign as i64;
+                        }
+                        new_freq = new_freq.max(0);
+                        if new_freq as u32 != dial_freq_hz {
+                            let (effective_freq, retune) =
+                                resolve_tune(connected.ctun, freq_hz, sample_rate, passband, new_freq as u32);
                             if let Some(lo) = retune {
                                 connected.session.set_frequency(lo);
                             } else {
@@ -5916,13 +5992,38 @@ fn render_extra_receiver_ui(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceiver>>) {
     let spectrum_height = (spectrum_waterfall_height * rx.spectrum_waterfall_ratio).max(80.0);
     let (rect, spectrum_resp) = ui.allocate_exact_size(
         egui::vec2(ui.available_width(), spectrum_height),
-        egui::Sense::click(),
+        egui::Sense::click_and_drag(),
     );
 
     if let Some(pos) = spectrum_resp.interact_pointer_pos() {
         if spectrum_resp.clicked() {
             let new_freq = freq_at_x(pos.x, rect, freq_hz, sample_rate, rx.spectrum_zoom, pan_offset_hz);
             let (effective_freq, retune) = resolve_tune(rx.ctun, freq_hz, sample_rate, passband, new_freq);
+            if let Some(lo) = retune {
+                rx.frequency_hz.store(lo, Ordering::Relaxed);
+            } else {
+                rx.ctun_frequency_hz = effective_freq;
+            }
+            remember_band_settings(&mut rx.band_memory, effective_freq, db_low, db_high, wf_db_low, wf_db_high, current_mode);
+            rx.settings_dirty.store(true, Ordering::Relaxed);
+        }
+    }
+    // Click-and-drag -- see the main receiver's identical treatment for
+    // why this uses drag_delta() rather than an absolute cursor-position
+    // mapping.
+    if spectrum_resp.dragged() {
+        let hz_per_px = (2.0 * visible_half_span_hz) / rect.width().max(1.0) as f64;
+        rx.drag_tune_accum_hz += -spectrum_resp.drag_delta().x as f64 * hz_per_px;
+        const STEP_HZ: i64 = 1_000;
+        let mut new_freq = dial_freq_hz as i64;
+        while rx.drag_tune_accum_hz.abs() >= STEP_HZ as f64 {
+            let sign = rx.drag_tune_accum_hz.signum();
+            rx.drag_tune_accum_hz -= sign * STEP_HZ as f64;
+            new_freq += STEP_HZ * sign as i64;
+        }
+        new_freq = new_freq.max(0);
+        if new_freq as u32 != dial_freq_hz {
+            let (effective_freq, retune) = resolve_tune(rx.ctun, freq_hz, sample_rate, passband, new_freq as u32);
             if let Some(lo) = retune {
                 rx.frequency_hz.store(lo, Ordering::Relaxed);
             } else {
@@ -6088,12 +6189,37 @@ fn render_extra_receiver_ui(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceiver>>) {
     let waterfall_height = (spectrum_waterfall_height - spectrum_height).max(80.0);
     let (wf_rect, wf_resp) = ui.allocate_exact_size(
         egui::vec2(ui.available_width(), waterfall_height),
-        egui::Sense::click(),
+        egui::Sense::click_and_drag(),
     );
     if let Some(pos) = wf_resp.interact_pointer_pos() {
         if wf_resp.clicked() {
             let new_freq = freq_at_x(pos.x, wf_rect, freq_hz, sample_rate, rx.spectrum_zoom, pan_offset_hz);
             let (effective_freq, retune) = resolve_tune(rx.ctun, freq_hz, sample_rate, passband, new_freq);
+            if let Some(lo) = retune {
+                rx.frequency_hz.store(lo, Ordering::Relaxed);
+            } else {
+                rx.ctun_frequency_hz = effective_freq;
+            }
+            remember_band_settings(&mut rx.band_memory, effective_freq, db_low, db_high, wf_db_low, wf_db_high, current_mode);
+            rx.settings_dirty.store(true, Ordering::Relaxed);
+        }
+    }
+    // Click-and-drag -- see the main receiver's identical treatment for
+    // why this uses drag_delta() rather than an absolute cursor-position
+    // mapping.
+    if wf_resp.dragged() {
+        let hz_per_px = (2.0 * visible_half_span_hz) / wf_rect.width().max(1.0) as f64;
+        rx.drag_tune_accum_hz += -wf_resp.drag_delta().x as f64 * hz_per_px;
+        const STEP_HZ: i64 = 1_000;
+        let mut new_freq = dial_freq_hz as i64;
+        while rx.drag_tune_accum_hz.abs() >= STEP_HZ as f64 {
+            let sign = rx.drag_tune_accum_hz.signum();
+            rx.drag_tune_accum_hz -= sign * STEP_HZ as f64;
+            new_freq += STEP_HZ * sign as i64;
+        }
+        new_freq = new_freq.max(0);
+        if new_freq as u32 != dial_freq_hz {
+            let (effective_freq, retune) = resolve_tune(rx.ctun, freq_hz, sample_rate, passband, new_freq as u32);
             if let Some(lo) = retune {
                 rx.frequency_hz.store(lo, Ordering::Relaxed);
             } else {
@@ -6592,6 +6718,7 @@ fn spawn_extra_receiver(
         waterfall_signature: None,
         scroll_accum: 0.0,
         slider_scroll_accum: 0.0,
+        drag_tune_accum_hz: 0.0,
         db_low: saved.map(|s| s.db_low).unwrap_or(-140.0),
         db_low_auto: saved.map(|s| s.db_low_auto).unwrap_or(true),
         db_low_auto_smoothed: None,
@@ -6831,20 +6958,6 @@ fn change_extra_receiver_sample_rate(rx: &mut ExtraReceiver, new_rate: u32) {
         }
     };
     rx.spectrum = spectrum;
-}
-
-fn min_max(v: &[f32]) -> (f32, f32) {
-    let mut min = f32::INFINITY;
-    let mut max = f32::NEG_INFINITY;
-    for &x in v {
-        if x < min {
-            min = x;
-        }
-        if x > max {
-            max = x;
-        }
-    }
-    (min, max)
 }
 
 /// Color-maps the waterfall row history (newest row first) into an

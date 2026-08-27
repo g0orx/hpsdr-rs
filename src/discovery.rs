@@ -44,6 +44,10 @@ impl Default for Boards {
 pub struct Device {
     pub address: SocketAddr,
     pub my_address: SocketAddr,
+    // Parsed straight off the wire but not consumed by any feature yet
+    // -- real protocol data, not scaffolding, so kept (and allowed)
+    // rather than thrown away just to quiet the compiler.
+    #[allow(dead_code)]
     pub device: u8, // protocol-relative board id
     pub board: Boards, // protocol-independent board identity
     pub protocol: u8, // 1 or 2
@@ -51,9 +55,12 @@ pub struct Device {
     pub status: u8, // 2 = idle/available, 3 = running/in use
     pub mac: [u8; 6],
     pub supported_receivers: u8,
+    #[allow(dead_code)]
     pub supported_transmitters: u8,
     pub adcs: u8,
+    #[allow(dead_code)]
     pub frequency_min: u64,
+    #[allow(dead_code)]
     pub frequency_max: u64,
 }
 

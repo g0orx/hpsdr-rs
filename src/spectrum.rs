@@ -152,8 +152,6 @@ pub enum Agc {
     Fast = 4,
 }
 
-pub const ALL_AGC: [Agc; 5] = [Agc::Off, Agc::Long, Agc::Slow, Agc::Medium, Agc::Fast];
-
 impl Agc {
     pub fn label(self) -> &'static str {
         match self {
@@ -1603,10 +1601,6 @@ impl SpectrumHandle {
     }
     pub fn set_eq(&self, eq: EqualizerParams) {
         self.demod_params.lock().unwrap().eq = eq;
-    }
-
-    pub fn ctun(&self) -> bool {
-        self.demod_params.lock().unwrap().ctun
     }
 
     /// Enables/disables CTUN and sets the current offset (Hz) from the

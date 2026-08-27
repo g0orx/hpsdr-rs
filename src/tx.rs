@@ -1736,16 +1736,10 @@ impl TxHandle {
         }
     }
 
-    pub fn mode(&self) -> Mode {
-        self.params.lock().unwrap().mode
-    }
     pub fn set_mode(&self, mode: Mode) {
         self.params.lock().unwrap().mode = mode;
     }
 
-    pub fn mic_gain(&self) -> f32 {
-        self.params.lock().unwrap().mic_gain
-    }
     pub fn set_mic_gain(&self, gain: f32) {
         self.params.lock().unwrap().mic_gain = gain.max(0.0);
     }
@@ -1774,11 +1768,6 @@ impl TxHandle {
         self.params.lock().unwrap().eq = eq;
     }
 
-    /// Current PureSignal params snapshot, for Settings -> PureSignal
-    /// to read on each redraw.
-    pub fn ps_params(&self) -> PsParams {
-        *self.ps_params.lock().unwrap()
-    }
     pub fn set_ps_enabled(&self, enabled: bool) {
         self.ps_params.lock().unwrap().enabled = enabled;
     }

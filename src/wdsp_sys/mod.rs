@@ -16,6 +16,17 @@
 */
 
 #![allow(non_camel_case_types)]
+// Constants mirror WDSP's own C enum names verbatim (e.g.
+// txaMeterType_TXA_CFC_GAIN) -- same "keep 1:1 with the C headers for
+// easy cross-referencing" reasoning as non_camel_case_types above,
+// rather than renaming ~26 constants (and their call sites) for no
+// benefit besides a quieter build.
+#![allow(non_upper_case_globals)]
+// This binds WDSP's full C API surface; this app only calls a subset
+// of it today, and more may get wired up as features are added --
+// unused bindings aren't dead code to delete, they're the rest of the
+// library sitting there for when it's needed.
+#![allow(dead_code)]
 
 /// Serializes one-time WDSP channel setup (OpenChannel and everything
 /// around it, including the FFTW wisdom-generation pass triggered on a
