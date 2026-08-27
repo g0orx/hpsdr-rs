@@ -395,6 +395,29 @@ fn handle_client(
     logging: DebugLog,
 ) {
     let _ = stream.set_nodelay(true);
+    // BUG FIX: same underlying Windows socket-mode quirk as
+    // send_is_fatal's own doc comment above (that one confirmed via
+    // WSAEWOULDBLOCK/error 10035 on writes), showing up here on the
+    // read side instead, at a point that fix didn't reach. The listener
+    // this stream came from is non-blocking (TciServer::start's
+    // listener.set_nonblocking(true), needed for its own accept-loop
+    // poll), and on Windows a socket returned by accept() on a
+    // non-blocking listener inherits that non-blocking state too --
+    // unlike Linux/macOS, where an accepted socket is always a fresh,
+    // independent descriptor that defaults to blocking regardless of
+    // the listener's own mode. Without this, tungstenite::accept()'s
+    // single blocking-style read below could run before the client's
+    // handshake bytes had actually arrived, see 0 bytes available, and
+    // (unlike send_is_fatal's handling, there's no WouldBlock-tolerant
+    // retry here -- tungstenite's own accept() treats it as the client
+    // closing the connection) report "WebSocket protocol error:
+    // handshake not finished" and give up immediately, instead of
+    // actually waiting for the handshake to arrive. Confirmed via a
+    // real report + packet capture on Windows: a client's connection
+    // got an unsolicited FIN from this server ~65ms after connecting,
+    // with zero bytes exchanged either direction, then sent its real
+    // handshake ~700ms later onto an already-closed connection.
+    let _ = stream.set_nonblocking(false);
 
     let mut ws = match tungstenite::accept(stream) {
         Ok(ws) => ws,
