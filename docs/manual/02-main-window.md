@@ -152,7 +152,11 @@ pane -- a quick visual check that audio is actually flowing, and roughly
 what level it's at, without needing an external scope. It shows the
 output audio while receiving, and while transmitting switches to whatever
 is actually feeding TX right now (local mic, TCI, or the radio's own mic,
-whichever is currently selected/active).
+whichever is currently selected/active). It traces the RMS loudness
+envelope over roughly the last half second (not raw min/max peaks, which
+tend to render as a solid block for continuous voice), auto-scaled each
+frame to the loudest moment in that window so it stays readable regardless
+of the Audio Gain slider or mic input level.
 
 ### Zoom and Pan
 
