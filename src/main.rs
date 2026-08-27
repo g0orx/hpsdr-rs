@@ -635,6 +635,18 @@ struct HpsdrApp {
 
 impl HpsdrApp {
     fn new(ctx: &egui::Context) -> Self {
+        // Pin the app to dark, rather than leaving egui's default
+        // ThemePreference::System in effect. This app's whole design
+        // assumes dark by default -- the Settings/extra-receiver-settings
+        // windows deliberately override to light on top of that (see
+        // their own "light theme override" comments) rather than the
+        // other way around. Without pinning this, egui silently follows
+        // the OS theme: on a real report, this looked white/light
+        // throughout on Windows (winit reliably reports the actual system
+        // theme there), while looking fine on Linux, where system theme
+        // detection generally isn't available and egui was quietly
+        // falling back to its own built-in dark default instead.
+        ctx.set_theme(egui::ThemePreference::Dark);
         Self {
             state: AppState::Discovering(DiscoveryWindow::new(ctx)),
             was_focused: true,
