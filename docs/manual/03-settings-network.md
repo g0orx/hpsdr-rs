@@ -31,7 +31,9 @@ rigctl" (e.g. WSJT-X, N1MM, and most logging/digital-mode programs).
   the address) or **Stopped**. A red error line appears if the server
   fails to bind (e.g. the port is already in use).
 - **Log to file (rigctl_log.txt)** -- optional debug logging of every
-  command received and reply sent, saved alongside this radio's settings.
+  command received and reply sent, saved in the same
+  [settings folder](README.md#conventions-used-in-this-manual) as this
+  radio's config.
 
 `0.0.0.0` accepts connections from any machine on your network;
 `127.0.0.1` restricts it to this machine only.
