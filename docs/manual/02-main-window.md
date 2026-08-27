@@ -147,6 +147,23 @@ over time, colored by the selected palette (Settings → Spectrum).
 Drag the thin divider between the two panes to adjust how much vertical
 space each gets.
 
+### Zoom and Pan
+
+Below the waterfall, **Zoom** (1x-16x, scroll-adjustable like every other
+slider in this app) narrows the visible frequency
+window symmetrically around the dial frequency; **Pan** then shifts that
+narrowed window left/right within the full receiver bandwidth (it has no
+effect at 1x zoom -- there's nothing to pan to when the full span is
+already shown). **Reset** returns to 1x/centered.
+
+This is a real resolution increase, not just a visual stretch of the same
+data: zooming in actually grows the underlying FFT size, so the spectrum
+trace and waterfall genuinely resolve finer detail the further in you
+zoom, the same way piHPSDR and rustyHPSDR's own zoom works. The
+frequency-axis ticks and band-edge markers track the current Zoom/Pan
+too, and clicking or scrolling to tune still targets the actual frequency
+under the cursor/zoomed view, not the underlying full span.
+
 ## S-meter / power meter
 
 Anchored in the top-right of the window:

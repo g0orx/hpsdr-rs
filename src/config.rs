@@ -55,6 +55,14 @@ pub struct Config {
     /// height -- draggable via the divider between them. Missing falls
     /// back to their old fixed 150/350 proportions.
     pub spectrum_waterfall_ratio: Option<f32>,
+    /// Spectrum/waterfall zoom/pan -- see ConnectedState::spectrum_zoom/
+    /// spectrum_pan's doc comments (main.rs). Missing (a config saved
+    /// before this existed) falls back to zoom 1 / pan 0.0, i.e. the
+    /// full sample-rate span, unzoomed -- this feature's own "off" state.
+    #[serde(default)]
+    pub spectrum_zoom: Option<i32>,
+    #[serde(default)]
+    pub spectrum_pan: Option<f32>,
     pub adc: Option<u8>,
     pub antenna: Option<u8>,
     pub rigctl_addr: Option<String>,
@@ -341,6 +349,16 @@ pub struct ExtraReceiverConfig {
     pub ctun: bool,
     #[serde(default)]
     pub ctun_frequency_hz: u32,
+    /// See Config::spectrum_zoom/spectrum_pan's doc comments -- same
+    /// thing, this receiver's own.
+    #[serde(default = "default_spectrum_zoom")]
+    pub spectrum_zoom: i32,
+    #[serde(default)]
+    pub spectrum_pan: f32,
+}
+
+fn default_spectrum_zoom() -> i32 {
+    1
 }
 
 fn default_spectrum_waterfall_ratio() -> f32 {

@@ -212,6 +212,10 @@ struct ExtraReceiver {
     /// See ConnectedState::spectrum_waterfall_ratio's doc comment --
     /// same thing, per extra receiver instead of shared.
     spectrum_waterfall_ratio: f32,
+    /// See ConnectedState::spectrum_zoom/spectrum_pan's doc comments --
+    /// same thing, per extra receiver instead of shared.
+    spectrum_zoom: i32,
+    spectrum_pan: f32,
     show_settings_window: bool,
     settings_tab: SettingsTab,
     /// Shared with ConnectedState -- any control here that changes a
@@ -324,6 +328,27 @@ struct ConnectedState {
     /// height, adjustable via the drag handle between them -- see
     /// Config::spectrum_waterfall_ratio's doc comment.
     spectrum_waterfall_ratio: f32,
+    /// Spectrum/waterfall zoom (1 = full sample-rate span, higher =
+    /// narrower, higher-resolution visible window), set via the Zoom
+    /// slider below the waterfall. Pushed to the analyzer thread every
+    /// frame via SpectrumHandle::set_zoom_pan, which actually grows the
+    /// live WDSP FFT size to genuinely resolve more detail (not just a
+    /// visual crop/stretch of a fixed-resolution trace) -- see that
+    /// method's/SpectrumAnalyzer::set_zoom_pan's doc comments, confirmed
+    /// against piHPSDR/rustyHPSDR's own zoom implementations. Narrows
+    /// the visible frequency window symmetrically around the dial
+    /// (before Pan is applied) -- see the spectrum-drawing code's
+    /// visible_half_span_hz/pan_offset_hz for the frequency-axis math
+    /// (labels, band-edge markers, passband overlay) shared with that;
+    /// the trace/waterfall themselves need no equivalent cropping code
+    /// since WDSP already returns only the visible window's data.
+    spectrum_zoom: i32,
+    /// Pan position within the zoomed window, -1.0 (leftmost/lowest
+    /// frequency the current zoom can reach) to +1.0 (rightmost/
+    /// highest), 0.0 = centered on the dial. Has no visible effect at
+    /// zoom 1.0 (nothing to pan to -- the full span is already shown),
+    /// set via the Pan slider below the waterfall.
+    spectrum_pan: f32,
     slider_scroll_accum: f32,
     show_settings_window: bool,
     settings_tab: SettingsTab,
@@ -1009,6 +1034,8 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                 spectrum_waterfall_ratio: cfg
                     .spectrum_waterfall_ratio
                     .unwrap_or(150.0 / 350.0),
+                spectrum_zoom: cfg.spectrum_zoom.unwrap_or(1),
+                spectrum_pan: cfg.spectrum_pan.unwrap_or(0.0),
                 slider_scroll_accum: 0.0,
                 show_settings_window: false,
                 settings_tab: SettingsTab::Agc,
@@ -1290,6 +1317,26 @@ impl eframe::App for HpsdrApp {
                 };
                 connected.spectrum.set_lo_frequency_hz(freq_hz as f64);
                 connected.spectrum.set_ctun(connected.ctun, ctun_offset_hz);
+                // Zoom should keep the CTUN'd listen frequency (where the
+                // filter/passband actually is) centered, not the parked
+                // hardware LO -- otherwise the filter drifts toward one
+                // edge of the zoomed view instead of staying put. WDSP's
+                // own fscLin/fscHin clipping (inside set_zoom_pan) only
+                // ever sees whatever pan value we hand it here, so the
+                // CTUN adjustment has to happen before this call, not just
+                // in the axis-label math further down.
+                let rx_half_span_hz = sample_rate as f64 / 2.0;
+                let rx_max_pan_hz = rx_half_span_hz - rx_half_span_hz / connected.spectrum_zoom as f64;
+                let rx_pan_offset_hz = (ctun_offset_hz + connected.spectrum_pan as f64 * rx_max_pan_hz)
+                    .clamp(-rx_max_pan_hz, rx_max_pan_hz);
+                let rx_effective_pan =
+                    if rx_max_pan_hz > 0.0 { (rx_pan_offset_hz / rx_max_pan_hz) as f32 } else { 0.0 };
+                connected.spectrum.set_zoom_pan(connected.spectrum_zoom, rx_effective_pan);
+                // TX has no CTUN concept -- tx_spectrum's own generated IQ
+                // is always centered on the real TX carrier (see the "force
+                // ctun_offset_hz to 0 while transmitting" passband-overlay
+                // logic below) -- so it zooms around the plain slider Pan.
+                connected.tx_spectrum.set_zoom_pan(connected.spectrum_zoom, connected.spectrum_pan);
                 let dial_freq_hz = if connected.ctun { connected.ctun_frequency_hz } else { freq_hz };
                 // See RadioSession::rx_frequency_hz's doc comment -- kept
                 // in sync every frame here so rigctl/TCI/CAT report the
@@ -1356,6 +1403,28 @@ impl eframe::App for HpsdrApp {
                 } else {
                     sample_rate
                 };
+
+                // Zoom/Pan (sliders below the waterfall): narrows the
+                // visible spectrum/waterfall window as zoom increases,
+                // then shifts it within the full captured span by
+                // pan_offset_hz. Computed here (not just where the
+                // spectrum/waterfall are drawn) so freq_at_x -- used by
+                // the click-to-tune handlers below, which run before the
+                // drawing code -- can also account for it. max_pan_hz is
+                // 0 at zoom 1.0, so Pan has no effect then regardless of
+                // the slider -- there's nothing to pan to when the full
+                // span is already shown.
+                let half_span_hz = sample_rate as f64 / 2.0;
+                let visible_half_span_hz = half_span_hz / connected.spectrum_zoom as f64;
+                let max_pan_hz = half_span_hz - visible_half_span_hz;
+                // Same CTUN-centering as the RX WDSP reconfigure above, so
+                // the axis ticks/overlays match what WDSP actually returns.
+                // TX has no CTUN concept (see the "force ctun_offset_hz to
+                // 0 while transmitting" logic just below), so this reduces
+                // to the plain slider pan while transmitting.
+                let zoom_ctun_offset_hz = if transmitting { 0.0 } else { ctun_offset_hz };
+                let pan_offset_hz = (zoom_ctun_offset_hz + connected.spectrum_pan as f64 * max_pan_hz)
+                    .clamp(-max_pan_hz, max_pan_hz);
 
                 let (spectrum_row, meter_db, waterfall_data_revision) = {
                     let d = if transmitting {
@@ -2200,14 +2269,18 @@ impl eframe::App for HpsdrApp {
                     // the drag handle between them, see
                     // spectrum_waterfall_divider) -- so they grow with
                     // the window instead of leaving empty space below a
-                    // fixed size. Reserve room for the gap+Stop button
-                    // below the waterfall first, since available_height()
-                    // here is everything down to the bottom of the
-                    // panel, not just what's free for the spectrum alone.
-                    let stop_button_reserve =
-                        ui.spacing().interact_size.y + 8.0 + SPECTRUM_WATERFALL_DIVIDER_HEIGHT;
+                    // fixed size. Reserve room for the gap+Zoom/Pan row
+                    // AND the gap+Stop button row below the waterfall
+                    // first, since available_height() here is everything
+                    // down to the bottom of the panel, not just what's
+                    // free for the spectrum alone -- otherwise the
+                    // spectrum/waterfall split greedily claims all of it
+                    // and pushes the Zoom/Pan row (and potentially the
+                    // Stop button) below the visible window.
+                    let below_waterfall_reserve = 2.0 * (ui.spacing().interact_size.y + 8.0)
+                        + SPECTRUM_WATERFALL_DIVIDER_HEIGHT;
                     let spectrum_waterfall_height =
-                        (ui.available_height() - stop_button_reserve).max(200.0);
+                        (ui.available_height() - below_waterfall_reserve).max(200.0);
                     let spectrum_height =
                         (spectrum_waterfall_height * connected.spectrum_waterfall_ratio).max(80.0);
                     let (rect, spectrum_resp) = ui.allocate_exact_size(
@@ -2220,7 +2293,7 @@ impl eframe::App for HpsdrApp {
                         // this is the one thing that click-to-refocus the
                         // window must NOT also do.
                         if spectrum_resp.clicked() && !suppress_refocus_click {
-                            let new_freq = freq_at_x(pos.x, rect, freq_hz, sample_rate);
+                            let new_freq = freq_at_x(pos.x, rect, freq_hz, sample_rate, connected.spectrum_zoom, pan_offset_hz);
                             let (effective_freq, retune) =
                                 resolve_tune(connected.ctun, freq_hz, sample_rate, passband, new_freq);
                             if let Some(lo) = retune {
@@ -2364,10 +2437,14 @@ impl eframe::App for HpsdrApp {
                     // the full DDC sample rate centered on the tuned
                     // frequency (standard convention at zoom=1). If the
                     // displayed span looks wrong, this assumption is the
-                    // first thing to check.
-                    let half_span_hz = sample_rate as f64 / 2.0;
+                    // first thing to check. half_span_hz/visible_half_span_hz/
+                    // pan_offset_hz (zoom/pan) are computed earlier in this
+                    // same frame -- see their own doc comment -- so the
+                    // click-to-tune handlers above (which run before this
+                    // drawing code) can use them too.
+                    let view_center_hz = freq_hz as f64 + pan_offset_hz;
 
-                    draw_band_edge_markers(ui.painter(), rect, freq_hz, half_span_hz, sample_rate);
+                    draw_band_edge_markers(ui.painter(), rect, view_center_hz, visible_half_span_hz);
 
                     // While transmitting, this displays tx_spectrum --
                     // generated TX IQ that's always centered on the real
@@ -2396,7 +2473,8 @@ impl eframe::App for HpsdrApp {
                     // going out" rather than looking like the ordinary RX
                     // passband indicator.
                     let x_for_offset = |offset_hz: f64| -> f32 {
-                        let frac = ((offset_hz + half_span_hz) / sample_rate as f64)
+                        let frac = ((offset_hz - pan_offset_hz + visible_half_span_hz)
+                            / (2.0 * visible_half_span_hz))
                             .clamp(0.0, 1.0) as f32;
                         rect.left() + frac * rect.width()
                     };
@@ -2444,8 +2522,8 @@ impl eframe::App for HpsdrApp {
                         if t == 0 || t == num_freq_ticks - 1 {
                             continue;
                         }
-                        let tick_freq_hz =
-                            freq_hz as f64 - half_span_hz + frac as f64 * sample_rate as f64;
+                        let tick_freq_hz = view_center_hz - visible_half_span_hz
+                            + frac as f64 * (2.0 * visible_half_span_hz);
                         ui.painter().text(
                             egui::pos2(x + 2.0, rect.bottom() - 2.0),
                             egui::Align2::LEFT_BOTTOM,
@@ -2488,6 +2566,16 @@ impl eframe::App for HpsdrApp {
                             );
                         }
 
+                        // Plain full-width bin mapping -- unlike an
+                        // earlier version of this, no zoom-aware
+                        // filtering/cropping is needed here: WDSP's own
+                        // analyzer (see SpectrumAnalyzer::set_zoom_pan's
+                        // doc comment) already returns spectrum_row
+                        // containing ONLY the current zoomed/panned
+                        // window's data, evenly spaced across all
+                        // SPECTRUM_WIDTH bins -- the real resolution gain
+                        // happens upstream, in WDSP's own FFT size, not
+                        // here.
                         let n = spectrum_row.len().saturating_sub(1).max(1);
                         let points: Vec<egui::Pos2> = spectrum_row
                             .iter()
@@ -2515,7 +2603,7 @@ impl eframe::App for HpsdrApp {
                     );
 
                     if let Some(pos) = spectrum_resp.hover_pos() {
-                        let hover_freq = freq_at_x(pos.x, rect, freq_hz, sample_rate);
+                        let hover_freq = freq_at_x(pos.x, rect, freq_hz, sample_rate, connected.spectrum_zoom, pan_offset_hz);
                         draw_freq_hover_tooltip(ui.painter(), pos, hover_freq);
                     }
 
@@ -2534,7 +2622,7 @@ impl eframe::App for HpsdrApp {
                     if let Some(pos) = waterfall_click_resp.interact_pointer_pos() {
                         // See suppress_refocus_click's own doc comment.
                         if waterfall_click_resp.clicked() && !suppress_refocus_click {
-                            let new_freq = freq_at_x(pos.x, rect, freq_hz, sample_rate);
+                            let new_freq = freq_at_x(pos.x, rect, freq_hz, sample_rate, connected.spectrum_zoom, pan_offset_hz);
                             let (effective_freq, retune) =
                                 resolve_tune(connected.ctun, freq_hz, sample_rate, passband, new_freq);
                             if let Some(lo) = retune {
@@ -2547,6 +2635,12 @@ impl eframe::App for HpsdrApp {
                         }
                     }
                     if let Some(tex_id) = waterfall_texture_id {
+                        // No zoom-aware UV cropping needed -- see the
+                        // spectrum trace's identical note above. Each
+                        // waterfall row already covers only the current
+                        // zoomed/panned window (WDSP's own analyzer did
+                        // the real cropping), so the texture is drawn at
+                        // its full [0,1] UV range as-is.
                         ui.painter().image(
                             tex_id,
                             rect,
@@ -2558,9 +2652,45 @@ impl eframe::App for HpsdrApp {
                         ui.put(rect, egui::Label::new(wisdom_status_text()));
                     }
                     if let Some(pos) = waterfall_click_resp.hover_pos() {
-                        let hover_freq = freq_at_x(pos.x, rect, freq_hz, sample_rate);
+                        let hover_freq = freq_at_x(pos.x, rect, freq_hz, sample_rate, connected.spectrum_zoom, pan_offset_hz);
                         draw_freq_hover_tooltip(ui.painter(), pos, hover_freq);
                     }
+
+                    ui.horizontal(|ui| {
+                        // Fill the available width -- reserve space for
+                        // the two labels, Reset button, and inter-widget
+                        // spacing, split the rest evenly between the two
+                        // sliders. Scoped to this row's own child Ui, so
+                        // it doesn't affect any other slider elsewhere
+                        // in the window.
+                        let reserved = 230.0;
+                        ui.spacing_mut().slider_width = ((ui.available_width() - reserved) / 2.0).max(80.0);
+
+                        ui.label("Zoom:");
+                        let mut zoom = connected.spectrum_zoom;
+                        if scroll_slider_i32(ui, &mut connected.slider_scroll_accum, &mut zoom, 1..=16, 1, "x") {
+                            connected.spectrum_zoom = zoom;
+                            settings_changed = true;
+                        }
+                        ui.add_space(12.0);
+                        ui.label("Pan:");
+                        // Disabled rather than hidden at zoom 1 -- there's
+                        // nothing to pan to (max_pan_hz is 0), but keeping
+                        // it visible-but-inert avoids the layout jumping
+                        // around as zoom changes.
+                        ui.add_enabled_ui(connected.spectrum_zoom > 1, |ui| {
+                            let mut pan = connected.spectrum_pan;
+                            if scroll_slider_f32(ui, &mut connected.slider_scroll_accum, &mut pan, -1.0..=1.0, 0.1) {
+                                connected.spectrum_pan = pan;
+                                settings_changed = true;
+                            }
+                        });
+                        if ui.button("Reset").on_hover_text("Zoom 1x, Pan centered").clicked() {
+                            connected.spectrum_zoom = 1;
+                            connected.spectrum_pan = 0.0;
+                            settings_changed = true;
+                        }
+                    });
 
                     ui.add_space(8.0);
                     ui.horizontal(|ui| {
@@ -4515,6 +4645,8 @@ impl eframe::App for HpsdrApp {
                                 window_geometry: rx.window_geometry,
                                 ctun: rx.ctun,
                                 ctun_frequency_hz: rx.ctun_frequency_hz,
+                                spectrum_zoom: rx.spectrum_zoom,
+                                spectrum_pan: rx.spectrum_pan,
                             }
                         })
                         .collect();
@@ -4554,6 +4686,8 @@ impl eframe::App for HpsdrApp {
                         tx_waterfall_db_high: Some(connected.tx_waterfall_db_high),
                         waterfall_palette: Some(connected.waterfall_palette),
                         spectrum_waterfall_ratio: Some(connected.spectrum_waterfall_ratio),
+                        spectrum_zoom: Some(connected.spectrum_zoom),
+                        spectrum_pan: Some(connected.spectrum_pan),
                         adc: Some(connected.session.adc.load(std::sync::atomic::Ordering::Relaxed) as u8),
                         antenna: Some(
                             connected.session.antenna.load(std::sync::atomic::Ordering::Relaxed) as u8,
@@ -4790,21 +4924,19 @@ fn draw_freq_hover_tooltip(painter: &egui::Painter, pos: egui::Pos2, freq_hz: u3
 /// for its own passband overlay/axis ticks, rather than threading that
 /// closure through -- this runs before `x_for_offset` even exists at
 /// either call site.
-fn draw_band_edge_markers(
-    painter: &egui::Painter,
-    rect: egui::Rect,
-    freq_hz: u32,
-    half_span_hz: f64,
-    sample_rate: u32,
-) {
+/// `center_hz`/`half_span_hz` describe the currently VISIBLE window
+/// (after zoom/pan), not necessarily the full captured sample-rate span
+/// -- see the caller's own visible_half_span_hz/pan_offset_hz for how
+/// that's derived.
+fn draw_band_edge_markers(painter: &egui::Painter, rect: egui::Rect, center_hz: f64, half_span_hz: f64) {
     const BAND_EDGE_COLOR: egui::Color32 = egui::Color32::from_rgb(255, 140, 0);
     for band in &BANDS {
         for edge_hz in [band.low_hz, band.high_hz] {
-            let offset_hz = edge_hz as f64 - freq_hz as f64;
+            let offset_hz = edge_hz as f64 - center_hz;
             if offset_hz.abs() > half_span_hz {
                 continue;
             }
-            let frac = ((offset_hz + half_span_hz) / sample_rate as f64) as f32;
+            let frac = ((offset_hz + half_span_hz) / (2.0 * half_span_hz)) as f32;
             let x = rect.left() + frac * rect.width();
             painter.line_segment(
                 [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
@@ -5336,6 +5468,22 @@ fn render_extra_receiver_ui(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceiver>>) {
 
     let freq_hz = rx.frequency_hz.load(Ordering::Relaxed);
     let sample_rate = rx.sample_rate_hz.load(Ordering::Relaxed);
+    // CTUN: same behavior as the main receiver -- see
+    // ConnectedState::ctun's doc comment. Pushed to the analyzer thread
+    // every frame regardless of change, same reasoning as the main
+    // receiver's own per-frame resync. Computed before Zoom/Pan below so
+    // zooming can keep the CTUN'd listen frequency centered.
+    let ctun_offset_hz = if rx.ctun { rx.ctun_frequency_hz as f64 - freq_hz as f64 } else { 0.0 };
+    // Zoom/Pan (sliders below the waterfall) -- see the main receiver's
+    // identical computation for the full reasoning, including why the CTUN
+    // offset has to be folded in here (for WDSP's own fscLin/fscHin
+    // clipping) rather than just in axis-label math.
+    let half_span_hz = sample_rate as f64 / 2.0;
+    let visible_half_span_hz = half_span_hz / rx.spectrum_zoom as f64;
+    let max_pan_hz = half_span_hz - visible_half_span_hz;
+    let pan_offset_hz = (ctun_offset_hz + rx.spectrum_pan as f64 * max_pan_hz)
+        .clamp(-max_pan_hz, max_pan_hz);
+    let effective_pan = if max_pan_hz > 0.0 { (pan_offset_hz / max_pan_hz) as f32 } else { 0.0 };
     let current_mode = rx.spectrum.mode();
     let current_width = rx.spectrum.width_hz();
     // Reused by resolve_tune (clamping a CTUN target so the passband
@@ -5353,13 +5501,9 @@ fn render_extra_receiver_ui(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceiver>>) {
         (d.spectrum.clone(), d.revision)
     };
 
-    // CTUN: same behavior as the main receiver -- see
-    // ConnectedState::ctun's doc comment. Pushed to the analyzer thread
-    // every frame regardless of change, same reasoning as the main
-    // receiver's own per-frame resync.
-    let ctun_offset_hz = if rx.ctun { rx.ctun_frequency_hz as f64 - freq_hz as f64 } else { 0.0 };
     rx.spectrum.set_lo_frequency_hz(freq_hz as f64);
     rx.spectrum.set_ctun(rx.ctun, ctun_offset_hz);
+    rx.spectrum.set_zoom_pan(rx.spectrum_zoom, effective_pan);
     let dial_freq_hz = if rx.ctun { rx.ctun_frequency_hz } else { freq_hz };
 
     ui.label(
@@ -5507,11 +5651,13 @@ fn render_extra_receiver_ui(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceiver>>) {
     // Split the window's remaining vertical space between the spectrum
     // and waterfall, according to rx.spectrum_waterfall_ratio
     // (adjustable via the drag handle between them) -- see the main
-    // receiver's own version of this for the full reasoning. Nothing
-    // else is rendered below the waterfall in this window, so no
-    // reserve is needed here (unlike the main receiver's Stop button).
+    // receiver's own version of this for the full reasoning. The
+    // Zoom/Pan row below the waterfall needs its own reserve here too
+    // (unlike a plain no-reserve version, which would let the split
+    // claim all available height and push Zoom/Pan below the window).
+    let zoom_pan_reserve = ui.spacing().interact_size.y + 8.0 + SPECTRUM_WATERFALL_DIVIDER_HEIGHT;
     let spectrum_waterfall_height =
-        (ui.available_height() - SPECTRUM_WATERFALL_DIVIDER_HEIGHT).max(200.0);
+        (ui.available_height() - zoom_pan_reserve).max(200.0);
     let spectrum_height = (spectrum_waterfall_height * rx.spectrum_waterfall_ratio).max(80.0);
     let (rect, spectrum_resp) = ui.allocate_exact_size(
         egui::vec2(ui.available_width(), spectrum_height),
@@ -5520,7 +5666,7 @@ fn render_extra_receiver_ui(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceiver>>) {
 
     if let Some(pos) = spectrum_resp.interact_pointer_pos() {
         if spectrum_resp.clicked() {
-            let new_freq = freq_at_x(pos.x, rect, freq_hz, sample_rate);
+            let new_freq = freq_at_x(pos.x, rect, freq_hz, sample_rate, rx.spectrum_zoom, pan_offset_hz);
             let (effective_freq, retune) = resolve_tune(rx.ctun, freq_hz, sample_rate, passband, new_freq);
             if let Some(lo) = retune {
                 rx.frequency_hz.store(lo, Ordering::Relaxed);
@@ -5568,9 +5714,12 @@ fn render_extra_receiver_ui(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceiver>>) {
     ui.painter().rect_filled(rect, 0.0, egui::Color32::BLACK);
 
     // Frequency axis ticks -- same mapping as the main receiver window.
-    let half_span_hz = sample_rate as f64 / 2.0;
+    // half_span_hz/visible_half_span_hz/pan_offset_hz (zoom/pan) are
+    // computed earlier in this function so the click-to-tune handlers
+    // above (which run before this drawing code) can use them too.
+    let view_center_hz = freq_hz as f64 + pan_offset_hz;
 
-    draw_band_edge_markers(ui.painter(), rect, freq_hz, half_span_hz, sample_rate);
+    draw_band_edge_markers(ui.painter(), rect, view_center_hz, visible_half_span_hz);
 
     let num_freq_ticks = 10;
     for t in 0..num_freq_ticks {
@@ -5585,7 +5734,8 @@ fn render_extra_receiver_ui(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceiver>>) {
         if t == 0 || t == num_freq_ticks - 1 {
             continue;
         }
-        let tick_freq_hz = freq_hz as f64 - half_span_hz + frac as f64 * sample_rate as f64;
+        let tick_freq_hz =
+            view_center_hz - visible_half_span_hz + frac as f64 * (2.0 * visible_half_span_hz);
         ui.painter().text(
             egui::pos2(x + 2.0, rect.bottom() - 2.0),
             egui::Align2::LEFT_BOTTOM,
@@ -5597,7 +5747,8 @@ fn render_extra_receiver_ui(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceiver>>) {
 
     // Filter passband overlay, same as the main window.
     let x_for_offset = |offset_hz: f64| -> f32 {
-        let frac = ((offset_hz + half_span_hz) / sample_rate as f64).clamp(0.0, 1.0) as f32;
+        let frac = ((offset_hz - pan_offset_hz + visible_half_span_hz) / (2.0 * visible_half_span_hz))
+            .clamp(0.0, 1.0) as f32;
         rect.left() + frac * rect.width()
     };
     let (pb_low, pb_high) = passband;
@@ -5639,6 +5790,10 @@ fn render_extra_receiver_ui(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceiver>>) {
             );
         }
 
+        // Plain full-width bin mapping -- see the main receiver's
+        // identical treatment for why no zoom-aware cropping is needed
+        // here (WDSP's own analyzer already returns just the visible
+        // window's data).
         let n = spectrum_row.len().saturating_sub(1).max(1);
         let points: Vec<egui::Pos2> = spectrum_row
             .iter()
@@ -5662,7 +5817,7 @@ fn render_extra_receiver_ui(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceiver>>) {
     );
 
     if let Some(pos) = spectrum_resp.hover_pos() {
-        let hover_freq = freq_at_x(pos.x, rect, freq_hz, sample_rate);
+        let hover_freq = freq_at_x(pos.x, rect, freq_hz, sample_rate, rx.spectrum_zoom, pan_offset_hz);
         draw_freq_hover_tooltip(ui.painter(), pos, hover_freq);
     }
 
@@ -5676,7 +5831,7 @@ fn render_extra_receiver_ui(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceiver>>) {
     );
     if let Some(pos) = wf_resp.interact_pointer_pos() {
         if wf_resp.clicked() {
-            let new_freq = freq_at_x(pos.x, wf_rect, freq_hz, sample_rate);
+            let new_freq = freq_at_x(pos.x, wf_rect, freq_hz, sample_rate, rx.spectrum_zoom, pan_offset_hz);
             let (effective_freq, retune) = resolve_tune(rx.ctun, freq_hz, sample_rate, passband, new_freq);
             if let Some(lo) = retune {
                 rx.frequency_hz.store(lo, Ordering::Relaxed);
@@ -5710,6 +5865,8 @@ fn render_extra_receiver_ui(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceiver>>) {
         // retries (cheaply) next frame, same as the main receiver.
     }
     if rx.waterfall_texture.is_some() {
+        // No zoom-aware UV cropping needed -- see the main receiver's
+        // identical treatment.
         ui.painter().image(
             rx.waterfall_texture.as_ref().unwrap().id(),
             wf_rect,
@@ -5721,9 +5878,38 @@ fn render_extra_receiver_ui(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceiver>>) {
         ui.put(wf_rect, egui::Label::new(wisdom_status_text()));
     }
     if let Some(pos) = wf_resp.hover_pos() {
-        let hover_freq = freq_at_x(pos.x, wf_rect, freq_hz, sample_rate);
+        let hover_freq = freq_at_x(pos.x, wf_rect, freq_hz, sample_rate, rx.spectrum_zoom, pan_offset_hz);
         draw_freq_hover_tooltip(ui.painter(), pos, hover_freq);
     }
+
+    // Zoom/Pan -- see the main receiver's identical controls.
+    ui.horizontal(|ui| {
+        // Fill the available width -- see the main receiver's identical
+        // treatment.
+        let reserved = 230.0;
+        ui.spacing_mut().slider_width = ((ui.available_width() - reserved) / 2.0).max(80.0);
+
+        ui.label("Zoom:");
+        let mut zoom = rx.spectrum_zoom;
+        if scroll_slider_i32(ui, &mut rx.slider_scroll_accum, &mut zoom, 1..=16, 1, "x") {
+            rx.spectrum_zoom = zoom;
+            rx.settings_dirty.store(true, Ordering::Relaxed);
+        }
+        ui.add_space(12.0);
+        ui.label("Pan:");
+        ui.add_enabled_ui(rx.spectrum_zoom > 1, |ui| {
+            let mut pan = rx.spectrum_pan;
+            if scroll_slider_f32(ui, &mut rx.slider_scroll_accum, &mut pan, -1.0..=1.0, 0.1) {
+                rx.spectrum_pan = pan;
+                rx.settings_dirty.store(true, Ordering::Relaxed);
+            }
+        });
+        if ui.button("Reset").on_hover_text("Zoom 1x, Pan centered").clicked() {
+            rx.spectrum_zoom = 1;
+            rx.spectrum_pan = 0.0;
+            rx.settings_dirty.store(true, Ordering::Relaxed);
+        }
+    });
 
     // Bounded rather than unconditional -- see the same call in the
     // main receiver's update loop for why.
@@ -5989,10 +6175,22 @@ fn render_extra_receiver_settings(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceive
     }
 }
 
-fn freq_at_x(x: f32, rect: egui::Rect, center_freq_hz: u32, sample_rate: u32) -> u32 {
+/// `zoom`/`pan_offset_hz` describe the currently visible window the same
+/// way the spectrum-drawing code's own visible_half_span_hz/
+/// pan_offset_hz do -- pass 1.0/0.0 for the old (full-span) behavior.
+fn freq_at_x(
+    x: f32,
+    rect: egui::Rect,
+    center_freq_hz: u32,
+    sample_rate: u32,
+    zoom: i32,
+    pan_offset_hz: f64,
+) -> u32 {
     let frac = ((x - rect.left()) / rect.width()).clamp(0.0, 1.0) as f64;
     let half_span_hz = sample_rate as f64 / 2.0;
-    let freq = center_freq_hz as f64 - half_span_hz + frac * sample_rate as f64;
+    let visible_half_span_hz = half_span_hz / zoom as f64;
+    let freq =
+        center_freq_hz as f64 + pan_offset_hz - visible_half_span_hz + frac * (2.0 * visible_half_span_hz);
     let rounded = (freq / 1000.0).round() * 1000.0;
     rounded.max(0.0) as u32
 }
@@ -6126,6 +6324,8 @@ fn spawn_extra_receiver(
         waterfall_db_high: saved.map(|s| s.waterfall_db_high).unwrap_or(-60.0),
         waterfall_palette: saved.map(|s| s.waterfall_palette).unwrap_or(Palette::Ocean),
         spectrum_waterfall_ratio: saved.map(|s| s.spectrum_waterfall_ratio).unwrap_or(150.0 / 350.0),
+        spectrum_zoom: saved.map(|s| s.spectrum_zoom).unwrap_or(1),
+        spectrum_pan: saved.map(|s| s.spectrum_pan).unwrap_or(0.0),
         show_settings_window: false,
         settings_tab: SettingsTab::Agc,
         settings_dirty,

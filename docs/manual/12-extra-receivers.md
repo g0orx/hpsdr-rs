@@ -27,9 +27,10 @@ whether or not PureSignal is actually enabled.
 It behaves like a scaled-down version of the main window: frequency
 display, band and mode rows, **Filter width** and **Audio gain** sliders,
 the CTUN/NB/NR/SNB/AGC toggle row, its own spectrum and waterfall panes
-(click or scroll to tune, same conventions as the main window, though
-Ctrl+scroll zoom-tuning isn't available here), and its own S-meter with a
-**Settings...** button.
+with their own [Zoom/Pan sliders](02-main-window.md#zoom-and-pan) below
+the waterfall (click or scroll to tune, same conventions as the main
+window, though Ctrl+scroll's 10kHz-step tuning gesture isn't available
+here), and its own S-meter with a **Settings...** button.
 
 ## Extra receiver Settings
 

@@ -368,6 +368,18 @@ pub struct DemodParams {
     /// every extra receiver window has its own DemodParams (and thus its
     /// own independent EQ), same as it already has its own AGC/NB/NR.
     pub eq: EqualizerParams,
+    /// Spectrum/waterfall zoom (1 = full sample-rate span, higher =
+    /// narrower, higher-resolution window) and pan (-1.0 = lowest
+    /// frequency the current zoom can reach, +1.0 = highest, 0.0 =
+    /// centered on the dial) -- see SpectrumAnalyzer's zoom/pan
+    /// reconfigure method for how this actually grows the real FFT size
+    /// (not just a visual crop/stretch of a fixed-resolution trace) --
+    /// confirmed against piHPSDR/rustyHPSDR's own zoom implementations,
+    /// both of which do the same: WDSP itself computes a bigger FFT and
+    /// clips/rebins it down to a fixed pixel count, rather than the UI
+    /// stretching a fixed-resolution trace.
+    pub zoom: i32,
+    pub pan: f32,
 }
 
 impl Default for DemodParams {
@@ -399,6 +411,8 @@ impl Default for DemodParams {
             ctun_offset_hz: 0.0,
             lo_frequency_hz: 0.0,
             eq: EqualizerParams::default(),
+            zoom: 1,
+            pan: 0.0,
         }
     }
 }
@@ -474,6 +488,13 @@ struct SpectrumAnalyzer {
     /// -- see its doc comment in demod() for why this exists and why
     /// it's edge- rather than every-call-triggered.
     last_fexchange_error: Option<bool>,
+    /// See set_zoom_pan's doc comment. Initialized to Some(1)/Some(0.0)
+    /// (matching what open()'s own SetAnalyzer call already configures),
+    /// not None, so the very first set_zoom_pan(1, 0.0, ..) call from
+    /// run()'s loop is correctly seen as a no-op rather than redundantly
+    /// reconfiguring the analyzer to the same values it already has.
+    last_zoom: Option<i32>,
+    last_pan: Option<f32>,
 }
 
 impl SpectrumAnalyzer {
@@ -744,7 +765,132 @@ impl SpectrumAnalyzer {
                 last_lo_frequency: None,
                 last_eq: None,
                 last_fexchange_error: None,
+                last_zoom: Some(1),
+                last_pan: Some(0.0),
             }
+        }
+    }
+
+    /// Live analyzer reconfigure for Zoom/Pan -- ROOT CAUSE FIX for a
+    /// real report: the previous zoom implementation just cropped/
+    /// stretched the SAME fixed-resolution (SPECTRUM_WIDTH-bin) trace
+    /// across the display, a purely cosmetic zoom with no real gain in
+    /// spectral detail. Confirmed against piHPSDR (receiver.c's
+    /// rx_set_analyzer) and rustyHPSDR (receiver/mod.rs's
+    /// init_analyzer) that both instead grow the actual FFT size
+    /// (afft_size) with zoom, so a zoomed-in view genuinely resolves
+    /// finer detail, not just bigger pixels of the same coarse data.
+    ///
+    /// This follows piHPSDR's specific variant (rather than
+    /// rustyHPSDR's): the OUTPUT pixel count stays fixed at
+    /// SPECTRUM_WIDTH regardless of zoom -- only the underlying FFT
+    /// size grows, with WDSP itself (via the fscLin/fscHin clip
+    /// parameters below) discarding everything outside the
+    /// zoomed+panned sub-band and rebinning just that portion down to
+    /// SPECTRUM_WIDTH pixels. That means the pixel arrays this project
+    /// already allocates at a fixed size (spectrum_pixels/
+    /// waterfall_pixels above, and every consumer downstream --
+    /// build_waterfall_image, the spectrum trace's bin-to-x mapping in
+    /// main.rs) need no resizing when zoom changes: WDSP returns
+    /// already-cropped-to-the-visible-window data, so main.rs's trace/
+    /// waterfall rendering can go back to a plain full-width mapping --
+    /// only the frequency-axis labels/overlays need to know the
+    /// current visible window's bounds (unchanged from the previous
+    /// implementation's visible_half_span_hz/pan_offset_hz math).
+    ///
+    /// `zoom` is clamped to >= 1 (1 = no zoom, full span, matches
+    /// open()'s own initial configuration). `pan` is -1.0 (view the
+    /// lowest frequency the current zoom can reach) to +1.0 (highest),
+    /// same convention as piHPSDR's pan slider (-100..100) just
+    /// rescaled -- confirmed identical by comparing the pl/pr formula
+    /// below against receiver.c's rx_set_analyzer.
+    fn set_zoom_pan(&mut self, zoom: i32, pan: f32, sample_rate: i32) {
+        let zoom = zoom.max(1);
+        let pan = pan.clamp(-1.0, 1.0);
+        if self.last_zoom == Some(zoom) && self.last_pan == Some(pan) {
+            return;
+        }
+        self.last_zoom = Some(zoom);
+        self.last_pan = Some(pan);
+
+        // Same tiered afft_size ladder as open()'s own initial
+        // SetAnalyzer call (there hardcoded to zoom=1's degenerate
+        // case, SPECTRUM_WIDTH * 1) -- confirmed against both
+        // piHPSDR's and rustyHPSDR's identical tier thresholds.
+        let pixels = SPECTRUM_WIDTH;
+        let min_for_rate = (sample_rate as f32 / SPECTRUM_FPS).ceil() as i32;
+        let required = (pixels * zoom).max(min_for_rate);
+        let a_fft_size = if required <= 16384 {
+            16384
+        } else if required <= 32768 {
+            32768
+        } else if required <= 65536 {
+            65536
+        } else if required <= 131072 {
+            131072
+        } else {
+            262144
+        };
+
+        // Bins to clip from the low/high end of the full afft_size-point
+        // FFT so only the zoomed+panned sub-band remains -- ported
+        // directly from piHPSDR's receiver.c (rx_set_analyzer): zz is
+        // the total bin count to discard; pl/pr split that between the
+        // low and high ends according to pan (pan=-1.0 -> pl=0.0, all
+        // discarded from the high end, i.e. the visible window sits at
+        // the LOW end of the full span; pan=+1.0 -> the reverse).
+        // Zero at zoom=1 automatically (zz=0), matching open()'s own
+        // hardcoded 0.0/0.0 for that case with no special-casing needed.
+        let zz = a_fft_size as f64 * (1.0 - 1.0 / zoom as f64);
+        let pl = 0.5 * (pan as f64 + 1.0);
+        let pr = 1.0 - pl;
+        let fsc_lin = pl * zz;
+        let fsc_hin = pr * zz;
+
+        let overlap = std::cmp::max(
+            0,
+            (a_fft_size as f32 - sample_rate as f32 / SPECTRUM_FPS).ceil() as i32,
+        );
+        let max_w = a_fft_size
+            + std::cmp::min(
+                (KEEP_TIME * SPECTRUM_FPS) as i32,
+                (KEEP_TIME * a_fft_size as f32 * SPECTRUM_FPS) as i32,
+            );
+
+        let mut flp = [0i32];
+        unsafe {
+            wdsp::SetAnalyzer(
+                self.channel,
+                2, // n_pixout: spectrum + waterfall
+                1, // n_fft
+                1, // typ: complex samples
+                flp.as_mut_ptr(),
+                a_fft_size,
+                BUFFER_SIZE as i32,
+                WIN_TYPE,
+                14.0, // "pi" param -- see open()'s identical call
+                overlap,
+                0, // clp
+                fsc_lin,
+                fsc_hin,
+                pixels,
+                1, // n_stch
+                0, // calset
+                0.0,
+                0.0,
+                max_w,
+            );
+            wdsp::SetDisplayDetectorMode(self.channel, 0, wdsp::DETECTOR_MODE_AVERAGE as c_int);
+            wdsp::SetDisplayAverageMode(self.channel, 0, wdsp::AVERAGE_MODE_LOG_RECURSIVE as c_int);
+            wdsp::SetDisplayDetectorMode(self.channel, 1, wdsp::DETECTOR_MODE_AVERAGE as c_int);
+            wdsp::SetDisplayAverageMode(self.channel, 1, wdsp::AVERAGE_MODE_LOG_RECURSIVE as c_int);
+            wdsp::SetDisplayNormOneHz(self.channel, 0, 1);
+            // width*zoom (the UNSNAPPED value, not a_fft_size) -- matches
+            // piHPSDR's SetDisplaySampleRate(rx->id, rx->width*rx->zoom)
+            // exactly; this normalizes for the per-pixel resolution
+            // actually represented at this zoom level, not the
+            // (possibly much larger, tier-snapped) FFT size.
+            wdsp::SetDisplaySampleRate(self.channel, pixels * zoom);
         }
     }
 
@@ -1111,6 +1257,13 @@ fn run(
             }
         }
 
+        // Loaded before feed() (not just before demod() further down,
+        // where this used to be read) so set_zoom_pan can reconfigure
+        // the analyzer -- a rare, edge-detected event, see its own doc
+        // comment -- ahead of this iteration's Spectrum0/GetPixels call.
+        let params = *demod_params.lock().unwrap();
+        analyzer.set_zoom_pan(params.zoom, params.pan, sample_rate);
+
         let (spectrum, waterfall) = analyzer.feed(&chunk);
         if spectrum.is_some() || waterfall.is_some() {
             let mut d = display.lock().unwrap();
@@ -1126,7 +1279,6 @@ fn run(
             d.revision = d.revision.wrapping_add(1);
         }
 
-        let params = *demod_params.lock().unwrap();
         let passband = passband_for(params.mode, params.width_hz);
         let audio = analyzer.demod(&chunk, params, passband);
         let meter_db = analyzer.meter_db();
@@ -1418,6 +1570,17 @@ impl SpectrumHandle {
         let mut p = self.demod_params.lock().unwrap();
         p.ctun = ctun;
         p.ctun_offset_hz = offset_hz;
+    }
+
+    /// See DemodParams::zoom/pan's doc comment. Picked up by the
+    /// analyzer thread's next iteration (SpectrumAnalyzer::set_zoom_pan,
+    /// edge-detected there -- cheap to call every frame regardless of
+    /// whether either value actually changed, same convention as
+    /// set_ctun/set_lo_frequency_hz below).
+    pub fn set_zoom_pan(&self, zoom: i32, pan: f32) {
+        let mut p = self.demod_params.lock().unwrap();
+        p.zoom = zoom.max(1);
+        p.pan = pan.clamp(-1.0, 1.0);
     }
 
     /// Mirrors the actual hardware/LO frequency into the analyzer thread
