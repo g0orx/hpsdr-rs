@@ -205,6 +205,12 @@ struct ExtraReceiver {
     scroll_accum: f32,
     slider_scroll_accum: f32,
     db_low: f32,
+    /// See ConnectedState::db_low_auto's doc comment -- same thing, per
+    /// extra receiver instead of shared.
+    db_low_auto: bool,
+    /// Runtime-only smoothing state for db_low_auto -- see
+    /// ConnectedState::db_low_auto_smoothed's doc comment. Not persisted.
+    db_low_auto_smoothed: Option<f32>,
     db_high: f32,
     waterfall_db_low: f32,
     waterfall_db_high: f32,
@@ -313,6 +319,27 @@ struct ConnectedState {
     zoom_accum: f32,
     sample_rate: u32,
     db_low: f32,
+    /// "Auto" mode for the Spectrum Low slider (Settings -> Spectrum):
+    /// when on, db_low is continuously overwritten each frame (RX only,
+    /// not while transmitting -- see the TX range's own doc comment for
+    /// why TX is a fundamentally different scenario) from a smoothed
+    /// tracking of the lowest level currently shown in the trace, so the
+    /// noise floor stays pinned near the bottom of the display without
+    /// manual re-adjustment as band conditions change. Excludes a few
+    /// bins at each edge of the trace when finding that minimum, since
+    /// WDSP's analyzer can show rolloff/artifacts right at the edges of
+    /// the visible span that aren't representative of the real noise
+    /// floor. Smoothed (see db_low_auto_smoothed) rather than snapping
+    /// straight to the raw per-frame minimum so it doesn't visibly jump
+    /// on every noise spike.
+    db_low_auto: bool,
+    /// Exponentially-smoothed state for db_low_auto, same ballistics
+    /// pattern as smoothed_fwd_power/smoothed_rev_power above. `None`
+    /// until the first frame with db_low_auto on (seeds from that
+    /// frame's raw value instead of smoothing from 0.0). Runtime-only,
+    /// not persisted -- there's nothing meaningful to resume across a
+    /// restart, it just re-converges from the first frame's data.
+    db_low_auto_smoothed: Option<f32>,
     db_high: f32,
     waterfall_db_low: f32,
     waterfall_db_high: f32,
@@ -1019,6 +1046,8 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                 zoom_accum: 0.0,
                 sample_rate: settings.sample_rate,
                 db_low: cfg.db_low.unwrap_or(-140.0),
+                db_low_auto: cfg.db_low_auto.unwrap_or(true),
+                db_low_auto_smoothed: None,
                 db_high: cfg.db_high.unwrap_or(-40.0),
                 waterfall_db_low: cfg.waterfall_db_low.unwrap_or(-140.0),
                 waterfall_db_high: cfg.waterfall_db_high.unwrap_or(-60.0),
@@ -1435,8 +1464,27 @@ impl eframe::App for HpsdrApp {
                     (d.spectrum.clone(), d.meter_db, d.revision)
                 };
 
-                // Fixed dB bounds (user-set, not auto-scaled) so the
-                // Fixed dB bounds (user-set, not auto-scaled) so the
+                // "Auto" Low (Settings -> Spectrum) -- see
+                // ConnectedState::db_low_auto's doc comment. RX only:
+                // spectrum_row is tx_spectrum's data while transmitting,
+                // which isn't a "find the noise floor" scenario (see the
+                // TX range's own doc comment just below).
+                if connected.db_low_auto && !transmitting {
+                    let n = spectrum_row.len();
+                    let edge = (n / AUTO_DB_LOW_EDGE_EXCLUDE_FRACTION).max(AUTO_DB_LOW_MIN_EDGE_EXCLUDE);
+                    if n > edge * 2 {
+                        let raw_min = spectrum_row[edge..n - edge].iter().copied().fold(f32::INFINITY, f32::min);
+                        if raw_min.is_finite() {
+                            let prev = connected.db_low_auto_smoothed.unwrap_or(raw_min);
+                            let smoothed = prev + AUTO_DB_LOW_SMOOTHING_ALPHA * (raw_min - prev);
+                            connected.db_low_auto_smoothed = Some(smoothed);
+                            connected.db_low = smoothed.clamp(-180.0, connected.db_high - 1.0);
+                        }
+                    }
+                }
+
+                // Fixed dB bounds (user-set unless db_low_auto above just
+                // overrode the low end, not otherwise auto-scaled) so the
                 // trace and gridlines stay put rather than shifting as
                 // power levels change. Separate ranges for RX and TX
                 // (Settings -> Display) -- a locally-picked-up TX
@@ -3686,25 +3734,39 @@ impl eframe::App for HpsdrApp {
                                 SettingsTab::Spectrum => {
                                     ui.horizontal(|ui| {
                                         ui.label("Spectrum");
-                                        let mut low = connected.db_low;
                                         ui.label("Low:");
-                                        if scroll_slider_f32(
-                                            ui,
-                                            &mut connected.slider_scroll_accum,
-                                            &mut low,
-                                            -180.0..=0.0,
-                                            2.0,
-                                        ) {
-                                            connected.db_low = low;
-                                            remember_band_settings(
-                                                &mut connected.band_memory,
-                                                freq_hz,
-                                                connected.db_low,
-                                                connected.db_high,
-                                                connected.waterfall_db_low,
-                                                connected.waterfall_db_high,
-                                                current_mode,
-                                            );
+                                        ui.add_enabled_ui(!connected.db_low_auto, |ui| {
+                                            let mut low = connected.db_low;
+                                            if scroll_slider_f32(
+                                                ui,
+                                                &mut connected.slider_scroll_accum,
+                                                &mut low,
+                                                -180.0..=0.0,
+                                                2.0,
+                                            ) {
+                                                connected.db_low = low;
+                                                remember_band_settings(
+                                                    &mut connected.band_memory,
+                                                    freq_hz,
+                                                    connected.db_low,
+                                                    connected.db_high,
+                                                    connected.waterfall_db_low,
+                                                    connected.waterfall_db_high,
+                                                    current_mode,
+                                                );
+                                                settings_changed = true;
+                                            }
+                                        });
+                                        if ui
+                                            .selectable_label(connected.db_low_auto, "Auto")
+                                            .on_hover_text(
+                                                "Continuously track the lowest level shown in \
+                                                 the spectrum trace, smoothed to avoid jumping \
+                                                 on every noise spike.",
+                                            )
+                                            .clicked()
+                                        {
+                                            connected.db_low_auto = !connected.db_low_auto;
                                             settings_changed = true;
                                         }
                                         let mut high = connected.db_high;
@@ -4647,6 +4709,7 @@ impl eframe::App for HpsdrApp {
                                 ctun_frequency_hz: rx.ctun_frequency_hz,
                                 spectrum_zoom: rx.spectrum_zoom,
                                 spectrum_pan: rx.spectrum_pan,
+                                db_low_auto: rx.db_low_auto,
                             }
                         })
                         .collect();
@@ -4677,6 +4740,7 @@ impl eframe::App for HpsdrApp {
                         tci_tx_gain: Some(connected.tci_tx_gain),
                         tx_power_watts: Some(connected.session.tx_power_watts.load(Ordering::Relaxed)),
                         db_low: Some(connected.db_low),
+                        db_low_auto: Some(connected.db_low_auto),
                         db_high: Some(connected.db_high),
                         waterfall_db_low: Some(connected.waterfall_db_low),
                         waterfall_db_high: Some(connected.waterfall_db_high),
@@ -4853,6 +4917,19 @@ fn format_khz(hz: f64) -> String {
 /// displays -- replaces the plain ui.add_space() that used to sit
 /// there, so it doesn't add extra vertical space on top of it.
 const SPECTRUM_WATERFALL_DIVIDER_HEIGHT: f32 = 8.0;
+
+/// "Auto" Low tuning -- see ConnectedState::db_low_auto's doc comment.
+/// Bins within the excluded edge (max of 1/20th of the trace width and
+/// this minimum count) are skipped when finding the trace's minimum,
+/// since WDSP's analyzer can show rolloff/artifacts right at the edges
+/// of the visible span that would otherwise drag the tracked floor down
+/// to somewhere unrepresentative of the real noise floor.
+const AUTO_DB_LOW_EDGE_EXCLUDE_FRACTION: usize = 20;
+const AUTO_DB_LOW_MIN_EDGE_EXCLUDE: usize = 4;
+/// Per-frame smoothing factor for db_low_auto_smoothed -- same
+/// ballistics pattern as the TX power meter's own SMOOTHING_ALPHA,
+/// just slower (a noise floor should drift, not visibly jump).
+const AUTO_DB_LOW_SMOOTHING_ALPHA: f32 = 0.03;
 
 /// Draggable divider between the spectrum and waterfall displays.
 /// Updates `ratio` (spectrum's share of their combined height, see
@@ -5501,6 +5578,22 @@ fn render_extra_receiver_ui(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceiver>>) {
         (d.spectrum.clone(), d.revision)
     };
 
+    // "Auto" Low -- see ConnectedState::db_low_auto's doc comment (no TX
+    // case to gate on here -- extra receivers never transmit).
+    if rx.db_low_auto {
+        let n = spectrum_row.len();
+        let edge = (n / AUTO_DB_LOW_EDGE_EXCLUDE_FRACTION).max(AUTO_DB_LOW_MIN_EDGE_EXCLUDE);
+        if n > edge * 2 {
+            let raw_min = spectrum_row[edge..n - edge].iter().copied().fold(f32::INFINITY, f32::min);
+            if raw_min.is_finite() {
+                let prev = rx.db_low_auto_smoothed.unwrap_or(raw_min);
+                let smoothed = prev + AUTO_DB_LOW_SMOOTHING_ALPHA * (raw_min - prev);
+                rx.db_low_auto_smoothed = Some(smoothed);
+                rx.db_low = smoothed.clamp(-180.0, rx.db_high - 1.0);
+            }
+        }
+    }
+
     rx.spectrum.set_lo_frequency_hz(freq_hz as f64);
     rx.spectrum.set_ctun(rx.ctun, ctun_offset_hz);
     rx.spectrum.set_zoom_pan(rx.spectrum_zoom, effective_pan);
@@ -6114,12 +6207,25 @@ fn render_extra_receiver_settings(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceive
         SettingsTab::Spectrum => {
             ui.horizontal(|ui| {
                 ui.label("Spectrum");
-                let mut low = rx.db_low;
                 ui.label("Low:");
-                if scroll_slider_f32(ui, &mut rx.slider_scroll_accum, &mut low, -180.0..=0.0, 2.0) {
-                    rx.db_low = low;
-                    let (a, b, c, d) = (rx.db_low, rx.db_high, rx.waterfall_db_low, rx.waterfall_db_high);
-                    remember_band_settings(&mut rx.band_memory, freq_hz, a, b, c, d, agc_params.mode);
+                ui.add_enabled_ui(!rx.db_low_auto, |ui| {
+                    let mut low = rx.db_low;
+                    if scroll_slider_f32(ui, &mut rx.slider_scroll_accum, &mut low, -180.0..=0.0, 2.0) {
+                        rx.db_low = low;
+                        let (a, b, c, d) = (rx.db_low, rx.db_high, rx.waterfall_db_low, rx.waterfall_db_high);
+                        remember_band_settings(&mut rx.band_memory, freq_hz, a, b, c, d, agc_params.mode);
+                        rx.settings_dirty.store(true, Ordering::Relaxed);
+                    }
+                });
+                if ui
+                    .selectable_label(rx.db_low_auto, "Auto")
+                    .on_hover_text(
+                        "Continuously track the lowest level shown in the spectrum trace, \
+                         smoothed to avoid jumping on every noise spike.",
+                    )
+                    .clicked()
+                {
+                    rx.db_low_auto = !rx.db_low_auto;
                     rx.settings_dirty.store(true, Ordering::Relaxed);
                 }
                 let mut high = rx.db_high;
@@ -6319,6 +6425,8 @@ fn spawn_extra_receiver(
         scroll_accum: 0.0,
         slider_scroll_accum: 0.0,
         db_low: saved.map(|s| s.db_low).unwrap_or(-140.0),
+        db_low_auto: saved.map(|s| s.db_low_auto).unwrap_or(true),
+        db_low_auto_smoothed: None,
         db_high: saved.map(|s| s.db_high).unwrap_or(-40.0),
         waterfall_db_low: saved.map(|s| s.waterfall_db_low).unwrap_or(-140.0),
         waterfall_db_high: saved.map(|s| s.waterfall_db_high).unwrap_or(-60.0),

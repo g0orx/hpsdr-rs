@@ -48,6 +48,11 @@ pub struct Config {
     pub agc_thresh_db: Option<f64>,
     pub db_low: Option<f32>,
     pub db_high: Option<f32>,
+    /// "Auto" mode for db_low -- see ConnectedState::db_low_auto's doc
+    /// comment (main.rs). Missing (a config saved before this existed)
+    /// falls back to on -- the default for this feature.
+    #[serde(default)]
+    pub db_low_auto: Option<bool>,
     pub waterfall_db_low: Option<f32>,
     pub waterfall_db_high: Option<f32>,
     pub waterfall_palette: Option<Palette>,
@@ -355,6 +360,14 @@ pub struct ExtraReceiverConfig {
     pub spectrum_zoom: i32,
     #[serde(default)]
     pub spectrum_pan: f32,
+    /// See Config::db_low_auto's doc comment -- same thing, this
+    /// receiver's own.
+    #[serde(default = "default_db_low_auto")]
+    pub db_low_auto: bool,
+}
+
+fn default_db_low_auto() -> bool {
+    true
 }
 
 fn default_spectrum_zoom() -> i32 {

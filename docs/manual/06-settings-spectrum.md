@@ -16,6 +16,15 @@ of sliders sets the same range for the waterfall.
 If a strong or weak station always looks pinned to the top or bottom of the
 display, adjust these.
 
+**Auto**, next to the spectrum **Low** slider, continuously tracks the
+lowest level currently shown in the trace and sets **Low** from it, so the
+noise floor stays pinned near the bottom of the display without manual
+re-adjustment as band conditions change (a few bins at each edge of the
+trace are excluded from that tracking, and the result is smoothed, so it
+doesn't jump on every noise spike or edge artifact). While **Auto** is on,
+the **Low** slider is disabled -- turn **Auto** off to set it manually
+again. RX only; the TX range below is unaffected.
+
 ## Waterfall palette
 
 Four color palettes: **Fire, Ocean, Classic, Grayscale**. Pick whichever is
