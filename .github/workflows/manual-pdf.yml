@@ -1,0 +1,46 @@
+name: Manual PDF
+
+# Builds docs/manual/ into a single PDF via scripts/build-manual-pdf.sh
+# and publishes it as a downloadable workflow artifact -- for anyone who
+# wants one offline/printable document instead of browsing the manual
+# page by page on GitHub. First workflow in this repo, so deliberately
+# scoped to just this (no build/test CI implied or attempted here).
+on:
+  push:
+    branches: [master]
+    paths:
+      - "docs/manual/**"
+      - "scripts/build-manual-pdf.sh"
+      - ".github/workflows/manual-pdf.yml"
+  pull_request:
+    paths:
+      - "docs/manual/**"
+      - "scripts/build-manual-pdf.sh"
+      - ".github/workflows/manual-pdf.yml"
+  workflow_dispatch: {}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # texlive (not wkhtmltopdf) -- see build-manual-pdf.sh's own doc
+      # comment for why: wkhtmltopdf has been dropped from current
+      # Debian/Ubuntu repos, while this texlive subset is pandoc's own
+      # documented recommendation for basic PDF output and reliably
+      # available via apt.
+      - name: Install pandoc and a PDF toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pandoc texlive-latex-base texlive-fonts-recommended texlive-latex-extra
+
+      - name: Build manual PDF
+        run: ./scripts/build-manual-pdf.sh
+
+      - name: Upload PDF artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: hpsdr-rs-manual
+          path: dist/hpsdr-rs-manual.pdf

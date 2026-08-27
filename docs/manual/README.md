@@ -20,6 +20,14 @@ from source and project status, see the [top-level README](../../README.md).
 12. [Extra Receivers](12-extra-receivers.md) -- adding independent receiver windows
 13. [Firmware Update](13-firmware-update.md) -- updating FPGA firmware and changing a radio's IP, in bootloader mode or in-application
 
+**PDF**: this whole manual is also available as a single PDF, useful for
+offline/printed reading. It's built automatically by the "Manual PDF"
+GitHub Actions workflow on every change here -- grab it from that
+workflow's most recent run (Actions tab -> Manual PDF -> latest run ->
+Artifacts). To build it yourself instead: `./scripts/build-manual-pdf.sh`
+(needs `pandoc` plus a LaTeX toolchain -- see the script's own doc
+comment for exact package names).
+
 Every page notes where a screenshot would help; those are marked
 `(Screenshot needed: ...)` with a broken image link pointing at
 `images/<page>-<name>.png`. Drop a matching PNG into
