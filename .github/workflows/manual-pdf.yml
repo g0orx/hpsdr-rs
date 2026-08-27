@@ -34,7 +34,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            pandoc texlive-latex-base texlive-fonts-recommended texlive-latex-extra
+            pandoc texlive-latex-base texlive-fonts-recommended texlive-latex-extra lmodern
 
       - name: Build manual PDF
         run: ./scripts/build-manual-pdf.sh

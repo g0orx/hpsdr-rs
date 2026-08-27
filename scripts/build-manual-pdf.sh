@@ -6,10 +6,15 @@
 # touches docs/manual/, uploaded there as a build artifact.
 #
 # Requires pandoc, plus a LaTeX toolchain for PDF output (Debian/Ubuntu:
-# texlive-latex-base texlive-fonts-recommended texlive-latex-extra) --
-# pandoc's own documented recommendation for basic PDF generation, and
+# texlive-latex-base texlive-fonts-recommended texlive-latex-extra lmodern)
+# -- pandoc's own documented recommendation for basic PDF generation, and
 # far more reliably available than wkhtmltopdf (removed from current
-# Debian/Ubuntu repos).
+# Debian/Ubuntu repos). lmodern specifically: pandoc's default template
+# loads it unconditionally, but it's its own separate package, not pulled
+# in by the texlive-* packages above -- easy to miss on a fresh install
+# (a real CI run without it failed at this step; likely "File
+# `lmodern.sty' not found", the standard symptom of a missing lmodern
+# package, though the exact log wasn't accessible to confirm).
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
