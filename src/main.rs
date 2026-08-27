@@ -2830,6 +2830,12 @@ impl eframe::App for HpsdrApp {
 
                         // ADC front-end overload -- see
                         // RadioSession::adc0_overload's doc comment.
+                        // Reserves this row's height unconditionally (a
+                        // real report: this message popping in and out
+                        // was pushing the Settings/Add Receiver buttons
+                        // below it up and down) rather than only
+                        // allocating a row when there's something to
+                        // show.
                         let adc0_ov = connected
                             .session
                             .adc0_overload
@@ -2838,6 +2844,11 @@ impl eframe::App for HpsdrApp {
                             .session
                             .adc1_overload
                             .load(std::sync::atomic::Ordering::Relaxed);
+                        let line_height = ui.text_style_height(&egui::TextStyle::Body);
+                        let (row_rect, _resp) = ui.allocate_exact_size(
+                            egui::vec2(180.0, line_height),
+                            egui::Sense::hover(),
+                        );
                         if adc0_ov || adc1_ov {
                             let text = if adc0_ov && adc1_ov {
                                 "ADC0+ADC1 OVERLOAD"
@@ -2846,11 +2857,19 @@ impl eframe::App for HpsdrApp {
                             } else {
                                 "ADC1 OVERLOAD"
                             };
-                            ui.colored_label(egui::Color32::from_rgb(255, 60, 60), text);
+                            ui.painter().text(
+                                row_rect.left_center(),
+                                egui::Align2::LEFT_CENTER,
+                                text,
+                                egui::TextStyle::Body.resolve(ui.style()),
+                                egui::Color32::from_rgb(255, 60, 60),
+                            );
                         }
 
                         // TX FIFO overrun/underrun -- see
                         // RadioSession::tx_fifo_underrun's doc comment.
+                        // Same fixed-height-row treatment as the ADC
+                        // overload row above, for the same reason.
                         let fifo_under = connected
                             .session
                             .tx_fifo_underrun
@@ -2862,6 +2881,10 @@ impl eframe::App for HpsdrApp {
                         if fifo_under || fifo_over {
                             connected.tx_fifo_warning_until = Some(Instant::now() + Duration::from_secs(2));
                         }
+                        let (fifo_row_rect, _resp) = ui.allocate_exact_size(
+                            egui::vec2(180.0, line_height),
+                            egui::Sense::hover(),
+                        );
                         if let Some(until) = connected.tx_fifo_warning_until {
                             if Instant::now() < until {
                                 let text = if fifo_under && fifo_over {
@@ -2871,7 +2894,13 @@ impl eframe::App for HpsdrApp {
                                 } else {
                                     "TX Overrun"
                                 };
-                                ui.colored_label(egui::Color32::from_rgb(255, 60, 60), text);
+                                ui.painter().text(
+                                    fifo_row_rect.left_center(),
+                                    egui::Align2::LEFT_CENTER,
+                                    text,
+                                    egui::TextStyle::Body.resolve(ui.style()),
+                                    egui::Color32::from_rgb(255, 60, 60),
+                                );
                             } else {
                                 connected.tx_fifo_warning_until = None;
                             }
