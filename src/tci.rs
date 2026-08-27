@@ -835,10 +835,10 @@ fn handle_client(
                 // is exactly the timing distortion reported. Only the
                 // announced `length` value changes here -- the actual
                 // payload (`&stereo`) and its real sample count are
-                // untouched, so this doesn't affect TCI Remote's own IQ
-                // streaming (still frame-pair count below, unconfirmed
-                // either way and not reported broken) or the real audio
-                // content itself.
+                // untouched, so this doesn't affect the real audio
+                // content itself. The IQ stream below got the identical
+                // fix later, once a client hit the same issue there too
+                // -- see its own doc comment.
                 let msg = encode_binary_message(
                     0,
                     TCI_AUDIO_SAMPLE_RATE,
@@ -869,11 +869,31 @@ fn handle_client(
                 // explicitly ("SWAP: Push Q then I"), not I before Q
                 // as would be the naive/obvious order.
                 let swapped: Vec<(f32, f32)> = pairs.into_iter().map(|(i, q)| (q, i)).collect();
+                // BUG FIX: `length` here used to be swapped.len() (frame-
+                // pair count), matching rustyHPSDR's own convention
+                // (confirmed working against TCI Remote) -- same
+                // reasoning as the audio stream's own identical fix
+                // above, which was deliberately NOT extended to IQ at
+                // the time since nothing had reported it broken. A real
+                // report since then: "TCI Remote Compactor" (a separate
+                // bridge app, re-encoding TCI for a bandwidth-constrained
+                // link to a remote TCI Remote client -- not TCI Remote
+                // itself) kept re-sending iq_start every few hundred ms
+                // after already receiving "first IQ data sent" and
+                // getting no closer, then giving up and reconnecting
+                // from scratch -- audio_start was never retried the same
+                // way, pointing specifically at the IQ stream's framing,
+                // not a general connection problem. Matches the same
+                // class of bug as the WSJT-X audio report: a client
+                // reading `length` as the raw float count (both channels)
+                // reads only half the intended samples per packet.
+                // Payload (`&swapped`) and its real sample count are
+                // unchanged, only the announced `length` value.
                 let msg = encode_binary_message(
                     0,
                     sample_rate.load(Ordering::Relaxed),
                     BinaryMessageType::IqStream,
-                    swapped.len() as u32,
+                    swapped.len() as u32 * 2,
                     &swapped,
                 );
                 let result = ws.send(Message::Binary(msg.into()));
