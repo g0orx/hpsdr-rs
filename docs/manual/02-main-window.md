@@ -151,10 +151,11 @@ space each gets.
 
 Below the waterfall, **Zoom** (1x-16x, scroll-adjustable like every other
 slider in this app) narrows the visible frequency
-window symmetrically around the dial frequency; **Pan** then shifts that
-narrowed window left/right within the full receiver bandwidth (it has no
-effect at 1x zoom -- there's nothing to pan to when the full span is
-already shown). **Reset** returns to 1x/centered.
+window symmetrically around the dial frequency (or, with
+[CTUN](#ctun-click-to-tune) on, the CTUN listen frequency instead); **Pan**
+then shifts that narrowed window left/right within the full receiver
+bandwidth (it has no effect at 1x zoom -- there's nothing to pan to when
+the full span is already shown). **Reset** returns to 1x/centered.
 
 This is a real resolution increase, not just a visual stretch of the same
 data: zooming in actually grows the underlying FFT size, so the spectrum
