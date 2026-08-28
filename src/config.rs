@@ -287,6 +287,18 @@ pub struct Config {
     pub vfo_b_frequency_hz: Option<u32>,
     #[serde(default)]
     pub split: Option<bool>,
+    /// RIT / XIT -- see ConnectedState::rit_enabled/xit_enabled's doc
+    /// comments (main.rs). `None`/missing falls back to off with a
+    /// zero offset, same "a config saved before this existed shouldn't
+    /// suddenly start in RIT/XIT" reasoning as ctun/split above.
+    #[serde(default)]
+    pub rit_enabled: Option<bool>,
+    #[serde(default)]
+    pub rit_offset_hz: Option<f64>,
+    #[serde(default)]
+    pub xit_enabled: Option<bool>,
+    #[serde(default)]
+    pub xit_offset_hz: Option<f64>,
 }
 
 fn default_nb_threshold() -> f64 {
@@ -364,6 +376,12 @@ pub struct ExtraReceiverConfig {
     /// receiver's own.
     #[serde(default = "default_db_low_auto")]
     pub db_low_auto: bool,
+    /// See Config::rit_enabled's doc comment -- same thing, this
+    /// receiver's own. No XIT here -- extra receivers never transmit.
+    #[serde(default)]
+    pub rit_enabled: bool,
+    #[serde(default)]
+    pub rit_offset_hz: f64,
 }
 
 fn default_db_low_auto() -> bool {

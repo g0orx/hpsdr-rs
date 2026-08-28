@@ -240,6 +240,13 @@ struct ExtraReceiver {
     /// receiver instead of shared across the whole session.
     ctun: bool,
     ctun_frequency_hz: u32,
+    /// RIT ("Receiver Incremental Tuning") -- see ConnectedState::rit_enabled's
+    /// doc comment for the full explanation; same behavior here, just
+    /// per extra receiver instead of shared. No XIT here -- extra
+    /// receivers never transmit.
+    rit_enabled: bool,
+    rit_offset_hz: f64,
+    rit_scroll_accum: f32,
     open: bool,
     /// This window's current on-screen position/size, refreshed every
     /// frame it's rendered so the periodic per-radio Config save (see
@@ -440,6 +447,41 @@ struct ConnectedState {
     /// unaffected -- this app has no dual-watch/second-RX-chain
     /// concept, so VFO A keeps receiving regardless of Split.
     split: bool,
+    /// RIT ("Receiver Incremental Tuning"): when on, rit_offset_hz is
+    /// added to the RXA demod shift (see spectrum::SpectrumHandle::
+    /// set_ctun -- RIT and CTUN share WDSP's one RXA shift register, so
+    /// the per-frame block sums whichever of ctun_offset_hz/rit_offset_hz
+    /// are currently active into a single value/enable pushed there),
+    /// same DSP-only mechanism as CTUN: the hardware/LO frequency stays
+    /// fixed, only what's actually demodulated shifts. Unlike CTUN, RIT
+    /// works independently of it -- CTUN moves the *displayed* listen
+    /// point, RIT is a small fine-tuning nudge on top that never
+    /// changes VFO-A's own displayed/logged frequency, matching
+    /// standard rig convention (RIT is meant for zero-beating a
+    /// slightly-off-frequency station without touching your actual
+    /// dial or transmit frequency).
+    rit_enabled: bool,
+    rit_offset_hz: f64,
+    /// Scroll accumulator for the RIT control -- same NOTCH-based
+    /// accumulate-then-step scheme as `scroll_accum`, kept separate so
+    /// scrolling RIT/XIT/VFO-A/VFO-B can never cross-contaminate each
+    /// other's pending sub-step motion.
+    rit_scroll_accum: f32,
+    /// XIT ("Transmitter Incremental Tuning"): the TX-side equivalent of
+    /// RIT, but implemented completely differently since WDSP has no
+    /// TXA-side shift primitive (confirmed: nothing like SetRXAShiftFreq
+    /// exists for TXA in wdsp_sys). Instead xit_offset_hz is added
+    /// directly to the real tx_frequency_hz value sent to the radio's
+    /// TX NCO/register -- the same genuine-hardware-retune path Split
+    /// already uses (see `split`'s doc comment), which both protocols
+    /// keep continuously live and independent of the RX frequency
+    /// regardless of MOX state, so there's no settling-time concern
+    /// distinct from what Split already has. Composes with Split (XIT
+    /// nudges whichever TX frequency -- VFO A or, if Split is on, VFO
+    /// B -- is already selected) the same way RIT composes with CTUN.
+    xit_enabled: bool,
+    xit_offset_hz: f64,
+    xit_scroll_accum: f32,
     rigctl_addr: String,
     tci_addr: String,
     cat_addr: String,
@@ -1052,6 +1094,11 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
             // of never leaving a frequency field at a meaningless 0).
             let vfo_b_frequency_hz = cfg.vfo_b_frequency_hz.unwrap_or(initial_frequency_hz);
             let split = cfg.split.unwrap_or(false);
+            // RIT / XIT -- see ConnectedState's own doc comments.
+            let rit_enabled = cfg.rit_enabled.unwrap_or(false);
+            let rit_offset_hz = cfg.rit_offset_hz.unwrap_or(0.0);
+            let xit_enabled = cfg.xit_enabled.unwrap_or(false);
+            let xit_offset_hz = cfg.xit_offset_hz.unwrap_or(0.0);
             Ok(ConnectedState {
                 device,
                 session,
@@ -1103,6 +1150,12 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                 vfo_b_frequency_hz,
                 vfo_b_scroll_accum: 0.0,
                 split,
+                rit_enabled,
+                rit_offset_hz,
+                rit_scroll_accum: 0.0,
+                xit_enabled,
+                xit_offset_hz,
+                xit_scroll_accum: 0.0,
                 rigctl_addr,
                 tci_addr,
                 cat_addr,
@@ -1369,7 +1422,19 @@ impl eframe::App for HpsdrApp {
                     0.0
                 };
                 connected.spectrum.set_lo_frequency_hz(freq_hz as f64);
-                connected.spectrum.set_ctun(connected.ctun, ctun_offset_hz);
+                // RIT ("Receiver Incremental Tuning"): summed into the
+                // same WDSP RXA shift CTUN uses (WDSP has one shift
+                // register -- see ConnectedState::rit_enabled's doc
+                // comment) but deliberately NOT folded into
+                // ctun_offset_hz itself, which drives the visible dial
+                // line/passband overlay/zoom centering below -- RIT is
+                // meant to nudge only what's actually demodulated, never
+                // the displayed/logged frequency, matching standard rig
+                // convention.
+                let rit_offset_hz = if connected.rit_enabled { connected.rit_offset_hz } else { 0.0 };
+                connected
+                    .spectrum
+                    .set_ctun(connected.ctun || connected.rit_enabled, ctun_offset_hz + rit_offset_hz);
                 // Zoom should keep the CTUN'd listen frequency (where the
                 // filter/passband actually is) centered, not the parked
                 // hardware LO -- otherwise the filter drifts toward one
@@ -1405,6 +1470,14 @@ impl eframe::App for HpsdrApp {
                 // comment for why that's the correct precedence.
                 let tx_dial_freq_hz =
                     if connected.split { connected.vfo_b_frequency_hz } else { dial_freq_hz };
+                // XIT ("Transmitter Incremental Tuning"): nudges the real
+                // TX NCO frequency on top of whichever of Split/dial is
+                // already selected above -- see ConnectedState::
+                // xit_enabled's doc comment for why this can't be a
+                // WDSP-side shift the way RIT is (no TXA shift primitive
+                // exists in this project's WDSP bindings).
+                let xit_offset_hz = if connected.xit_enabled { connected.xit_offset_hz } else { 0.0 };
+                let tx_dial_freq_hz = (tx_dial_freq_hz as i64 + xit_offset_hz.round() as i64).max(0) as u32;
                 connected.session.tx_frequency_hz.store(tx_dial_freq_hz, std::sync::atomic::Ordering::Relaxed);
 
                 // While transmitting, show tx_spectrum (fed with the
@@ -2327,6 +2400,112 @@ impl eframe::App for HpsdrApp {
                             } else if !space_down && connected.ptt_held {
                                 connected.ptt_held = false;
                                 connected.session.set_mox(false);
+                            }
+
+                            // RIT: click toggles on/off, scroll while
+                            // hovering adjusts the offset. Placed here
+                            // next to XIT (not up by VFO A/B, where it
+                            // originally lived) at the user's own
+                            // request, for the two to read as an obvious
+                            // pair -- the tradeoff is RIT now only shows
+                            // up once TX is armed too, same as XIT,
+                            // even though RIT itself has nothing to do
+                            // with TX capability.
+                            let rit_label = if connected.rit_offset_hz == 0.0 {
+                                "RIT".to_string()
+                            } else {
+                                format!("RIT {:+.0}", connected.rit_offset_hz)
+                            };
+                            let rit_resp = ui
+                                .add(egui::Button::selectable(connected.rit_enabled, rit_label))
+                                .on_hover_text(
+                                    "Receiver Incremental Tuning -- nudges what you hear \
+                                     without moving VFO A's displayed/logged frequency. \
+                                     Scroll to adjust -- Shift: 10 Hz, none: 100 Hz.",
+                                );
+                            if rit_resp.clicked() {
+                                connected.rit_enabled = !connected.rit_enabled;
+                                settings_changed = true;
+                            }
+                            if rit_resp.hovered() {
+                                let scroll_delta = ui.input(|i| i.smooth_scroll_delta);
+                                let delta = if scroll_delta.y.abs() >= scroll_delta.x.abs() {
+                                    scroll_delta.y
+                                } else {
+                                    scroll_delta.x
+                                };
+                                if delta != 0.0 {
+                                    connected.rit_scroll_accum += delta;
+                                    const NOTCH: f32 = 50.0;
+                                    let shift = ui.input(|i| i.modifiers.shift);
+                                    let step: i64 = if shift { 10 } else { 100 };
+                                    let mut new_offset = connected.rit_offset_hz as i64;
+                                    while connected.rit_scroll_accum.abs() >= NOTCH {
+                                        let sign = connected.rit_scroll_accum.signum();
+                                        connected.rit_scroll_accum -= sign * NOTCH;
+                                        new_offset += step * sign as i64;
+                                    }
+                                    new_offset = new_offset.clamp(-9_999, 9_999);
+                                    if new_offset as f64 != connected.rit_offset_hz {
+                                        connected.rit_offset_hz = new_offset as f64;
+                                        settings_changed = true;
+                                    }
+                                }
+                            }
+                            if ui.button("Clear").on_hover_text("Zero the RIT offset").clicked() {
+                                connected.rit_offset_hz = 0.0;
+                                settings_changed = true;
+                            }
+
+                            // XIT: same click-to-toggle/hover-to-scroll
+                            // convention as RIT just above. See
+                            // ConnectedState::xit_enabled's doc comment
+                            // for how this nudges the real TX frequency.
+                            let xit_label = if connected.xit_offset_hz == 0.0 {
+                                "XIT".to_string()
+                            } else {
+                                format!("XIT {:+.0}", connected.xit_offset_hz)
+                            };
+                            let xit_resp = ui
+                                .add(egui::Button::selectable(connected.xit_enabled, xit_label))
+                                .on_hover_text(
+                                    "Transmitter Incremental Tuning -- nudges your actual TX \
+                                     frequency without moving VFO A's (or VFO B's, if Split is \
+                                     on) displayed frequency. Scroll to adjust -- Shift: 10 Hz, \
+                                     none: 100 Hz.",
+                                );
+                            if xit_resp.clicked() {
+                                connected.xit_enabled = !connected.xit_enabled;
+                                settings_changed = true;
+                            }
+                            if xit_resp.hovered() {
+                                let scroll_delta = ui.input(|i| i.smooth_scroll_delta);
+                                let delta = if scroll_delta.y.abs() >= scroll_delta.x.abs() {
+                                    scroll_delta.y
+                                } else {
+                                    scroll_delta.x
+                                };
+                                if delta != 0.0 {
+                                    connected.xit_scroll_accum += delta;
+                                    const NOTCH: f32 = 50.0;
+                                    let shift = ui.input(|i| i.modifiers.shift);
+                                    let step: i64 = if shift { 10 } else { 100 };
+                                    let mut new_offset = connected.xit_offset_hz as i64;
+                                    while connected.xit_scroll_accum.abs() >= NOTCH {
+                                        let sign = connected.xit_scroll_accum.signum();
+                                        connected.xit_scroll_accum -= sign * NOTCH;
+                                        new_offset += step * sign as i64;
+                                    }
+                                    new_offset = new_offset.clamp(-9_999, 9_999);
+                                    if new_offset as f64 != connected.xit_offset_hz {
+                                        connected.xit_offset_hz = new_offset as f64;
+                                        settings_changed = true;
+                                    }
+                                }
+                            }
+                            if ui.button("Clear").on_hover_text("Zero the XIT offset").clicked() {
+                                connected.xit_offset_hz = 0.0;
+                                settings_changed = true;
                             }
 
                             if mox_now {
@@ -4847,6 +5026,8 @@ impl eframe::App for HpsdrApp {
                                 spectrum_zoom: rx.spectrum_zoom,
                                 spectrum_pan: rx.spectrum_pan,
                                 db_low_auto: rx.db_low_auto,
+                                rit_enabled: rx.rit_enabled,
+                                rit_offset_hz: rx.rit_offset_hz,
                             }
                         })
                         .collect();
@@ -4950,6 +5131,10 @@ impl eframe::App for HpsdrApp {
                         ctun_frequency_hz: Some(connected.ctun_frequency_hz),
                         vfo_b_frequency_hz: Some(connected.vfo_b_frequency_hz),
                         split: Some(connected.split),
+                        rit_enabled: Some(connected.rit_enabled),
+                        rit_offset_hz: Some(connected.rit_offset_hz),
+                        xit_enabled: Some(connected.xit_enabled),
+                        xit_offset_hz: Some(connected.xit_offset_hz),
                     }
                     .save(connected.device.mac);
                 }
@@ -5835,7 +6020,12 @@ fn render_extra_receiver_ui(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceiver>>) {
     }
 
     rx.spectrum.set_lo_frequency_hz(freq_hz as f64);
-    rx.spectrum.set_ctun(rx.ctun, ctun_offset_hz);
+    // RIT -- see the main receiver's identical treatment for why this
+    // is summed into the WDSP shift here but NOT into ctun_offset_hz
+    // itself (which drives the visible dial/passband/zoom centering
+    // above).
+    let rit_offset_hz = if rx.rit_enabled { rx.rit_offset_hz } else { 0.0 };
+    rx.spectrum.set_ctun(rx.ctun || rx.rit_enabled, ctun_offset_hz + rit_offset_hz);
     rx.spectrum.set_zoom_pan(rx.spectrum_zoom, effective_pan);
     let dial_freq_hz = if rx.ctun { rx.ctun_frequency_hz } else { freq_hz };
 
@@ -5975,6 +6165,49 @@ fn render_extra_receiver_ui(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceiver>>) {
             .clicked()
         {
             rx.spectrum.set_agc(current_agc.next());
+            rx.settings_dirty.store(true, Ordering::Relaxed);
+        }
+        // RIT -- see the main receiver's identical treatment for the
+        // full reasoning. No XIT here -- extra receivers never transmit.
+        let rit_label = if rx.rit_offset_hz == 0.0 {
+            "RIT".to_string()
+        } else {
+            format!("RIT {:+.0}", rx.rit_offset_hz)
+        };
+        let rit_resp = ui
+            .add(egui::Button::selectable(rx.rit_enabled, rit_label))
+            .on_hover_text(
+                "Receiver Incremental Tuning -- nudges what you hear without moving the \
+                 displayed/logged frequency. Scroll to adjust -- Shift: 10 Hz, none: 100 Hz.",
+            );
+        if rit_resp.clicked() {
+            rx.rit_enabled = !rx.rit_enabled;
+            rx.settings_dirty.store(true, Ordering::Relaxed);
+        }
+        if rit_resp.hovered() {
+            let scroll_delta = ui.input(|i| i.smooth_scroll_delta);
+            let delta =
+                if scroll_delta.y.abs() >= scroll_delta.x.abs() { scroll_delta.y } else { scroll_delta.x };
+            if delta != 0.0 {
+                rx.rit_scroll_accum += delta;
+                const NOTCH: f32 = 50.0;
+                let shift = ui.input(|i| i.modifiers.shift);
+                let step: i64 = if shift { 10 } else { 100 };
+                let mut new_offset = rx.rit_offset_hz as i64;
+                while rx.rit_scroll_accum.abs() >= NOTCH {
+                    let sign = rx.rit_scroll_accum.signum();
+                    rx.rit_scroll_accum -= sign * NOTCH;
+                    new_offset += step * sign as i64;
+                }
+                new_offset = new_offset.clamp(-9_999, 9_999);
+                if new_offset as f64 != rx.rit_offset_hz {
+                    rx.rit_offset_hz = new_offset as f64;
+                    rx.settings_dirty.store(true, Ordering::Relaxed);
+                }
+            }
+        }
+        if ui.button("Clear").on_hover_text("Zero the RIT offset").clicked() {
+            rx.rit_offset_hz = 0.0;
             rx.settings_dirty.store(true, Ordering::Relaxed);
         }
     });
@@ -6702,6 +6935,10 @@ fn spawn_extra_receiver(
     let ctun = saved.map(|s| s.ctun).unwrap_or(false);
     let ctun_frequency_hz =
         if ctun { saved.map(|s| s.ctun_frequency_hz).unwrap_or(initial_frequency_hz) } else { initial_frequency_hz };
+    // Restore RIT -- see ConnectedState::rit_enabled's doc comment
+    // (same reasoning, per receiver).
+    let rit_enabled = saved.map(|s| s.rit_enabled).unwrap_or(false);
+    let rit_offset_hz = saved.map(|s| s.rit_offset_hz).unwrap_or(0.0);
 
     Some(Arc::new(Mutex::new(ExtraReceiver {
         ddc_index: idx,
@@ -6738,6 +6975,9 @@ fn spawn_extra_receiver(
         width_memory: saved.map(|s| s.width_memory.clone()).unwrap_or_default(),
         ctun,
         ctun_frequency_hz,
+        rit_enabled,
+        rit_offset_hz,
+        rit_scroll_accum: 0.0,
         open: true,
         // Live-tracked every frame from here on (see this receiver's
         // viewport closure) -- seeded from saved config too, purely so

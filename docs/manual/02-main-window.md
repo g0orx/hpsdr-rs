@@ -124,6 +124,20 @@ Transmit**):
 - **TWO TONE** -- transmits a two-tone test signal instead of a steady
   tone, also at Tune Power. This is required (not just an alternative) for
   PureSignal calibration -- see [PureSignal](09-puresignal.md).
+- **RIT** (Receiver Incremental Tuning) -- nudges what you actually hear
+  without touching VFO A's displayed or logged frequency, useful for
+  zero-beating a station that's drifted slightly off frequency without
+  moving your own dial.
+- **XIT** (Transmitter Incremental Tuning) -- the TX-side equivalent:
+  nudges your actual TX frequency without moving VFO A's (or VFO B's, if
+  Split is on) displayed frequency.
+- **RIT**/**XIT** both: click to toggle on/off; scroll while hovering to
+  adjust the offset (Shift for 10 Hz steps, otherwise 100 Hz, clamped to
+  ±9,999 Hz) -- the button's own label shows the current offset once it's
+  non-zero (e.g. **RIT +250**); **Clear** zeros it. Independent of each
+  other and of CTUN -- any combination can be on at once, and neither RIT
+  nor XIT ever moves the CTUN listen point or the displayed VFO
+  frequency.
 - **Spacebar** is a hold-to-talk shortcut for MOX, active whenever no text
   field has keyboard focus.
 
