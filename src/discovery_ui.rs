@@ -138,7 +138,12 @@ impl DiscoveryWindow {
             egui::ViewportId::from_hash_of("discovery_window"),
             egui::ViewportBuilder::default()
                 .with_title("Discover HPSDR Radios")
-                .with_inner_size([700.0, 500.0])
+                // Widened from 700 -- the Interface column now shows the
+                // interface name alongside its address (e.g. "eth0
+                // (192.168.1.50)"), which combined with the MAC column's
+                // own width was pushing the trailing Status column past
+                // the fixed window edge and clipping it.
+                .with_inner_size([900.0, 500.0])
                 .with_active(true)
                 .with_window_level(window_level),
             |ui, _class| {
