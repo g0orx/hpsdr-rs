@@ -3056,34 +3056,11 @@ impl eframe::App for HpsdrApp {
                     }
                     let x_dial = x_for_offset(ctun_offset_hz);
 
-                    let num_freq_ticks = 10;
-                    for t in 0..num_freq_ticks {
-                        let frac = t as f32 / (num_freq_ticks - 1) as f32;
-                        let x = rect.left() + frac * rect.width();
-                        ui.painter().line_segment(
-                            [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
-                            egui::Stroke::new(1.0, egui::Color32::from_gray(55)),
-                        );
-                        // Skip the label at the first/last tick -- right at
-                        // the plot's edge, it either gets clipped or hangs
-                        // off into the surrounding UI.
-                        if t == 0 || t == num_freq_ticks - 1 {
-                            continue;
-                        }
-                        let tick_freq_hz = view_center_hz - visible_half_span_hz
-                            + frac as f64 * (2.0 * visible_half_span_hz);
-                        ui.painter().text(
-                            egui::pos2(x + 2.0, rect.bottom() - 2.0),
-                            egui::Align2::LEFT_BOTTOM,
-                            // Label shown in RF space when a transverter is
-                            // active (see xvtr_rf_offset_hz's doc comment
-                            // above) -- the tick's x position stays in real
-                            // IF space, only the printed number shifts.
-                            format_khz(tick_freq_hz + xvtr_rf_offset_hz as f64),
-                            egui::FontId::monospace(13.0),
-                            egui::Color32::GRAY,
-                        );
-                    }
+                    // Label shown in RF space when a transverter is active
+                    // (see xvtr_rf_offset_hz's doc comment above) -- tick
+                    // x positions stay in real IF space, only the printed
+                    // numbers shift.
+                    draw_freq_axis_ticks(ui.painter(), rect, view_center_hz, visible_half_span_hz, xvtr_rf_offset_hz);
 
                     if spectrum_row.len() > 1 {
                         let range = (db_high - db_low).max(1.0);
@@ -3174,7 +3151,12 @@ impl eframe::App for HpsdrApp {
 
                     if let Some(pos) = spectrum_resp.hover_pos() {
                         let hover_freq = freq_at_x(pos.x, rect, freq_hz, sample_rate, connected.spectrum_zoom, pan_offset_hz);
-                        draw_freq_hover_tooltip(ui.painter(), pos, hover_freq);
+                        // Shown in RF space when a transverter is active --
+                        // see xvtr_rf_offset_hz's doc comment -- matching
+                        // the frequency-axis tick labels, which get the
+                        // same treatment.
+                        let hover_freq_shown = (hover_freq as i64 + xvtr_rf_offset_hz).clamp(0, u32::MAX as i64) as u32;
+                        draw_freq_hover_tooltip(ui.painter(), pos, hover_freq_shown);
                     }
 
                     if spectrum_waterfall_divider(
@@ -3249,7 +3231,9 @@ impl eframe::App for HpsdrApp {
                     }
                     if let Some(pos) = waterfall_click_resp.hover_pos() {
                         let hover_freq = freq_at_x(pos.x, rect, freq_hz, sample_rate, connected.spectrum_zoom, pan_offset_hz);
-                        draw_freq_hover_tooltip(ui.painter(), pos, hover_freq);
+                        // See the spectrum pane's identical treatment above.
+                        let hover_freq_shown = (hover_freq as i64 + xvtr_rf_offset_hz).clamp(0, u32::MAX as i64) as u32;
+                        draw_freq_hover_tooltip(ui.painter(), pos, hover_freq_shown);
                     }
 
                     ui.horizontal(|ui| {
@@ -5574,9 +5558,85 @@ impl eframe::App for HpsdrApp {
     }
 }
 
-/// Compact axis-label format, e.g. 7,100,000 Hz -> "7100.0k".
+/// Compact axis-label format, e.g. 7,100,000 Hz -> "7100.0" (kHz, no
+/// unit suffix -- the frequency's own magnitude already makes the unit
+/// obvious in context).
 fn format_khz(hz: f64) -> String {
-    format!("{:.1}k", hz / 1000.0)
+    format!("{:.1}", hz / 1000.0)
+}
+
+/// Picks a "nice" round tick-spacing step (a 1-2-5 progression, e.g. 1k,
+/// 2k, 5k, 10k, 20k...) close to `visible_span_hz / target_ticks`, so
+/// frequency-axis gridlines land on round boundaries instead of whatever
+/// arbitrary frequency happens to fall at an evenly-spaced pixel fraction
+/// -- confirmed as a real problem via a user report of ticks reading
+/// "144021.3k" (an XVTR band, but the same imprecision existed on plain
+/// IF too, just less visible with smaller numbers).
+fn nice_tick_step_hz(visible_span_hz: f64, target_ticks: f64) -> f64 {
+    let raw_step = visible_span_hz / target_ticks.max(1.0);
+    if !raw_step.is_finite() || raw_step <= 0.0 {
+        return 1000.0;
+    }
+    let magnitude = 10f64.powf(raw_step.log10().floor());
+    let residual = raw_step / magnitude;
+    let nice_residual = if residual < 1.5 {
+        1.0
+    } else if residual < 3.5 {
+        2.0
+    } else if residual < 7.5 {
+        5.0
+    } else {
+        10.0
+    };
+    nice_residual * magnitude
+}
+
+/// Draws the frequency-axis gridlines/labels along the bottom of a
+/// spectrum/waterfall pane, snapped to nice_tick_step_hz boundaries
+/// rather than evenly-spaced pixel fractions (see its doc comment). A
+/// margin near each edge skips labels that would otherwise get clipped
+/// or hang off into the surrounding UI -- expressed as a fraction of the
+/// span rather than a fixed tick index, since ticks are no longer evenly
+/// spaced. `rf_offset_hz` shifts only the printed label (RF space when a
+/// transverter is active), never the tick's real IF-space x position --
+/// same convention as draw_band_edge_markers (0 for callers with no XVTR
+/// concept, e.g. extra receiver windows).
+fn draw_freq_axis_ticks(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    view_center_hz: f64,
+    visible_half_span_hz: f64,
+    rf_offset_hz: i64,
+) {
+    let step_hz = nice_tick_step_hz(2.0 * visible_half_span_hz, 8.0);
+    let range_start = view_center_hz - visible_half_span_hz;
+    let range_end = view_center_hz + visible_half_span_hz;
+    let edge_margin_hz = 2.0 * visible_half_span_hz * 0.03;
+    let mut f = (range_start / step_hz).ceil() * step_hz;
+    while f <= range_end {
+        let frac = ((f - range_start) / (2.0 * visible_half_span_hz)) as f32;
+        let x = rect.left() + frac * rect.width();
+        painter.line_segment(
+            [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
+            egui::Stroke::new(1.0, egui::Color32::from_gray(55)),
+        );
+        if f - range_start >= edge_margin_hz && range_end - f >= edge_margin_hz {
+            let label_freq = f + rf_offset_hz as f64;
+            let label = if step_hz >= 1000.0 {
+                format!("{:.0}", label_freq / 1000.0)
+            } else {
+                format!("{:.1}", label_freq / 1000.0)
+            };
+            painter.text(
+                egui::pos2(x + 2.0, rect.bottom() - 2.0),
+                egui::Align2::LEFT_BOTTOM,
+                label,
+                egui::FontId::monospace(13.0),
+                egui::Color32::GRAY,
+            );
+        }
+        f += step_hz;
+    }
 }
 
 /// Height of the draggable divider between the spectrum and waterfall
@@ -6675,29 +6735,9 @@ fn render_extra_receiver_ui(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceiver>>) {
 
     draw_band_edge_markers(ui.painter(), rect, view_center_hz, visible_half_span_hz, &[]);
 
-    let num_freq_ticks = 10;
-    for t in 0..num_freq_ticks {
-        let frac = t as f32 / (num_freq_ticks - 1) as f32;
-        let x = rect.left() + frac * rect.width();
-        ui.painter().line_segment(
-            [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
-            egui::Stroke::new(1.0, egui::Color32::from_gray(55)),
-        );
-        // Skip the label at the first/last tick -- see the main window's
-        // identical treatment.
-        if t == 0 || t == num_freq_ticks - 1 {
-            continue;
-        }
-        let tick_freq_hz =
-            view_center_hz - visible_half_span_hz + frac as f64 * (2.0 * visible_half_span_hz);
-        ui.painter().text(
-            egui::pos2(x + 2.0, rect.bottom() - 2.0),
-            egui::Align2::LEFT_BOTTOM,
-            format_khz(tick_freq_hz),
-            egui::FontId::monospace(13.0),
-            egui::Color32::GRAY,
-        );
-    }
+    // No XVTR concept for extra receivers -- see draw_freq_axis_ticks's
+    // doc comment.
+    draw_freq_axis_ticks(ui.painter(), rect, view_center_hz, visible_half_span_hz, 0);
 
     // Filter passband overlay, same as the main window.
     let x_for_offset = |offset_hz: f64| -> f32 {
