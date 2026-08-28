@@ -666,7 +666,11 @@ struct ConnectedState {
     /// SET) if the real IF drifts outside the active XVTR's own IF range
     /// -- e.g. scrolled or CAT-tuned far enough away -- so this can't get
     /// stuck showing a stale transverter label indefinitely; see the
-    /// per-frame reconciliation block for that fallback.
+    /// per-frame reconciliation block for that fallback. Persisted
+    /// verbatim (Config::active_xvtr) -- safe to restore as-is since it's
+    /// explicit state, not re-derived from the restored frequency; the
+    /// same auto-clear check handles a since-renamed/removed/out-of-range
+    /// slot on the very first frame either way.
     active_xvtr: Option<String>,
     /// Upper bound (watts) for the main panel's TX Power slider. The
     /// discovery protocol only reports board *type* (Boards), not the
@@ -1308,11 +1312,11 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                     xvtrs.resize_with(MAX_XVTRS, Xvtr::default);
                     xvtrs
                 },
-                // Not persisted -- see active_xvtr's doc comment ("never
-                // automatically SET, only explicit"). A fresh connect
-                // always starts on plain hardware-IF display; click the
-                // XVTR button again if you want it back.
-                active_xvtr: None,
+                // Restored verbatim as explicit state -- see Config::
+                // active_xvtr's doc comment for why this doesn't
+                // reintroduce the frequency-inference ambiguity
+                // active_xvtr itself exists to avoid.
+                active_xvtr: cfg.active_xvtr.clone(),
                 max_tx_power_watts: cfg
                     .max_tx_power_watts
                     .unwrap_or_else(|| default_max_tx_power_watts(device.board)),
@@ -5463,6 +5467,7 @@ impl eframe::App for HpsdrApp {
                         xit_enabled: Some(connected.xit_enabled),
                         xit_offset_hz: Some(connected.xit_offset_hz),
                         xvtrs: connected.xvtrs.clone(),
+                        active_xvtr: connected.active_xvtr.clone(),
                     }
                     .save(connected.device.mac);
                 }

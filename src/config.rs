@@ -306,6 +306,20 @@ pub struct Config {
     /// added to this struct.
     #[serde(default)]
     pub xvtrs: Vec<crate::Xvtr>,
+    /// Name of the XVTR slot that was active/displayed-through at last
+    /// disconnect, if any -- see main.rs's ConnectedState::active_xvtr
+    /// doc comment. `#[serde(default)]` so configs saved before this
+    /// existed just start with no transverter active, same as every
+    /// other feature added to this struct. Restoring this is safe (won't
+    /// reintroduce the ambiguity active_xvtr itself exists to avoid)
+    /// because it's restored verbatim as explicit state, not re-derived
+    /// from the restored frequency -- and if the named slot no longer
+    /// exists, or the restored frequency no longer falls within its
+    /// range (e.g. its settings changed since), the very first frame's
+    /// own auto-clear check (see the per-frame reconciliation block)
+    /// clears it right back to None.
+    #[serde(default)]
+    pub active_xvtr: Option<String>,
 }
 
 fn default_nb_threshold() -> f64 {
