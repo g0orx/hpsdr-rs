@@ -463,119 +463,91 @@ fn handle_client(
 
     // Best-effort initial state push -- see module-level note.
     //
-    // BUG FIX: this used to stop at trx:, missing the `start;`/`ready;`
-    // handshake messages entirely. Confirmed against rustyHPSDR's own
-    // TCI server (~/github/rustyHPSDR/src/tci/mod.rs, proven working
-    // against real TCI clients): its init sequence explicitly sends
-    // `"start;"` then `"ready;"` after the initial state. A real report
-    // of WSJT-X connecting, streaming data successfully for a while,
-    // then showing "TCI SDR is not switched on" is consistent with a
-    // client-side state machine that's waiting for that `start;`
-    // signal and eventually times out/gives up without it -- this
-    // project never sent it at all. `device:` added alongside it since
-    // it's part of the same reference sequence and cheap/harmless for
-    // any client that reads it.
+    // REORDERED to match a real Thetis TCI session log's actual
+    // sequence closely, not just its content -- a prior pass (see the
+    // BUG FIX comments retained below on the individual fields that
+    // pass added) matched Thetis's full field list but kept this
+    // project's own original ordering (protocol/device first, ready;/
+    // start; near the end), and a client ("TCI Remote Compactor", a
+    // bandwidth-compacting relay, not TCI Remote itself) still kept
+    // reconnecting every 1-3s even with every field present -- ruling
+    // out "missing content" as the cause. Thetis's own reference
+    // sequence sends tx_profile_ex/tx_profiles_ex FIRST, ready;/start;
+    // (that order, not start;/ready;) right after the client's own
+    // ready/start, and protocol:/device: LAST -- the opposite of what
+    // this project was doing. device: specifically was never actually
+    // sent at all despite an earlier comment here claiming it was
+    // "added alongside" protocol -- confirmed missing by grep, not just
+    // reasoning; Thetis's reference explicitly includes it.
+    //
+    // The start;/ready; ORDER swap is the one change here with a small
+    // known regression risk: the original start;-then-ready; order was
+    // copied from rustyHPSDR while fixing a real WSJT-X report ("TCI
+    // SDR is not switched on"), but that report was about start;
+    // missing entirely, not about its position relative to ready; --
+    // there's no independent confirmation the order itself mattered to
+    // WSJT-X, so matching Thetis (whose protocol identity this project
+    // already claims via PROTOCOL_MESSAGE) is the more consistent
+    // choice if this needs to be picked one way.
     let freq = rx_frequency_hz.load(Ordering::Relaxed);
     let params = *demod_params.lock().unwrap().clone().lock().unwrap();
     let mode = params.mode;
-    let _ = ws.send(Message::Text(PROTOCOL_MESSAGE.into()));
-    // Remaining Initialization commands (spec section 4.1) beyond
-    // protocol/device -- previously not sent at all (this file's own
-    // module note flagged the full handshake as an unconfirmed
-    // reconstruction; the real spec fills these in). VFO_LIMITS mirrors
-    // rigctl.rs's own permissive 0Hz-4GHz range (see its dump_state's
-    // doc comment) rather than modeling exact hardware limits, for the
-    // same reason: no single value is right for every supported board/
-    // filter combination, and a wide-open range never incorrectly
-    // rejects a client's request. RECEIVE_ONLY:false -- this project
-    // always has TX support wired up (Settings -> TX gates actual PTT,
-    // not the protocol handshake). TRX_COUNT/CHANNEL_COUNT:1 -- TCI
-    // (unlike rigctl) has no second-VFO/extra-receiver concept
-    // implemented here; see this file's module note on trx always
-    // being 0. MODULATIONS_LIST uses the canonical spellings
-    // tci_to_mode below actually keys on, not its aliases (CWR/PKTUSB/
-    // PKTLSB/WFM).
-    let _ = ws.send(Message::Text("vfo_limits:0,4000000000;".into()));
-    let _ = ws.send(Message::Text("trx_count:1;".into()));
-    let _ = ws.send(Message::Text("channel_count:1;".into()));
-    let _ = ws.send(Message::Text("receive_only:false;".into()));
-    // BUG FIX: none of these seven were ever sent -- confirmed missing
-    // by direct comparison against Thetis's own TCI server
-    // (TCIServer.cs's sendInitialisationData/sendInitialState), while
-    // chasing a real report of WSJT-X-over-TCI TX audio being
-    // consistently splattered against this project, reproduced
-    // independently against Thetis itself in its NATIVE handshake
-    // (proving it isn't specific to this project's own bugs) but NOT
-    // once Thetis's handshake was complete. TX_ENABLE in particular is
-    // spec-explicit about its purpose (section 4.3): "informs clients
-    // that TX is enabled... sent to the client when connected... in
-    // case transmitter permission was changed" -- i.e. tells the
-    // client whether it's allowed to transmit at all, which this
-    // project never told it. AUDIO_SAMPLERATE/IQ_SAMPLERATE and the
-    // four audio-stream parameters below are, per spec, normally
-    // client-to-server -- but Thetis proactively announces its own
-    // values for them at connect too (sensible defaults a client can
-    // still override), and a client that reads these rather than
+    let (pb_low, pb_high) = passband_for(mode, params.width_hz);
+    let nb_on = params.noise_blanker != NoiseBlanker::Off;
+    let nr_on = params.noise_reduction != NoiseReduction::Off;
+
+    // This project has no real TX-profile concept (Thetis-style PA/EQ
+    // profile switching) -- "Default" is a static, harmless stand-in.
+    let _ = ws.send(Message::Text("tx_profile_ex:Default;".into()));
+    let _ = ws.send(Message::Text("tx_profiles_ex:Default;".into()));
+    let _ = ws.send(Message::Text("ready;".into()));
+    let _ = ws.send(Message::Text("start;".into()));
+
+    // TX_ENABLE (spec section 4.3): "informs clients that TX is
+    // enabled... sent to the client when connected... in case
+    // transmitter permission was changed" -- i.e. tells the client
+    // whether it's allowed to transmit at all. AUDIO_SAMPLERATE/
+    // IQ_SAMPLERATE and the four audio-stream parameters are, per spec,
+    // normally client-to-server -- but Thetis proactively announces its
+    // own values for them at connect too (sensible defaults a client
+    // can still override), and a client that reads these rather than
     // assuming its own defaults would otherwise silently disagree with
-    // this project's real values.
-    //
-    // AUDIO_STREAM_SAMPLES tracks TCI_TX_AUDIO_CHUNK (this project's own
-    // real per-reply request size -- see that constant's doc comment for
-    // the full back-and-forth on what value actually belongs here).
-    let _ = ws.send(Message::Text("tx_enable:0,true;".into()));
+    // this project's real values. AUDIO_STREAM_SAMPLES tracks
+    // TCI_TX_AUDIO_CHUNK (this project's own real per-reply request
+    // size -- see that constant's doc comment for the full back-and-
+    // forth on what value actually belongs here).
+    let _ = ws.send(Message::Text("mon_volume:0.0;".into()));
+    let _ = ws.send(Message::Text("mon_enable:false;".into()));
+    let _ = ws.send(Message::Text("tune:0,false;".into()));
+    let _ = ws.send(Message::Text("rx_mute:0,false;".into()));
+    let _ = ws.send(Message::Text("mute:false;".into()));
+    let _ = ws.send(Message::Text("tx_stream_audio_buffering:50;".into()));
+    let _ = ws.send(Message::Text(
+        format!("audio_stream_samples:{TCI_TX_AUDIO_CHUNK};").into(),
+    ));
+    let _ = ws.send(Message::Text("audio_stream_channels:2;".into()));
+    let _ = ws.send(Message::Text("audio_stream_sample_type:float32;".into()));
     let _ = ws.send(Message::Text(
         format!("audio_samplerate:{TCI_AUDIO_SAMPLE_RATE};").into(),
     ));
     let _ = ws.send(Message::Text(
         format!("iq_samplerate:{};", sample_rate.load(Ordering::Relaxed)).into(),
     ));
-    let _ = ws.send(Message::Text("audio_stream_sample_type:float32;".into()));
-    let _ = ws.send(Message::Text("audio_stream_channels:2;".into()));
-    let _ = ws.send(Message::Text(
-        format!("audio_stream_samples:{TCI_TX_AUDIO_CHUNK};").into(),
-    ));
-    let _ = ws.send(Message::Text("tx_stream_audio_buffering:50;".into()));
-    let _ = ws.send(Message::Text(
-        "modulations_list:LSB,USB,DSB,CW,AM,NFM,DIGU,DIGL,SAM;".into(),
-    ));
-    let _ = ws.send(Message::Text(format!("vfo:0,0,{freq};").into()));
-    let _ = ws.send(Message::Text(format!("modulation:0,{};", mode_to_tci(mode)).into()));
+    let _ = ws.send(Message::Text("iq_stop:0;".into()));
     let _ = ws.send(Message::Text(
         format!("trx:0,{};", mox.load(Ordering::Relaxed)).into(),
     ));
-    // BUG FIX: this project's initial state push still stopped well
-    // short of Thetis's own -- confirmed by direct comparison against a
-    // real Thetis TCI session log, captured specifically because "TCI
-    // Remote Compactor" (a bandwidth-compacting relay client, not TCI
-    // Remote itself) kept reconnecting every ~6s without ever settling
-    // into a stable session against this project, despite audio/IQ
-    // genuinely flowing each time -- consistent with a client state
-    // machine built against Thetis's much fuller handshake, waiting on
-    // fields this project never sent at all, timing out, and retrying.
-    // Real values below where this project actually tracks the
-    // underlying state (filter passband, AGC mode, noise blanker/
-    // reduction, CTUN, audio gain); a safe/neutral static default
-    // (matching Thetis's own example values where they're clearly just
-    // "off"/"none") for features this project doesn't implement at all
-    // (CW keyer, VFO lock, RIT/XIT, squelch, calibration, preamp/step
-    // attenuator, TX profiles) -- there's no real value to report for a
-    // feature that doesn't exist here, but answering with a harmless
-    // default is still better than the client getting no reply at all
-    // to a field it expects. Channel 0 only, matching this project's
-    // own trx_count:1/channel_count:1 self-declaration above.
-    let (pb_low, pb_high) = passband_for(mode, params.width_hz);
-    let nb_on = params.noise_blanker != NoiseBlanker::Off;
-    let nr_on = params.noise_reduction != NoiseReduction::Off;
-    let _ = ws.send(Message::Text("mon_volume:0.0;".into()));
-    let _ = ws.send(Message::Text("mon_enable:false;".into()));
-    let _ = ws.send(Message::Text("tune:0,false;".into()));
-    let _ = ws.send(Message::Text("rx_mute:0,false;".into()));
-    let _ = ws.send(Message::Text("mute:false;".into()));
-    let _ = ws.send(Message::Text("iq_stop:0;".into()));
     let _ = ws.send(Message::Text("tune_drive:0,50;".into()));
     let _ = ws.send(Message::Text("drive:0,50;".into()));
     let _ = ws.send(Message::Text("rx_channel_enable:0,0,true;".into()));
+    let _ = ws.send(Message::Text("tx_enable:0,true;".into()));
     let _ = ws.send(Message::Text("split_enable:0,false;".into()));
+    // No real value to report for features this project doesn't
+    // implement at all (CW keyer, squelch, VFO lock, RIT/XIT,
+    // calibration, preamp/step attenuator) -- a safe/neutral static
+    // default (matching Thetis's own example values where they're
+    // clearly just "off"/"none") still beats the client getting no
+    // reply at all to a field it expects.
     let _ = ws.send(Message::Text("sql_level:0,-140;".into()));
     let _ = ws.send(Message::Text("sql_enable:0,false;".into()));
     let _ = ws.send(Message::Text("lock:0,false;".into()));
@@ -583,8 +555,11 @@ fn handle_client(
     let _ = ws.send(Message::Text("rit_offset:0,0;".into()));
     let _ = ws.send(Message::Text("xit_enable:0,false;".into()));
     let _ = ws.send(Message::Text("rit_enable:0,false;".into()));
-    let _ = ws.send(Message::Text("tx_profile_ex:Default;".into()));
-    let _ = ws.send(Message::Text("tx_profiles_ex:Default;".into()));
+    // Real values below where this project actually tracks the
+    // underlying state (CTUN, AGC mode, noise blanker/reduction, audio
+    // gain, filter passband, frequency/mode/dds). Channel 0 only,
+    // matching this project's own trx_count:1/channel_count:1
+    // self-declaration below.
     let _ = ws.send(Message::Text(format!("rx_ctun_ex:0,{};", params.ctun).into()));
     let _ = ws.send(Message::Text("fm_deviation_ex:0,5000;".into()));
     let _ = ws.send(Message::Text("agc_auto_ex:0,false;".into()));
@@ -609,12 +584,33 @@ fn handle_client(
     let _ = ws.send(Message::Text(
         format!("rx_filter_band:0,{},{};", pb_low.round() as i64, pb_high.round() as i64).into(),
     ));
+    let _ = ws.send(Message::Text(format!("modulation:0,{};", mode_to_tci(mode)).into()));
     let _ = ws.send(Message::Text(format!("tx_frequency:{freq};").into()));
-    let _ = ws.send(Message::Text(format!("dds:0,{freq};").into()));
+    let _ = ws.send(Message::Text(format!("vfo:0,0,{freq};").into()));
     let _ = ws.send(Message::Text("if:0,0,0;".into()));
+    let _ = ws.send(Message::Text(format!("dds:0,{freq};").into()));
+    // MODULATIONS_LIST uses the canonical spellings tci_to_mode below
+    // actually keys on, not its aliases (CWR/PKTUSB/PKTLSB/WFM).
+    // IF_LIMITS/VFO_LIMITS: VFO_LIMITS mirrors rigctl.rs's own
+    // permissive 0Hz-4GHz range (see its dump_state's doc comment)
+    // rather than modeling exact hardware limits -- no single value is
+    // right for every supported board/filter combination, and a
+    // wide-open range never incorrectly rejects a client's request.
+    // RECEIVE_ONLY:false -- this project always has TX support wired
+    // up (Settings -> TX gates actual PTT, not the protocol handshake).
+    // TRX_COUNT/CHANNEL_COUNT:1 -- TCI (unlike rigctl) has no second-
+    // VFO/extra-receiver concept implemented here; see this file's
+    // module note on trx always being 0.
+    let _ = ws.send(Message::Text(
+        "modulations_list:LSB,USB,DSB,CW,AM,NFM,DIGU,DIGL,SAM;".into(),
+    ));
     let _ = ws.send(Message::Text("if_limits:-96000,96000;".into()));
-    let _ = ws.send(Message::Text("start;".into()));
-    let _ = ws.send(Message::Text("ready;".into()));
+    let _ = ws.send(Message::Text("vfo_limits:0,4000000000;".into()));
+    let _ = ws.send(Message::Text("channel_count:1;".into()));
+    let _ = ws.send(Message::Text("trx_count:1;".into()));
+    let _ = ws.send(Message::Text("receive_only:false;".into()));
+    let _ = ws.send(Message::Text("device:hpsdr-rs;".into()));
+    let _ = ws.send(Message::Text(PROTOCOL_MESSAGE.into()));
 
     // Per-client streaming state -- audio defaults to ON (see below),
     // IQ defaults to OFF, only enabled by an explicit iq_start. This
