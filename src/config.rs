@@ -299,6 +299,13 @@ pub struct Config {
     pub xit_enabled: Option<bool>,
     #[serde(default)]
     pub xit_offset_hz: Option<f64>,
+    /// Configured transverters (up to 8, see main.rs's MAX_XVTRS) -- see
+    /// main.rs's Xvtr struct doc comment. An empty `name` marks an unused
+    /// slot. `#[serde(default)]` so configs saved before this existed just
+    /// load with no transverters defined, same as every other feature
+    /// added to this struct.
+    #[serde(default)]
+    pub xvtrs: Vec<crate::Xvtr>,
 }
 
 fn default_nb_threshold() -> f64 {

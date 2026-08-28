@@ -77,6 +77,91 @@ fn resolved_pa_gain_db(pa_calibration: &std::collections::HashMap<String, f32>, 
         .unwrap_or(radio::DEFAULT_PA_GAIN_DB)
 }
 
+/// Maximum number of transverter (XVTR) slots -- matches what was asked
+/// for (piHPSDR itself currently allows 10, but there's nothing special
+/// about that number; this is just a fixed-size settings-UI/config cap).
+const MAX_XVTRS: usize = 8;
+
+/// A user-configured transverter: converts the radio's real tunable range
+/// (its IF -- e.g. 28-29.7MHz on 10m) to some other displayed/operating
+/// frequency (RF -- e.g. 144-144.5MHz on 2m) via an external analog box.
+/// `RF = IF + lo_offset_hz + lo_error_hz` -- a pure additive shift, no
+/// scaling, which is why this doesn't need to touch any DSP/WDSP/spectrum-
+/// FFT code (see xvtr_for_rf_freq's and ConnectedState::active_xvtr's doc
+/// comments): only
+/// *absolute* frequency values (display, CAT/rigctl/TCI reporting, band-
+/// button targets) need converting, every delta-based mechanism (scroll,
+/// click-drag, CTUN/RIT shift math, zoom/pan) is unaffected.
+///
+/// `lo_offset_hz`/`lo_error_hz` are kept as two separate fields (matching
+/// piHPSDR's own `frequencyLO`/`errorLO`) rather than one: `lo_offset_hz`
+/// is the transverter's nominal/documented LO, `lo_error_hz` a small
+/// trim for whatever that LO actually measures in practice.
+///
+/// An empty `name` marks an unused slot (same convention piHPSDR's own
+/// XVTR menu uses) -- `frequency_min_hz`/`frequency_max_hz` etc are
+/// meaningless until a name is set.
+///
+/// Deliberately u32 (not u64) for frequency_min_hz/frequency_max_hz,
+/// matching every other frequency field in this project -- covers
+/// roughly 2m through 9cm transverters (the overwhelming majority of
+/// real-world use), but NOT microwave/QO-100-class transverters
+/// (10.489GHz), which would overflow u32. A full u64 migration would
+/// touch a very large number of already-carefully-tuned call sites
+/// throughout this project for a use case most users won't hit.
+///
+/// No PA-calibration-table entry and no S-meter/panadapter gain-
+/// calibration field (piHPSDR's `gaincalib`) -- transverter drive is set
+/// directly via the existing TX Power slider (uncalibrated; watts-based
+/// calibration doesn't mean anything for a transverter's mW-level IF
+/// input), and this project's meter/spectrum display isn't calibrated to
+/// absolute dBm in the first place, so a gain-calibration field would have
+/// no meaningful effect.
+///
+/// Scoped to the main receiver only for now -- extra receiver windows
+/// keep operating in raw hardware-LO space, unaffected by any configured
+/// XVTR.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+pub struct Xvtr {
+    pub name: String,
+    pub frequency_min_hz: u32,
+    pub frequency_max_hz: u32,
+    pub lo_offset_hz: i64,
+    pub lo_error_hz: i64,
+    pub disable_pa: bool,
+    pub default_mode: spectrum::Mode,
+}
+
+impl Default for Xvtr {
+    fn default() -> Self {
+        Xvtr {
+            name: String::new(),
+            frequency_min_hz: 0,
+            frequency_max_hz: 0,
+            lo_offset_hz: 0,
+            lo_error_hz: 0,
+            disable_pa: true,
+            default_mode: spectrum::Mode::Usb,
+        }
+    }
+}
+
+/// The RF-space offset a transverter applies: `RF = IF + this`. Trivial,
+/// but named so every call site reads the same way.
+fn xvtr_rf_offset(xvtr: &Xvtr) -> i64 {
+    xvtr.lo_offset_hz + xvtr.lo_error_hz
+}
+
+/// Finds the configured transverter (if any) whose *RF* range contains
+/// `rf_freq_hz` -- used at the "set" boundary (CAT/rigctl/TCI set-
+/// frequency, XVTR band-button clicks), where the incoming value is
+/// already in RF/displayed space.
+fn xvtr_for_rf_freq(xvtrs: &[Xvtr], rf_freq_hz: u32) -> Option<&Xvtr> {
+    xvtrs
+        .iter()
+        .find(|x| !x.name.is_empty() && rf_freq_hz >= x.frequency_min_hz && rf_freq_hz <= x.frequency_max_hz)
+}
+
 /// Everything remembered per-band: not just the last frequency used,
 /// but also the spectrum/waterfall level ranges, since different bands
 /// often want different level settings (e.g. a noisy 160m vs a quiet
@@ -155,6 +240,7 @@ enum SettingsTab {
     PureSignal,
     Diversity,
     Equalizer,
+    Xvtr,
     Firmware,
 }
 
@@ -559,6 +645,29 @@ struct ConnectedState {
     /// since there are several of those and a once-per-frame resolve is
     /// cheap and can't drift out of sync.
     pa_calibration: std::collections::HashMap<String, f32>,
+    /// Configured transverters (up to MAX_XVTRS) -- see Xvtr's doc
+    /// comment. Persisted verbatim (Config::xvtrs); an empty `name` marks
+    /// an unused slot, same "empty string = unconfigured" convention as
+    /// piHPSDR's own XVTR menu.
+    xvtrs: Vec<Xvtr>,
+    /// Name of the XVTR slot currently being displayed/reported through
+    /// (see Xvtr's doc comment), or None for plain hardware-IF operation.
+    /// Deliberately EXPLICIT state, set only by an XVTR/band button click
+    /// or an external RF-space CAT/rigctl/TCI frequency request -- NOT
+    /// re-derived from the real hardware IF every frame, because a
+    /// transverter's IF range typically sits *inside* an ordinary HF
+    /// band's range (e.g. a 2m XVTR's IF often lands around 28MHz, inside
+    /// 10m's own 28-29.7MHz), so "which one is the user on" is genuinely
+    /// ambiguous from frequency alone -- inferring it that way (an
+    /// earlier version of this field) meant clicking the plain 10m
+    /// button while a 144MHz XVTR was active left the display stuck
+    /// showing 144MHz, since the new (10m) IF still fell inside the
+    /// XVTR's own IF range. Automatically cleared (never automatically
+    /// SET) if the real IF drifts outside the active XVTR's own IF range
+    /// -- e.g. scrolled or CAT-tuned far enough away -- so this can't get
+    /// stuck showing a stale transverter label indefinitely; see the
+    /// per-frame reconciliation block for that fallback.
+    active_xvtr: Option<String>,
     /// Upper bound (watts) for the main panel's TX Power slider. The
     /// discovery protocol only reports board *type* (Boards), not the
     /// specific radio model or its PA's actual max output -- e.g.
@@ -1189,6 +1298,21 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                 ps_tx_delay_ns,
                 ps_ptol,
                 pa_calibration: cfg.pa_calibration.clone(),
+                // Always exactly MAX_XVTRS slots so the settings tab has a
+                // stable fixed-size row list to render/edit -- a config
+                // saved with fewer (or none, or from before this existed)
+                // just pads out with unconfigured (empty-name) slots.
+                xvtrs: {
+                    let mut xvtrs = cfg.xvtrs.clone();
+                    xvtrs.truncate(MAX_XVTRS);
+                    xvtrs.resize_with(MAX_XVTRS, Xvtr::default);
+                    xvtrs
+                },
+                // Not persisted -- see active_xvtr's doc comment ("never
+                // automatically SET, only explicit"). A fresh connect
+                // always starts on plain hardware-IF display; click the
+                // XVTR button again if you want it back.
+                active_xvtr: None,
                 max_tx_power_watts: cfg
                     .max_tx_power_watts
                     .unwrap_or_else(|| default_max_tx_power_watts(device.board)),
@@ -1398,8 +1522,24 @@ impl eframe::App for HpsdrApp {
                     .requested_frequency_hz
                     .load(std::sync::atomic::Ordering::Relaxed);
                 if requested_freq_hz != connected.last_requested_frequency_hz {
+                    // requested_freq_hz is whatever a network client wrote
+                    // (RF/displayed space -- CAT/rigctl/TCI never see IF),
+                    // so convert back to real hardware IF before handing
+                    // it to resolve_tune, which operates purely in IF
+                    // space. Ordinary (non-XVTR) frequencies see offset 0
+                    // and are unaffected.
+                    // Also explicitly (re)derives active_xvtr from this
+                    // RF-space request -- see its doc comment: unlike
+                    // inferring from the real IF, a request in RF space is
+                    // unambiguous, so this is a case where auto-SETTING it
+                    // (not just auto-clearing) is correct.
+                    let requested_xvtr = xvtr_for_rf_freq(&connected.xvtrs, requested_freq_hz);
+                    connected.active_xvtr = requested_xvtr.map(|x| x.name.clone());
+                    let requested_offset_hz = requested_xvtr.map(xvtr_rf_offset).unwrap_or(0);
+                    let requested_if_hz =
+                        (requested_freq_hz as i64 - requested_offset_hz).clamp(0, u32::MAX as i64) as u32;
                     let (effective_freq, retune) =
-                        resolve_tune(connected.ctun, freq_hz, sample_rate, passband, requested_freq_hz);
+                        resolve_tune(connected.ctun, freq_hz, sample_rate, passband, requested_if_hz);
                     if let Some(lo) = retune {
                         connected.session.set_frequency(lo);
                     } else {
@@ -1465,10 +1605,50 @@ impl eframe::App for HpsdrApp {
                 // logic below) -- so it zooms around the plain slider Pan.
                 connected.tx_spectrum.set_zoom_pan(connected.spectrum_zoom, connected.spectrum_pan);
                 let dial_freq_hz = if connected.ctun { connected.ctun_frequency_hz } else { freq_hz };
+                // Active transverter (if any) -- see
+                // ConnectedState::active_xvtr's doc comment: EXPLICIT
+                // state (set by band-button clicks / external RF-space
+                // frequency requests below), not re-derived from
+                // dial_freq_hz alone, since a transverter's IF range
+                // typically overlaps an ordinary HF band's range and
+                // frequency-only inference can't tell them apart. Auto-
+                // cleared here (not auto-set) if the real IF has drifted
+                // outside the active slot's own IF range -- e.g. scrolled
+                // away -- so this can't get stuck showing a stale
+                // transverter label. Computed into owned values (not a
+                // borrow of connected.xvtrs) so it doesn't conflict with
+                // connected being mutated further down this same frame.
+                if let Some(name) = &connected.active_xvtr {
+                    let still_in_range = connected.xvtrs.iter().any(|x| {
+                        if &x.name != name {
+                            return false;
+                        }
+                        let offset = xvtr_rf_offset(x);
+                        let if_low = x.frequency_min_hz as i64 - offset;
+                        let if_high = x.frequency_max_hz as i64 - offset;
+                        let f = dial_freq_hz as i64;
+                        f >= if_low && f <= if_high
+                    });
+                    if !still_in_range {
+                        connected.active_xvtr = None;
+                    }
+                }
+                let (xvtr_rf_offset_hz, xvtr_disable_pa, active_xvtr_name): (i64, bool, Option<String>) =
+                    match connected.active_xvtr.as_deref().and_then(|name| connected.xvtrs.iter().find(|x| x.name == name)) {
+                        Some(x) => (xvtr_rf_offset(x), x.disable_pa, Some(x.name.clone())),
+                        None => (0, false, None),
+                    };
+                let displayed_freq_hz = (dial_freq_hz as i64 + xvtr_rf_offset_hz).clamp(0, u32::MAX as i64) as u32;
+                connected
+                    .session
+                    .disable_pa
+                    .store(xvtr_disable_pa, std::sync::atomic::Ordering::Relaxed);
                 // See RadioSession::rx_frequency_hz's doc comment -- kept
                 // in sync every frame here so rigctl/TCI/CAT report the
-                // CTUN'd listen frequency, not the parked hardware LO.
-                connected.session.rx_frequency_hz.store(dial_freq_hz, std::sync::atomic::Ordering::Relaxed);
+                // CTUN'd listen frequency, not the parked hardware LO --
+                // and, if a transverter is active, the real RF frequency
+                // rather than the radio's own IF.
+                connected.session.rx_frequency_hz.store(displayed_freq_hz, std::sync::atomic::Ordering::Relaxed);
                 // See RadioSession::tx_frequency_hz's doc comment --
                 // kept in sync every frame here (same "cheap, no call
                 // site can forget it" reasoning as ctun_offset_hz just
@@ -1703,7 +1883,7 @@ impl eframe::App for HpsdrApp {
                                         ui.label("VFO-A");
                                         ui.add(
                                             egui::Label::new(
-                                                egui::RichText::new(format_frequency(dial_freq_hz))
+                                                egui::RichText::new(format_frequency(displayed_freq_hz))
                                                     .monospace()
                                                     .size(28.0)
                                                     .strong()
@@ -1824,7 +2004,18 @@ impl eframe::App for HpsdrApp {
 
                     ui.add_space(8.0);
                     ui.horizontal_wrapped(|ui| {
-                        let current_band = band_for_frequency(dial_freq_hz).map(|b| b.name);
+                        // Suppressed (None) whenever an XVTR is active --
+                        // otherwise both the XVTR button AND whichever
+                        // fixed HF band happens to contain its real
+                        // hardware IF (e.g. 10m, if a 2m transverter's IF
+                        // sits at 28MHz) would light up together, which
+                        // reads as "I'm on two bands at once". Only one
+                        // button should ever appear selected.
+                        let current_band = if active_xvtr_name.is_none() {
+                            band_for_frequency(dial_freq_hz).map(|b| b.name)
+                        } else {
+                            None
+                        };
                         for band in &BANDS {
                             // Skip bands the radio can't actually reach --
                             // e.g. HermesLite/HermesLite2 cap out at
@@ -1838,6 +2029,10 @@ impl eframe::App for HpsdrApp {
                             }
                             let selected = Some(band.name) == current_band;
                             if ui.add(egui::Button::selectable(selected, band.name)).clicked() && !selected {
+                                // Explicitly leaving any active XVTR --
+                                // see ConnectedState::active_xvtr's doc
+                                // comment.
+                                connected.active_xvtr = None;
                                 let saved = connected.band_memory.get(band.name).copied();
                                 let target = saved.map(|s| s.frequency_hz).unwrap_or(band.default_hz);
                                 connected.session.set_frequency(target);
@@ -1875,6 +2070,50 @@ impl eframe::App for HpsdrApp {
                                 connected.spectrum.set_width_hz(resolved_width_hz);
                                 if let Some(tx) = &connected.tx_handle {
                                     tx.set_mode(resolved_mode);
+                                    tx.set_width_hz(resolved_width_hz);
+                                }
+                                settings_changed = true;
+                            }
+                        }
+
+                        // XVTR buttons -- see Xvtr's doc comment. Ranges
+                        // are configured in RF space; only offered when
+                        // the corresponding real hardware IF range
+                        // actually fits this radio's native tunable
+                        // range (same skip-the-button convention as the
+                        // HermesLite/6m filtering just above, just
+                        // computed from the shifted range instead of the
+                        // raw one). Unlike ordinary bands, XVTR
+                        // selections don't participate in band_memory --
+                        // clicking always applies the slot's own
+                        // configured default frequency/mode.
+                        for xvtr in &connected.xvtrs {
+                            if xvtr.name.is_empty() {
+                                continue;
+                            }
+                            let offset = xvtr_rf_offset(xvtr);
+                            let if_low = xvtr.frequency_min_hz as i64 - offset;
+                            let if_high = xvtr.frequency_max_hz as i64 - offset;
+                            if if_low < connected.device.frequency_min as i64
+                                || if_high > connected.device.frequency_max as i64
+                            {
+                                continue;
+                            }
+                            let selected = active_xvtr_name.as_deref() == Some(xvtr.name.as_str());
+                            if ui.add(egui::Button::selectable(selected, &xvtr.name)).clicked() && !selected {
+                                // Explicit selection -- see
+                                // ConnectedState::active_xvtr's doc
+                                // comment.
+                                connected.active_xvtr = Some(xvtr.name.clone());
+                                let target = if_low.clamp(0, u32::MAX as i64) as u32;
+                                connected.session.set_frequency(target);
+                                connected.ctun_frequency_hz = target;
+                                connected.spectrum.set_mode(xvtr.default_mode);
+                                let resolved_width_hz =
+                                    width_for_mode(&connected.width_memory, xvtr.default_mode);
+                                connected.spectrum.set_width_hz(resolved_width_hz);
+                                if let Some(tx) = &connected.tx_handle {
+                                    tx.set_mode(xvtr.default_mode);
                                     tx.set_width_hz(resolved_width_hz);
                                 }
                                 settings_changed = true;
@@ -2753,7 +2992,7 @@ impl eframe::App for HpsdrApp {
                     // drawing code) can use them too.
                     let view_center_hz = freq_hz as f64 + pan_offset_hz;
 
-                    draw_band_edge_markers(ui.painter(), rect, view_center_hz, visible_half_span_hz);
+                    draw_band_edge_markers(ui.painter(), rect, view_center_hz, visible_half_span_hz, &connected.xvtrs);
 
                     // While transmitting, this displays tx_spectrum --
                     // generated TX IQ that's always centered on the real
@@ -2836,7 +3075,11 @@ impl eframe::App for HpsdrApp {
                         ui.painter().text(
                             egui::pos2(x + 2.0, rect.bottom() - 2.0),
                             egui::Align2::LEFT_BOTTOM,
-                            format_khz(tick_freq_hz),
+                            // Label shown in RF space when a transverter is
+                            // active (see xvtr_rf_offset_hz's doc comment
+                            // above) -- the tick's x position stays in real
+                            // IF space, only the printed number shifts.
+                            format_khz(tick_freq_hz + xvtr_rf_offset_hz as f64),
                             egui::FontId::monospace(13.0),
                             egui::Color32::GRAY,
                         );
@@ -3445,6 +3688,7 @@ impl eframe::App for HpsdrApp {
                                     (SettingsTab::PureSignal, "PureSignal"),
                                     (SettingsTab::Diversity, "Diversity"),
                                     (SettingsTab::Equalizer, "Equalizer"),
+                                    (SettingsTab::Xvtr, "XVTR"),
                                     (SettingsTab::Firmware, "Firmware"),
                                 ] {
                                     // Diversity requires a 2-ADC board -- see
@@ -4587,6 +4831,75 @@ impl eframe::App for HpsdrApp {
                                         });
                                     }
                                 }
+                                SettingsTab::Xvtr => {
+                                    // See Xvtr's doc comment (main-receiver
+                                    // only for now). Up to MAX_XVTRS slots,
+                                    // always rendered (an empty Name marks
+                                    // an unused slot) rather than an
+                                    // add/remove list, matching how
+                                    // piHPSDR's own XVTR menu presents a
+                                    // fixed 10-row grid.
+                                    ui.add_space(4.0);
+                                    ui.label(
+                                        "Transverters convert this radio's real tunable range (its \
+                                         IF) to some other operating frequency (RF) via an external \
+                                         analog box -- e.g. a 10m IF of 28-29.7MHz driving a 2m \
+                                         transverter to cover 144-145.7MHz. RF = IF + LO Offset + LO \
+                                         Error. Only supports up to ~4.3GHz RF (not QO-100-class \
+                                         microwave transverters). Main receiver only -- extra \
+                                         receiver windows are unaffected.",
+                                    );
+                                    ui.add_space(6.0);
+                                    egui::Grid::new("xvtr_grid").striped(true).show(ui, |ui| {
+                                        ui.label("Name");
+                                        ui.label("RF Min (Hz)");
+                                        ui.label("RF Max (Hz)");
+                                        ui.label("LO Offset (Hz)");
+                                        ui.label("LO Error (Hz)");
+                                        ui.label("Disable PA");
+                                        ui.end_row();
+                                        for xvtr in connected.xvtrs.iter_mut() {
+                                            if ui
+                                                .add(
+                                                    egui::TextEdit::singleline(&mut xvtr.name)
+                                                        .hint_text("(unused)")
+                                                        .desired_width(80.0),
+                                                )
+                                                .changed()
+                                            {
+                                                settings_changed = true;
+                                            }
+                                            if ui
+                                                .add(egui::DragValue::new(&mut xvtr.frequency_min_hz).range(0..=u32::MAX))
+                                                .changed()
+                                            {
+                                                settings_changed = true;
+                                            }
+                                            if ui
+                                                .add(egui::DragValue::new(&mut xvtr.frequency_max_hz).range(0..=u32::MAX))
+                                                .changed()
+                                            {
+                                                settings_changed = true;
+                                            }
+                                            if ui
+                                                .add(egui::DragValue::new(&mut xvtr.lo_offset_hz))
+                                                .changed()
+                                            {
+                                                settings_changed = true;
+                                            }
+                                            if ui
+                                                .add(egui::DragValue::new(&mut xvtr.lo_error_hz))
+                                                .changed()
+                                            {
+                                                settings_changed = true;
+                                            }
+                                            if ui.checkbox(&mut xvtr.disable_pa, "").changed() {
+                                                settings_changed = true;
+                                            }
+                                            ui.end_row();
+                                        }
+                                    });
+                                }
                                 SettingsTab::PureSignal => {
                                     // See radio::RadioSettings::puresignal_enabled
                                     // and radio::ps_feedback_config for what
@@ -5165,6 +5478,7 @@ impl eframe::App for HpsdrApp {
                         rit_offset_hz: Some(connected.rit_offset_hz),
                         xit_enabled: Some(connected.xit_enabled),
                         xit_offset_hz: Some(connected.xit_offset_hz),
+                        xvtrs: connected.xvtrs.clone(),
                     }
                     .save(connected.device.mac);
                 }
@@ -5460,21 +5774,35 @@ fn draw_audio_waveform(painter: &egui::Painter, rect: egui::Rect, samples: &[f32
 /// (after zoom/pan), not necessarily the full captured sample-rate span
 /// -- see the caller's own visible_half_span_hz/pan_offset_hz for how
 /// that's derived.
-fn draw_band_edge_markers(painter: &egui::Painter, rect: egui::Rect, center_hz: f64, half_span_hz: f64) {
+fn draw_band_edge_markers(painter: &egui::Painter, rect: egui::Rect, center_hz: f64, half_span_hz: f64, xvtrs: &[Xvtr]) {
     const BAND_EDGE_COLOR: egui::Color32 = egui::Color32::from_rgb(255, 140, 0);
-    for band in &BANDS {
-        for edge_hz in [band.low_hz, band.high_hz] {
-            let offset_hz = edge_hz as f64 - center_hz;
-            if offset_hz.abs() > half_span_hz {
-                continue;
-            }
-            let frac = ((offset_hz + half_span_hz) / (2.0 * half_span_hz)) as f32;
-            let x = rect.left() + frac * rect.width();
-            painter.line_segment(
-                [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
-                egui::Stroke::new(1.0, BAND_EDGE_COLOR),
-            );
+    let draw_edge = |edge_hz: f64| {
+        let offset_hz = edge_hz - center_hz;
+        if offset_hz.abs() > half_span_hz {
+            return;
         }
+        let frac = ((offset_hz + half_span_hz) / (2.0 * half_span_hz)) as f32;
+        let x = rect.left() + frac * rect.width();
+        painter.line_segment(
+            [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
+            egui::Stroke::new(1.0, BAND_EDGE_COLOR),
+        );
+    };
+    for band in &BANDS {
+        draw_edge(band.low_hz as f64);
+        draw_edge(band.high_hz as f64);
+    }
+    // XVTR edges are defined in RF space -- center_hz/half_span_hz here
+    // are real hardware IF, so shift each edge back by the transverter's
+    // own offset before the same position math (see Xvtr's doc comment:
+    // a pure additive shift, so this is the only conversion needed).
+    for xvtr in xvtrs {
+        if xvtr.name.is_empty() {
+            continue;
+        }
+        let offset = xvtr_rf_offset(xvtr) as f64;
+        draw_edge(xvtr.frequency_min_hz as f64 - offset);
+        draw_edge(xvtr.frequency_max_hz as f64 - offset);
     }
 }
 
@@ -6345,7 +6673,7 @@ fn render_extra_receiver_ui(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceiver>>) {
     // above (which run before this drawing code) can use them too.
     let view_center_hz = freq_hz as f64 + pan_offset_hz;
 
-    draw_band_edge_markers(ui.painter(), rect, view_center_hz, visible_half_span_hz);
+    draw_band_edge_markers(ui.painter(), rect, view_center_hz, visible_half_span_hz, &[]);
 
     let num_freq_ticks = 10;
     for t in 0..num_freq_ticks {
@@ -6615,6 +6943,9 @@ fn render_extra_receiver_settings(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceive
         SettingsTab::PaCalibration => rx.settings_tab = SettingsTab::Agc,
         SettingsTab::PureSignal => rx.settings_tab = SettingsTab::Agc,
         SettingsTab::Diversity => rx.settings_tab = SettingsTab::Agc,
+        // XVTR is main-receiver-only (see Xvtr's doc comment) -- redirect
+        // same as Network/Tx/PaCalibration above.
+        SettingsTab::Xvtr => rx.settings_tab = SettingsTab::Agc,
         // Firmware update is against the whole radio, not a per-receiver
         // concept -- redirect same as Network.
         SettingsTab::Firmware => rx.settings_tab = SettingsTab::Agc,

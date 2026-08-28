@@ -71,6 +71,40 @@ all -- e.g. HermesLite/HermesLite2 cap out around 30.72MHz, so **6m**
 → PA Calibration's per-band list and to extra receiver windows' own band
 row.
 
+### Transverters (XVTR)
+
+Settings → **XVTR** lets you define up to 8 transverters -- external boxes
+that convert this radio's real tunable range (its IF) to some other
+operating frequency (RF), e.g. a 10m IF of 28-29.7MHz driving a 2m
+transverter to cover 144-145.7MHz. Each slot has:
+
+- **Name** -- anything you like; an empty name marks the slot unused.
+- **RF Min/Max** -- the transverter's operating range, in the frequency
+  you actually want to see and work on.
+- **LO Offset** -- the transverter's own local-oscillator offset, such that
+  `RF = IF + LO Offset + LO Error`.
+- **LO Error** -- a small trim on top of LO Offset, for whatever the real
+  LO measures in practice (kept separate so you don't have to recompute
+  the nominal offset every time you touch it).
+- **Disable PA** -- when checked, this radio's internal PA and antenna
+  T/R relay are left alone while transmitting on this band, so full PA
+  drive/relay switching never gets routed into a transverter's low-level
+  IF input. Leave TX Power low regardless -- this checkbox does not limit
+  drive level, it only stops the internal PA/relay from engaging.
+
+A configured, in-range transverter appears as an extra button alongside
+the ordinary band row (only if its corresponding IF range actually fits
+this radio's native tunable range). Clicking it retunes to the band's RF
+minimum; VFO-A, the spectrum/waterfall frequency axis, and CAT/rigctl/TCI
+frequency reporting all show the real RF frequency while a transverter
+band is active, even though the radio's actual hardware LO stays at the
+true IF underneath. Only ~4.3GHz of RF range is supported (covers roughly
+2m through 9cm) -- not microwave/QO-100-class transverters. Transverter
+bands are main-receiver-only for now: extra receiver windows and PA
+Calibration don't know about them. This feature has not been verified
+against real transverter hardware -- bench-test at low power before
+relying on it, same as any other TX-path change in this project.
+
 Below that, a row of mode buttons: **LSB, USB, DSB, CWL, CWU, FM, AM, DIGU,
 SPEC, DIGL, SAM, DRM**.
 

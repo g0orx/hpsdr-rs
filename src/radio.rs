@@ -325,6 +325,15 @@ pub struct RadioSession {
     /// bank on this board family). Whichever receiver last changes it
     /// affects every receiver sharing ADC0.
     pub antenna: Arc<AtomicU32>,
+    /// Set by main.rs, once per frame, from whether the currently active
+    /// transverter (if any -- see main.rs's Xvtr::disable_pa doc comment)
+    /// wants the internal PA/antenna-relay left alone while transmitting,
+    /// so a transverter's low-level IF input never sees full PA drive or
+    /// gets routed through the internal PA's TX relay path. Read by both
+    /// protocol sender loops -- see p2_general_packet's `disable_pa` param
+    /// and alex0_word's, and p1_build_packet's HermesLite PA-enable
+    /// branch.
+    pub disable_pa: Arc<std::sync::atomic::AtomicBool>,
     /// Protocol 1, standard (non-HermesLite) boards only -- RX step
     /// attenuator, 0-31 dB, encoded into the C4 byte of command 4
     /// (0x14) as `0x20 | attenuation` (bit 5 = attenuator-enable,
@@ -1072,6 +1081,8 @@ fn start_protocol1(
     // `socket` itself gets consumed by the sender/receiver threads below,
     // so send_stop_command can later send from this SAME local port.
     let stop_socket = socket.try_clone()?;
+    // See RadioSession::disable_pa's doc comment.
+    let disable_pa = Arc::new(AtomicBool::new(false));
 
     // PureSignal (P1): see ps_feedback_config's doc comment. `ps_config`
     // is None only when this board has no known PS support -- everything
@@ -1214,6 +1225,7 @@ fn start_protocol1(
     let sender_rx_attenuation = Arc::clone(&rx_attenuation);
     let sender_ps_tx_attenuation = Arc::clone(&ps_tx_attenuation);
     let sender_is_hermes_lite = matches!(device.board, Boards::HermesLite | Boards::HermesLite2);
+    let sender_disable_pa = Arc::clone(&disable_pa);
     let sender_num_adcs = device.adcs;
     let sender_rx_audio_to_radio = Arc::clone(&rx_audio_to_radio);
     let sender_send_rx_audio_to_radio = Arc::clone(&send_rx_audio_to_radio);
@@ -1244,6 +1256,7 @@ fn start_protocol1(
             sender_rx_attenuation,
             sender_ps_tx_attenuation,
             sender_is_hermes_lite,
+            sender_disable_pa,
             sender_num_adcs,
             sender_adc,
             sender_extra_adcs,
@@ -1304,6 +1317,7 @@ fn start_protocol1(
         sample_rate,
         adc,
         antenna,
+        disable_pa,
         rx_attenuation,
         ps_tx_attenuation,
         extra_frequencies_hz,
@@ -1610,6 +1624,7 @@ fn p1_send_preconfig_and_start(
             sample_rate,
             false, // mox: never keyed during startup config
             is_hermes_lite,
+            false, // disable_pa: nothing to key yet this early -- sender_loop's live value takes over immediately after
             rx_attenuation,
             ps_tx_attenuation,
             num_adcs,
@@ -1686,6 +1701,7 @@ fn p1_build_packet(
     sample_rate_hz: u32,
     mox_on: bool,
     is_hermes_lite: bool,
+    disable_pa: bool,
     rx_attenuation: u8,
     ps_tx_attenuation: u8,
     num_adcs: u8,
@@ -1858,8 +1874,12 @@ fn p1_build_packet(
             // enable works in the reference (a persistent "PA
             // enabled" mode, not a per-transmission key) and this
             // project's existing P2 "enable PA" fix, which is also
-            // unconditional.
-            let (c2, c3, c4) = if is_hermes_lite { (0x08, 0x00, 0x00) } else { (0x00, 0x00, 0x00) };
+            // unconditional -- except now also gated on !disable_pa
+            // (see RadioSession::disable_pa's doc comment), matching
+            // piHPSDR's own `pa_enabled && !txband->disablePA` check at
+            // this exact bit (old_protocol.c).
+            let (c2, c3, c4) =
+                if is_hermes_lite && !disable_pa { (0x08, 0x00, 0x00) } else { (0x00, 0x00, 0x00) };
             (0x12, c1, c2, c3, c4)
         }
         4 => {
@@ -2184,6 +2204,7 @@ fn sender_loop(
     rx_attenuation: Arc<AtomicU32>,
     ps_tx_attenuation: Arc<AtomicU32>,
     is_hermes_lite: bool,
+    disable_pa: Arc<std::sync::atomic::AtomicBool>,
     num_adcs: u8,
     // See p1_build_packet's identically-named params' doc comments.
     adc: Arc<AtomicU32>,
@@ -2399,6 +2420,7 @@ fn sender_loop(
             current_rate,
             mox_on,
             is_hermes_lite,
+            disable_pa.load(Ordering::Relaxed),
             rx_attenuation.load(Ordering::Relaxed) as u8,
             ps_tx_attenuation.load(Ordering::Relaxed) as u8,
             num_adcs,
@@ -3083,6 +3105,8 @@ fn start_protocol2(
     // full story) -- cloned now, before `socket` gets consumed by the
     // sender/receiver threads below.
     let stop_socket = socket.try_clone()?;
+    // See RadioSession::disable_pa's doc comment.
+    let disable_pa = Arc::new(AtomicBool::new(false));
 
     let stop_flag = Arc::new(AtomicBool::new(false));
     let iq_buffers: Vec<Arc<Mutex<VecDeque<IqSample>>>> = (0..real_receivers)
@@ -3120,6 +3144,7 @@ fn start_protocol2(
     let sender_sample_rate = Arc::clone(&sample_rate);
     let sender_adc = Arc::clone(&adc);
     let sender_antenna = Arc::clone(&antenna);
+    let sender_disable_pa = Arc::clone(&disable_pa);
     let sender_extra_frequencies = extra_frequencies_hz.clone();
     let sender_extra_sample_rates = extra_sample_rates_hz.clone();
     let sender_extra_adcs = extra_adcs.clone();
@@ -3149,6 +3174,7 @@ fn start_protocol2(
             sender_sample_rate,
             sender_adc,
             sender_antenna,
+            sender_disable_pa,
             sender_extra_frequencies,
             sender_extra_sample_rates,
             sender_extra_adcs,
@@ -3234,6 +3260,7 @@ fn start_protocol2(
         sample_rate,
         adc,
         antenna,
+        disable_pa,
         rx_attenuation,
         ps_tx_attenuation,
         extra_frequencies_hz,
@@ -3295,7 +3322,7 @@ fn start_protocol2(
 // byte-for-byte, yet the radio never transitions" perfectly.
 const P2_GENERAL_PACKET_SIZE: usize = 60;
 
-fn p2_general_packet(seq: u32, num_adcs: u8) -> [u8; P2_GENERAL_PACKET_SIZE] {
+fn p2_general_packet(seq: u32, num_adcs: u8, disable_pa: bool) -> [u8; P2_GENERAL_PACKET_SIZE] {
     let mut p = [0u8; P2_GENERAL_PACKET_SIZE];
     p[0..4].copy_from_slice(&seq.to_be_bytes());
     p[4] = 0x00; // General packet command
@@ -3309,7 +3336,11 @@ fn p2_general_packet(seq: u32, num_adcs: u8) -> [u8; P2_GENERAL_PACKET_SIZE] {
     // radio may never actually transition into transmit regardless of
     // MOX/TR_RELAY/filter word all being correct -- a strong candidate
     // for the root cause of "no state transition at all".
-    p[58] = 0x01; // enable PA
+    // See RadioSession::disable_pa's doc comment -- matches piHPSDR's own
+    // `!pa_enabled || band->disablePA` check at this exact byte
+    // (new_protocol.c), so a transverter's low-level IF input never sees
+    // the internal PA turned on.
+    p[58] = if disable_pa { 0x00 } else { 0x01 };
     p[59] = if num_adcs == 2 { 0x03 } else { 0x01 }; // enable Alex0 (+ Alex1 if this board has 2 ADCs)
     p
 }
@@ -3514,6 +3545,10 @@ fn p2_high_priority_packet(
     frequencies_hz: &[u32],
     antenna: u32,
     mox_on: bool,
+    // See RadioSession::disable_pa's doc comment -- passed through to
+    // alex0_word so the T/R relay doesn't switch to the internal PA's TX
+    // path while a transverter should be driven at low level instead.
+    disable_pa: bool,
     tx_freq_hz: u32,
     tx_drive: u8,
     ps_tx_attenuation: u8,
@@ -3579,7 +3614,7 @@ fn p2_high_priority_packet(
     // Antenna/filter selection is driven by receiver 0's frequency --
     // there's only one Alex front end, shared across all DDCs.
     let primary_freq = frequencies_hz.first().copied().unwrap_or(7_100_000);
-    p[1432..1436].copy_from_slice(&alex0_word(primary_freq, antenna, mox_on).to_be_bytes());
+    p[1432..1436].copy_from_slice(&alex0_word(primary_freq, antenna, mox_on, disable_pa).to_be_bytes());
 
     // RX2/Alex1 bandpass filter (bytes 1430-1431) -- see this param's own
     // doc comment. BUG FIX: previously never written at all (stayed
@@ -3619,7 +3654,7 @@ fn p2_high_priority_packet(
 /// actually connected. Only the antenna/TR_RELAY handling was written
 /// by me; the two threshold ladders and every constant value came
 /// directly from the user.
-fn alex0_word(freq_hz: u32, antenna: u32, mox_on: bool) -> u32 {
+fn alex0_word(freq_hz: u32, antenna: u32, mox_on: bool, disable_pa: bool) -> u32 {
     const HPF_13MHZ: u32 = 0x00000002;
     const HPF_20MHZ: u32 = 0x00000004;
     const PREAMP_6M: u32 = 0x00000008;
@@ -3687,7 +3722,13 @@ fn alex0_word(freq_hz: u32, antenna: u32, mox_on: bool) -> u32 {
         _ => ANT_1,
     };
 
-    let tr = if mox_on { TR_RELAY } else { 0 };
+    // See RadioSession::disable_pa's doc comment -- matches piHPSDR's own
+    // `!txband->disablePA && pa_enabled` check before setting this bit
+    // (new_protocol.c: "Do not switch TR relay to 'TX' if PA is
+    // disabled"), so the antenna relay stays on the RX path instead of
+    // routing through the internal PA while a transverter should be
+    // driven at low level instead.
+    let tr = if mox_on && !disable_pa { TR_RELAY } else { 0 };
 
     hpf | lpf | ant | tr
 }
@@ -3758,6 +3799,7 @@ fn p2_sender_loop(
     sample_rate: Arc<AtomicU32>,
     adc: Arc<AtomicU32>,
     antenna: Arc<AtomicU32>,
+    disable_pa: Arc<AtomicBool>,
     extra_frequencies_hz: Vec<Arc<AtomicU32>>,
     extra_sample_rates_hz: Vec<Arc<AtomicU32>>,
     extra_adcs: Vec<Arc<AtomicU32>>,
@@ -3978,7 +4020,7 @@ fn p2_sender_loop(
         let ps_tx_atten = ps_tx_attenuation.load(Ordering::Relaxed) as u8;
 
         if due_for_keepalive {
-            let general = p2_general_packet(general_seq, num_adcs);
+            let general = p2_general_packet(general_seq, num_adcs, disable_pa.load(Ordering::Relaxed));
             let ddc = p2_ddc_specific_packet(ddc_seq, &rates, &adcs, num_adcs, ps_mox_gate);
             let tx = p2_tx_specific_packet(
                 tx_seq,
@@ -3994,6 +4036,7 @@ fn p2_sender_loop(
                     &freqs,
                     antenna_now,
                     mox_on,
+                    disable_pa.load(Ordering::Relaxed),
                     tx_freq_hz,
                     drive,
                     ps_tx_atten,
@@ -4035,6 +4078,7 @@ fn p2_sender_loop(
                     &freqs,
                     antenna_now,
                     mox_on,
+                    disable_pa.load(Ordering::Relaxed),
                     tx_freq_hz,
                     drive,
                     ps_tx_atten,
