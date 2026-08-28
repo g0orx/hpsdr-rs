@@ -27,7 +27,7 @@ columns:
 | Column | Meaning |
 |---|---|
 | Device | Board type (e.g. `Orion2`, `Hermes`, `HermesLite2`) |
-| Interface | The local network interface's IP address the reply was heard on |
+| Interface | The local network interface the reply was heard on -- name and IP address (e.g. `eth0 (192.168.1.50)`), or just the IP if the interface's name isn't known (a manually-entered IP, see below) |
 | IP | The radio's own IP address |
 | MAC | The radio's MAC address (also used as the key for its saved settings) |
 | Protocol | 1 (Metis/Ozy-style) or 2 (Hermes/Orion-style) |

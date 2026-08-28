@@ -1,6 +1,7 @@
 use crate::bootloader_ui::FirmwareUpdateWindow;
 use crate::discovery::{discover, manual_discovery, Device};
 use eframe::egui;
+use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -28,6 +29,9 @@ pub enum DiscoveryAction {
 pub struct DiscoveryWindow {
     pub open: bool,
     devices: Arc<Mutex<Vec<Device>>>,
+    /// See discover()'s own doc comment -- this machine's own address ->
+    /// the interface name it belongs to, for the "Interface" column.
+    interface_names: Arc<Mutex<HashMap<IpAddr, String>>>,
     discovering: Arc<Mutex<bool>>,
     selected: Option<usize>,
     manual_ip: String,
@@ -57,6 +61,7 @@ impl DiscoveryWindow {
         let window = Self {
             open: true,
             devices: Arc::new(Mutex::new(Vec::new())),
+            interface_names: Arc::new(Mutex::new(HashMap::new())),
             discovering: Arc::new(Mutex::new(false)),
             selected: None,
             manual_ip: String::new(),
@@ -70,10 +75,11 @@ impl DiscoveryWindow {
 
     fn spawn_discovery(&self, ctx: egui::Context) {
         let devices = Arc::clone(&self.devices);
+        let interface_names = Arc::clone(&self.interface_names);
         let discovering = Arc::clone(&self.discovering);
         *discovering.lock().unwrap() = true;
         thread::spawn(move || {
-            discover(Arc::clone(&devices));
+            discover(Arc::clone(&devices), interface_names);
             *discovering.lock().unwrap() = false;
             ctx.request_repaint(); // wake the UI thread once results land
         });
@@ -196,6 +202,7 @@ impl DiscoveryWindow {
                         }
                         ui.end_row();
 
+                        let interface_names = self.interface_names.lock().unwrap();
                         for (i, dev) in devices_snapshot.iter().enumerate() {
                             let available = dev.status == 2;
                             let is_selected = self.selected == Some(i);
@@ -208,9 +215,20 @@ impl DiscoveryWindow {
                                 available,
                             )
                             .clicked();
+                            // Real interface name (e.g. "eth0") next to
+                            // this machine's own address on it -- a real
+                            // report that this column, despite its own
+                            // "Interface" heading, was only ever showing
+                            // the address. Manually-discovered devices
+                            // (manual_discovery has no interface concept)
+                            // just fall back to the address alone.
+                            let interface_cell = match interface_names.get(&dev.my_address.ip()) {
+                                Some(name) => format!("{name} ({})", dev.my_address.ip()),
+                                None => dev.my_address.ip().to_string(),
+                            };
                             row_clicked |= selectable_cell(
                                 ui,
-                                dev.my_address.ip().to_string(),
+                                interface_cell,
                                 is_selected,
                                 available,
                             )

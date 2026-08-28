@@ -13,6 +13,7 @@
 use network_interface::{Addr, NetworkInterface, NetworkInterfaceConfig};
 use serde::{Deserialize, Serialize};
 use socket2::{Domain, Socket, Type};
+use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr, UdpSocket};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -252,7 +253,18 @@ pub fn protocol2_discovery(devices: Arc<Mutex<Vec<Device>>>, socket_addr: Socket
 
 /// Run both discovery phases on every active IPv4 interface.
 /// Blocking -- call this from a background thread, not the UI thread.
-pub fn discover(devices: Arc<Mutex<Vec<Device>>>) {
+///
+/// `interface_names`: filled in with this machine's own address -> the
+/// interface name it belongs to (e.g. "eth0"/"enp3s0") as each interface
+/// is probed, so the UI can show a real interface name next to each
+/// discovered device's `my_address` (which was previously the only
+/// interface-identifying thing shown, despite the discovery window's
+/// own "Interface" column heading -- a real report that it was actually
+/// just displaying an IP there). Left untouched (not cleared) by
+/// `manual_discovery`, which has no interface concept -- a device found
+/// that way just won't have an entry here, and the UI falls back to
+/// showing its `my_address` alone.
+pub fn discover(devices: Arc<Mutex<Vec<Device>>>, interface_names: Arc<Mutex<HashMap<IpAddr, String>>>) {
     devices.lock().unwrap().clear();
 
     let interfaces = match NetworkInterface::show() {
@@ -269,6 +281,7 @@ pub fn discover(devices: Arc<Mutex<Vec<Device>>>) {
                 let ip = v4_info.ip;
                 // Probe that the interface is actually up/bindable before using it.
                 if std::net::UdpSocket::bind((ip, 5000)).is_ok() {
+                    interface_names.lock().unwrap().insert(IpAddr::V4(ip), itf.name.clone());
                     let socket_address = SocketAddr::new(IpAddr::V4(ip), 50000);
                     protocol1_discovery(Arc::clone(&devices), socket_address);
                     protocol2_discovery(Arc::clone(&devices), socket_address);
