@@ -102,7 +102,7 @@
 */
 
 use crate::debug_log::DebugLog;
-use crate::spectrum::{DemodParams, Mode};
+use crate::spectrum::{Agc, DemodParams, Mode, NoiseBlanker, NoiseReduction, passband_for};
 use std::collections::VecDeque;
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -476,7 +476,8 @@ fn handle_client(
     // it's part of the same reference sequence and cheap/harmless for
     // any client that reads it.
     let freq = rx_frequency_hz.load(Ordering::Relaxed);
-    let mode = demod_params.lock().unwrap().clone().lock().unwrap().mode;
+    let params = *demod_params.lock().unwrap().clone().lock().unwrap();
+    let mode = params.mode;
     let _ = ws.send(Message::Text(PROTOCOL_MESSAGE.into()));
     // Remaining Initialization commands (spec section 4.1) beyond
     // protocol/device -- previously not sent at all (this file's own
@@ -542,6 +543,76 @@ fn handle_client(
     let _ = ws.send(Message::Text(
         format!("trx:0,{};", mox.load(Ordering::Relaxed)).into(),
     ));
+    // BUG FIX: this project's initial state push still stopped well
+    // short of Thetis's own -- confirmed by direct comparison against a
+    // real Thetis TCI session log, captured specifically because "TCI
+    // Remote Compactor" (a bandwidth-compacting relay client, not TCI
+    // Remote itself) kept reconnecting every ~6s without ever settling
+    // into a stable session against this project, despite audio/IQ
+    // genuinely flowing each time -- consistent with a client state
+    // machine built against Thetis's much fuller handshake, waiting on
+    // fields this project never sent at all, timing out, and retrying.
+    // Real values below where this project actually tracks the
+    // underlying state (filter passband, AGC mode, noise blanker/
+    // reduction, CTUN, audio gain); a safe/neutral static default
+    // (matching Thetis's own example values where they're clearly just
+    // "off"/"none") for features this project doesn't implement at all
+    // (CW keyer, VFO lock, RIT/XIT, squelch, calibration, preamp/step
+    // attenuator, TX profiles) -- there's no real value to report for a
+    // feature that doesn't exist here, but answering with a harmless
+    // default is still better than the client getting no reply at all
+    // to a field it expects. Channel 0 only, matching this project's
+    // own trx_count:1/channel_count:1 self-declaration above.
+    let (pb_low, pb_high) = passband_for(mode, params.width_hz);
+    let nb_on = params.noise_blanker != NoiseBlanker::Off;
+    let nr_on = params.noise_reduction != NoiseReduction::Off;
+    let _ = ws.send(Message::Text("mon_volume:0.0;".into()));
+    let _ = ws.send(Message::Text("mon_enable:false;".into()));
+    let _ = ws.send(Message::Text("tune:0,false;".into()));
+    let _ = ws.send(Message::Text("rx_mute:0,false;".into()));
+    let _ = ws.send(Message::Text("mute:false;".into()));
+    let _ = ws.send(Message::Text("iq_stop:0;".into()));
+    let _ = ws.send(Message::Text("tune_drive:0,50;".into()));
+    let _ = ws.send(Message::Text("drive:0,50;".into()));
+    let _ = ws.send(Message::Text("rx_channel_enable:0,0,true;".into()));
+    let _ = ws.send(Message::Text("split_enable:0,false;".into()));
+    let _ = ws.send(Message::Text("sql_level:0,-140;".into()));
+    let _ = ws.send(Message::Text("sql_enable:0,false;".into()));
+    let _ = ws.send(Message::Text("lock:0,false;".into()));
+    let _ = ws.send(Message::Text("xit_offset:0,0;".into()));
+    let _ = ws.send(Message::Text("rit_offset:0,0;".into()));
+    let _ = ws.send(Message::Text("xit_enable:0,false;".into()));
+    let _ = ws.send(Message::Text("rit_enable:0,false;".into()));
+    let _ = ws.send(Message::Text("tx_profile_ex:Default;".into()));
+    let _ = ws.send(Message::Text("tx_profiles_ex:Default;".into()));
+    let _ = ws.send(Message::Text(format!("rx_ctun_ex:0,{};", params.ctun).into()));
+    let _ = ws.send(Message::Text("fm_deviation_ex:0,5000;".into()));
+    let _ = ws.send(Message::Text("agc_auto_ex:0,false;".into()));
+    let _ = ws.send(Message::Text(format!("agc_mode:0,{};", agc_to_tci(params.agc)).into()));
+    let _ = ws.send(Message::Text("rx_preamp_att_ex:0,0;".into()));
+    let _ = ws.send(Message::Text("rx_step_att_ex:0,0;".into()));
+    let _ = ws.send(Message::Text("rx_step_att_enabled_ex:0,false;".into()));
+    let _ = ws.send(Message::Text("vfo_sync_ex:false;".into()));
+    let _ = ws.send(Message::Text("rx_balance:0,0,0.00;".into()));
+    let _ = ws.send(Message::Text(
+        format!("rx_volume:0,0,{:.2};", gain_to_tci_db(params.gain)).into(),
+    ));
+    let _ = ws.send(Message::Text("rx_nf_enable:0,false;".into()));
+    let _ = ws.send(Message::Text("rx_apf_enable:0,false;".into()));
+    let _ = ws.send(Message::Text("rx_anf_enable:0,false;".into()));
+    let _ = ws.send(Message::Text("rx_bin_enable:0,false;".into()));
+    let _ = ws.send(Message::Text(format!("rx_nb_enable_ex:0,{nb_on},0;").into()));
+    let _ = ws.send(Message::Text(format!("rx_nb_enable:0,{nb_on};").into()));
+    let _ = ws.send(Message::Text(format!("rx_nr_enable_ex:0,{nr_on},0;").into()));
+    let _ = ws.send(Message::Text(format!("rx_nr_enable:0,{nr_on};").into()));
+    let _ = ws.send(Message::Text("rx_enable:0,true;".into()));
+    let _ = ws.send(Message::Text(
+        format!("rx_filter_band:0,{},{};", pb_low.round() as i64, pb_high.round() as i64).into(),
+    ));
+    let _ = ws.send(Message::Text(format!("tx_frequency:{freq};").into()));
+    let _ = ws.send(Message::Text(format!("dds:0,{freq};").into()));
+    let _ = ws.send(Message::Text("if:0,0,0;".into()));
+    let _ = ws.send(Message::Text("if_limits:-96000,96000;".into()));
     let _ = ws.send(Message::Text("start;".into()));
     let _ = ws.send(Message::Text("ready;".into()));
 
@@ -1314,6 +1385,14 @@ fn handle_command(
             *iq_streaming = false;
             Some(format!("iq_stop:{};", args.first().unwrap_or(&"0")))
         }
+        // Bare queries (no args) for state also pushed once at connect
+        // (see handle_client's initial state push) -- answered here too
+        // since a client is explicitly asking again, not just relying
+        // on what it already got. This project has no real TX-profile
+        // concept (Thetis-style PA/EQ profile switching), so "Default"
+        // is a static, harmless stand-in.
+        "tx_profile_ex" => Some("tx_profile_ex:Default;".to_string()),
+        "tx_profiles_ex" => Some("tx_profiles_ex:Default;".to_string()),
         _ => None,
     }
 }
@@ -1365,4 +1444,30 @@ fn tci_to_mode(s: &str) -> Option<Mode> {
         "SAM" => Some(Mode::Sam),
         _ => None,
     }
+}
+
+/// For the initial state push's agc_mode field -- lowercase, matching
+/// Thetis's own "normal" example (this project has no confirmed spec
+/// list of valid agc_mode strings beyond that one sample, so this just
+/// mirrors this project's own Agc variant names in the same casing
+/// convention rather than guessing at Thetis-specific names).
+fn agc_to_tci(agc: Agc) -> &'static str {
+    match agc {
+        Agc::Off => "off",
+        Agc::Long => "long",
+        Agc::Slow => "slow",
+        Agc::Medium => "medium",
+        Agc::Fast => "fast",
+    }
+}
+
+/// For the initial state push's rx_volume field -- TCI reports gain in
+/// dB (see Thetis's own "-14.42" example), but this project's own gain
+/// is a linear amplitude multiplier (see spectrum.rs's DemodParams::gain
+/// doc comment), same as the main window's Audio Gain slider before its
+/// own dB conversion. Standard 20*log10 amplitude-to-dB, floored well
+/// below audible rather than propagating -infinity for a exactly-zero
+/// gain.
+fn gain_to_tci_db(gain: f32) -> f32 {
+    if gain <= 0.0001 { -100.0 } else { 20.0 * gain.log10() }
 }
