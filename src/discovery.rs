@@ -59,9 +59,15 @@ pub struct Device {
     #[allow(dead_code)]
     pub supported_transmitters: u8,
     pub adcs: u8,
-    #[allow(dead_code)]
+    /// Now consumed by main.rs's band-button rows (and PA Calibration's
+    /// per-band list) -- see BANDS::iter() call sites there: a real
+    /// report that HermesLite/HermesLite2 don't reach 6m, confirmed
+    /// against piHPSDR's own identical frequency_max clamp (its
+    /// band_menu.c skips any band button whose range falls outside
+    /// radio->frequency_min/frequency_max), which this project already
+    /// computed correctly per board_info_p1/p2 above but never actually
+    /// used anywhere until now.
     pub frequency_min: u64,
-    #[allow(dead_code)]
     pub frequency_max: u64,
 }
 

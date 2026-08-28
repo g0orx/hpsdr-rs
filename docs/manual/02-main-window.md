@@ -64,7 +64,12 @@ stored value directly, or use the buttons between the two boxes:
 One row of band buttons -- **160m, 80m, 60m, 40m, 30m, 20m, 17m, 15m, 12m,
 10m, 6m** -- jumps to that band's remembered frequency, mode, and filter
 width (or sensible defaults the first time you visit a band). Each band
-remembers its own settings independently as you use the app.
+remembers its own settings independently as you use the app. A band whose
+range the connected radio can't actually tune to doesn't get a button at
+all -- e.g. HermesLite/HermesLite2 cap out around 30.72MHz, so **6m**
+(50-54MHz) is missing on those boards. Same filtering applies to Settings
+→ PA Calibration's per-band list and to extra receiver windows' own band
+row.
 
 Below that, a row of mode buttons: **LSB, USB, DSB, CWL, CWU, FM, AM, DIGU,
 SPEC, DIGL, SAM, DRM**.

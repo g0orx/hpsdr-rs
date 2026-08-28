@@ -175,6 +175,13 @@ struct ExtraReceiver {
     /// this receiver's own sample-rate control when it can't actually
     /// be honored independently (see render_extra_receiver_settings).
     protocol: u8,
+    /// See discovery::Device::frequency_min/frequency_max's doc comment
+    /// -- same radio, same limits, copied in once at spawn time (the
+    /// connected device can't change mid-session). Used by this
+    /// receiver's own band-button row to skip bands the radio can't
+    /// reach (e.g. 6m on a HermesLite/HermesLite2).
+    frequency_min: u64,
+    frequency_max: u64,
     /// Shared with every other receiver (including the primary) --
     /// Alex's antenna relays are one physical resource, not per-DDC.
     antenna: Arc<std::sync::atomic::AtomicU32>,
@@ -984,6 +991,8 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                     &session,
                     device.adcs,
                     device.protocol,
+                    device.frequency_min,
+                    device.frequency_max,
                     Arc::clone(&settings_dirty),
                     Some(saved),
                 ) {
@@ -1817,6 +1826,16 @@ impl eframe::App for HpsdrApp {
                     ui.horizontal_wrapped(|ui| {
                         let current_band = band_for_frequency(dial_freq_hz).map(|b| b.name);
                         for band in &BANDS {
+                            // Skip bands the radio can't actually reach --
+                            // e.g. HermesLite/HermesLite2 cap out at
+                            // 30.72MHz, well short of 6m's 50MHz start.
+                            // Same check piHPSDR's own band_menu.c makes
+                            // against radio->frequency_min/frequency_max.
+                            if (band.low_hz as u64) < connected.device.frequency_min
+                                || band.high_hz as u64 > connected.device.frequency_max
+                            {
+                                continue;
+                            }
                             let selected = Some(band.name) == current_band;
                             if ui.add(egui::Button::selectable(selected, band.name)).clicked() && !selected {
                                 let saved = connected.band_memory.get(band.name).copied();
@@ -3200,6 +3219,8 @@ impl eframe::App for HpsdrApp {
                                     &connected.session,
                                     connected.device.adcs,
                                     connected.device.protocol,
+                                    connected.device.frequency_min,
+                                    connected.device.frequency_max,
                                     Arc::clone(&connected.settings_dirty),
                                     None,
                                 ) {
@@ -4531,6 +4552,15 @@ impl eframe::App for HpsdrApp {
                                     // mean anything close to accurate.
                                     ui.add_space(4.0);
                                     for band in &BANDS {
+                                        // Same reachable-band filter as
+                                        // the main band-button row -- no
+                                        // point calibrating PA power for
+                                        // a band this radio can't reach.
+                                        if (band.low_hz as u64) < connected.device.frequency_min
+                                            || band.high_hz as u64 > connected.device.frequency_max
+                                        {
+                                            continue;
+                                        }
                                         let mut gain_db = connected
                                             .pa_calibration
                                             .get(band.name)
@@ -6041,6 +6071,11 @@ fn render_extra_receiver_ui(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceiver>>) {
     ui.horizontal_wrapped(|ui| {
         let current_band = band_for_frequency(dial_freq_hz).map(|b| b.name);
         for band in &BANDS {
+            // Same reachable-band filter as the main receiver's own
+            // band-button row -- see its doc comment for why.
+            if (band.low_hz as u64) < rx.frequency_min || band.high_hz as u64 > rx.frequency_max {
+                continue;
+            }
             let selected = Some(band.name) == current_band;
             if ui.add(egui::Button::selectable(selected, band.name)).clicked() && !selected {
                 let saved = rx.band_memory.get(band.name).copied();
@@ -6883,6 +6918,8 @@ fn spawn_extra_receiver(
     session: &RadioSession,
     num_adcs: u8,
     protocol: u8,
+    frequency_min: u64,
+    frequency_max: u64,
     settings_dirty: Arc<std::sync::atomic::AtomicBool>,
     saved: Option<&ExtraReceiverConfig>,
 ) -> Option<Arc<Mutex<ExtraReceiver>>> {
@@ -6948,6 +6985,8 @@ fn spawn_extra_receiver(
         adc: adc_arc,
         num_adcs,
         protocol,
+        frequency_min,
+        frequency_max,
         antenna: antenna_arc,
         mox: Arc::clone(&session.mox),
         spectrum,
