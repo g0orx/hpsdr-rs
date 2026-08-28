@@ -211,6 +211,10 @@ impl TciServer {
         tci_tx_audio: Arc<Mutex<VecDeque<f32>>>,
         tci_tx_gain: Arc<Mutex<f32>>,
         tci_wants_mic: Arc<AtomicBool>,
+        // For the initial state push's device: field -- the actual
+        // detected board (e.g. "Orion2"), not this project's own name.
+        // See handle_client's doc comment on why this matters.
+        board_name: String,
         logging: DebugLog,
     ) -> std::io::Result<Self> {
         let listener = TcpListener::bind(addr)?;
@@ -262,6 +266,7 @@ impl TciServer {
                         let conn_stop = Arc::clone(&accept_stop);
                         let conn_connected = Arc::clone(&accept_connected);
                         let conn_logging = accept_logging.clone();
+                        let conn_board_name = board_name.clone();
                         let superseded = Arc::new(AtomicBool::new(false));
                         {
                             let mut current = current_client_superseded.lock().unwrap();
@@ -273,7 +278,7 @@ impl TciServer {
                             conn_connected.fetch_add(1, Ordering::Relaxed);
                             handle_client(
                                 stream, freq, rx_freq, rate, params, audio_iq, tx_audio, tx_gain, wants_mic,
-                                conn_mox, conn_stop, superseded, conn_logging,
+                                conn_mox, conn_stop, superseded, conn_board_name, conn_logging,
                             );
                             conn_connected.fetch_sub(1, Ordering::Relaxed);
                         });
@@ -392,6 +397,10 @@ fn handle_client(
     // (the whole-server shutdown flag) so this same loop exit path
     // handles both.
     superseded: Arc<AtomicBool>,
+    // Real detected board (e.g. "Orion2"), for the initial state push's
+    // device: field -- see that field's own doc comment for why this
+    // shouldn't just be this project's own name.
+    board_name: String,
     logging: DebugLog,
 ) {
     let _ = stream.set_nodelay(true);
@@ -609,7 +618,16 @@ fn handle_client(
     let _ = ws.send(Message::Text("channel_count:1;".into()));
     let _ = ws.send(Message::Text("trx_count:1;".into()));
     let _ = ws.send(Message::Text("receive_only:false;".into()));
-    let _ = ws.send(Message::Text("device:hpsdr-rs;".into()));
+    // DEVICE identifies the actual radio hardware (e.g. Thetis reports
+    // "ANAN8000D" for its connected board) -- a real report/correction:
+    // this used to send this project's own name ("hpsdr-rs") here
+    // instead, which isn't what the field is for. board_name is
+    // whatever discovery.rs's own Boards enum detected (e.g. "Orion2"),
+    // not a specific commercial model name -- this project has no way
+    // to know a radio's marketing/model name (e.g. "ANAN8000D" vs the
+    // underlying "Orion2" board it's built around), only the board type
+    // reported over the wire.
+    let _ = ws.send(Message::Text(format!("device:{board_name};").into()));
     let _ = ws.send(Message::Text(PROTOCOL_MESSAGE.into()));
 
     // Per-client streaming state -- audio defaults to ON (see below),

@@ -832,6 +832,7 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                     Arc::clone(&session.tci_tx_audio),
                     Arc::clone(&session.tci_tx_gain),
                     Arc::clone(&session.tci_wants_mic),
+                    format!("{:?}", device.board),
                     tci_debug_log.clone(),
                 ) {
                     Ok(s) => Some(s),
@@ -3354,6 +3355,7 @@ impl eframe::App for HpsdrApp {
                                                 Arc::clone(&connected.session.tci_tx_audio),
                                                 Arc::clone(&connected.session.tci_tx_gain),
                                                 Arc::clone(&connected.session.tci_wants_mic),
+                                                format!("{:?}", connected.device.board),
                                                 connected.tci_debug_log.clone(),
                                             ) {
                                                 Ok(s) => Some(s),
