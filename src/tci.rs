@@ -243,31 +243,10 @@ impl TciServer {
         // report described (traced to a stale TCI connection -- e.g.
         // from earlier testing, or one a client didn't cleanly close
         // when reconfigured -- still alive and draining alongside a
-        // fresh one).
-        //
-        // EXPERIMENTALLY DISABLED (previous.store(true, ...) below, the
-        // actual eviction, is commented out -- `superseded`/
-        // current_client_superseded are left wired up so this is a
-        // one-line revert) while chasing a real report of "TCI Remote
-        // Compactor" (a bandwidth-compacting relay, not TCI Remote
-        // itself) reconnecting every 1-3s even with a content- and
-        // order-correct handshake: a real packet capture showed one
-        // connection reach a fully working state (real IQ data
-        // flowing) and get superseded by a brand new connection from
-        // the same peer just 61ms later, while it was still actively
-        // fine -- consistent with the client legitimately using more
-        // than one simultaneous connection (Thetis's own multi-channel
-        // design suggests it may tolerate that), not a stalled/failed
-        // one being replaced. Tracks the current client's own stop flag
-        // here regardless, for now unused for eviction.
-        //
-        // KNOWN TRADEOFF while this stays disabled: if two genuinely
-        // independent clients (not one client's own multiple
-        // connections) connect at once, both drain(..) the same
-        // audio_iq queues, splitting samples between them -- the exact
-        // bouncing-audio bug this was originally built to prevent.
-        // Revert by restoring the previous.store(true, ...) call if
-        // this doesn't turn out to be the actual cause here.
+        // fresh one). Tracks the current client's own stop flag here;
+        // accepting a new connection flips the previous one first so
+        // its loop exits (within its ~20ms read-timeout tick) before
+        // the new client starts pulling from the same queues.
         let current_client_superseded: Arc<Mutex<Option<Arc<AtomicBool>>>> = Arc::new(Mutex::new(None));
         let thread = thread::spawn(move || {
             while !accept_stop.load(Ordering::Relaxed) {
@@ -291,11 +270,9 @@ impl TciServer {
                         let superseded = Arc::new(AtomicBool::new(false));
                         {
                             let mut current = current_client_superseded.lock().unwrap();
-                            // EXPERIMENTALLY DISABLED: this used to be
-                            // `if let Some(previous) = ... { previous.store(true, ...) }`
-                            // (the actual eviction) -- see the doc comment above
-                            // current_client_superseded for why, and how to revert.
-                            let _previous = current.replace(Arc::clone(&superseded));
+                            if let Some(previous) = current.replace(Arc::clone(&superseded)) {
+                                previous.store(true, Ordering::Relaxed);
+                            }
                         }
                         let handle = thread::spawn(move || {
                             conn_connected.fetch_add(1, Ordering::Relaxed);
@@ -1430,17 +1407,6 @@ fn handle_command(
         // is a static, harmless stand-in.
         "tx_profile_ex" => Some("tx_profile_ex:Default;".to_string()),
         "tx_profiles_ex" => Some("tx_profiles_ex:Default;".to_string()),
-        // BUG FIX: the client's own `start;` (distinct from this
-        // project's own `start;` push at connect -- TCI's start/stop is
-        // bidirectional) previously got no reply at all here, falling
-        // through to the catch-all below. A real Thetis session log
-        // shows it replying with volume:0.0; immediately after
-        // receiving the client's start -- this project has no distinct
-        // master/output volume concept separate from rx_volume, so
-        // 0.0 (matching Thetis's own example, presumably "unity/no
-        // attenuation") is a safe static stand-in, same reasoning as
-        // the tx_profile_ex/tx_profiles_ex replies above.
-        "start" => Some("volume:0.0;".to_string()),
         _ => None,
     }
 }
