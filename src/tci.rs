@@ -18,9 +18,14 @@
       Expert Electronics' own "TCI Protocol Ver. 2.0" PDF (12 Jan 2024)
       -- the authoritative spec, not a third-party reconstruction.
     - The specific commands implemented here (vfo, modulation, trx,
-      audio_start/stop, iq_start/stop) and their argument order are
-      confirmed against BOTH that spec and JTDX's actual working TCI
-      client implementation (TCITransceiver.cpp).
+      audio_start/stop, iq_start/stop, rit_offset, rit_enable,
+      xit_offset, xit_enable) and their argument order are confirmed
+      against BOTH that spec and JTDX's actual working TCI client
+      implementation (TCITransceiver.cpp) -- except rit/xit, whose
+      argument order (receiver,value/bool) is inferred from this
+      project's own already-existing initial-state push for these same
+      commands (see handle_client), not independently re-verified
+      against JTDX specifically.
     - The *initial handshake sequence* sent on connect now includes
       every Initialization command the spec defines (section 4.1):
       protocol, device, vfo_limits, trx_count, channel_count,
@@ -105,7 +110,7 @@ use crate::debug_log::DebugLog;
 use crate::spectrum::{Agc, DemodParams, Mode, NoiseBlanker, NoiseReduction, passband_for};
 use std::collections::VecDeque;
 use std::net::{TcpListener, TcpStream};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -211,6 +216,14 @@ impl TciServer {
         tci_tx_audio: Arc<Mutex<VecDeque<f32>>>,
         tci_tx_gain: Arc<Mutex<f32>>,
         tci_wants_mic: Arc<AtomicBool>,
+        // See RadioSession::rit_enabled/rit_offset_hz/xit_enabled/
+        // xit_offset_hz's doc comments -- backs the incoming
+        // rit_offset/rit_enable/xit_offset/xit_enable commands and their
+        // real values in the initial state push.
+        rit_enabled: Arc<AtomicBool>,
+        rit_offset_hz: Arc<AtomicI32>,
+        xit_enabled: Arc<AtomicBool>,
+        xit_offset_hz: Arc<AtomicI32>,
         // For the initial state push's device: field -- the actual
         // detected board (e.g. "Orion2"), not this project's own name.
         // See handle_client's doc comment on why this matters.
@@ -263,6 +276,10 @@ impl TciServer {
                         let tx_gain = Arc::clone(&accept_tci_tx_gain);
                         let wants_mic = Arc::clone(&accept_tci_wants_mic);
                         let conn_mox = Arc::clone(&mox);
+                        let conn_rit_enabled = Arc::clone(&rit_enabled);
+                        let conn_rit_offset_hz = Arc::clone(&rit_offset_hz);
+                        let conn_xit_enabled = Arc::clone(&xit_enabled);
+                        let conn_xit_offset_hz = Arc::clone(&xit_offset_hz);
                         let conn_stop = Arc::clone(&accept_stop);
                         let conn_connected = Arc::clone(&accept_connected);
                         let conn_logging = accept_logging.clone();
@@ -278,7 +295,8 @@ impl TciServer {
                             conn_connected.fetch_add(1, Ordering::Relaxed);
                             handle_client(
                                 stream, freq, rx_freq, rate, params, audio_iq, tx_audio, tx_gain, wants_mic,
-                                conn_mox, conn_stop, superseded, conn_board_name, conn_logging,
+                                conn_mox, conn_rit_enabled, conn_rit_offset_hz, conn_xit_enabled, conn_xit_offset_hz,
+                                conn_stop, superseded, conn_board_name, conn_logging,
                             );
                             conn_connected.fetch_sub(1, Ordering::Relaxed);
                         });
@@ -391,6 +409,10 @@ fn handle_client(
     tci_tx_gain: Arc<Mutex<f32>>,
     tci_wants_mic: Arc<AtomicBool>,
     mox: Arc<AtomicBool>,
+    rit_enabled: Arc<AtomicBool>,
+    rit_offset_hz: Arc<AtomicI32>,
+    xit_enabled: Arc<AtomicBool>,
+    xit_offset_hz: Arc<AtomicI32>,
     stop: Arc<AtomicBool>,
     // Set when a NEWER client has connected -- see TciServer::start's
     // single-client enforcement doc comment. Checked alongside `stop`
@@ -552,23 +574,31 @@ fn handle_client(
     let _ = ws.send(Message::Text("tx_enable:0,true;".into()));
     let _ = ws.send(Message::Text("split_enable:0,false;".into()));
     // No real value to report for features this project doesn't
-    // implement at all (CW keyer, squelch, VFO lock, RIT/XIT,
-    // calibration, preamp/step attenuator) -- a safe/neutral static
-    // default (matching Thetis's own example values where they're
-    // clearly just "off"/"none") still beats the client getting no
-    // reply at all to a field it expects.
+    // implement at all (CW keyer, squelch, VFO lock, calibration,
+    // preamp/step attenuator) -- a safe/neutral static default (matching
+    // Thetis's own example values where they're clearly just
+    // "off"/"none") still beats the client getting no reply at all to a
+    // field it expects.
     let _ = ws.send(Message::Text("sql_level:0,-140;".into()));
     let _ = ws.send(Message::Text("sql_enable:0,false;".into()));
     let _ = ws.send(Message::Text("lock:0,false;".into()));
-    let _ = ws.send(Message::Text("xit_offset:0,0;".into()));
-    let _ = ws.send(Message::Text("rit_offset:0,0;".into()));
-    let _ = ws.send(Message::Text("xit_enable:0,false;".into()));
-    let _ = ws.send(Message::Text("rit_enable:0,false;".into()));
     // Real values below where this project actually tracks the
-    // underlying state (CTUN, AGC mode, noise blanker/reduction, audio
-    // gain, filter passband, frequency/mode/dds). Channel 0 only,
-    // matching this project's own trx_count:1/channel_count:1
-    // self-declaration below.
+    // underlying state (RIT/XIT, CTUN, AGC mode, noise blanker/
+    // reduction, audio gain, filter passband, frequency/mode/dds).
+    // Channel 0 only, matching this project's own trx_count:1/
+    // channel_count:1 self-declaration below.
+    let _ = ws.send(Message::Text(
+        format!("xit_offset:0,{};", xit_offset_hz.load(Ordering::Relaxed)).into(),
+    ));
+    let _ = ws.send(Message::Text(
+        format!("rit_offset:0,{};", rit_offset_hz.load(Ordering::Relaxed)).into(),
+    ));
+    let _ = ws.send(Message::Text(
+        format!("xit_enable:0,{};", xit_enabled.load(Ordering::Relaxed)).into(),
+    ));
+    let _ = ws.send(Message::Text(
+        format!("rit_enable:0,{};", rit_enabled.load(Ordering::Relaxed)).into(),
+    ));
     let _ = ws.send(Message::Text(format!("rx_ctun_ex:0,{};", params.ctun).into()));
     let _ = ws.send(Message::Text("fm_deviation_ex:0,5000;".into()));
     let _ = ws.send(Message::Text("agc_auto_ex:0,false;".into()));
@@ -742,6 +772,10 @@ fn handle_client(
                         &requested_frequency_hz,
                         &current_params,
                         &mox,
+                        &rit_enabled,
+                        &rit_offset_hz,
+                        &xit_enabled,
+                        &xit_offset_hz,
                         &tci_wants_mic,
                         &mut audio_streaming,
                         &mut iq_streaming,
@@ -1302,6 +1336,10 @@ fn handle_command(
     requested_frequency_hz: &Arc<AtomicU32>,
     demod_params: &Arc<Mutex<DemodParams>>,
     mox: &Arc<AtomicBool>,
+    rit_enabled: &Arc<AtomicBool>,
+    rit_offset_hz: &Arc<AtomicI32>,
+    xit_enabled: &Arc<AtomicBool>,
+    xit_offset_hz: &Arc<AtomicI32>,
     tci_wants_mic: &Arc<AtomicBool>,
     audio_streaming: &mut bool,
     iq_streaming: &mut bool,
@@ -1342,6 +1380,34 @@ fn handle_command(
             // `mode` value -- what actually matters -- is identical
             // either way).
             Some(format!("modulation:{},{};", args.first().unwrap_or(&"0"), requested))
+        }
+        // rit_offset:receiver,value; -- see RadioSession::rit_enabled's
+        // doc comment. Clamped to +-9999 Hz, matching main.rs's own UI
+        // clamp for this value.
+        "rit_offset" => {
+            let v = args.get(1)?.trim().parse::<f64>().ok()?;
+            let v = v.round().clamp(-9999.0, 9999.0) as i32;
+            rit_offset_hz.store(v, Ordering::Relaxed);
+            Some(format!("rit_offset:{},{};", args.first().unwrap_or(&"0"), v))
+        }
+        // rit_enable:receiver,bool;
+        "rit_enable" => {
+            let v = args.get(1)?.trim().eq_ignore_ascii_case("true");
+            rit_enabled.store(v, Ordering::Relaxed);
+            Some(format!("rit_enable:{},{};", args.first().unwrap_or(&"0"), v))
+        }
+        // xit_offset:receiver,value;
+        "xit_offset" => {
+            let v = args.get(1)?.trim().parse::<f64>().ok()?;
+            let v = v.round().clamp(-9999.0, 9999.0) as i32;
+            xit_offset_hz.store(v, Ordering::Relaxed);
+            Some(format!("xit_offset:{},{};", args.first().unwrap_or(&"0"), v))
+        }
+        // xit_enable:receiver,bool;
+        "xit_enable" => {
+            let v = args.get(1)?.trim().eq_ignore_ascii_case("true");
+            xit_enabled.store(v, Ordering::Relaxed);
+            Some(format!("xit_enable:{},{};", args.first().unwrap_or(&"0"), v))
         }
         // trx:receiver,state,source; -- source (arg3) is optional, per
         // spec section 4.2: "tci" means take TX audio from the TCI

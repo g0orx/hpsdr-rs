@@ -21,7 +21,7 @@ use crate::discovery::{Boards, Device};
 use std::collections::VecDeque;
 use std::io;
 use std::net::UdpSocket;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -188,6 +188,18 @@ pub struct RadioSettings {
     /// this is just their starting point on connect.
     pub diversity_gain_db: f32,
     pub diversity_phase_deg: f32,
+    /// Initial values for RadioSession::rit_enabled/rit_offset_hz/
+    /// xit_enabled/xit_offset_hz -- see those fields' doc comments.
+    /// Seeded here (rather than left at 0/false and pushed in
+    /// afterward) so the shared atomics already match the restored UI
+    /// state on the very first frame -- see main.rs's per-frame sync
+    /// block for why starting them unequal to the just-restored
+    /// ConnectedState fields would incorrectly look like an external
+    /// (network) change on that first frame and clobber the restore.
+    pub rit_enabled: bool,
+    pub rit_offset_hz: i32,
+    pub xit_enabled: bool,
+    pub xit_offset_hz: i32,
 }
 
 impl Default for RadioSettings {
@@ -206,6 +218,10 @@ impl Default for RadioSettings {
             // user tunes by ear/S-meter after enabling.
             diversity_gain_db: 0.0,
             diversity_phase_deg: 0.0,
+            rit_enabled: false,
+            rit_offset_hz: 0,
+            xit_enabled: false,
+            xit_offset_hz: 0,
         }
     }
 }
@@ -518,6 +534,30 @@ pub struct RadioSession {
     /// actually run mic audio through TXA or idle). Written from the
     /// UI's PTT control and from rigctl/TCI's set_ptt/trx commands.
     pub mox: Arc<AtomicBool>,
+    /// RIT ("Receiver Incremental Tuning") on/off and its offset (Hz,
+    /// clamped to +-9999 -- matching main.rs's own UI clamp). Same
+    /// direct-write pattern as `mox` above: written straight from
+    /// wherever changes it (the main window's RIT button/scroll/Clear,
+    /// or rigctl's j/J/u RIT/U RIT, CAT's RT/RC/RD/RU, or TCI's
+    /// rit_offset/rit_enable commands), with no separate "requested"
+    /// staging Arc -- unlike frequency, RIT/XIT have no CTUN-style
+    /// clamping complexity that would need main.rs's per-frame loop to
+    /// reconcile a write against. main.rs's own per-frame block still
+    /// polls these once, comparing against its last-seen local copy, so
+    /// an externally (network-)driven change gets reflected in the UI
+    /// and persisted to Config -- see that block's own doc comment.
+    pub rit_enabled: Arc<AtomicBool>,
+    pub rit_offset_hz: Arc<AtomicI32>,
+    /// XIT ("Transmitter Incremental Tuning") -- same pattern as
+    /// rit_enabled/rit_offset_hz just above, but nudges the real TX
+    /// frequency instead of a WDSP RX shift (see main.rs's
+    /// ConnectedState::xit_enabled doc comment for why). CAT's Kenwood
+    /// emulation only exposes XIT's on/off state (XT), matching real
+    /// Kenwood TS-2000 behavior -- there's no Kenwood command to set an
+    /// absolute XIT value, only RIT's RC/RD/RU -- so xit_offset_hz is
+    /// only reachable via rigctl (z/Z) and TCI (xit_offset), not CAT.
+    pub xit_enabled: Arc<AtomicBool>,
+    pub xit_offset_hz: Arc<AtomicI32>,
     /// TX audio/IQ produced by tx.rs, consumed by whichever sender
     /// loop(s) below are currently keyed. See tx.rs and
     /// fill_tx_payload's module notes for the confidence caveats on
@@ -1083,6 +1123,13 @@ fn start_protocol1(
     let stop_socket = socket.try_clone()?;
     // See RadioSession::disable_pa's doc comment.
     let disable_pa = Arc::new(AtomicBool::new(false));
+    // See RadioSession::rit_enabled/xit_enabled's doc comments -- seeded
+    // from `settings` (see RadioSettings::rit_enabled's doc comment for
+    // why) rather than left at false/0.
+    let rit_enabled = Arc::new(AtomicBool::new(settings.rit_enabled));
+    let rit_offset_hz = Arc::new(AtomicI32::new(settings.rit_offset_hz));
+    let xit_enabled = Arc::new(AtomicBool::new(settings.xit_enabled));
+    let xit_offset_hz = Arc::new(AtomicI32::new(settings.xit_offset_hz));
 
     // PureSignal (P1): see ps_feedback_config's doc comment. `ps_config`
     // is None only when this board has no known PS support -- everything
@@ -1327,6 +1374,10 @@ fn start_protocol1(
         ps_rx_feedback_iq,
         ps_tx_feedback_iq,
         mox,
+        rit_enabled,
+        rit_offset_hz,
+        xit_enabled,
+        xit_offset_hz,
         tx_iq,
         tci_tx_audio,
         tci_tx_gain,
@@ -3107,6 +3158,12 @@ fn start_protocol2(
     let stop_socket = socket.try_clone()?;
     // See RadioSession::disable_pa's doc comment.
     let disable_pa = Arc::new(AtomicBool::new(false));
+    // See RadioSession::rit_enabled/xit_enabled's doc comments -- seeded
+    // from `settings`, see start_protocol1's identical treatment.
+    let rit_enabled = Arc::new(AtomicBool::new(settings.rit_enabled));
+    let rit_offset_hz = Arc::new(AtomicI32::new(settings.rit_offset_hz));
+    let xit_enabled = Arc::new(AtomicBool::new(settings.xit_enabled));
+    let xit_offset_hz = Arc::new(AtomicI32::new(settings.xit_offset_hz));
 
     let stop_flag = Arc::new(AtomicBool::new(false));
     let iq_buffers: Vec<Arc<Mutex<VecDeque<IqSample>>>> = (0..real_receivers)
@@ -3270,6 +3327,10 @@ fn start_protocol2(
         ps_rx_feedback_iq,
         ps_tx_feedback_iq,
         mox,
+        rit_enabled,
+        rit_offset_hz,
+        xit_enabled,
+        xit_offset_hz,
         tx_iq,
         tci_tx_audio,
         tci_tx_gain,

@@ -40,7 +40,7 @@ use crate::debug_log::DebugLog;
 use crate::spectrum::{DemodParams, Mode, SpectrumDisplay};
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -107,6 +107,13 @@ impl RigctlServer {
         demod_params: Arc<Mutex<DemodParams>>,
         display: Arc<Mutex<SpectrumDisplay>>,
         mox: Arc<AtomicBool>,
+        // See RadioSession::rit_enabled/rit_offset_hz/xit_enabled/
+        // xit_offset_hz's doc comments -- backs j/J (get/set_rit), z/Z
+        // (get/set_xit), and u/U (get/set_func RIT/XIT).
+        rit_enabled: Arc<AtomicBool>,
+        rit_offset_hz: Arc<AtomicI32>,
+        xit_enabled: Arc<AtomicBool>,
+        xit_offset_hz: Arc<AtomicI32>,
         logging: DebugLog,
     ) -> std::io::Result<Self> {
         let listener = TcpListener::bind(addr)?;
@@ -145,12 +152,19 @@ impl RigctlServer {
                         let params = Arc::clone(&accept_demod_params);
                         let disp = Arc::clone(&accept_display);
                         let conn_mox = Arc::clone(&mox);
+                        let conn_rit_enabled = Arc::clone(&rit_enabled);
+                        let conn_rit_offset_hz = Arc::clone(&rit_offset_hz);
+                        let conn_xit_enabled = Arc::clone(&xit_enabled);
+                        let conn_xit_offset_hz = Arc::clone(&xit_offset_hz);
                         let conn_stop = Arc::clone(&accept_stop);
                         let conn_connected = Arc::clone(&accept_connected);
                         let conn_logging = accept_logging.clone();
                         let handle = thread::spawn(move || {
                             conn_connected.fetch_add(1, Ordering::Relaxed);
-                            handle_client(stream, freq, rx_freq, params, disp, conn_mox, conn_stop, conn_logging);
+                            handle_client(
+                                stream, freq, rx_freq, params, disp, conn_mox, conn_rit_enabled,
+                                conn_rit_offset_hz, conn_xit_enabled, conn_xit_offset_hz, conn_stop, conn_logging,
+                            );
                             conn_connected.fetch_sub(1, Ordering::Relaxed);
                         });
                         let mut threads = accept_client_threads.lock().unwrap();
@@ -238,6 +252,10 @@ fn handle_client(
     demod_params: DemodParamsCell,
     display: DisplayCell,
     mox: Arc<AtomicBool>,
+    rit_enabled: Arc<AtomicBool>,
+    rit_offset_hz: Arc<AtomicI32>,
+    xit_enabled: Arc<AtomicBool>,
+    xit_offset_hz: Arc<AtomicI32>,
     stop: Arc<AtomicBool>,
     logging: DebugLog,
 ) {
@@ -268,7 +286,18 @@ fn handle_client(
                 // already-connected clients too, not just new ones.
                 let current_params = demod_params.lock().unwrap().clone();
                 let current_display = display.lock().unwrap().clone();
-                match handle_command(cmd, &requested_frequency_hz, &rx_frequency_hz, &current_params, &current_display, &mox) {
+                match handle_command(
+                    cmd,
+                    &requested_frequency_hz,
+                    &rx_frequency_hz,
+                    &current_params,
+                    &current_display,
+                    &mox,
+                    &rit_enabled,
+                    &rit_offset_hz,
+                    &xit_enabled,
+                    &xit_offset_hz,
+                ) {
                     Some(response) => {
                         logging.log(&format!(">> {}", response.trim_end()));
                         if writer.write_all(response.as_bytes()).is_err() {
@@ -314,6 +343,10 @@ fn handle_command(
     demod_params: &Arc<Mutex<DemodParams>>,
     display: &Arc<Mutex<SpectrumDisplay>>,
     mox: &Arc<AtomicBool>,
+    rit_enabled: &Arc<AtomicBool>,
+    rit_offset_hz: &Arc<AtomicI32>,
+    xit_enabled: &Arc<AtomicBool>,
+    xit_offset_hz: &Arc<AtomicI32>,
 ) -> Option<String> {
     let mut parts = cmd.split_whitespace();
     let op = parts.next().unwrap_or("");
@@ -330,6 +363,58 @@ fn handle_command(
             }
             None => "RPRT -1\n".to_string(),
         },
+        // RIT/XIT offset, Hz, signed -- clamped to +-9999 matching
+        // main.rs's own UI clamp for these values.
+        "j" | "\\get_rit" => {
+            let v = rit_offset_hz.load(Ordering::Relaxed);
+            format!("{v}\n")
+        }
+        "J" | "\\set_rit" => match parts.next().and_then(|s| s.parse::<i32>().ok()) {
+            Some(v) => {
+                rit_offset_hz.store(v.clamp(-9999, 9999), Ordering::Relaxed);
+                "RPRT 0\n".to_string()
+            }
+            None => "RPRT -1\n".to_string(),
+        },
+        "z" | "\\get_xit" => {
+            let v = xit_offset_hz.load(Ordering::Relaxed);
+            format!("{v}\n")
+        }
+        "Z" | "\\set_xit" => match parts.next().and_then(|s| s.parse::<i32>().ok()) {
+            Some(v) => {
+                xit_offset_hz.store(v.clamp(-9999, 9999), Ordering::Relaxed);
+                "RPRT 0\n".to_string()
+            }
+            None => "RPRT -1\n".to_string(),
+        },
+        // RIT/XIT on/off via Hamlib's func mechanism -- only these two
+        // funcs are backed by anything; any other func name is RPRT -1,
+        // same "respond unsupported rather than a made-up value"
+        // philosophy as everywhere else in this file. dump_state's own
+        // has_get_func/has_set_func are deliberately left at 0 below
+        // regardless (see that function's own comment) -- this doesn't
+        // claim full Hamlib function-bitmap support, just these two
+        // specific funcs for a client that tries them directly.
+        "u" | "\\get_func" => match parts.next().unwrap_or("") {
+            "RIT" => format!("{}\n", rit_enabled.load(Ordering::Relaxed) as i32),
+            "XIT" => format!("{}\n", xit_enabled.load(Ordering::Relaxed) as i32),
+            _ => "RPRT -1\n".to_string(),
+        },
+        "U" | "\\set_func" => {
+            let func = parts.next().unwrap_or("");
+            let val = parts.next().and_then(|s| s.parse::<i32>().ok());
+            match (func, val) {
+                ("RIT", Some(v)) => {
+                    rit_enabled.store(v != 0, Ordering::Relaxed);
+                    "RPRT 0\n".to_string()
+                }
+                ("XIT", Some(v)) => {
+                    xit_enabled.store(v != 0, Ordering::Relaxed);
+                    "RPRT 0\n".to_string()
+                }
+                _ => "RPRT -1\n".to_string(),
+            }
+        }
         "m" | "\\get_mode" => {
             let p = *demod_params.lock().unwrap();
             format!("{}\n{}\n", mode_to_hamlib(p.mode), p.width_hz.round() as i64)
@@ -473,12 +558,19 @@ fn dump_state() -> String {
         "0 0\n",     // end of tuning step list
         "-1 2400\n", // filters: all modes, 2400Hz default
         "0 0\n",     // end of filter list
-        "0\n",       // max RIT
-        "0\n",       // max XIT
+        "9999\n",    // max RIT -- real now, see handle_command's j/J
+        "9999\n",    // max XIT -- real now, see handle_command's z/Z
         "0\n",       // max IF shift
         "0\n",       // announces
         "0\n",       // preamp list
         "0\n",       // attenuator list
+        // Left at 0 despite j/J/z/Z/u/U (RIT/XIT get/set_func) now being
+        // real -- see handle_command's own comment on why: this would
+        // need the correct Hamlib RIG_FUNC bitmask encoding to claim
+        // properly, which isn't confirmed here, and a wrong bitmask
+        // could be worse than 0 for a client that trusts it. A client
+        // that just tries u/U RIT/XIT directly (rather than gating on
+        // this) sees the real values regardless.
         "0\n",       // has_get_func
         "0\n",       // has_set_func
         // Left at 0 rather than advertising a RIG_LEVEL_STRENGTH bit --

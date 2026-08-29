@@ -886,6 +886,19 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
     if let Some(atten) = cfg.ps_tx_attenuation {
         settings.ps_tx_attenuation = atten;
     }
+    // See RadioSettings::rit_enabled's doc comment -- computed here
+    // (rather than after RadioSession::start, where these were
+    // previously read) so the shared atomics it seeds already match this
+    // restored state from the very first frame. Reused below for
+    // ConnectedState's own fields once `session` exists.
+    let rit_enabled = cfg.rit_enabled.unwrap_or(false);
+    let rit_offset_hz = cfg.rit_offset_hz.unwrap_or(0.0);
+    let xit_enabled = cfg.xit_enabled.unwrap_or(false);
+    let xit_offset_hz = cfg.xit_offset_hz.unwrap_or(0.0);
+    settings.rit_enabled = rit_enabled;
+    settings.rit_offset_hz = rit_offset_hz.round().clamp(-9_999.0, 9_999.0) as i32;
+    settings.xit_enabled = xit_enabled;
+    settings.xit_offset_hz = xit_offset_hz.round().clamp(-9_999.0, 9_999.0) as i32;
     match RadioSession::start(&device, settings) {
         Ok(session) => {
             // Override RadioSession::start's hardcoded
@@ -968,6 +981,10 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                     spectrum.demod_params_handle(),
                     Arc::clone(&spectrum.display),
                     Arc::clone(&session.mox),
+                    Arc::clone(&session.rit_enabled),
+                    Arc::clone(&session.rit_offset_hz),
+                    Arc::clone(&session.xit_enabled),
+                    Arc::clone(&session.xit_offset_hz),
                     rigctl_debug_log.clone(),
                 ) {
                     Ok(s) => Some(s),
@@ -994,6 +1011,10 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                     Arc::clone(&session.tci_tx_audio),
                     Arc::clone(&session.tci_tx_gain),
                     Arc::clone(&session.tci_wants_mic),
+                    Arc::clone(&session.rit_enabled),
+                    Arc::clone(&session.rit_offset_hz),
+                    Arc::clone(&session.xit_enabled),
+                    Arc::clone(&session.xit_offset_hz),
                     format!("{:?}", device.board),
                     tci_debug_log.clone(),
                 ) {
@@ -1016,6 +1037,9 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                     spectrum.demod_params_handle(),
                     Arc::clone(&spectrum.display),
                     Arc::clone(&session.mox),
+                    Arc::clone(&session.rit_enabled),
+                    Arc::clone(&session.rit_offset_hz),
+                    Arc::clone(&session.xit_enabled),
                     cat_debug_log.clone(),
                 ) {
                     Ok(s) => Some(s),
@@ -1216,11 +1240,9 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
             // of never leaving a frequency field at a meaningless 0).
             let vfo_b_frequency_hz = cfg.vfo_b_frequency_hz.unwrap_or(initial_frequency_hz);
             let split = cfg.split.unwrap_or(false);
-            // RIT / XIT -- see ConnectedState's own doc comments.
-            let rit_enabled = cfg.rit_enabled.unwrap_or(false);
-            let rit_offset_hz = cfg.rit_offset_hz.unwrap_or(0.0);
-            let xit_enabled = cfg.xit_enabled.unwrap_or(false);
-            let xit_offset_hz = cfg.xit_offset_hz.unwrap_or(0.0);
+            // RIT / XIT -- see ConnectedState's own doc comments. Values
+            // themselves already computed above (before RadioSession::
+            // start), reused here.
             Ok(ConnectedState {
                 device,
                 session,
@@ -1555,6 +1577,33 @@ impl eframe::App for HpsdrApp {
                     // mechanism for marking a save needed from outside its
                     // scope (see e.g. the rigctl/TCI/CAT Start buttons'
                     // own use of it).
+                    connected.settings_dirty.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+
+                // RIT/XIT: see RadioSession::rit_enabled's doc comment --
+                // a single shared atomic per value, written directly by
+                // whichever side changes it (this app's own UI below, or
+                // rigctl/CAT/TCI's set commands), with no CTUN-style
+                // reconciliation needed. This just catches an externally
+                // (network-)driven change and mirrors it into local state
+                // for rendering/persistence -- a UI-driven change writes
+                // both sides together at its own call site below, so it
+                // never shows up here as a "change" (already equal by the
+                // time this runs next frame).
+                let net_rit_enabled = connected.session.rit_enabled.load(std::sync::atomic::Ordering::Relaxed);
+                let net_rit_offset_hz =
+                    connected.session.rit_offset_hz.load(std::sync::atomic::Ordering::Relaxed) as f64;
+                if net_rit_enabled != connected.rit_enabled || net_rit_offset_hz != connected.rit_offset_hz {
+                    connected.rit_enabled = net_rit_enabled;
+                    connected.rit_offset_hz = net_rit_offset_hz;
+                    connected.settings_dirty.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+                let net_xit_enabled = connected.session.xit_enabled.load(std::sync::atomic::Ordering::Relaxed);
+                let net_xit_offset_hz =
+                    connected.session.xit_offset_hz.load(std::sync::atomic::Ordering::Relaxed) as f64;
+                if net_xit_enabled != connected.xit_enabled || net_xit_offset_hz != connected.xit_offset_hz {
+                    connected.xit_enabled = net_xit_enabled;
+                    connected.xit_offset_hz = net_xit_offset_hz;
                     connected.settings_dirty.store(true, std::sync::atomic::Ordering::Relaxed);
                 }
 
@@ -2687,6 +2736,10 @@ impl eframe::App for HpsdrApp {
                                 );
                             if rit_resp.clicked() {
                                 connected.rit_enabled = !connected.rit_enabled;
+                                connected
+                                    .session
+                                    .rit_enabled
+                                    .store(connected.rit_enabled, std::sync::atomic::Ordering::Relaxed);
                                 settings_changed = true;
                             }
                             if rit_resp.hovered() {
@@ -2710,12 +2763,17 @@ impl eframe::App for HpsdrApp {
                                     new_offset = new_offset.clamp(-9_999, 9_999);
                                     if new_offset as f64 != connected.rit_offset_hz {
                                         connected.rit_offset_hz = new_offset as f64;
+                                        connected
+                                            .session
+                                            .rit_offset_hz
+                                            .store(new_offset as i32, std::sync::atomic::Ordering::Relaxed);
                                         settings_changed = true;
                                     }
                                 }
                             }
                             if ui.button("Clear").on_hover_text("Zero the RIT offset").clicked() {
                                 connected.rit_offset_hz = 0.0;
+                                connected.session.rit_offset_hz.store(0, std::sync::atomic::Ordering::Relaxed);
                                 settings_changed = true;
                             }
 
@@ -2738,6 +2796,10 @@ impl eframe::App for HpsdrApp {
                                 );
                             if xit_resp.clicked() {
                                 connected.xit_enabled = !connected.xit_enabled;
+                                connected
+                                    .session
+                                    .xit_enabled
+                                    .store(connected.xit_enabled, std::sync::atomic::Ordering::Relaxed);
                                 settings_changed = true;
                             }
                             if xit_resp.hovered() {
@@ -2761,12 +2823,17 @@ impl eframe::App for HpsdrApp {
                                     new_offset = new_offset.clamp(-9_999, 9_999);
                                     if new_offset as f64 != connected.xit_offset_hz {
                                         connected.xit_offset_hz = new_offset as f64;
+                                        connected
+                                            .session
+                                            .xit_offset_hz
+                                            .store(new_offset as i32, std::sync::atomic::Ordering::Relaxed);
                                         settings_changed = true;
                                     }
                                 }
                             }
                             if ui.button("Clear").on_hover_text("Zero the XIT offset").clicked() {
                                 connected.xit_offset_hz = 0.0;
+                                connected.session.xit_offset_hz.store(0, std::sync::atomic::Ordering::Relaxed);
                                 settings_changed = true;
                             }
 
@@ -2996,8 +3063,6 @@ impl eframe::App for HpsdrApp {
                     // drawing code) can use them too.
                     let view_center_hz = freq_hz as f64 + pan_offset_hz;
 
-                    draw_band_edge_markers(ui.painter(), rect, view_center_hz, visible_half_span_hz, &connected.xvtrs);
-
                     // While transmitting, this displays tx_spectrum --
                     // generated TX IQ that's always centered on the real
                     // TX carrier by construction (tx_spectrum never has
@@ -3125,6 +3190,12 @@ impl eframe::App for HpsdrApp {
                             egui::Stroke::new(1.5, egui::Color32::LIGHT_GREEN),
                         ));
                     }
+
+                    // See draw_band_edge_markers's own doc comment for
+                    // why this moved here (on top of the trace/gridlines,
+                    // not underneath) -- drawn before the dial line below
+                    // so the dial line still wins if they ever overlap.
+                    draw_band_edge_markers(ui.painter(), rect, view_center_hz, visible_half_span_hz, &connected.xvtrs);
 
                     // Drawn last (on top of the trace/gridlines above)
                     // and thicker than a plain 1px stroke so it's
@@ -3721,6 +3792,10 @@ impl eframe::App for HpsdrApp {
                                                 connected.spectrum.demod_params_handle(),
                                                 Arc::clone(&connected.spectrum.display),
                                                 Arc::clone(&connected.session.mox),
+                                                Arc::clone(&connected.session.rit_enabled),
+                                                Arc::clone(&connected.session.rit_offset_hz),
+                                                Arc::clone(&connected.session.xit_enabled),
+                                                Arc::clone(&connected.session.xit_offset_hz),
                                                 connected.rigctl_debug_log.clone(),
                                             ) {
                                                 Ok(s) => Some(s),
@@ -3787,6 +3862,10 @@ impl eframe::App for HpsdrApp {
                                                 Arc::clone(&connected.session.tci_tx_audio),
                                                 Arc::clone(&connected.session.tci_tx_gain),
                                                 Arc::clone(&connected.session.tci_wants_mic),
+                                                Arc::clone(&connected.session.rit_enabled),
+                                                Arc::clone(&connected.session.rit_offset_hz),
+                                                Arc::clone(&connected.session.xit_enabled),
+                                                Arc::clone(&connected.session.xit_offset_hz),
                                                 format!("{:?}", connected.device.board),
                                                 connected.tci_debug_log.clone(),
                                             ) {
@@ -3852,6 +3931,9 @@ impl eframe::App for HpsdrApp {
                                                 connected.spectrum.demod_params_handle(),
                                                 Arc::clone(&connected.spectrum.display),
                                                 Arc::clone(&connected.session.mox),
+                                                Arc::clone(&connected.session.rit_enabled),
+                                                Arc::clone(&connected.session.rit_offset_hz),
+                                                Arc::clone(&connected.session.xit_enabled),
                                                 connected.cat_debug_log.clone(),
                                             ) {
                                                 Ok(s) => Some(s),
@@ -5828,13 +5910,20 @@ fn draw_audio_waveform(painter: &egui::Painter, rect: egui::Rect, samples: &[f32
 /// (BANDS' low_hz/high_hz) that falls within the currently visible span
 /// -- e.g. tuned near the top of 40m shows a line at 7.300MHz, or near a
 /// WARC band shows both its edges. Deliberately spectrum-only (not the
-/// waterfall) and drawn early, right after the black background, so the
-/// spectrum trace/dial line/passband overlay all stay visually on top
-/// of it rather than the reverse. Recomputes the same offset-from-dial-
+/// waterfall). REGRESSION FIX: this used to be drawn right after the
+/// black background, before the trace/gridlines -- at a plain 1px
+/// stroke width, a real report confirmed this made the markers
+/// effectively invisible (not just occasionally crossed-over) once the
+/// trace was drawn on top, unlike the dial line, which had already been
+/// through this exact problem and fixed it (see its own "thicker than a
+/// plain 1px stroke so it's unambiguous regardless of what's under it or
+/// the display's DPI scaling" comment at its call site). Now drawn AFTER
+/// the trace/gridlines (still before the dial line, so the dial line --
+/// the single most important indicator -- always wins if they overlap)
+/// and at the same 2px width. Recomputes the same offset-from-dial-
 /// frequency-to-x mapping the caller builds separately (as `x_for_offset`)
 /// for its own passband overlay/axis ticks, rather than threading that
-/// closure through -- this runs before `x_for_offset` even exists at
-/// either call site.
+/// closure through.
 /// `center_hz`/`half_span_hz` describe the currently VISIBLE window
 /// (after zoom/pan), not necessarily the full captured sample-rate span
 /// -- see the caller's own visible_half_span_hz/pan_offset_hz for how
@@ -5850,7 +5939,7 @@ fn draw_band_edge_markers(painter: &egui::Painter, rect: egui::Rect, center_hz: 
         let x = rect.left() + frac * rect.width();
         painter.line_segment(
             [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
-            egui::Stroke::new(1.0, BAND_EDGE_COLOR),
+            egui::Stroke::new(2.0, BAND_EDGE_COLOR),
         );
     };
     for band in &BANDS {
@@ -6738,8 +6827,6 @@ fn render_extra_receiver_ui(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceiver>>) {
     // above (which run before this drawing code) can use them too.
     let view_center_hz = freq_hz as f64 + pan_offset_hz;
 
-    draw_band_edge_markers(ui.painter(), rect, view_center_hz, visible_half_span_hz, &[]);
-
     // No XVTR concept for extra receivers -- see draw_freq_axis_ticks's
     // doc comment.
     draw_freq_axis_ticks(ui.painter(), rect, view_center_hz, visible_half_span_hz, 0);
@@ -6807,6 +6894,11 @@ fn render_extra_receiver_ui(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceiver>>) {
         ui.painter()
             .add(egui::Shape::line(points, egui::Stroke::new(1.5, egui::Color32::LIGHT_GREEN)));
     }
+
+    // See draw_band_edge_markers's own doc comment for why this moved
+    // here (on top of the trace/gridlines) -- drawn before the dial line
+    // below so the dial line still wins if they ever overlap.
+    draw_band_edge_markers(ui.painter(), rect, view_center_hz, visible_half_span_hz, &[]);
 
     // Drawn last (on top of the trace/gridlines above) and thicker
     // than a plain 1px stroke, same as the main window.

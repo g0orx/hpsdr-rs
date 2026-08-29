@@ -19,6 +19,12 @@ hold-to-talk), but only while Settings → TX → **Enable Transmit** is on --
 with transmit not armed, a PTT request is accepted (so the client's own
 handshake doesn't fail) but has no receiver on the other end.
 
+[RIT and XIT](02-main-window.md#transmit-controls) are readable and
+settable through all three servers too, and stay in sync with the
+on-screen **RIT**/**XIT** buttons in both directions -- a change made in
+hpsdr-rs's own UI is visible to a connected client, and a change made by a
+client shows up on screen, the same as any other setting.
+
 ## rigctl
 
 Hamlib-compatible TCP control, for software that supports "Hamlib NET
@@ -63,10 +69,12 @@ named "rigctl" too.
 - Same **Start**/**Stop**/status/logging behavior as rigctl above (logs to
   `cat_log.txt`).
 - Implements a practical subset of the TS-2000 command set: frequency,
-  mode, PTT, S-meter, and a few identification/status commands. Commands
-  with no clean equivalent in this app yet (drive/power level, mic gain,
-  CW keyer, RIT/XIT, memory channels) respond `?;` or are accepted with no
-  effect, rather than reporting a made-up value.
+  mode, PTT, S-meter, RIT/XIT, and a few identification/status commands.
+  Commands with no clean equivalent in this app yet (drive/power level,
+  mic gain, CW keyer, memory channels) respond `?;` or are accepted with
+  no effect, rather than reporting a made-up value. XIT can only be
+  toggled on/off (`XT`), not set to a specific value -- matches real
+  Kenwood TS-2000 behavior, which has no such command either.
 
 None of the three servers auto-start -- start them explicitly here each
 session, or whenever you need them.

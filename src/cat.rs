@@ -16,10 +16,10 @@
     Ported from piHPSDR's src/rigctl.c (hardware-tested reference,
     written by the same author as this app), scoped down to a practical
     subset rather than porting its full ~5900 lines. Implemented:
-    ID, IF, FA, FB, FR, FT, MD, AI, PS, TX, RX, SM, TY. Deliberately
-    NOT implemented (unlike the reference) because this app has no
-    clean value/range to back them with yet, matching rigctl.rs's own
-    "respond unsupported rather than a made-up value" philosophy:
+    ID, IF, FA, FB, FR, FT, MD, AI, PS, TX, RX, SM, TY, RT, RC, RD, RU, XT.
+    Deliberately NOT implemented (unlike the reference) because this app
+    has no clean value/range to back them with yet, matching rigctl.rs's
+    own "respond unsupported rather than a made-up value" philosophy:
       - PC (drive/power level): max_tx_power_watts isn't currently
         shared via an Arc the way frequency/mox are, and the reference's
         0-100 scale doesn't map cleanly onto watts without it.
@@ -27,9 +27,13 @@
         multiplier, not the reference's -12..+50 dB range -- no honest
         conversion between the two.
       - KS/KY (CW keyer speed/send): no CW keyer exists in this app.
-      - RIT/XIT, split (FT accepted but always reports/treats as off),
-        CTCSS, memory channels, SAT mode: none of these have any
-        backing state in this app.
+      - Split (FT accepted but always reports/treats as off), CTCSS,
+        memory channels, SAT mode: none of these have any backing state
+        in this app. RIT/XIT DO now (RT/RC/RD/RU/XT, and the IF
+        response's rit/rit_en/xit_en fields) -- see RadioSession::
+        rit_enabled's doc comment (radio.rs). No command to set an
+        absolute XIT value exists in real Kenwood CAT either, only XT's
+        on/off toggle -- matches the reference exactly.
       - AI's auto-reporting flag is stored and read back per the
         client's own request, but no asynchronous FA/MD/... push
         notifications are actually sent on state changes -- a client
@@ -61,7 +65,7 @@ use crate::debug_log::DebugLog;
 use crate::spectrum::{DemodParams, Mode, SpectrumDisplay};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -110,6 +114,14 @@ impl CatServer {
         demod_params: Arc<Mutex<DemodParams>>,
         display: Arc<Mutex<SpectrumDisplay>>,
         mox: Arc<AtomicBool>,
+        // See RadioSession::rit_enabled/rit_offset_hz/xit_enabled's doc
+        // comments -- backs RT/RC/RD/RU (RIT) and XT (XIT). No
+        // xit_offset_hz here -- real Kenwood TS-2000 CAT has no command
+        // to set an absolute XIT value, only RIT's RC/RD/RU (see
+        // RadioSession::xit_enabled's doc comment).
+        rit_enabled: Arc<AtomicBool>,
+        rit_offset_hz: Arc<AtomicI32>,
+        xit_enabled: Arc<AtomicBool>,
         logging: DebugLog,
     ) -> std::io::Result<Self> {
         let listener = TcpListener::bind(addr)?;
@@ -141,12 +153,18 @@ impl CatServer {
                         let params = Arc::clone(&accept_demod_params);
                         let disp = Arc::clone(&accept_display);
                         let conn_mox = Arc::clone(&mox);
+                        let conn_rit_enabled = Arc::clone(&rit_enabled);
+                        let conn_rit_offset_hz = Arc::clone(&rit_offset_hz);
+                        let conn_xit_enabled = Arc::clone(&xit_enabled);
                         let conn_stop = Arc::clone(&accept_stop);
                         let conn_connected = Arc::clone(&accept_connected);
                         let conn_logging = accept_logging.clone();
                         let handle = thread::spawn(move || {
                             conn_connected.fetch_add(1, Ordering::Relaxed);
-                            handle_client(stream, freq, rx_freq, params, disp, conn_mox, conn_stop, conn_logging);
+                            handle_client(
+                                stream, freq, rx_freq, params, disp, conn_mox, conn_rit_enabled,
+                                conn_rit_offset_hz, conn_xit_enabled, conn_stop, conn_logging,
+                            );
                             conn_connected.fetch_sub(1, Ordering::Relaxed);
                         });
                         let mut threads = accept_client_threads.lock().unwrap();
@@ -213,6 +231,9 @@ fn handle_client(
     demod_params: DemodParamsCell,
     display: DisplayCell,
     mox: Arc<AtomicBool>,
+    rit_enabled: Arc<AtomicBool>,
+    rit_offset_hz: Arc<AtomicI32>,
+    xit_enabled: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
     logging: DebugLog,
 ) {
@@ -263,6 +284,9 @@ fn handle_client(
                         &current_params,
                         &current_display,
                         &mox,
+                        &rit_enabled,
+                        &rit_offset_hz,
+                        &xit_enabled,
                         &mut auto_reporting,
                     ) {
                         logging.log(&format!(">> {response}"));
@@ -297,6 +321,9 @@ fn handle_command(
     demod_params: &Arc<Mutex<DemodParams>>,
     display: &Arc<Mutex<SpectrumDisplay>>,
     mox: &Arc<AtomicBool>,
+    rit_enabled: &Arc<AtomicBool>,
+    rit_offset_hz: &Arc<AtomicI32>,
+    xit_enabled: &Arc<AtomicBool>,
     auto_reporting: &mut u8,
 ) -> Option<String> {
     if cmd.len() < 2 {
@@ -319,7 +346,67 @@ fn handle_command(
         }
         "IF" => {
             if suffix.is_empty() {
-                Some(build_if_response(rx_frequency_hz, demod_params, mox))
+                Some(build_if_response(rx_frequency_hz, demod_params, mox, rit_enabled, rit_offset_hz, xit_enabled))
+            } else {
+                None
+            }
+        }
+        // RIT status/value -- ported directly from piHPSDR's rigctl.c
+        // (case 'R'/'T', 'C', 'D', 'U'), confirmed exact field widths and
+        // step-size behavior against that reference rather than guessed.
+        "RT" => {
+            if suffix.is_empty() {
+                Some(format!("RT{};", rit_enabled.load(Ordering::Relaxed) as i32))
+            } else if let Ok(v) = suffix.parse::<i32>() {
+                rit_enabled.store(v != 0, Ordering::Relaxed);
+                None
+            } else {
+                None
+            }
+        }
+        // Clear VFO-A RIT value.
+        "RC" => {
+            if suffix.is_empty() {
+                rit_offset_hz.store(0, Ordering::Relaxed);
+            }
+            None
+        }
+        // Set or decrement VFO-A RIT value -- "RD;" (no arg) decrements
+        // by 10Hz (CW modes) or 50Hz (other modes); "RDxxxxx;" sets RIT
+        // to the NEGATIVE of x (matches the reference exactly).
+        "RD" => {
+            if suffix.is_empty() {
+                let mode = demod_params.lock().unwrap().mode;
+                let step = if matches!(mode, Mode::Cwl | Mode::Cwu) { 10 } else { 50 };
+                let v = (rit_offset_hz.load(Ordering::Relaxed) - step).clamp(-9999, 9999);
+                rit_offset_hz.store(v, Ordering::Relaxed);
+            } else if let Ok(v) = suffix.parse::<i32>() {
+                rit_offset_hz.store((-v).clamp(-9999, 9999), Ordering::Relaxed);
+            }
+            None
+        }
+        // Set or increment VFO-A RIT value -- same shape as RD, positive
+        // direction (and an absolute set to +x, not -x).
+        "RU" => {
+            if suffix.is_empty() {
+                let mode = demod_params.lock().unwrap().mode;
+                let step = if matches!(mode, Mode::Cwl | Mode::Cwu) { 10 } else { 50 };
+                let v = (rit_offset_hz.load(Ordering::Relaxed) + step).clamp(-9999, 9999);
+                rit_offset_hz.store(v, Ordering::Relaxed);
+            } else if let Ok(v) = suffix.parse::<i32>() {
+                rit_offset_hz.store(v.clamp(-9999, 9999), Ordering::Relaxed);
+            }
+            None
+        }
+        // XIT status -- real Kenwood TS-2000 CAT has no command to set
+        // an absolute XIT value (see RadioSession::xit_enabled's doc
+        // comment), only this on/off toggle.
+        "XT" => {
+            if suffix.is_empty() {
+                Some(format!("XT{};", xit_enabled.load(Ordering::Relaxed) as i32))
+            } else if let Ok(v) = suffix.parse::<i32>() {
+                xit_enabled.store(v != 0, Ordering::Relaxed);
+                None
             } else {
                 None
             }
@@ -420,12 +507,16 @@ fn handle_command(
 /// IF response field layout ported directly from piHPSDR's rigctl.c
 /// (the "IF" case, see this module's doc comment) -- see that file for
 /// the full field-by-field breakdown. Fields with no backing state in
-/// this app (tuning step, RIT/XIT, split, CTCSS) are hardcoded to their
-/// "off"/zero value.
+/// this app (tuning step, split, CTCSS) are hardcoded to their
+/// "off"/zero value; rit/rit_en/xit_en now reflect real live state --
+/// see RadioSession::rit_enabled's doc comment.
 fn build_if_response(
     frequency_hz: &Arc<AtomicU32>,
     demod_params: &Arc<Mutex<DemodParams>>,
     mox: &Arc<AtomicBool>,
+    rit_enabled: &Arc<AtomicBool>,
+    rit_offset_hz: &Arc<AtomicI32>,
+    xit_enabled: &Arc<AtomicBool>,
 ) -> String {
     let f = frequency_hz.load(Ordering::Relaxed);
     let mode = demod_params.lock().unwrap().mode;
@@ -433,9 +524,9 @@ fn build_if_response(
     format!(
         "IF{f:011}{step:04}{rit:+06}{rit_en}{xit_en}{z1}{z2:02}{tx}{mode}{z3}{z4}{split}{ctcss_en:01}{ctcss:02}{z5};",
         step = 0,
-        rit = 0,
-        rit_en = 0,
-        xit_en = 0,
+        rit = rit_offset_hz.load(Ordering::Relaxed),
+        rit_en = rit_enabled.load(Ordering::Relaxed) as u8,
+        xit_en = xit_enabled.load(Ordering::Relaxed) as u8,
         z1 = 0,
         z2 = 0,
         tx = transmitting,
@@ -490,7 +581,15 @@ mod tests {
     use std::collections::VecDeque;
     use std::sync::atomic::AtomicBool;
 
-    fn fixture() -> (Arc<AtomicU32>, Arc<Mutex<DemodParams>>, Arc<Mutex<SpectrumDisplay>>, Arc<AtomicBool>) {
+    fn fixture() -> (
+        Arc<AtomicU32>,
+        Arc<Mutex<DemodParams>>,
+        Arc<Mutex<SpectrumDisplay>>,
+        Arc<AtomicBool>,
+        Arc<AtomicBool>,
+        Arc<AtomicI32>,
+        Arc<AtomicBool>,
+    ) {
         let frequency_hz = Arc::new(AtomicU32::new(14_074_000));
         let demod_params = Arc::new(Mutex::new(DemodParams::default()));
         let display = Arc::new(Mutex::new(SpectrumDisplay {
@@ -500,7 +599,10 @@ mod tests {
             revision: 0,
         }));
         let mox = Arc::new(AtomicBool::new(false));
-        (frequency_hz, demod_params, display, mox)
+        let rit_enabled = Arc::new(AtomicBool::new(false));
+        let rit_offset_hz = Arc::new(AtomicI32::new(0));
+        let xit_enabled = Arc::new(AtomicBool::new(false));
+        (frequency_hz, demod_params, display, mox, rit_enabled, rit_offset_hz, xit_enabled)
     }
 
     #[test]
@@ -522,58 +624,114 @@ mod tests {
 
     #[test]
     fn id_reports_ts2000() {
-        let (f, p, d, m) = fixture();
+        let (f, p, d, m, rit, rit_hz, xit) = fixture();
         let mut ai = 0;
-        assert_eq!(handle_command("ID", &f, &f, &p, &d, &m, &mut ai), Some("ID019;".to_string()));
+        assert_eq!(handle_command("ID", &f, &f, &p, &d, &m, &rit, &rit_hz, &xit, &mut ai), Some("ID019;".to_string()));
     }
 
     #[test]
     fn fa_read_reflects_current_frequency() {
-        let (f, p, d, m) = fixture();
+        let (f, p, d, m, rit, rit_hz, xit) = fixture();
         let mut ai = 0;
-        assert_eq!(handle_command("FA", &f, &f, &p, &d, &m, &mut ai), Some("FA00014074000;".to_string()));
+        assert_eq!(handle_command("FA", &f, &f, &p, &d, &m, &rit, &rit_hz, &xit, &mut ai), Some("FA00014074000;".to_string()));
     }
 
     #[test]
     fn fa_set_updates_frequency_and_sends_no_reply() {
-        let (f, p, d, m) = fixture();
+        let (f, p, d, m, rit, rit_hz, xit) = fixture();
         let mut ai = 0;
-        assert_eq!(handle_command("FA00007074000", &f, &f, &p, &d, &m, &mut ai), None);
+        assert_eq!(handle_command("FA00007074000", &f, &f, &p, &d, &m, &rit, &rit_hz, &xit, &mut ai), None);
         assert_eq!(f.load(Ordering::Relaxed), 7_074_000);
     }
 
     #[test]
     fn fb_read_mirrors_fa() {
-        let (f, p, d, m) = fixture();
+        let (f, p, d, m, rit, rit_hz, xit) = fixture();
         let mut ai = 0;
-        assert_eq!(handle_command("FB", &f, &f, &p, &d, &m, &mut ai), Some("FB00014074000;".to_string()));
+        assert_eq!(handle_command("FB", &f, &f, &p, &d, &m, &rit, &rit_hz, &xit, &mut ai), Some("FB00014074000;".to_string()));
     }
 
     #[test]
     fn md_get_set_round_trip() {
-        let (f, p, d, m) = fixture();
+        let (f, p, d, m, rit, rit_hz, xit) = fixture();
         let mut ai = 0;
         // Default DemodParams starts at USB (code 2).
-        assert_eq!(handle_command("MD", &f, &f, &p, &d, &m, &mut ai), Some("MD2;".to_string()));
-        assert_eq!(handle_command("MD3", &f, &f, &p, &d, &m, &mut ai), None); // CWU
+        assert_eq!(handle_command("MD", &f, &f, &p, &d, &m, &rit, &rit_hz, &xit, &mut ai), Some("MD2;".to_string()));
+        assert_eq!(handle_command("MD3", &f, &f, &p, &d, &m, &rit, &rit_hz, &xit, &mut ai), None); // CWU
         assert_eq!(p.lock().unwrap().mode, Mode::Cwu);
-        assert_eq!(handle_command("MD", &f, &f, &p, &d, &m, &mut ai), Some("MD3;".to_string()));
+        assert_eq!(handle_command("MD", &f, &f, &p, &d, &m, &rit, &rit_hz, &xit, &mut ai), Some("MD3;".to_string()));
+    }
+
+    #[test]
+    fn rt_get_set_round_trip() {
+        let (f, p, d, m, rit, rit_hz, xit) = fixture();
+        let mut ai = 0;
+        assert_eq!(handle_command("RT", &f, &f, &p, &d, &m, &rit, &rit_hz, &xit, &mut ai), Some("RT0;".to_string()));
+        assert_eq!(handle_command("RT1", &f, &f, &p, &d, &m, &rit, &rit_hz, &xit, &mut ai), None);
+        assert!(rit.load(Ordering::Relaxed));
+        assert_eq!(handle_command("RT", &f, &f, &p, &d, &m, &rit, &rit_hz, &xit, &mut ai), Some("RT1;".to_string()));
+    }
+
+    #[test]
+    fn rc_clears_rit_offset() {
+        let (f, p, d, m, rit, rit_hz, xit) = fixture();
+        let mut ai = 0;
+        rit_hz.store(250, Ordering::Relaxed);
+        assert_eq!(handle_command("RC", &f, &f, &p, &d, &m, &rit, &rit_hz, &xit, &mut ai), None);
+        assert_eq!(rit_hz.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn rd_ru_step_and_absolute_set() {
+        let (f, p, d, m, rit, rit_hz, xit) = fixture();
+        let mut ai = 0;
+        // Default mode (USB) steps by 50Hz.
+        assert_eq!(handle_command("RU", &f, &f, &p, &d, &m, &rit, &rit_hz, &xit, &mut ai), None);
+        assert_eq!(rit_hz.load(Ordering::Relaxed), 50);
+        assert_eq!(handle_command("RD", &f, &f, &p, &d, &m, &rit, &rit_hz, &xit, &mut ai), None);
+        assert_eq!(rit_hz.load(Ordering::Relaxed), 0);
+        // CW modes step by 10Hz instead of 50Hz.
+        p.lock().unwrap().mode = Mode::Cwl;
+        assert_eq!(handle_command("RU", &f, &f, &p, &d, &m, &rit, &rit_hz, &xit, &mut ai), None);
+        assert_eq!(rit_hz.load(Ordering::Relaxed), 10);
+        // An explicit value is an ABSOLUTE set, negated for RD -- matches
+        // piHPSDR's rigctl.c exactly (see handle_command's own comment).
+        assert_eq!(
+            handle_command("RU00500", &f, &f, &p, &d, &m, &rit, &rit_hz, &xit, &mut ai),
+            None
+        );
+        assert_eq!(rit_hz.load(Ordering::Relaxed), 500);
+        assert_eq!(
+            handle_command("RD00500", &f, &f, &p, &d, &m, &rit, &rit_hz, &xit, &mut ai),
+            None
+        );
+        assert_eq!(rit_hz.load(Ordering::Relaxed), -500);
+    }
+
+    #[test]
+    fn xt_get_set_round_trip() {
+        let (f, p, d, m, rit, rit_hz, xit) = fixture();
+        let mut ai = 0;
+        assert_eq!(handle_command("XT", &f, &f, &p, &d, &m, &rit, &rit_hz, &xit, &mut ai), Some("XT0;".to_string()));
+        assert_eq!(handle_command("XT1", &f, &f, &p, &d, &m, &rit, &rit_hz, &xit, &mut ai), None);
+        assert!(xit.load(Ordering::Relaxed));
+        assert_eq!(handle_command("XT", &f, &f, &p, &d, &m, &rit, &rit_hz, &xit, &mut ai), Some("XT1;".to_string()));
     }
 
     #[test]
     fn tx_rx_drive_mox() {
-        let (f, p, d, m) = fixture();
+        let (f, p, d, m, rit, rit_hz, xit) = fixture();
         let mut ai = 0;
-        assert_eq!(handle_command("TX", &f, &f, &p, &d, &m, &mut ai), None);
+        assert_eq!(handle_command("TX", &f, &f, &p, &d, &m, &rit, &rit_hz, &xit, &mut ai), None);
         assert!(m.load(Ordering::Relaxed));
-        assert_eq!(handle_command("RX", &f, &f, &p, &d, &m, &mut ai), None);
+        assert_eq!(handle_command("RX", &f, &f, &p, &d, &m, &rit, &rit_hz, &xit, &mut ai), None);
         assert!(!m.load(Ordering::Relaxed));
     }
 
     #[test]
     fn if_response_has_expected_length_and_frequency() {
-        let (f, p, _d, m) = fixture();
-        let resp = build_if_response(&f, &p, &m);
+        let (f, p, _d, m, rit, rit_hz, xit) = fixture();
+        let resp = build_if_response(&f, &p, &m, &rit, &rit_hz, &xit);
         assert!(resp.starts_with("IF00014074000"), "{resp}");
         assert!(resp.ends_with(';'));
         // "IF" + freq(11) + step(4) + rit(6) + 10 single-digit fields +
@@ -583,39 +741,39 @@ mod tests {
 
     #[test]
     fn sm_reports_s9_as_midscale() {
-        let (f, p, d, m) = fixture();
+        let (f, p, d, m, rit, rit_hz, xit) = fixture();
         let mut ai = 0;
         // fixture() sets meter_db to -73 (S9); piHPSDR's formula maps
         // that to roughly the middle of the 0-30 scale.
-        let resp = handle_command("SM0", &f, &f, &p, &d, &m, &mut ai).unwrap();
+        let resp = handle_command("SM0", &f, &f, &p, &d, &m, &rit, &rit_hz, &xit, &mut ai).unwrap();
         assert!(resp.starts_with("SM0"), "{resp}");
         assert!(resp.ends_with(';'));
     }
 
     #[test]
     fn ai_get_set_round_trip() {
-        let (f, p, d, m) = fixture();
+        let (f, p, d, m, rit, rit_hz, xit) = fixture();
         let mut ai = 0;
-        assert_eq!(handle_command("AI", &f, &f, &p, &d, &m, &mut ai), Some("AI0;".to_string()));
-        assert_eq!(handle_command("AI2", &f, &f, &p, &d, &m, &mut ai), None);
+        assert_eq!(handle_command("AI", &f, &f, &p, &d, &m, &rit, &rit_hz, &xit, &mut ai), Some("AI0;".to_string()));
+        assert_eq!(handle_command("AI2", &f, &f, &p, &d, &m, &rit, &rit_hz, &xit, &mut ai), None);
         assert_eq!(ai, 2);
-        assert_eq!(handle_command("AI", &f, &f, &p, &d, &m, &mut ai), Some("AI2;".to_string()));
+        assert_eq!(handle_command("AI", &f, &f, &p, &d, &m, &rit, &rit_hz, &xit, &mut ai), Some("AI2;".to_string()));
     }
 
     #[test]
     fn ps_read_always_reports_on_and_set_is_ignored() {
-        let (f, p, d, m) = fixture();
+        let (f, p, d, m, rit, rit_hz, xit) = fixture();
         let mut ai = 0;
-        assert_eq!(handle_command("PS", &f, &f, &p, &d, &m, &mut ai), Some("PS1;".to_string()));
+        assert_eq!(handle_command("PS", &f, &f, &p, &d, &m, &rit, &rit_hz, &xit, &mut ai), Some("PS1;".to_string()));
         // "PS0;" (power off) is deliberately a no-op, not a shutdown --
         // see this module's doc comment.
-        assert_eq!(handle_command("PS0", &f, &f, &p, &d, &m, &mut ai), None);
+        assert_eq!(handle_command("PS0", &f, &f, &p, &d, &m, &rit, &rit_hz, &xit, &mut ai), None);
     }
 
     #[test]
     fn unknown_command_gets_question_mark() {
-        let (f, p, d, m) = fixture();
+        let (f, p, d, m, rit, rit_hz, xit) = fixture();
         let mut ai = 0;
-        assert_eq!(handle_command("ZZ", &f, &f, &p, &d, &m, &mut ai), Some("?;".to_string()));
+        assert_eq!(handle_command("ZZ", &f, &f, &p, &d, &m, &rit, &rit_hz, &xit, &mut ai), Some("?;".to_string()));
     }
 }
