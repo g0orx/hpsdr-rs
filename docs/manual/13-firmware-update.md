@@ -1,4 +1,4 @@
-[← Extra Receivers](12-extra-receivers.md) | [Index](README.md)
+[← Extra Receivers](12-extra-receivers.md) | [Index](README.md) | [XVTR →](14-xvtr.md)
 
 # Firmware Update
 
@@ -111,4 +111,4 @@ check the error shown before trying again.
 
 ---
 
-[← Extra Receivers](12-extra-receivers.md) | [Index](README.md)
+[← Extra Receivers](12-extra-receivers.md) | [Index](README.md) | [XVTR →](14-xvtr.md)
