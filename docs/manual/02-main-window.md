@@ -19,10 +19,13 @@ that VFO is the one actually transmitting (see
 - **Click** directly on the spectrum or waterfall: retunes straight to the
   clicked frequency (rounded to the nearest kHz).
 - **Click and drag** across the spectrum or waterfall: retunes by however
-  far you've dragged, in whichever direction -- like grabbing and moving
-  the display itself (drag right to bring lower frequencies into view,
-  left for higher), rather than jumping straight to wherever the cursor
-  ends up.
+  far you've dragged, in whichever direction, rather than jumping straight
+  to wherever the cursor ends up. With [CTUN](#ctun-click-to-tune) off,
+  this grabs and moves the display itself (drag right to bring lower
+  frequencies into view, left for higher). With CTUN on, the spectrum
+  itself doesn't move (the radio's real tuned frequency stays fixed) --
+  instead this drags the CTUN listen point directly, the same direction as
+  your cursor, the same way clicking a spot tunes straight to it.
 
 ### CTUN (Click to Tune)
 

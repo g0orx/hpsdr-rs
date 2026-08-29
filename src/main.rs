@@ -2897,13 +2897,29 @@ impl eframe::App for HpsdrApp {
                     // even after the drag stopped moving (a real report).
                     if spectrum_resp.dragged() && !suppress_refocus_click {
                         let hz_per_px = (2.0 * visible_half_span_hz) / rect.width().max(1.0) as f64;
-                        // Negated: dragging right pulls lower frequencies
-                        // in from the right edge, the same way dragging a
-                        // map or a scrollable view does -- content moves
-                        // right = the reference point tracks left. A real
-                        // report: the unnegated version (drag right ->
-                        // frequency up, like a tuning knob) felt backwards.
-                        connected.drag_tune_accum_hz += -spectrum_resp.drag_delta().x as f64 * hz_per_px;
+                        // Negated when CTUN is off: dragging right pulls
+                        // lower frequencies in from the right edge, the
+                        // same way dragging a map or a scrollable view
+                        // does -- content moves right = the reference
+                        // point (the real hardware LO) tracks left. A
+                        // real report: the unnegated version (drag right
+                        // -> frequency up, like a tuning knob) felt
+                        // backwards.
+                        //
+                        // NOT negated when CTUN is on: unlike the LO
+                        // retune case above, the spectrum trace itself
+                        // doesn't move at all while CTUN is on (freq_hz,
+                        // its center, is unchanged) -- only the CTUN dial
+                        // marker moves across that static ruler, the same
+                        // "click where you want it" model click-to-tune
+                        // already uses (freq_at_x, a direct, non-negated
+                        // position lookup). ROOT CAUSE FIX for a real
+                        // report: reusing the LO-retune case's negation
+                        // here made the dial marker drift opposite the
+                        // drag direction, since there's no "content" to
+                        // grab and slide when CTUN is on.
+                        let drag_sign = if connected.ctun { 1.0 } else { -1.0 };
+                        connected.drag_tune_accum_hz += drag_sign * spectrum_resp.drag_delta().x as f64 * hz_per_px;
                         const STEP_HZ: i64 = 1_000;
                         let mut new_freq = dial_freq_hz as i64;
                         while connected.drag_tune_accum_hz.abs() >= STEP_HZ as f64 {
@@ -3263,10 +3279,12 @@ impl eframe::App for HpsdrApp {
                     }
                     // Click-and-drag -- see the spectrum pane's identical
                     // treatment above for why this uses drag_delta()
-                    // rather than an absolute cursor-position mapping.
+                    // rather than an absolute cursor-position mapping,
+                    // and why the sign flips depending on CTUN.
                     if waterfall_click_resp.dragged() && !suppress_refocus_click {
                         let hz_per_px = (2.0 * visible_half_span_hz) / rect.width().max(1.0) as f64;
-                        connected.drag_tune_accum_hz += -waterfall_click_resp.drag_delta().x as f64 * hz_per_px;
+                        let drag_sign = if connected.ctun { 1.0 } else { -1.0 };
+                        connected.drag_tune_accum_hz += drag_sign * waterfall_click_resp.drag_delta().x as f64 * hz_per_px;
                         const STEP_HZ: i64 = 1_000;
                         let mut new_freq = dial_freq_hz as i64;
                         while connected.drag_tune_accum_hz.abs() >= STEP_HZ as f64 {
@@ -3287,6 +3305,77 @@ impl eframe::App for HpsdrApp {
                             settings_changed = true;
                         }
                     }
+
+                    // Scroll-to-tune -- see the spectrum pane's identical
+                    // treatment above (including the Ctrl+scroll zoom-
+                    // gesture case) for the full reasoning; this was
+                    // missing entirely for the waterfall (only click and
+                    // drag were wired up), confirmed by a real report.
+                    // Shares connected.scroll_accum/zoom_accum with the
+                    // spectrum pane -- only one pane can be hovered at
+                    // once, so there's no cross-talk.
+                    if waterfall_click_resp.hovered() {
+                        let scroll_delta = ui.input(|i| i.smooth_scroll_delta);
+                        let delta = if scroll_delta.y.abs() >= scroll_delta.x.abs() {
+                            scroll_delta.y
+                        } else {
+                            scroll_delta.x
+                        };
+
+                        if delta != 0.0 {
+                            connected.scroll_accum += delta;
+                            const NOTCH: f32 = 50.0;
+                            let shift = ui.input(|i| i.modifiers.shift);
+                            let step: i64 = if shift { 100 } else { 1_000 };
+
+                            let mut new_freq = dial_freq_hz as i64;
+                            while connected.scroll_accum.abs() >= NOTCH {
+                                let sign = connected.scroll_accum.signum();
+                                connected.scroll_accum -= sign * NOTCH;
+                                new_freq += step * sign as i64;
+                            }
+                            new_freq = new_freq.max(0);
+
+                            if new_freq as u32 != dial_freq_hz {
+                                let (effective_freq, retune) =
+                                    resolve_tune(connected.ctun, freq_hz, sample_rate, passband, new_freq as u32);
+                                if let Some(lo) = retune {
+                                    connected.session.set_frequency(lo);
+                                } else {
+                                    connected.ctun_frequency_hz = effective_freq;
+                                }
+                                remember_band_settings(&mut connected.band_memory, effective_freq, connected.db_low, connected.db_high, connected.waterfall_db_low, connected.waterfall_db_high, current_mode);
+                                settings_changed = true;
+                            }
+                        }
+
+                        let zoom = ui.input(|i| i.zoom_delta());
+                        if zoom != 1.0 {
+                            connected.zoom_accum += zoom - 1.0;
+                            const ZOOM_NOTCH: f32 = 0.05;
+
+                            let mut new_freq = dial_freq_hz as i64;
+                            while connected.zoom_accum.abs() >= ZOOM_NOTCH {
+                                let sign = connected.zoom_accum.signum();
+                                connected.zoom_accum -= sign * ZOOM_NOTCH;
+                                new_freq += 10_000 * sign as i64;
+                            }
+                            new_freq = new_freq.max(0);
+
+                            if new_freq as u32 != dial_freq_hz {
+                                let (effective_freq, retune) =
+                                    resolve_tune(connected.ctun, freq_hz, sample_rate, passband, new_freq as u32);
+                                if let Some(lo) = retune {
+                                    connected.session.set_frequency(lo);
+                                } else {
+                                    connected.ctun_frequency_hz = effective_freq;
+                                }
+                                remember_band_settings(&mut connected.band_memory, effective_freq, connected.db_low, connected.db_high, connected.waterfall_db_low, connected.waterfall_db_high, current_mode);
+                                settings_changed = true;
+                            }
+                        }
+                    }
+
                     if let Some(tex_id) = waterfall_texture_id {
                         // No zoom-aware UV cropping needed -- see the
                         // spectrum trace's identical note above. Each
@@ -6762,10 +6851,11 @@ fn render_extra_receiver_ui(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceiver>>) {
     }
     // Click-and-drag -- see the main receiver's identical treatment for
     // why this uses drag_delta() rather than an absolute cursor-position
-    // mapping.
+    // mapping, and why the sign flips depending on CTUN.
     if spectrum_resp.dragged() {
         let hz_per_px = (2.0 * visible_half_span_hz) / rect.width().max(1.0) as f64;
-        rx.drag_tune_accum_hz += -spectrum_resp.drag_delta().x as f64 * hz_per_px;
+        let drag_sign = if rx.ctun { 1.0 } else { -1.0 };
+        rx.drag_tune_accum_hz += drag_sign * spectrum_resp.drag_delta().x as f64 * hz_per_px;
         const STEP_HZ: i64 = 1_000;
         let mut new_freq = dial_freq_hz as i64;
         while rx.drag_tune_accum_hz.abs() >= STEP_HZ as f64 {
@@ -6941,10 +7031,11 @@ fn render_extra_receiver_ui(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceiver>>) {
     }
     // Click-and-drag -- see the main receiver's identical treatment for
     // why this uses drag_delta() rather than an absolute cursor-position
-    // mapping.
+    // mapping, and why the sign flips depending on CTUN.
     if wf_resp.dragged() {
         let hz_per_px = (2.0 * visible_half_span_hz) / wf_rect.width().max(1.0) as f64;
-        rx.drag_tune_accum_hz += -wf_resp.drag_delta().x as f64 * hz_per_px;
+        let drag_sign = if rx.ctun { 1.0 } else { -1.0 };
+        rx.drag_tune_accum_hz += drag_sign * wf_resp.drag_delta().x as f64 * hz_per_px;
         const STEP_HZ: i64 = 1_000;
         let mut new_freq = dial_freq_hz as i64;
         while rx.drag_tune_accum_hz.abs() >= STEP_HZ as f64 {
@@ -6962,6 +7053,43 @@ fn render_extra_receiver_ui(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceiver>>) {
             }
             remember_band_settings(&mut rx.band_memory, effective_freq, db_low, db_high, wf_db_low, wf_db_high, current_mode);
             rx.settings_dirty.store(true, Ordering::Relaxed);
+        }
+    }
+
+    // Scroll-to-tune -- see the spectrum pane's identical treatment
+    // above; this was missing entirely for the waterfall (only click and
+    // drag were wired up), same gap confirmed and fixed on the main
+    // receiver window.
+    if wf_resp.hovered() {
+        let scroll_delta = ui.input(|i| i.smooth_scroll_delta);
+        let delta = if scroll_delta.y.abs() >= scroll_delta.x.abs() {
+            scroll_delta.y
+        } else {
+            scroll_delta.x
+        };
+        if delta != 0.0 {
+            rx.scroll_accum += delta;
+            const NOTCH: f32 = 50.0;
+            let shift = ui.input(|i| i.modifiers.shift);
+            let step: i64 = if shift { 100 } else { 1_000 };
+            let mut new_freq = dial_freq_hz as i64;
+            while rx.scroll_accum.abs() >= NOTCH {
+                let sign = rx.scroll_accum.signum();
+                rx.scroll_accum -= sign * NOTCH;
+                new_freq += step * sign as i64;
+            }
+            new_freq = new_freq.max(0);
+            if new_freq as u32 != dial_freq_hz {
+                let (effective_freq, retune) =
+                    resolve_tune(rx.ctun, freq_hz, sample_rate, passband, new_freq as u32);
+                if let Some(lo) = retune {
+                    rx.frequency_hz.store(lo, Ordering::Relaxed);
+                } else {
+                    rx.ctun_frequency_hz = effective_freq;
+                }
+                remember_band_settings(&mut rx.band_memory, effective_freq, db_low, db_high, wf_db_low, wf_db_high, current_mode);
+                rx.settings_dirty.store(true, Ordering::Relaxed);
+            }
         }
     }
 
