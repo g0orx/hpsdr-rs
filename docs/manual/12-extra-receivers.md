@@ -56,7 +56,6 @@ Calibration, PureSignal, and Diversity are session-wide, not per-receiver:
 - **EQ** -- its own independent [graphic equalizer](11-equalizer.md),
   RX-only.
 
-(Screenshot needed: an extra receiver's own Settings window)
 ![Extra receiver settings window](images/11-extra-receiver-settings.png)
 
 Every extra receiver's settings persist per radio, the same as the main

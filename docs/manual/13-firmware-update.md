@@ -63,7 +63,6 @@ discovery broadcasts.
    power-cycle it** before normal use -- the app reminds you of this on
    screen.
 
-(Screenshot needed: the Firmware Update window, bootloader mode, mid-Program)
 ![Firmware Update window -- bootloader mode](images/12-firmware-update-bootloader.png)
 
 ### If something goes wrong
