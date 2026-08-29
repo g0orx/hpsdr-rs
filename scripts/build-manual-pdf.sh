@@ -58,6 +58,18 @@ done
 
 # --resource-path so image references (e.g. images/02-main-window-overview.png)
 # resolve against docs/manual/ rather than $COMBINED's own location in /tmp.
+#
+# header-includes forces every image to render exactly where it appears
+# in the source instead of LaTeX's own default: pandoc wraps a standalone
+# image paragraph in a floating `figure` environment, and LaTeX's float
+# algorithm is free to relocate a figure to wherever there's room --
+# confirmed by a real report of the PureSignal "correcting" screenshot
+# drifting forward past its own section into the START of the next
+# chapter (Diversity), ahead of that chapter's own image, because there
+# wasn't space left on PureSignal's own page. `\floatplacement{figure}{H}`
+# (from the `float` package) pins every figure to right where it's
+# written ("here", not just "here if it fits") -- the standard fix for
+# this well-known pandoc/LaTeX behavior.
 pandoc "$COMBINED" \
     --resource-path="$MANUAL_DIR" \
     --metadata title="hpsdr-rs User Manual" \
@@ -65,6 +77,7 @@ pandoc "$COMBINED" \
     --toc --toc-depth=2 \
     -V geometry:margin=1in \
     -V colorlinks=true \
+    -V header-includes='\usepackage{float}\floatplacement{figure}{H}' \
     -o "$OUT_FILE"
 
 echo "Built $OUT_FILE"
