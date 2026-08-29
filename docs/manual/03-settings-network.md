@@ -62,9 +62,9 @@ you a remote VFO/mode/RIT-XIT/PTT control surface on a phone or tablet
 without needing a full remote-desktop session. Point it at this machine's
 IP address and the TCI port above (`40001` by default).
 
-![TCI Remote running on Android](images/03-tci-remote-android.png)
+![Example of TCI Remote running on an Android Phone](images/03-tci-remote-android.png)
 
-![TCI Remote running on iPadOS](images/03-tci-remote-ipad.png)
+![Example of TCI Remote running on an Apple iPad](images/03-tci-remote-ipad.png)
 
 ## CAT (Kenwood TS-2000 emulation)
 
