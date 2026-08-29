@@ -54,6 +54,18 @@ for both control and audio streaming.
 - Same **Start**/**Stop**/status/logging behavior as rigctl above (logs to
   `tci_log.txt`).
 
+### TCI Remote
+
+TCI Remote is a mobile TCI client, available for both Android and iOS/
+iPadOS, that connects to hpsdr-rs's TCI server over the network -- giving
+you a remote VFO/mode/RIT-XIT/PTT control surface on a phone or tablet
+without needing a full remote-desktop session. Point it at this machine's
+IP address and the TCI port above (`40001` by default).
+
+![TCI Remote running on Android](images/03-tci-remote-android.png)
+
+![TCI Remote running on iPadOS](images/03-tci-remote-ipad.png)
+
 ## CAT (Kenwood TS-2000 emulation)
 
 A plain-ASCII, semicolon-terminated command set for logging/rig-control
