@@ -61,6 +61,7 @@ done
 pandoc "$COMBINED" \
     --resource-path="$MANUAL_DIR" \
     --metadata title="hpsdr-rs User Manual" \
+    --metadata author="John Melton G0ORX <john.d.melton@googlemail.com>" \
     --toc --toc-depth=2 \
     -V geometry:margin=1in \
     -V colorlinks=true \
