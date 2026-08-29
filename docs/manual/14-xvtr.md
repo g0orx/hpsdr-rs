@@ -4,7 +4,7 @@
 
 Open **Settings...** from the main window, then the **XVTR** tab.
 
-(Screenshot needed: images/14-xvtr-tab.png)
+![XVTR settings tab](images/14-xvtr-tab.png)
 
 Transverters convert this radio's real tunable range (its **IF**) to some
 other operating frequency (**RF**) via an external analog box -- e.g. a 10m
