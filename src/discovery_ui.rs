@@ -118,22 +118,18 @@ impl DiscoveryWindow {
         // dragged outside the main window's bounds. show_viewport_immediate
         // (not _deferred) since this closure borrows `self`/`action`
         // directly by reference rather than through an Arc<Mutex<>>.
-        // While `focus_deadline` is still active, also force the window
-        // level to AlwaysOnTop -- a plain Focus command only asks for
-        // keyboard focus, but the actual symptom here is the *main*
-        // window's own initial show/raise (eframe reveals its root
-        // window only after the first frame paints, and most window
-        // managers raise a window when it's newly shown) re-covering
-        // this one in stacking order a moment later regardless of which
-        // window has focus. AlwaysOnTop guarantees stacking order
-        // directly instead of depending on that race. Dropped back to
-        // Normal once the deadline passes so this window doesn't stay
-        // pinned above everything (e.g. the Settings window) forever.
-        let window_level = if self.focus_deadline.is_some() {
-            egui::WindowLevel::AlwaysOnTop
-        } else {
-            egui::WindowLevel::Normal
-        };
+        // Always AlwaysOnTop, for the window's whole lifetime -- a real
+        // report: it was only pinned above everything for the brief
+        // `focus_deadline` grace period below (originally just to win
+        // the initial show/raise race against the main window -- see
+        // that field's own doc comment), then dropped back to Normal,
+        // letting it get buried behind other windows (a terminal, a
+        // browser) while discovery is still running/waiting for a
+        // selection. `focus_deadline` still separately controls the
+        // one-shot keyboard-focus grab just below -- that's a different
+        // concern (focus vs. stacking order) that happens to have
+        // shared this same window_level gate before.
+        let window_level = egui::WindowLevel::AlwaysOnTop;
         ui.ctx().show_viewport_immediate(
             egui::ViewportId::from_hash_of("discovery_window"),
             egui::ViewportBuilder::default()
