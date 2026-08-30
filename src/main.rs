@@ -5962,6 +5962,7 @@ fn draw_audio_waveform(painter: &egui::Painter, rect: egui::Rect, samples: &[f32
         egui::vec2(WIDTH, HEIGHT),
     );
     painter.rect_filled(panel, 3.0, egui::Color32::from_rgba_unmultiplied(20, 20, 20, 220));
+    painter.rect_stroke(panel, 3.0, egui::Stroke::new(1.0, egui::Color32::WHITE), egui::StrokeKind::Inside);
 
     let mid_y = panel.center().y;
     if samples.len() < 2 {
