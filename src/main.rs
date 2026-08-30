@@ -3077,7 +3077,26 @@ impl eframe::App for HpsdrApp {
                     // same frame -- see their own doc comment -- so the
                     // click-to-tune handlers above (which run before this
                     // drawing code) can use them too.
-                    let view_center_hz = freq_hz as f64 + pan_offset_hz;
+                    //
+                    // ROOT CAUSE FIX for a real report: while transmitting
+                    // with CTUN on, the displayed trace switches to
+                    // tx_spectrum, which is always centered on the real TX
+                    // carrier (dial_freq_hz -- see the "force
+                    // ctun_offset_hz to 0" comment just below) -- but this
+                    // was still centering the axis on `freq_hz` (the
+                    // parked hardware LO), not the CTUN'd frequency
+                    // actually being transmitted on, so the printed
+                    // numbers stayed at their RX values while the trace
+                    // itself had already re-centered. `pan_offset_hz`
+                    // itself is already transmitting-aware (see
+                    // zoom_ctun_offset_hz above: it excludes ctun_offset_hz
+                    // while transmitting, since dial_freq_hz supplies that
+                    // contribution here instead) -- while receiving,
+                    // dial_freq_hz == freq_hz when CTUN is off, and when
+                    // CTUN is on pan_offset_hz already carries the CTUN
+                    // offset itself, so this stays exactly the same value
+                    // as before in every non-transmitting case.
+                    let view_center_hz = if transmitting { dial_freq_hz as f64 } else { freq_hz as f64 } + pan_offset_hz;
 
                     // While transmitting, this displays tx_spectrum --
                     // generated TX IQ that's always centered on the real
@@ -3815,7 +3834,12 @@ impl eframe::App for HpsdrApp {
                         egui::ViewportId::from_hash_of("settings_window"),
                         egui::ViewportBuilder::default()
                             .with_title("Settings")
-                            .with_inner_size([860.0, 700.0]),
+                            .with_inner_size([860.0, 700.0])
+                            // Same "keep the window from getting buried
+                            // behind other windows" reasoning as the
+                            // discovery window -- see its own doc
+                            // comment on window_level.
+                            .with_window_level(egui::WindowLevel::AlwaysOnTop),
                         |ui, _class| {
                             if ui.input(|i| i.viewport().close_requested()) {
                                 close_requested = true;
