@@ -402,6 +402,19 @@ fn send_is_fatal(result: &tungstenite::Result<()>) -> bool {
     }
 }
 
+/// Sends one outgoing TCI text message and logs it (">> msg", matching
+/// the existing reply-logging convention below) in the same call --
+/// used for the initial per-client state push, which previously wasn't
+/// logged at all. ROOT CAUSE FIX for a real report: with the push
+/// invisible in tci_log.txt, there was no way to confirm from the log
+/// alone whether a fix to that push (e.g. ready/start's trailing-
+/// semicolon fix) had actually taken effect on a given build, as
+/// opposed to the log simply predating a rebuild.
+fn send_logged(ws: &mut tungstenite::WebSocket<TcpStream>, logging: &DebugLog, msg: String) {
+    logging.log(&format!(">> {msg}"));
+    let _ = ws.send(Message::Text(msg.into()));
+}
+
 fn handle_client(
     stream: TcpStream,
     requested_frequency_hz: Arc<AtomicU32>,
@@ -533,8 +546,8 @@ fn handle_client(
 
     // This project has no real TX-profile concept (Thetis-style PA/EQ
     // profile switching) -- "Default" is a static, harmless stand-in.
-    let _ = ws.send(Message::Text("tx_profile_ex:Default;".into()));
-    let _ = ws.send(Message::Text("tx_profiles_ex:Default;".into()));
+    send_logged(&mut ws, &logging, "tx_profile_ex:Default;".into());
+    send_logged(&mut ws, &logging, "tx_profiles_ex:Default;".into());
     // ROOT CAUSE FIX for the still-unresolved "TCI Remote Compactor keeps
     // reconnecting every 1-3s" report above: `ready` and `start` are BARE
     // tokens with NO trailing semicolon -- confirmed against an
@@ -551,8 +564,8 @@ fn handle_client(
     // its handshake, and reconnect -- matching the exact symptom above
     // (which persisted even after every other content/ordering fix tried
     // at the time).
-    let _ = ws.send(Message::Text("ready".into()));
-    let _ = ws.send(Message::Text("start".into()));
+    send_logged(&mut ws, &logging, "ready".into());
+    send_logged(&mut ws, &logging, "start".into());
 
     // TX_ENABLE (spec section 4.3): "informs clients that TX is
     // enabled... sent to the client when connected... in case
@@ -567,87 +580,67 @@ fn handle_client(
     // TCI_TX_AUDIO_CHUNK (this project's own real per-reply request
     // size -- see that constant's doc comment for the full back-and-
     // forth on what value actually belongs here).
-    let _ = ws.send(Message::Text("mon_volume:0.0;".into()));
-    let _ = ws.send(Message::Text("mon_enable:false;".into()));
-    let _ = ws.send(Message::Text("tune:0,false;".into()));
-    let _ = ws.send(Message::Text("rx_mute:0,false;".into()));
-    let _ = ws.send(Message::Text("mute:false;".into()));
-    let _ = ws.send(Message::Text("tx_stream_audio_buffering:50;".into()));
-    let _ = ws.send(Message::Text(
-        format!("audio_stream_samples:{TCI_TX_AUDIO_CHUNK};").into(),
-    ));
-    let _ = ws.send(Message::Text("audio_stream_channels:2;".into()));
-    let _ = ws.send(Message::Text("audio_stream_sample_type:float32;".into()));
-    let _ = ws.send(Message::Text(
-        format!("audio_samplerate:{TCI_AUDIO_SAMPLE_RATE};").into(),
-    ));
-    let _ = ws.send(Message::Text(
-        format!("iq_samplerate:{};", sample_rate.load(Ordering::Relaxed)).into(),
-    ));
-    let _ = ws.send(Message::Text("iq_stop:0;".into()));
-    let _ = ws.send(Message::Text(
-        format!("trx:0,{};", mox.load(Ordering::Relaxed)).into(),
-    ));
-    let _ = ws.send(Message::Text("tune_drive:0,50;".into()));
-    let _ = ws.send(Message::Text("drive:0,50;".into()));
-    let _ = ws.send(Message::Text("rx_channel_enable:0,0,true;".into()));
-    let _ = ws.send(Message::Text("tx_enable:0,true;".into()));
-    let _ = ws.send(Message::Text("split_enable:0,false;".into()));
+    send_logged(&mut ws, &logging, "mon_volume:0.0;".into());
+    send_logged(&mut ws, &logging, "mon_enable:false;".into());
+    send_logged(&mut ws, &logging, "tune:0,false;".into());
+    send_logged(&mut ws, &logging, "rx_mute:0,false;".into());
+    send_logged(&mut ws, &logging, "mute:false;".into());
+    send_logged(&mut ws, &logging, "tx_stream_audio_buffering:50;".into());
+    send_logged(&mut ws, &logging, format!("audio_stream_samples:{TCI_TX_AUDIO_CHUNK};").into());
+    send_logged(&mut ws, &logging, "audio_stream_channels:2;".into());
+    send_logged(&mut ws, &logging, "audio_stream_sample_type:float32;".into());
+    send_logged(&mut ws, &logging, format!("audio_samplerate:{TCI_AUDIO_SAMPLE_RATE};").into());
+    send_logged(&mut ws, &logging, format!("iq_samplerate:{};", sample_rate.load(Ordering::Relaxed)).into());
+    send_logged(&mut ws, &logging, "iq_stop:0;".into());
+    send_logged(&mut ws, &logging, format!("trx:0,{};", mox.load(Ordering::Relaxed)).into());
+    send_logged(&mut ws, &logging, "tune_drive:0,50;".into());
+    send_logged(&mut ws, &logging, "drive:0,50;".into());
+    send_logged(&mut ws, &logging, "rx_channel_enable:0,0,true;".into());
+    send_logged(&mut ws, &logging, "tx_enable:0,true;".into());
+    send_logged(&mut ws, &logging, "split_enable:0,false;".into());
     // No real value to report for features this project doesn't
     // implement at all (CW keyer, squelch, VFO lock, calibration,
     // preamp/step attenuator) -- a safe/neutral static default (matching
     // Thetis's own example values where they're clearly just
     // "off"/"none") still beats the client getting no reply at all to a
     // field it expects.
-    let _ = ws.send(Message::Text("sql_level:0,-140;".into()));
-    let _ = ws.send(Message::Text("sql_enable:0,false;".into()));
-    let _ = ws.send(Message::Text("lock:0,false;".into()));
+    send_logged(&mut ws, &logging, "sql_level:0,-140;".into());
+    send_logged(&mut ws, &logging, "sql_enable:0,false;".into());
+    send_logged(&mut ws, &logging, "lock:0,false;".into());
     // Real values below where this project actually tracks the
     // underlying state (RIT/XIT, CTUN, AGC mode, noise blanker/
     // reduction, audio gain, filter passband, frequency/mode/dds).
     // Channel 0 only, matching this project's own trx_count:1/
     // channels_count:1 self-declaration below.
-    let _ = ws.send(Message::Text(
-        format!("xit_offset:0,{};", xit_offset_hz.load(Ordering::Relaxed)).into(),
-    ));
-    let _ = ws.send(Message::Text(
-        format!("rit_offset:0,{};", rit_offset_hz.load(Ordering::Relaxed)).into(),
-    ));
-    let _ = ws.send(Message::Text(
-        format!("xit_enable:0,{};", xit_enabled.load(Ordering::Relaxed)).into(),
-    ));
-    let _ = ws.send(Message::Text(
-        format!("rit_enable:0,{};", rit_enabled.load(Ordering::Relaxed)).into(),
-    ));
-    let _ = ws.send(Message::Text(format!("rx_ctun_ex:0,{};", params.ctun).into()));
-    let _ = ws.send(Message::Text("fm_deviation_ex:0,5000;".into()));
-    let _ = ws.send(Message::Text("agc_auto_ex:0,false;".into()));
-    let _ = ws.send(Message::Text(format!("agc_mode:0,{};", agc_to_tci(params.agc)).into()));
-    let _ = ws.send(Message::Text("rx_preamp_att_ex:0,0;".into()));
-    let _ = ws.send(Message::Text("rx_step_att_ex:0,0;".into()));
-    let _ = ws.send(Message::Text("rx_step_att_enabled_ex:0,false;".into()));
-    let _ = ws.send(Message::Text("vfo_sync_ex:false;".into()));
-    let _ = ws.send(Message::Text("rx_balance:0,0,0.00;".into()));
-    let _ = ws.send(Message::Text(
-        format!("rx_volume:0,0,{:.2};", gain_to_tci_db(params.gain)).into(),
-    ));
-    let _ = ws.send(Message::Text("rx_nf_enable:0,false;".into()));
-    let _ = ws.send(Message::Text("rx_apf_enable:0,false;".into()));
-    let _ = ws.send(Message::Text("rx_anf_enable:0,false;".into()));
-    let _ = ws.send(Message::Text("rx_bin_enable:0,false;".into()));
-    let _ = ws.send(Message::Text(format!("rx_nb_enable_ex:0,{nb_on},0;").into()));
-    let _ = ws.send(Message::Text(format!("rx_nb_enable:0,{nb_on};").into()));
-    let _ = ws.send(Message::Text(format!("rx_nr_enable_ex:0,{nr_on},0;").into()));
-    let _ = ws.send(Message::Text(format!("rx_nr_enable:0,{nr_on};").into()));
-    let _ = ws.send(Message::Text("rx_enable:0,true;".into()));
-    let _ = ws.send(Message::Text(
-        format!("rx_filter_band:0,{},{};", pb_low.round() as i64, pb_high.round() as i64).into(),
-    ));
-    let _ = ws.send(Message::Text(format!("modulation:0,{};", mode_to_tci(mode)).into()));
-    let _ = ws.send(Message::Text(format!("tx_frequency:{freq};").into()));
-    let _ = ws.send(Message::Text(format!("vfo:0,0,{freq};").into()));
-    let _ = ws.send(Message::Text("if:0,0,0;".into()));
-    let _ = ws.send(Message::Text(format!("dds:0,{freq};").into()));
+    send_logged(&mut ws, &logging, format!("xit_offset:0,{};", xit_offset_hz.load(Ordering::Relaxed)).into());
+    send_logged(&mut ws, &logging, format!("rit_offset:0,{};", rit_offset_hz.load(Ordering::Relaxed)).into());
+    send_logged(&mut ws, &logging, format!("xit_enable:0,{};", xit_enabled.load(Ordering::Relaxed)).into());
+    send_logged(&mut ws, &logging, format!("rit_enable:0,{};", rit_enabled.load(Ordering::Relaxed)).into());
+    send_logged(&mut ws, &logging, format!("rx_ctun_ex:0,{};", params.ctun).into());
+    send_logged(&mut ws, &logging, "fm_deviation_ex:0,5000;".into());
+    send_logged(&mut ws, &logging, "agc_auto_ex:0,false;".into());
+    send_logged(&mut ws, &logging, format!("agc_mode:0,{};", agc_to_tci(params.agc)).into());
+    send_logged(&mut ws, &logging, "rx_preamp_att_ex:0,0;".into());
+    send_logged(&mut ws, &logging, "rx_step_att_ex:0,0;".into());
+    send_logged(&mut ws, &logging, "rx_step_att_enabled_ex:0,false;".into());
+    send_logged(&mut ws, &logging, "vfo_sync_ex:false;".into());
+    send_logged(&mut ws, &logging, "rx_balance:0,0,0.00;".into());
+    send_logged(&mut ws, &logging, format!("rx_volume:0,0,{:.2};", gain_to_tci_db(params.gain)).into());
+    send_logged(&mut ws, &logging, "rx_nf_enable:0,false;".into());
+    send_logged(&mut ws, &logging, "rx_apf_enable:0,false;".into());
+    send_logged(&mut ws, &logging, "rx_anf_enable:0,false;".into());
+    send_logged(&mut ws, &logging, "rx_bin_enable:0,false;".into());
+    send_logged(&mut ws, &logging, format!("rx_nb_enable_ex:0,{nb_on},0;").into());
+    send_logged(&mut ws, &logging, format!("rx_nb_enable:0,{nb_on};").into());
+    send_logged(&mut ws, &logging, format!("rx_nr_enable_ex:0,{nr_on},0;").into());
+    send_logged(&mut ws, &logging, format!("rx_nr_enable:0,{nr_on};").into());
+    send_logged(&mut ws, &logging, "rx_enable:0,true;".into());
+    send_logged(&mut ws, &logging, format!("rx_filter_band:0,{},{};", pb_low.round() as i64, pb_high.round() as i64).into());
+    send_logged(&mut ws, &logging, format!("modulation:0,{};", mode_to_tci(mode)).into());
+    send_logged(&mut ws, &logging, format!("tx_frequency:{freq};").into());
+    send_logged(&mut ws, &logging, format!("vfo:0,0,{freq};").into());
+    send_logged(&mut ws, &logging, "if:0,0,0;".into());
+    send_logged(&mut ws, &logging, format!("dds:0,{freq};").into());
     // MODULATIONS_LIST uses the canonical spellings tci_to_mode below
     // actually keys on, not its aliases (CWR/PKTUSB/PKTLSB/WFM).
     // IF_LIMITS/VFO_LIMITS: VFO_LIMITS mirrors rigctl.rs's own
@@ -660,11 +653,9 @@ fn handle_client(
     // TRX_COUNT/CHANNEL_COUNT:1 -- TCI (unlike rigctl) has no second-
     // VFO/extra-receiver concept implemented here; see this file's
     // module note on trx always being 0.
-    let _ = ws.send(Message::Text(
-        "modulations_list:LSB,USB,DSB,CW,AM,NFM,DIGU,DIGL,SAM;".into(),
-    ));
-    let _ = ws.send(Message::Text("if_limits:-96000,96000;".into()));
-    let _ = ws.send(Message::Text("vfo_limits:0,4000000000;".into()));
+    send_logged(&mut ws, &logging, "modulations_list:LSB,USB,DSB,CW,AM,NFM,DIGU,DIGL,SAM;".into());
+    send_logged(&mut ws, &logging, "if_limits:-96000,96000;".into());
+    send_logged(&mut ws, &logging, "vfo_limits:0,4000000000;".into());
     // FIELD NAME FIX: was "channel_count" (singular) -- confirmed wrong
     // against the same authoritative reference as the ready/start fix
     // above; the real field is "channels_count" (plural). Harmless
@@ -673,9 +664,9 @@ fn handle_client(
     // TCI clients. Value bumped to 2 to match this project's own
     // audio_stream_channels:2 declaration just above (RX audio frames
     // are always stereo here, mono duplicated to both channels).
-    let _ = ws.send(Message::Text("channels_count:2;".into()));
-    let _ = ws.send(Message::Text("trx_count:1;".into()));
-    let _ = ws.send(Message::Text("receive_only:false;".into()));
+    send_logged(&mut ws, &logging, "channels_count:2;".into());
+    send_logged(&mut ws, &logging, "trx_count:1;".into());
+    send_logged(&mut ws, &logging, "receive_only:false;".into());
     // DEVICE identifies the actual radio hardware (e.g. Thetis reports
     // "ANAN8000D" for its connected board) -- a real report/correction:
     // this used to send this project's own name ("hpsdr-rs") here
@@ -685,8 +676,8 @@ fn handle_client(
     // to know a radio's marketing/model name (e.g. "ANAN8000D" vs the
     // underlying "Orion2" board it's built around), only the board type
     // reported over the wire.
-    let _ = ws.send(Message::Text(format!("device:{board_name};").into()));
-    let _ = ws.send(Message::Text(PROTOCOL_MESSAGE.into()));
+    send_logged(&mut ws, &logging, format!("device:{board_name};").into());
+    send_logged(&mut ws, &logging, PROTOCOL_MESSAGE.into());
 
     // Per-client streaming state -- audio defaults to ON (see below),
     // IQ defaults to OFF, only enabled by an explicit iq_start. This
