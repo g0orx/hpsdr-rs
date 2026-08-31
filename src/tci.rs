@@ -115,7 +115,7 @@ use crate::spectrum::{Agc, DemodParams, Mode, NoiseBlanker, NoiseReduction, pass
 use std::collections::VecDeque;
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 use tungstenite::Message;
@@ -170,17 +170,119 @@ struct AudioIqTaps {
 /// TciServer::set_audio_iq's doc comment.
 type AudioIqCell = Arc<Mutex<AudioIqTaps>>;
 
+/// One connected client's own private audio/IQ queue -- REPLACES the
+/// earlier design where every client drained the SAME shared AudioIqCell
+/// directly. ROOT CAUSE FIX for a real report ("intermittent/bouncing
+/// audio" with 2 clients connected, and separately, a healthy/actively-
+/// streaming client getting killed within milliseconds by a second
+/// connection arriving -- confirmed via tci_log.txt timestamps, and by
+/// the user's own observation that starting "TCI Remote Compactor"
+/// opens two connections immediately): this project used to paper over
+/// the queue-sharing problem with single-client "supersede" enforcement
+/// (kill whichever client was already connected the instant a new TCP
+/// connection arrived), which piHPSDR-style server behavior never
+/// required and which an authoritative TCI Remote/Compactor protocol
+/// reference the user found explicitly says is the wrong model ("the
+/// server must broadcast state changes to all connected clients").
+/// Worse, the supersede logic didn't even require the NEW connection to
+/// finish its own WebSocket handshake first -- any raw TCP accept()
+/// killed the previous (possibly perfectly healthy) client -- and
+/// separately, `handle_client`'s own "clear stale queue on connect"
+/// step cleared the SHARED queue out from under an already-connected
+/// client too. Giving each client its own queue, fed by a single
+/// dedicated broadcaster (spawn_audio_iq_broadcaster) that's the ONLY
+/// reader of the real shared taps, removes the need for any of that:
+/// clients can now come and go freely with no cross-talk.
+struct ClientAudioIqSink {
+    audio: Mutex<VecDeque<f32>>,
+    iq: Mutex<VecDeque<(f32, f32)>>,
+}
+
+/// Registry of currently-connected clients' own sinks, as Weak refs so a
+/// client that disconnects (normally, or via an early return/panic on
+/// any of handle_client's several exit paths) is automatically dropped
+/// from the fan-out on the broadcaster's next tick, with no explicit
+/// unregister bookkeeping needed at each exit point.
+type ClientAudioIqRegistry = Arc<Mutex<Vec<Weak<ClientAudioIqSink>>>>;
+
+/// Caps how much unconsumed audio/IQ a single client's own sink can
+/// accumulate before the oldest data gets dropped -- protects memory if
+/// one client's connection stalls (slow network, blocked send) while
+/// others keep streaming normally. Matches the existing shared-tap
+/// queues' own "drop oldest once full" behavior (see spectrum.rs's
+/// tci_audio_out/iq_out doc comments), just enforced per-client now
+/// that each client has its own queue instead of sharing one. ~1s of
+/// audio at 48kHz; the IQ figure is generous headroom across every
+/// sample rate this app supports (up to 1.536Msps -- see main.rs's rate
+/// list -- would still buffer over 100ms before dropping).
+const CLIENT_SINK_MAX_AUDIO_SAMPLES: usize = 48_000;
+const CLIENT_SINK_MAX_IQ_PAIRS: usize = 200_000;
+
+/// The single reader of the real shared audio/IQ taps -- drains them
+/// and fans a clone of each batch out to every currently-registered
+/// client's own sink, at the same ~20ms cadence handle_client's own
+/// read-timeout loop already used for streaming (so this doesn't change
+/// end-to-end latency). See ClientAudioIqSink's own doc comment for why
+/// this replaced N client threads each draining the shared taps
+/// directly.
+fn spawn_audio_iq_broadcaster(
+    audio_iq: AudioIqCell,
+    registry: ClientAudioIqRegistry,
+    stop: Arc<AtomicBool>,
+) -> JoinHandle<()> {
+    thread::spawn(move || {
+        while !stop.load(Ordering::Relaxed) {
+            thread::sleep(Duration::from_millis(20));
+            let taps = audio_iq.lock().unwrap().clone();
+            let audio_batch: Vec<f32> = {
+                let mut q = taps.audio.lock().unwrap();
+                q.drain(..).collect()
+            };
+            let iq_batch: Vec<(f32, f32)> = {
+                let mut q = taps.iq.lock().unwrap();
+                q.drain(..).collect()
+            };
+            if audio_batch.is_empty() && iq_batch.is_empty() {
+                continue;
+            }
+            let mut clients = registry.lock().unwrap();
+            clients.retain(|w| w.strong_count() > 0);
+            for sink in clients.iter().filter_map(|w| w.upgrade()) {
+                if !audio_batch.is_empty() {
+                    let mut q = sink.audio.lock().unwrap();
+                    q.extend(audio_batch.iter().copied());
+                    while q.len() > CLIENT_SINK_MAX_AUDIO_SAMPLES {
+                        q.pop_front();
+                    }
+                }
+                if !iq_batch.is_empty() {
+                    let mut q = sink.iq.lock().unwrap();
+                    q.extend(iq_batch.iter().copied());
+                    while q.len() > CLIENT_SINK_MAX_IQ_PAIRS {
+                        q.pop_front();
+                    }
+                }
+            }
+        }
+    })
+}
+
 pub struct TciServer {
     demod_params: DemodParamsCell,
     audio_iq: AudioIqCell,
     stop: Arc<AtomicBool>,
-    /// Count of currently-connected clients (normally 0 or 1, but the
-    /// accept loop doesn't limit concurrent connections, so a counter
-    /// is more correct than a bool if two ever overlap). Lets the UI
-    /// show "listening, no client" vs. "client connected" separately
-    /// from "not running at all" (server is None).
+    /// Count of currently-connected clients -- genuinely N now (see
+    /// ClientAudioIqSink's doc comment: multiple simultaneous clients
+    /// are fully supported, not just tolerated during a handoff
+    /// window). Lets the UI show "listening, no client" vs. "client(s)
+    /// connected" separately from "not running at all" (server is
+    /// None).
     connected: Arc<AtomicU32>,
     thread: Option<JoinHandle<()>>,
+    /// See spawn_audio_iq_broadcaster's doc comment -- the single
+    /// reader of the shared audio/IQ taps, fanning out to every
+    /// connected client's own sink. Joined by stop() same as `thread`.
+    broadcaster_thread: Option<JoinHandle<()>>,
     /// Per-client handler threads -- stop() joins these too, not just
     /// the accept thread. handle_client already polls `stop` via its
     /// own read timeout (so it was never leaked indefinitely the way
@@ -243,28 +345,21 @@ impl TciServer {
         let stop = Arc::new(AtomicBool::new(false));
         let connected = Arc::new(AtomicU32::new(0));
         let client_threads: Arc<Mutex<Vec<JoinHandle<()>>>> = Arc::new(Mutex::new(Vec::new()));
+        // See ClientAudioIqSink/spawn_audio_iq_broadcaster's doc comments
+        // -- replaces the single-client "supersede" enforcement this
+        // used to need.
+        let audio_iq_registry: ClientAudioIqRegistry = Arc::new(Mutex::new(Vec::new()));
+        let broadcaster_thread =
+            spawn_audio_iq_broadcaster(Arc::clone(&audio_iq), Arc::clone(&audio_iq_registry), Arc::clone(&stop));
         let accept_stop = Arc::clone(&stop);
         let accept_connected = Arc::clone(&connected);
         let accept_client_threads = Arc::clone(&client_threads);
         let accept_demod_params = Arc::clone(&demod_params);
-        let accept_audio_iq = Arc::clone(&audio_iq);
+        let accept_audio_iq_registry = Arc::clone(&audio_iq_registry);
         let accept_tci_tx_audio = Arc::clone(&tci_tx_audio);
         let accept_tci_tx_gain = Arc::clone(&tci_tx_gain);
         let accept_tci_wants_mic = Arc::clone(&tci_wants_mic);
         let accept_logging = logging.clone();
-        // Single-client enforcement -- see the module note on why: every
-        // connected client shares the SAME audio_iq queues (a single
-        // radio has one operator), so two clients connected at once
-        // would each drain(..) the other's samples out from under it,
-        // producing exactly the intermittent/bouncing audio a real
-        // report described (traced to a stale TCI connection -- e.g.
-        // from earlier testing, or one a client didn't cleanly close
-        // when reconfigured -- still alive and draining alongside a
-        // fresh one). Tracks the current client's own stop flag here;
-        // accepting a new connection flips the previous one first so
-        // its loop exits (within its ~20ms read-timeout tick) before
-        // the new client starts pulling from the same queues.
-        let current_client_superseded: Arc<Mutex<Option<Arc<AtomicBool>>>> = Arc::new(Mutex::new(None));
         let thread = thread::spawn(move || {
             while !accept_stop.load(Ordering::Relaxed) {
                 match listener.accept() {
@@ -275,7 +370,7 @@ impl TciServer {
                         let rx_freq = Arc::clone(&rx_frequency_hz);
                         let rate = Arc::clone(&sample_rate);
                         let params = Arc::clone(&accept_demod_params);
-                        let audio_iq = Arc::clone(&accept_audio_iq);
+                        let conn_audio_iq_registry = Arc::clone(&accept_audio_iq_registry);
                         let tx_audio = Arc::clone(&accept_tci_tx_audio);
                         let tx_gain = Arc::clone(&accept_tci_tx_gain);
                         let wants_mic = Arc::clone(&accept_tci_wants_mic);
@@ -288,19 +383,12 @@ impl TciServer {
                         let conn_connected = Arc::clone(&accept_connected);
                         let conn_logging = accept_logging.clone();
                         let conn_board_name = board_name.clone();
-                        let superseded = Arc::new(AtomicBool::new(false));
-                        {
-                            let mut current = current_client_superseded.lock().unwrap();
-                            if let Some(previous) = current.replace(Arc::clone(&superseded)) {
-                                previous.store(true, Ordering::Relaxed);
-                            }
-                        }
                         let handle = thread::spawn(move || {
                             conn_connected.fetch_add(1, Ordering::Relaxed);
                             handle_client(
-                                stream, freq, rx_freq, rate, params, audio_iq, tx_audio, tx_gain, wants_mic,
-                                conn_mox, conn_rit_enabled, conn_rit_offset_hz, conn_xit_enabled, conn_xit_offset_hz,
-                                conn_stop, superseded, conn_board_name, conn_logging,
+                                stream, freq, rx_freq, rate, params, conn_audio_iq_registry, tx_audio, tx_gain,
+                                wants_mic, conn_mox, conn_rit_enabled, conn_rit_offset_hz, conn_xit_enabled,
+                                conn_xit_offset_hz, conn_stop, conn_board_name, conn_logging,
                             );
                             conn_connected.fetch_sub(1, Ordering::Relaxed);
                         });
@@ -320,6 +408,7 @@ impl TciServer {
             demod_params,
             audio_iq,
             stop,
+            broadcaster_thread: Some(broadcaster_thread),
             connected,
             thread: Some(thread),
             client_threads,
@@ -366,6 +455,9 @@ impl TciServer {
             let _ = t.join();
         }
         if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+        if let Some(t) = self.broadcaster_thread.take() {
             let _ = t.join();
         }
     }
@@ -421,7 +513,10 @@ fn handle_client(
     rx_frequency_hz: Arc<AtomicU32>,
     sample_rate: Arc<AtomicU32>,
     demod_params: DemodParamsCell,
-    audio_iq: AudioIqCell,
+    // See ClientAudioIqSink's doc comment -- this client registers its
+    // own sink into the registry below rather than draining a queue
+    // shared with every other connected client.
+    audio_iq_registry: ClientAudioIqRegistry,
     tci_tx_audio: Arc<Mutex<VecDeque<f32>>>,
     tci_tx_gain: Arc<Mutex<f32>>,
     tci_wants_mic: Arc<AtomicBool>,
@@ -431,11 +526,6 @@ fn handle_client(
     xit_enabled: Arc<AtomicBool>,
     xit_offset_hz: Arc<AtomicI32>,
     stop: Arc<AtomicBool>,
-    // Set when a NEWER client has connected -- see TciServer::start's
-    // single-client enforcement doc comment. Checked alongside `stop`
-    // (the whole-server shutdown flag) so this same loop exit path
-    // handles both.
-    superseded: Arc<AtomicBool>,
     // Real detected board (e.g. "Orion2"), for the initial state push's
     // device: field -- see that field's own doc comment for why this
     // shouldn't just be this project's own name.
@@ -484,30 +574,17 @@ fn handle_client(
         eprintln!("tci: failed to set read timeout: {e}");
     }
 
-    // BUG FIX: audio_out/iq_out are shared, continuously-filled taps
-    // (see TciServer::set_audio_iq's doc comment) that keep accumulating
-    // whether or not a client is connected to drain them -- with no
-    // client connected they just overflow and drop the oldest samples
-    // (confirmed via real-hardware log: ~48,000 samples/sec dropped
-    // while idle, harmless on its own). But whatever's sitting in them
-    // at THIS moment is up to their full ~300ms capacity of real audio
-    // that accumulated before this client existed to want it -- without
-    // this clear, the very first drain below delivers all of it in one
-    // oversized burst instead of a normal ~20ms chunk. Investigated
-    // while chasing a report of WSJT-X's RX audio level bouncing/
-    // failing to decode after connecting mid-session -- this burst
-    // turned out NOT to be the actual cause there (steady-state
-    // delivery was already clean either way, and the report was
-    // eventually traced to WSJT-X's own audio subsystem not resetting
-    // cleanly when its Soundcard setting is switched live, not
-    // anything on this side), but delivering ~300ms of audio as one
-    // oversized burst instead of a normal ~20ms chunk on every connect
-    // is still a real, worth-fixing bug in its own right.
-    {
-        let taps = audio_iq.lock().unwrap().clone();
-        taps.audio.lock().unwrap().clear();
-        taps.iq.lock().unwrap().clear();
-    }
+    // This client's own private audio/IQ sink -- see ClientAudioIqSink's
+    // doc comment. Starts empty by construction, so unlike the old
+    // shared-queue design there's no "burst of stale pre-connect audio
+    // on the very first drain" concern to work around here: nothing
+    // gets pushed into this sink until spawn_audio_iq_broadcaster's next
+    // tick, after this client is already registered. Kept alive as a
+    // local variable for this whole function -- the registry below only
+    // holds a Weak reference, so this Arc is what keeps the sink (and
+    // this client's registration) alive for as long as this thread runs.
+    let sink = Arc::new(ClientAudioIqSink { audio: Mutex::new(VecDeque::new()), iq: Mutex::new(VecDeque::new()) });
+    audio_iq_registry.lock().unwrap().push(Arc::downgrade(&sink));
 
     // Best-effort initial state push -- see module-level note.
     //
@@ -690,18 +767,23 @@ fn handle_client(
     // any other TCI client that relies on that gate.
     let mut audio_streaming = true;
     let mut iq_streaming = false;
-    // ROOT CAUSE INVESTIGATION continued: the superseded connections in
-    // a real Windows report never logged a read error either (see
-    // "connection error, closing" above) -- consistent with the OLD
-    // connection just going quiet (no read error, no data) until TCI
-    // Remote gives up and opens a NEW one, which supersedes it before it
-    // ever hits an error path at all. These one-shot markers narrow down
-    // WHERE that quiet actually starts: logged the first time each
-    // stream actually sends real data, so comparing against "iq_start"/
-    // "audio_start" timestamps already logged shows whether data flows
-    // at all before the ~2s reconnect, or never starts flowing in the
-    // first place (which would point at the RX pipeline itself, not
-    // networking).
+    // ROOT CAUSE INVESTIGATION continued: a real Windows report's
+    // connections never logged a read error either (see "connection
+    // error, closing" above) -- consistent with a connection just going
+    // quiet (no read error, no data) until the client gives up and opens
+    // a new one. Confirmed via a later report + tci_log.txt timestamps:
+    // this project's own single-client "supersede" enforcement (since
+    // removed -- see ClientAudioIqSink's doc comment) was then killing
+    // that new connection's *predecessor* within milliseconds, even
+    // when the predecessor was perfectly healthy and already streaming
+    // -- multiple clients are now allowed to coexist instead. These
+    // one-shot markers still narrow down WHERE a stream first starts
+    // flowing, which remains useful for diagnosing anything similar in
+    // the future: logged the first time each stream actually sends real
+    // data, so comparing against "iq_start"/"audio_start" timestamps
+    // already logged shows whether data flows at all before a given
+    // reconnect, or never starts flowing in the first place (which
+    // would point at the RX pipeline itself, not networking).
     let mut audio_first_sent = false;
     let mut iq_first_sent = false;
     // BUG FIX: a bad (garbage-value) pair used to be dropped outright
@@ -771,7 +853,7 @@ fn handle_client(
     let mut last_tx_chrono_activity = Instant::now();
     let mut mox_was_active = false;
 
-    while !stop.load(Ordering::Relaxed) && !superseded.load(Ordering::Relaxed) {
+    while !stop.load(Ordering::Relaxed) {
         match ws.read() {
             Ok(Message::Text(text)) => {
                 for cmd in text.split(';') {
@@ -960,18 +1042,14 @@ fn handle_client(
             }
         }
 
-        // Streaming taps re-resolved fresh each tick (not once per
-        // connection) for the same reason current_params is above --
-        // see TciServer::set_audio_iq's doc comment: a sample-rate
-        // change mid-session hands out new queues, and an
-        // already-streaming client needs to follow them, not keep
-        // draining an abandoned queue that will never get new data
-        // again.
-        let taps = audio_iq.lock().unwrap().clone();
-
+        // This client's own sink -- see ClientAudioIqSink's doc comment.
+        // No re-resolving needed on a sample-rate change the way the
+        // old shared-taps design required: spawn_audio_iq_broadcaster is
+        // the one place that has to follow TciServer::set_audio_iq's new
+        // queues, and it feeds this same sink regardless.
         if audio_streaming {
             let samples: Vec<f32> = {
-                let mut q = taps.audio.lock().unwrap();
+                let mut q = sink.audio.lock().unwrap();
                 q.drain(..).collect()
             };
             if !samples.is_empty() {
@@ -1021,7 +1099,7 @@ fn handle_client(
 
         if iq_streaming {
             let pairs: Vec<(f32, f32)> = {
-                let mut q = taps.iq.lock().unwrap();
+                let mut q = sink.iq.lock().unwrap();
                 q.drain(..).collect()
             };
             if !pairs.is_empty() {
