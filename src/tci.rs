@@ -30,13 +30,15 @@
       every Initialization command the spec defines (section 4.1):
       protocol, device, vfo_limits, trx_count, channels_count,
       receive_only, modulations_list, plus vfo/modulation/trx state and
-      start/ready (both sent bare, no trailing semicolon -- confirmed
-      against pure-editions.com/on7off's TCI Protocol Reference, verified
-      against TCI Remote v3.5/Compactor v1.3.4.1 source), and if_limits
-      (a fixed -96000..96000 Hz range -- no real IF-shift-within-panorama
-      concept implemented here to report an exact one for, but a static
-      "wide enough" range is harmless and this field is documented as
-      accepted-and-discarded by TCI Remote regardless).
+      start;/ready; (semicolon-terminated, start before ready -- CONFIRMED
+      against a real packet capture of actual Thetis wire traffic, see
+      handle_client's own doc comment at the send site for the full story
+      of why a written protocol reference claiming otherwise turned out
+      to be wrong here), and if_limits (a fixed -96000..96000 Hz range --
+      no real IF-shift-within-panorama concept implemented here to report
+      an exact one for, but a static "wide enough" range is harmless and
+      this field is documented as accepted-and-discarded by TCI Remote
+      regardless).
     - TCI mode-string spellings (LSB/USB/CW/etc.) match the spec's own
       MODULATIONS_LIST example and are cross-checked against JTDX/
       WSJT-X source for exact case-sensitivity behavior (see
@@ -621,28 +623,29 @@ fn handle_client(
     let nb_on = params.noise_blanker != NoiseBlanker::Off;
     let nr_on = params.noise_reduction != NoiseReduction::Off;
 
+    // CORRECTED per a real packet capture of actual Thetis wire traffic
+    // the user provided (tci-idle-thetis.pcapng, an idle ExpertSDR3/
+    // Thetis session), which directly contradicts a written protocol
+    // reference (pure-editions.com/on7off's TCI Protocol Reference) an
+    // earlier pass here trusted instead: that reference claims `ready`/
+    // `start` are bare tokens with no trailing semicolon, but the actual
+    // bytes on the wire from Thetis -- confirmed by exact WebSocket
+    // frame length (8 bytes = 2-byte frame header + 6-byte payload
+    // "start;"/"ready;", not "start"/"ready") -- are semicolon-
+    // terminated after all, sent as **start; then ready;** (not
+    // ready;/start; as an earlier pass here also had it), with
+    // tx_profile_ex/tx_profiles_ex following AFTER ready, not before
+    // it. A hard packet capture of the real reference implementation
+    // outweighs a written doc here. This also vindicates this project's
+    // OWN original start;-then-ready; order (copied from rustyHPSDR),
+    // which a much earlier pass swapped away from based on an
+    // unconfirmed belief about Thetis's own order.
+    send_logged(&mut ws, &logging, "start;".into());
+    send_logged(&mut ws, &logging, "ready;".into());
     // This project has no real TX-profile concept (Thetis-style PA/EQ
     // profile switching) -- "Default" is a static, harmless stand-in.
     send_logged(&mut ws, &logging, "tx_profile_ex:Default;".into());
     send_logged(&mut ws, &logging, "tx_profiles_ex:Default;".into());
-    // ROOT CAUSE FIX for the still-unresolved "TCI Remote Compactor keeps
-    // reconnecting every 1-3s" report above: `ready` and `start` are BARE
-    // tokens with NO trailing semicolon -- confirmed against an
-    // authoritative, source-code-verified TCI Remote/Compactor protocol
-    // reference the user provided (pure-editions.com/on7off's TCI
-    // Protocol Reference, verified against TCI Remote v3.5 and Compactor
-    // v1.3.4.1 source): "Three server -> client messages carry no
-    // parameters and no trailing semicolon... A parser that splits on :
-    // must not throw them away" -- `ready`, `start`, `stop`. This project
-    // was sending "ready;"/"start;" (each its own WebSocket text frame,
-    // with a semicolon neither should have) -- if the Compactor's parser
-    // does an exact match on the bare token rather than splitting
-    // generically, it would never actually see a valid `ready`, time out
-    // its handshake, and reconnect -- matching the exact symptom above
-    // (which persisted even after every other content/ordering fix tried
-    // at the time).
-    send_logged(&mut ws, &logging, "ready".into());
-    send_logged(&mut ws, &logging, "start".into());
 
     // TX_ENABLE (spec section 4.3): "informs clients that TX is
     // enabled... sent to the client when connected... in case
