@@ -220,6 +220,28 @@ type ClientAudioIqRegistry = Arc<Mutex<Vec<Weak<ClientAudioIqSink>>>>;
 const CLIENT_SINK_MAX_AUDIO_SAMPLES: usize = 48_000;
 const CLIENT_SINK_MAX_IQ_PAIRS: usize = 200_000;
 
+/// Max audio/IQ frame-pairs sent in a single WebSocket binary message.
+/// A client's sink can legitimately accumulate a large backlog -- e.g.
+/// it hasn't sent iq_start yet (the broadcaster fills every registered
+/// sink regardless), or its socket briefly stalled -- and draining that
+/// whole backlog into ONE message produces frames far bigger than
+/// anything seen in normal steady-state streaming. Confirmed via a real
+/// packet capture (tcpdump + a hand-rolled TCP/WS reassembly, tshark
+/// unavailable) of a TCI Remote Compactor probe connection: the very
+/// first IQ send after iq_start was a single 1,600,064-byte frame (the
+/// full 200,000-pair backlog cap), which the client's own WebSocket
+/// library closed the connection over with code 1009 "Message Too Big"
+/// (its default max is 1MiB) -- and matches this file's own earlier
+/// doc comment (see the IQ send site below) describing the Compactor
+/// re-sending iq_start every few hundred ms and eventually giving up,
+/// exactly the symptom an oversized first frame would cause against a
+/// client enforcing a smaller limit. Chunking every drain to this size
+/// keeps every message close to what normal steady-state ticks already
+/// produce (seen fine in the same capture up to ~9,000 pairs/message)
+/// regardless of how large the backlog was.
+const MAX_AUDIO_SAMPLES_PER_MESSAGE: usize = 4096;
+const MAX_IQ_PAIRS_PER_MESSAGE: usize = 4096;
+
 /// The single reader of the real shared audio/IQ taps -- drains them
 /// and fans a clone of each batch out to every currently-registered
 /// client's own sink, at the same ~20ms cadence handle_client's own
@@ -1081,21 +1103,27 @@ fn handle_client(
                 // content itself. The IQ stream below got the identical
                 // fix later, once a client hit the same issue there too
                 // -- see its own doc comment.
-                let msg = encode_binary_message(
-                    0,
-                    TCI_AUDIO_SAMPLE_RATE,
-                    BinaryMessageType::RxAudioStream,
-                    stereo.len() as u32 * 2,
-                    &stereo,
-                );
-                let result = ws.send(Message::Binary(msg.into()));
-                if send_is_fatal(&result) {
-                    logging.log(&format!("audio stream send failed, closing: {:?}", result.unwrap_err()));
-                    return;
-                }
-                if result.is_ok() && !audio_first_sent {
-                    audio_first_sent = true;
-                    logging.log("first audio data sent");
+                //
+                // Chunked to MAX_AUDIO_SAMPLES_PER_MESSAGE -- see that
+                // constant's doc comment for why a single unbounded
+                // drain-and-send breaks real clients.
+                for chunk in stereo.chunks(MAX_AUDIO_SAMPLES_PER_MESSAGE) {
+                    let msg = encode_binary_message(
+                        0,
+                        TCI_AUDIO_SAMPLE_RATE,
+                        BinaryMessageType::RxAudioStream,
+                        chunk.len() as u32 * 2,
+                        chunk,
+                    );
+                    let result = ws.send(Message::Binary(msg.into()));
+                    if send_is_fatal(&result) {
+                        logging.log(&format!("audio stream send failed, closing: {:?}", result.unwrap_err()));
+                        return;
+                    }
+                    if result.is_ok() && !audio_first_sent {
+                        audio_first_sent = true;
+                        logging.log("first audio data sent");
+                    }
                 }
             }
         }
@@ -1131,21 +1159,36 @@ fn handle_client(
                 // reads only half the intended samples per packet.
                 // Payload (`&swapped`) and its real sample count are
                 // unchanged, only the announced `length` value.
-                let msg = encode_binary_message(
-                    0,
-                    sample_rate.load(Ordering::Relaxed),
-                    BinaryMessageType::IqStream,
-                    swapped.len() as u32 * 2,
-                    &swapped,
-                );
-                let result = ws.send(Message::Binary(msg.into()));
-                if send_is_fatal(&result) {
-                    logging.log(&format!("IQ stream send failed, closing: {:?}", result.unwrap_err()));
-                    return;
-                }
-                if result.is_ok() && !iq_first_sent {
-                    iq_first_sent = true;
-                    logging.log("first IQ data sent");
+                //
+                // FURTHER BUG FIX, found chasing the exact Compactor
+                // symptom described above via a real packet capture: the
+                // first drain after iq_start could be the client's whole
+                // backlog (built up while iq_streaming was false for this
+                // client but the broadcaster kept filling its sink
+                // regardless -- up to CLIENT_SINK_MAX_IQ_PAIRS), sent as
+                // ONE oversized WS message. A capture of a Compactor probe
+                // connection caught exactly this: a single 1,600,064-byte
+                // first IQ frame, closed by the client's own WebSocket
+                // library with code 1009 "Message Too Big". Chunked to
+                // MAX_IQ_PAIRS_PER_MESSAGE -- see that constant's doc
+                // comment.
+                for chunk in swapped.chunks(MAX_IQ_PAIRS_PER_MESSAGE) {
+                    let msg = encode_binary_message(
+                        0,
+                        sample_rate.load(Ordering::Relaxed),
+                        BinaryMessageType::IqStream,
+                        chunk.len() as u32 * 2,
+                        chunk,
+                    );
+                    let result = ws.send(Message::Binary(msg.into()));
+                    if send_is_fatal(&result) {
+                        logging.log(&format!("IQ stream send failed, closing: {:?}", result.unwrap_err()));
+                        return;
+                    }
+                    if result.is_ok() && !iq_first_sent {
+                        iq_first_sent = true;
+                        logging.log("first IQ data sent");
+                    }
                 }
             }
         }
