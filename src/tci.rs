@@ -1600,7 +1600,17 @@ fn handle_command(
             // first send below replays stale, non-real-time audio
             // instead of starting fresh from now. Same reasoning as
             // iq_start's own identical clear.
-            sink.audio.lock().unwrap().clear();
+            //
+            // Only on the off->on transition, NOT on every audio_start
+            // (a real client can send this more than once in a row
+            // while already streaming, e.g. TCI Remote Compactor as
+            // part of its own connect sequence, not just as an error
+            // retry -- see iq_start's own identical guard for the full
+            // story of why re-clearing on a repeat send is itself a
+            // bug, not just redundant).
+            if !*audio_streaming {
+                sink.audio.lock().unwrap().clear();
+            }
             *audio_streaming = true;
             Some(format!("audio_start:{};", args.first().unwrap_or(&"0")))
         }
@@ -1626,7 +1636,20 @@ fn handle_command(
             // waterfall has no way to know that burst isn't real-time,
             // so it renders wrong until real-time data catches up.
             // Clearing here means streaming starts from "now" instead.
-            sink.iq.lock().unwrap().clear();
+            //
+            // FURTHER BUG FIX: only clear on the off->on transition, not
+            // on every iq_start -- a real client can legitimately send
+            // this more than once in a row while already streaming
+            // (part of Compactor's own normal connect sequence, not
+            // just the error-retry case this file already documents
+            // elsewhere). Clearing unconditionally on a repeat send
+            // discarded a live, already-flowing stream right as it
+            // started, producing exactly the reported symptom: a short
+            // burst, a gap (the re-clear), another burst, then correct
+            // -- two false starts instead of one clean one.
+            if !*iq_streaming {
+                sink.iq.lock().unwrap().clear();
+            }
             *iq_streaming = true;
             Some(format!("iq_start:{};", args.first().unwrap_or(&"0")))
         }
