@@ -175,8 +175,9 @@ pub struct RadioSettings {
     /// this from Config, falling back to this struct's own default
     /// for a never-saved config.
     pub rx_attenuation: u32,
-    /// Initial value for RadioSession::ps_tx_attenuation (P1, standard
-    /// boards only, PureSignal) -- see that field's doc comment.
+    /// Initial value for RadioSession::ps_tx_attenuation -- see that
+    /// field's doc comment (standard boards only, both protocols; not a
+    /// PureSignal-only concept despite the name).
     pub ps_tx_attenuation: u32,
     /// Initial value for RadioSession::diversity_enabled -- see that
     /// field's doc comment. Fixed at session-start time, same as
@@ -212,7 +213,17 @@ impl Default for RadioSettings {
             // Non-zero rather than 0dB -- see RadioSession::rx_attenuation's
             // doc comment for why 0dB caused real front-end overload.
             rx_attenuation: 12,
-            ps_tx_attenuation: 0,
+            // Non-zero rather than 0dB, same "real front-end overload"
+            // reasoning as rx_attenuation just above -- this protects
+            // ADC0 from the radio's OWN TX leakage while transmitting
+            // (see this field's own doc comment: not a PureSignal-only
+            // concept despite the name), confirmed by a real "ADC0
+            // Overload while transmitting" report with PureSignal off,
+            // where this defaulting to 0dB meant no protection at all.
+            // Still well within PureSignal's own comfortable calibration
+            // range (0-31dB, targeting a feedback level around 152) if
+            // PureSignal gets enabled later.
+            ps_tx_attenuation: 20,
             diversity_enabled: false,
             // Neutral starting point -- matches piHPSDR's own default,
             // user tunes by ear/S-meter after enabling.
@@ -366,10 +377,23 @@ pub struct RadioSession {
     /// different, already-separate RX gain mechanism (bit 6 of the
     /// same byte, see p1_build_packet's is_hermes_lite branch).
     pub rx_attenuation: Arc<AtomicU32>,
-    /// PureSignal -- TX-time step attenuator (0-31 dB) applied to
-    /// ADC0's input while transmitting (ADC0 doubles as PureSignal's
-    /// feedback source during TX on this board family, on both
-    /// protocols). Standard (non-HermesLite) boards only.
+    /// TX-time step attenuator (0-31 dB) applied to ADC0's input while
+    /// transmitting, on both protocols. Standard (non-HermesLite) boards
+    /// only. Despite the name (kept for now to avoid a config-schema
+    /// rename -- see RadioSettings::ps_tx_attenuation), this protects
+    /// ADC0's front end from the radio's OWN TX leakage generally, not
+    /// just during PureSignal calibration -- ADC0 is always the main
+    /// receiver's ADC (PureSignal's feedback just happens to share it
+    /// during TX on this board family), so it needs protecting from TX
+    /// leakage whether or not PureSignal is in use. Exposed in the UI
+    /// both under Settings -> TX ("TX ADC0 Attenuation", the general
+    /// framing) and Settings -> PureSignal ("Feedback Attenuation", the
+    /// calibration framing) -- same underlying value either way.
+    /// Defaults to 20dB (RadioSettings::default), not 0dB -- confirmed by
+    /// a real "ADC0 Overload while transmitting" report with PureSignal
+    /// off, where this had never been touched (only reachable from
+    /// PureSignal's own tab at the time) and so stayed at 0dB, i.e. no
+    /// protection at all.
     ///
     /// P1: encoded into command 6 (0x1C)'s C3 byte -- confirmed against
     /// piHPSDR's old_protocol.c: `output_buffer[C3] |=

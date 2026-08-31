@@ -26,6 +26,15 @@ The percentage (1-100%) of TX Power actually used while **TUNE** or **TWO
 TONE** is engaged from the main window -- keep this low for safe antenna/
 amplifier tuning rather than transmitting at full power.
 
+## TX ADC0 Attenuation (standard boards only)
+
+Protects ADC0's front end from this radio's own TX leakage while
+transmitting (0-31dB, default 20dB). If you see an **ADC0 Overload**
+warning while transmitting, raise this. Not shown on HermesLite/
+HermesLite2, which handle RX gain differently. Same underlying value as
+[PureSignal](09-puresignal.md)'s **Feedback Attenuation** slider --
+adjusting either one changes both.
+
 ## Enable Transmit
 
 Arms (or disarms) the whole TX signal path -- microphone input, the TX DSP

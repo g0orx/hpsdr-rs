@@ -33,7 +33,10 @@ Once enabled (and TX armed), the rest of this tab's controls appear:
 - **Measured peak TX** -- the actual envelope peak PureSignal is currently
   measuring.
 - **Feedback Attenuation** (non-HermesLite boards) -- 0-31 dB, adjust to
-  keep Feedback Level in the ideal range.
+  keep Feedback Level in the ideal range. Same underlying value as
+  [Settings: TX](07-settings-tx.md)'s **TX ADC0 Attenuation** -- it isn't
+  PureSignal-specific, it protects ADC0 from this radio's own TX leakage
+  generally, PureSignal or not.
 - **HW Peak** -- 0.0-1.0. See below; this is the setting that actually
   matters most.
 - **MOX Delay**, **Loop Delay**, **TX Delay**, **Ptol** -- advanced timing/

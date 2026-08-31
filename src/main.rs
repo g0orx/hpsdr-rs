@@ -4730,6 +4730,52 @@ impl eframe::App for HpsdrApp {
                                     });
                                     ui.add_space(8.0);
 
+                                    // Standard (non-HermesLite) boards only -- see
+                                    // radio::RadioSession::ps_tx_attenuation's doc comment. Despite
+                                    // the internal name, this protects ADC0's front end from the
+                                    // radio's OWN TX leakage during transmit generally -- it isn't
+                                    // a PureSignal-only concept, and matters just as much with
+                                    // PureSignal off (confirmed by a real "ADC0 Overload while
+                                    // transmitting" report with PureSignal/Diversity both
+                                    // disabled: this defaulted to 0dB, i.e. no protection at all,
+                                    // since the only place it was previously exposed was
+                                    // PureSignal's own settings tab). Same underlying value as
+                                    // that tab's "Feedback Attenuation" slider -- adjusting either
+                                    // one changes both.
+                                    if !matches!(connected.device.board, Boards::HermesLite | Boards::HermesLite2) {
+                                        let mut tx_atten = connected
+                                            .session
+                                            .ps_tx_attenuation
+                                            .load(Ordering::Relaxed)
+                                            as i32;
+                                        ui.horizontal(|ui| {
+                                            ui.label("TX ADC0 Attenuation:");
+                                            if scroll_slider_i32(
+                                                ui,
+                                                &mut connected.slider_scroll_accum,
+                                                &mut tx_atten,
+                                                0..=31,
+                                                1,
+                                                " dB",
+                                            ) {
+                                                connected
+                                                    .session
+                                                    .ps_tx_attenuation
+                                                    .store(tx_atten as u32, Ordering::Relaxed);
+                                                settings_changed = true;
+                                            }
+                                        })
+                                        .response
+                                        .on_hover_text(
+                                            "Protects ADC0's front end from this radio's own TX \
+                                             leakage while transmitting -- raise this if you see \
+                                             \"ADC0 Overload\" while transmitting. Also used (and \
+                                             adjustable from) Settings -> PureSignal as \"Feedback \
+                                             Attenuation\" -- same value either way.",
+                                        );
+                                        ui.add_space(8.0);
+                                    }
+
                                     let mut tx_enabled = connected.tx_enabled;
                                     if ui.checkbox(&mut tx_enabled, "Enable Transmit").changed() {
                                         if tx_enabled {
@@ -5200,7 +5246,9 @@ impl eframe::App for HpsdrApp {
                                             // the ideal 128-181 range -- confirmed against
                                             // piHPSDR's own "Auto Attenuate" logic, which adjusts
                                             // exactly this value (not HW Peak) to target a
-                                            // feedback level near 152.
+                                            // feedback level near 152. Same underlying value as
+                                            // Settings -> TX's "TX ADC0 Attenuation" slider --
+                                            // adjusting either one changes both.
                                             if !matches!(
                                                 connected.device.board,
                                                 Boards::HermesLite | Boards::HermesLite2
