@@ -28,11 +28,15 @@
       against JTDX specifically.
     - The *initial handshake sequence* sent on connect now includes
       every Initialization command the spec defines (section 4.1):
-      protocol, device, vfo_limits, trx_count, channel_count,
+      protocol, device, vfo_limits, trx_count, channels_count,
       receive_only, modulations_list, plus vfo/modulation/trx state and
-      start/ready. if_limits is the one Initialization command still not
-      sent (no IF-shift-within-panorama concept implemented here to
-      report a range for).
+      start/ready (both sent bare, no trailing semicolon -- confirmed
+      against pure-editions.com/on7off's TCI Protocol Reference, verified
+      against TCI Remote v3.5/Compactor v1.3.4.1 source), and if_limits
+      (a fixed -96000..96000 Hz range -- no real IF-shift-within-panorama
+      concept implemented here to report an exact one for, but a static
+      "wide enough" range is harmless and this field is documented as
+      accepted-and-discarded by TCI Remote regardless).
     - TCI mode-string spellings (LSB/USB/CW/etc.) match the spec's own
       MODULATIONS_LIST example and are cross-checked against JTDX/
       WSJT-X source for exact case-sensitivity behavior (see
@@ -531,8 +535,24 @@ fn handle_client(
     // profile switching) -- "Default" is a static, harmless stand-in.
     let _ = ws.send(Message::Text("tx_profile_ex:Default;".into()));
     let _ = ws.send(Message::Text("tx_profiles_ex:Default;".into()));
-    let _ = ws.send(Message::Text("ready;".into()));
-    let _ = ws.send(Message::Text("start;".into()));
+    // ROOT CAUSE FIX for the still-unresolved "TCI Remote Compactor keeps
+    // reconnecting every 1-3s" report above: `ready` and `start` are BARE
+    // tokens with NO trailing semicolon -- confirmed against an
+    // authoritative, source-code-verified TCI Remote/Compactor protocol
+    // reference the user provided (pure-editions.com/on7off's TCI
+    // Protocol Reference, verified against TCI Remote v3.5 and Compactor
+    // v1.3.4.1 source): "Three server -> client messages carry no
+    // parameters and no trailing semicolon... A parser that splits on :
+    // must not throw them away" -- `ready`, `start`, `stop`. This project
+    // was sending "ready;"/"start;" (each its own WebSocket text frame,
+    // with a semicolon neither should have) -- if the Compactor's parser
+    // does an exact match on the bare token rather than splitting
+    // generically, it would never actually see a valid `ready`, time out
+    // its handshake, and reconnect -- matching the exact symptom above
+    // (which persisted even after every other content/ordering fix tried
+    // at the time).
+    let _ = ws.send(Message::Text("ready".into()));
+    let _ = ws.send(Message::Text("start".into()));
 
     // TX_ENABLE (spec section 4.3): "informs clients that TX is
     // enabled... sent to the client when connected... in case
@@ -586,7 +606,7 @@ fn handle_client(
     // underlying state (RIT/XIT, CTUN, AGC mode, noise blanker/
     // reduction, audio gain, filter passband, frequency/mode/dds).
     // Channel 0 only, matching this project's own trx_count:1/
-    // channel_count:1 self-declaration below.
+    // channels_count:1 self-declaration below.
     let _ = ws.send(Message::Text(
         format!("xit_offset:0,{};", xit_offset_hz.load(Ordering::Relaxed)).into(),
     ));
@@ -645,7 +665,15 @@ fn handle_client(
     ));
     let _ = ws.send(Message::Text("if_limits:-96000,96000;".into()));
     let _ = ws.send(Message::Text("vfo_limits:0,4000000000;".into()));
-    let _ = ws.send(Message::Text("channel_count:1;".into()));
+    // FIELD NAME FIX: was "channel_count" (singular) -- confirmed wrong
+    // against the same authoritative reference as the ready/start fix
+    // above; the real field is "channels_count" (plural). Harmless
+    // either way for TCI Remote specifically (this field is "accepted,
+    // discarded" per that reference), but worth being correct for other
+    // TCI clients. Value bumped to 2 to match this project's own
+    // audio_stream_channels:2 declaration just above (RX audio frames
+    // are always stereo here, mono duplicated to both channels).
+    let _ = ws.send(Message::Text("channels_count:2;".into()));
     let _ = ws.send(Message::Text("trx_count:1;".into()));
     let _ = ws.send(Message::Text("receive_only:false;".into()));
     // DEVICE identifies the actual radio hardware (e.g. Thetis reports
