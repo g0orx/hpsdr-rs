@@ -905,6 +905,7 @@ fn handle_client(
                         &tci_wants_mic,
                         &mut audio_streaming,
                         &mut iq_streaming,
+                        &sink,
                     ) {
                         logging.log(&format!(">> {response}"));
                         let result = ws.send(Message::Text(response.into()));
@@ -1486,6 +1487,7 @@ fn handle_command(
     tci_wants_mic: &Arc<AtomicBool>,
     audio_streaming: &mut bool,
     iq_streaming: &mut bool,
+    sink: &ClientAudioIqSink,
 ) -> Option<String> {
     let mut parts = cmd.splitn(2, ':');
     let name = parts.next().unwrap_or("").to_lowercase();
@@ -1591,6 +1593,14 @@ fn handle_command(
         // that don't need it (TCI Remote/rustyHPSDR ignore replies to
         // commands they didn't ask a question with).
         "audio_start" => {
+            // Discard whatever backlog the broadcaster already queued
+            // into this sink before this client asked to start
+            // streaming (it fills every registered sink unconditionally
+            // -- see ClientAudioIqSink's doc comment) -- otherwise the
+            // first send below replays stale, non-real-time audio
+            // instead of starting fresh from now. Same reasoning as
+            // iq_start's own identical clear.
+            sink.audio.lock().unwrap().clear();
             *audio_streaming = true;
             Some(format!("audio_start:{};", args.first().unwrap_or(&"0")))
         }
@@ -1601,6 +1611,22 @@ fn handle_command(
         // iq_start:receiver; / iq_stop:receiver; -- same reasoning as
         // audio_start/stop above.
         "iq_start" => {
+            // BUG FIX: a real report of the spectrum/waterfall showing
+            // ~1s of garbled/compressed data right after connecting
+            // (via TCI Remote Compactor) traced back to this same
+            // backlog-accumulation mechanism the oversized-frame bug
+            // above came from: the broadcaster fills this sink from the
+            // moment the client connects, regardless of iq_streaming,
+            // so by the time a client finishes its setup handshake and
+            // finally sends iq_start, the sink can already hold a
+            // second or more of stale IQ data queued up while nobody
+            // was listening. Chunking (above) fixed the disconnect that
+            // backlog caused, but still played the whole stale backlog
+            // back-to-back once chunked -- a client's spectrum/
+            // waterfall has no way to know that burst isn't real-time,
+            // so it renders wrong until real-time data catches up.
+            // Clearing here means streaming starts from "now" instead.
+            sink.iq.lock().unwrap().clear();
             *iq_streaming = true;
             Some(format!("iq_start:{};", args.first().unwrap_or(&"0")))
         }
