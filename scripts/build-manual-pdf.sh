@@ -59,17 +59,28 @@ done
 # --resource-path so image references (e.g. images/02-main-window-overview.png)
 # resolve against docs/manual/ rather than $COMBINED's own location in /tmp.
 #
-# header-includes forces every image to render exactly where it appears
-# in the source instead of LaTeX's own default: pandoc wraps a standalone
-# image paragraph in a floating `figure` environment, and LaTeX's float
-# algorithm is free to relocate a figure to wherever there's room --
-# confirmed by a real report of the PureSignal "correcting" screenshot
-# drifting forward past its own section into the START of the next
-# chapter (Diversity), ahead of that chapter's own image, because there
-# wasn't space left on PureSignal's own page. `\floatplacement{figure}{H}`
-# (from the `float` package) pins every figure to right where it's
-# written ("here", not just "here if it fits") -- the standard fix for
-# this well-known pandoc/LaTeX behavior.
+# header-includes:
+# - float/floatplacement forces every image to render exactly where it
+#   appears in the source instead of LaTeX's own default: pandoc wraps a
+#   standalone image paragraph in a floating `figure` environment, and
+#   LaTeX's float algorithm is free to relocate a figure to wherever
+#   there's room -- confirmed by a real report of the PureSignal
+#   "correcting" screenshot drifting forward past its own section into
+#   the START of the next chapter (Diversity), ahead of that chapter's
+#   own image, because there wasn't space left on PureSignal's own page.
+#   `\floatplacement{figure}{H}` (from the `float` package) pins every
+#   figure to right where it's written ("here", not just "here if it
+#   fits") -- the standard fix for this well-known pandoc/LaTeX behavior.
+# - The \let/\renewcommand pair makes every chapter (each numbered
+#   manual page is one H1 -> \section, since this uses the default
+#   article class rather than --top-level-division=chapter/report class,
+#   which would additionally renumber everything as "Chapter N" -- a
+#   bigger visual change than just wanting page breaks) start on a fresh
+#   page, requested after the PDF's chapters were running on
+#   immediately after one another with no visual separation.
+#   \clearpage (not \newpage) also flushes any pending floats first, so
+#   a figure held over by floatplacement=H at the end of one chapter
+#   can't drift onto the next chapter's fresh page.
 pandoc "$COMBINED" \
     --resource-path="$MANUAL_DIR" \
     --metadata title="hpsdr-rs User Manual" \
@@ -77,7 +88,7 @@ pandoc "$COMBINED" \
     --toc --toc-depth=2 \
     -V geometry:margin=1in \
     -V colorlinks=true \
-    -V header-includes='\usepackage{float}\floatplacement{figure}{H}' \
+    -V header-includes='\usepackage{float}\floatplacement{figure}{H}\let\oldsection\section\renewcommand{\section}{\clearpage\oldsection}' \
     -o "$OUT_FILE"
 
 echo "Built $OUT_FILE"
