@@ -20,6 +20,7 @@ from source and project status, see the [top-level README](../../README.md).
 12. [Extra Receivers](12-extra-receivers.md) -- adding independent receiver windows
 13. [Firmware Update](13-firmware-update.md) -- updating FPGA firmware and changing a radio's IP, in bootloader mode or in-application
 14. [Settings: XVTR](14-xvtr.md) -- defining transverters (IF-to-RF band conversion)
+15. [Settings: Open Collector](15-open-collector.md) -- per-band relay-driver output configuration
 
 **PDF**: this whole manual is also available as a single PDF, useful for
 offline/printed reading. It's built automatically by the "Manual PDF"

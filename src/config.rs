@@ -320,6 +320,17 @@ pub struct Config {
     /// clears it right back to None.
     #[serde(default)]
     pub active_xvtr: Option<String>,
+    /// Per-band (or XVTR) Open Collector Rx/Tx masks -- see main.rs's
+    /// OcMask struct doc comment. Keyed by band/XVTR name, same pattern
+    /// as pa_calibration above. `#[serde(default)]` so configs saved
+    /// before this existed just load with no OC outputs configured.
+    #[serde(default)]
+    pub oc_settings: std::collections::HashMap<String, crate::OcMask>,
+    /// Global Open Collector mask ORed into the active band's Tx mask
+    /// while TUNE is active -- see main.rs's ConnectedState::oc_tune
+    /// doc comment.
+    #[serde(default)]
+    pub oc_tune: u8,
 }
 
 fn default_nb_threshold() -> f64 {

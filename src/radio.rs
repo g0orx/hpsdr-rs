@@ -361,6 +361,17 @@ pub struct RadioSession {
     /// and alex0_word's, and p1_build_packet's HermesLite PA-enable
     /// branch.
     pub disable_pa: Arc<std::sync::atomic::AtomicBool>,
+    /// Set by main.rs, once per frame, from the currently active band's
+    /// (or XVTR's) configured Open Collector Rx mask -- see main.rs's
+    /// OcMask struct and its per-frame OC resolution block. Bits 0-6 =
+    /// OC1-OC7 (matches piHPSDR's oc_menu.c encoding). Read by both
+    /// protocol sender loops while not transmitting.
+    pub oc_rx: Arc<AtomicU8>,
+    /// Same as oc_rx, but the Tx mask -- already has the global Tune
+    /// mask ORed in while TUNE is active (see main.rs's resolution
+    /// block), so the sender loops use this value directly while keyed,
+    /// with no separate Tune handling needed at the protocol layer.
+    pub oc_tx: Arc<AtomicU8>,
     /// Protocol 1, standard (non-HermesLite) boards only -- RX step
     /// attenuator, 0-31 dB, encoded into the C4 byte of command 4
     /// (0x14) as `0x20 | attenuation` (bit 5 = attenuator-enable,
@@ -1147,6 +1158,9 @@ fn start_protocol1(
     let stop_socket = socket.try_clone()?;
     // See RadioSession::disable_pa's doc comment.
     let disable_pa = Arc::new(AtomicBool::new(false));
+    // See RadioSession::oc_rx/oc_tx's doc comments.
+    let oc_rx = Arc::new(AtomicU8::new(0));
+    let oc_tx = Arc::new(AtomicU8::new(0));
     // See RadioSession::rit_enabled/xit_enabled's doc comments -- seeded
     // from `settings` (see RadioSettings::rit_enabled's doc comment for
     // why) rather than left at false/0.
@@ -1297,6 +1311,8 @@ fn start_protocol1(
     let sender_ps_tx_attenuation = Arc::clone(&ps_tx_attenuation);
     let sender_is_hermes_lite = matches!(device.board, Boards::HermesLite | Boards::HermesLite2);
     let sender_disable_pa = Arc::clone(&disable_pa);
+    let sender_oc_rx = Arc::clone(&oc_rx);
+    let sender_oc_tx = Arc::clone(&oc_tx);
     let sender_num_adcs = device.adcs;
     let sender_rx_audio_to_radio = Arc::clone(&rx_audio_to_radio);
     let sender_send_rx_audio_to_radio = Arc::clone(&send_rx_audio_to_radio);
@@ -1328,6 +1344,8 @@ fn start_protocol1(
             sender_ps_tx_attenuation,
             sender_is_hermes_lite,
             sender_disable_pa,
+            sender_oc_rx,
+            sender_oc_tx,
             sender_num_adcs,
             sender_adc,
             sender_extra_adcs,
@@ -1389,6 +1407,8 @@ fn start_protocol1(
         adc,
         antenna,
         disable_pa,
+        oc_rx,
+        oc_tx,
         rx_attenuation,
         ps_tx_attenuation,
         extra_frequencies_hz,
@@ -1700,6 +1720,8 @@ fn p1_send_preconfig_and_start(
             false, // mox: never keyed during startup config
             is_hermes_lite,
             false, // disable_pa: nothing to key yet this early -- sender_loop's live value takes over immediately after
+            0, // oc_rx: nothing to key yet this early -- sender_loop's live value takes over immediately after
+            0, // oc_tx: not transmitting during startup config (mox false above), so never actually used
             rx_attenuation,
             ps_tx_attenuation,
             num_adcs,
@@ -1777,6 +1799,13 @@ fn p1_build_packet(
     mox_on: bool,
     is_hermes_lite: bool,
     disable_pa: bool,
+    // See RadioSession::oc_rx/oc_tx's doc comments -- resolved masks
+    // (bits 0-6 = OC1-OC7), used raw here (this project has no per-band
+    // config infrastructure for P1 yet elsewhere -- see this function's
+    // own module doc comment -- but OC is simple enough to wire
+    // directly from main.rs's per-frame resolution regardless).
+    oc_rx: u8,
+    oc_tx: u8,
     rx_attenuation: u8,
     ps_tx_attenuation: u8,
     num_adcs: u8,
@@ -1861,7 +1890,14 @@ fn p1_build_packet(
     if diversity_enabled {
         c4 |= 0x80;
     }
-    let mut frame0 = build_usb_frame(0x00 | mox_bit, c1, 0x00, 0x00, c4);
+    // Open Collector outputs -- C2 of the general (C0=0) packet.
+    // Confirmed against piHPSDR's old_protocol.c: `output_buffer[C2] |=
+    // (rxband|txband)->OCrx/OCtx << 1` (bit 0 unused, OC1-OC7 in bits
+    // 1-7). Resolved by main.rs's per-frame OC block (oc_tx already has
+    // any active Tune mask ORed in), same rx/tx split as everything
+    // else in this function that depends on mox_on.
+    let oc_byte = (if mox_on { oc_tx } else { oc_rx }) << 1;
+    let mut frame0 = build_usb_frame(0x00 | mox_bit, c1, oc_byte, 0x00, c4);
 
     // USB frame 2: the rotating command. Ported directly from the
     // reference where this project has equivalent state to feed
@@ -2280,6 +2316,9 @@ fn sender_loop(
     ps_tx_attenuation: Arc<AtomicU32>,
     is_hermes_lite: bool,
     disable_pa: Arc<std::sync::atomic::AtomicBool>,
+    // See RadioSession::oc_rx/oc_tx's doc comments.
+    oc_rx: Arc<AtomicU8>,
+    oc_tx: Arc<AtomicU8>,
     num_adcs: u8,
     // See p1_build_packet's identically-named params' doc comments.
     adc: Arc<AtomicU32>,
@@ -2496,6 +2535,8 @@ fn sender_loop(
             mox_on,
             is_hermes_lite,
             disable_pa.load(Ordering::Relaxed),
+            oc_rx.load(Ordering::Relaxed),
+            oc_tx.load(Ordering::Relaxed),
             rx_attenuation.load(Ordering::Relaxed) as u8,
             ps_tx_attenuation.load(Ordering::Relaxed) as u8,
             num_adcs,
@@ -3182,6 +3223,9 @@ fn start_protocol2(
     let stop_socket = socket.try_clone()?;
     // See RadioSession::disable_pa's doc comment.
     let disable_pa = Arc::new(AtomicBool::new(false));
+    // See RadioSession::oc_rx/oc_tx's doc comments.
+    let oc_rx = Arc::new(AtomicU8::new(0));
+    let oc_tx = Arc::new(AtomicU8::new(0));
     // See RadioSession::rit_enabled/xit_enabled's doc comments -- seeded
     // from `settings`, see start_protocol1's identical treatment.
     let rit_enabled = Arc::new(AtomicBool::new(settings.rit_enabled));
@@ -3226,6 +3270,8 @@ fn start_protocol2(
     let sender_adc = Arc::clone(&adc);
     let sender_antenna = Arc::clone(&antenna);
     let sender_disable_pa = Arc::clone(&disable_pa);
+    let sender_oc_rx = Arc::clone(&oc_rx);
+    let sender_oc_tx = Arc::clone(&oc_tx);
     let sender_extra_frequencies = extra_frequencies_hz.clone();
     let sender_extra_sample_rates = extra_sample_rates_hz.clone();
     let sender_extra_adcs = extra_adcs.clone();
@@ -3256,6 +3302,8 @@ fn start_protocol2(
             sender_adc,
             sender_antenna,
             sender_disable_pa,
+            sender_oc_rx,
+            sender_oc_tx,
             sender_extra_frequencies,
             sender_extra_sample_rates,
             sender_extra_adcs,
@@ -3342,6 +3390,8 @@ fn start_protocol2(
         adc,
         antenna,
         disable_pa,
+        oc_rx,
+        oc_tx,
         rx_attenuation,
         ps_tx_attenuation,
         extra_frequencies_hz,
@@ -3634,6 +3684,11 @@ fn p2_high_priority_packet(
     // alex0_word so the T/R relay doesn't switch to the internal PA's TX
     // path while a transverter should be driven at low level instead.
     disable_pa: bool,
+    // See RadioSession::oc_rx/oc_tx's doc comments -- resolved masks
+    // (bits 0-6 = OC1-OC7). oc_tx already has any active Tune mask
+    // ORed in by main.rs's per-frame resolution.
+    oc_rx: u8,
+    oc_tx: u8,
     tx_freq_hz: u32,
     tx_drive: u8,
     ps_tx_attenuation: u8,
@@ -3681,6 +3736,13 @@ fn p2_high_priority_packet(
     // while keyed.
     p[329..333].copy_from_slice(&phase_word(tx_freq_hz).to_be_bytes());
     p[345] = if mox_on { tx_drive } else { 0 };
+
+    // Open Collector outputs -- high-priority byte 1401. BUG FIX:
+    // never written at all before this, staying at the zero-
+    // initialized default. Confirmed against piHPSDR's new_protocol.c:
+    // `high_priority_buffer_to_radio[1401] = (rxband|txband)->OCrx/
+    // OCtx << 1` (bit 0 unused, OC1-OC7 in bits 1-7).
+    p[1401] = (if mox_on { oc_tx } else { oc_rx }) << 1;
 
     // BUG FIX: bytes 1442/1443 (ADC1/ADC0 step attenuators) were never
     // written at all, staying at the zero-initialized default -- a real
@@ -3885,6 +3947,9 @@ fn p2_sender_loop(
     adc: Arc<AtomicU32>,
     antenna: Arc<AtomicU32>,
     disable_pa: Arc<AtomicBool>,
+    // See RadioSession::oc_rx/oc_tx's doc comments.
+    oc_rx: Arc<AtomicU8>,
+    oc_tx: Arc<AtomicU8>,
     extra_frequencies_hz: Vec<Arc<AtomicU32>>,
     extra_sample_rates_hz: Vec<Arc<AtomicU32>>,
     extra_adcs: Vec<Arc<AtomicU32>>,
@@ -4122,6 +4187,8 @@ fn p2_sender_loop(
                     antenna_now,
                     mox_on,
                     disable_pa.load(Ordering::Relaxed),
+                    oc_rx.load(Ordering::Relaxed),
+                    oc_tx.load(Ordering::Relaxed),
                     tx_freq_hz,
                     drive,
                     ps_tx_atten,
@@ -4164,6 +4231,8 @@ fn p2_sender_loop(
                     antenna_now,
                     mox_on,
                     disable_pa.load(Ordering::Relaxed),
+                    oc_rx.load(Ordering::Relaxed),
+                    oc_tx.load(Ordering::Relaxed),
                     tx_freq_hz,
                     drive,
                     ps_tx_atten,

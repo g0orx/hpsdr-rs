@@ -162,6 +162,20 @@ fn xvtr_for_rf_freq(xvtrs: &[Xvtr], rf_freq_hz: u32) -> Option<&Xvtr> {
         .find(|x| !x.name.is_empty() && rf_freq_hz >= x.frequency_min_hz && rf_freq_hz <= x.frequency_max_hz)
 }
 
+/// Per-band Open Collector output masks -- bits 0-6 = OC1-OC7 (bit i-1
+/// for OCi), matching piHPSDR's oc_menu.c encoding exactly (band->OCrx/
+/// band->OCtx, written to the wire as `mask << 1`). Keyed by band/XVTR
+/// name in ConnectedState::oc_settings, same HashMap-by-name pattern as
+/// pa_calibration -- see that field's doc comment. `rx` is active while
+/// receiving on that band, `tx` while transmitting (see
+/// ConnectedState::oc_tune's doc comment for the global TUNE override
+/// ORed into `tx`).
+#[derive(Clone, Copy, Default, serde::Serialize, serde::Deserialize)]
+pub struct OcMask {
+    pub rx: u8,
+    pub tx: u8,
+}
+
 /// Everything remembered per-band: not just the last frequency used,
 /// but also the spectrum/waterfall level ranges, since different bands
 /// often want different level settings (e.g. a noisy 160m vs a quiet
@@ -241,6 +255,7 @@ enum SettingsTab {
     Diversity,
     Equalizer,
     Xvtr,
+    OpenCollector,
     Firmware,
 }
 
@@ -672,6 +687,21 @@ struct ConnectedState {
     /// same auto-clear check handles a since-renamed/removed/out-of-range
     /// slot on the very first frame either way.
     active_xvtr: Option<String>,
+    /// Per-band (or XVTR) Open Collector Rx/Tx masks -- see OcMask's
+    /// doc comment. Same HashMap-by-name pattern as pa_calibration
+    /// above, resolved to the current band and pushed into
+    /// session.oc_rx/oc_tx once per frame alongside pa_gain_db.
+    oc_settings: std::collections::HashMap<String, OcMask>,
+    /// Global Open Collector mask ORed into the current band's `tx`
+    /// mask while tune_active -- matches piHPSDR's OCtune (see
+    /// oc_menu.c), not per-band since it's meant to apply regardless
+    /// of which band TUNE happens to be pressed on. piHPSDR further
+    /// distinguishes full_tune/memory_tune timing windows for its
+    /// ATU-cycling feature, which this project has no equivalent of
+    /// (only a single tune_active bool), so this ORs in unconditionally
+    /// whenever tune_active is true -- the simpler case piHPSDR's own
+    /// logic degenerates to without that feature.
+    oc_tune: u8,
     /// Upper bound (watts) for the main panel's TX Power slider. The
     /// discovery protocol only reports board *type* (Boards), not the
     /// specific radio model or its PA's actual max output -- e.g.
@@ -1340,6 +1370,8 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                 // reintroduce the frequency-inference ambiguity
                 // active_xvtr itself exists to avoid.
                 active_xvtr: cfg.active_xvtr.clone(),
+                oc_settings: cfg.oc_settings.clone(),
+                oc_tune: cfg.oc_tune,
                 max_tx_power_watts: cfg
                     .max_tx_power_watts
                     .unwrap_or_else(|| default_max_tx_power_watts(device.board)),
@@ -1697,6 +1729,20 @@ impl eframe::App for HpsdrApp {
                     .session
                     .disable_pa
                     .store(xvtr_disable_pa, std::sync::atomic::Ordering::Relaxed);
+                // Open Collector outputs -- see OcMask's doc comment.
+                // Same band resolution as xvtr_disable_pa just above
+                // (active_xvtr_name if a transverter's active, otherwise
+                // the real hardware LO's own band -- freq_hz, not
+                // dial_freq_hz, matching pa_gain_db's identical
+                // real-RF-path reasoning just above in this same frame).
+                let current_band_name: &str = match active_xvtr_name.as_deref() {
+                    Some(name) => name,
+                    None => band_for_frequency(freq_hz).map(|b| b.name).unwrap_or(""),
+                };
+                let oc = connected.oc_settings.get(current_band_name).copied().unwrap_or_default();
+                let oc_tx_resolved = if connected.tune_active { oc.tx | connected.oc_tune } else { oc.tx };
+                connected.session.oc_rx.store(oc.rx, std::sync::atomic::Ordering::Relaxed);
+                connected.session.oc_tx.store(oc_tx_resolved, std::sync::atomic::Ordering::Relaxed);
                 // See RadioSession::rx_frequency_hz's doc comment -- kept
                 // in sync every frame here so rigctl/TCI/CAT report the
                 // CTUN'd listen frequency, not the parked hardware LO --
@@ -3862,6 +3908,7 @@ impl eframe::App for HpsdrApp {
                                     (SettingsTab::Diversity, "Diversity"),
                                     (SettingsTab::Equalizer, "Equalizer"),
                                     (SettingsTab::Xvtr, "XVTR"),
+                                    (SettingsTab::OpenCollector, "Open Collector"),
                                     (SettingsTab::Firmware, "Firmware"),
                                 ] {
                                     // Diversity requires a 2-ADC board -- see
@@ -5131,6 +5178,115 @@ impl eframe::App for HpsdrApp {
                                         }
                                     });
                                 }
+                                SettingsTab::OpenCollector => {
+                                    // See OcMask's doc comment. Board-
+                                    // agnostic (no per-board gating) --
+                                    // harmless on boards without the
+                                    // physical outputs, same as PA
+                                    // Calibration.
+                                    ui.add_space(4.0);
+                                    ui.label(
+                                        "Open Collector outputs (OC1-OC7) are general-purpose relay \
+                                         driver lines, configured per band -- e.g. for external \
+                                         antenna switching, bandpass filter selection, or amp \
+                                         keying. Rx is active while receiving on that band, Tx while \
+                                         transmitting. Driven by the primary front end's band, shared \
+                                         across every receiver -- not a per-extra-receiver setting. \
+                                         The Tune row (its own set of outputs, not tied to any band) \
+                                         is OR'd into the current band's Tx outputs while the Tune \
+                                         button is engaged.",
+                                    );
+                                    ui.add_space(6.0);
+                                    // Every row emits exactly the same 15
+                                    // cells (Band + 7 Rx + 7 Tx) so the
+                                    // header's per-OC-number columns line
+                                    // up with each row's checkboxes --
+                                    // an egui::Grid column's width is
+                                    // driven by ALL cells in that column,
+                                    // so a row that instead grouped its 7
+                                    // checkboxes into one ui.horizontal
+                                    // (an earlier version of this code)
+                                    // collapsed them into a single cell,
+                                    // throwing off every column after it.
+                                    egui::Grid::new("oc_grid").striped(true).show(ui, |ui| {
+                                        ui.label("Band");
+                                        for i in 1..=7 {
+                                            ui.label(format!("R{i}"));
+                                        }
+                                        for i in 1..=7 {
+                                            ui.label(format!("T{i}"));
+                                        }
+                                        ui.end_row();
+
+                                        // Reachable BANDS, then configured
+                                        // XVTRs -- same combined row list
+                                        // as PA Calibration + XVTR's own
+                                        // tabs, matching piHPSDR's fused
+                                        // oc_menu.c loop.
+                                        let names: Vec<&str> = BANDS
+                                            .iter()
+                                            .filter(|band| {
+                                                (band.low_hz as u64) >= connected.device.frequency_min
+                                                    && (band.high_hz as u64) <= connected.device.frequency_max
+                                            })
+                                            .map(|band| band.name)
+                                            .chain(
+                                                connected
+                                                    .xvtrs
+                                                    .iter()
+                                                    .filter(|x| !x.name.is_empty())
+                                                    .map(|x| x.name.as_str()),
+                                            )
+                                            .collect();
+                                        for name in names {
+                                            ui.label(name);
+                                            let mut oc = connected.oc_settings.get(name).copied().unwrap_or_default();
+                                            let mut changed = false;
+                                            for i in 0..7u8 {
+                                                let mask = 0x01 << i;
+                                                let mut on = oc.rx & mask != 0;
+                                                if ui.checkbox(&mut on, "").changed() {
+                                                    if on { oc.rx |= mask } else { oc.rx &= !mask }
+                                                    changed = true;
+                                                }
+                                            }
+                                            for i in 0..7u8 {
+                                                let mask = 0x01 << i;
+                                                let mut on = oc.tx & mask != 0;
+                                                if ui.checkbox(&mut on, "").changed() {
+                                                    if on { oc.tx |= mask } else { oc.tx &= !mask }
+                                                    changed = true;
+                                                }
+                                            }
+                                            if changed {
+                                                connected.oc_settings.insert(name.to_string(), oc);
+                                                settings_changed = true;
+                                            }
+                                            ui.end_row();
+                                        }
+
+                                        // Global Tune mask -- see
+                                        // ConnectedState::oc_tune's doc
+                                        // comment. Shown under the Tx
+                                        // columns (it's OR'd into Tx, not
+                                        // Rx) -- the 7 Rx-column cells are
+                                        // left blank to keep every row's
+                                        // cell count identical.
+                                        ui.label("Tune");
+                                        for _ in 0..7 {
+                                            ui.label("");
+                                        }
+                                        for i in 0..7u8 {
+                                            let mask = 0x01 << i;
+                                            let mut on = connected.oc_tune & mask != 0;
+                                            if ui.checkbox(&mut on, "").changed() {
+                                                if on { connected.oc_tune |= mask } else { connected.oc_tune &= !mask }
+                                                settings_changed = true;
+                                            }
+                                        }
+                                        ui.end_row();
+                                    });
+                                }
                                 SettingsTab::PureSignal => {
                                     // See radio::RadioSettings::puresignal_enabled
                                     // and radio::ps_feedback_config for what
@@ -5713,6 +5869,8 @@ impl eframe::App for HpsdrApp {
                         xit_offset_hz: Some(connected.xit_offset_hz),
                         xvtrs: connected.xvtrs.clone(),
                         active_xvtr: connected.active_xvtr.clone(),
+                        oc_settings: connected.oc_settings.clone(),
+                        oc_tune: connected.oc_tune,
                     }
                     .save(connected.device.mac);
                 }
@@ -7286,6 +7444,10 @@ fn render_extra_receiver_settings(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceive
         // XVTR is main-receiver-only (see Xvtr's doc comment) -- redirect
         // same as Network/Tx/PaCalibration above.
         SettingsTab::Xvtr => rx.settings_tab = SettingsTab::Agc,
+        // Open Collector outputs are driven by the primary front end's
+        // band, shared across every receiver (see OcMask's doc comment)
+        // -- not a per-receiver concept, redirect same as Xvtr above.
+        SettingsTab::OpenCollector => rx.settings_tab = SettingsTab::Agc,
         // Firmware update is against the whole radio, not a per-receiver
         // concept -- redirect same as Network.
         SettingsTab::Firmware => rx.settings_tab = SettingsTab::Agc,

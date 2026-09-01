@@ -1,4 +1,4 @@
-[← Firmware Update](13-firmware-update.md) | [Index](README.md)
+[← Firmware Update](13-firmware-update.md) | [Index](README.md) | [Open Collector →](15-open-collector.md)
 
 # Settings: XVTR
 
@@ -55,4 +55,4 @@ Clicking it retunes to the slot's RF minimum. While active:
 
 ---
 
-[← Firmware Update](13-firmware-update.md) | [Index](README.md)
+[← Firmware Update](13-firmware-update.md) | [Index](README.md) | [Open Collector →](15-open-collector.md)
