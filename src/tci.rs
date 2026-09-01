@@ -235,12 +235,28 @@ const CLIENT_SINK_MAX_IQ_PAIRS: usize = 200_000;
 /// doc comment (see the IQ send site below) describing the Compactor
 /// re-sending iq_start every few hundred ms and eventually giving up,
 /// exactly the symptom an oversized first frame would cause against a
-/// client enforcing a smaller limit. Chunking every drain to this size
-/// keeps every message close to what normal steady-state ticks already
-/// produce (seen fine in the same capture up to ~9,000 pairs/message)
-/// regardless of how large the backlog was.
-const MAX_AUDIO_SAMPLES_PER_MESSAGE: usize = 4096;
-const MAX_IQ_PAIRS_PER_MESSAGE: usize = 4096;
+/// client enforcing a smaller limit.
+///
+/// SIZES CORRECTED after a real, successful Compactor connection still
+/// showed ~1s of visibly wrong (compressed-looking) spectrum right
+/// after connecting even with the backlog clear (see iq_start's own
+/// doc comment) in place. A real packet capture of the *working*
+/// Compactor session this time (not the earlier failing probe) showed
+/// IQ chunks maxing out at 4096 pairs/message -- this constant's
+/// previous value -- multiple times per handle_client read-loop tick
+/// (its ~20ms read timeout naturally accumulates up to a whole 20ms's
+/// worth of IQ each iteration, e.g. 4096 pairs at 192kHz), i.e. still
+/// coarse, bursty batches rather than smooth real-time delivery. A
+/// side-by-side capture of Thetis's own reference server doing the
+/// same iq_start showed it uses much finer 256-pair (2112-byte) IQ
+/// chunks throughout, and its audio chunks match the client's own
+/// declared audio_stream_samples (2048) rather than this project's
+/// previous 4096 cap. Matching those confirmed reference sizes here
+/// keeps every individual message the size a real client's own
+/// buffering/rendering is presumably already tuned for, instead of
+/// occasionally handing it an unusually large one.
+const MAX_AUDIO_SAMPLES_PER_MESSAGE: usize = 2048;
+const MAX_IQ_PAIRS_PER_MESSAGE: usize = 256;
 
 /// The single reader of the real shared audio/IQ taps -- drains them
 /// and fans a clone of each batch out to every currently-registered
