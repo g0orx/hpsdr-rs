@@ -26,6 +26,12 @@ The percentage (1-100%) of TX Power actually used while **TUNE** or **TWO
 TONE** is engaged from the main window -- keep this low for safe antenna/
 amplifier tuning rather than transmitting at full power.
 
+## Max SWR
+
+The SWR threshold (1.0-10.0:1, default 3.0:1) above which the main
+window's power meter -- shown in place of the S-meter while transmitting
+-- turns red, warning of a bad antenna match.
+
 ## TX ADC0 Attenuation (standard boards only)
 
 Protects ADC0's front end from this radio's own TX leakage while

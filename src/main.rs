@@ -716,6 +716,10 @@ struct ConnectedState {
     /// Power slider was set to when TUNE was pressed (pre_tune_power_watts
     /// below) -- see Config::tune_power_percent.
     tune_power_percent: u32,
+    /// SWR threshold (e.g. 3.0 = 3:1) above which the TX power meter's
+    /// needle/readout turn red -- see draw_power_meter and
+    /// Config::max_swr.
+    max_swr: f32,
     /// Whether the Tune button is currently engaged -- transient, not
     /// persisted. See the main-panel Tune button handler for the full
     /// mechanism (WDSP PostGen tone + a temporary TX Power override).
@@ -1376,6 +1380,7 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                     .max_tx_power_watts
                     .unwrap_or_else(|| default_max_tx_power_watts(device.board)),
                 tune_power_percent: cfg.tune_power_percent.unwrap_or(20),
+                max_swr: cfg.max_swr.unwrap_or(3.0),
                 tune_active: false,
                 pre_tune_power_watts: None,
                 two_tone_active: false,
@@ -3566,7 +3571,14 @@ impl eframe::App for HpsdrApp {
                                 connected.smoothed_rev_power as u32,
                                 connected.device.board,
                             );
-                            draw_power_meter(ui, meter_rect, watts, swr, connected.max_tx_power_watts as f32);
+                            draw_power_meter(
+                                ui,
+                                meter_rect,
+                                watts,
+                                swr,
+                                connected.max_tx_power_watts as f32,
+                                connected.max_swr,
+                            );
                         } else {
                             // Reset so the next key-up's meter ramps from
                             // zero (like a real wattmeter's needle
@@ -4779,6 +4791,25 @@ impl eframe::App for HpsdrApp {
                                     });
                                     ui.add_space(8.0);
 
+                                    ui.horizontal(|ui| {
+                                        ui.label("Max SWR:");
+                                        // See draw_power_meter/Config::max_swr's doc
+                                        // comments -- the TX power meter's needle/
+                                        // readout turn red once the live SWR crosses
+                                        // this.
+                                        if scroll_slider_f32(
+                                            ui,
+                                            &mut connected.slider_scroll_accum,
+                                            &mut connected.max_swr,
+                                            1.0..=10.0,
+                                            0.1,
+                                        ) {
+                                            settings_changed = true;
+                                        }
+                                        ui.label(":1");
+                                    });
+                                    ui.add_space(8.0);
+
                                     // Standard (non-HermesLite) boards only -- see
                                     // radio::RadioSession::ps_tx_attenuation's doc comment. Despite
                                     // the internal name, this protects ADC0's front end from the
@@ -5811,6 +5842,7 @@ impl eframe::App for HpsdrApp {
                         pa_calibration: connected.pa_calibration.clone(),
                         max_tx_power_watts: Some(connected.max_tx_power_watts),
                         tune_power_percent: Some(connected.tune_power_percent),
+                        max_swr: Some(connected.max_swr),
                         rigctl_addr: Some(connected.rigctl_addr.clone()),
                         tci_addr: Some(connected.tci_addr.clone()),
                         cat_addr: Some(connected.cat_addr.clone()),
@@ -6709,11 +6741,12 @@ fn draw_s_meter(ui: &mut egui::Ui, rect: egui::Rect, db: f64) {
 
 /// Same semicircle-gauge treatment as draw_s_meter, scaled 0..max_watts
 /// instead of S-units, shown in place of it while transmitting. The
-/// needle (and the combined digital readout) turn red once SWR crosses
-/// the same 3.0 threshold the plain-text display this replaces already
+/// needle (and the combined digital readout) turn a more alarming red
+/// once SWR crosses `max_swr` (Settings -> TX, ConnectedState::max_swr)
+/// -- the same threshold the plain-text display this replaces already
 /// flagged, so a bad match is visible at a glance without reading the
 /// number.
-fn draw_power_meter(ui: &mut egui::Ui, rect: egui::Rect, watts: f32, swr: f32, max_watts: f32) {
+fn draw_power_meter(ui: &mut egui::Ui, rect: egui::Rect, watts: f32, swr: f32, max_watts: f32, max_swr: f32) {
     let painter = ui.painter();
     painter.rect_filled(rect, 4.0, egui::Color32::from_gray(20));
 
@@ -6759,9 +6792,15 @@ fn draw_power_meter(ui: &mut egui::Ui, rect: egui::Rect, watts: f32, swr: f32, m
         );
     }
 
-    let bad_swr = swr > 3.0;
+    let bad_swr = swr > max_swr;
+    // Red whenever transmitting (this gauge only shows while keyed --
+    // see this function's own doc comment), not just on bad SWR --
+    // previously yellow unless bad_swr, distinguishing "transmitting"
+    // from "transmitting with a bad match" the same way this gauge's
+    // digital readout still does (its own colors, just below, are
+    // untouched).
     let needle_color =
-        if bad_swr { egui::Color32::from_rgb(220, 60, 60) } else { egui::Color32::YELLOW };
+        if bad_swr { egui::Color32::from_rgb(220, 60, 60) } else { egui::Color32::RED };
     let needle_angle = angle_for_watts(watts);
     painter.line_segment(
         [center, point_at(needle_angle, radius * 0.92)],

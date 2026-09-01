@@ -159,6 +159,10 @@ pub struct Config {
     /// your normal operating power rather than being a fixed ceiling.
     /// Missing falls back to a conservative 20%.
     pub tune_power_percent: Option<u32>,
+    /// SWR threshold (e.g. 3.0 = 3:1) above which the TX power meter's
+    /// needle/readout turn red -- see main.rs's draw_power_meter. Missing
+    /// falls back to 3.0.
+    pub max_swr: Option<f32>,
     /// Spectrum/waterfall display range while transmitting -- separate
     /// from db_low/db_high/waterfall_db_low/waterfall_db_high (which
     /// are for receiving) because a locally-picked-up TX signal is
