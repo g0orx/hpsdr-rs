@@ -299,6 +299,28 @@ pub fn discover(devices: Arc<Mutex<Vec<Device>>>, interface_names: Arc<Mutex<Has
     }
 }
 
+/// Looks up which local network interface (e.g. "eth0"/"enp3s0")
+/// currently owns `ip` -- same lookup `discover`'s own interface_names
+/// map is built from, but standalone and side-effect-free (no
+/// bindability probing, no discovery traffic), for callers that just
+/// want a name for an address they already know is in use (e.g. the
+/// About tab showing which interface a connected radio's `my_address`
+/// belongs to, after the original discover() call -- and its
+/// interface_names map -- is long gone).
+pub fn interface_name_for(ip: IpAddr) -> Option<String> {
+    let interfaces = NetworkInterface::show().ok()?;
+    for itf in interfaces {
+        for addr in &itf.addr {
+            if let Addr::V4(v4_info) = addr {
+                if IpAddr::V4(v4_info.ip) == ip {
+                    return Some(itf.name.clone());
+                }
+            }
+        }
+    }
+    None
+}
+
 /// Unicast discovery against a specific IP, trying Protocol 1 then
 /// Protocol 2. Returns true and appends to `devices` if either replies.
 /// Blocking -- call from a background thread.

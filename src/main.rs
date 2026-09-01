@@ -257,6 +257,7 @@ enum SettingsTab {
     Xvtr,
     OpenCollector,
     Firmware,
+    About,
 }
 
 /// A receiver beyond the first, shown in its own native OS window (P2
@@ -391,6 +392,14 @@ struct ExtraReceiver {
 
 struct ConnectedState {
     device: Device,
+    /// The local network interface (e.g. "eth0") `device.my_address`
+    /// belongs to -- resolved once at connect time via
+    /// discovery::interface_name_for (the discovery window's own
+    /// interface_names map, built during the scan, doesn't survive
+    /// past that window closing). None if it couldn't be resolved
+    /// (e.g. a manually-discovered device, or the interface changed
+    /// since connecting) -- shown as "unknown" in the About tab.
+    interface_name: Option<String>,
     session: RadioSession,
     spectrum: SpectrumHandle,
     /// A SEPARATE analyzer fed with the actual generated TX IQ (via
@@ -1279,6 +1288,7 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
             // themselves already computed above (before RadioSession::
             // start), reused here.
             Ok(ConnectedState {
+                interface_name: discovery::interface_name_for(device.my_address.ip()),
                 device,
                 session,
                 spectrum,
@@ -3938,6 +3948,7 @@ impl eframe::App for HpsdrApp {
                                     (SettingsTab::Xvtr, "XVTR"),
                                     (SettingsTab::OpenCollector, "Open Collector"),
                                     (SettingsTab::Firmware, "Firmware"),
+                                    (SettingsTab::About, "About"),
                                 ] {
                                     // Diversity requires a 2-ADC board -- see
                                     // radio::RadioSession::diversity_enabled's
@@ -4193,6 +4204,53 @@ impl eframe::App for HpsdrApp {
                                             connected.device.mac,
                                         ));
                                     }
+                                }
+
+                                SettingsTab::About => {
+                                    ui.add_space(4.0);
+                                    egui::Grid::new("about_grid").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
+                                        ui.label("Board:");
+                                        ui.label(format!("{:?}", connected.device.board));
+                                        ui.end_row();
+
+                                        ui.label("Protocol:");
+                                        ui.label(format!("{}", connected.device.protocol));
+                                        ui.end_row();
+
+                                        ui.label("Protocol Version:");
+                                        ui.label(format!(
+                                            "{}.{}",
+                                            connected.device.version / 10,
+                                            connected.device.version % 10
+                                        ));
+                                        ui.end_row();
+
+                                        ui.label("IP Address:");
+                                        ui.label(format!("{}", connected.device.address.ip()));
+                                        ui.end_row();
+
+                                        ui.label("MAC Address:");
+                                        let mac = connected.device.mac;
+                                        ui.label(format!(
+                                            "{:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}",
+                                            mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
+                                        ));
+                                        ui.end_row();
+
+                                        ui.label("Interface:");
+                                        ui.label(connected.interface_name.as_deref().unwrap_or("unknown"));
+                                        ui.end_row();
+                                    });
+
+                                    ui.add_space(16.0);
+                                    ui.separator();
+                                    ui.add_space(8.0);
+                                    ui.label("hpsdr-rs");
+                                    ui.label("John Melton G0ORX");
+                                    ui.hyperlink_to(
+                                        "john.d.melton@googlemail.com",
+                                        "mailto:john.d.melton@googlemail.com",
+                                    );
                                 }
 
                                 SettingsTab::Audio => {
@@ -7506,6 +7564,10 @@ fn render_extra_receiver_settings(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceive
         // Firmware update is against the whole radio, not a per-receiver
         // concept -- redirect same as Network.
         SettingsTab::Firmware => rx.settings_tab = SettingsTab::Agc,
+        // About shows this connection's own device/network details
+        // (main.rs's ConnectedState::device/interface_name), which this
+        // struct doesn't carry -- redirect same as Firmware.
+        SettingsTab::About => rx.settings_tab = SettingsTab::Agc,
 
         SettingsTab::Agc => {
             ui.label("Sample Rate:");

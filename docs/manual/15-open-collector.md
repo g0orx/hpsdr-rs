@@ -1,4 +1,4 @@
-[← XVTR](14-xvtr.md) | [Index](README.md)
+[← XVTR](14-xvtr.md) | [Index](README.md) | [About →](16-about.md)
 
 # Settings: Open Collector
 
@@ -43,4 +43,4 @@ windows don't have their own Open Collector settings.
 
 ---
 
-[← XVTR](14-xvtr.md) | [Index](README.md)
+[← XVTR](14-xvtr.md) | [Index](README.md) | [About →](16-about.md)
