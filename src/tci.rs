@@ -260,11 +260,29 @@ const MAX_IQ_PAIRS_PER_MESSAGE: usize = 256;
 
 /// The single reader of the real shared audio/IQ taps -- drains them
 /// and fans a clone of each batch out to every currently-registered
-/// client's own sink, at the same ~20ms cadence handle_client's own
+/// client's own sink, at the same ~5ms cadence handle_client's own
 /// read-timeout loop already used for streaming (so this doesn't change
 /// end-to-end latency). See ClientAudioIqSink's own doc comment for why
 /// this replaced N client threads each draining the shared taps
 /// directly.
+///
+/// TICK LOWERED from 20ms to 5ms (along with handle_client's matching
+/// read timeout below) after a real report: connecting straight to
+/// this project's TCI port showed no issue, and connecting to Thetis
+/// through "TCI Remote Compactor" (a bandwidth-compacting relay, not
+/// TCI Remote itself) showed no issue either, but this project through
+/// the Compactor specifically showed a visible burst/gap/burst right
+/// after connecting -- narrowing it to this project's own delivery
+/// smoothness, not the chunk sizes (already matched to Thetis's own,
+/// see MAX_IQ_PAIRS_PER_MESSAGE) or the Compactor itself. At a 20ms
+/// tick, a whole 20ms's worth of IQ can accumulate before a single
+/// send (e.g. ~4096 pairs at 192kHz -- BUFFER_SIZE=1024 samples,
+/// produced by spectrum.rs's own analyzer loop roughly every 5ms at
+/// that rate, means ~4 of its blocks land in one batch); a real
+/// capture of Thetis's reference server showed it delivering far more
+/// often than that. 5ms keeps each batch close to a single DSP block
+/// even at this project's highest supported IQ rate, rather than
+/// several stacked together.
 fn spawn_audio_iq_broadcaster(
     audio_iq: AudioIqCell,
     registry: ClientAudioIqRegistry,
@@ -272,7 +290,7 @@ fn spawn_audio_iq_broadcaster(
 ) -> JoinHandle<()> {
     thread::spawn(move || {
         while !stop.load(Ordering::Relaxed) {
-            thread::sleep(Duration::from_millis(20));
+            thread::sleep(Duration::from_millis(5));
             let taps = audio_iq.lock().unwrap().clone();
             let audio_batch: Vec<f32> = {
                 let mut q = taps.audio.lock().unwrap();
@@ -629,7 +647,15 @@ fn handle_client(
     // coarse once this loop is also responsible for pushing streaming
     // data at roughly this same cadence -- see the streaming sends
     // below). Still just a read timeout, not a hard latency guarantee.
-    if let Err(e) = ws.get_ref().set_read_timeout(Some(Duration::from_millis(20))) {
+    //
+    // LOWERED from 20ms to 5ms -- see spawn_audio_iq_broadcaster's doc
+    // comment for the real report this addresses. Every other timing
+    // decision in this loop (TxChrono's buffer-target control loop,
+    // the 1s vfo/dds/modulation/trx heartbeat) is driven by wall-clock
+    // Instant::elapsed() checks, not by counting iterations of this
+    // loop, so running it more often only makes those checks more
+    // responsive -- it doesn't change what they converge to.
+    if let Err(e) = ws.get_ref().set_read_timeout(Some(Duration::from_millis(5))) {
         eprintln!("tci: failed to set read timeout: {e}");
     }
 
@@ -1095,8 +1121,11 @@ fn handle_client(
                 // build otherwise) with no "client closed the connection"
                 // ever logged points straight at this arm -- the only
                 // other way this loop exits without logging something.
-                // ~2s is suspiciously close to this read's own 20ms
-                // timeout ticking over many times right after the
+                // ~2s is suspiciously close to this read's own timeout
+                // (20ms when this was diagnosed, since lowered to 5ms --
+                // see set_read_timeout's own doc comment -- but the same
+                // reasoning applies at either value) ticking over many
+                // times right after the
                 // handshake goes quiet, which is consistent with Windows
                 // surfacing a DIFFERENT io::ErrorKind (or a non-Io
                 // tungstenite::Error variant entirely) for what's
@@ -1312,7 +1341,7 @@ fn handle_client(
         // client-side staleness check that expects to keep seeing
         // confirmation of the current state, not just a one-time ack.
         // Resent every second here (piggybacking on this loop's
-        // existing ~20ms tick) as a low-risk heartbeat -- harmless for
+        // existing read-timeout tick) as a low-risk heartbeat -- harmless for
         // clients that don't need it (TCI Remote/rustyHPSDR never
         // solicited this either, and ignore unsolicited state messages
         // they don't ask for).
