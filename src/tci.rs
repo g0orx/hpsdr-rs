@@ -354,6 +354,23 @@ impl TciServer {
         // vfo/heartbeat frequency reports so a CTUN'd listen frequency is
         // reported correctly, not the parked hardware LO.
         rx_frequency_hz: Arc<AtomicU32>,
+        // RadioSession::frequency_hz -- the real, parked hardware LO that
+        // this project's raw wideband IQ tap (spectrum.rs's iq_out, what
+        // dds/if below describe) is actually centered on. BUG FIX: dds/
+        // if used to be derived from rx_frequency_hz (the CTUN'd listen
+        // frequency) instead, i.e. dds==vfo and if_offset==0 always --
+        // harmless with CTUN off (the two are equal then), but a real
+        // report of TCI Remote's spectrum/waterfall being visibly offset
+        // from its own frequency markers while CTUN was on traced back
+        // to exactly this: a client is expected to center its panorama
+        // on `dds` and place the tuned marker at `dds + if_offset`
+        // (== vfo), so reporting dds==vfo when the real IQ data is
+        // actually centered on the parked LO (a different frequency
+        // whenever CTUN has shifted the listen point away from it)
+        // draws the client's own axis right, but the underlying data --
+        // genuinely captured around the LO -- ends up looking shifted
+        // relative to it.
+        hw_frequency_hz: Arc<AtomicU32>,
         sample_rate: Arc<AtomicU32>,
         demod_params: Arc<Mutex<DemodParams>>,
         mox: Arc<AtomicBool>,
@@ -408,6 +425,7 @@ impl TciServer {
                         accept_logging.log(&format!("client connected from {peer}"));
                         let freq = Arc::clone(&requested_frequency_hz);
                         let rx_freq = Arc::clone(&rx_frequency_hz);
+                        let hw_freq = Arc::clone(&hw_frequency_hz);
                         let rate = Arc::clone(&sample_rate);
                         let params = Arc::clone(&accept_demod_params);
                         let conn_audio_iq_registry = Arc::clone(&accept_audio_iq_registry);
@@ -426,8 +444,8 @@ impl TciServer {
                         let handle = thread::spawn(move || {
                             conn_connected.fetch_add(1, Ordering::Relaxed);
                             handle_client(
-                                stream, freq, rx_freq, rate, params, conn_audio_iq_registry, tx_audio, tx_gain,
-                                wants_mic, conn_mox, conn_rit_enabled, conn_rit_offset_hz, conn_xit_enabled,
+                                stream, freq, rx_freq, hw_freq, rate, params, conn_audio_iq_registry, tx_audio,
+                                tx_gain, wants_mic, conn_mox, conn_rit_enabled, conn_rit_offset_hz, conn_xit_enabled,
                                 conn_xit_offset_hz, conn_stop, conn_board_name, conn_logging,
                             );
                             conn_connected.fetch_sub(1, Ordering::Relaxed);
@@ -551,6 +569,7 @@ fn handle_client(
     stream: TcpStream,
     requested_frequency_hz: Arc<AtomicU32>,
     rx_frequency_hz: Arc<AtomicU32>,
+    hw_frequency_hz: Arc<AtomicU32>,
     sample_rate: Arc<AtomicU32>,
     demod_params: DemodParamsCell,
     // See ClientAudioIqSink's doc comment -- this client registers its
@@ -655,6 +674,12 @@ fn handle_client(
     // already claims via PROTOCOL_MESSAGE) is the more consistent
     // choice if this needs to be picked one way.
     let freq = rx_frequency_hz.load(Ordering::Relaxed);
+    // See hw_frequency_hz's doc comment: dds is the real parked LO the
+    // raw IQ tap is actually centered on, and if_offset (the `if`
+    // message) is the gap between that and the CTUN'd `freq`/vfo above
+    // -- 0 whenever CTUN is off, since the two are then equal.
+    let dds_freq = hw_frequency_hz.load(Ordering::Relaxed);
+    let if_offset = freq as i64 - dds_freq as i64;
     let params = *demod_params.lock().unwrap().clone().lock().unwrap();
     let mode = params.mode;
     let (pb_low, pb_high) = passband_for(mode, params.width_hz);
@@ -757,8 +782,8 @@ fn handle_client(
     send_logged(&mut ws, &logging, format!("modulation:0,{};", mode_to_tci(mode)).into());
     send_logged(&mut ws, &logging, format!("tx_frequency:{freq};").into());
     send_logged(&mut ws, &logging, format!("vfo:0,0,{freq};").into());
-    send_logged(&mut ws, &logging, "if:0,0,0;".into());
-    send_logged(&mut ws, &logging, format!("dds:0,{freq};").into());
+    send_logged(&mut ws, &logging, format!("if:0,0,{if_offset};").into());
+    send_logged(&mut ws, &logging, format!("dds:0,{dds_freq};").into());
     // MODULATIONS_LIST uses the canonical spellings tci_to_mode below
     // actually keys on, not its aliases (CWR/PKTUSB/PKTLSB/WFM).
     // IF_LIMITS/VFO_LIMITS: VFO_LIMITS mirrors rigctl.rs's own
@@ -1293,9 +1318,18 @@ fn handle_client(
         // they don't ask for).
         if last_status_broadcast.elapsed() >= Duration::from_secs(1) {
             let freq = rx_frequency_hz.load(Ordering::Relaxed);
+            // See hw_frequency_hz's doc comment -- re-derived every
+            // heartbeat, not just once at connect, so toggling/adjusting
+            // CTUN mid-session doesn't leave an already-connected
+            // client's dds/if stuck at whatever they were at connect
+            // time.
+            let dds_freq = hw_frequency_hz.load(Ordering::Relaxed);
+            let if_offset = freq as i64 - dds_freq as i64;
             let mode = demod_params.lock().unwrap().clone().lock().unwrap().mode;
             let mox_on = mox.load(Ordering::Relaxed);
             let _ = ws.send(Message::Text(format!("vfo:0,0,{freq};").into()));
+            let _ = ws.send(Message::Text(format!("if:0,0,{if_offset};").into()));
+            let _ = ws.send(Message::Text(format!("dds:0,{dds_freq};").into()));
             let _ =
                 ws.send(Message::Text(format!("modulation:0,{};", mode_to_tci(mode)).into()));
             if ws
