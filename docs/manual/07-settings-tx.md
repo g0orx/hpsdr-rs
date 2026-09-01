@@ -32,6 +32,11 @@ The SWR threshold (1.0-10.0:1, default 3.0:1) above which the main
 window's power meter -- shown in place of the S-meter while transmitting
 -- turns red, warning of a bad antenna match.
 
+If SWR reaches or exceeds this while actually running more than 35W,
+**TX Power** is automatically cut to 10W to protect the PA -- it doesn't
+raise itself back up on its own once the match improves, so raise it
+back manually when it's safe to.
+
 ## TX ADC0 Attenuation (standard boards only)
 
 Protects ADC0's front end from this radio's own TX leakage while

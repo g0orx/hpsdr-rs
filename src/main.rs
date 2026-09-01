@@ -3571,6 +3571,22 @@ impl eframe::App for HpsdrApp {
                                 connected.smoothed_rev_power as u32,
                                 connected.device.board,
                             );
+                            // SWR protection: cut drive to a safe 10W the
+                            // moment SWR reaches/exceeds Max SWR while
+                            // actually running more than 35W -- a bad
+                            // match at high power is what actually risks
+                            // the PA, not a bad match at a few watts, so
+                            // this only engages above that floor. No
+                            // separate "already tripped" latch needed:
+                            // once tx_power_watts drops to 10, watts
+                            // (the real measured output, not the drive
+                            // setting) falls with it within a frame or
+                            // two, so the condition clears itself --
+                            // and re-trips immediately if the operator
+                            // raises power back up while still mismatched.
+                            if swr >= connected.max_swr && watts > 35.0 {
+                                connected.session.tx_power_watts.store(10, std::sync::atomic::Ordering::Relaxed);
+                            }
                             draw_power_meter(
                                 ui,
                                 meter_rect,
