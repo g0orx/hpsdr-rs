@@ -3,7 +3,11 @@
     protocol -- an open WebSocket-based control protocol originally from
     Expert Electronics (ExpertSDR2/3), also supported by Thetis/
     OpenHPSDR and digital-mode software like JTDX. Listens on
-    0.0.0.0:40001 by default (TCI's standard default port, but bound to
+    0.0.0.0:50001 by default (Thetis's own default TCI port, and what
+    real-world TCI Remote/TCI Remote Compactor setups were confirmed
+    using via packet capture during this project's own interop
+    debugging -- an earlier default of 40001 here, cited as "TCI's
+    standard default port", didn't match that in practice; bound to
     all interfaces rather than just loopback) so a client on another
     machine on the network -- a remote-operating laptop, a tablet, a
     separate shack PC -- can connect too, not just software running on
@@ -122,7 +126,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 use tungstenite::Message;
 
-pub const DEFAULT_ADDR: &str = "0.0.0.0:40001";
+pub const DEFAULT_ADDR: &str = "0.0.0.0:50001";
 /// PROTOCOL:program-name,protocol-version; -- confirmed against the
 /// official TCI Protocol spec (v2.0, section 4.1): arg1 is the program
 /// name, arg2 the TCI protocol version implemented.
@@ -355,7 +359,7 @@ pub struct TciServer {
 
 impl TciServer {
     /// Starts listening in the background on `addr` (e.g.
-    /// "0.0.0.0:40001", the default -- or "127.0.0.1:40001" to restrict
+    /// "0.0.0.0:50001", the default -- or "127.0.0.1:50001" to restrict
     /// to this machine only). Returns Err if the address is invalid or
     /// the port is already in use.
     pub fn start(
@@ -439,7 +443,6 @@ impl TciServer {
             while !accept_stop.load(Ordering::Relaxed) {
                 match listener.accept() {
                     Ok((stream, peer)) => {
-                        println!("tci: client connected from {peer}");
                         accept_logging.log(&format!("client connected from {peer}"));
                         let freq = Arc::clone(&requested_frequency_hz);
                         let rx_freq = Arc::clone(&rx_frequency_hz);
@@ -637,7 +640,7 @@ fn handle_client(
     let mut ws = match tungstenite::accept(stream) {
         Ok(ws) => ws,
         Err(e) => {
-            eprintln!("tci: websocket handshake failed: {e}");
+            logging.log(&format!("websocket handshake failed: {e}"));
             return;
         }
     };

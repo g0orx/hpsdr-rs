@@ -50,7 +50,9 @@ A WebSocket-based control protocol, used by some digital-mode software
 (e.g. as an alternative to rigctl for WSJT-X, or TCI Remote-style clients)
 for both control and audio streaming.
 
-- Address field -- default `0.0.0.0:40001`.
+- Address field -- default `0.0.0.0:50001` (Thetis's own default TCI
+  port, and what real-world TCI Remote/TCI Remote Compactor setups
+  actually use).
 - Same **Start**/**Stop**/status/logging behavior as rigctl above (logs to
   `tci_log.txt`).
 
@@ -60,7 +62,7 @@ TCI Remote is a mobile TCI client, available for both Android and iOS/
 iPadOS, that connects to hpsdr-rs's TCI server over the network -- giving
 you a remote VFO/mode/RIT-XIT/PTT control surface on a phone or tablet
 without needing a full remote-desktop session. Point it at this machine's
-IP address and the TCI port above (`40001` by default).
+IP address and the TCI port above (`50001` by default).
 
 ![TCI Remote on Android](images/03-tci-remote-android.png)
 
