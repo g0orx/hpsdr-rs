@@ -29,7 +29,8 @@ that VFO is the one actually transmitting (see
 
 ### CTUN (Click to Tune)
 
-The **CTUN** button toggles an alternate tuning mode: instead of retuning
+The **CTUN** button (in its own row in the **VFO-A** box, below **A<>B**/
+**Split**) toggles an alternate tuning mode: instead of retuning
 the radio's actual hardware oscillator on every click/scroll, the *listen
 point* moves within the currently-received passband, and the radio's real
 tuned frequency stays fixed. This is useful for quickly browsing around a
@@ -93,15 +94,10 @@ volume). The slider is scaled in dB (-100 to +18), so each step is an equal
 relative loudness change across the whole range rather than the low end
 being too coarse and the high end too fine on a plain linear scale.
 
-## AGC Gain
-
-**AGC Gain** (0.0-140.0 dB) is the same value as Settings → RX's **Top**
-slider -- a quick-access copy on the main window, under the name piHPSDR
-uses for it. Raises or lowers the AGC's target output level.
-
 ## Noise/AGC toggles
 
-A row of cycling buttons, each click advancing to the next state:
+A row of cycling buttons, each click advancing to the next state, plus one
+slider:
 
 - **NB** -- cycles Off → NB → NB2 → Off (two mutually-exclusive noise
   blanker stages; the threshold both share is in Settings → RX).
@@ -118,6 +114,9 @@ A row of cycling buttons, each click advancing to the next state:
   headphones or stereo speakers to hear the effect.
 - **AGC** -- cycles Off → Long → Slow → Medium → Fast → Off. Attack/decay/
   hang/top/slope/threshold for AGC are tuned in Settings → RX.
+- **AGC Gain** (0.0-140.0 dB) -- right after the AGC button. The same value
+  as Settings → RX's **Top** slider, under the name piHPSDR uses for it --
+  raises or lowers the AGC's target output level.
 
 ![Noise and AGC toggle row](images/02-toggle-row.png)
 
@@ -228,7 +227,11 @@ Anchored in the top-right of the window:
 - **Receiving**: a classic analog S-meter, S0-S9 in 6 dB steps, with
   +10..+60 over S9 shown in red.
 - **Transmitting**: forward/reverse power and SWR, scaled to your
-  configured **Max TX Power** (Settings → TX).
+  configured **Max TX Power** (Settings → TX). The needle is red whenever
+  you're transmitting at all, and if SWR reaches or exceeds **Max SWR**
+  (Settings → TX) at more than 35W, **TX Power** is automatically cut to
+  10W to protect the PA -- see [Settings: TX](07-settings-tx.md#max-swr)
+  for the full behavior.
 
 Below the meter:
 

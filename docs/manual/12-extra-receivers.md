@@ -26,7 +26,10 @@ whether or not PureSignal is actually enabled.
 
 It behaves like a scaled-down version of the main window: frequency
 display, band and mode rows, **Filter width** and **Audio gain** sliders,
-the CTUN/NB/NR/SNB/AGC/RIT toggle row -- RIT here works the same as the
+the CTUN/NB/NR/SNB/ANF/BIN/AGC/AGC Gain/RIT toggle row (unlike the main
+window, CTUN stays in this same row here rather than moving into its own
+spot -- extra receivers have no A<>B/Split box to sit below) -- RIT here
+works the same as the
 main window's own (see [Transmit controls](02-main-window.md#transmit-controls)),
 just always visible rather than tucked into a TX-only row, since it's a
 receive-only feature and this window has no XIT (extra receivers never
