@@ -1146,6 +1146,12 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
             if let Some(v) = cfg.snb {
                 spectrum.set_snb(v);
             }
+            if let Some(v) = cfg.anf {
+                spectrum.set_anf(v);
+            }
+            if let Some(v) = cfg.binaural {
+                spectrum.set_binaural(v);
+            }
             if let Some(v) = cfg.rx_eq {
                 spectrum.set_eq(v);
             }
@@ -2485,6 +2491,27 @@ impl eframe::App for HpsdrApp {
                             .clicked()
                         {
                             connected.spectrum.set_snb(!snb);
+                            settings_changed = true;
+                        }
+                        let anf = connected.spectrum.anf();
+                        if ui
+                            .add(egui::Button::selectable(anf, "ANF"))
+                            .on_hover_text("Automatic Notch Filter -- removes a steady heterodyne/carrier")
+                            .clicked()
+                        {
+                            connected.spectrum.set_anf(!anf);
+                            settings_changed = true;
+                        }
+                        let binaural = connected.spectrum.binaural();
+                        if ui
+                            .add(egui::Button::selectable(binaural, "BIN"))
+                            .on_hover_text(
+                                "Binaural (phasing) RX audio -- genuinely different L/R for stereo \
+                                 listening, needs headphones/stereo speakers to hear the effect",
+                            )
+                            .clicked()
+                        {
+                            connected.spectrum.set_binaural(!binaural);
                             settings_changed = true;
                         }
                         if ui
@@ -5847,6 +5874,8 @@ impl eframe::App for HpsdrApp {
                                 nb_threshold: agc_params.nb_threshold,
                                 noise_reduction: agc_params.noise_reduction,
                                 snb: agc_params.snb,
+                                anf: agc_params.anf,
+                                binaural: agc_params.binaural,
                                 db_low: rx.db_low,
                                 db_high: rx.db_high,
                                 waterfall_db_low: rx.waterfall_db_low,
@@ -5889,6 +5918,8 @@ impl eframe::App for HpsdrApp {
                         nb_threshold: Some(agc_params_now.nb_threshold),
                         noise_reduction: Some(agc_params_now.noise_reduction),
                         snb: Some(agc_params_now.snb),
+                        anf: Some(agc_params_now.anf),
+                        binaural: Some(agc_params_now.binaural),
                         rx_eq: Some(agc_params_now.eq),
                         mic_gain: Some(connected.mic_gain),
                         tx_eq: connected.tx_handle.as_ref().map(|t| t.eq()),
@@ -7110,6 +7141,27 @@ fn render_extra_receiver_ui(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceiver>>) {
             rx.spectrum.set_snb(!snb);
             rx.settings_dirty.store(true, Ordering::Relaxed);
         }
+        let anf = rx.spectrum.anf();
+        if ui
+            .add(egui::Button::selectable(anf, "ANF"))
+            .on_hover_text("Automatic Notch Filter -- removes a steady heterodyne/carrier")
+            .clicked()
+        {
+            rx.spectrum.set_anf(!anf);
+            rx.settings_dirty.store(true, Ordering::Relaxed);
+        }
+        let binaural = rx.spectrum.binaural();
+        if ui
+            .add(egui::Button::selectable(binaural, "BIN"))
+            .on_hover_text(
+                "Binaural (phasing) RX audio -- genuinely different L/R for stereo listening, \
+                 needs headphones/stereo speakers to hear the effect",
+            )
+            .clicked()
+        {
+            rx.spectrum.set_binaural(!binaural);
+            rx.settings_dirty.store(true, Ordering::Relaxed);
+        }
         let current_agc = rx.spectrum.agc();
         if ui
             .add(egui::Button::selectable(current_agc != spectrum::Agc::Off, current_agc.label()))
@@ -7910,6 +7962,8 @@ fn spawn_extra_receiver(
         spectrum.set_nb_threshold(s.nb_threshold);
         spectrum.set_noise_reduction(s.noise_reduction);
         spectrum.set_snb(s.snb);
+        spectrum.set_anf(s.anf);
+        spectrum.set_binaural(s.binaural);
         spectrum.set_eq(s.eq);
     }
 
@@ -8026,6 +8080,8 @@ fn change_sample_rate(connected: &mut ConnectedState, new_rate: u32) {
     spectrum.set_nb_threshold(agc_params.nb_threshold);
     spectrum.set_noise_reduction(agc_params.noise_reduction);
     spectrum.set_snb(agc_params.snb);
+    spectrum.set_anf(agc_params.anf);
+    spectrum.set_binaural(agc_params.binaural);
 
     connected.audio_output = match AudioOutput::start(
         Arc::clone(&spectrum.audio_out),
@@ -8180,6 +8236,8 @@ fn change_extra_receiver_sample_rate(rx: &mut ExtraReceiver, new_rate: u32) {
     spectrum.set_nb_threshold(agc_params.nb_threshold);
     spectrum.set_noise_reduction(agc_params.noise_reduction);
     spectrum.set_snb(agc_params.snb);
+    spectrum.set_anf(agc_params.anf);
+    spectrum.set_binaural(agc_params.binaural);
 
     rx.audio_output = match AudioOutput::start(Arc::clone(&spectrum.audio_out), rx.audio_output_device.as_deref()) {
         Ok(a) => Some(a),

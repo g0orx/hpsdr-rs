@@ -37,7 +37,14 @@
       real TCI Remote session log (tci_log.txt) exercising all of
       NB/NB2/NR/NR2/NR3/NR4 -- see rx_nb_enable_ex/rx_nr_enable_ex's own
       doc comments for the real bug this caught (stage was originally
-      assumed 0-indexed and, for NR, ignored outright).
+      assumed 0-indexed and, for NR, ignored outright). rx_anf_enable/
+      rx_bin_enable follow the exact same bare-query-or-set pattern
+      (base command syntax already confirmed for rx_*_enable in
+      general) but, unlike NB/NR, have NOT yet been exercised against a
+      real client's own ANF/BIN buttons specifically -- flag any report
+      of unexpected behavior from those two the same way NB/NR's own
+      _ex indexing bug was found, rather than assuming this pattern
+      definitely holds for them too.
     - The *initial handshake sequence* sent on connect now includes
       every Initialization command the spec defines (section 4.1):
       protocol, device, vfo_limits, trx_count, channels_count,
@@ -176,7 +183,7 @@ type DemodParamsCell = Arc<Mutex<Arc<Mutex<DemodParams>>>>;
 /// and get swapped together with the same SpectrumHandle.
 #[derive(Clone)]
 struct AudioIqTaps {
-    audio: Arc<Mutex<VecDeque<f32>>>,
+    audio: Arc<Mutex<VecDeque<(f32, f32)>>>,
     iq: Arc<Mutex<VecDeque<(f32, f32)>>>,
 }
 
@@ -208,7 +215,7 @@ type AudioIqCell = Arc<Mutex<AudioIqTaps>>;
 /// reader of the real shared taps, removes the need for any of that:
 /// clients can now come and go freely with no cross-talk.
 struct ClientAudioIqSink {
-    audio: Mutex<VecDeque<f32>>,
+    audio: Mutex<VecDeque<(f32, f32)>>,
     iq: Mutex<VecDeque<(f32, f32)>>,
 }
 
@@ -304,7 +311,7 @@ fn spawn_audio_iq_broadcaster(
         while !stop.load(Ordering::Relaxed) {
             thread::sleep(Duration::from_millis(5));
             let taps = audio_iq.lock().unwrap().clone();
-            let audio_batch: Vec<f32> = {
+            let audio_batch: Vec<(f32, f32)> = {
                 let mut q = taps.audio.lock().unwrap();
                 q.drain(..).collect()
             };
@@ -404,7 +411,7 @@ impl TciServer {
         sample_rate: Arc<AtomicU32>,
         demod_params: Arc<Mutex<DemodParams>>,
         mox: Arc<AtomicBool>,
-        tci_audio_out: Arc<Mutex<VecDeque<f32>>>,
+        tci_audio_out: Arc<Mutex<VecDeque<(f32, f32)>>>,
         iq_out: Arc<Mutex<VecDeque<(f32, f32)>>>,
         tci_tx_audio: Arc<Mutex<VecDeque<f32>>>,
         tci_tx_gain: Arc<Mutex<f32>>,
@@ -518,7 +525,7 @@ impl TciServer {
     /// the new ones or its stream would silently go dead.
     pub fn set_audio_iq(
         &self,
-        new_audio_out: Arc<Mutex<VecDeque<f32>>>,
+        new_audio_out: Arc<Mutex<VecDeque<(f32, f32)>>>,
         new_iq_out: Arc<Mutex<VecDeque<(f32, f32)>>>,
     ) {
         *self.audio_iq.lock().unwrap() = AudioIqTaps { audio: new_audio_out, iq: new_iq_out };
@@ -808,8 +815,8 @@ fn handle_client(
     send_logged(&mut ws, &logging, format!("rx_volume:0,0,{:.2};", gain_to_tci_db(params.gain)).into());
     send_logged(&mut ws, &logging, "rx_nf_enable:0,false;".into());
     send_logged(&mut ws, &logging, "rx_apf_enable:0,false;".into());
-    send_logged(&mut ws, &logging, "rx_anf_enable:0,false;".into());
-    send_logged(&mut ws, &logging, "rx_bin_enable:0,false;".into());
+    send_logged(&mut ws, &logging, format!("rx_anf_enable:0,{};", params.anf).into());
+    send_logged(&mut ws, &logging, format!("rx_bin_enable:0,{};", params.binaural).into());
     // ROOT CAUSE FIX: stage was hardcoded to 0 here regardless of which
     // NB/NR stage was actually active -- harmless as long as it stayed
     // Off, but a real report of TCI Remote showing the wrong NB/NR
@@ -1196,7 +1203,7 @@ fn handle_client(
             // latency, the same latency this size chunking already
             // implies for Thetis.
             loop {
-                let samples: Option<Vec<f32>> = {
+                let stereo: Option<Vec<(f32, f32)>> = {
                     let mut q = sink.audio.lock().unwrap();
                     if q.len() >= MAX_AUDIO_SAMPLES_PER_MESSAGE {
                         Some(q.drain(..MAX_AUDIO_SAMPLES_PER_MESSAGE).collect())
@@ -1204,13 +1211,15 @@ fn handle_client(
                         None
                     }
                 };
-                let Some(samples) = samples else { break };
-                // Mono -> stereo: TCI's audio format is stereo (both
-                // the reference client library and rustyHPSDR's own
-                // confirmed-working server always declare channels=2);
-                // this project's RX audio is mono, so duplicate each
-                // sample to both channels.
-                let stereo: Vec<(f32, f32)> = samples.into_iter().map(|s| (s, s)).collect();
+                let Some(stereo) = stereo else { break };
+                // Genuinely stereo now (see DemodParams::binaural's doc
+                // comment) -- identical L/R pairs when binaural is off,
+                // the same as this project's own former mono-duplicated-
+                // to-stereo encoding produced, so this is a no-op change
+                // for that case. TCI's audio format is stereo either way
+                // (both the reference client library and rustyHPSDR's
+                // own confirmed-working server always declare
+                // channels=2).
                 // BUG FIX: `length` here used to be stereo.len() (frame-PAIR
                 // count), matching rustyHPSDR's own convention (confirmed
                 // working against TCI Remote). A real report of WSJT-X's
@@ -1806,6 +1815,41 @@ fn handle_command(
             };
             demod_params.lock().unwrap().noise_reduction = nr;
             Some(format!("rx_nr_enable_ex:{},{on},{stage};", args.first().unwrap_or(&"0")))
+        }
+        // rx_anf_enable:receiver[,bool]; -- same bare-query-or-set
+        // pattern as rx_nb_enable/rx_nr_enable above. No _ex/stage
+        // concept -- ANF (see DemodParams::anf's doc comment) has no
+        // multi-stage equivalent, unlike NB/NR.
+        "rx_anf_enable" => {
+            let recv = args.first().unwrap_or(&"0");
+            match args.get(1) {
+                Some(v) => {
+                    let on = v.trim().eq_ignore_ascii_case("true");
+                    demod_params.lock().unwrap().anf = on;
+                    Some(format!("rx_anf_enable:{recv},{on};"))
+                }
+                None => {
+                    let on = demod_params.lock().unwrap().anf;
+                    Some(format!("rx_anf_enable:{recv},{on};"))
+                }
+            }
+        }
+        // rx_bin_enable:receiver[,bool]; -- same bare-query-or-set
+        // pattern as rx_anf_enable above. See DemodParams::binaural's
+        // doc comment for what this actually controls.
+        "rx_bin_enable" => {
+            let recv = args.first().unwrap_or(&"0");
+            match args.get(1) {
+                Some(v) => {
+                    let on = v.trim().eq_ignore_ascii_case("true");
+                    demod_params.lock().unwrap().binaural = on;
+                    Some(format!("rx_bin_enable:{recv},{on};"))
+                }
+                None => {
+                    let on = demod_params.lock().unwrap().binaural;
+                    Some(format!("rx_bin_enable:{recv},{on};"))
+                }
+            }
         }
         // rit_offset:receiver,value; -- see RadioSession::rit_enabled's
         // doc comment. Clamped to +-9999 Hz, matching main.rs's own UI

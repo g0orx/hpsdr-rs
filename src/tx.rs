@@ -1261,7 +1261,7 @@ fn run(
     // and gets capacity-trimmed like any other unused tap) so main.rs
     // can start/stop actually listening to it at any time without a
     // reconnect.
-    tx_audio_monitor: Arc<Mutex<VecDeque<f32>>>,
+    tx_audio_monitor: Arc<Mutex<VecDeque<(f32, f32)>>>,
     // See TxHandle::waveform_tap's doc comment. Fed alongside
     // tx_audio_monitor, same source content, independent capacity.
     waveform_tap: Arc<Mutex<VecDeque<f32>>>,
@@ -1509,7 +1509,12 @@ fn run(
                 if mon.len() >= TX_AUDIO_MONITOR_CAPACITY {
                     mon.pop_front();
                 }
-                mon.push_back(sample);
+                // AudioOutput (audio.rs) now always plays real (L, R)
+                // pairs -- this monitor tap is intentionally mono
+                // content (no binaural concept on TX), so duplicate to
+                // both channels, same as this project's own RX audio
+                // used to do before it gained real binaural support.
+                mon.push_back((sample, sample));
                 if wave.len() >= WAVEFORM_TAP_CAPACITY {
                     wave.pop_front();
                 }
@@ -1632,7 +1637,7 @@ pub struct TxHandle {
     /// hear exactly what's reaching WDSP, which distinguishes "already
     /// wrong in the source audio" from "introduced downstream in
     /// hpsdr-rs's own processing".
-    pub tx_audio_monitor: Arc<Mutex<VecDeque<f32>>>,
+    pub tx_audio_monitor: Arc<Mutex<VecDeque<(f32, f32)>>>,
     /// Same content as tx_audio_monitor above, fed at the same point --
     /// but a separate, independently-capacitied tap (see main.rs's
     /// draw_audio_waveform, WAVEFORM_TAP_CAPACITY's doc comment) so

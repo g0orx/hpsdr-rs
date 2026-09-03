@@ -103,6 +103,13 @@ A row of cycling buttons, each click advancing to the next state:
   noise reduction algorithms).
 - **SNB** -- toggles the Spectral Noise Blanker on/off, independently of NB
   and NR (it can run alongside either).
+- **ANF** -- toggles the Automatic Notch Filter on/off, independently of
+  NB/NR/SNB. Targets a steady heterodyne/carrier within the passband, not
+  broadband noise.
+- **BIN** -- toggles binaural ("phasing") RX audio on/off: when on, the
+  left and right audio channels genuinely differ (an intentional SDR
+  stereo-listening effect), instead of the usual identical L/R. Needs
+  headphones or stereo speakers to hear the effect.
 - **AGC** -- cycles Off → Long → Slow → Medium → Fast → Off. Attack/decay/
   hang/top/slope/threshold for AGC are tuned in Settings → RX.
 

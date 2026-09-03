@@ -83,7 +83,7 @@ impl AudioOutput {
     /// system default output device, same as this always did before
     /// device selection existed -- never a hard error just because a
     /// specific device isn't found.
-    pub fn start(buffer: Arc<Mutex<VecDeque<f32>>>, device_name: Option<&str>) -> Result<Self, String> {
+    pub fn start(buffer: Arc<Mutex<VecDeque<(f32, f32)>>>, device_name: Option<&str>) -> Result<Self, String> {
         let host = cpal::default_host();
         let device = match device_name {
             Some(name) => host
@@ -111,24 +111,30 @@ impl AudioOutput {
         let stream = device
             .build_output_stream(
                 &config,
-                // BUG FIX: `data` is cpal's interleaved STEREO buffer
-                // (OUTPUT_CHANNELS=2), but `buffer` (audio_out) is MONO
-                // content at 48kHz. This used to pop a fresh value from
-                // the mono queue for every interleaved slot (both L and
-                // R independently) instead of once per frame -- draining
-                // the queue at 2x its true production rate, playing
-                // local audio at roughly double speed/pitch. Confirmed
-                // via a real report: WSJT-X (fed from this output via a
-                // loopback device) showed known signals at the wrong
-                // audio frequency, consistent with 2x speed. Each mono
-                // sample must be duplicated across the frame's channels,
-                // not treated as filling one channel slot at a time.
+                // BUG FIX (history): `data` is cpal's interleaved STEREO
+                // buffer (OUTPUT_CHANNELS=2), but `buffer` (audio_out)
+                // used to be MONO content at 48kHz. Popping a fresh
+                // value from the mono queue for every interleaved slot
+                // (both L and R independently) instead of once per frame
+                // drained the queue at 2x its true production rate,
+                // playing local audio at roughly double speed/pitch --
+                // confirmed via a real report: WSJT-X (fed from this
+                // output via a loopback device) showed known signals at
+                // the wrong audio frequency, consistent with 2x speed.
+                // `buffer` now carries real (L, R) pairs (see spectrum.
+                // rs's DemodParams::binaural doc comment) -- one pair
+                // per frame, written straight to both channel slots, so
+                // this stays correct at the true 1:1 rate whether
+                // binaural is on (genuinely different L/R) or off
+                // (L==R, same as this project's own former duplicated-
+                // mono behavior).
                 move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
                     let mut buf = buffer.lock().unwrap();
                     for frame in data.chunks_mut(OUTPUT_CHANNELS as usize) {
-                        let sample = buf.pop_front().unwrap_or(0.0); // silence on underrun
-                        for channel in frame.iter_mut() {
-                            *channel = sample;
+                        let (l, r) = buf.pop_front().unwrap_or((0.0, 0.0)); // silence on underrun
+                        if let [left, right, ..] = frame {
+                            *left = l;
+                            *right = r;
                         }
                     }
                 },

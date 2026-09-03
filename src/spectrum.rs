@@ -346,6 +346,20 @@ pub struct DemodParams {
     /// Thetis) commonly run both at once. Lives inside the RXA chain
     /// like NR does, so this is likewise just a Set*Run call.
     pub snb: bool,
+    /// ANF ("Automatic Notch Filter", WDSP's ANF stage) -- an
+    /// independent toggle, just like SNB above (its own Set*Run call,
+    /// no mutually-exclusive cycle to fold into). Targets a steady
+    /// heterodyne/carrier within the passband, not broadband noise.
+    pub anf: bool,
+    /// Binaural ("phasing") RX audio -- when true, RXA's PatchPanel
+    /// output stage is left in WDSP's own default mode, producing
+    /// genuinely different L/R audio (an intentional SDR stereo-
+    /// listening effect) instead of a single duplicated mono channel.
+    /// See open()'s own SetRXAPanelBinaural doc comment for the history
+    /// of why this defaulted off, and demod()'s for how this is
+    /// actually applied. radio-audio-to-radio downmixes to mono
+    /// regardless of this setting -- see run()'s own doc comment.
+    pub binaural: bool,
     /// CTUN ("Click to Tune"): when true, the hardware/LO frequency
     /// (lo_frequency_hz below) stays fixed and ctun_offset_hz shifts the
     /// RXA demod chain instead, so the user can pick a different listen
@@ -405,6 +419,8 @@ impl Default for DemodParams {
             nb_threshold: 20.0,
             noise_reduction: NoiseReduction::Off,
             snb: false,
+            anf: false,
+            binaural: false,
             ctun: false,
             ctun_offset_hz: 0.0,
             lo_frequency_hz: 0.0,
@@ -488,6 +504,8 @@ struct SpectrumAnalyzer {
     last_nb_threshold: Option<f64>,
     last_nr_enabled: Option<NoiseReduction>,
     last_snb_enabled: Option<bool>,
+    last_anf_enabled: Option<bool>,
+    last_binaural: Option<bool>,
     last_ctun: Option<bool>,
     last_ctun_offset: Option<f64>,
     last_lo_frequency: Option<f64>,
@@ -591,12 +609,25 @@ impl SpectrumAnalyzer {
             // channels as one flat stream), and averaging them (a first
             // attempted fix) also sounded wrong, since averaging two
             // signals with a real phase/content relationship isn't the
-            // same as them being identical. This project has no UI for
-            // binaural listening, and every consumer (local playback,
-            // TCI, radio-audio) expects a single real mono channel --
-            // forcing monaural mode at the source (copy I to Q) is the
-            // correct fix, matching demod()'s own doc comment on why it
-            // can safely read either interleaved slot once this is set.
+            // same as them being identical. At the time this project had
+            // no UI for binaural listening, and every consumer (local
+            // playback, TCI, radio-audio) expected a single real mono
+            // channel -- forcing monaural mode at the source (copy I to
+            // Q) was the fix.
+            //
+            // UPDATE: binaural listening is now a real, user-toggleable
+            // feature (DemodParams::binaural) -- see demod()'s own
+            // per-frame SetRXAPanelBinaural call (mirrors every other
+            // dynamic Set*Run toggle in this file) for where it's
+            // actually controlled now. This call just establishes the
+            // same off-by-default startup state DemodParams::binaural's
+            // own Default already implies, before the first demod() call
+            // takes over -- radio-audio (the one consumer that still
+            // always wants mono, on purpose -- see run()'s own handling)
+            // downmixes L+R regardless of this setting, so that consumer
+            // was never actually dependent on RXA itself staying
+            // monaural, only demod()'s OWN interpretation of the buffer
+            // was (now fixed to read both slots for real).
             wdsp::SetRXAPanelBinaural(channel, 0);
 
             // RXA PatchPanel's own gain1 also defaults to 4.0 (per the
@@ -768,6 +799,8 @@ impl SpectrumAnalyzer {
                 last_nb_threshold: None,
                 last_nr_enabled: None,
                 last_snb_enabled: None,
+                last_anf_enabled: None,
+                last_binaural: None,
                 last_ctun: None,
                 last_ctun_offset: None,
                 last_lo_frequency: None,
@@ -943,7 +976,7 @@ impl SpectrumAnalyzer {
     /// DSP/output rate. Uses its own scratch buffers, separate from
     /// feed()'s, since it's not confirmed whether Spectrum0/fexchange0
     /// mutate their input buffers in place.
-    fn demod(&mut self, samples: &[IqSample], params: DemodParams, passband: (f64, f64)) -> Vec<f32> {
+    fn demod(&mut self, samples: &[IqSample], params: DemodParams, passband: (f64, f64)) -> Vec<(f32, f32)> {
         debug_assert_eq!(samples.len(), BUFFER_SIZE);
 
         if self.last_mode != Some(params.mode) {
@@ -1050,6 +1083,27 @@ impl SpectrumAnalyzer {
                 wdsp::SetRXASNBARun(self.channel, params.snb as c_int);
             }
             self.last_snb_enabled = Some(params.snb);
+        }
+
+        // ANF ("Automatic Notch Filter", WDSP's ANF stage) -- see
+        // DemodParams::anf's doc comment. Same independent-toggle
+        // treatment as SNB just above.
+        if self.last_anf_enabled != Some(params.anf) {
+            unsafe {
+                wdsp::SetRXAANFRun(self.channel, params.anf as c_int);
+            }
+            self.last_anf_enabled = Some(params.anf);
+        }
+
+        // Binaural ("phasing") RX audio -- see DemodParams::binaural's
+        // doc comment. Same edge-detected Set*-call pattern as every
+        // other toggle above; off by default matches open()'s own
+        // startup call, this just takes over from there.
+        if self.last_binaural != Some(params.binaural) {
+            unsafe {
+                wdsp::SetRXAPanelBinaural(self.channel, params.binaural as c_int);
+            }
+            self.last_binaural = Some(params.binaural);
         }
 
         // Graphic EQ -- see EqualizerParams's doc comment for the two
@@ -1170,15 +1224,20 @@ impl SpectrumAnalyzer {
         // buffer convention, per the WDSP Guide -- used even for a real
         // audio signal, not a true I-Q signal) into demod_audio_scratch,
         // confirmed by its own allocation above (`output_samples * 2`).
-        // Safe to take just the first (I) element of each pair and
-        // discard the second (Q) here BECAUSE `open()` above forces
-        // RXA's PatchPanel into monaural mode (SetRXAPanelBinaural(ch,
-        // 0)) -- see that call's doc comment for why this project reads
-        // it this way instead of the "binaural"/stereo interpretation
-        // WDSP defaults to (which produced a real, measured near-Nyquist
-        // artifact when the two channels were incorrectly treated as
-        // interchangeable/duplicate before this fix).
-        self.demod_audio_scratch.iter().step_by(2).map(|&v| v as f32).collect()
+        // Read BOTH elements of each pair as (L, R) now that binaural is
+        // a real, dynamically-toggled setting (see DemodParams::
+        // binaural's doc comment) -- when it's off, SetRXAPanelBinaural
+        // above already makes WDSP copy I to Q at the source, so L==R
+        // and this is a strict superset of the old (I-only) behavior,
+        // not a change for that case. The near-Nyquist artifact this
+        // file's history refers to came from treating the two slots as
+        // interchangeable/duplicate while binaural was WDSP's own
+        // default-on state and nothing here accounted for that -- this
+        // reads them honestly as a real stereo pair either way now.
+        self.demod_audio_scratch
+            .chunks_exact(2)
+            .map(|p| (p[0] as f32, p[1] as f32))
+            .collect()
     }
 
     /// Reads the RXA S-meter (averaged). Must be called from the same
@@ -1205,8 +1264,8 @@ fn run(
     sample_rate: i32,
     display: Arc<Mutex<SpectrumDisplay>>,
     demod_params: Arc<Mutex<DemodParams>>,
-    audio_out: Arc<Mutex<VecDeque<f32>>>,
-    tci_audio_out: Arc<Mutex<VecDeque<f32>>>,
+    audio_out: Arc<Mutex<VecDeque<(f32, f32)>>>,
+    tci_audio_out: Arc<Mutex<VecDeque<(f32, f32)>>>,
     waveform_out: Arc<Mutex<VecDeque<f32>>>,
     iq_out: Arc<Mutex<VecDeque<(f32, f32)>>>,
     rx_audio_to_radio: Option<Arc<Mutex<VecDeque<f32>>>>,
@@ -1340,32 +1399,44 @@ fn run(
             // PureSignal's own feedback path are untouched -- this only
             // gates the post-demod AUDIO taps below.
             let mox_active = mox.load(Ordering::Relaxed);
-            for sample in audio {
+            for (l, r) in audio {
                 if mox_active {
                     continue;
                 }
-                // Waveform tap fed from the RAW (pre-gain) sample, not
-                // the Audio Gain-scaled one below -- a real report:
-                // tapping post-gain meant the display's amplitude
-                // tracked the speaker volume control, not the actual
-                // signal, so a normal listening gain showed a flat line
-                // and only cranking Audio Gain to an uncomfortably loud
-                // level made anything visible.
+                // Waveform tap and radio-audio-to-radio both stay a
+                // plain mono downmix regardless of DemodParams::binaural
+                // -- see that field's own doc comment: neither is a
+                // "listening" consumer binaural panning matters for, and
+                // downstream both still expect single f32 samples
+                // (radio.rs's RX-audio-payload filler, main.rs's
+                // waveform-drawing code). Fed from the RAW (pre-gain)
+                // downmix, not the Audio Gain-scaled one below -- a real
+                // report: tapping post-gain meant the display's
+                // amplitude tracked the speaker volume control, not the
+                // actual signal, so a normal listening gain showed a
+                // flat line and only cranking Audio Gain to an
+                // uncomfortably loud level made anything visible.
+                let mono = (l + r) * 0.5;
                 if waveform_out.len() >= WAVEFORM_TAP_CAPACITY {
                     waveform_out.pop_front();
                 }
-                waveform_out.push_back(sample.clamp(-1.0, 1.0));
-                let sample = (sample * params.gain).clamp(-1.0, 1.0);
+                waveform_out.push_back(mono.clamp(-1.0, 1.0));
+                // Local speaker playback and TCI's RX audio stream carry
+                // the real (l, r) pair -- identical (l==r) when binaural
+                // is off, same as every consumer effectively saw before
+                // this was ever a stereo pair at all.
+                let (l, r) = ((l * params.gain).clamp(-1.0, 1.0), (r * params.gain).clamp(-1.0, 1.0));
                 if out.len() >= AUDIO_BUFFER_CAPACITY {
                     out.pop_front();
                 }
-                out.push_back(sample);
+                out.push_back((l, r));
                 if tci_out.len() >= AUDIO_BUFFER_CAPACITY {
                     tci_out.pop_front();
                 }
-                tci_out.push_back(sample);
+                tci_out.push_back((l, r));
                 if let Some(radio_out) = radio_out.as_mut() {
-                    let filtered = radio_audio_lpf.feed(sample);
+                    let mono_gained = (mono * params.gain).clamp(-1.0, 1.0);
+                    let filtered = radio_audio_lpf.feed(mono_gained);
                     if radio_out.len() >= AUDIO_BUFFER_CAPACITY {
                         radio_out.pop_front();
                     }
@@ -1381,12 +1452,16 @@ fn run(
 /// that the audio module consumes from.
 pub struct SpectrumHandle {
     pub display: Arc<Mutex<SpectrumDisplay>>,
-    pub audio_out: Arc<Mutex<VecDeque<f32>>>,
+    /// (L, R) pairs -- identical when DemodParams::binaural is off
+    /// (the common case), genuinely different when it's on. See that
+    /// field's own doc comment and run()'s for how this gets filled.
+    pub audio_out: Arc<Mutex<VecDeque<(f32, f32)>>>,
     /// Dedicated audio tap for TCI's audio_start streaming -- NOT the
     /// same queue as audio_out (which the local AudioOutput speaker
     /// playback already drains); see run()'s doc comment on why a
-    /// second consumer of that same queue would glitch both.
-    pub tci_audio_out: Arc<Mutex<VecDeque<f32>>>,
+    /// second consumer of that same queue would glitch both. Same
+    /// (L, R) pair shape as audio_out.
+    pub tci_audio_out: Arc<Mutex<VecDeque<(f32, f32)>>>,
     /// Recent-history tap for the small audio-waveform display (see
     /// main.rs's draw_audio_waveform) -- never drained by anything but
     /// its own drop-oldest-on-overflow, so the UI thread can peek the
@@ -1436,8 +1511,10 @@ impl SpectrumHandle {
     ) -> Self {
         let display = Arc::new(Mutex::new(SpectrumDisplay::default()));
         let demod_params = Arc::new(Mutex::new(DemodParams::default()));
-        let audio_out = Arc::new(Mutex::new(VecDeque::with_capacity(AUDIO_BUFFER_CAPACITY)));
-        let tci_audio_out = Arc::new(Mutex::new(VecDeque::with_capacity(AUDIO_BUFFER_CAPACITY)));
+        let audio_out: Arc<Mutex<VecDeque<(f32, f32)>>> =
+            Arc::new(Mutex::new(VecDeque::with_capacity(AUDIO_BUFFER_CAPACITY)));
+        let tci_audio_out: Arc<Mutex<VecDeque<(f32, f32)>>> =
+            Arc::new(Mutex::new(VecDeque::with_capacity(AUDIO_BUFFER_CAPACITY)));
         let waveform_out = Arc::new(Mutex::new(VecDeque::with_capacity(WAVEFORM_TAP_CAPACITY)));
         let iq_out = Arc::new(Mutex::new(VecDeque::with_capacity(IQ_OUT_CAPACITY)));
         let stop = Arc::new(AtomicBool::new(false));
@@ -1594,6 +1671,20 @@ impl SpectrumHandle {
     }
     pub fn set_snb(&self, v: bool) {
         self.demod_params.lock().unwrap().snb = v;
+    }
+
+    pub fn anf(&self) -> bool {
+        self.demod_params.lock().unwrap().anf
+    }
+    pub fn set_anf(&self, v: bool) {
+        self.demod_params.lock().unwrap().anf = v;
+    }
+
+    pub fn binaural(&self) -> bool {
+        self.demod_params.lock().unwrap().binaural
+    }
+    pub fn set_binaural(&self, v: bool) {
+        self.demod_params.lock().unwrap().binaural = v;
     }
 
     pub fn eq(&self) -> EqualizerParams {

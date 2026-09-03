@@ -113,6 +113,12 @@ pub struct Config {
     /// SNB ("Spectral Noise Blanker") -- independent of noise_reduction
     /// above, see spectrum::DemodParams::snb's doc comment for why.
     pub snb: Option<bool>,
+    /// ANF ("Automatic Notch Filter") -- see spectrum::DemodParams::anf's
+    /// doc comment.
+    pub anf: Option<bool>,
+    /// Binaural ("phasing") RX audio -- see spectrum::DemodParams::
+    /// binaural's doc comment.
+    pub binaural: Option<bool>,
     /// Main receiver's graphic EQ -- see spectrum::EqualizerParams's doc
     /// comment. Each extra receiver window persists its own copy
     /// separately, see ExtraReceiverConfig::eq.
@@ -383,6 +389,12 @@ pub struct ExtraReceiverConfig {
     /// See Config::snb's doc comment.
     #[serde(default)]
     pub snb: bool,
+    /// See Config::anf's doc comment.
+    #[serde(default)]
+    pub anf: bool,
+    /// See Config::binaural's doc comment.
+    #[serde(default)]
+    pub binaural: bool,
     /// See Config::spectrum_waterfall_ratio's doc comment.
     #[serde(default = "default_spectrum_waterfall_ratio")]
     pub spectrum_waterfall_ratio: f32,
