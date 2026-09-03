@@ -1147,11 +1147,37 @@ fn handle_client(
         // the one place that has to follow TciServer::set_audio_iq's new
         // queues, and it feeds this same sink regardless.
         if audio_streaming {
-            let samples: Vec<f32> = {
-                let mut q = sink.audio.lock().unwrap();
-                q.drain(..).collect()
-            };
-            if !samples.is_empty() {
+            // ROOT CAUSE FIX: this used to drain and send whatever had
+            // accumulated since the last tick, whole -- fine at the old
+            // 20ms tick (close to one full MAX_AUDIO_SAMPLES_PER_MESSAGE
+            // chunk's worth at 48kHz), but the 5ms tick lowered for the
+            // IQ burst fix (see spawn_audio_iq_broadcaster's doc
+            // comment) means each tick only accumulates ~240 samples --
+            // far short of a full chunk -- so every message sent was an
+            // undersized partial chunk instead. A real report of WSJT-X
+            // RX audio being fuzzy specifically over TCI (clean via a
+            // virtual-audio-cable path on the same signal) traced back
+            // to exactly this: a real capture of Thetis's own RX audio
+            // (from the earlier TCI Remote Compactor investigation)
+            // showed EVERY SINGLE one of 888 RxAudioStream messages was
+            // exactly MAX_AUDIO_SAMPLES_PER_MESSAGE (2048) pairs, never
+            // smaller -- Thetis buffers until it has a full chunk, not
+            // send-whatever's-there. Only drain full
+            // MAX_AUDIO_SAMPLES_PER_MESSAGE-sized chunks now, leaving
+            // any remainder queued for the next tick(s) to complete --
+            // adds at most one chunk's worth (~42ms at 48kHz) of extra
+            // latency, the same latency this size chunking already
+            // implies for Thetis.
+            loop {
+                let samples: Option<Vec<f32>> = {
+                    let mut q = sink.audio.lock().unwrap();
+                    if q.len() >= MAX_AUDIO_SAMPLES_PER_MESSAGE {
+                        Some(q.drain(..MAX_AUDIO_SAMPLES_PER_MESSAGE).collect())
+                    } else {
+                        None
+                    }
+                };
+                let Some(samples) = samples else { break };
                 // Mono -> stereo: TCI's audio format is stereo (both
                 // the reference client library and rustyHPSDR's own
                 // confirmed-working server always declare channels=2);
@@ -1177,27 +1203,21 @@ fn handle_client(
                 // content itself. The IQ stream below got the identical
                 // fix later, once a client hit the same issue there too
                 // -- see its own doc comment.
-                //
-                // Chunked to MAX_AUDIO_SAMPLES_PER_MESSAGE -- see that
-                // constant's doc comment for why a single unbounded
-                // drain-and-send breaks real clients.
-                for chunk in stereo.chunks(MAX_AUDIO_SAMPLES_PER_MESSAGE) {
-                    let msg = encode_binary_message(
-                        0,
-                        TCI_AUDIO_SAMPLE_RATE,
-                        BinaryMessageType::RxAudioStream,
-                        chunk.len() as u32 * 2,
-                        chunk,
-                    );
-                    let result = ws.send(Message::Binary(msg.into()));
-                    if send_is_fatal(&result) {
-                        logging.log(&format!("audio stream send failed, closing: {:?}", result.unwrap_err()));
-                        return;
-                    }
-                    if result.is_ok() && !audio_first_sent {
-                        audio_first_sent = true;
-                        logging.log("first audio data sent");
-                    }
+                let msg = encode_binary_message(
+                    0,
+                    TCI_AUDIO_SAMPLE_RATE,
+                    BinaryMessageType::RxAudioStream,
+                    stereo.len() as u32 * 2,
+                    &stereo,
+                );
+                let result = ws.send(Message::Binary(msg.into()));
+                if send_is_fatal(&result) {
+                    logging.log(&format!("audio stream send failed, closing: {:?}", result.unwrap_err()));
+                    return;
+                }
+                if result.is_ok() && !audio_first_sent {
+                    audio_first_sent = true;
+                    logging.log("first audio data sent");
                 }
             }
         }
