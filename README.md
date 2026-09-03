@@ -40,12 +40,31 @@ Any board the standard openHPSDR discovery protocol reports as one of: Metis, He
 
 Developed and tested primarily on Linux. A Windows build (via MSVC + vcpkg)
 has also been confirmed to build and run successfully — see below. Two
-Windows toolchains are supported:
+Windows toolchains are supported. macOS support is new and NOT yet
+confirmed on real hardware (no Mac was available to test with) — see its
+own section below, and the macOS entry in this repo's CI (Actions tab)
+for the current build status.
 
 **Linux:**
 - A recent Rust toolchain (`rustup` recommended)
 - FFTW3 development headers (`apt install libfftw3-dev` or your distro's equivalent)
 - ALSA development headers for audio I/O (e.g. `apt install libasound2-dev`)
+
+**macOS:**
+- A recent Rust toolchain (`rustup` recommended)
+- Xcode Command Line Tools, for a C compiler (`xcode-select --install`)
+- [Homebrew](https://brew.sh/), then `brew install fftw pkg-config`
+- No ALSA-equivalent package needed — `cpal` (audio I/O) talks to
+  CoreAudio directly, built in to macOS
+- Native (Apple Silicon or Intel) target, no cross-compilation flags
+  needed — just `cargo build --release` like Linux
+- The vendored WDSP/libspecbleach/rnnoise C source (`build.rs`) already
+  branches on `#if defined(linux) || defined(__APPLE__)` internally (this
+  project ported that branching as-is, unmodified, from the upstream
+  source), so no source changes were needed to get this far — genuinely
+  untested beyond that read-through and a clean `cargo build` in CI,
+  though, so if something doesn't compile or misbehaves on your Mac,
+  please open an issue
 
 **Windows via MSYS2/MinGW-w64:**
 - [MSYS2](https://www.msys2.org/), then from an **MSYS2 MinGW64** shell: `pacman -S mingw-w64-x86_64-toolchain mingw-w64-x86_64-fftw mingw-w64-x86_64-pkg-config`

@@ -1,0 +1,50 @@
+name: macOS Build
+
+# Builds this project on real macOS hardware -- the only way to get
+# actual confirmation macOS support works, since no Mac was available
+# to test with directly when it was added (see the README's own
+# "Building" section). Build-only, not run: there's no radio hardware
+# reachable from a CI runner either way, so this can't confirm the app
+# actually WORKS on macOS, only that it compiles and links cleanly.
+on:
+  push:
+    branches: [master]
+    paths:
+      - "src/**"
+      - "vendor/**"
+      - "build.rs"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/macos-build.yml"
+  pull_request:
+    paths:
+      - "src/**"
+      - "vendor/**"
+      - "build.rs"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/macos-build.yml"
+  workflow_dispatch: {}
+
+jobs:
+  build:
+    # Apple Silicon runner -- GitHub's current default for macos-latest.
+    # If Intel-specific coverage is ever needed too, add a matrix entry
+    # for an macos-13 (x86_64) runner alongside this one.
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      # See README.md's "macOS" build prerequisites -- fftw3 (this
+      # project's own DSP dependency) plus pkg-config (build.rs uses it,
+      # non-MSVC path, to locate fftw3's headers/libs). Xcode Command
+      # Line Tools (the C compiler build.rs's cc::Build needs) are
+      # already present on GitHub's macos-latest runners by default.
+      - name: Install fftw3 via Homebrew
+        run: brew install fftw pkg-config
+
+      - name: cargo build --release
+        run: cargo build --release
