@@ -48,7 +48,10 @@ rigctl" (e.g. WSJT-X, N1MM, and most logging/digital-mode programs).
 
 A WebSocket-based control protocol, used by some digital-mode software
 (e.g. as an alternative to rigctl for WSJT-X, or TCI Remote-style clients)
-for both control and audio streaming.
+for both control and audio streaming. Confirmed working end-to-end on real
+hardware: WSJT-X (control, RX audio, and TX audio via TCI, including a
+successful on-air contact) and TCI Remote (control plus RX audio/IQ
+streaming), both directly and through TCI Remote Compactor.
 
 - Address field -- default `0.0.0.0:50001` (Thetis's own default TCI
   port, and what real-world TCI Remote/TCI Remote Compactor setups
