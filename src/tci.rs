@@ -1516,25 +1516,54 @@ fn encode_binary_message(
 /// downmixes). Returns None if the buffer is shorter than the header.
 ///
 /// CORRECTED after real-world testing against TCI Remote: the header's
-/// `length` field is NOT used to determine how many floats to read.
-/// An earlier version derived the expected float count from `length`
-/// (assuming it meant frame-pairs, matching this project's own
-/// *outgoing* convention, confirmed against rustyHPSDR) and rejected
-/// the frame if the payload didn't match -- but real frames from TCI
-/// Remote were rejected this way (16448 bytes = 64-byte header +
-/// 16384-byte payload = exactly 4096 f32s / 2048 stereo pairs, yet
-/// still didn't satisfy that check), meaning this client's `length`
+/// `length` field used to NOT be used at all to decide how many floats
+/// to read. An earlier version derived the expected float count from
+/// `length` (assuming it meant frame-pairs, matching this project's own
+/// *outgoing* convention, confirmed against rustyHPSDR) and REJECTED
+/// the whole frame if the payload didn't match that exactly -- but real
+/// frames from TCI Remote were rejected this way (16448 bytes = 64-byte
+/// header + 16384-byte payload = exactly 4096 f32s / 2048 stereo pairs,
+/// yet still didn't satisfy that check), meaning this client's `length`
 /// doesn't follow the same frame-pair convention for data it SENDS
-/// (whatever it actually means here isn't confirmed). Rather than
-/// guess at yet another `length` semantic, this now derives the float
-/// count directly from the actual received payload size instead --
-/// unambiguous, self-describing, and doesn't depend on a convention
-/// that's turned out to differ by direction/client.
+/// (whatever it actually means here isn't confirmed). The fix then was
+/// to ignore `length` entirely and derive the float count purely from
+/// the actual received payload size.
+///
+/// FURTHER BUG FIX, found chasing a real report of WSJT-X-over-TCI TX
+/// audio "pulsing" (confirmed via a side-by-side packet capture against
+/// Thetis on the same Windows machine/WSJT-X: Thetis stayed clean,
+/// this project pulsed) -- decoded and inspected the actual float
+/// payload of every TxAudioStream message in both captures. Both
+/// receive the SAME garbage: WSJT-X's `length` field (2048, matching
+/// TCI_TX_AUDIO_CHUNK) is reliably the count of floats it actually
+/// wrote real audio into; the payload is still a full 4096-float
+/// (16448-byte) message regardless, so anything beyond `length` is
+/// stale/uninitialized buffer content (varying 0-50% of the whole
+/// message, cycling with WSJT-X's own internal ring-buffer reuse every
+/// 8 messages -- matches this function's own `channels` observation
+/// above) -- confirmed exhaustively: in both captures, EVERY single
+/// value beyond index `length` that exceeded handle_client's existing
+/// sanity threshold did so, and NOT ONE value before it ever did.
+/// Thetis apparently already trusts `length` as an upper bound and
+/// never reads past it; this project read the whole payload every
+/// time, handing WDSP's TX chain a stream that's genuinely garbage
+/// ~0-50% of the time in a repeating pattern -- exactly what "pulsing"
+/// sounds like, and far more of it than the existing per-pair
+/// interpolation safety net (sized for occasional corruption, not a
+/// deterministic near-half-the-message pattern) was ever meant to
+/// absorb.
+///
+/// Only ever SHRINKS the read count, and only when `length` is
+/// non-zero and smaller than the payload already implies -- doesn't
+/// reintroduce the old reject-on-mismatch bug (TCI Remote's own
+/// `length`, whatever it means, has never been observed smaller than
+/// its real payload, so this is a no-op for it either way).
 fn decode_binary_message(data: &[u8]) -> Option<(u32, Vec<f32>)> {
     if data.len() < 64 {
         return None;
     }
     let msg_type = u32::from_le_bytes(data[24..28].try_into().ok()?);
+    let declared_length = u32::from_le_bytes(data[20..24].try_into().ok()?) as usize;
     // format/channels (bytes 8-12/28-32) are NOT validated against what
     // this project's own encode_binary_message assumes (float32, 2
     // interleaved channels) -- confirmed harmless to skip: a real
@@ -1546,7 +1575,15 @@ fn decode_binary_message(data: &[u8]) -> Option<(u32, Vec<f32>)> {
     // `format` isn't otherwise in question (payload starts at the same
     // fixed 64-byte offset regardless).
     let payload = &data[64..];
-    let num_floats = payload.len() / 4; // drops any trailing partial float, if ever present
+    let payload_floats = payload.len() / 4; // drops any trailing partial float, if ever present
+    // See this function's own doc comment for why this cap exists and
+    // why it's safe: only takes effect when the sender's own declared
+    // length is smaller than the payload, never larger.
+    let num_floats = if declared_length > 0 && declared_length < payload_floats {
+        declared_length
+    } else {
+        payload_floats
+    };
     let samples = payload[..num_floats * 4]
         .chunks_exact(4)
         .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
