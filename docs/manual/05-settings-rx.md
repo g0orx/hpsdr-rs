@@ -47,6 +47,9 @@ Medium/Fast -- is toggled from the main window, not here):
 | Slope | 0-100 dB | 2 |
 | Thresh | -140.0-0.0 dB | 2.0 |
 
+**Top** is also available directly on the main window as **AGC Gain**
+(piHPSDR's name for the same value) -- both control the identical setting.
+
 ## Noise blanker threshold
 
 **NB Threshold** (0-100) is shared by both blanker stages (NB and NB2,

@@ -93,6 +93,12 @@ volume). The slider is scaled in dB (-100 to +18), so each step is an equal
 relative loudness change across the whole range rather than the low end
 being too coarse and the high end too fine on a plain linear scale.
 
+## AGC Gain
+
+**AGC Gain** (0.0-140.0 dB) is the same value as Settings → RX's **Top**
+slider -- a quick-access copy on the main window, under the name piHPSDR
+uses for it. Raises or lowers the AGC's target output level.
+
 ## Noise/AGC toggles
 
 A row of cycling buttons, each click advancing to the next state:

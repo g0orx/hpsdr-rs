@@ -2093,6 +2093,30 @@ impl eframe::App for HpsdrApp {
                                         settings_changed = true;
                                     }
                                 });
+                                ui.horizontal(|ui| {
+                                    if ui
+                                        .add(egui::Button::selectable(connected.ctun, "CTUN"))
+                                        .on_hover_text(
+                                            "Click to Tune: browse within the spectrum without retuning the radio",
+                                        )
+                                        .clicked()
+                                    {
+                                        if connected.ctun {
+                                            // Turning off: commit the
+                                            // CTUN'd listen frequency as
+                                            // the new hardware/LO
+                                            // frequency, so listening
+                                            // continues uninterrupted at
+                                            // the same real frequency
+                                            // rather than snapping back.
+                                            connected.session.set_frequency(connected.ctun_frequency_hz);
+                                        } else {
+                                            connected.ctun_frequency_hz = freq_hz;
+                                        }
+                                        connected.ctun = !connected.ctun;
+                                        settings_changed = true;
+                                    }
+                                });
                             });
 
                             let vfo_b_label = ui
@@ -2444,26 +2468,6 @@ impl eframe::App for HpsdrApp {
                     }
 
                     ui.horizontal_wrapped(|ui| {
-                        if ui
-                            .add(egui::Button::selectable(connected.ctun, "CTUN"))
-                            .on_hover_text(
-                                "Click to Tune: browse within the spectrum without retuning the radio",
-                            )
-                            .clicked()
-                        {
-                            if connected.ctun {
-                                // Turning off: commit the CTUN'd listen
-                                // frequency as the new hardware/LO
-                                // frequency, so listening continues
-                                // uninterrupted at the same real
-                                // frequency rather than snapping back.
-                                connected.session.set_frequency(connected.ctun_frequency_hz);
-                            } else {
-                                connected.ctun_frequency_hz = freq_hz;
-                            }
-                            connected.ctun = !connected.ctun;
-                            settings_changed = true;
-                        }
                         let nb = connected.spectrum.noise_blanker();
                         if ui
                             .add(egui::Button::selectable(nb != spectrum::NoiseBlanker::Off, nb.label()))
@@ -2523,6 +2527,31 @@ impl eframe::App for HpsdrApp {
                             .clicked()
                         {
                             connected.spectrum.set_agc(current_agc.next());
+                            settings_changed = true;
+                        }
+
+                        // AGC Gain -- WDSP's SetRXAAGCTop (already wired
+                        // as "Top" in Settings -> RX; this is a quick-
+                        // access control for the same value, matching
+                        // piHPSDR's own "AGC Gain" slider, confirmed via
+                        // its receiver.c: `SetRXAAGCTop(id, rx->agc_gain)`
+                        // -- same WDSP call, just this project's own name
+                        // for it predates this slider existing here at
+                        // all. Placed right after the AGC button, not
+                        // next to Audio gain -- it tunes the AGC itself,
+                        // not the speaker volume.
+                        ui.add_space(12.0);
+                        ui.label("AGC Gain:");
+                        let mut agc_top_db = connected.spectrum.agc_params().agc_top_db;
+                        if scroll_slider_f64(
+                            ui,
+                            &mut connected.slider_scroll_accum,
+                            &mut agc_top_db,
+                            0.0..=140.0,
+                            2.0,
+                            " dB",
+                        ) {
+                            connected.spectrum.set_agc_top_db(agc_top_db);
                             settings_changed = true;
                         }
                     });
@@ -7169,6 +7198,19 @@ fn render_extra_receiver_ui(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceiver>>) {
             .clicked()
         {
             rx.spectrum.set_agc(current_agc.next());
+            rx.settings_dirty.store(true, Ordering::Relaxed);
+        }
+
+        // AGC Gain -- see the main window's identical control (main.rs)
+        // for why this is the same value as "Top" below in this
+        // receiver's own Settings tab, just under piHPSDR's own name
+        // for it. Placed right after the AGC button, not next to Audio
+        // gain -- it tunes the AGC itself, not the speaker volume.
+        ui.add_space(12.0);
+        ui.label("AGC Gain:");
+        let mut agc_top_db = rx.spectrum.agc_params().agc_top_db;
+        if scroll_slider_f64(ui, &mut rx.slider_scroll_accum, &mut agc_top_db, 0.0..=140.0, 2.0, " dB") {
+            rx.spectrum.set_agc_top_db(agc_top_db);
             rx.settings_dirty.store(true, Ordering::Relaxed);
         }
         // RIT -- see the main receiver's identical treatment for the
