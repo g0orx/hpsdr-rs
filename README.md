@@ -40,10 +40,11 @@ Any board the standard openHPSDR discovery protocol reports as one of: Metis, He
 
 Developed and tested primarily on Linux. A Windows build (via MSVC + vcpkg)
 has also been confirmed to build and run successfully — see below. Two
-Windows toolchains are supported. macOS support is new and NOT yet
-confirmed on real hardware (no Mac was available to test with) — see its
-own section below, and the macOS entry in this repo's CI (Actions tab)
-for the current build status.
+Windows toolchains are supported. macOS builds successfully too, confirmed
+via this repo's own CI (`.github/workflows/macos-build.yml`, real
+`macos-latest` GitHub Actions hardware) — see its own section below.
+Actually *running* it on macOS hasn't been confirmed against real radio
+hardware yet, since CI has no radio to connect to.
 
 **Linux:**
 - A recent Rust toolchain (`rustup` recommended)
@@ -61,10 +62,10 @@ for the current build status.
 - The vendored WDSP/libspecbleach/rnnoise C source (`build.rs`) already
   branches on `#if defined(linux) || defined(__APPLE__)` internally (this
   project ported that branching as-is, unmodified, from the upstream
-  source), so no source changes were needed to get this far — genuinely
-  untested beyond that read-through and a clean `cargo build` in CI,
-  though, so if something doesn't compile or misbehaves on your Mac,
-  please open an issue
+  source), so no source changes were needed to get this far
+- Confirmed building successfully via CI on real macOS hardware — not
+  yet confirmed actually *running* against a real radio, so if
+  something misbehaves at runtime on your Mac, please open an issue
 
 **Windows via MSYS2/MinGW-w64:**
 - [MSYS2](https://www.msys2.org/), then from an **MSYS2 MinGW64** shell: `pacman -S mingw-w64-x86_64-toolchain mingw-w64-x86_64-fftw mingw-w64-x86_64-pkg-config`
