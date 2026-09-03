@@ -28,8 +28,16 @@
       implementation (TCITransceiver.cpp) -- except rit/xit, whose
       argument order (receiver,value/bool) is inferred from this
       project's own already-existing initial-state push for these same
-      commands (see handle_client), not independently re-verified
-      against JTDX specifically.
+      commands (see handle_client), not independently re-verified.
+      rx_nb_enable/rx_nr_enable's plain (non-_ex) form and argument
+      order (receiver,bool) are confirmed against a real captured
+      Thetis<->SunSDR2PRO session (TCIServer.cs's reference dump);
+      rx_nb2_enable and the _ex variants (which add a 1-indexed `stage`
+      argument selecting which NB/NR stage) are confirmed against a
+      real TCI Remote session log (tci_log.txt) exercising all of
+      NB/NB2/NR/NR2/NR3/NR4 -- see rx_nb_enable_ex/rx_nr_enable_ex's own
+      doc comments for the real bug this caught (stage was originally
+      assumed 0-indexed and, for NR, ignored outright).
     - The *initial handshake sequence* sent on connect now includes
       every Initialization command the spec defines (section 4.1):
       protocol, device, vfo_limits, trx_count, channels_count,
@@ -802,9 +810,28 @@ fn handle_client(
     send_logged(&mut ws, &logging, "rx_apf_enable:0,false;".into());
     send_logged(&mut ws, &logging, "rx_anf_enable:0,false;".into());
     send_logged(&mut ws, &logging, "rx_bin_enable:0,false;".into());
-    send_logged(&mut ws, &logging, format!("rx_nb_enable_ex:0,{nb_on},0;").into());
+    // ROOT CAUSE FIX: stage was hardcoded to 0 here regardless of which
+    // NB/NR stage was actually active -- harmless as long as it stayed
+    // Off, but a real report of TCI Remote showing the wrong NB/NR
+    // button highlighted right after connecting (when a non-Off stage
+    // was already active from a previous session) traced back to this:
+    // see rx_nb_enable_ex/rx_nr_enable_ex's own doc comments for why
+    // stage must be 1-indexed to match what's parsed on the way in.
+    let nb_stage = if params.noise_blanker == NoiseBlanker::Nb2 { 2 } else { 1 };
+    let nr_stage = match params.noise_reduction {
+        NoiseReduction::Nr2 => 2,
+        NoiseReduction::Nr3 => 3,
+        NoiseReduction::Nr4 => 4,
+        _ => 1,
+    };
+    send_logged(&mut ws, &logging, format!("rx_nb_enable_ex:0,{nb_on},{nb_stage};").into());
     send_logged(&mut ws, &logging, format!("rx_nb_enable:0,{nb_on};").into());
-    send_logged(&mut ws, &logging, format!("rx_nr_enable_ex:0,{nr_on},0;").into());
+    send_logged(
+        &mut ws,
+        &logging,
+        format!("rx_nb2_enable:0,{};", params.noise_blanker == NoiseBlanker::Nb2).into(),
+    );
+    send_logged(&mut ws, &logging, format!("rx_nr_enable_ex:0,{nr_on},{nr_stage};").into());
     send_logged(&mut ws, &logging, format!("rx_nr_enable:0,{nr_on};").into());
     send_logged(&mut ws, &logging, "rx_enable:0,true;".into());
     send_logged(&mut ws, &logging, format!("rx_filter_band:0,{},{};", pb_low.round() as i64, pb_high.round() as i64).into());
@@ -1664,6 +1691,121 @@ fn handle_command(
             // `mode` value -- what actually matters -- is identical
             // either way).
             Some(format!("modulation:{},{};", args.first().unwrap_or(&"0"), requested))
+        }
+        // rx_nb_enable:receiver[,bool]; -- bare form (no bool) is a
+        // query for the plain NB stage's current state -- confirmed via
+        // a real TCI Remote session log (tci_log.txt): sent bare at
+        // connect, paired with rx_nb2_enable's own identical bare query
+        // just below. The set form's argument order (receiver,bool) is
+        // confirmed against Thetis's own TCIServer.cs reference dump of
+        // a real SunSDR2PRO session ("rx_nb_enable: 0,false;").
+        "rx_nb_enable" => {
+            let recv = args.first().unwrap_or(&"0");
+            match args.get(1) {
+                Some(v) => {
+                    let on = v.trim().eq_ignore_ascii_case("true");
+                    demod_params.lock().unwrap().noise_blanker =
+                        if on { NoiseBlanker::Nb } else { NoiseBlanker::Off };
+                    Some(format!("rx_nb_enable:{recv},{on};"))
+                }
+                None => {
+                    let on = demod_params.lock().unwrap().noise_blanker == NoiseBlanker::Nb;
+                    Some(format!("rx_nb_enable:{recv},{on};"))
+                }
+            }
+        }
+        // rx_nb2_enable:receiver[,bool]; -- TCI Remote's own dedicated
+        // command for the second NB stage -- confirmed via the same
+        // real session log: queried bare at connect alongside
+        // rx_nb_enable above (its own button press, however, was
+        // observed going through rx_nb_enable_ex's stage parameter
+        // instead -- see that command's doc comment), so this is
+        // mainly here to answer the query TCI Remote already sends,
+        // plus a set form for any client that uses it directly.
+        "rx_nb2_enable" => {
+            let recv = args.first().unwrap_or(&"0");
+            match args.get(1) {
+                Some(v) => {
+                    let on = v.trim().eq_ignore_ascii_case("true");
+                    demod_params.lock().unwrap().noise_blanker =
+                        if on { NoiseBlanker::Nb2 } else { NoiseBlanker::Off };
+                    Some(format!("rx_nb2_enable:{recv},{on};"))
+                }
+                None => {
+                    let on = demod_params.lock().unwrap().noise_blanker == NoiseBlanker::Nb2;
+                    Some(format!("rx_nb2_enable:{recv},{on};"))
+                }
+            }
+        }
+        // rx_nb_enable_ex:receiver,bool,stage; -- ROOT CAUSE FIX:
+        // `stage` is 1-INDEXED, not 0-indexed as an earlier version of
+        // this assumed -- confirmed via a real TCI Remote session log:
+        // its "NB" button (the plain/first stage) sends stage=1, its
+        // "NB2" button sends stage=2. The earlier 0-indexed assumption
+        // mapped EVERY press (stage 1 included) to Nb2, a real reported
+        // bug ("NB just sets NB2"). TCI Remote sends this immediately
+        // after the plain rx_nb_enable/rx_nb2_enable command above with
+        // the same bool, so this handler (processed second) is what
+        // actually determines the final state.
+        "rx_nb_enable_ex" => {
+            let on = args.get(1)?.trim().eq_ignore_ascii_case("true");
+            let stage = args.get(2).and_then(|s| s.trim().parse::<u32>().ok()).unwrap_or(1);
+            let nb = if !on {
+                NoiseBlanker::Off
+            } else if stage <= 1 {
+                NoiseBlanker::Nb
+            } else {
+                NoiseBlanker::Nb2
+            };
+            demod_params.lock().unwrap().noise_blanker = nb;
+            Some(format!("rx_nb_enable_ex:{},{on},{stage};", args.first().unwrap_or(&"0")))
+        }
+        // rx_nr_enable:receiver[,bool]; -- same bare-query-or-set
+        // reasoning as rx_nb_enable above. This project's noise
+        // reduction has more stages (Nr/Nr2/Nr3/Nr4) than TCI's plain
+        // boolean can address; the set form's true selects the first
+        // (NoiseReduction::Nr); the bare query reports whether ANY
+        // stage is active (TCI Remote has no separate rx_nr2/nr3/
+        // nr4_enable query the way it does for NB2 -- see
+        // rx_nr_enable_ex below for how those are actually addressed).
+        "rx_nr_enable" => {
+            let recv = args.first().unwrap_or(&"0");
+            match args.get(1) {
+                Some(v) => {
+                    let on = v.trim().eq_ignore_ascii_case("true");
+                    demod_params.lock().unwrap().noise_reduction =
+                        if on { NoiseReduction::Nr } else { NoiseReduction::Off };
+                    Some(format!("rx_nr_enable:{recv},{on};"))
+                }
+                None => {
+                    let on = demod_params.lock().unwrap().noise_reduction != NoiseReduction::Off;
+                    Some(format!("rx_nr_enable:{recv},{on};"))
+                }
+            }
+        }
+        // rx_nr_enable_ex:receiver,bool,stage; -- ROOT CAUSE FIX, same
+        // story as rx_nb_enable_ex above: `stage` is 1-indexed
+        // (confirmed via the same real TCI Remote session log: its NR/
+        // NR2/NR3/NR4 buttons send stage 1/2/3/4 respectively), not
+        // ignored as an earlier version of this did -- a real reported
+        // bug ("NR/NR2/NR3/NR4 all just set NR"). This project's own
+        // noise_reduction enum happens to have exactly four non-off
+        // stages (Nr/Nr2/Nr3/Nr4), a clean 1:1 match.
+        "rx_nr_enable_ex" => {
+            let on = args.get(1)?.trim().eq_ignore_ascii_case("true");
+            let stage = args.get(2).and_then(|s| s.trim().parse::<u32>().ok()).unwrap_or(1);
+            let nr = if !on {
+                NoiseReduction::Off
+            } else {
+                match stage {
+                    1 => NoiseReduction::Nr,
+                    2 => NoiseReduction::Nr2,
+                    3 => NoiseReduction::Nr3,
+                    _ => NoiseReduction::Nr4,
+                }
+            };
+            demod_params.lock().unwrap().noise_reduction = nr;
+            Some(format!("rx_nr_enable_ex:{},{on},{stage};", args.first().unwrap_or(&"0")))
         }
         // rit_offset:receiver,value; -- see RadioSession::rit_enabled's
         // doc comment. Clamped to +-9999 Hz, matching main.rs's own UI
