@@ -848,6 +848,18 @@ struct HpsdrApp {
     main_window_geometry: Option<WindowGeometry>,
 }
 
+/// Orange (instead of egui's default blue) for every "active" widget --
+/// `Button::selectable(true, ...)`, checkboxes, etc. -- throughout the
+/// app. Applied to both the pinned dark theme (see HpsdrApp::new) and
+/// every light-theme override (the Settings and extra-receiver-settings
+/// windows) so the whole app stays visually consistent rather than only
+/// changing it in the main window.
+fn with_orange_selection(mut visuals: egui::Visuals) -> egui::Visuals {
+    visuals.selection.bg_fill = egui::Color32::from_rgb(230, 126, 34);
+    visuals.selection.stroke.color = egui::Color32::WHITE;
+    visuals
+}
+
 impl HpsdrApp {
     fn new(ctx: &egui::Context) -> Self {
         // Pin the app to dark, rather than leaving egui's default
@@ -862,6 +874,10 @@ impl HpsdrApp {
         // detection generally isn't available and egui was quietly
         // falling back to its own built-in dark default instead.
         ctx.set_theme(egui::ThemePreference::Dark);
+        // See with_orange_selection's own doc comment.
+        ctx.style_mut_of(egui::Theme::Dark, |style| {
+            style.visuals = with_orange_selection(style.visuals.clone());
+        });
         Self {
             state: AppState::Discovering(DiscoveryWindow::new(ctx)),
             was_focused: true,
@@ -3915,7 +3931,7 @@ impl eframe::App for HpsdrApp {
                                 // theme override is needed) rather than
                                 // being confined to this receiver's own
                                 // viewport.
-                                let light_visuals = egui::Visuals::light();
+                                let light_visuals = with_orange_selection(egui::Visuals::light());
                                 let light_style = egui::Style {
                                     visuals: light_visuals.clone(),
                                     ..Default::default()
@@ -3961,7 +3977,7 @@ impl eframe::App for HpsdrApp {
                     // isn't focused. Overriding the whole window's
                     // visuals instead keeps it consistently white
                     // regardless of focus.
-                    let light_visuals = egui::Visuals::light();
+                    let light_visuals = with_orange_selection(egui::Visuals::light());
                     let light_style = egui::Style { visuals: light_visuals.clone(), ..Default::default() };
                     // Rendered in its own OS-level viewport (like the
                     // extra receiver windows) rather than an
