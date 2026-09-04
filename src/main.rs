@@ -6522,7 +6522,19 @@ fn tci_status_hover(status: Option<bool>, addr: &str, server: Option<&TciServer>
     if ips.is_empty() {
         return base;
     }
-    let ip_list = ips.iter().map(|ip| ip.to_string()).collect::<Vec<_>>().join(", ");
+    // Interface name (e.g. "eth0") alongside the IP -- same lookup the
+    // About tab uses for the same reason (see its own doc comment):
+    // an IP alone still doesn't say which physical/virtual interface
+    // it belongs to on a machine with several. None if it can't be
+    // resolved (e.g. the interface changed since the client connected).
+    let ip_list = ips
+        .iter()
+        .map(|ip| match discovery::interface_name_for(*ip) {
+            Some(name) => format!("{ip} ({name})"),
+            None => ip.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
     format!("{base}\nvia {ip_list}")
 }
 
