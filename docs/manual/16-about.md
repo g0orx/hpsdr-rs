@@ -22,7 +22,7 @@ FX2 Version**, **Mercury FW** (one or two version numbers, separated by
 `/` for a two-Mercury setup), and **Penny FW** -- all read once over I2C
 at connect time.
 
-Also shows the author's name and contact email.
+Also shows the hpsdr-rs version, and the author's name and contact email.
 
 ---
 

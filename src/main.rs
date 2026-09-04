@@ -4369,7 +4369,10 @@ impl eframe::App for HpsdrApp {
                                     ui.add_space(16.0);
                                     ui.separator();
                                     ui.add_space(8.0);
-                                    ui.label("hpsdr-rs");
+                                    // CARGO_PKG_VERSION is baked in at compile time from
+                                    // Cargo.toml's own [package] version -- always in sync,
+                                    // no separate version constant to keep updated by hand.
+                                    ui.label(format!("hpsdr-rs {}", env!("CARGO_PKG_VERSION")));
                                     ui.label("John Melton G0ORX");
                                     ui.hyperlink_to(
                                         "john.d.melton@googlemail.com",
