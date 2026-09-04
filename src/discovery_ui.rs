@@ -1,5 +1,6 @@
 use crate::bootloader_ui::FirmwareUpdateWindow;
-use crate::discovery::{discover, manual_discovery, Device};
+use crate::config::Config;
+use crate::discovery::{discover, manual_discovery, Boards, Device};
 use eframe::egui;
 use std::collections::HashMap;
 use std::net::IpAddr;
@@ -17,6 +18,21 @@ fn selectable_cell(
     enabled: bool,
 ) -> egui::Response {
     ui.add_enabled(enabled, egui::Button::selectable(selected, text))
+}
+
+/// Display text for one Ozy firmware/FPGA path row -- an explicit
+/// choice always wins; otherwise shows the bundled default's own path
+/// (with "(bundled)" so it's clear no action is needed) or "(not
+/// found)" if even that's missing (e.g. running a non-packaged build
+/// outside its source checkout with no override set yet).
+fn effective_path_label(explicit: &Option<String>, default: fn() -> Option<std::path::PathBuf>) -> String {
+    if let Some(p) = explicit {
+        return p.clone();
+    }
+    match default() {
+        Some(p) => format!("{} (bundled)", p.display()),
+        None => "(not found -- use Choose... below)".to_string(),
+    }
 }
 
 /// What the caller should do after this frame's `show()` call.
@@ -52,12 +68,27 @@ pub struct DiscoveryWindow {
     /// `Option<...Window>` toggle idiom as every other secondary window
     /// in this app (e.g. ConnectedState::show_settings_window).
     firmware_update: Option<FirmwareUpdateWindow>,
+    /// Classic Ozy hardware's user-supplied FX2 firmware (.hex) / FPGA
+    /// bitstream (.rbf) paths -- set here, not in the (post-connect)
+    /// Settings window, since Ozy needs them just to complete its very
+    /// first connect. Persisted under a fixed sentinel MAC ([0;6],
+    /// matching discover_ozy_usb's own synthetic Device.mac) via the
+    /// same Config file mechanism every other radio's settings use --
+    /// see `save_ozy_paths`.
+    ozy_firmware_path: Option<String>,
+    ozy_fpga_path: Option<String>,
 }
+
+/// Sentinel MAC discover_ozy_usb's synthetic `Device` uses (Ozy has no
+/// real MAC) -- doubles as a stable, dedicated Config-file identity for
+/// Ozy's own global (not per-connect) settings.
+const OZY_CONFIG_MAC: [u8; 6] = [0; 6];
 
 impl DiscoveryWindow {
     /// Creates the window and immediately kicks off a background discovery
     /// pass, same as the original GTK dialog did on open.
     pub fn new(ctx: &egui::Context) -> Self {
+        let ozy_cfg = Config::load(OZY_CONFIG_MAC);
         let window = Self {
             open: true,
             devices: Arc::new(Mutex::new(Vec::new())),
@@ -68,9 +99,18 @@ impl DiscoveryWindow {
             manual_error: None,
             focus_deadline: Some(Instant::now() + std::time::Duration::from_millis(1500)),
             firmware_update: None,
+            ozy_firmware_path: ozy_cfg.ozy_firmware_path,
+            ozy_fpga_path: ozy_cfg.ozy_fpga_path,
         };
         window.spawn_discovery(ctx.clone());
         window
+    }
+
+    fn save_ozy_paths(&self) {
+        let mut cfg = Config::load(OZY_CONFIG_MAC);
+        cfg.ozy_firmware_path = self.ozy_firmware_path.clone();
+        cfg.ozy_fpga_path = self.ozy_fpga_path.clone();
+        cfg.save(OZY_CONFIG_MAC);
     }
 
     fn spawn_discovery(&self, ctx: egui::Context) {
@@ -223,9 +263,18 @@ impl DiscoveryWindow {
                             // the address. Manually-discovered devices
                             // (manual_discovery has no interface concept)
                             // just fall back to the address alone.
-                            let interface_cell = match interface_names.get(&dev.my_address.ip()) {
-                                Some(name) => format!("{name} ({})", dev.my_address.ip()),
-                                None => dev.my_address.ip().to_string(),
+                            // Ozy has no real network address at all (it's
+                            // USB) -- `dev.address`/`dev.my_address` are just
+                            // sentinels for it (see discover_ozy_usb's doc
+                            // comment), so show "USB" instead of formatting
+                            // them like a real IP/interface.
+                            let interface_cell = if dev.board == Boards::Ozy {
+                                "USB".to_string()
+                            } else {
+                                match interface_names.get(&dev.my_address.ip()) {
+                                    Some(name) => format!("{name} ({})", dev.my_address.ip()),
+                                    None => dev.my_address.ip().to_string(),
+                                }
                             };
                             row_clicked |= selectable_cell(
                                 ui,
@@ -234,9 +283,14 @@ impl DiscoveryWindow {
                                 available,
                             )
                             .clicked();
+                            let ip_cell = if dev.board == Boards::Ozy {
+                                "USB".to_string()
+                            } else {
+                                dev.address.ip().to_string()
+                            };
                             row_clicked |= selectable_cell(
                                 ui,
-                                dev.address.ip().to_string(),
+                                ip_cell,
                                 is_selected,
                                 available,
                             )
@@ -362,6 +416,40 @@ impl DiscoveryWindow {
                         self.firmware_update = None;
                     }
                 }
+
+                ui.add_space(8.0);
+                egui::CollapsingHeader::new("Ozy USB setup").show(ui, |ui| {
+                    ui.label(
+                        "Classic Ozy/Mercury/Penny hardware needs these two files \
+                         to connect. hpsdr-rs bundles its own copies (sourced from \
+                         piHPSDR) -- only use Choose... below to override with a \
+                         different/custom build.",
+                    );
+                    ui.horizontal(|ui| {
+                        ui.label("FX2 firmware (.hex):");
+                        ui.label(effective_path_label(&self.ozy_firmware_path, crate::ozy::default_firmware_path));
+                        if ui.button("Choose...").clicked() {
+                            if let Some(path) =
+                                rfd::FileDialog::new().add_filter("Ozy FX2 firmware", &["hex"]).pick_file()
+                            {
+                                self.ozy_firmware_path = Some(path.display().to_string());
+                                self.save_ozy_paths();
+                            }
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("FPGA bitstream (.rbf):");
+                        ui.label(effective_path_label(&self.ozy_fpga_path, crate::ozy::default_fpga_path));
+                        if ui.button("Choose...").clicked() {
+                            if let Some(path) =
+                                rfd::FileDialog::new().add_filter("FPGA firmware", &["rbf"]).pick_file()
+                            {
+                                self.ozy_fpga_path = Some(path.display().to_string());
+                                self.save_ozy_paths();
+                            }
+                        }
+                    });
+                });
                 });
             },
         );

@@ -18,6 +18,7 @@
 */
 
 use crate::discovery::{Boards, Device};
+use crate::ozy;
 use std::collections::VecDeque;
 use std::io;
 use std::net::UdpSocket;
@@ -156,7 +157,7 @@ pub struct IqSample {
     pub q: i32,
 }
 
-#[derive(Copy, Clone, Debug)]
+#[derive(Clone, Debug)]
 pub struct RadioSettings {
     pub frequency_hz: u32,
     pub sample_rate: u32,
@@ -201,6 +202,14 @@ pub struct RadioSettings {
     pub rit_offset_hz: i32,
     pub xit_enabled: bool,
     pub xit_offset_hz: i32,
+    /// Classic Ozy hardware only (see start_protocol1_ozy_usb) -- paths
+    /// to the user-supplied FX2 firmware (.hex) and FPGA bitstream
+    /// (.rbf) files, set in Settings and loaded from Config the same
+    /// way rx_attenuation is (main.rs's connect flow). Connecting to an
+    /// Ozy device with either unset fails immediately with a clear
+    /// error rather than attempting anything over USB.
+    pub ozy_firmware_path: Option<String>,
+    pub ozy_fpga_path: Option<String>,
 }
 
 impl Default for RadioSettings {
@@ -233,6 +242,8 @@ impl Default for RadioSettings {
             rit_offset_hz: 0,
             xit_enabled: false,
             xit_offset_hz: 0,
+            ozy_firmware_path: None,
+            ozy_fpga_path: None,
         }
     }
 }
@@ -287,7 +298,10 @@ fn ps_feedback_config(protocol: u8, board: Boards) -> Option<(u8, u8, Option<u8>
             Boards::Metis | Boards::HermesLite => Some((0, 1, Some(0))),
             Boards::Hermes | Boards::Hermes2 | Boards::HermesLite2 => Some((2, 3, Some(2))),
             Boards::Angelia | Boards::Orion | Boards::Orion2 => Some((3, 4, Some(3))),
-            Boards::Saturn | Boards::Unknown => None,
+            // Classic Ozy+Mercury+Penny hardware has no PureSignal
+            // feedback ADC wiring in this project's scope (see
+            // start_protocol1_ozy_usb's doc comment) -- no reservation.
+            Boards::Saturn | Boards::Ozy | Boards::Unknown => None,
         },
         // P2: DDC0/DDC1 reservation is universal, not board-dependent --
         // confirmed via new_protocol.c, no per-board variation in that
@@ -832,6 +846,22 @@ pub struct RadioSession {
     /// least makes the Stop packet itself consistent with the session it
     /// belongs to, which is the cheapest testable step toward that.
     stop_socket: UdpSocket,
+    /// True only for a classic Ozy/Mercury/Penny session (see
+    /// start_protocol1_ozy_usb) -- checked by send_stop_command to skip
+    /// the UDP-specific stop packet (there's no radio_ip/stop_socket
+    /// peer to send it to; stopping an Ozy session is just `stop_flag`
+    /// + thread joins). The actual USB handles are owned by
+    /// ozy_sender_loop/ozy_receiver_loop/ozy_i2c_loop themselves (each
+    /// holds an exclusive endpoint or the control-transfer Interface --
+    /// see ozy.rs's RxEndpoint/TxEndpoint/OzyDevice doc comments), not
+    /// stored here.
+    is_ozy: bool,
+    /// `pub` so main.rs's About tab can show the firmware versions read
+    /// at connect time.
+    pub ozy_versions: Option<crate::ozy::OzyVersions>,
+    /// ozy_i2c_loop's handle -- joined in `stop()` alongside the other
+    /// threads. Always None on every other transport.
+    ozy_i2c_thread: Option<JoinHandle<()>>,
 }
 
 impl RadioSession {
@@ -896,7 +926,24 @@ impl RadioSession {
         let adc1_overload = Arc::new(AtomicBool::new(false));
         let tx_fifo_underrun = Arc::new(AtomicBool::new(false));
         let tx_fifo_overrun = Arc::new(AtomicBool::new(false));
-        let mut result = match device.protocol {
+        // Checked ahead of the protocol match below, not instead of it:
+        // Ozy still reports protocol 1 (it IS P1 framing, just over USB
+        // instead of UDP -- see ozy.rs's module doc comment), so every
+        // OTHER P1-vs-P2 branch elsewhere in this codebase that keys off
+        // `device.protocol == 1` already does the right thing for it.
+        let mut result = if device.board == Boards::Ozy {
+            start_protocol1_ozy_usb(
+                device, settings, frequency_hz, tx_frequency_hz, rx_frequency_hz, requested_frequency_hz, sample_rate, adc, antenna, rx_attenuation,
+                ps_tx_attenuation, mox, tx_iq, tci_tx_audio, tci_tx_gain, tx_power_watts, pa_gain_db,
+                tx_forward_power, tx_reverse_power, adc0_overload, adc1_overload,
+                tx_fifo_underrun, tx_fifo_overrun, ps_rx_feedback_iq, ps_tx_feedback_iq,
+                rx_audio_to_radio, send_rx_audio_to_radio, radio_mic_audio, tx_audio_source,
+                tci_wants_mic, mic_ptt_enabled, mic_bias_enabled, mic_ptt_on_tip,
+                diversity_enabled, diversity_gain_db, diversity_phase_deg, diversity_main_raw_iq,
+                puresignal_enabled,
+            )
+        } else {
+            match device.protocol {
             1 => start_protocol1(
                 device, settings, frequency_hz, tx_frequency_hz, rx_frequency_hz, requested_frequency_hz, sample_rate, adc, antenna, rx_attenuation,
                 ps_tx_attenuation, mox, tx_iq, tci_tx_audio, tci_tx_gain, tx_power_watts, pa_gain_db,
@@ -921,6 +968,7 @@ impl RadioSession {
                 io::ErrorKind::InvalidInput,
                 format!("unknown protocol {p}"),
             )),
+            }
         };
         // Diversity combiner -- spawned here (not inside start_protocol1/2)
         // since it's protocol-agnostic: it only touches queues, never the
@@ -1072,10 +1120,21 @@ impl RadioSession {
         if let Some(t) = self.receiver_thread.take() {
             let _ = t.join();
         }
+        if let Some(t) = self.ozy_i2c_thread.take() {
+            let _ = t.join();
+        }
         self.stop_diversity_combiner_now();
     }
 
     fn send_stop_command(&self) {
+        // Ozy/USB: no UDP peer to send a stop packet to at all --
+        // stopping is just stop_flag + thread joins (already done by
+        // the time this is called) + dropping ozy_device. Matches
+        // piHPSDR's own old_protocol.c, which short-circuits equivalent
+        // stop-packet logic for DEVICE_OZY the same way.
+        if self.is_ozy {
+            return;
+        }
         // See stop_socket's own doc comment -- sent from the SAME local
         // port the rest of this session used, not a fresh throwaway one.
         match self.protocol {
@@ -1456,6 +1515,280 @@ fn start_protocol1(
         protocol: 1,
         radio_ip: device.address.ip(),
         stop_socket,
+        is_ozy: false,
+        ozy_versions: None,
+        ozy_i2c_thread: None,
+    })
+}
+
+/// Ozy/Mercury/Penny over USB -- Protocol 1 framing (see ozy.rs's
+/// module doc comment), but over raw USB bulk transfers instead of
+/// UDP. Mirrors start_protocol1's overall shape (same RadioSession
+/// field construction, same thread-spawn pattern) but is deliberately
+/// SMALLER in scope: classic Ozy hardware has no PureSignal feedback
+/// ADC wiring (already reflected in ps_feedback_config returning None
+/// for Boards::Ozy) and, in the common single/dual-Mercury
+/// configurations this was built against, no independent second ADC
+/// for Diversity either -- so ozy_sender_loop/ozy_receiver_loop always
+/// pass `false`/`None` for diversity/PureSignal to p1_build_packet/
+/// parse_iq_stream, regardless of what `diversity_enabled`/
+/// `puresignal_enabled` are live-set to. Those Arcs are still stored on
+/// the returned RadioSession (every other part of the app reads them
+/// unconditionally) so nothing crashes if a user flips one of those
+/// toggles during an Ozy session -- it just has no effect, same as
+/// this board reporting no PureSignal support already does today.
+///
+/// UNTESTED end-to-end: this development environment has no USB access
+/// at all. Every constant/sequence in ozy.rs is ported from piHPSDR's
+/// working ozyio.c, and the packet CONTENT construction below reuses
+/// p1_build_packet/parse_iq_stream completely unchanged from the
+/// proven UDP path -- but the USB transport plumbing itself (this
+/// function and the three loops below) has only ever been
+/// `cargo build`'d, never run against a real Ozy. See README's Ozy USB
+/// section for the suggested first-bringup checklist.
+#[allow(clippy::too_many_arguments)]
+fn start_protocol1_ozy_usb(
+    device: &Device,
+    settings: RadioSettings,
+    frequency_hz: Arc<AtomicU32>,
+    tx_frequency_hz: Arc<AtomicU32>,
+    rx_frequency_hz: Arc<AtomicU32>,
+    requested_frequency_hz: Arc<AtomicU32>,
+    sample_rate: Arc<AtomicU32>,
+    adc: Arc<AtomicU32>,
+    antenna: Arc<AtomicU32>,
+    rx_attenuation: Arc<AtomicU32>,
+    ps_tx_attenuation: Arc<AtomicU32>,
+    mox: Arc<AtomicBool>,
+    tx_iq: Arc<Mutex<VecDeque<f32>>>,
+    tci_tx_audio: Arc<Mutex<VecDeque<f32>>>,
+    tci_tx_gain: Arc<Mutex<f32>>,
+    tx_power_watts: Arc<AtomicU32>,
+    pa_gain_db: Arc<AtomicU32>,
+    tx_forward_power: Arc<AtomicU32>,
+    tx_reverse_power: Arc<AtomicU32>,
+    adc0_overload: Arc<AtomicBool>,
+    adc1_overload: Arc<AtomicBool>,
+    tx_fifo_underrun: Arc<AtomicBool>,
+    tx_fifo_overrun: Arc<AtomicBool>,
+    ps_rx_feedback_iq: Arc<Mutex<VecDeque<IqSample>>>,
+    ps_tx_feedback_iq: Arc<Mutex<VecDeque<IqSample>>>,
+    rx_audio_to_radio: Arc<Mutex<VecDeque<f32>>>,
+    send_rx_audio_to_radio: Arc<AtomicBool>,
+    radio_mic_audio: Arc<Mutex<VecDeque<f32>>>,
+    tx_audio_source: Arc<AtomicU8>,
+    tci_wants_mic: Arc<AtomicBool>,
+    mic_ptt_enabled: Arc<AtomicBool>,
+    mic_bias_enabled: Arc<AtomicBool>,
+    mic_ptt_on_tip: Arc<AtomicBool>,
+    diversity_enabled: Arc<AtomicBool>,
+    diversity_gain_db: Arc<AtomicU32>,
+    diversity_phase_deg: Arc<AtomicU32>,
+    diversity_main_raw_iq: Arc<Mutex<VecDeque<IqSample>>>,
+    puresignal_enabled: Arc<AtomicBool>,
+) -> io::Result<RadioSession> {
+    // An explicit choice (Discover window's "Ozy USB setup" section)
+    // always wins; otherwise fall back to hpsdr-rs's own bundled copies
+    // (see ozy::bundled_path's doc comment -- sourced from the user's
+    // own piHPSDR repo, same GPL license, not a third-party blob). Only
+    // errors if NEITHER is available, which on a `.deb` install (or a
+    // `cargo run` from a source checkout) shouldn't normally happen. If
+    // this error is showing, go back to Discover and expand "Ozy USB
+    // setup" to point at a firmware/FPGA file manually.
+    let hex_path = settings
+        .ozy_firmware_path
+        .map(std::path::PathBuf::from)
+        .or_else(crate::ozy::default_firmware_path)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Ozy firmware (.hex) not found -- go back to the Discover window's \"Ozy USB setup\" section",
+            )
+        })?;
+    let rbf_path = settings
+        .ozy_fpga_path
+        .map(std::path::PathBuf::from)
+        .or_else(crate::ozy::default_fpga_path)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Ozy FPGA (.rbf) not found -- go back to the Discover window's \"Ozy USB setup\" section",
+            )
+        })?;
+    let (ozy_device, rx_endpoint, tx_endpoint, ozy_versions) = crate::ozy::initialise(&hex_path, &rbf_path)?;
+
+    let stop_flag = Arc::new(AtomicBool::new(false));
+    // Ozy's historical 2-receiver cap (see discover_ozy_usb's own doc
+    // comment in discovery.rs) -- ignores real_receivers/PureSignal's
+    // board-table cap entirely, unlike start_protocol1.
+    let real_receivers: u32 = (settings.receivers as u32).max(1).min(2);
+    let iq_buffers: Vec<Arc<Mutex<VecDeque<IqSample>>>> =
+        (0..real_receivers).map(|_| Arc::new(Mutex::new(VecDeque::with_capacity(IQ_BUFFER_CAPACITY)))).collect();
+    let extra_count = real_receivers.saturating_sub(1) as usize;
+    let extra_frequencies_hz: Vec<Arc<AtomicU32>> =
+        (0..extra_count).map(|_| Arc::new(AtomicU32::new(settings.frequency_hz))).collect();
+    let extra_sample_rates_hz: Vec<Arc<AtomicU32>> =
+        (0..extra_count).map(|_| Arc::new(AtomicU32::new(settings.sample_rate))).collect();
+    let extra_adcs: Vec<Arc<AtomicU32>> = (0..extra_count).map(|_| Arc::new(AtomicU32::new(0))).collect();
+    let active_receiver_count = Arc::new(AtomicU32::new(1));
+    // See RadioSession::disable_pa/oc_rx/oc_tx's doc comments -- same
+    // inert-until-set-by-main.rs defaults start_protocol1 uses.
+    let disable_pa = Arc::new(AtomicBool::new(false));
+    let oc_rx = Arc::new(AtomicU8::new(0));
+    let oc_tx = Arc::new(AtomicU8::new(0));
+    let rit_enabled = Arc::new(AtomicBool::new(settings.rit_enabled));
+    let rit_offset_hz = Arc::new(AtomicI32::new(settings.rit_offset_hz));
+    let xit_enabled = Arc::new(AtomicBool::new(settings.xit_enabled));
+    let xit_offset_hz = Arc::new(AtomicI32::new(settings.xit_offset_hz));
+
+    let sender_stop = Arc::clone(&stop_flag);
+    let sender_frequency = Arc::clone(&frequency_hz);
+    let sender_tx_frequency = Arc::clone(&tx_frequency_hz);
+    let sender_sample_rate = Arc::clone(&sample_rate);
+    let sender_mox = Arc::clone(&mox);
+    let sender_tx_iq = Arc::clone(&tx_iq);
+    let sender_antenna = Arc::clone(&antenna);
+    let sender_active_receiver_count = Arc::clone(&active_receiver_count);
+    let sender_extra_frequencies_hz = extra_frequencies_hz.clone();
+    let sender_tx_power_watts = Arc::clone(&tx_power_watts);
+    let sender_pa_gain_db = Arc::clone(&pa_gain_db);
+    let sender_rx_attenuation = Arc::clone(&rx_attenuation);
+    let sender_ps_tx_attenuation = Arc::clone(&ps_tx_attenuation);
+    let sender_disable_pa = Arc::clone(&disable_pa);
+    let sender_oc_rx = Arc::clone(&oc_rx);
+    let sender_oc_tx = Arc::clone(&oc_tx);
+    let sender_num_adcs = device.adcs;
+    let sender_rx_audio_to_radio = Arc::clone(&rx_audio_to_radio);
+    let sender_send_rx_audio_to_radio = Arc::clone(&send_rx_audio_to_radio);
+    let sender_mic_ptt_enabled = Arc::clone(&mic_ptt_enabled);
+    let sender_mic_bias_enabled = Arc::clone(&mic_bias_enabled);
+    let sender_mic_ptt_on_tip = Arc::clone(&mic_ptt_on_tip);
+    let sender_adc = Arc::clone(&adc);
+    let sender_extra_adcs = extra_adcs.clone();
+    let sender_thread = thread::spawn(move || {
+        ozy_sender_loop(
+            tx_endpoint,
+            sender_frequency,
+            sender_tx_frequency,
+            sender_sample_rate,
+            sender_mox,
+            sender_tx_iq,
+            sender_active_receiver_count,
+            sender_extra_frequencies_hz,
+            sender_antenna,
+            sender_tx_power_watts,
+            sender_pa_gain_db,
+            sender_rx_attenuation,
+            sender_ps_tx_attenuation,
+            sender_disable_pa,
+            sender_oc_rx,
+            sender_oc_tx,
+            sender_num_adcs,
+            sender_adc,
+            sender_extra_adcs,
+            sender_rx_audio_to_radio,
+            sender_send_rx_audio_to_radio,
+            sender_mic_ptt_enabled,
+            sender_mic_bias_enabled,
+            sender_mic_ptt_on_tip,
+            sender_stop,
+        );
+    });
+
+    let receiver_stop = Arc::clone(&stop_flag);
+    let receiver_buffers = iq_buffers.clone();
+    let receiver_sample_rate = Arc::clone(&sample_rate);
+    let receiver_active_receiver_count = Arc::clone(&active_receiver_count);
+    let receiver_tx_forward_power = Arc::clone(&tx_forward_power);
+    let receiver_tx_reverse_power = Arc::clone(&tx_reverse_power);
+    let receiver_adc0_overload = Arc::clone(&adc0_overload);
+    let receiver_adc1_overload = Arc::clone(&adc1_overload);
+    let receiver_radio_mic_audio = Arc::clone(&radio_mic_audio);
+    let receiver_thread = thread::spawn(move || {
+        ozy_receiver_loop(
+            rx_endpoint,
+            receiver_buffers,
+            receiver_active_receiver_count,
+            receiver_sample_rate,
+            receiver_tx_forward_power,
+            receiver_tx_reverse_power,
+            receiver_adc0_overload,
+            receiver_adc1_overload,
+            receiver_radio_mic_audio,
+            receiver_stop,
+        );
+    });
+
+    let i2c_stop = Arc::clone(&stop_flag);
+    let i2c_tx_forward_power = Arc::clone(&tx_forward_power);
+    let i2c_tx_reverse_power = Arc::clone(&tx_reverse_power);
+    let i2c_adc1_overload = Arc::clone(&adc1_overload);
+    let i2c_thread = thread::spawn(move || {
+        ozy_i2c_loop(ozy_device, i2c_tx_forward_power, i2c_tx_reverse_power, i2c_adc1_overload, i2c_stop);
+    });
+
+    Ok(RadioSession {
+        iq_buffers,
+        frequency_hz,
+        tx_frequency_hz,
+        rx_frequency_hz,
+        requested_frequency_hz,
+        sample_rate,
+        adc,
+        antenna,
+        disable_pa,
+        oc_rx,
+        oc_tx,
+        rx_attenuation,
+        ps_tx_attenuation,
+        extra_frequencies_hz,
+        extra_sample_rates_hz,
+        extra_adcs,
+        active_receiver_count,
+        ps_rx_feedback_iq,
+        ps_tx_feedback_iq,
+        mox,
+        rit_enabled,
+        rit_offset_hz,
+        xit_enabled,
+        xit_offset_hz,
+        tx_iq,
+        tci_tx_audio,
+        tci_tx_gain,
+        rx_audio_to_radio,
+        send_rx_audio_to_radio,
+        radio_mic_audio,
+        tx_audio_source,
+        tci_wants_mic,
+        mic_ptt_enabled,
+        mic_bias_enabled,
+        mic_ptt_on_tip,
+        diversity_enabled,
+        diversity_gain_db,
+        diversity_phase_deg,
+        diversity_main_raw_iq,
+        puresignal_enabled,
+        tx_power_watts,
+        pa_gain_db,
+        tx_forward_power,
+        tx_reverse_power,
+        adc0_overload,
+        adc1_overload,
+        tx_fifo_underrun,
+        tx_fifo_overrun,
+        stop_flag,
+        sender_thread: Some(sender_thread),
+        receiver_thread: Some(receiver_thread),
+        tx_iq_thread: None,
+        rx_audio_thread: None,
+        diversity_combiner_thread: None,
+        diversity_combiner_stop: None,
+        protocol: 1,
+        radio_ip: device.address.ip(),
+        stop_socket: UdpSocket::bind(("0.0.0.0", 0))?,
+        is_ozy: true,
+        ozy_versions: Some(ozy_versions),
+        ozy_i2c_thread: Some(i2c_thread),
     })
 }
 
@@ -2787,6 +3120,227 @@ fn receiver_loop(
     }
 }
 
+/// Ozy USB counterpart to sender_loop -- same packet-content
+/// construction (p1_build_packet, unchanged), just written as two
+/// separate 512-byte USB bulk OUT transfers instead of one 1032-byte
+/// UDP `socket.send()`. See start_protocol1_ozy_usb's doc comment for
+/// why diversity/PureSignal are hardcoded off here rather than threaded
+/// through as live params the way sender_loop does.
+#[allow(clippy::too_many_arguments)]
+fn ozy_sender_loop(
+    mut tx_endpoint: ozy::TxEndpoint,
+    frequency_hz: Arc<AtomicU32>,
+    tx_frequency_hz: Arc<AtomicU32>,
+    sample_rate: Arc<AtomicU32>,
+    mox: Arc<AtomicBool>,
+    tx_iq: Arc<Mutex<VecDeque<f32>>>,
+    active_receiver_count: Arc<AtomicU32>,
+    extra_frequencies_hz: Vec<Arc<AtomicU32>>,
+    antenna: Arc<AtomicU32>,
+    tx_power_watts: Arc<AtomicU32>,
+    pa_gain_db: Arc<AtomicU32>,
+    rx_attenuation: Arc<AtomicU32>,
+    ps_tx_attenuation: Arc<AtomicU32>,
+    disable_pa: Arc<AtomicBool>,
+    oc_rx: Arc<AtomicU8>,
+    oc_tx: Arc<AtomicU8>,
+    num_adcs: u8,
+    adc: Arc<AtomicU32>,
+    extra_adcs: Vec<Arc<AtomicU32>>,
+    rx_audio_to_radio: Arc<Mutex<VecDeque<f32>>>,
+    send_rx_audio_to_radio: Arc<AtomicBool>,
+    mic_ptt_enabled: Arc<AtomicBool>,
+    mic_bias_enabled: Arc<AtomicBool>,
+    mic_ptt_on_tip: Arc<AtomicBool>,
+    stop: Arc<AtomicBool>,
+) {
+    let mut seq: u32 = 0;
+    let mut ozy_command: u8 = 1;
+    let mut current_receiver: u8 = 0;
+    let mut rx_audio_pacer = RxAudioPacer::new();
+    let mut next_send = Instant::now();
+
+    while !stop.load(Ordering::Relaxed) {
+        let current_rate = sample_rate.load(Ordering::Relaxed);
+        let receivers = (active_receiver_count.load(Ordering::Relaxed) as u8).max(1);
+        // Same stride formula as sender_loop -- see its own doc comment
+        // (the "ROOT CAUSE FIX" one) for why this must be computed live
+        // per-receivers rather than a fixed constant.
+        let samples_per_frame = (USB_FRAME_SIZE - 8) / ((receivers as usize * 6) + 2);
+        let samples_per_packet = samples_per_frame * 2;
+        let interval = Duration::from_secs_f64(samples_per_packet as f64 / current_rate as f64);
+        let mox_on = mox.load(Ordering::Relaxed);
+        let send_rx_audio = !mox_on && send_rx_audio_to_radio.load(Ordering::Relaxed);
+        const SLOTS_PER_PACKET: f64 = 126.0;
+        let rx_audio_slots_per_sample =
+            (SLOTS_PER_PACKET * current_rate as f64 / (samples_per_packet as f64 * 48_000.0)).max(1.0);
+
+        let packet = p1_build_packet(
+            seq,
+            &mut ozy_command,
+            &mut current_receiver,
+            receivers,
+            frequency_hz.load(Ordering::Relaxed),
+            tx_frequency_hz.load(Ordering::Relaxed),
+            antenna.load(Ordering::Relaxed),
+            tx_power_watts.load(Ordering::Relaxed),
+            f32::from_bits(pa_gain_db.load(Ordering::Relaxed)),
+            current_rate,
+            mox_on,
+            false, // is_hermes_lite -- Ozy is never a HermesLite-family board
+            disable_pa.load(Ordering::Relaxed),
+            oc_rx.load(Ordering::Relaxed),
+            oc_tx.load(Ordering::Relaxed),
+            rx_attenuation.load(Ordering::Relaxed) as u8,
+            ps_tx_attenuation.load(Ordering::Relaxed) as u8,
+            num_adcs,
+            &extra_frequencies_hz,
+            &adc,
+            &extra_adcs,
+            false, // diversity -- out of scope for Ozy, see start_protocol1_ozy_usb's doc comment
+            &tx_iq,
+            false, // puresignal -- out of scope for Ozy, same reasoning
+            &rx_audio_to_radio,
+            send_rx_audio,
+            &mut rx_audio_pacer,
+            rx_audio_slots_per_sample,
+            mic_ptt_enabled.load(Ordering::Relaxed),
+            mic_bias_enabled.load(Ordering::Relaxed),
+            mic_ptt_on_tip.load(Ordering::Relaxed),
+        );
+
+        // `packet` is [8-byte Metis header][512-byte frame][512-byte
+        // frame] (see PACKET_SIZE's own doc comment) -- Ozy sends those
+        // same two frames directly over USB bulk OUT, no Metis header,
+        // no UDP wrapping.
+        let ok = tx_endpoint.write(&packet[HEADER_SIZE..HEADER_SIZE + USB_FRAME_SIZE]).is_ok()
+            && tx_endpoint.write(&packet[HEADER_SIZE + USB_FRAME_SIZE..PACKET_SIZE]).is_ok();
+        if !ok {
+            break; // device gone; let the thread exit
+        }
+
+        seq = seq.wrapping_add(1);
+
+        next_send += interval;
+        let now = Instant::now();
+        if next_send > now {
+            thread::sleep(next_send - now);
+        } else {
+            next_send = now;
+        }
+    }
+}
+
+/// Ozy USB counterpart to receiver_loop. No Metis 8-byte header to
+/// strip and no fixed 1032-byte packet size to match -- USB bulk reads
+/// come back as raw, concatenated 512-byte P1 sub-frames with no outer
+/// framing at all, so the bytes actually read are fed to
+/// parse_iq_stream directly. parse_iq_stream already treats its input
+/// as a continuous byte stream with its own sync-byte recovery (see its
+/// own doc comment), so this needs no frame-boundary handling of its
+/// own regardless of how many bytes one USB read happens to return.
+#[allow(clippy::too_many_arguments)]
+fn ozy_receiver_loop(
+    mut rx_endpoint: ozy::RxEndpoint,
+    buffers: Vec<Arc<Mutex<VecDeque<IqSample>>>>,
+    active_receiver_count: Arc<AtomicU32>,
+    sample_rate: Arc<AtomicU32>,
+    tx_forward_power: Arc<AtomicU32>,
+    tx_reverse_power: Arc<AtomicU32>,
+    adc0_overload: Arc<AtomicBool>,
+    adc1_overload: Arc<AtomicBool>,
+    radio_mic_audio: Arc<Mutex<VecDeque<f32>>>,
+    stop: Arc<AtomicBool>,
+) {
+    let mut buf = [0u8; ozy::EP6_READ_SIZE];
+    let mut carry: Vec<u8> = Vec::new();
+    let mut frame_synced = false;
+    // No PureSignal/diversity on Ozy (see start_protocol1_ozy_usb's doc
+    // comment) -- parse_iq_stream needs somewhere to route samples it
+    // WOULD send there, but ps_feedback_indices=None/diversity=false
+    // below mean neither queue is ever actually touched.
+    let ps_rx_feedback_iq: Arc<Mutex<VecDeque<IqSample>>> = Arc::new(Mutex::new(VecDeque::new()));
+    let ps_tx_feedback_iq: Arc<Mutex<VecDeque<IqSample>>> = Arc::new(Mutex::new(VecDeque::new()));
+    let diversity_main_raw_iq: Arc<Mutex<VecDeque<IqSample>>> = Arc::new(Mutex::new(VecDeque::new()));
+
+    while !stop.load(Ordering::Relaxed) {
+        match rx_endpoint.read(&mut buf) {
+            Ok(n) if n > 0 => {
+                let capacity = iq_buffer_capacity_for_rate(sample_rate.load(Ordering::Relaxed));
+                let receivers = (active_receiver_count.load(Ordering::Relaxed) as u8).max(1);
+                let _ = parse_iq_stream(
+                    &buf[..n],
+                    receivers,
+                    &buffers,
+                    capacity,
+                    &tx_forward_power,
+                    &tx_reverse_power,
+                    &adc0_overload,
+                    &adc1_overload,
+                    None,
+                    &ps_rx_feedback_iq,
+                    &ps_tx_feedback_iq,
+                    &radio_mic_audio,
+                    false,
+                    &diversity_main_raw_iq,
+                    &mut carry,
+                    &mut frame_synced,
+                );
+            }
+            Ok(_) => continue, // 0 bytes -- transient, keep polling
+            Err(e)
+                if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut =>
+            {
+                continue // the NORMAL idle case -- see ozy.rs's IO_TIMEOUT doc comment
+            }
+            Err(_) => break, // device gone
+        }
+    }
+}
+
+/// Periodic I2C telemetry poll -- Penny's forward/reverse power + ALC,
+/// Mercury's ADC overload flags. Writes results into the SAME
+/// `tx_forward_power`/`tx_reverse_power`/`adc0_overload`/
+/// `adc1_overload` atomics real Metis/Hermes-class P1 packets populate
+/// (see ozy_receiver_loop's params -- Ozy's own receiver_loop
+/// equivalent never gets these from the wire the way UDP boards do,
+/// since Ozy's C&C reply frames don't carry them; only I2C does), so
+/// the existing TX meter/red-needle-while-transmitting/Max-SWR-cutback
+/// UI (main.rs) works for Ozy with no changes at all.
+///
+/// `adc0_overload` isn't written here -- Mercury1/ADC0's overload flag
+/// mirrors what old_protocol.c's C&C reply frame carries on other P1
+/// boards, but this project's own receiver_loop/parse_iq_stream has no
+/// wire-level source for it on Ozy (see ozy_receiver_loop above); only
+/// `read_mercury_overload(1)` (Mercury2/ADC1, the aux/second board) is
+/// something this poll can source over I2C alone (I2C_MERC1_ADC_OFS's
+/// "channel 0" 2-byte reply format wasn't confirmed against a real
+/// single-Mercury reference at the time this was written -- flag if
+/// ADC0 overload never lights up on real hardware).
+fn ozy_i2c_loop(
+    device: ozy::OzyDevice,
+    tx_forward_power: Arc<AtomicU32>,
+    tx_reverse_power: Arc<AtomicU32>,
+    adc1_overload: Arc<AtomicBool>,
+    stop: Arc<AtomicBool>,
+) {
+    // Matches piHPSDR's own ozy_i2c_thread cadence (its own doc comment
+    // ports as "should be executed periodically" without a fixed
+    // number) -- 250ms is fast enough for a meter to feel live without
+    // saturating the I2C bus with back-to-back control transfers.
+    const POLL_INTERVAL: Duration = Duration::from_millis(250);
+    while !stop.load(Ordering::Relaxed) {
+        if let Ok((fwd, rev, _alc)) = device.read_penny_power() {
+            tx_forward_power.store(fwd as u32, Ordering::Relaxed);
+            tx_reverse_power.store(rev as u32, Ordering::Relaxed);
+        }
+        if let Ok(overload) = device.read_mercury_overload(1) {
+            adc1_overload.store(overload, Ordering::Relaxed);
+        }
+        thread::sleep(POLL_INTERVAL);
+    }
+}
+
 /// ~0.25s worth of samples at the given rate, floored so very low rates
 /// still get a sane minimum. Computed live (not a fixed constant) so
 /// the buffer represents a constant TIME duration regardless of actual
@@ -3439,6 +3993,9 @@ fn start_protocol2(
         protocol: 2,
         radio_ip,
         stop_socket,
+        is_ozy: false,
+        ozy_versions: None,
+        ozy_i2c_thread: None,
     })
 }
 

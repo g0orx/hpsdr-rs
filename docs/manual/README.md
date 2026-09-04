@@ -22,6 +22,7 @@ from source and project status, see the [top-level README](../../README.md).
 14. [Settings: XVTR](14-xvtr.md) -- defining transverters (IF-to-RF band conversion)
 15. [Settings: Open Collector](15-open-collector.md) -- per-band relay-driver output configuration
 16. [Settings: About](16-about.md) -- connected radio details and author info
+17. [Ozy USB](17-ozy-usb.md) -- connecting the original Ozy/Mercury/Penny hardware over USB (new, unconfirmed)
 
 **PDF**: this whole manual is also available as a single PDF, useful for
 offline/printed reading. It's built automatically by the "Manual PDF"

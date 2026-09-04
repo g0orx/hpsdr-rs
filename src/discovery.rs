@@ -10,6 +10,7 @@
     (at your option) any later version.
 */
 
+use crate::ozy;
 use network_interface::{Addr, NetworkInterface, NetworkInterfaceConfig};
 use serde::{Deserialize, Serialize};
 use socket2::{Domain, Socket, Type};
@@ -32,6 +33,12 @@ pub enum Boards {
     Saturn,
     HermesLite,
     HermesLite2,
+    /// The original HPSDR hardware -- Ozy (Cypress FX2 + FPGA) paired
+    /// with separate Mercury/Penny boards, reached over raw USB bulk
+    /// transfers instead of Ethernet/UDP. Still Protocol 1 framing
+    /// (`Device::protocol` is 1 for this board too) -- see ozy.rs and
+    /// radio.rs's start_protocol1_ozy_usb.
+    Ozy,
     Unknown,
 }
 
@@ -273,6 +280,14 @@ pub fn protocol2_discovery(devices: Arc<Mutex<Vec<Device>>>, socket_addr: Socket
 pub fn discover(devices: Arc<Mutex<Vec<Device>>>, interface_names: Arc<Mutex<HashMap<IpAddr, String>>>) {
     devices.lock().unwrap().clear();
 
+    // Called from inside here (after the clear above), not spawned as
+    // a separate thread appending to the same `devices` list -- a
+    // separate thread racing this function's own `.clear()` could wipe
+    // out an Ozy entry that landed first. USB enumeration is fast and
+    // independent of the network-interface loop below, so there's no
+    // real cost to doing it inline first.
+    discover_ozy_usb(&devices);
+
     let interfaces = match NetworkInterface::show() {
         Ok(v) => v,
         Err(e) => {
@@ -297,6 +312,42 @@ pub fn discover(devices: Arc<Mutex<Vec<Device>>>, interface_names: Arc<Mutex<Has
             }
         }
     }
+}
+
+/// USB-side counterpart to protocol1_discovery/protocol2_discovery --
+/// a synthetic `Device` entry for a plugged-in Ozy, since there's no
+/// UDP discovery reply to parse for it. `address`/`my_address` have no
+/// real meaning here (there's no network address at all) -- every UI
+/// site that would otherwise display or use them checks
+/// `board == Boards::Ozy` first and substitutes "USB" instead (see
+/// discovery_ui.rs's grid and main.rs's About tab). Real version/ADC
+/// counts aren't known until `ozy::initialise` actually talks to the
+/// device at connect time -- this entry only needs to be enough for
+/// the discovery list to show a selectable "Ozy" row, same as any
+/// other.
+fn discover_ozy_usb(devices: &Arc<Mutex<Vec<Device>>>) {
+    if !ozy::discover() {
+        return;
+    }
+    let sentinel = SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0);
+    devices.lock().unwrap().push(Device {
+        address: sentinel,
+        my_address: sentinel,
+        device: 0,
+        board: Boards::Ozy,
+        protocol: 1,
+        version: 0,
+        status: 2, // available
+        mac: [0; 6],
+        // Matches old_protocol.c's own documented Ozy cap ("OZY's tend
+        // to hang if the..." -- see radio.rs's start_protocol1_ozy_usb
+        // doc comment) rather than the 5 a Metis-class board reports.
+        supported_receivers: 2,
+        supported_transmitters: 1,
+        adcs: 2,
+        frequency_min: 0,
+        frequency_max: 61_440_000,
+    });
 }
 
 /// Looks up which local network interface (e.g. "eth0"/"enp3s0")

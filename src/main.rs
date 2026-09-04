@@ -6,6 +6,7 @@ mod config;
 mod debug_log;
 mod discovery;
 mod discovery_ui;
+mod ozy;
 mod radio;
 mod rigctl;
 mod spectrum;
@@ -729,6 +730,12 @@ struct ConnectedState {
     /// needle/readout turn red -- see draw_power_meter and
     /// Config::max_swr.
     max_swr: f32,
+    /// Classic Ozy hardware only -- see Config::ozy_firmware_path/
+    /// ozy_fpga_path and radio::RadioSettings' identically-named fields.
+    /// Set via Settings' file pickers; read at connect time into
+    /// RadioSettings before RadioSession::start is called.
+    ozy_firmware_path: Option<String>,
+    ozy_fpga_path: Option<String>,
     /// Whether the Tune button is currently engaged -- transient, not
     /// persisted. See the main-panel Tune button handler for the full
     /// mechanism (WDSP PostGen tone + a temporary TX Power override).
@@ -958,7 +965,9 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
     settings.rit_offset_hz = rit_offset_hz.round().clamp(-9_999.0, 9_999.0) as i32;
     settings.xit_enabled = xit_enabled;
     settings.xit_offset_hz = xit_offset_hz.round().clamp(-9_999.0, 9_999.0) as i32;
-    match RadioSession::start(&device, settings) {
+    settings.ozy_firmware_path = cfg.ozy_firmware_path.clone();
+    settings.ozy_fpga_path = cfg.ozy_fpga_path.clone();
+    match RadioSession::start(&device, settings.clone()) {
         Ok(session) => {
             // Override RadioSession::start's hardcoded
             // conservative default with whatever was
@@ -1413,6 +1422,8 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                     .unwrap_or_else(|| default_max_tx_power_watts(device.board)),
                 tune_power_percent: cfg.tune_power_percent.unwrap_or(20),
                 max_swr: cfg.max_swr.unwrap_or(3.0),
+                ozy_firmware_path: cfg.ozy_firmware_path.clone(),
+                ozy_fpga_path: cfg.ozy_fpga_path.clone(),
                 tune_active: false,
                 pre_tune_power_watts: None,
                 two_tone_active: false,
@@ -4301,21 +4312,58 @@ impl eframe::App for HpsdrApp {
                                         ));
                                         ui.end_row();
 
+                                        let is_ozy = connected.device.board == Boards::Ozy;
                                         ui.label("IP Address:");
-                                        ui.label(format!("{}", connected.device.address.ip()));
+                                        ui.label(if is_ozy {
+                                            "USB".to_string()
+                                        } else {
+                                            format!("{}", connected.device.address.ip())
+                                        });
                                         ui.end_row();
 
-                                        ui.label("MAC Address:");
-                                        let mac = connected.device.mac;
-                                        ui.label(format!(
-                                            "{:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}",
-                                            mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
-                                        ));
-                                        ui.end_row();
+                                        if !is_ozy {
+                                            ui.label("MAC Address:");
+                                            let mac = connected.device.mac;
+                                            ui.label(format!(
+                                                "{:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}",
+                                                mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
+                                            ));
+                                            ui.end_row();
+                                        }
 
                                         ui.label("Interface:");
-                                        ui.label(connected.interface_name.as_deref().unwrap_or("unknown"));
+                                        ui.label(if is_ozy {
+                                            "USB".to_string()
+                                        } else {
+                                            connected.interface_name.clone().unwrap_or_else(|| "unknown".to_string())
+                                        });
                                         ui.end_row();
+
+                                        // See ozy_i2c_loop's doc comment (radio.rs) -- read once
+                                        // at connect time via I2C, not available for any other
+                                        // board.
+                                        if let Some(versions) = &connected.session.ozy_versions {
+                                            ui.label("Ozy FX2 Version:");
+                                            ui.label(&versions.ozy_fx2);
+                                            ui.end_row();
+
+                                            ui.label("Mercury FW:");
+                                            ui.label(
+                                                versions
+                                                    .mercury
+                                                    .iter()
+                                                    .map(|v| v.map(|n| n.to_string()).unwrap_or_else(|| "-".to_string()))
+                                                    .collect::<Vec<_>>()
+                                                    .join(" / "),
+                                            );
+                                            ui.end_row();
+
+                                            ui.label("Penny FW:");
+                                            ui.label(
+                                                versions.penny.map(|n| n.to_string()).unwrap_or_else(|| "-".to_string()),
+                                            );
+                                            ui.end_row();
+                                        }
                                     });
 
                                     ui.add_space(16.0);
@@ -5997,6 +6045,8 @@ impl eframe::App for HpsdrApp {
                         max_tx_power_watts: Some(connected.max_tx_power_watts),
                         tune_power_percent: Some(connected.tune_power_percent),
                         max_swr: Some(connected.max_swr),
+                        ozy_firmware_path: connected.ozy_firmware_path.clone(),
+                        ozy_fpga_path: connected.ozy_fpga_path.clone(),
                         rigctl_addr: Some(connected.rigctl_addr.clone()),
                         tci_addr: Some(connected.tci_addr.clone()),
                         cat_addr: Some(connected.cat_addr.clone()),
@@ -6787,6 +6837,9 @@ fn default_ps_hw_peak(protocol: u8) -> f64 {
 fn default_max_tx_power_watts(board: Boards) -> u32 {
     match board {
         Boards::HermesLite | Boards::HermesLite2 => 5,
+        // Bare Penny/Penelope exciter, no add-on PA -- same low-power
+        // bucket as HermesLite rather than a full-power board's default.
+        Boards::Ozy => 5,
         Boards::Metis | Boards::Hermes | Boards::Hermes2 | Boards::Angelia => 10,
         Boards::Orion | Boards::Orion2 | Boards::Saturn => 100,
         Boards::Unknown => 100,
@@ -6823,6 +6876,16 @@ fn power_watts_and_swr(raw_forward: u32, raw_reverse: u32, board: Boards) -> (f3
         Boards::Saturn => (3.3, 0.09),
         Boards::HermesLite => (3.3, 1.4),
         Boards::HermesLite2 => (3.3, 1.4),
+        // UNVERIFIED: no confirmed reference for Penny's own forward/
+        // reverse power detector calibration was found (piHPSDR's
+        // ozyio.c exposes the raw I2C-read ADC values penny_fp/penny_rp
+        // but no watts-conversion formula) -- reusing Metis's constants
+        // as a placeholder so the meter shows *something* rather than
+        // nothing, not because they're known correct for Penny's
+        // detector hardware. Flag and fix this once real hardware is
+        // available to compare an indicated value against a real power
+        // meter.
+        Boards::Ozy => (3.3, 0.09),
         Boards::Unknown => (3.3, 0.09),
     };
 

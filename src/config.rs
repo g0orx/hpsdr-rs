@@ -169,6 +169,13 @@ pub struct Config {
     /// needle/readout turn red -- see main.rs's draw_power_meter. Missing
     /// falls back to 3.0.
     pub max_swr: Option<f32>,
+    /// Classic Ozy hardware only (see radio.rs's start_protocol1_ozy_usb)
+    /// -- paths to the user-supplied FX2 firmware (.hex) and FPGA
+    /// bitstream (.rbf) files, set via Settings' file pickers. Not
+    /// bundled in this repo (matches piHPSDR's own approach) -- see
+    /// README's Ozy USB section for where to get them.
+    pub ozy_firmware_path: Option<String>,
+    pub ozy_fpga_path: Option<String>,
     /// Spectrum/waterfall display range while transmitting -- separate
     /// from db_low/db_high/waterfall_db_low/waterfall_db_high (which
     /// are for receiving) because a locally-picked-up TX signal is

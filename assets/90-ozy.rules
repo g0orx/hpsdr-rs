@@ -1,0 +1,8 @@
+# udev rule for non-root USB access to classic Ozy/Mercury/Penny HPSDR
+# hardware (VID:PID fffe:0007) -- ported as-is from piHPSDR's own
+# 90-ozy.rules, a standard permission rule with no reason to deviate
+# from a working reference.
+#
+# Install: copy to /etc/udev/rules.d/, then either replug the device or
+# run: sudo udevadm control --reload-rules && sudo udevadm trigger
+SUBSYSTEMS=="usb",ATTRS{idVendor}=="fffe",ATTRS{idProduct}=="0007",SYMLINK+="ozy",MODE="666"

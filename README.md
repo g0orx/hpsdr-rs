@@ -36,6 +36,8 @@ This project started as an experiment: could Claude port the discovery code from
 
 Any board the standard openHPSDR discovery protocol reports as one of: Metis, Hermes, Hermes2, Angelia, Orion, Orion2, HermesLite, or HermesLite2 (this covers most Protocol 1/2 hardware, including the ANAN series). The discovery/board-type reply doesn't distinguish specific models or their actual max power (e.g. a 100W vs. 200W ANAN both report as Orion2) — set your radio's actual max TX power in Settings once connected.
 
+Also, separately: the original Ozy/Mercury/Penny hardware (Protocol 1 over USB rather than Ethernet) — see [Ozy USB](#ozy-usb-legacy-hardware) below. **New, partially confirmed against real hardware.**
+
 ## Building
 
 Developed and tested primarily on Linux. A Windows build (via MSVC + vcpkg)
@@ -110,6 +112,53 @@ Two independent, unrelated ways to update a radio's FPGA firmware (`.rbf` file) 
 
 See the manual's **[Firmware Update](docs/manual/13-firmware-update.md)** page for the full step-by-step procedure and warnings.
 
+## Ozy USB (legacy hardware)
+
+> **New, partially confirmed against real hardware.** USB discovery and
+> the FX2 firmware load stage have both been confirmed working on a
+> real Ozy. FPGA bitstream load, RX/TX streaming, and I2C telemetry
+> (Penny power/Mercury overload) are still unconfirmed — this
+> development environment has no complete Ozy/Mercury/Penny setup to
+> test the rest against. If you try it, reports (good or bad) are very
+> welcome.
+
+The original HPSDR hardware — an "Ozy" board (Cypress FX2 USB
+controller + FPGA) paired with separate Mercury (RX) and Penny (TX/audio
+codec) boards on a backplane — predates every other board this project
+talks to, which all use Ethernet/UDP. Ozy speaks the same Protocol 1
+framing over raw USB bulk transfers instead, and needs a bit of one-time
+setup normal boards don't:
+
+1. **Firmware files** — the Cypress FX2 RAM firmware (`ozyfw-sdr1k.hex`)
+   and the FPGA bitstream (`Ozy_Janus.rbf`) are **bundled with
+   hpsdr-rs** (sourced from the author's own piHPSDR repo, same
+   GPL-2.0 license) — a `.deb` install or a `cargo run` from a source
+   checkout both find them automatically, no setup needed. The
+   Discover window's **Ozy USB setup** section shows which copy is in
+   use and lets you override it with a different/custom build via
+   **Choose...** if you ever need to.
+2. **Linux only**: a udev rule for non-root USB access. Copy
+   [`assets/90-ozy.rules`](assets/90-ozy.rules) to `/etc/udev/rules.d/`,
+   then `sudo udevadm control --reload-rules && sudo udevadm trigger`
+   (or just replug the device).
+3. **Windows only**: Ozy's `fffe:0007` VID:PID needs a WinUSB driver
+   bound to it via [Zadig](https://zadig.akeo.ie/) — Windows has no
+   built-in generic driver for an unrecognized USB device.
+4. **macOS**: no extra driver needed (nusb, the USB library this
+   project uses, talks to IOKit directly) — untested either way.
+
+Once set up, Ozy shows up in the normal Discover window like any other
+radio (as "USB" instead of an IP address) — select it and click Start.
+Connecting runs the full one-time bring-up (FX2 firmware load, a few
+seconds for the device to re-enumerate, FPGA bitstream load) before
+streaming begins, so the first connect takes noticeably longer than a
+network radio.
+
+Classic Ozy hardware is capped at 2 receivers (matching piHPSDR's own
+documented limit — these boards are reported to hang with more), and
+Diversity/PureSignal aren't available on it (no independent feedback
+ADC in this hardware generation).
+
 ## Packaging (Debian/Ubuntu)
 
 A `.deb` can be built with [`cargo-deb`](https://crates.io/crates/cargo-deb):
@@ -124,6 +173,8 @@ This produces `target/debian/hpsdr-rs_<version>_amd64.deb`, installing the binar
 ```sh
 sudo apt install ./target/debian/hpsdr-rs_<version>_amd64.deb
 ```
+
+Rebuilding and reinstalling repeatedly (e.g. while testing local changes) with the crate's own `version` unchanged produces the exact same package version every time — `dpkg`/`apt` treat that as nothing to do, requiring `sudo dpkg -r hpsdr-rs` before the new one will install. `./scripts/build-deb.sh` avoids this: it's a thin wrapper around `cargo deb --deb-revision <n>` that auto-increments a local counter (`.deb-revision`, gitignored) on every run, so each build gets a genuinely newer Debian revision and installs over the previous one cleanly. Use it exactly like `cargo deb` — extra arguments are passed through, e.g. `./scripts/build-deb.sh --no-build`.
 
 ## PureSignal calibration
 

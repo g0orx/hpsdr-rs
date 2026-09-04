@@ -52,6 +52,23 @@ pnet_datalink = "0.35.0"
 # project's existing GTK-avoidance elsewhere (see eframe's own feature list
 # above -- no GTK anywhere in this app), so no feature overrides needed.
 rfd = "0.17.2"
+# USB I/O for the original Ozy/Metis-predecessor hardware (ozy.rs) --
+# the classic Ozy+Mercury+Penny board set talks Protocol 1 over raw USB
+# bulk transfers instead of UDP. Chosen over `rusb` (the libusb-1.0
+# wrapper) deliberately: rusb needs the actual libusb-1.0 C library
+# present at build+link+run time, a NEW system dependency on every
+# platform, right after this project worked through real system-
+# dependency pain getting Windows (Npcap SDK, MSVC+vcpkg) and macOS
+# (Homebrew fftw3) building cleanly -- see README's Building section.
+# `nusb` talks to the OS USB stack directly (usbfs on Linux, IOKit on
+# macOS, WinUSB on Windows) with no C library at all. Its transfer
+# methods return nusb's own `MaybeFuture`, resolved synchronously via
+# `.wait()` (no tokio/async runtime pulled in), matching this codebase's
+# existing thread-per-loop style everywhere else. Windows still needs a
+# WinUSB driver bound to the Ozy VID:PID via Zadig regardless of crate
+# choice (a Windows driver-model fact, not a libusb-specific one) --
+# see README's Ozy USB section.
+nusb = "0.2"
 
 # NOTE: I could not compile-check this in the sandbox this was written in
 # (no Rust toolchain available), so treat these version numbers as a
@@ -93,6 +110,15 @@ equalizer, and rigctl/TCI control servers for use with WSJT-X and similar \
 digital-mode software."""
 section = "hamradio"
 priority = "optional"
+# Debian revision suffix (the "-N" after the crate version in the built
+# .deb's filename/package version) -- defaults to "1" when unset.
+# Bump this on its own, independent of [package]'s `version` above,
+# whenever a new .deb needs to be built and installed over an existing
+# one without changing the crate's own version number: dpkg/apt only
+# treats a new package as an upgrade if ITS version string (crate
+# version + this revision) actually differs from what's installed, so
+# reusing the same version+revision needs a manual `dpkg -r` first.
+revision = "2"
 assets = [
     ["target/release/hpsdr-rs", "usr/bin/", "755"],
     ["README.md", "usr/share/doc/hpsdr-rs/README.md", "644"],
@@ -100,4 +126,18 @@ assets = [
     ["docs/manual/images/*", "usr/share/doc/hpsdr-rs/manual/images/", "644"],
     ["assets/hpsdr-rs.desktop", "usr/share/applications/hpsdr-rs.desktop", "644"],
     ["assets/icons/hpsdr-rs.png", "usr/share/icons/hicolor/256x256/apps/hpsdr-rs.png", "644"],
+    # Not auto-installed to /etc/udev/rules.d/ (a .deb shouldn't silently
+    # install udev rules without the user's say-so) -- shipped as a
+    # reference copy alongside the docs, see README's Ozy USB section
+    # for the install command.
+    ["assets/90-ozy.rules", "usr/share/doc/hpsdr-rs/90-ozy.rules", "644"],
+    # Ozy's FX2 firmware + FPGA bitstream -- sourced from the author's
+    # own piHPSDR repo (github.com/g0orx/pihpsdr), same GPL-2.0 license
+    # as this project, not a third-party blob. Installed to
+    # usr/share/hpsdr-rs/ozy/ specifically -- ozy.rs's `bundled_path`
+    # derives this exact location from the installed binary's own path
+    # (usr/bin/hpsdr-rs -> ../share/hpsdr-rs/ozy/), so a .deb install
+    # needs no manual Ozy firmware/FPGA setup at all, only the udev rule.
+    ["assets/ozy/ozyfw-sdr1k.hex", "usr/share/hpsdr-rs/ozy/ozyfw-sdr1k.hex", "644"],
+    ["assets/ozy/Ozy_Janus.rbf", "usr/share/hpsdr-rs/ozy/Ozy_Janus.rbf", "644"],
 ]
