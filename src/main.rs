@@ -2578,7 +2578,11 @@ impl eframe::App for HpsdrApp {
                             .on_hover_text(network_status_hover("rigctl", rigctl_status, &connected.rigctl_addr));
                         ui.add_space(12.0);
                         ui.colored_label(network_status_color(tci_status), "TCI")
-                            .on_hover_text(network_status_hover("TCI", tci_status, &connected.tci_addr));
+                            .on_hover_text(tci_status_hover(
+                                tci_status,
+                                &connected.tci_addr,
+                                connected.tci_server.as_ref(),
+                            ));
                         ui.add_space(12.0);
                         ui.colored_label(network_status_color(cat_status), "CAT")
                             .on_hover_text(network_status_hover("CAT", cat_status, &connected.cat_addr));
@@ -6498,6 +6502,28 @@ fn network_status_hover(name: &str, status: Option<bool>, addr: &str) -> String 
         Some(true) => format!("{name}: client connected on {addr}"),
     };
     format!("{state}\n(start/stop in Settings -> Network)")
+}
+
+/// Same as network_status_hover, but for TCI specifically: appends which
+/// of this machine's own IP addresses currently-connected client(s)
+/// actually landed on -- see TciServer::connected_ips's doc comment for
+/// why the plain `addr` (typically "0.0.0.0:PORT", the bind address, not
+/// which real interface is in use) isn't enough on its own. A real
+/// report: with a client connected, the hover text just showed
+/// "0.0.0.0:50001" regardless of which of this machine's several network
+/// interfaces the connection actually came in on.
+fn tci_status_hover(status: Option<bool>, addr: &str, server: Option<&TciServer>) -> String {
+    let base = network_status_hover("TCI", status, addr);
+    if status != Some(true) {
+        return base;
+    }
+    let Some(server) = server else { return base };
+    let ips = server.connected_ips();
+    if ips.is_empty() {
+        return base;
+    }
+    let ip_list = ips.iter().map(|ip| ip.to_string()).collect::<Vec<_>>().join(", ");
+    format!("{base}\nvia {ip_list}")
 }
 
 fn format_frequency(hz: u32) -> String {

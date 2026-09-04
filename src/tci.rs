@@ -355,6 +355,17 @@ pub struct TciServer {
     /// connected" separately from "not running at all" (server is
     /// None).
     connected: Arc<AtomicU32>,
+    /// Local (this machine's) address each currently-connected client's
+    /// socket actually landed on -- distinct from `addr` this server was
+    /// started with (typically "0.0.0.0:PORT", meaningless for "which
+    /// interface is actually in use" once real clients are connected).
+    /// A real report: the TCI status badge's hover text just showed the
+    /// 0.0.0.0 bind address regardless, not which of this machine's own
+    /// interfaces/IPs a connection actually came in on. One entry per
+    /// connected client (same multi-client model as `connected` above);
+    /// the UI collapses to the distinct set of IPs, since the port is
+    /// always this server's own.
+    local_addrs: Arc<Mutex<Vec<std::net::SocketAddr>>>,
     thread: Option<JoinHandle<()>>,
     /// See spawn_audio_iq_broadcaster's doc comment -- the single
     /// reader of the shared audio/IQ taps, fanning out to every
@@ -438,6 +449,8 @@ impl TciServer {
         let audio_iq: AudioIqCell = Arc::new(Mutex::new(AudioIqTaps { audio: tci_audio_out, iq: iq_out }));
         let stop = Arc::new(AtomicBool::new(false));
         let connected = Arc::new(AtomicU32::new(0));
+        // See TciServer::local_addrs's own doc comment.
+        let local_addrs: Arc<Mutex<Vec<std::net::SocketAddr>>> = Arc::new(Mutex::new(Vec::new()));
         let client_threads: Arc<Mutex<Vec<JoinHandle<()>>>> = Arc::new(Mutex::new(Vec::new()));
         // See ClientAudioIqSink/spawn_audio_iq_broadcaster's doc comments
         // -- replaces the single-client "supersede" enforcement this
@@ -447,6 +460,7 @@ impl TciServer {
             spawn_audio_iq_broadcaster(Arc::clone(&audio_iq), Arc::clone(&audio_iq_registry), Arc::clone(&stop));
         let accept_stop = Arc::clone(&stop);
         let accept_connected = Arc::clone(&connected);
+        let accept_local_addrs = Arc::clone(&local_addrs);
         let accept_client_threads = Arc::clone(&client_threads);
         let accept_demod_params = Arc::clone(&demod_params);
         let accept_audio_iq_registry = Arc::clone(&audio_iq_registry);
@@ -459,6 +473,9 @@ impl TciServer {
                 match listener.accept() {
                     Ok((stream, peer)) => {
                         accept_logging.log(&format!("client connected from {peer}"));
+                        // See TciServer::local_addrs's own doc comment.
+                        let local_addr = stream.local_addr().ok();
+                        let conn_local_addrs = Arc::clone(&accept_local_addrs);
                         let freq = Arc::clone(&requested_frequency_hz);
                         let rx_freq = Arc::clone(&rx_frequency_hz);
                         let hw_freq = Arc::clone(&hw_frequency_hz);
@@ -479,12 +496,21 @@ impl TciServer {
                         let conn_board_name = board_name.clone();
                         let handle = thread::spawn(move || {
                             conn_connected.fetch_add(1, Ordering::Relaxed);
+                            if let Some(addr) = local_addr {
+                                conn_local_addrs.lock().unwrap().push(addr);
+                            }
                             handle_client(
                                 stream, freq, rx_freq, hw_freq, rate, params, conn_audio_iq_registry, tx_audio,
                                 tx_gain, wants_mic, conn_mox, conn_rit_enabled, conn_rit_offset_hz, conn_xit_enabled,
                                 conn_xit_offset_hz, conn_stop, conn_board_name, conn_logging,
                             );
                             conn_connected.fetch_sub(1, Ordering::Relaxed);
+                            if let Some(addr) = local_addr {
+                                let mut addrs = conn_local_addrs.lock().unwrap();
+                                if let Some(pos) = addrs.iter().position(|a| *a == addr) {
+                                    addrs.remove(pos);
+                                }
+                            }
                         });
                         let mut threads = accept_client_threads.lock().unwrap();
                         threads.retain(|h| !h.is_finished()); // opportunistic cleanup
@@ -504,6 +530,7 @@ impl TciServer {
             stop,
             broadcaster_thread: Some(broadcaster_thread),
             connected,
+            local_addrs,
             thread: Some(thread),
             client_threads,
         })
@@ -536,6 +563,21 @@ impl TciServer {
     /// tell "listening but idle" apart from "actively in use".
     pub fn is_connected(&self) -> bool {
         self.connected.load(Ordering::Relaxed) > 0
+    }
+
+    /// Distinct local (this machine's) IP addresses currently-connected
+    /// clients actually landed on -- see `local_addrs`'s own doc
+    /// comment for why this is more useful than the "0.0.0.0" bind
+    /// address for a UI showing which interface is actually in use.
+    /// Deduplicated (a real report showed several clients from the same
+    /// interface, which would otherwise repeat the same IP), sorted for
+    /// a stable display order.
+    pub fn connected_ips(&self) -> Vec<std::net::IpAddr> {
+        let mut ips: Vec<std::net::IpAddr> =
+            self.local_addrs.lock().unwrap().iter().map(|a| a.ip()).collect();
+        ips.sort();
+        ips.dedup();
+        ips
     }
 
     pub fn stop(&mut self) {
