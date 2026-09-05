@@ -4899,12 +4899,39 @@ fn p2_receiver_loop(
                                 &ps_tx_feedback_iq,
                                 PS_FEEDBACK_BUFFER_CAPACITY,
                             );
-                        } else if diversity_enabled.load(Ordering::Relaxed) && ddc - ddc_reserved == 0 {
+                        } else if ddc < ddc_reserved {
+                            // ROOT CAUSE FIX for a real crash (GitHub #1,
+                            // confirmed on an ANAN-G2, 2 ADCs, PureSignal
+                            // off, 1 DDC requested): DDC0/DDC1's wire
+                            // positions are ALWAYS reserved (see
+                            // ddc_reserved above) regardless of whether
+                            // PureSignal actually claims them -- this
+                            // radio sends a full-size packet on DDC1's
+                            // port even with PureSignal off and only 1
+                            // DDC requested. Falling through to the
+                            // `buffers[ddc - ddc_reserved]` indexing below
+                            // with ddc==1 underflows (1usize - 2usize),
+                            // which a release build silently wraps to
+                            // usize::MAX rather than panicking on, so it
+                            // proceeded straight to an out-of-bounds
+                            // index and panicked there instead (`index
+                            // out of bounds: the len is 5 but the index
+                            // is 18446744073709551615`). Nothing to parse
+                            // for an unclaimed reserved position -- drop it.
+                        } else if diversity_enabled.load(Ordering::Relaxed) && ddc == ddc_reserved {
                             // Wire 0's raw ADC0 samples go to the
                             // combiner's input queue instead of
                             // buffers[0] -- wire 1 (the ADC1 aux feed)
                             // needs no special case, it already lands in
-                            // buffers[1] untouched.
+                            // buffers[1] untouched. Written as `ddc ==
+                            // ddc_reserved` rather than the previous `ddc
+                            // - ddc_reserved == 0` -- equivalent when
+                            // reached (diversity forces real_receivers
+                            // >= 2, so ddc_reserved is always 2 here
+                            // regardless), but doesn't rely on
+                            // short-circuit evaluation order to avoid the
+                            // same underflow the branch above now guards
+                            // against explicitly.
                             p2_parse_ddc_iq_packet(&buf[..n], &diversity_main_raw_iq, capacity);
                         } else {
                             p2_parse_ddc_iq_packet(&buf[..n], &buffers[ddc - ddc_reserved], capacity);
