@@ -375,6 +375,13 @@ pub struct RadioSession {
     /// and alex0_word's, and p1_build_packet's HermesLite PA-enable
     /// branch.
     pub disable_pa: Arc<std::sync::atomic::AtomicBool>,
+    /// Set by main.rs, once per frame, from `ConnectedState::tune_active`
+    /// (the Tune button, NOT two-tone -- see p1_build_packet's HermesLite2
+    /// branch doc comment for why the two are kept separate, matching
+    /// piHPSDR exactly). P1/HermesLite2 only for now -- standard boards'
+    /// PA doesn't need a separate "tune mode" signal, and HermesLite2 is
+    /// P1-only hardware (P2 sender loop never reads this).
+    pub tune_active: Arc<std::sync::atomic::AtomicBool>,
     /// Set by main.rs, once per frame, from the currently active band's
     /// (or XVTR's) configured Open Collector Rx mask -- see main.rs's
     /// OcMask struct and its per-frame OC resolution block. Bits 0-6 =
@@ -1217,6 +1224,7 @@ fn start_protocol1(
     let stop_socket = socket.try_clone()?;
     // See RadioSession::disable_pa's doc comment.
     let disable_pa = Arc::new(AtomicBool::new(false));
+    let tune_active = Arc::new(AtomicBool::new(false));
     // See RadioSession::oc_rx/oc_tx's doc comments.
     let oc_rx = Arc::new(AtomicU8::new(0));
     let oc_tx = Arc::new(AtomicU8::new(0));
@@ -1370,6 +1378,7 @@ fn start_protocol1(
     let sender_ps_tx_attenuation = Arc::clone(&ps_tx_attenuation);
     let sender_is_hermes_lite = matches!(device.board, Boards::HermesLite | Boards::HermesLite2);
     let sender_disable_pa = Arc::clone(&disable_pa);
+    let sender_tune_active = Arc::clone(&tune_active);
     let sender_oc_rx = Arc::clone(&oc_rx);
     let sender_oc_tx = Arc::clone(&oc_tx);
     let sender_num_adcs = device.adcs;
@@ -1403,6 +1412,7 @@ fn start_protocol1(
             sender_ps_tx_attenuation,
             sender_is_hermes_lite,
             sender_disable_pa,
+            sender_tune_active,
             sender_oc_rx,
             sender_oc_tx,
             sender_num_adcs,
@@ -1466,6 +1476,7 @@ fn start_protocol1(
         adc,
         antenna,
         disable_pa,
+        tune_active,
         oc_rx,
         oc_tx,
         rx_attenuation,
@@ -1634,6 +1645,7 @@ fn start_protocol1_ozy_usb(
     // See RadioSession::disable_pa/oc_rx/oc_tx's doc comments -- same
     // inert-until-set-by-main.rs defaults start_protocol1 uses.
     let disable_pa = Arc::new(AtomicBool::new(false));
+    let tune_active = Arc::new(AtomicBool::new(false));
     let oc_rx = Arc::new(AtomicU8::new(0));
     let oc_tx = Arc::new(AtomicU8::new(0));
     let rit_enabled = Arc::new(AtomicBool::new(settings.rit_enabled));
@@ -1737,6 +1749,7 @@ fn start_protocol1_ozy_usb(
         adc,
         antenna,
         disable_pa,
+        tune_active,
         oc_rx,
         oc_tx,
         rx_attenuation,
@@ -2053,6 +2066,7 @@ fn p1_send_preconfig_and_start(
             false, // mox: never keyed during startup config
             is_hermes_lite,
             false, // disable_pa: nothing to key yet this early -- sender_loop's live value takes over immediately after
+            false, // tune_active: never during startup config, nothing keyed yet
             0, // oc_rx: nothing to key yet this early -- sender_loop's live value takes over immediately after
             0, // oc_tx: not transmitting during startup config (mox false above), so never actually used
             rx_attenuation,
@@ -2132,6 +2146,10 @@ fn p1_build_packet(
     mox_on: bool,
     is_hermes_lite: bool,
     disable_pa: bool,
+    // See RadioSession::tune_active's doc comment. HermesLite2-only
+    // (see this function's own HermesLite2 branch below) -- ignored
+    // entirely for every other board.
+    tune_active: bool,
     // See RadioSession::oc_rx/oc_tx's doc comments -- resolved masks
     // (bits 0-6 = OC1-OC7), used raw here (this project has no per-band
     // config infrastructure for P1 yet elsewhere -- see this function's
@@ -2322,8 +2340,34 @@ fn p1_build_packet(
             // (see RadioSession::disable_pa's doc comment), matching
             // piHPSDR's own `pa_enabled && !txband->disablePA` check at
             // this exact bit (old_protocol.c).
-            let (c2, c3, c4) =
-                if is_hermes_lite && !disable_pa { (0x08, 0x00, 0x00) } else { (0x00, 0x00, 0x00) };
+            //
+            // ROOT CAUSE FIX for a real report (HL2, Tune button stuck
+            // around 1.4W regardless of TX Power/PA Calibration/Tune %
+            // settings -- none of which touch anything but this
+            // register's C1 drive byte, so a fixed low ceiling
+            // independent of C1 pointed at a firmware-side limit, not a
+            // calibration problem): piHPSDR's own HL2 block ALSO sets
+            // bit 4 (0x10) whenever `transmitter->tune` is active
+            // ("ADDR=0x09 bit 20 follows TUNE state", old_protocol.c) --
+            // this project had no equivalent bit at all, so the HL2
+            // firmware never learned Tune was active and evidently
+            // limited output as if it wasn't (plausibly a duty-cycle/
+            // continuous-carrier safety limit that a real SSB/CW signal
+            // wouldn't hit, but Tune's steady tone would). NOT set for
+            // two-tone (a separate, distinct flag in the reference too --
+            // only `tune` gets this bit).
+            let (c2, c3, c4) = if is_hermes_lite {
+                let mut c2 = 0x00;
+                if !disable_pa {
+                    c2 |= 0x08;
+                }
+                if tune_active {
+                    c2 |= 0x10;
+                }
+                (c2, 0x00, 0x00)
+            } else {
+                (0x00, 0x00, 0x00)
+            };
             (0x12, c1, c2, c3, c4)
         }
         4 => {
@@ -2649,6 +2693,9 @@ fn sender_loop(
     ps_tx_attenuation: Arc<AtomicU32>,
     is_hermes_lite: bool,
     disable_pa: Arc<std::sync::atomic::AtomicBool>,
+    // See RadioSession::tune_active's doc comment -- read live, same as
+    // disable_pa just above.
+    tune_active: Arc<std::sync::atomic::AtomicBool>,
     // See RadioSession::oc_rx/oc_tx's doc comments.
     oc_rx: Arc<AtomicU8>,
     oc_tx: Arc<AtomicU8>,
@@ -2868,6 +2915,7 @@ fn sender_loop(
             mox_on,
             is_hermes_lite,
             disable_pa.load(Ordering::Relaxed),
+            tune_active.load(Ordering::Relaxed),
             oc_rx.load(Ordering::Relaxed),
             oc_tx.load(Ordering::Relaxed),
             rx_attenuation.load(Ordering::Relaxed) as u8,
@@ -3067,6 +3115,13 @@ fn receiver_loop(
     // a connection-wide constant, not something to rediscover per call.
     let mut carry: Vec<u8> = Vec::new();
     let mut frame_synced = false;
+    // See parse_iq_stream's fwd_acc/rev_acc doc comment -- smooths raw
+    // per-address-cycle forward/reverse power samples across calls,
+    // same fix p2_receiver_loop already has for the same class of
+    // problem (real report: HL2's on-screen meter bouncing 0.5-1W/
+    // SWR 1.1-1.9 while an external wattmeter read a steady 5.0W).
+    let mut fwd_acc: u32 = 0;
+    let mut rev_acc: u32 = 0;
     while !stop.load(Ordering::Relaxed) {
         match socket.recv(&mut buf) {
             Ok(n) if n == PACKET_SIZE => {
@@ -3103,6 +3158,8 @@ fn receiver_loop(
                         &radio_mic_audio,
                         diversity_enabled.load(Ordering::Relaxed),
                         &diversity_main_raw_iq,
+                        &mut fwd_acc,
+                        &mut rev_acc,
                         &mut carry,
                         &mut frame_synced,
                     );
@@ -3189,6 +3246,7 @@ fn ozy_sender_loop(
             mox_on,
             false, // is_hermes_lite -- Ozy is never a HermesLite-family board
             disable_pa.load(Ordering::Relaxed),
+            false, // tune_active -- irrelevant when is_hermes_lite is false above
             oc_rx.load(Ordering::Relaxed),
             oc_tx.load(Ordering::Relaxed),
             rx_attenuation.load(Ordering::Relaxed) as u8,
@@ -3255,6 +3313,13 @@ fn ozy_receiver_loop(
     let mut buf = [0u8; ozy::EP6_READ_SIZE];
     let mut carry: Vec<u8> = Vec::new();
     let mut frame_synced = false;
+    // See parse_iq_stream's fwd_acc/rev_acc doc comment -- smooths raw
+    // per-address-cycle forward/reverse power samples across calls,
+    // same fix p2_receiver_loop already has for the same class of
+    // problem (real report: HL2's on-screen meter bouncing 0.5-1W/
+    // SWR 1.1-1.9 while an external wattmeter read a steady 5.0W).
+    let mut fwd_acc: u32 = 0;
+    let mut rev_acc: u32 = 0;
     // No PureSignal/diversity on Ozy (see start_protocol1_ozy_usb's doc
     // comment) -- parse_iq_stream needs somewhere to route samples it
     // WOULD send there, but ps_feedback_indices=None/diversity=false
@@ -3283,6 +3348,8 @@ fn ozy_receiver_loop(
                     &radio_mic_audio,
                     false,
                     &diversity_main_raw_iq,
+                    &mut fwd_acc,
+                    &mut rev_acc,
                     &mut carry,
                     &mut frame_synced,
                 );
@@ -3413,6 +3480,18 @@ fn parse_iq_stream(
     // `buffers[0]` itself with the combined result.
     diversity_enabled: bool,
     diversity_main_raw_iq: &Arc<Mutex<VecDeque<IqSample>>>,
+    // Persistent, caller-owned exponential moving average state for
+    // tx_forward_power/tx_reverse_power -- same fix p2_receiver_loop
+    // already has (see its own doc comment: "TX power cycling 35-55W
+    // ... while an external wattmeter showed a steady 100W", raw ADC
+    // noise sampled far too sparsely to average out on its own). P1's
+    // address-1/address-2 C&C replies recur far less often than P2's
+    // per-packet HP status, but the same 15/16-old + 1/16-new weighting
+    // still smooths a real report of an HL2's on-screen meter bouncing
+    // 0.5-1W/SWR 1.1-1.9 while an external wattmeter read a steady
+    // 5.0W/1.45:1.
+    fwd_acc: &mut u32,
+    rev_acc: &mut u32,
     // DIAGNOSTIC (Phase 1 -- protocol plumbing verification, see
     // receiver_loop's per-second summary): returns how many samples
     // this call routed into (ps_rx_feedback_iq, ps_tx_feedback_iq), so
@@ -3477,11 +3556,47 @@ fn parse_iq_stream(
         let c0 = frame[3];
         let address = (c0 >> 3) & 0x1F;
         if address == 1 {
-            let forward = u16::from_be_bytes([frame[6], frame[7]]);
-            tx_forward_power.store(forward as u32, Ordering::Relaxed);
+            let forward = u16::from_be_bytes([frame[6], frame[7]]) as u32;
+            // ROOT CAUSE FIX for a real HL2 report (meter settling at a
+            // steady but way-too-low ~1W vs an external wattmeter's
+            // steady 5.0W). A plain averaging filter (this project's
+            // and piHPSDR's own formula/constants were independently
+            // confirmed correct via rustyHPSDR reading the SAME
+            // hardware right) was the wrong tool: real captured data
+            // (temporary debug prints) showed the raw reading hitting
+            // ~3100 -- matching 5W almost exactly -- for several
+            // consecutive updates, then DECAYING smoothly down to
+            // ~250-300 over the next dozen or so, before snapping back
+            // to ~3100 and repeating, on a steady cycle, the whole time
+            // the external wattmeter read a rock-steady 5.0W. That's
+            // the signature of a peak-detector-with-decay circuit
+            // (typical for this kind of RF power sensing) discharging
+            // between refreshes, not a real fluctuation in output --
+            // any AVERAGING filter necessarily drags the result down
+            // toward those decay troughs. Fixed with peak-hold
+            // ballistics instead (matching how a real analog wattmeter
+            // handles exactly this): snap up immediately to a new
+            // higher reading, decay slowly otherwise. Started at /32
+            // (simulated against the captured sequence: held within
+            // ~2100-3150 vs. ~250-750 with plain averaging) but a real
+            // retest still showed a residual ~3.5-4W bounce against a
+            // steady 4.9W external reading -- tightened to /256 (same
+            // sequence: holds within ~4.1-4.6W-equivalent throughout
+            // the whole cycle). There's also a SEPARATE, independent
+            // smoothing layer in main.rs (ConnectedState::
+            // smoothed_fwd_power, a slow symmetric filter predating
+            // this fix, added for a different Two-Tone-related report)
+            // that could still be compounding on top of this -- if a
+            // slower decay here still doesn't fully close the gap,
+            // that's the next thing to check, not a further divisor
+            // bump here.
+            *fwd_acc = if forward >= *fwd_acc { forward } else { *fwd_acc - (*fwd_acc - forward) / 256 };
+            tx_forward_power.store(*fwd_acc, Ordering::Relaxed);
         } else if address == 2 {
-            let reverse = u16::from_be_bytes([frame[4], frame[5]]);
-            tx_reverse_power.store(reverse as u32, Ordering::Relaxed);
+            let reverse = u16::from_be_bytes([frame[4], frame[5]]) as u32;
+            // Same peak-hold reasoning as forward power just above.
+            *rev_acc = if reverse >= *rev_acc { reverse } else { *rev_acc - (*rev_acc - reverse) / 256 };
+            tx_reverse_power.store(*rev_acc, Ordering::Relaxed);
         } else if address == 0 {
             adc0_overload.store(frame[4] & 0x01 != 0, Ordering::Relaxed);
         } else if address == 4 {
@@ -3777,6 +3892,7 @@ fn start_protocol2(
     let stop_socket = socket.try_clone()?;
     // See RadioSession::disable_pa's doc comment.
     let disable_pa = Arc::new(AtomicBool::new(false));
+    let tune_active = Arc::new(AtomicBool::new(false));
     // See RadioSession::oc_rx/oc_tx's doc comments.
     let oc_rx = Arc::new(AtomicU8::new(0));
     let oc_tx = Arc::new(AtomicU8::new(0));
@@ -3944,6 +4060,7 @@ fn start_protocol2(
         adc,
         antenna,
         disable_pa,
+        tune_active,
         oc_rx,
         oc_tx,
         rx_attenuation,

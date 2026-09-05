@@ -1609,6 +1609,14 @@ impl eframe::App for HpsdrApp {
                     resolved_pa_gain_db(&connected.pa_calibration, freq_hz).to_bits(),
                     std::sync::atomic::Ordering::Relaxed,
                 );
+                // See RadioSession::tune_active's doc comment -- P1/
+                // HermesLite2-only (harmless no-op to also store this on
+                // every other board/protocol rather than special-casing
+                // it here, same reasoning as pa_gain_db just above).
+                connected
+                    .session
+                    .tune_active
+                    .store(connected.tune_active, std::sync::atomic::Ordering::Relaxed);
                 let sample_rate = connected.sample_rate;
                 let current_mode = connected.spectrum.mode();
                 let current_width = connected.spectrum.width_hz();
@@ -3658,11 +3666,39 @@ impl eframe::App for HpsdrApp {
                             // constant, closer to typical analog
                             // wattmeter ballistics -- still fast enough
                             // to track a real key-up ramp.
+                            //
+                            // ROOT CAUSE FIX for a real HL2 report (this
+                            // meter reading noticeably low vs. an external
+                            // wattmeter -- e.g. 4.5W shown here against a
+                            // steady 4.9W -- even after radio.rs's own
+                            // peak-hold fix for a real detector-decay
+                            // artifact on that board): `raw_fwd`/`raw_rev`
+                            // above are ALREADY peak-held (radio.rs
+                            // snaps up instantly, decays slowly), but this
+                            // symmetric EMA still lagged on the way UP,
+                            // re-introducing the same kind of "never
+                            // quite reaches the true peak" gap the
+                            // peak-hold fix eliminated underneath it.
+                            // Snap up immediately here too (matching that
+                            // same ballistics philosophy end to end);
+                            // only decay via the existing alpha on the
+                            // way down, so the Two-Tone fix above (which
+                            // was specifically about a value dropping
+                            // too abruptly, not rising too slowly) stays
+                            // intact.
                             const SMOOTHING_ALPHA: f32 = 0.045;
-                            connected.smoothed_fwd_power +=
-                                SMOOTHING_ALPHA * (raw_fwd as f32 - connected.smoothed_fwd_power);
-                            connected.smoothed_rev_power +=
-                                SMOOTHING_ALPHA * (raw_rev as f32 - connected.smoothed_rev_power);
+                            connected.smoothed_fwd_power = if raw_fwd as f32 >= connected.smoothed_fwd_power {
+                                raw_fwd as f32
+                            } else {
+                                connected.smoothed_fwd_power
+                                    + SMOOTHING_ALPHA * (raw_fwd as f32 - connected.smoothed_fwd_power)
+                            };
+                            connected.smoothed_rev_power = if raw_rev as f32 >= connected.smoothed_rev_power {
+                                raw_rev as f32
+                            } else {
+                                connected.smoothed_rev_power
+                                    + SMOOTHING_ALPHA * (raw_rev as f32 - connected.smoothed_rev_power)
+                            };
                             let (watts, _reverse_watts, swr) = power_watts_and_swr(
                                 connected.smoothed_fwd_power as u32,
                                 connected.smoothed_rev_power as u32,
@@ -6868,6 +6904,20 @@ fn default_max_tx_power_watts(board: Boards) -> u32 {
 /// reverse_watts, swr); SWR is clamped to a sane minimum of 1.0 rather
 /// than propagating NaN/negative results from a near-zero forward
 /// reading (e.g. right at PTT key-up before power has ramped).
+///
+/// REVERTED 2026-09-05: briefly changed HermesLite/HermesLite2's
+/// constant2 to 1.52 plus a +34 raw-ADC offset, sourced from piHPSDR's
+/// own C code ("a fit to the HL2FilterE3 data in Quisk" -- a SPECIFIC
+/// HL2 filter-board revision, not necessarily this one). Real evidence
+/// then contradicted it: the same real hardware, read by rustyHPSDR
+/// using the ORIGINAL constants below (3.3/1.4, no offset), matched an
+/// external wattmeter correctly. So the formula/constants were never
+/// the actual bug for this report -- the real cause is still open, see
+/// this project's own memory notes (hl2_tune_power_bit.md) for the
+/// full thread. Lesson: a more "authoritative-looking" reference isn't
+/// automatically correct for a DIFFERENT specific unit/revision --
+/// prefer a same-hardware, same-session comparison over reference
+/// authority when the two actually disagree.
 fn power_watts_and_swr(raw_forward: u32, raw_reverse: u32, board: Boards) -> (f32, f32, f32) {
     let (c1, c2): (f32, f32) = match board {
         Boards::Metis => (3.3, 0.09),
