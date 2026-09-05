@@ -52,9 +52,12 @@ fn main() {
     // mingw-w64-x86_64-fftw package ships a normal .pc file).
     let fftw_include_paths: Vec<std::path::PathBuf> = if target_env == "msvc" {
         let lib = vcpkg::find_package("fftw3")
-            .expect("Could not find fftw3 via vcpkg. Install it with: vcpkg install fftw3:x64-windows \
-                     -- and either set VCPKG_ROOT to your vcpkg checkout, or run `vcpkg integrate install` \
-                     once so it's found automatically.");
+            .expect("Could not find fftw3 via vcpkg. Install it with: vcpkg install fftw3:x64-windows-static-md \
+                     -- NOT x64-windows-static or plain x64-windows (see README's Windows/MSVC build \
+                     instructions for why -static-md specifically: it's the vcpkg crate's own actual \
+                     default whenever RUSTFLAGS=-Ctarget-feature=+crt-static/VCPKGRS_DYNAMIC aren't set, \
+                     which is the common case) -- and either set VCPKG_ROOT to your vcpkg checkout, or run \
+                     `vcpkg integrate install` once so it's found automatically.");
         lib.include_paths
     } else {
         let fftw = pkg_config::probe_library("fftw3")
