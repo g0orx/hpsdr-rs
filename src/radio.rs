@@ -1857,7 +1857,33 @@ fn pack_24(v: f32) -> [u8; 3] {
 /// every count (wrong width, wrong interleaving, missing the padding
 /// bytes entirely), which a radio's firmware would have no way to
 /// decode as valid TX audio.
-fn fill_tx_payload(frame: &mut [u8; USB_FRAME_SIZE], tx_iq: &Mutex<VecDeque<f32>>) {
+///
+/// ROOT CAUSE FIX for a real report (bad TX spectrum + non-decoding
+/// WSJT-X/TCI audio specifically at a non-48k P1 RX sample rate, e.g.
+/// 192k): this used to pop a "new" (i, q) pair from `tx_iq` on EVERY
+/// 8-byte slot unconditionally -- the same bug class already found and
+/// fixed once for the RX-audio-to-radio direction (see RxAudioPacer/
+/// fill_rx_audio_payload's own doc comments) but never applied here.
+/// `tx_iq` is filled by TxProcessor at a genuinely fixed 48kHz (P1's TX
+/// IQ rate is always 48000 regardless of the RX DDC rate -- see
+/// main.rs's duc_rate fix), while this function is called once per
+/// 8-byte slot at whatever cadence sender_loop's packet rate currently
+/// is, which tracks the RX sample rate. At anything other than exactly
+/// 48kHz/1 receiver, slots arrive faster than 48kHz-real content is
+/// produced, so unconditional popping drained the queue empty most of
+/// the time -- silence-padding (this function's own existing underrun
+/// behavior) filled in the rest, i.e. real TX audio was only present
+/// in a fraction of slots (e.g. 1 in 4 at 192k), guaranteed to sound
+/// broken regardless of anything upstream. Paced via `pacer`/
+/// `slots_per_sample` exactly like fill_rx_audio_payload -- same ratio,
+/// reused from the caller, since both are pacing a genuinely
+/// fixed-48kHz source against the same variable slot cadence.
+fn fill_tx_payload(
+    frame: &mut [u8; USB_FRAME_SIZE],
+    tx_iq: &Mutex<VecDeque<f32>>,
+    pacer: &mut TxIqPacer,
+    slots_per_sample: f64,
+) {
     let mut buf = tx_iq.lock().unwrap();
     let mut b = HEADER_SIZE;
     while b + 8 <= USB_FRAME_SIZE {
@@ -1865,10 +1891,16 @@ fn fill_tx_payload(frame: &mut [u8; USB_FRAME_SIZE], tx_iq: &Mutex<VecDeque<f32>
         frame[b + 1] = 0;
         frame[b + 2] = 0;
         frame[b + 3] = 0;
-        let i = buf.pop_front().unwrap_or(0.0);
-        let q = buf.pop_front().unwrap_or(0.0);
-        let i_sample = (i.clamp(-1.0, 1.0) * 32767.0) as i16;
-        let q_sample = (q.clamp(-1.0, 1.0) * 32767.0) as i16;
+        pacer.accum += 1.0;
+        if pacer.accum >= slots_per_sample {
+            pacer.accum -= slots_per_sample;
+            let i = buf.pop_front().unwrap_or(0.0);
+            let q = buf.pop_front().unwrap_or(0.0);
+            pacer.held_i = (i.clamp(-1.0, 1.0) * 32767.0) as i16;
+            pacer.held_q = (q.clamp(-1.0, 1.0) * 32767.0) as i16;
+        }
+        let i_sample = pacer.held_i;
+        let q_sample = pacer.held_q;
         frame[b + 4] = (i_sample >> 8) as u8;
         frame[b + 5] = i_sample as u8;
         frame[b + 6] = (q_sample >> 8) as u8;
@@ -1900,6 +1932,28 @@ struct RxAudioPacer {
 impl RxAudioPacer {
     fn new() -> Self {
         Self { accum: 0.0, held: 0 }
+    }
+}
+
+/// Same zero-order-hold pacing as RxAudioPacer, but for fill_tx_payload
+/// (mic/TCI TX audio going TO the radio) -- see that function's own doc
+/// comment for the full story: this exact class of bug (an 8-byte-slot
+/// cadence that tracks the RX ADC sample rate, popping a queue entry
+/// every slot regardless of whether the QUEUE is actually being filled
+/// at that same rate) was already found and fixed once for the RX-
+/// audio-to-radio direction, but fill_tx_payload itself never got the
+/// same treatment. Holds an (I, Q) PAIR together (unlike RxAudioPacer's
+/// single value) since each TX slot is one interleaved I/Q sample, not
+/// a single audio value.
+struct TxIqPacer {
+    accum: f64,
+    held_i: i16,
+    held_q: i16,
+}
+
+impl TxIqPacer {
+    fn new() -> Self {
+        Self { accum: 0.0, held_i: 0, held_q: 0 }
     }
 }
 
@@ -2050,6 +2104,7 @@ fn p1_send_preconfig_and_start(
     let mut pre_current_receiver: u8 = 0;
     let mut rotations = 0;
     let mut dummy_rx_audio_pacer = RxAudioPacer::new(); // send_rx_audio is false below -- never actually read
+    let mut dummy_tx_iq_pacer = TxIqPacer::new(); // mox is false below -- never actually read
     let dummy_adc = Arc::new(AtomicU32::new(0)); // ADC0 -- nothing keyed yet this early, see extra_frequencies_hz's identical reasoning below
     while rotations < PRE_CONFIG_ROTATIONS {
         let packet = p1_build_packet(
@@ -2077,6 +2132,7 @@ fn p1_send_preconfig_and_start(
             &[], // no extra receivers' ADCs active yet this early either -- diversity_enabled below still forces wire 1 to ADC1 regardless
             diversity_enabled,
             tx_iq,
+            &mut dummy_tx_iq_pacer,
             puresignal_enabled,
             tx_iq, // send_rx_audio is false below, so this is never actually read -- reusing tx_iq's Mutex just to satisfy the type, not a real audio source
             false, // send_rx_audio: never during startup config, nothing keyed yet
@@ -2172,6 +2228,13 @@ fn p1_build_packet(
     // its ADC (command 6) is forced to 1 regardless of extra_adcs[0].
     diversity_enabled: bool,
     tx_iq: &Mutex<VecDeque<f32>>,
+    // See fill_tx_payload's own doc comment -- paces TX IQ against the
+    // same fixed-48kHz-vs-variable-slot-cadence mismatch
+    // rx_audio_pacer/rx_audio_slots_per_sample already handle for the
+    // RX-audio-to-radio direction. Reuses rx_audio_slots_per_sample
+    // itself (see its own call site below) rather than a separate
+    // parameter, since both are pacing the identical ratio.
+    tx_iq_pacer: &mut TxIqPacer,
     // PureSignal: command 10 (0x24)'s C2 bit 0x40 -- see that command's
     // own doc comment below for what it does and why it matters.
     puresignal_enabled: bool,
@@ -2656,8 +2719,8 @@ fn p1_build_packet(
     // under-full or garbage payload going out while the
     // transmitter is actually keyed is worse than silence.
     if mox_on {
-        fill_tx_payload(&mut frame0, tx_iq);
-        fill_tx_payload(&mut frame1, tx_iq);
+        fill_tx_payload(&mut frame0, tx_iq, tx_iq_pacer, rx_audio_slots_per_sample);
+        fill_tx_payload(&mut frame1, tx_iq, tx_iq_pacer, rx_audio_slots_per_sample);
     } else if send_rx_audio {
         // Same 8-byte-per-sample slot fill_tx_payload uses while
         // transmitting, but for the receive side: local audio in
@@ -2737,6 +2800,7 @@ fn sender_loop(
     let mut ozy_command: u8 = 1;
     let mut current_receiver: u8 = 0;
     let mut rx_audio_pacer = RxAudioPacer::new();
+    let mut tx_iq_pacer = TxIqPacer::new();
 
     // Absolute-deadline pacing, not `thread::sleep(interval)` computed
     // fresh each iteration (which this loop used until now) -- same
@@ -2926,6 +2990,7 @@ fn sender_loop(
             &extra_adcs,
             now_diversity_enabled,
             &tx_iq,
+            &mut tx_iq_pacer,
             now_puresignal_enabled,
             &rx_audio_to_radio,
             send_rx_audio,
@@ -3215,6 +3280,7 @@ fn ozy_sender_loop(
     let mut ozy_command: u8 = 1;
     let mut current_receiver: u8 = 0;
     let mut rx_audio_pacer = RxAudioPacer::new();
+    let mut tx_iq_pacer = TxIqPacer::new();
     let mut next_send = Instant::now();
 
     while !stop.load(Ordering::Relaxed) {
@@ -3257,6 +3323,7 @@ fn ozy_sender_loop(
             &extra_adcs,
             false, // diversity -- out of scope for Ozy, see start_protocol1_ozy_usb's doc comment
             &tx_iq,
+            &mut tx_iq_pacer,
             false, // puresignal -- out of scope for Ozy, same reasoning
             &rx_audio_to_radio,
             send_rx_audio,

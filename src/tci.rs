@@ -957,6 +957,34 @@ fn handle_client(
     // would point at the RX pipeline itself, not networking).
     let mut audio_first_sent = false;
     let mut iq_first_sent = false;
+    // ROOT CAUSE FIX for a real report (WSJT-X RX audio "fuzzy"
+    // specifically over a Protocol 1 radio, never Protocol 2, on the
+    // SAME server code -- confirmed via a real Wireshark capture: the
+    // actual decoded audio content was clean when played back as a
+    // WAV file and re-fed into WSJT-X directly, ruling out any content
+    // corruption, but RxAudioStream message inter-arrival times showed
+    // real jitter, 36-56ms around a 42.67ms mean for 2048-sample/48kHz
+    // chunks, versus none of this loop's several independent 5ms-poll
+    // stages (spectrum.rs's own run() loop, spawn_audio_iq_broadcaster,
+    // and this loop's own read-timeout tick) doing anything to smooth
+    // that out -- each sends/forwards a chunk the INSTANT it's ready,
+    // so whatever jitter P1's own delivery has (plausibly more than
+    // P2's, given the very different wire structure) propagates
+    // straight through to the network. A real-time client turning
+    // network arrivals directly into audio (unlike a WAV file played
+    // back on a steady local clock) is exposed to that jitter as
+    // audible glitching. Fixed with absolute-deadline pacing on the
+    // SEND side (same pattern already used for P1/P2 TX packet pacing
+    // -- see radio.rs's sender_loop/p2_tx_iq_loop) -- next_audio_send
+    // advances by exactly one chunk's worth of wall-clock time
+    // regardless of small timing variance in when the queue actually
+    // has data ready, so the OUTGOING cadence stays metronomic even if
+    // the underlying production isn't. Falls behind gracefully (resyncs
+    // to now, matching the same fallback those references use) if the
+    // queue can't keep up rather than bursting to catch up.
+    let audio_chunk_interval =
+        Duration::from_secs_f64(MAX_AUDIO_SAMPLES_PER_MESSAGE as f64 / TCI_AUDIO_SAMPLE_RATE as f64);
+    let mut next_audio_send = Instant::now();
     // BUG FIX: a bad (garbage-value) pair used to be dropped outright
     // (`continue`, pushing nothing), which shortens tci_tx_audio's
     // effective timeline by one sample every time it fires -- confirmed
@@ -1244,7 +1272,21 @@ fn handle_client(
             // adds at most one chunk's worth (~42ms at 48kHz) of extra
             // latency, the same latency this size chunking already
             // implies for Thetis.
-            loop {
+            //
+            // Paced now (see next_audio_send's own doc comment above) --
+            // was an unconditional `loop` sending every complete chunk
+            // the INSTANT it became available, which is exactly what let
+            // upstream jitter (this loop's own 5ms poll granularity,
+            // stacked on spectrum.rs's/the broadcaster's own independent
+            // 5ms polls) reach the network unfiltered. Sends AT MOST one
+            // chunk per deadline -- if several intervals' worth backed
+            // up (the thread was blocked, a slow client write, etc.),
+            // this deliberately does NOT burst-send the backlog, same
+            // "resync to now rather than catch up" choice already made
+            // for P1/P2 TX pacing, since bursting here would just move
+            // the jitter problem rather than fix it.
+            let now = Instant::now();
+            if now >= next_audio_send {
                 let stereo: Option<Vec<(f32, f32)>> = {
                     let mut q = sink.audio.lock().unwrap();
                     if q.len() >= MAX_AUDIO_SAMPLES_PER_MESSAGE {
@@ -1253,49 +1295,54 @@ fn handle_client(
                         None
                     }
                 };
-                let Some(stereo) = stereo else { break };
-                // Genuinely stereo now (see DemodParams::binaural's doc
-                // comment) -- identical L/R pairs when binaural is off,
-                // the same as this project's own former mono-duplicated-
-                // to-stereo encoding produced, so this is a no-op change
-                // for that case. TCI's audio format is stereo either way
-                // (both the reference client library and rustyHPSDR's
-                // own confirmed-working server always declare
-                // channels=2).
-                // BUG FIX: `length` here used to be stereo.len() (frame-PAIR
-                // count), matching rustyHPSDR's own convention (confirmed
-                // working against TCI Remote). A real report of WSJT-X's
-                // waterfall/decode looking compressed/stretched over TCI
-                // audio led to checking github.com/ftl/tci (an independent
-                // Go client library) directly: its ParseBinaryMessage reads
-                // `data = make([]float32, msg.DataLength)`, i.e. DataLength
-                // is the RAW FLOAT COUNT (both channels included), not a
-                // frame-pair count -- exactly half of what this project was
-                // sending. A client following that convention (apparently
-                // WSJT-X, unlike TCI Remote) would read only half the
-                // intended samples per packet as "the whole chunk", which
-                // is exactly the timing distortion reported. Only the
-                // announced `length` value changes here -- the actual
-                // payload (`&stereo`) and its real sample count are
-                // untouched, so this doesn't affect the real audio
-                // content itself. The IQ stream below got the identical
-                // fix later, once a client hit the same issue there too
-                // -- see its own doc comment.
-                let msg = encode_binary_message(
-                    0,
-                    TCI_AUDIO_SAMPLE_RATE,
-                    BinaryMessageType::RxAudioStream,
-                    stereo.len() as u32 * 2,
-                    &stereo,
-                );
-                let result = ws.send(Message::Binary(msg.into()));
-                if send_is_fatal(&result) {
-                    logging.log(&format!("audio stream send failed, closing: {:?}", result.unwrap_err()));
-                    return;
-                }
-                if result.is_ok() && !audio_first_sent {
-                    audio_first_sent = true;
-                    logging.log("first audio data sent");
+                if let Some(stereo) = stereo {
+                    next_audio_send += audio_chunk_interval;
+                    if next_audio_send < now {
+                        next_audio_send = now; // fell behind -- resync, don't chase
+                    }
+                    // Genuinely stereo now (see DemodParams::binaural's doc
+                    // comment) -- identical L/R pairs when binaural is off,
+                    // the same as this project's own former mono-duplicated-
+                    // to-stereo encoding produced, so this is a no-op change
+                    // for that case. TCI's audio format is stereo either way
+                    // (both the reference client library and rustyHPSDR's
+                    // own confirmed-working server always declare
+                    // channels=2).
+                    // BUG FIX: `length` here used to be stereo.len() (frame-PAIR
+                    // count), matching rustyHPSDR's own convention (confirmed
+                    // working against TCI Remote). A real report of WSJT-X's
+                    // waterfall/decode looking compressed/stretched over TCI
+                    // audio led to checking github.com/ftl/tci (an independent
+                    // Go client library) directly: its ParseBinaryMessage reads
+                    // `data = make([]float32, msg.DataLength)`, i.e. DataLength
+                    // is the RAW FLOAT COUNT (both channels included), not a
+                    // frame-pair count -- exactly half of what this project was
+                    // sending. A client following that convention (apparently
+                    // WSJT-X, unlike TCI Remote) would read only half the
+                    // intended samples per packet as "the whole chunk", which
+                    // is exactly the timing distortion reported. Only the
+                    // announced `length` value changes here -- the actual
+                    // payload (`&stereo`) and its real sample count are
+                    // untouched, so this doesn't affect the real audio
+                    // content itself. The IQ stream below got the identical
+                    // fix later, once a client hit the same issue there too
+                    // -- see its own doc comment.
+                    let msg = encode_binary_message(
+                        0,
+                        TCI_AUDIO_SAMPLE_RATE,
+                        BinaryMessageType::RxAudioStream,
+                        stereo.len() as u32 * 2,
+                        &stereo,
+                    );
+                    let result = ws.send(Message::Binary(msg.into()));
+                    if send_is_fatal(&result) {
+                        logging.log(&format!("audio stream send failed, closing: {:?}", result.unwrap_err()));
+                        return;
+                    }
+                    if result.is_ok() && !audio_first_sent {
+                        audio_first_sent = true;
+                        logging.log("first audio data sent");
+                    }
                 }
             }
         }

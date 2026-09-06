@@ -1220,11 +1220,11 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
             // can still be used to disarm mid-session if
             // wanted; this just changes the default from off
             // to on rather than removing the control.
-            let duc_rate = if device.protocol == 2 {
-                192_000
-            } else {
-                settings.sample_rate as i32
-            };
+            // P1's TX IQ rate is a fixed 48000 regardless of the RX
+            // DDC rate -- see the identical fix's own doc comment at
+            // the live sample-rate-change call site further down for
+            // the full story (confirmed via piHPSDR's reference).
+            let duc_rate = if device.protocol == 2 { 192_000 } else { 48_000 };
             // Fed by TxHandle with the actual generated TX
             // IQ (not RX ADC samples) -- see
             // ConnectedState::tx_spectrum's doc comment.
@@ -5096,15 +5096,23 @@ impl eframe::App for HpsdrApp {
                                     let mut tx_enabled = connected.tx_enabled;
                                     if ui.checkbox(&mut tx_enabled, "Enable Transmit").changed() {
                                         if tx_enabled {
-                                            // P2 has a fixed DUC rate (matches the already-stubbed
-                                            // 192ksps in radio.rs's p2_tx_specific_packet); P1 has no
-                                            // separate DUC concept, so TX IQ must be produced at
-                                            // whatever the shared RX/TX clock is currently set to.
-                                            let duc_rate = if connected.device.protocol == 2 {
-                                                192_000
-                                            } else {
-                                                connected.sample_rate as i32
-                                            };
+                                            // ROOT CAUSE FIX for a real report (bad TX spectrum +
+                                            // excess power bouncing specifically at a non-48k P1
+                                            // RX sample rate, e.g. 192k): P1's TX IQ rate is NOT
+                                            // "whatever the shared RX/TX clock is currently set
+                                            // to" -- confirmed via piHPSDR's own reference
+                                            // (transmitter.c's protocol/rate switch): Protocol 1's
+                                            // iq_output_rate is a FIXED 48000 always, completely
+                                            // independent of the RX DDC rate (which alone goes up
+                                            // to 384k+ for panadapter/wideband display purposes --
+                                            // TX was never extended past 48k for the classic
+                                            // protocol). Feeding a HIGHER duc_rate in here made
+                                            // TxProcessor generate TX IQ several times faster than
+                                            // the radio's TX firmware actually expects. P2's own
+                                            // fixed 192ksps (matches the already-stubbed value in
+                                            // radio.rs's p2_tx_specific_packet) was already correct
+                                            // and is unchanged.
+                                            let duc_rate = if connected.device.protocol == 2 { 192_000 } else { 48_000 };
                                             // Tear down the old tx_spectrum before creating a
                                             // replacement -- same reasoning as the RX
                                             // SpectrumHandle rebuild in change_sample_rate.
