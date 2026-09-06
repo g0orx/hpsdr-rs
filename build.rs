@@ -88,6 +88,42 @@ fn main() {
             let lib_dir = std::path::Path::new(&npcap_sdk).join("Lib").join("x64");
             println!("cargo:rustc-link-search=native={}", lib_dir.display());
         }
+        // ROOT CAUSE FIX for a real report: the built .exe refused to
+        // even LAUNCH on a machine that had only the Npcap SDK (for
+        // building, above) but not the separate Npcap application
+        // itself installed -- `STATUS_DLL_NOT_FOUND` immediately on
+        // start, before any of this project's own code runs at all.
+        // Packet.dll (see the doc comment above -- pnet_datalink's own
+        // `#[link(name = "Packet")]`) is a normal, non-delay-loaded
+        // import by default, which Windows resolves for EVERY import
+        // at process-launch time, not just when the function is
+        // actually called -- so this project's raw-Ethernet firmware-
+        // upload feature (bootloader.rs, used rarely) was silently
+        // forcing every Windows user to have Npcap's runtime installed
+        // just to open the app at all, whether they ever touch that
+        // feature or not.
+        //
+        // Fixed (MSVC only -- `/DELAYLOAD` is an MSVC linker feature,
+        // not available the same way under MinGW-w64) by delay-loading
+        // Packet.dll: this makes Windows resolve it lazily, on the
+        // first actual call into it, instead of at startup. pnet_
+        // datalink's OTHER Windows import, iphlpapi.dll, is a standard
+        // Windows system DLL always present on any real Windows
+        // install, so it doesn't need this treatment.
+        //
+        // UNVERIFIED end-to-end on a real Windows build (no Windows
+        // access in this development environment) -- if the app still
+        // fails to launch without Npcap installed after this, or if
+        // linking itself fails with an unresolved `delayimp`/`__delay
+        // LoadHelper2` symbol, that means either delayimp.lib isn't
+        // being found (should be included with any MSVC/Visual Studio
+        // install -- same toolchain requirement as the C++ Build Tools
+        // this project already needs) or the exact linker argument
+        // syntax rustc passes through needs adjusting.
+        if target_env == "msvc" {
+            println!("cargo:rustc-link-arg=/DELAYLOAD:Packet.dll");
+            println!("cargo:rustc-link-lib=delayimp");
+        }
     }
 
     let mut build = cc::Build::new();
