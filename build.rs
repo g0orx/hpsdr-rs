@@ -32,6 +32,26 @@
 */
 
 fn main() {
+    // ROOT CAUSE FIX for a real report ("cannot open input file
+    // Packet.lib" persisting even after correctly setting
+    // NPCAP_SDK_DIR): once a build script emits ANY `rerun-if-changed`
+    // line (this one does, for the vendored C source dirs below).
+    // Cargo stops using its default "rerun on any change" behavior and
+    // only reruns when something on that explicit watch list changes
+    // -- environment variables included, unless separately declared
+    // here. Without this, setting NPCAP_SDK_DIR (or VCPKG_ROOT) AFTER
+    // an earlier failed build wouldn't trigger a rebuild at all --
+    // Cargo would just replay the stale, cached failure from before
+    // the variable existed, exactly matching two independent real
+    // reports (both only got unstuck via `cargo clean`, which forces a
+    // full rebuild regardless of this bug -- masking it rather than
+    // fixing it). Emitted unconditionally (cheap, harmless on
+    // platforms/configs that never read these) rather than only
+    // inside the Windows-specific blocks below, so this can't be
+    // missed if either variable's read site ever moves.
+    println!("cargo:rerun-if-env-changed=NPCAP_SDK_DIR");
+    println!("cargo:rerun-if-env-changed=VCPKG_ROOT");
+
     let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
     // "msvc" or "gnu" on Windows (MinGW-w64); empty/irrelevant elsewhere.
     let target_env = std::env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default();
