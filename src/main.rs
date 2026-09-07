@@ -1156,9 +1156,6 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
             if let Some(v) = cfg.agc_slope_db {
                 spectrum.set_agc_slope_db(v);
             }
-            if let Some(v) = cfg.agc_thresh_db {
-                spectrum.set_agc_thresh_db(v);
-            }
             if let Some(v) = cfg.noise_blanker {
                 spectrum.set_noise_blanker(v);
             }
@@ -4758,20 +4755,6 @@ impl eframe::App for HpsdrApp {
                                             connected.spectrum.set_agc_slope_db(slope);
                                             settings_changed = true;
                                         }
-
-                                        let mut thresh = agc_params.agc_thresh_db;
-                                        ui.label("Thresh:");
-                                        if scroll_slider_f64(
-                                            ui,
-                                            &mut connected.slider_scroll_accum,
-                                            &mut thresh,
-                                            -140.0..=0.0,
-                                            2.0,
-                                            " dB",
-                                        ) {
-                                            connected.spectrum.set_agc_thresh_db(thresh);
-                                            settings_changed = true;
-                                        }
                                     });
 
                                     ui.separator();
@@ -6013,7 +5996,6 @@ impl eframe::App for HpsdrApp {
                                 agc_hang_ms: agc_params.agc_hang_ms,
                                 agc_top_db: agc_params.agc_top_db,
                                 agc_slope_db: agc_params.agc_slope_db,
-                                agc_thresh_db: agc_params.agc_thresh_db,
                                 noise_blanker: agc_params.noise_blanker,
                                 nb_threshold: agc_params.nb_threshold,
                                 noise_reduction: agc_params.noise_reduction,
@@ -6057,7 +6039,6 @@ impl eframe::App for HpsdrApp {
                         agc_hang_ms: Some(agc_params_now.agc_hang_ms),
                         agc_top_db: Some(agc_params_now.agc_top_db),
                         agc_slope_db: Some(agc_params_now.agc_slope_db),
-                        agc_thresh_db: Some(agc_params_now.agc_thresh_db),
                         noise_blanker: Some(agc_params_now.noise_blanker),
                         nb_threshold: Some(agc_params_now.nb_threshold),
                         noise_reduction: Some(agc_params_now.noise_reduction),
@@ -7937,13 +7918,6 @@ fn render_extra_receiver_settings(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceive
                     rx.spectrum.set_agc_slope_db(slope);
                     rx.settings_dirty.store(true, Ordering::Relaxed);
                 }
-
-                let mut thresh = agc_params.agc_thresh_db;
-                ui.label("Thresh:");
-                if scroll_slider_f64(ui, &mut rx.slider_scroll_accum, &mut thresh, -140.0..=0.0, 2.0, " dB") {
-                    rx.spectrum.set_agc_thresh_db(thresh);
-                    rx.settings_dirty.store(true, Ordering::Relaxed);
-                }
             });
 
             ui.separator();
@@ -8177,7 +8151,6 @@ fn spawn_extra_receiver(
         spectrum.set_agc_hang_ms(s.agc_hang_ms);
         spectrum.set_agc_top_db(s.agc_top_db);
         spectrum.set_agc_slope_db(s.agc_slope_db);
-        spectrum.set_agc_thresh_db(s.agc_thresh_db);
         spectrum.set_noise_blanker(s.noise_blanker);
         spectrum.set_nb_threshold(s.nb_threshold);
         spectrum.set_noise_reduction(s.noise_reduction);
@@ -8295,7 +8268,6 @@ fn change_sample_rate(connected: &mut ConnectedState, new_rate: u32) {
     spectrum.set_agc_hang_ms(agc_params.agc_hang_ms);
     spectrum.set_agc_top_db(agc_params.agc_top_db);
     spectrum.set_agc_slope_db(agc_params.agc_slope_db);
-    spectrum.set_agc_thresh_db(agc_params.agc_thresh_db);
     spectrum.set_noise_blanker(agc_params.noise_blanker);
     spectrum.set_nb_threshold(agc_params.nb_threshold);
     spectrum.set_noise_reduction(agc_params.noise_reduction);
@@ -8451,7 +8423,6 @@ fn change_extra_receiver_sample_rate(rx: &mut ExtraReceiver, new_rate: u32) {
     spectrum.set_agc_hang_ms(agc_params.agc_hang_ms);
     spectrum.set_agc_top_db(agc_params.agc_top_db);
     spectrum.set_agc_slope_db(agc_params.agc_slope_db);
-    spectrum.set_agc_thresh_db(agc_params.agc_thresh_db);
     spectrum.set_noise_blanker(agc_params.noise_blanker);
     spectrum.set_nb_threshold(agc_params.nb_threshold);
     spectrum.set_noise_reduction(agc_params.noise_reduction);

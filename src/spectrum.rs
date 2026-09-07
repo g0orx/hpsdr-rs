@@ -315,13 +315,12 @@ pub struct DemodParams {
     pub gain: f32,
     pub agc: Agc,
     // Units assumed (not confirmed against your reference): attack/decay/
-    // hang in milliseconds, top/slope/thresh in dB. Tune by ear/meter.
+    // hang in milliseconds, top/slope in dB. Tune by ear/meter.
     pub agc_attack_ms: i32,
     pub agc_decay_ms: i32,
     pub agc_hang_ms: i32,
     pub agc_top_db: f64,
     pub agc_slope_db: i32,
-    pub agc_thresh_db: f64,
     /// NB (ANB) vs. NB2 (NOB) vs. off -- mutually exclusive, see
     /// NoiseBlanker's doc comment. External to the RXA chain: whichever
     /// stage is active runs on the raw ADC-rate IQ before fexchange0,
@@ -411,7 +410,6 @@ impl Default for DemodParams {
             agc_hang_ms: 500,
             agc_top_db: 100.0,
             agc_slope_db: 35,
-            agc_thresh_db: -100.0,
             // NB/NR off by default, same reasoning as AGC above --
             // these reshape the signal in ways that can surprise a
             // user who didn't ask for them; opt-in from the main panel.
@@ -499,7 +497,7 @@ struct SpectrumAnalyzer {
     last_mode: Option<Mode>,
     last_passband: Option<(f64, f64)>,
     last_agc: Option<Agc>,
-    last_agc_params: Option<(i32, i32, i32, f64, i32, f64)>,
+    last_agc_params: Option<(i32, i32, i32, f64, i32)>,
     last_nb_enabled: Option<NoiseBlanker>,
     last_nb_threshold: Option<f64>,
     last_nr_enabled: Option<NoiseReduction>,
@@ -1008,22 +1006,28 @@ impl SpectrumAnalyzer {
             params.agc_hang_ms,
             params.agc_top_db,
             params.agc_slope_db,
-            params.agc_thresh_db,
         );
         if self.last_agc_params != Some(agc_params) {
-            let (attack_ms, decay_ms, hang_ms, top_db, slope_db, thresh_db) = agc_params;
+            let (attack_ms, decay_ms, hang_ms, top_db, slope_db) = agc_params;
             unsafe {
                 wdsp::SetRXAAGCAttack(self.channel, attack_ms);
                 wdsp::SetRXAAGCDecay(self.channel, decay_ms);
                 wdsp::SetRXAAGCHang(self.channel, hang_ms);
                 wdsp::SetRXAAGCTop(self.channel, top_db);
                 wdsp::SetRXAAGCSlope(self.channel, slope_db);
-                // size/rate: not user-exposed -- their exact meaning
-                // (likely AGC lookup-table size and processing rate)
-                // isn't confirmed against your reference, so passing
-                // plausible fixed values tied to our own buffer/DSP
-                // rate rather than guessing something tunable.
-                wdsp::SetRXAAGCThresh(self.channel, thresh_db, BUFFER_SIZE as f64, DSP_RATE as f64);
+                // Deliberately NOT calling SetRXAAGCThresh here (it used
+                // to be, bundled with the rest of this tuple): it writes
+                // to the exact same internal agc.p->max_gain field as
+                // SetRXAAGCTop, via a completely different (threshold +
+                // noise_offset -based) formula, unconditionally
+                // clobbering whatever SetRXAAGCTop had just set two
+                // lines above -- since this whole tuple is edge-detected
+                // as one unit, that clobber fired on every AGC-params
+                // change, including changes to Top itself, making the
+                // "AGC Gain" slider have no perceptible effect. Neither
+                // piHPSDR's (receiver.c) nor rustyHPSDR's AGC code calls
+                // SetRXAAGCThresh at all -- only SetRXAAGCTop -- so this
+                // matches the reference behavior.
             }
             self.last_agc_params = Some(agc_params);
         }
@@ -1640,9 +1644,6 @@ impl SpectrumHandle {
     }
     pub fn set_agc_slope_db(&self, v: i32) {
         self.demod_params.lock().unwrap().agc_slope_db = v.max(0);
-    }
-    pub fn set_agc_thresh_db(&self, v: f64) {
-        self.demod_params.lock().unwrap().agc_thresh_db = v;
     }
 
     pub fn noise_blanker(&self) -> NoiseBlanker {

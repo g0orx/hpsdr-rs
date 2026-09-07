@@ -45,7 +45,6 @@ pub struct Config {
     pub agc_hang_ms: Option<i32>,
     pub agc_top_db: Option<f64>,
     pub agc_slope_db: Option<i32>,
-    pub agc_thresh_db: Option<f64>,
     pub db_low: Option<f32>,
     pub db_high: Option<f32>,
     /// "Auto" mode for db_low -- see ConnectedState::db_low_auto's doc
@@ -378,7 +377,6 @@ pub struct ExtraReceiverConfig {
     pub agc_hang_ms: i32,
     pub agc_top_db: f64,
     pub agc_slope_db: i32,
-    pub agc_thresh_db: f64,
     pub db_low: f32,
     pub db_high: f32,
     pub waterfall_db_low: f32,
