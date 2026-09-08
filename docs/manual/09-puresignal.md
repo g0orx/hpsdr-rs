@@ -22,7 +22,14 @@ maximum count is 2 lower than the radio's full capacity on any such radio.
 Once enabled (and TX armed), the rest of this tab's controls appear:
 
 - **Running (continuous auto-calibrate)** checkbox.
-- **Calibrate Now** -- runs one manual calibration pass immediately.
+- **OneShot** -- applies the last good correction table instead of
+  continuing to relearn. Calibrate with Two Tone (envelope-rich) first,
+  then enable OneShot before running constant-envelope digital modes
+  (FT8 etc.) -- their TX envelope can't sweep the full amplitude range a
+  correction table needs to keep relearning from, so Running above will
+  never settle on that traffic.
+- **Calibrate Now** -- runs one manual calibration pass on top of Running
+  above, e.g. after changing drive or band.
 - **Feedback level** -- a colored readout of the feedback receiver's signal
   strength: red below 90 (too weak), yellow 90-127, green 128-181 (ideal),
   blue 182-256, red above 256 (too strong). Despite the "ideal" range, this
@@ -30,6 +37,19 @@ Once enabled (and TX armed), the rest of this tab's controls appear:
   confirmed working well outside it, as long as HW Peak (below) is right.
 - **Correcting** -- yes/no, turns green once PureSignal is actively
   applying correction.
+- **State** -- WDSP's own live calibration-state-machine value, shown as
+  text (`RESET`, `WAIT`, `MOXDELAY`, `SETUP`, `COLLECT`, `MOXCHECK`,
+  `CALC`, `DELAY`, `STAYON`, `TURNON`), matching piHPSDR/deskHPSDR's own
+  PureSignal dialog. With Running enabled and MOX held, watching this
+  cycle through `SETUP`/`COLLECT`/`CALC` on its own (without needing to
+  press Calibrate Now) confirms continuous auto-calibrate is genuinely
+  retrying rather than stuck.
+- **Curve fit status** -- only shown while not Correcting and something's
+  nonzero. Five hex codes (rx-scale/magnitude/cos-phase/sin-phase/solution
+  check) identifying which stage of the correction-table fit failed. A
+  nonzero code often reflects a real limit of the feedback signal itself
+  (e.g. too little SNR at low drive for the calibration signal in use)
+  rather than a bug -- try adjusting attenuation or drive first.
 - **Measured peak TX** -- the actual envelope peak PureSignal is currently
   measuring.
 - **Feedback Attenuation** (non-HermesLite boards) -- 0-31 dB, adjust to
@@ -37,6 +57,10 @@ Once enabled (and TX armed), the rest of this tab's controls appear:
   [Settings: TX](07-settings-tx.md)'s **TX ADC0 Attenuation** -- it isn't
   PureSignal-specific, it protects ADC0 from this radio's own TX leakage
   generally, PureSignal or not.
+- **Auto Attenuate (Two Tone)** (non-HermesLite boards) -- periodically
+  nudges Feedback Attenuation toward a feedback level of ~152, then
+  re-calibrates, so you don't have to tune it by hand. Needs Two Tone (or
+  other PS-driving TX audio) and MOX active to have anything to act on.
 - **HW Peak** -- 0.0-1.0. See below; this is the setting that actually
   matters most.
 - **MOX Delay**, **Loop Delay**, **TX Delay** -- advanced timing

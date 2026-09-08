@@ -37,10 +37,12 @@ columns:
 Click anywhere on a row to select it -- the whole row highlights. Only
 **Available** radios can be selected and started; a radio already **In Use**
 (by another client, or another instance of this app) is shown but disabled.
+Double-clicking an **Available** row starts it immediately, same as
+selecting it and pressing **Start**.
 
 The first **Available** radio in the list is selected automatically as
 soon as results land (skipping over any radio already **In Use**), so you
-can usually just click **Start**.
+can usually just click **Start** -- or double-click that row.
 
 **Rediscover** clears the current list and scans again -- useful if your
 radio was slow to respond or you just powered it on.

@@ -58,6 +58,15 @@ streaming), both directly and through TCI Remote Compactor.
   actually use).
 - Same **Start**/**Stop**/status/logging behavior as rigctl above (logs to
   `tci_log.txt`).
+- **Mute local audio output while TCI is running** -- hpsdr-rs normally
+  streams RX audio to both its own local audio device and TCI at the same
+  time. If that local device is *also* independently picked up by your TCI
+  client (e.g. a virtual audio cable left over from before TCI was set
+  up), the client receives the same audio twice -- once via TCI, once via
+  the device -- which shows up as a doubled/offset waterfall segment and
+  fuzzy-sounding decodes. Enable this to mute only the local device output
+  while TCI is actually running; TCI clients keep receiving audio
+  normally either way.
 
 ### TCI Remote
 
