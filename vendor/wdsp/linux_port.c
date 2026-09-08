@@ -25,6 +25,20 @@ john.d.melton@googlemail.com
 
 */
 
+// BUG FIX (2026-09-08, real Windows build failure -- "cannot find
+// semaphore.h"): this whole file's content, including these includes,
+// is Linux/macOS-only POSIX shims for Win32 APIs -- on Windows the
+// real Win32 APIs are used directly instead (see comm.h's own
+// `#if defined(linux) || defined(__APPLE__)` branch). linux_port.h
+// itself already guards its entire content the same way, but this
+// file's own `#if` used to start AFTER these includes, so
+// <semaphore.h> (a POSIX-only header, no equivalent shipped with
+// MSVC) was being compiled unconditionally even on Windows, where
+// none of the rest of this file's content is even reachable. Moved
+// the guard up to wrap the includes too, so this whole translation
+// unit is empty on Windows, matching linux_port.h.
+#if defined(linux) || defined(__APPLE__)
+
 #include <errno.h>
 #include <inttypes.h>
 #include <semaphore.h>
@@ -38,8 +52,6 @@ john.d.melton@googlemail.com
 * Linux Port Utilities                                        *
 *                                                   *
 ********************************************************************************************************/
-
-#if defined(linux) || defined(__APPLE__)
 
 void *wdsp_aligned_malloc(size_t size, size_t alignment) {
   void *ptr = NULL;
