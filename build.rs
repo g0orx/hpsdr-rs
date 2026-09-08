@@ -4,14 +4,17 @@
     from rustyHPSDR's own build.rs, which built the same source tree on
     both Linux and Windows (MSYS2/MinGW-w64).
 
-    vendor/libspecbleach and vendor/rnnoise are built alongside WDSP too,
-    backing its NR4 ("SBNR") and NR3 ("RNNR") noise-reduction stages
-    respectively -- confirmed (2026-09-08, re-porting from a newer WDSP
-    2.10 revision after the first 2026-09-07 port from an incomplete
-    snapshot briefly dropped them) that both stages coexist alongside
-    the newer built-in neural-net stage ("NNR", vendor/wdsp/nnr.c +
-    nnet.c/nnio.c + two compiled-in trained models) rather than being
-    replaced by it -- see memory/wdsp_210_port.md.
+    vendor/libspecbleach and vendor/rnnoise (which backed WDSP's NR4
+    "SBNR" and NR3 "RNNR" noise-reduction stages) are NOT built --
+    removed entirely (2026-09-08), along with the real DSP work inside
+    vendor/wdsp/rnnr.c/sbnr.c that called into them (now inert stubs,
+    see those files' own header comments). Neither stage was ever
+    enabled by any Rust code in this project -- WDSP's own built-in
+    neural-net stage ("NNR", vendor/wdsp/nnr.c + nnet.c/nnio.c + two
+    compiled-in trained models) is what's actually wired up to the UI
+    (labeled "NNR", not "NR3", to avoid confusion with the removed
+    RNNoise-backed stage -- see spectrum.rs's NoiseReduction doc
+    comment) -- see memory/wdsp_210_port.md for the full history.
 
     Confirmed viable cross-platform by reading the vendored source
     directly: wdsp/comm.h and wdsp/linux_port.h branch on
@@ -156,42 +159,6 @@ fn main() {
 
     let mut build = cc::Build::new();
     build.files([
-        "vendor/libspecbleach/src/processors/specbleach_adenoiser.c",
-        "vendor/libspecbleach/src/processors/specbleach_denoiser.c",
-        "vendor/libspecbleach/src/processors/adaptivedenoiser/adaptive_denoiser.c",
-        "vendor/libspecbleach/src/processors/denoiser/spectral_denoiser.c",
-        "vendor/libspecbleach/src/shared/stft/stft_windows.c",
-        "vendor/libspecbleach/src/shared/stft/fft_transform.c",
-        "vendor/libspecbleach/src/shared/stft/stft_buffer.c",
-        "vendor/libspecbleach/src/shared/stft/stft_processor.c",
-        "vendor/libspecbleach/src/shared/noise_estimation/noise_estimator.c",
-        "vendor/libspecbleach/src/shared/noise_estimation/noise_profile.c",
-        "vendor/libspecbleach/src/shared/noise_estimation/adaptive_noise_estimator.c",
-        "vendor/libspecbleach/src/shared/utils/general_utils.c",
-        "vendor/libspecbleach/src/shared/utils/spectral_features.c",
-        "vendor/libspecbleach/src/shared/utils/spectral_trailing_buffer.c",
-        "vendor/libspecbleach/src/shared/utils/denoise_mixer.c",
-        "vendor/libspecbleach/src/shared/utils/spectral_utils.c",
-        "vendor/libspecbleach/src/shared/gain_estimation/gain_estimators.c",
-        "vendor/libspecbleach/src/shared/post_estimation/spectral_whitening.c",
-        "vendor/libspecbleach/src/shared/post_estimation/noise_floor_manager.c",
-        "vendor/libspecbleach/src/shared/post_estimation/postfilter.c",
-        "vendor/libspecbleach/src/shared/pre_estimation/absolute_hearing_thresholds.c",
-        "vendor/libspecbleach/src/shared/pre_estimation/spectral_smoother.c",
-        "vendor/libspecbleach/src/shared/pre_estimation/noise_scaling_criterias.c",
-        "vendor/libspecbleach/src/shared/pre_estimation/critical_bands.c",
-        "vendor/libspecbleach/src/shared/pre_estimation/masking_estimator.c",
-        "vendor/libspecbleach/src/shared/pre_estimation/transient_detector.c",
-        "vendor/rnnoise/src/denoise.c",
-        "vendor/rnnoise/src/celt_lpc.c",
-        "vendor/rnnoise/src/kiss_fft.c",
-        "vendor/rnnoise/src/nnet.c",
-        "vendor/rnnoise/src/nnet_default.c",
-        "vendor/rnnoise/src/parse_lpcnet_weights.c",
-        "vendor/rnnoise/src/pitch.c",
-        "vendor/rnnoise/src/rnn.c",
-        "vendor/rnnoise/src/rnnoise_data.c",
-        "vendor/rnnoise/src/rnnoise_tables.c",
         "vendor/wdsp/calculus.c",
         "vendor/wdsp/emnr.c",
         "vendor/wdsp/icfir.c",
@@ -258,12 +225,14 @@ fn main() {
         "vendor/wdsp/matchedCW.c",
         "vendor/wdsp/sender.c",
         "vendor/wdsp/zetaHat.c",
-        // RNNoise-backed (NR3) and libspecbleach-backed (NR4) noise
-        // reduction -- confirmed present (2026-09-08) alongside the new
-        // NNR stage below, not replaced by it: the initial WDSP 2.10
-        // source drop this project first ported from (2026-09-07)
-        // simply omitted rnnr.c/sbnr.c, an incomplete snapshot, not an
-        // upstream removal -- see memory/wdsp_210_port.md.
+        // Still built -- RXA.c creates an instance of each unconditionally
+        // -- but stubbed out (2026-09-08) to an inert passthrough with no
+        // external library dependency, since neither stage is ever
+        // enabled by any Rust code here. See these two files' own header
+        // comments and memory/wdsp_210_port.md for the full history
+        // (they briefly backed real RNNoise/libspecbleach-based NR3/NR4
+        // noise reduction after the WDSP 2.10 re-port, alongside the new
+        // NNR stage below -- since removed as genuinely unused).
         "vendor/wdsp/rnnr.c",
         "vendor/wdsp/sbnr.c",
         // Added by the WDSP 2.10 port (2026-09-07): a new built-in
@@ -292,25 +261,7 @@ fn main() {
         "vendor/wdsp/reshb.c",
     ]);
 
-    // Headers live flat in include/ now (specbleach_adenoiser.h etc,
-    // no "specbleach/" subdirectory) -- matches the newer libspecbleach
-    // synced in from deskHPSDR's own WDSP 2.10 revision (2026-09-08),
-    // whose sbnr.c does `#include <specbleach_adenoiser.h>` bare.
-    build.include("vendor/libspecbleach/include");
-    build.include("vendor/libspecbleach/src");
-    build.include("vendor/libspecbleach/src/processors");
-    build.include("vendor/libspecbleach/src/processors/adaptivedenoiser");
-    build.include("vendor/libspecbleach/src/processors/denoiser");
-    build.include("vendor/libspecbleach/src/shared/stft");
-    build.include("vendor/libspecbleach/src/shared/noise_estimation");
-    build.include("vendor/libspecbleach/src/shared");
-    build.include("vendor/libspecbleach/src/shared/utils");
-    build.include("vendor/libspecbleach/src/shared/gain_estimation");
-    build.include("vendor/libspecbleach/src/shared/post_estimation");
-    build.include("vendor/libspecbleach/src/shared/pre_estimation");
     build.include("vendor/wdsp");
-    build.include("vendor/rnnoise/src");
-    build.include("vendor/rnnoise/include");
 
     // Same flags rustyHPSDR's own build.rs uses -- MinGW-w64's GCC
     // accepts all of these identically to Linux GCC/Clang, so no
@@ -388,6 +339,4 @@ fn main() {
     }
 
     println!("cargo:rerun-if-changed=vendor/wdsp");
-    println!("cargo:rerun-if-changed=vendor/libspecbleach");
-    println!("cargo:rerun-if-changed=vendor/rnnoise");
 }

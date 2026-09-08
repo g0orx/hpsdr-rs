@@ -25,27 +25,23 @@ The author can be reached by email at
 
 mw0lge@grange-lane.co.uk
 
-This code is based on code and ideas from  : https://github.com/vu3rdd/wdsp
-and and uses libspecbleach
-https://github.com/lucianodato/libspecbleach
+STUBBED (2026-09-08, see this project's memory/wdsp_210_port.md and
+sbnr.h's own updated header comment): the vendored libspecbleach
+library this file used to call into (specbleach_adaptive_initialize/
+process/free/load_parameters) has been removed from this project --
+this noise-reduction stage is created but never enabled anywhere here
+(no Rust code calls SetRXASBNRRun with a nonzero value; WDSP's built-
+in neural-net NNR stage, `nnr.c`, is what's actually wired up to the
+UI). Every function below keeps its original signature so RXA.c and
+everything else that references `SBNR`/these functions needed no
+changes -- only the real DSP work (which was dead code, exercised by
+nothing) is gone. The per-parameter setters (SetRXASBNRreductionAmount
+etc.) still store their values on the struct (harmless, never read by
+anything now) rather than being removed, to keep this file's public
+API surface identical to upstream.
 */
-//
-//============================================================================================//
-// Dual-Licensing Statement (Applies Only to Author's Contributions, Richard Samphire MW0LGE) //
-// ------------------------------------------------------------------------------------------ //
-// For any code originally written by Richard Samphire MW0LGE, or for any modifications     //
-// made by him, the copyright holder for those portions (Richard Samphire) reserves the     //
-// right to use, license, and distribute such code under different terms, including       //
-// closed-source and proprietary licences, in addition to the GNU General Public License    //
-// granted above. Nothing in this statement restricts any rights granted to recipients under  //
-// the GNU GPL. Code contributed by others (not Richard Samphire) remains licensed under    //
-// its original terms and is not affected by this dual-licensing statement in any way.      //
-// Richard Samphire can be reached by email at :  mw0lge@grange-lane.co.uk            //
-//============================================================================================//
 
 #define _CRT_SECURE_NO_WARNINGS
-
-#include <specbleach_adenoiser.h>
 
 #include "comm.h"
 
@@ -67,7 +63,7 @@ SBNR create_sbnr(int run, int position, int size, double *in, double *out, int r
   a->run = run;
   a->position = position;
   a->rate = rate;
-  a->st = specbleach_adaptive_initialize(a->rate, 20); //20ms frame size, documentation recommends 20-100
+  a->st = NULL;
   a->in = in;
   a->out = out;
   a->reduction_amount = 10.F;
@@ -83,44 +79,20 @@ SBNR create_sbnr(int run, int position, int size, double *in, double *out, int r
 }
 
 void setSamplerate_sbnr(SBNR a, int rate) {
-  specbleach_adaptive_free(a->st);
   a->rate = rate;
-  a->st = specbleach_adaptive_initialize(a->rate, 20); //20ms frame size, documentation recommends 20-100
 }
 
 void xsbnr(SBNR a, int pos) {
-  if (a->run && pos == a->position) {
-    SpectralBleachAdaptiveParameters parameters =
-    (SpectralBleachAdaptiveParameters) {
-      .residual_listen = false,
-      .reduction_amount = a->reduction_amount,
-      .smoothing_factor = a->smoothing_factor,
-      .whitening_factor = a->whitening_factor,
-      .noise_scaling_type = a->noise_scaling_type,
-      .noise_rescale = a->noise_rescale,
-      .post_filter_threshold = a->post_filter_threshold
-    };
-    specbleach_adaptive_load_parameters(a->st, parameters);
-    double  *in = a->in;
-    double *out = a->out;
-    int    bs = a->buffer_size;
-    float *proc_out = a->output;
-    float  *to_proc = a->input;
-    for (size_t i = 0; i < bs; i++) {
-      to_proc[i] = (float)in[2 * i + 0];
-    }
-    specbleach_adaptive_process(a->st, (uint32_t)bs, to_proc, proc_out);
-    for (size_t i = 0; i < bs; i++) {
-      out[2 * i + 0] = (double) proc_out[i];
-      out[2 * i + 1] = 0.0;
-    }
-  } else if (a->out != a->in) {
+  // Always the passthrough path -- a->run is permanently 0 (see this
+  // file's own header comment), but kept branch-for-branch identical
+  // to every other WDSP stage's own "not running" behavior rather
+  // than special-casing it away.
+  if (a->out != a->in) {
     memcpy(a->out, a->in, a->buffer_size * sizeof(complex));
   }
 }
 
 void destroy_sbnr(SBNR a) {
-  specbleach_adaptive_free(a->st);
   _aligned_free(a->input);
   _aligned_free(a->output);
   _aligned_free(a);

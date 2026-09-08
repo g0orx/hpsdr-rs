@@ -76,9 +76,9 @@ nusb = "0.2"
 # if crates.io has moved on since.
 
 [build-dependencies]
-# Compile WDSP/libspecbleach/rnnoise from vendored C source (see
-# build.rs's own doc comment) instead of linking prebuilt platform-
-# specific binaries -- needed for this to build on Windows at all.
+# Compile WDSP from vendored C source (see build.rs's own doc comment)
+# instead of linking a prebuilt platform-specific binary -- needed for
+# this to build on Windows at all.
 cc = "1"
 pkg-config = "0.3"
 # Finds fftw3 via a local vcpkg install -- MSVC-target Windows builds

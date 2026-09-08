@@ -25,48 +25,31 @@ The author can be reached by email at
 
 mw0lge@grange-lane.co.uk
 
-This code is based on code and ideas from  : https://github.com/vu3rdd/wdsp
-and and uses RNNoise and libspecbleach
-https://gitlab.xiph.org/xiph/rnnoise
-https://github.com/lucianodato/libspecbleach
+Original code is based on code and ideas from : https://github.com/vu3rdd/wdsp
+and used RNNoise (https://gitlab.xiph.org/xiph/rnnoise).
 
-It uses a non modified version of rmnoise and implements a ringbuffer to handle input/output frame size differences.
+STUBBED (2026-09-08, see this project's memory/wdsp_210_port.md): the
+vendored RNNoise library this file originally called into has been
+removed -- this stage is never enabled anywhere in this project (no
+Rust code calls SetRXARNNRRun with a nonzero value; `nnr.c`'s neural-
+net NNR stage is what's actually wired up to the UI, see spectrum.rs's
+NoiseReduction doc comment), so the real DSP work was dead code kept
+alive only by a library dependency nothing used. This header keeps
+every symbol RXA.c/RXA.h and the rest of WDSP already reference
+(struct layout, function signatures) so nothing outside rnnr.c/rnnr.h
+needed to change -- only the actual RNNoise-backed implementation is
+gone, replaced with an inert passthrough in rnnr.c.
 */
-//
-//============================================================================================//
-// Dual-Licensing Statement (Applies Only to Author's Contributions, Richard Samphire MW0LGE) //
-// ------------------------------------------------------------------------------------------ //
-// For any code originally written by Richard Samphire MW0LGE, or for any modifications     //
-// made by him, the copyright holder for those portions (Richard Samphire) reserves the     //
-// right to use, license, and distribute such code under different terms, including       //
-// closed-source and proprietary licences, in addition to the GNU General Public License    //
-// granted above. Nothing in this statement restricts any rights granted to recipients under  //
-// the GNU GPL. Code contributed by others (not Richard Samphire) remains licensed under    //
-// its original terms and is not affected by this dual-licensing statement in any way.      //
-// Richard Samphire can be reached by email at :  mw0lge@grange-lane.co.uk            //
-//============================================================================================//
 
 #ifndef _rnnr_h
 #define _rnnr_h
 
-#include "rnnoise.h"
-
-#define FRAME_SIZE
-
-typedef struct _rnnr_ring_buffer {
-  float *buf;
-  int capacity;
-  int head;
-  int tail;
-  int count;
-} rnnr_ring_buffer;
-
 typedef struct _rnnr {
   int run;
-  int run_old; // used when loading a new model
+  int run_old; // unused now -- kept for struct-layout compatibility
   int position;
   int frame_size;
-  DenoiseState *st;
+  void *st; // was RNNoise's DenoiseState*; unused now, kept for layout
   double *in;
   double *out;
   float gain;
@@ -80,9 +63,6 @@ typedef struct _rnnr {
 
   float *to_process_buffer;
   float *processed_output_buffer;
-
-  rnnr_ring_buffer input_ring;
-  rnnr_ring_buffer output_ring;
 
   CRITICAL_SECTION cs;
 
