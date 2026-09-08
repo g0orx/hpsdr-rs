@@ -78,6 +78,49 @@ fn resolved_pa_gain_db(pa_calibration: &std::collections::HashMap<String, f32>, 
         .unwrap_or(radio::DEFAULT_PA_GAIN_DB)
 }
 
+/// Piecewise-linear interpolation between 9 stored dB-adjustment
+/// points (indices 0..8 = 10%/20%/.../90% of drive), with an implicit
+/// 0dB adjustment at both 0% and 100% -- ports Thetis's own
+/// PAProfile::calcDriveAdjust/lerp (Console/setup.cs) exactly,
+/// generalized from Thetis's integer-percent-only input to a
+/// continuous `drive_percent` (this project's TX Power slider is in
+/// watts, not Thetis's native 0-100 PWR percentage, so the caller
+/// converts watts/max_watts*100 -- see resolved_pa_drive_adjust_db).
+/// At an exact 10%-multiple boundary this naturally reduces to
+/// returning that stored point directly (frac=0), matching Thetis's
+/// separate "exact" branch without needing one here.
+fn interpolate_drive_adjust(points: &[f32; 9], drive_percent: f32) -> f32 {
+    let p = drive_percent.clamp(0.0, 100.0);
+    let seg = (p / 10.0).floor() as usize;
+    if seg >= 10 {
+        return 0.0; // at (or past, from float rounding) 100%
+    }
+    let low = if seg == 0 { 0.0 } else { points[seg - 1] };
+    let high = if seg == 9 { 0.0 } else { points[seg] };
+    let frac = (p - seg as f32 * 10.0) / 10.0;
+    low + frac * (high - low)
+}
+
+/// Looks up the current band's drive-linearization table and
+/// interpolates the dB adjustment for `tx_power_watts` commanded out
+/// of `max_watts` (the power pa_calibration's flat gain was itself
+/// calibrated against, i.e. 100% of the curve) -- 0.0 (no adjustment)
+/// for a band with no entry yet, same "missing = pre-feature
+/// behavior" convention as resolved_pa_gain_db. See
+/// Config::pa_drive_adjust's doc comment for why this exists.
+fn resolved_pa_drive_adjust_db(
+    pa_drive_adjust: &std::collections::HashMap<String, [f32; 9]>,
+    freq_hz: u32,
+    tx_power_watts: u32,
+    max_watts: u32,
+) -> f32 {
+    let Some(points) = band_for_frequency(freq_hz).and_then(|b| pa_drive_adjust.get(b.name)) else {
+        return 0.0;
+    };
+    let drive_percent = (tx_power_watts as f32 / max_watts.max(1) as f32) * 100.0;
+    interpolate_drive_adjust(points, drive_percent)
+}
+
 /// Maximum number of transverter (XVTR) slots -- matches what was asked
 /// for (piHPSDR itself currently allows 10, but there's nothing special
 /// about that number; this is just a fixed-size settings-UI/config cap).
@@ -706,6 +749,13 @@ struct ConnectedState {
     /// since there are several of those and a once-per-frame resolve is
     /// cheap and can't drift out of sync.
     pa_calibration: std::collections::HashMap<String, f32>,
+    /// Per-band drive-level linearization curve. See
+    /// Config::pa_drive_adjust's doc comment for the real-hardware
+    /// report this exists for, and interpolate_drive_adjust for how
+    /// it's applied. Resolved and folded into session.pa_gain_db at
+    /// the same once-per-frame point pa_calibration itself is (see
+    /// that field's own doc comment).
+    pa_drive_adjust: std::collections::HashMap<String, [f32; 9]>,
     /// Configured transverters (up to MAX_XVTRS) -- see Xvtr's doc
     /// comment. Persisted verbatim (Config::xvtrs); an empty `name` marks
     /// an unused slot, same "empty string = unconfigured" convention as
@@ -1447,6 +1497,7 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                 auto_atten_last_seen_feedback: None,
                 auto_atten_last_check: None,
                 pa_calibration: cfg.pa_calibration.clone(),
+                pa_drive_adjust: cfg.pa_drive_adjust.clone(),
                 // Always exactly MAX_XVTRS slots so the settings tab has a
                 // stable fixed-size row list to render/edit -- a config
                 // saved with fewer (or none, or from before this existed)
@@ -1649,13 +1700,23 @@ impl eframe::App for HpsdrApp {
                     .session
                     .frequency_hz
                     .load(std::sync::atomic::Ordering::Relaxed);
-                // Protocol 1 only (see p1_drive_byte_for_watts); harmless
-                // no-op to compute/store on P2 too rather than special-
-                // casing it here.
-                connected.session.pa_gain_db.store(
-                    resolved_pa_gain_db(&connected.pa_calibration, freq_hz).to_bits(),
-                    std::sync::atomic::Ordering::Relaxed,
-                );
+                // Used by both protocols -- see radio::drive_byte_for_watts.
+                // gain_db is the flat per-band base (pa_calibration,
+                // calibrated at max_tx_power_watts, i.e. 100% of the
+                // drive curve) MINUS the current commanded power's
+                // interpolated drive-linearization adjustment (0.0 for
+                // an uncalibrated band, so this is a no-op until the
+                // user actually populates a curve) -- see
+                // resolved_pa_drive_adjust_db's own doc comment for the
+                // real-hardware report this corrects.
+                let gain_db = resolved_pa_gain_db(&connected.pa_calibration, freq_hz)
+                    - resolved_pa_drive_adjust_db(
+                        &connected.pa_drive_adjust,
+                        freq_hz,
+                        connected.session.tx_power_watts.load(std::sync::atomic::Ordering::Relaxed),
+                        connected.max_tx_power_watts,
+                    );
+                connected.session.pa_gain_db.store(gain_db.to_bits(), std::sync::atomic::Ordering::Relaxed);
                 // See RadioSession::tune_active's doc comment -- P1/
                 // HermesLite2-only (harmless no-op to also store this on
                 // every other board/protocol rather than special-casing
@@ -5486,6 +5547,79 @@ impl eframe::App for HpsdrApp {
                                             }
                                         });
                                     }
+
+                                    // Drive Level Linearization: see
+                                    // Config::pa_drive_adjust's doc
+                                    // comment for the real ANAN-8000DLE
+                                    // report this exists for -- the flat
+                                    // gain above is only ever exactly
+                                    // right at the one power level it
+                                    // was calibrated against; a real PA
+                                    // whose gain isn't flat across its
+                                    // drive range needs a per-level
+                                    // correction on top of it. Ports
+                                    // Thetis's own per-band drive-
+                                    // linearization table (dB adjustment
+                                    // at 10%/20%/.../90% of the
+                                    // calibrated power, 0 = "no
+                                    // adjustment yet" so this is a no-op
+                                    // until populated). Workflow: key
+                                    // Tune at each %% of your calibrated
+                                    // power (e.g. 10W/20W/.../90W of a
+                                    // 100W calibration) and adjust that
+                                    // column's value until the wattmeter
+                                    // matches -- positive reduces output
+                                    // at that level, negative increases
+                                    // it.
+                                    ui.add_space(10.0);
+                                    ui.separator();
+                                    ui.add_space(6.0);
+                                    ui.label(
+                                        "Drive Level Linearization -- dB adjustment (subtracted from \
+                                         the base gain above) at each % of the power PA Calibration \
+                                         was itself set at. Key Tune at each %% and adjust until the \
+                                         meter matches; 0 = no adjustment.",
+                                    );
+                                    ui.add_space(6.0);
+                                    egui::Grid::new("pa_drive_adjust_grid").striped(true).show(ui, |ui| {
+                                        ui.label("Band");
+                                        for pct in (10..=90).step_by(10) {
+                                            ui.label(format!("{pct}%"));
+                                        }
+                                        ui.label("");
+                                        ui.end_row();
+                                        for band in &BANDS {
+                                            if (band.low_hz as u64) < connected.device.frequency_min
+                                                || band.high_hz as u64 > connected.device.frequency_max
+                                            {
+                                                continue;
+                                            }
+                                            let mut points =
+                                                connected.pa_drive_adjust.get(band.name).copied().unwrap_or([0.0; 9]);
+                                            ui.label(band.name);
+                                            let mut changed = false;
+                                            for point in points.iter_mut() {
+                                                if scroll_drag_value_f32(
+                                                    ui,
+                                                    &mut connected.slider_scroll_accum,
+                                                    point,
+                                                    -20.0..=20.0,
+                                                    0.1,
+                                                ) {
+                                                    changed = true;
+                                                }
+                                            }
+                                            if changed {
+                                                connected.pa_drive_adjust.insert(band.name.to_string(), points);
+                                                settings_changed = true;
+                                            }
+                                            if ui.small_button("Reset").clicked() {
+                                                connected.pa_drive_adjust.remove(band.name);
+                                                settings_changed = true;
+                                            }
+                                            ui.end_row();
+                                        }
+                                    });
                                 }
                                 SettingsTab::Xvtr => {
                                     // See Xvtr's doc comment (main-receiver
@@ -6383,6 +6517,7 @@ impl eframe::App for HpsdrApp {
                         band_settings: connected.band_memory.clone(),
                         width_memory: connected.width_memory.clone(),
                         pa_calibration: connected.pa_calibration.clone(),
+                        pa_drive_adjust: connected.pa_drive_adjust.clone(),
                         max_tx_power_watts: Some(connected.max_tx_power_watts),
                         tune_power_percent: Some(connected.tune_power_percent),
                         max_swr: Some(connected.max_swr),
@@ -6550,15 +6685,21 @@ fn format_khz(hz: f64) -> String {
     format!("{:.1}", hz / 1000.0)
 }
 
-/// Picks a "nice" round tick-spacing step (a 1-2-5 progression, e.g. 1k,
-/// 2k, 5k, 10k, 20k...) close to `visible_span_hz / target_ticks`, so
-/// frequency-axis gridlines land on round boundaries instead of whatever
-/// arbitrary frequency happens to fall at an evenly-spaced pixel fraction
-/// -- confirmed as a real problem via a user report of ticks reading
-/// "144021.3k" (an XVTR band, but the same imprecision existed on plain
-/// IF too, just less visible with smaller numbers).
-fn nice_tick_step_hz(visible_span_hz: f64, target_ticks: f64) -> f64 {
-    let raw_step = visible_span_hz / target_ticks.max(1.0);
+/// Picks a "nice" round tick-spacing step (a 1-2-5 progression, e.g. 1,
+/// 2, 5, 10, 20... in whatever unit `span` is) close to
+/// `span / target_ticks`, so axis gridlines land on round boundaries
+/// instead of whatever arbitrary value happens to fall at an
+/// evenly-spaced fraction. Originally frequency-axis-only (hence ticks
+/// landing on round Hz values) -- confirmed as a real problem via a
+/// user report of ticks reading "144021.3k" (an XVTR band, but the same
+/// imprecision existed on plain IF too, just less visible with smaller
+/// numbers). Generic unit-agnostic math (nothing Hz-specific), so also
+/// used by draw_power_meter for its watt ticks -- see that call site's
+/// own doc comment for the real report (needle visually not landing on
+/// the labeled tick for a round-number wattage) fixed by reusing this
+/// instead of a fixed 0/25/50/75/100% split.
+fn nice_tick_step(span: f64, target_ticks: f64) -> f64 {
+    let raw_step = span / target_ticks.max(1.0);
     if !raw_step.is_finite() || raw_step <= 0.0 {
         return 1000.0;
     }
@@ -6577,7 +6718,7 @@ fn nice_tick_step_hz(visible_span_hz: f64, target_ticks: f64) -> f64 {
 }
 
 /// Draws the frequency-axis gridlines/labels along the bottom of a
-/// spectrum/waterfall pane, snapped to nice_tick_step_hz boundaries
+/// spectrum/waterfall pane, snapped to nice_tick_step boundaries
 /// rather than evenly-spaced pixel fractions (see its doc comment). A
 /// margin near each edge skips labels that would otherwise get clipped
 /// or hang off into the surrounding UI -- expressed as a fraction of the
@@ -6593,7 +6734,7 @@ fn draw_freq_axis_ticks(
     visible_half_span_hz: f64,
     rf_offset_hz: i64,
 ) {
-    let step_hz = nice_tick_step_hz(2.0 * visible_half_span_hz, 8.0);
+    let step_hz = nice_tick_step(2.0 * visible_half_span_hz, 8.0);
     let range_start = view_center_hz - visible_half_span_hz;
     let range_end = view_center_hz + visible_half_span_hz;
     let edge_margin_hz = 2.0 * visible_half_span_hz * 0.03;
@@ -6972,6 +7113,37 @@ fn scroll_slider_f64(
                 let sign = scroll_accum.signum();
                 *scroll_accum -= sign * NOTCH;
                 *value = (*value + step * sign as f64).clamp(*range.start(), *range.end());
+                changed = true;
+            }
+        }
+    }
+    changed
+}
+
+/// Same scroll-wheel-to-step behavior as scroll_slider_f32, but around
+/// a compact egui::DragValue instead of a full-width Slider -- for
+/// grids with many narrow numeric cells (e.g. the PA drive-adjust
+/// table's 9-column-per-band layout) where a full Slider per cell
+/// wouldn't fit.
+fn scroll_drag_value_f32(
+    ui: &mut egui::Ui,
+    scroll_accum: &mut f32,
+    value: &mut f32,
+    range: std::ops::RangeInclusive<f32>,
+    step: f32,
+) -> bool {
+    let resp = ui.add(egui::DragValue::new(value).speed(step).range(range.clone()).fixed_decimals(1));
+    let mut changed = resp.changed();
+    if resp.hovered() {
+        let scroll_delta = ui.input(|i| i.smooth_scroll_delta);
+        let delta = if scroll_delta.y.abs() >= scroll_delta.x.abs() { scroll_delta.y } else { scroll_delta.x };
+        if delta != 0.0 {
+            *scroll_accum += delta;
+            const NOTCH: f32 = 20.0;
+            while scroll_accum.abs() >= NOTCH {
+                let sign = scroll_accum.signum();
+                *scroll_accum -= sign * NOTCH;
+                *value = (*value + step * sign).clamp(*range.start(), *range.end());
                 changed = true;
             }
         }
@@ -7378,12 +7550,25 @@ fn draw_power_meter(ui: &mut egui::Ui, rect: egui::Rect, watts: f32, swr: f32, m
         .collect();
     painter.add(egui::Shape::line(arc, egui::Stroke::new(2.0, egui::Color32::WHITE)));
 
-    // 0/25/50/75/100% of max_watts ticks, labeled with the actual watt
-    // value rather than a percentage -- max_watts varies per radio (see
-    // ConnectedState::max_tx_power_watts), so a fixed set of watt
-    // labels wouldn't make sense across boards the way S1-S9 does.
-    for frac in [0.0, 0.25, 0.5, 0.75, 1.0] {
-        let w = max_watts * frac;
+    // Ticks at "nice" round-number watt boundaries (nice_tick_step,
+    // same 1-2-5 progression the frequency axis uses), labeled with the
+    // actual watt value rather than a percentage -- max_watts varies
+    // per radio (see ConnectedState::max_tx_power_watts), so a fixed
+    // set of watt labels wouldn't make sense across boards the way
+    // S1-S9 does.
+    //
+    // BUG FIX for a real report ("needle doesn't land on the right
+    // tick" despite a correct digital readout): this used to be a
+    // fixed 0/25/50/75% split of max_watts. For a low, non-round
+    // max_watts (e.g. HermesLite2's default 5W), that lands ticks at
+    // 1.25/2.5/3.75W -- rounded labels like "1"/"3"/"4" -- while the
+    // TX Power slider only ever commands whole watts, so a commanded
+    // 3W needle visibly sat well past the "3" label (which was really
+    // marking 2.5W). Round-number tick boundaries fix this for any
+    // max_watts, not just 5W.
+    let step = nice_tick_step(max_watts as f64, 4.0) as f32;
+    let mut w = 0.0f32;
+    while w <= max_watts + step * 0.001 {
         let angle = angle_for_watts(w);
         painter.line_segment(
             [point_at(angle, radius * 0.85), point_at(angle, radius)],
@@ -7396,6 +7581,7 @@ fn draw_power_meter(ui: &mut egui::Ui, rect: egui::Rect, watts: f32, swr: f32, m
             egui::FontId::proportional(11.0),
             egui::Color32::WHITE,
         );
+        w += step;
     }
 
     let bad_swr = swr > max_swr;

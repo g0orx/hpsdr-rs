@@ -163,6 +163,23 @@ pub struct Config {
     /// never-calibrated install would.
     #[serde(default)]
     pub pa_calibration: std::collections::HashMap<String, f32>,
+    /// Per-band drive-level linearization curve (Settings -> TX -> PA
+    /// Calibration), 9 dB-adjustment points at 10%/20%/.../90% of the
+    /// band's calibrated power, subtracted from pa_calibration's flat
+    /// per-band gain -- see main.rs's interpolate_drive_adjust doc
+    /// comment for the interpolation and radio::drive_byte_for_watts
+    /// for how the result feeds the wire-level drive byte. Ports
+    /// Thetis's own per-band drive-linearization table (PAProfile::
+    /// _gainAdjust/GetGainForBand, Project Files/Source/Console/
+    /// setup.cs) -- confirmed necessary via a real ANAN-8000DLE report:
+    /// a single flat gain_db (piHPSDR's own simplified model, which
+    /// this project mirrored) can't correct real PA gain non-
+    /// uniformity across the drive range -- calibrating exactly at
+    /// 100W left 50W/75W commanded measuring only 16W/63W actual. A
+    /// missing entry (or all-zero) means no adjustment anywhere,
+    /// identical to pre-feature behavior.
+    #[serde(default)]
+    pub pa_drive_adjust: std::collections::HashMap<String, [f32; 9]>,
     /// Upper bound (watts) for the main panel's TX Power slider --
     /// see main.rs's ConnectedState::max_tx_power_watts doc comment for
     /// why this has to be a per-radio (per-MAC) override rather than a

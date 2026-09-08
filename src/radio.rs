@@ -1913,6 +1913,10 @@ fn fill_tx_payload(
     tx_iq: &Mutex<VecDeque<f32>>,
     pacer: &mut TxIqPacer,
     slots_per_sample: f64,
+    // HermesLite2's digital fine-gain compensation for its coarse
+    // 16-step hardware attenuator -- see hl2_drive_level_and_scale's
+    // doc comment. 1.0 (no-op) for every other board.
+    drive_scale: f32,
 ) {
     let mut buf = tx_iq.lock().unwrap();
     let mut b = HEADER_SIZE;
@@ -1924,8 +1928,8 @@ fn fill_tx_payload(
         pacer.accum += 1.0;
         if pacer.accum >= slots_per_sample {
             pacer.accum -= slots_per_sample;
-            let i = buf.pop_front().unwrap_or(0.0);
-            let q = buf.pop_front().unwrap_or(0.0);
+            let i = buf.pop_front().unwrap_or(0.0) * drive_scale;
+            let q = buf.pop_front().unwrap_or(0.0) * drive_scale;
             pacer.held_i = (i.clamp(-1.0, 1.0) * 32767.0) as i16;
             pacer.held_q = (q.clamp(-1.0, 1.0) * 32767.0) as i16;
         }
@@ -2060,6 +2064,55 @@ fn drive_byte_for_watts(watts: f32, gain_db: f32) -> u8 {
     let volts = (target_volts / 0.8).min(1.0);
     let actual_volts = (volts / 0.98).clamp(0.0, 1.0);
     (actual_volts * 255.0) as u8
+}
+
+/// Splits drive_byte_for_watts's continuous 0-255 "level" into
+/// HermesLite2's real two-part drive mechanism: a coarse hardware
+/// attenuator step (the actual P1 command-3 C1 byte, one of 16 values
+/// 0/16/32/.../240 spanning -7.5dB to 0dB) plus a digital TX IQ sample
+/// scale factor supplying the finer/lower-power control the
+/// attenuator alone can't reach. Ported directly from piHPSDR's
+/// radio_calc_drive_level (radio.c, DEVICE_HERMES_LITE2 branch) --
+/// same threshold table and per-step constants, chosen there so the
+/// scale factor lands near 1.0 at the top of each step's range and
+/// compensates down through it, keeping effective output continuous
+/// across attenuator-step transitions. See this function's call site
+/// (p1_build_packet) for the real-hardware report this fixes.
+fn hl2_drive_level_and_scale(level: u8) -> (u8, f32) {
+    let d = level as f32;
+    if level > 240 {
+        (240, d * 0.0039215)
+    } else if level > 227 {
+        (224, d * 0.0041539)
+    } else if level > 214 {
+        (208, d * 0.0044000)
+    } else if level > 202 {
+        (192, d * 0.0046607)
+    } else if level > 191 {
+        (176, d * 0.0049369)
+    } else if level > 180 {
+        (160, d * 0.0052295)
+    } else if level > 170 {
+        (144, d * 0.0055393)
+    } else if level > 160 {
+        (128, d * 0.0058675)
+    } else if level > 151 {
+        (112, d * 0.0062152)
+    } else if level > 143 {
+        (96, d * 0.0065835)
+    } else if level > 135 {
+        (80, d * 0.0069736)
+    } else if level > 127 {
+        (64, d * 0.0073868)
+    } else if level > 120 {
+        (48, d * 0.0078245)
+    } else if level > 113 {
+        (32, d * 0.0082881)
+    } else if level > 107 {
+        (16, d * 0.0087793)
+    } else {
+        (0, d * 0.0092995)
+    }
 }
 
 fn sample_rate_code(rate: u32) -> u8 {
@@ -2291,6 +2344,30 @@ fn p1_build_packet(
     // against your old_protocol.c -- flag if this differs.
     let mox_bit: u8 = if mox_on { 0x01 } else { 0x00 };
 
+    // BUG FIX for a real report: HermesLite2's C1 drive byte is NOT a
+    // smooth linear/log DAC value like standard Hermes/Metis/Angelia
+    // boards -- confirmed against piHPSDR's radio_calc_drive_level
+    // (radio.c, DEVICE_HERMES_LITE2 branch): the byte only selects one
+    // of 16 discrete hardware-attenuator steps spanning just -7.5dB to
+    // 0dB (encoded as 0,16,32,...,240), with any finer/lower-power
+    // control coming from scaling the outgoing TX IQ SAMPLE amplitude
+    // digitally instead (piHPSDR's drive_scale, applied to
+    // iq_output_buffer post-ALC in transmitter.c). Sending
+    // drive_byte_for_watts's continuous byte straight to C1, as this
+    // project previously did for every Hermes-family board including
+    // this one, means most of that byte's computed dynamic range below
+    // the top step collapses onto the SAME actual attenuation --
+    // exactly matching a real report (5W slider calibrated to read 5W,
+    // but 3W/1W/0W measured ~4.3W/~2W/~1.2W: the -7.5dB floor alone is
+    // only a ~5.6x reduction, nowhere near enough range for "0W" to
+    // mean silence). hl2_drive_level_and_scale ports piHPSDR's exact
+    // threshold table/constants; tx_drive_scale is applied to tx_iq
+    // samples in fill_tx_payload below, 1.0 (no-op) for every other
+    // board.
+    let drive_level = drive_byte_for_watts(tx_power_watts_val as f32, pa_gain_db);
+    let (c1_drive, tx_drive_scale) =
+        if is_hermes_lite { hl2_drive_level_and_scale(drive_level) } else { (drive_level, 1.0f32) };
+
     let mut packet = [0u8; PACKET_SIZE];
     packet[0] = 0xEF;
     packet[1] = 0xFE;
@@ -2406,9 +2483,14 @@ fn p1_build_packet(
             // 345, but not what P1 actually expects), which very
             // plausibly explains persistent "0 watts" TX output even
             // with a nonzero drive setting. Mic boost not tracked --
-            // left off.
+            // left off. `c1_drive` (computed once above, before this
+            // match, since fill_tx_payload below needs the paired
+            // tx_drive_scale regardless of which C&C register is
+            // active this packet) is HL2's quantized 16-step
+            // attenuator byte -- see that computation's own doc
+            // comment.
             let c1 = if mox_on {
-                drive_byte_for_watts(tx_power_watts_val as f32, pa_gain_db)
+                c1_drive
             } else {
                 0x00
             };
@@ -2749,8 +2831,8 @@ fn p1_build_packet(
     // under-full or garbage payload going out while the
     // transmitter is actually keyed is worse than silence.
     if mox_on {
-        fill_tx_payload(&mut frame0, tx_iq, tx_iq_pacer, rx_audio_slots_per_sample);
-        fill_tx_payload(&mut frame1, tx_iq, tx_iq_pacer, rx_audio_slots_per_sample);
+        fill_tx_payload(&mut frame0, tx_iq, tx_iq_pacer, rx_audio_slots_per_sample, tx_drive_scale);
+        fill_tx_payload(&mut frame1, tx_iq, tx_iq_pacer, rx_audio_slots_per_sample, tx_drive_scale);
     } else if send_rx_audio {
         // Same 8-byte-per-sample slot fill_tx_payload uses while
         // transmitting, but for the receive side: local audio in
