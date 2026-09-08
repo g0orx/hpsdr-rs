@@ -1308,6 +1308,10 @@ fn run(
     // Muted (not pushed to any of the four audio outputs above) while
     // MOX is active -- see SpectrumHandle::start's doc comment on why.
     mox: Arc<AtomicBool>,
+    // Mutes ONLY the local speaker tap (audio_out) while true --
+    // tci_audio_out/waveform_out/rx_audio_to_radio are untouched. See
+    // SpectrumHandle::start's doc comment.
+    mute_local_for_tci: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
 ) {
     let mut analyzer = SpectrumAnalyzer::open(channel, sample_rate);
@@ -1435,6 +1439,10 @@ fn run(
             // PureSignal's own feedback path are untouched -- this only
             // gates the post-demod AUDIO taps below.
             let mox_active = mox.load(Ordering::Relaxed);
+            // See this function's own mute_local_for_tci param doc
+            // comment -- read once per chunk, not per-sample, same as
+            // mox_active above.
+            let mute_local = mute_local_for_tci.load(Ordering::Relaxed);
             for (l, r) in audio {
                 if mox_active {
                     continue;
@@ -1462,10 +1470,12 @@ fn run(
                 // is off, same as every consumer effectively saw before
                 // this was ever a stereo pair at all.
                 let (l, r) = ((l * params.gain).clamp(-1.0, 1.0), (r * params.gain).clamp(-1.0, 1.0));
-                if out.len() >= AUDIO_BUFFER_CAPACITY {
-                    out.pop_front();
+                if !mute_local {
+                    if out.len() >= AUDIO_BUFFER_CAPACITY {
+                        out.pop_front();
+                    }
+                    out.push_back((l, r));
                 }
-                out.push_back((l, r));
                 if tci_out.len() >= AUDIO_BUFFER_CAPACITY {
                     tci_out.pop_front();
                 }
@@ -1538,12 +1548,18 @@ impl SpectrumHandle {
     /// spectrum tap, where muting is harmless (their audio_out/
     /// tci_audio_out aren't wired to anything that plays them back) --
     /// simpler than threading an Option through just to skip it there.
+    ///
+    /// `mute_local_for_tci`: same "always pass, harmless where unused"
+    /// reasoning as `mox` -- see RadioSession::mute_local_audio_for_tci's
+    /// doc comment for what this actually gates (ONLY the local speaker
+    /// tap, not TCI's own audio stream).
     pub fn start(
         channel: i32,
         iq_buffer: Arc<Mutex<VecDeque<IqSample>>>,
         sample_rate: i32,
         rx_audio_to_radio: Option<Arc<Mutex<VecDeque<f32>>>>,
         mox: Arc<AtomicBool>,
+        mute_local_for_tci: Arc<AtomicBool>,
     ) -> Self {
         let display = Arc::new(Mutex::new(SpectrumDisplay::default()));
         let demod_params = Arc::new(Mutex::new(DemodParams::default()));
@@ -1575,6 +1591,7 @@ impl SpectrumHandle {
                     iq_out,
                     rx_audio_to_radio,
                     mox,
+                    mute_local_for_tci,
                     stop,
                 )
             })

@@ -295,6 +295,10 @@ struct ExtraReceiver {
     /// why this receiver's own audio_output (local playback) needs it
     /// just as much as the main receiver does.
     mox: Arc<std::sync::atomic::AtomicBool>,
+    /// Same Arc as RadioSession::mute_local_audio_for_tci -- same
+    /// "kept here so change_extra_receiver_sample_rate can pass it to
+    /// a rebuilt SpectrumHandle too" reasoning as `mox` above.
+    mute_local_audio_for_tci: Arc<std::sync::atomic::AtomicBool>,
     spectrum: SpectrumHandle,
     audio_output: Option<AudioOutput>,
     /// Selected output device name (Settings -> RX's "Output device"
@@ -618,6 +622,13 @@ struct ConnectedState {
     /// startup" case to report here -- only ones the user triggered.
     rigctl_error: Option<String>,
     tci_error: Option<String>,
+    /// "Mute local audio output while TCI is running" (Settings ->
+    /// Network) -- see RadioSession::mute_local_audio_for_tci's doc
+    /// comment for the mechanism and the real report that prompted it.
+    /// Persisted (unlike ps_oneshot/ps_auto_attenuate) -- this is a
+    /// workflow/wiring preference tied to the user's own audio routing,
+    /// not something that should reset to off every session.
+    mute_local_audio_during_tci: bool,
     cat_error: Option<String>,
     /// TX is armed automatically on connect (MicInput/TxHandle created
     /// right away, PTT control visible immediately) -- this flag is
@@ -1023,6 +1034,7 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                 settings.sample_rate as i32,
                 Some(Arc::clone(&session.rx_audio_to_radio)),
                 Arc::clone(&session.mox),
+                Arc::clone(&session.mute_local_audio_for_tci),
             );
             let audio_output_device = cfg.audio_output_device.clone();
             let audio_output =
@@ -1038,6 +1050,7 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
             let tci_addr =
                 cfg.tci_addr.clone().unwrap_or_else(|| tci::DEFAULT_ADDR.to_string());
             let cat_addr = cfg.cat_addr.clone().unwrap_or_else(|| cat::DEFAULT_ADDR.to_string());
+            let mute_local_audio_during_tci = cfg.mute_local_audio_during_tci.unwrap_or(false);
             // Debug logging (Settings -> Network) -- see debug_log.rs's
             // own doc comment. Constructed once per connection (not per
             // Start/Stop of the server itself) so toggling the checkbox
@@ -1208,7 +1221,11 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
             if let Some(v) = cfg.rx_eq {
                 spectrum.set_eq(v);
             }
-            let mic_gain = cfg.mic_gain.unwrap_or(0.5);
+            // See tx::TxParams::default's doc comment -- 0.5 (-6dB) was
+            // too quiet in practice on real hardware (0W output with
+            // both pipewire and TCI audio at WDSP's default no-boost
+            // ALC headroom); 1.0 (0dB/unity) confirmed working.
+            let mic_gain = cfg.mic_gain.unwrap_or(1.0);
             let tci_tx_gain = cfg.tci_tx_gain.unwrap_or(1.0);
             *session.tci_tx_gain.lock().unwrap() = tci_tx_gain;
             // See tx::PsParams::default for these same
@@ -1263,6 +1280,7 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                 duc_rate,
                 None,
                 Arc::clone(&session.mox),
+                Arc::clone(&session.mute_local_audio_for_tci),
             );
             let mic_buffer = Arc::new(Mutex::new(VecDeque::new()));
             let mic_input_device = cfg.mic_input_device.clone();
@@ -1411,6 +1429,7 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                 rigctl_error,
                 tci_error,
                 cat_error,
+                mute_local_audio_during_tci,
                 tx_enabled,
                 mic_input,
                 mic_input_device,
@@ -1813,6 +1832,14 @@ impl eframe::App for HpsdrApp {
                     .session
                     .disable_pa
                     .store(xvtr_disable_pa, std::sync::atomic::Ordering::Relaxed);
+                // See RadioSession::mute_local_audio_for_tci's doc comment
+                // -- recomputed every frame (not just when the checkbox or
+                // TCI Start/Stop are clicked) so it stays correct even
+                // while Settings -> Network isn't the visible tab.
+                connected.session.mute_local_audio_for_tci.store(
+                    connected.mute_local_audio_during_tci && connected.tci_server.is_some(),
+                    std::sync::atomic::Ordering::Relaxed,
+                );
                 // Open Collector outputs -- see OcMask's doc comment.
                 // Same band resolution as xvtr_disable_pa just above
                 // (active_xvtr_name if a transverter's active, otherwise
@@ -4257,6 +4284,26 @@ impl eframe::App for HpsdrApp {
                                             settings_changed = true;
                                         }
                                     }
+                                    {
+                                        let mut mute = connected.mute_local_audio_during_tci;
+                                        if ui
+                                            .checkbox(&mut mute, "Mute local audio output while TCI is running")
+                                            .on_hover_text(
+                                                "Prevents a client (e.g. WSJT-X) that's ALSO picking up \
+                                                 hpsdr-rs's local audio output device (e.g. a virtual \
+                                                 audio cable left over from before TCI was set up) from \
+                                                 receiving the same RX audio twice -- once via TCI, once \
+                                                 via that device -- which shows up as a doubled/offset \
+                                                 waterfall segment and fuzzy-sounding decodes. Only mutes \
+                                                 the local speaker/device output; TCI clients keep \
+                                                 receiving audio normally either way.",
+                                            )
+                                            .changed()
+                                        {
+                                            connected.mute_local_audio_during_tci = mute;
+                                            settings_changed = true;
+                                        }
+                                    }
 
                                     ui.add_space(8.0);
                                     ui.label(
@@ -5174,6 +5221,7 @@ impl eframe::App for HpsdrApp {
                                                 duc_rate,
                                                 None,
                                                 Arc::clone(&connected.session.mox),
+                                                Arc::clone(&connected.session.mute_local_audio_for_tci),
                                             );
                                             let mic_buffer = Arc::new(Mutex::new(VecDeque::new()));
                                             match MicInput::start(
@@ -6337,6 +6385,7 @@ impl eframe::App for HpsdrApp {
                         rigctl_addr: Some(connected.rigctl_addr.clone()),
                         tci_addr: Some(connected.tci_addr.clone()),
                         cat_addr: Some(connected.cat_addr.clone()),
+                        mute_local_audio_during_tci: Some(connected.mute_local_audio_during_tci),
                         rigctl_running: Some(connected.rigctl_server.is_some()),
                         tci_running: Some(connected.tci_server.is_some()),
                         cat_running: Some(connected.cat_server.is_some()),
@@ -8421,6 +8470,7 @@ fn spawn_extra_receiver(
         rate_val as i32,
         None,
         Arc::clone(&session.mox),
+        Arc::clone(&session.mute_local_audio_for_tci),
     );
 
     if let Some(s) = saved {
@@ -8470,6 +8520,7 @@ fn spawn_extra_receiver(
         frequency_max,
         antenna: antenna_arc,
         mox: Arc::clone(&session.mox),
+        mute_local_audio_for_tci: Arc::clone(&session.mute_local_audio_for_tci),
         spectrum,
         audio_output,
         audio_output_device,
@@ -8542,6 +8593,7 @@ fn change_sample_rate(connected: &mut ConnectedState, new_rate: u32) {
         new_rate as i32,
         Some(Arc::clone(&connected.session.rx_audio_to_radio)),
         Arc::clone(&connected.session.mox),
+        Arc::clone(&connected.session.mute_local_audio_for_tci),
     );
     spectrum.set_mode(mode);
     spectrum.set_width_hz(width_hz);
@@ -8613,6 +8665,7 @@ fn change_sample_rate(connected: &mut ConnectedState, new_rate: u32) {
                 new_rate as i32,
                 None,
                 Arc::clone(&connected.session.mox),
+                Arc::clone(&connected.session.mute_local_audio_for_tci),
             );
             if let Some(mic) = &connected.mic_input {
                 let tx_handle = TxHandle::start(
@@ -8698,6 +8751,7 @@ fn change_extra_receiver_sample_rate(rx: &mut ExtraReceiver, new_rate: u32) {
         new_rate as i32,
         None,
         Arc::clone(&rx.mox),
+        Arc::clone(&rx.mute_local_audio_for_tci),
     );
     spectrum.set_mode(mode);
     spectrum.set_width_hz(width_hz);

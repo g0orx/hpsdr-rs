@@ -590,6 +590,24 @@ pub struct RadioSession {
     /// actually run mic audio through TXA or idle). Written from the
     /// UI's PTT control and from rigctl/TCI's set_ptt/trx commands.
     pub mox: Arc<AtomicBool>,
+    /// Mutes the MAIN receiver's local audio_out tap (spectrum.rs's
+    /// SpectrumHandle::run, same mechanism as its own `mox`-gating
+    /// param) while true. Computed fresh each UI frame from
+    /// `Settings::mute_local_audio_during_tci` (the user's own toggle)
+    /// AND whether the TCI server is actually running -- see main.rs's
+    /// update loop. Added after a real report: with a local audio
+    /// output device also routed into WSJT-X (e.g. a virtual audio
+    /// cable, from before TCI was in use, or for local monitoring),
+    /// WSJT-X received the SAME receive audio twice -- once via TCI,
+    /// once via that device -- producing a doubled/offset waterfall
+    /// segment and fuzzy-sounding decodes. TCI's OWN audio tap
+    /// (tci_audio_out) is deliberately NOT gated by this -- only the
+    /// local speaker path is muted, TCI clients keep receiving audio
+    /// normally. Threaded to every SpectrumHandle::start call (main
+    /// receiver, extra receivers, TX spectrum tap) the same way `mox`
+    /// itself is -- harmless where a receiver's own audio_out isn't
+    /// wired to real playback anyway.
+    pub mute_local_audio_for_tci: Arc<AtomicBool>,
     /// RIT ("Receiver Incremental Tuning") on/off and its offset (Hz,
     /// clamped to +-9999 -- matching main.rs's own UI clamp). Same
     /// direct-write pattern as `mox` above: written straight from
@@ -1466,6 +1484,11 @@ fn start_protocol1(
         );
     });
 
+    // See RadioSession::mute_local_audio_for_tci's doc comment -- only
+    // ever read/written from main.rs's UI thread and spectrum.rs's
+    // background loop, no sender/receiver thread here needs it.
+    let mute_local_audio_for_tci = Arc::new(AtomicBool::new(false));
+
     Ok(RadioSession {
         iq_buffers,
         frequency_hz,
@@ -1488,6 +1511,7 @@ fn start_protocol1(
         ps_rx_feedback_iq,
         ps_tx_feedback_iq,
         mox,
+        mute_local_audio_for_tci,
         rit_enabled,
         rit_offset_hz,
         xit_enabled,
@@ -1739,6 +1763,11 @@ fn start_protocol1_ozy_usb(
         ozy_i2c_loop(ozy_device, i2c_tx_forward_power, i2c_tx_reverse_power, i2c_adc1_overload, i2c_stop);
     });
 
+    // See RadioSession::mute_local_audio_for_tci's doc comment -- only
+    // ever read/written from main.rs's UI thread and spectrum.rs's
+    // background loop, no sender/receiver thread here needs it.
+    let mute_local_audio_for_tci = Arc::new(AtomicBool::new(false));
+
     Ok(RadioSession {
         iq_buffers,
         frequency_hz,
@@ -1761,6 +1790,7 @@ fn start_protocol1_ozy_usb(
         ps_rx_feedback_iq,
         ps_tx_feedback_iq,
         mox,
+        mute_local_audio_for_tci,
         rit_enabled,
         rit_offset_hz,
         xit_enabled,
@@ -4117,6 +4147,11 @@ fn start_protocol2(
         );
     });
 
+    // See RadioSession::mute_local_audio_for_tci's doc comment -- only
+    // ever read/written from main.rs's UI thread and spectrum.rs's
+    // background loop, no sender/receiver thread here needs it.
+    let mute_local_audio_for_tci = Arc::new(AtomicBool::new(false));
+
     Ok(RadioSession {
         iq_buffers,
         frequency_hz,
@@ -4139,6 +4174,7 @@ fn start_protocol2(
         ps_rx_feedback_iq,
         ps_tx_feedback_iq,
         mox,
+        mute_local_audio_for_tci,
         rit_enabled,
         rit_offset_hz,
         xit_enabled,

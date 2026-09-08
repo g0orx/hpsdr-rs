@@ -414,20 +414,21 @@ impl Default for TxParams {
     fn default() -> Self {
         Self {
             mode: Mode::Usb,
-            // Conservative starting point, same reasoning as
-            // spectrum::DemodParams's RX audio gain default -- easier
-            // to notice "too quiet" and turn it up than to start too
-            // hot into a live transmitter. Fed directly to WDSP's Panel
-            // gain stage (SetTXAPanelGain1) as a linear multiplier --
-            // this project's UI slider has always used linear 0.0-1.0
-            // semantics, kept as-is rather than switching to the
-            // reference's dB convention (10^(dB/20)) to avoid a
-            // breaking change to already-saved config values; the
-            // *mechanism* (WDSP's own Panel gain stage rather than
-            // pre-scaling raw samples ourselves) is what's now
-            // confirmed-correct and fixed to match the reference, the
-            // unit convention on top of it is a deliberate deviation.
-            mic_gain: 0.5,
+            // CHANGED (2026-09-08): was 0.5 (-6dB), a deliberately
+            // conservative starting point -- real-hardware testing found
+            // that too quiet in practice (both a local pipewire mic and
+            // TCI-sourced audio produced ~0W output at the default) with
+            // WDSP's ALC configured for no boost headroom of its own
+            // (SetTXAALCMaxGain(0.0), see this file's `open()` for why
+            // that's deliberate). 1.0 (0dB, unity) confirmed working for
+            // both audio sources on real hardware. Fed directly to
+            // WDSP's Panel gain stage (SetTXAPanelGain1) as a linear
+            // multiplier -- this project's UI slider displays/edits this
+            // in dB (see main.rs's scroll_slider_f32_db) but the stored
+            // value/wire format stays linear, kept as-is rather than
+            // switching to the reference's own dB convention to avoid a
+            // breaking change to already-saved config values.
+            mic_gain: 1.0,
             width_hz: crate::spectrum::default_width_hz(Mode::Usb),
             tune: false,
             two_tone: false,

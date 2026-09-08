@@ -79,6 +79,12 @@ pub struct Config {
     /// value here).
     #[serde(default)]
     pub cat_addr: Option<String>,
+    /// "Mute local audio output while TCI is running" (Settings ->
+    /// Network) -- see radio::RadioSession::mute_local_audio_for_tci's
+    /// doc comment. Missing/false means unchanged behavior (both local
+    /// audio and TCI stream, as before this option existed).
+    #[serde(default)]
+    pub mute_local_audio_during_tci: Option<bool>,
     /// Whether rigctl/TCI/CAT were running at last save -- since starting
     /// them is now a manual action (Settings -> Network) rather than
     /// automatic, this is what lets a reconnect restore "was running"
