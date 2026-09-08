@@ -257,7 +257,13 @@ impl NoiseReduction {
             NoiseReduction::Off => "NR: Off",
             NoiseReduction::Nr => "NR: NR",
             NoiseReduction::Nr2 => "NR: NR2",
-            NoiseReduction::Nr3 => "NR: NR3",
+            // Displayed as "NNR" (not "NR3") -- see this enum's own doc
+            // comment: the underlying algorithm is WDSP's neural-net NNR
+            // stage, a different thing from the old RNNoise-backed NR3
+            // this variant name/value is kept for (config compatibility
+            // only, see the #[serde(alias = "Nr4")] above) -- the display
+            // text shouldn't imply it's still that.
+            NoiseReduction::Nr3 => "NR: NNR",
         }
     }
 }

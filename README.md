@@ -22,7 +22,7 @@ This project started as an experiment: could Claude port the discovery code from
 - Multiple simultaneous receivers (main receiver + independent "extra receiver" windows), each with its own VFO, mode, filter width, and band memory
 - Spectrum/waterfall display with adjustable dB range, palette, and Click-to-Tune (CTUN)
 - SSB/CW/AM/FM/digital modes, per-mode/per-band filter width and mode memory
-- Noise blanker (NB/NB2), noise reduction (NR/NR2/NR3), and SNB (spectral noise blanker), independently switchable
+- Noise blanker (NB/NB2), noise reduction (NR/NR2/NNR), and SNB (spectral noise blanker), independently switchable
 - AGC with selectable Off/Long/Slow/Medium/Fast modes
 - TX: mic audio through WDSP's TXA chain, ALC, TX power/SWR meter with per-band PA calibration, and a Tune button (WDSP PostGen tone centered in the passband, at a separate reduced "Tune Power" for safe antenna/PA tuning)
 - PureSignal (PA linearization/predistortion), on both Protocol 1 and Protocol 2 — see [PureSignal calibration](#puresignal-calibration) below for how to set it up

@@ -2570,7 +2570,7 @@ impl eframe::App for HpsdrApp {
                         let nr = connected.spectrum.noise_reduction();
                         if ui
                             .add(egui::Button::selectable(nr != spectrum::NoiseReduction::Off, nr.label()))
-                            .on_hover_text("Click to cycle: Off -> NR -> NR2 -> NR3 -> Off")
+                            .on_hover_text("Click to cycle: Off -> NR -> NR2 -> NNR -> Off")
                             .clicked()
                         {
                             connected.spectrum.set_noise_reduction(nr.next());
@@ -4856,7 +4856,7 @@ impl eframe::App for HpsdrApp {
                                     ui.separator();
                                     ui.horizontal(|ui| {
                                         let mut mask_floor = agc_params.nnr_mask_floor_db;
-                                        ui.label("NR3 Mask Floor:");
+                                        ui.label("NNR Mask Floor:");
                                         if scroll_slider_f64(
                                             ui,
                                             &mut connected.slider_scroll_accum,
@@ -4873,7 +4873,7 @@ impl eframe::App for HpsdrApp {
                                         if ui
                                             .add(egui::Button::selectable(premium, "Premium"))
                                             .on_hover_text(
-                                                "NR3's Standard model (~10% of one core) vs Premium \
+                                                "NNR's Standard model (~10% of one core) vs Premium \
                                                  (~32%, measurably better) -- both built in, switching \
                                                  is instant.",
                                             )
@@ -4884,7 +4884,7 @@ impl eframe::App for HpsdrApp {
                                         }
                                     });
                                     ui.weak(
-                                        "NR3 (Neural NR) only -- lower Mask Floor removes more noise, \
+                                        "NNR (Neural NR) only -- lower Mask Floor removes more noise, \
                                          higher lets more genuine band noise through.",
                                     );
                                 }
@@ -7621,7 +7621,7 @@ fn render_extra_receiver_ui(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceiver>>) {
         let nr = rx.spectrum.noise_reduction();
         if ui
             .add(egui::Button::selectable(nr != spectrum::NoiseReduction::Off, nr.label()))
-            .on_hover_text("Click to cycle: Off -> NR -> NR2 -> NR3 -> Off")
+            .on_hover_text("Click to cycle: Off -> NR -> NR2 -> NNR -> Off")
             .clicked()
         {
             rx.spectrum.set_noise_reduction(nr.next());
@@ -8241,7 +8241,7 @@ fn render_extra_receiver_settings(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceive
 
             ui.horizontal(|ui| {
                 let mut mask_floor = agc_params.nnr_mask_floor_db;
-                ui.label("NR3 Mask Floor:");
+                ui.label("NNR Mask Floor:");
                 if scroll_slider_f64(
                     ui,
                     &mut rx.slider_scroll_accum,
@@ -8260,7 +8260,7 @@ fn render_extra_receiver_settings(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceive
                     rx.settings_dirty.store(true, Ordering::Relaxed);
                 }
             });
-            ui.weak("NR3 (Neural NR) only.");
+            ui.weak("NNR (Neural NR) only.");
             ui.separator();
 
             ui.horizontal(|ui| {
