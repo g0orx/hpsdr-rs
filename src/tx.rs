@@ -336,18 +336,6 @@ pub struct PsStatus {
     /// value alongside `over_drive` so a scheck-only failure (bit0, no
     /// over-drive) is distinguishable in diagnostics.
     pub solution_check: i32,
-    /// See feed_ps's low-RX-envelope filter doc comment. Running
-    /// percentage of PS feedback samples dropped by that filter since
-    /// this TX channel was opened (not per-attempt) -- purely a "is the
-    /// filter doing anything" indicator, not calibration-accuracy
-    /// diagnostic.
-    pub filtered_pct: f32,
-    /// Raw total sample count `feed_ps` has ever been called with (same
-    /// counter `filtered_pct` is derived from) -- added specifically to
-    /// tell "feed_ps isn't being invoked at all" apart from "it's being
-    /// invoked but the percentage happens to look static", which
-    /// `filtered_pct` alone can't distinguish.
-    pub feed_ps_total_samples: u64,
     /// GetPSInfo's info[15] -- calcc.c's own `ctrl.state` enum value
     /// (`_calcc_state`: 0=LRESET, 1=LWAIT, 2=LMOXDELAY, 3=LSETUP,
     /// 4=LCOLLECT, 5=MOXCHECK, 6=LCALC, 7=LDELAY, 8=LSTAYON, 9=LTURNON),
@@ -465,13 +453,6 @@ struct TxProcessor {
     last_post_gen: Option<(bool, bool)>,
     /// See set_ps_mox's doc comment.
     last_ps_mox: Option<bool>,
-    /// See feed_ps's low-RX-envelope filter doc comment. Running
-    /// totals (not reset per calibration attempt) purely for the
-    /// Settings -> PureSignal "Filtered" diagnostic -- approximate by
-    /// design, just meant to show whether the filter is actually doing
-    /// anything on real hardware.
-    ps_filter_total: u64,
-    ps_filter_dropped: u64,
     /// Slow EMA of feed_ps's per-chunk median TX/RX envelope ratio --
     /// see feed_ps's doc comment for why this has to be a long-run
     /// baseline (persists across the whole TX channel's lifetime, not
@@ -853,8 +834,6 @@ impl TxProcessor {
             last_eq: None,
             last_post_gen: None,
             last_ps_mox: None,
-            ps_filter_total: 0,
-            ps_filter_dropped: 0,
             ps_ratio_baseline: None,
             last_ps_enabled: None,
             last_ps_oneshot: None,
@@ -1364,12 +1343,6 @@ impl TxProcessor {
             over_drive: info[6] & 2 != 0,
             curve_status: [info[0], info[1], info[2], info[3]],
             solution_check: info[6],
-            filtered_pct: if self.ps_filter_total > 0 {
-                100.0 * self.ps_filter_dropped as f32 / self.ps_filter_total as f32
-            } else {
-                0.0
-            },
-            feed_ps_total_samples: self.ps_filter_total,
             state: info[15],
         }
     }
@@ -1489,10 +1462,7 @@ impl TxProcessor {
         // pscc() zero-preprocessed samples, so matching that exactly
         // (rather than guessing at new filter parameters on top of an
         // already-uncertain fix) is the cleanest way to isolate whether
-        // SetPSDeadlockMinFrac alone is sufficient. Diagnostics below
-        // still compute normally (so `filtered_pct` correctly reads 0%
-        // while this is off, not stale data) -- only the actual
-        // drop/keep decision is short-circuited.
+        // SetPSDeadlockMinFrac alone is sufficient.
         const FILTER_ENABLED: bool = false;
         const MIN_ENV: f32 = 1.0e-6;
         const PS_FEED_MAX_RATIO_MULTIPLIER: f32 = 15.0;
@@ -1531,7 +1501,6 @@ impl TxProcessor {
         let mut temptx = Vec::with_capacity(size * 2);
         let mut temprx = Vec::with_capacity(size * 2);
         for i in 0..size {
-            self.ps_filter_total += 1;
             let valid = tx_env[i] >= MIN_ENV && rx_env[i] >= MIN_ENV;
             let keep = !FILTER_ENABLED
                 || (valid
@@ -1544,8 +1513,6 @@ impl TxProcessor {
                 temptx.push(qtx[i] as f64);
                 temprx.push(irx[i] as f64);
                 temprx.push(qrx[i] as f64);
-            } else {
-                self.ps_filter_dropped += 1;
             }
         }
 

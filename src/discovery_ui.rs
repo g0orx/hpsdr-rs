@@ -249,13 +249,20 @@ impl DiscoveryWindow {
                             let is_selected = self.selected == Some(i);
 
                             let mut row_clicked = false;
-                            row_clicked |= selectable_cell(
+                            // Double-click on an available row starts it
+                            // immediately, same as selecting it then
+                            // pressing Start -- OR'd across all cells the
+                            // same way row_clicked already is, since each
+                            // is its own egui widget/Response.
+                            let mut row_double_clicked = false;
+                            let resp = selectable_cell(
                                 ui,
                                 format!("{:?}", dev.board),
                                 is_selected,
                                 available,
-                            )
-                            .clicked();
+                            );
+                            row_clicked |= resp.clicked();
+                            row_double_clicked |= resp.double_clicked();
                             // Real interface name (e.g. "eth0") next to
                             // this machine's own address on it -- a real
                             // report that this column, despite its own
@@ -276,47 +283,52 @@ impl DiscoveryWindow {
                                     None => dev.my_address.ip().to_string(),
                                 }
                             };
-                            row_clicked |= selectable_cell(
+                            let resp = selectable_cell(
                                 ui,
                                 interface_cell,
                                 is_selected,
                                 available,
-                            )
-                            .clicked();
+                            );
+                            row_clicked |= resp.clicked();
+                            row_double_clicked |= resp.double_clicked();
                             let ip_cell = if dev.board == Boards::Ozy {
                                 "USB".to_string()
                             } else {
                                 dev.address.ip().to_string()
                             };
-                            row_clicked |= selectable_cell(
+                            let resp = selectable_cell(
                                 ui,
                                 ip_cell,
                                 is_selected,
                                 available,
-                            )
-                            .clicked();
-                            row_clicked |= selectable_cell(
+                            );
+                            row_clicked |= resp.clicked();
+                            row_double_clicked |= resp.double_clicked();
+                            let resp = selectable_cell(
                                 ui,
                                 format!("{:02X?}", dev.mac),
                                 is_selected,
                                 available,
-                            )
-                            .clicked();
-                            row_clicked |= selectable_cell(
+                            );
+                            row_clicked |= resp.clicked();
+                            row_double_clicked |= resp.double_clicked();
+                            let resp = selectable_cell(
                                 ui,
                                 dev.protocol.to_string(),
                                 is_selected,
                                 available,
-                            )
-                            .clicked();
-                            row_clicked |= selectable_cell(
+                            );
+                            row_clicked |= resp.clicked();
+                            row_double_clicked |= resp.double_clicked();
+                            let resp = selectable_cell(
                                 ui,
                                 format!("{}.{}", dev.version / 10, dev.version % 10),
                                 is_selected,
                                 available,
-                            )
-                            .clicked();
-                            row_clicked |= selectable_cell(
+                            );
+                            row_clicked |= resp.clicked();
+                            row_double_clicked |= resp.double_clicked();
+                            let resp = selectable_cell(
                                 ui,
                                 match dev.status {
                                     2 => "Available",
@@ -325,11 +337,16 @@ impl DiscoveryWindow {
                                 },
                                 is_selected,
                                 available,
-                            )
-                            .clicked();
+                            );
+                            row_clicked |= resp.clicked();
+                            row_double_clicked |= resp.double_clicked();
 
                             if row_clicked {
                                 self.selected = Some(i);
+                            }
+                            if row_double_clicked && available {
+                                self.selected = Some(i);
+                                action = DiscoveryAction::Start(*dev);
                             }
 
                             ui.end_row();

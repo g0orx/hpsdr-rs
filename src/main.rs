@@ -660,6 +660,33 @@ struct ConnectedState {
     ps_mox_delay: f64,
     ps_loop_delay: f64,
     ps_tx_delay_ns: f64,
+    /// Auto Attenuate (Two Tone) -- see this file's own PureSignal
+    /// settings block for the algorithm, ported from piHPSDR/deskHPSDR's
+    /// `ps_menu.c` (`transmitter->auto_on`): periodically nudges
+    /// `RadioSession::ps_tx_attenuation` toward a feedback level of
+    /// ~152 (WDSP's own documented ideal), then forces a fresh
+    /// calibration (same as clicking "Calibrate Now") since old
+    /// collected samples from before an attenuation change aren't
+    /// valid to mix with new ones. Not persisted, same reasoning as
+    /// `ps_oneshot` above -- always starts false each session, so a
+    /// stale attenuation isn't auto-nudged again without the user
+    /// re-arming it deliberately.
+    ps_auto_attenuate: bool,
+    /// Debounce state for the above -- NOT user-visible. `GetPSInfo`'s
+    /// feedback-level (info[4]) only refreshes once per completed WDSP
+    /// calibration cycle (set inside `calc()`, calcc.c), not
+    /// continuously -- evaluating on every UI frame would repeatedly
+    /// act on the SAME stale reading from before the last attenuation
+    /// change, the same "info[4] may still describe the feedback level
+    /// from before the most recent TX attenuation change" pitfall
+    /// piHPSDR's own comment calls out. Mirrors piHPSDR's own
+    /// newcal-or-timeout gate: only re-evaluate once the feedback level
+    /// has actually changed since the last time we looked, or -- if it
+    /// hasn't -- once a few seconds have passed anyway (a stable board
+    /// can legitimately report the same value on consecutive fresh
+    /// cycles).
+    auto_atten_last_seen_feedback: Option<i32>,
+    auto_atten_last_check: Option<Instant>,
     /// Per-band PA gain (dB), keyed by band name. See
     /// Config::pa_calibration and radio::drive_byte_for_watts. Resolved
     /// to the current band and pushed into session.pa_gain_db once per
@@ -1397,6 +1424,9 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                 ps_mox_delay,
                 ps_loop_delay,
                 ps_tx_delay_ns,
+                ps_auto_attenuate: false,
+                auto_atten_last_seen_feedback: None,
+                auto_atten_last_check: None,
                 pa_calibration: cfg.pa_calibration.clone(),
                 // Always exactly MAX_XVTRS slots so the settings tab has a
                 // stable fixed-size row list to render/edit -- a config
@@ -5735,21 +5765,16 @@ impl eframe::App for HpsdrApp {
                                                 )
                                                 .on_hover_text(
                                                     "Nonzero = that stage of PureSignal's correction-\
-                                                     table fit failed and it reset -- report this to \
-                                                     the developer along with which one(s) are nonzero.",
+                                                     table fit failed and it reset. Often reflects a \
+                                                     real limit of the feedback signal itself (e.g. too \
+                                                     little SNR at low drive for the calibration signal \
+                                                     in use) rather than a bug -- try adjusting \
+                                                     attenuation or drive first. If it persists across \
+                                                     settings, note which code(s) are nonzero when \
+                                                     asking for help.",
                                                 );
                                             }
                                             ui.label(format!("Measured peak TX: {:.4}", status.max_tx));
-                                            ui.label(format!(
-                                                "Feedback samples filtered: {:.1}% (of {} total)",
-                                                status.filtered_pct, status.feed_ps_total_samples
-                                            ))
-                                            .on_hover_text(
-                                                "Samples dropped by feed_ps's low-RX-envelope \
-                                                 filter before reaching WDSP -- see its doc \
-                                                 comment (tx.rs). Running total since this TX \
-                                                 channel was opened, not per-attempt.",
-                                            );
 
                                             // Standard (non-HermesLite) boards only, both protocols
                                             // -- see radio::RadioSession::ps_tx_attenuation's doc
@@ -5791,6 +5816,120 @@ impl eframe::App for HpsdrApp {
                                                     "Raise this if Feedback level above reads too high \
                                                      (near/over 256) -- target the 128-181 range.",
                                                 );
+
+                                                let mut ps_auto_attenuate = connected.ps_auto_attenuate;
+                                                if ui
+                                                    .checkbox(&mut ps_auto_attenuate, "Auto Attenuate (Two Tone)")
+                                                    .changed()
+                                                {
+                                                    connected.ps_auto_attenuate = ps_auto_attenuate;
+                                                    // Re-arm the debounce so turning this on doesn't
+                                                    // treat whatever feedback_level happens to be
+                                                    // showing right now (possibly stale, from before
+                                                    // this was last on) as already "seen" -- see
+                                                    // ConnectedState::auto_atten_last_seen_feedback's
+                                                    // doc comment.
+                                                    connected.auto_atten_last_seen_feedback = None;
+                                                    connected.auto_atten_last_check = None;
+                                                }
+                                                ui.weak(
+                                                    "Periodically nudges the attenuation above toward \
+                                                     a feedback level of ~152, then re-calibrates -- \
+                                                     ported from piHPSDR/deskHPSDR's own Auto Attenuate \
+                                                     (ps_menu.c). Needs Two Tone (or other PS-driving \
+                                                     TX audio) and MOX active to have anything to act on.",
+                                                );
+
+                                                // Ported from piHPSDR/deskHPSDR's ps_menu.c
+                                                // (transmitter->auto_on handling) -- see this
+                                                // session's PureSignal investigation,
+                                                // memory/wdsp_210_port.md, for why the underlying
+                                                // attenuation value/target (~152) and the
+                                                // reset-then-recalibrate-after-a-change behavior
+                                                // are exactly what that reference does, just
+                                                // reusing this project's own already-fixed
+                                                // "Calibrate Now" (tx.ps_calibrate()) for the
+                                                // reset+resume step instead of a separate hand-
+                                                // rolled state machine.
+                                                if connected.ps_auto_attenuate && connected.session.mox_active() {
+                                                    const AUTO_ATTEN_TARGET: f64 = 152.293;
+                                                    const AUTO_ATTEN_LOW: i32 = 140;
+                                                    const AUTO_ATTEN_HIGH: i32 = 165;
+                                                    const AUTO_ATTEN_MIN: i32 = 0;
+                                                    const AUTO_ATTEN_MAX: i32 = 31;
+                                                    // How long to wait before re-evaluating an
+                                                    // unchanged feedback_level as if it were fresh.
+                                                    // GetPSInfo's info[4] only refreshes once per
+                                                    // completed WDSP calibration cycle (calcc.c's
+                                                    // calc()), not continuously -- see
+                                                    // ConnectedState::auto_atten_last_seen_feedback's
+                                                    // doc comment for why this can't just check
+                                                    // every frame.
+                                                    const AUTO_ATTEN_RECHECK: Duration = Duration::from_secs(3);
+
+                                                    let feedback = status.feedback_level;
+                                                    let now = Instant::now();
+                                                    let changed =
+                                                        connected.auto_atten_last_seen_feedback != Some(feedback);
+                                                    let due = connected
+                                                        .auto_atten_last_check
+                                                        .map(|t| now.duration_since(t) >= AUTO_ATTEN_RECHECK)
+                                                        .unwrap_or(true);
+                                                    if changed || due {
+                                                        connected.auto_atten_last_seen_feedback = Some(feedback);
+                                                        connected.auto_atten_last_check = Some(now);
+
+                                                        let current = connected
+                                                            .session
+                                                            .ps_tx_attenuation
+                                                            .load(Ordering::Relaxed)
+                                                            as i32;
+                                                        if (feedback > AUTO_ATTEN_HIGH && current < AUTO_ATTEN_MAX)
+                                                            || (feedback < AUTO_ATTEN_LOW
+                                                                && current > AUTO_ATTEN_MIN)
+                                                        {
+                                                            // One-step dB correction (not iterative
+                                                            // guessing) -- 20*log10(ratio) is exactly
+                                                            // how many dB of attenuation change would
+                                                            // move `feedback` to the target, since
+                                                            // feedback level scales linearly with the
+                                                            // (un-attenuated) RF amplitude. Special-
+                                                            // cased +-15dB jumps for very strong/weak
+                                                            // readings match piHPSDR's own handling of
+                                                            // ADC-clipping/overflow at the extremes,
+                                                            // where the log formula's input isn't
+                                                            // trustworthy anyway.
+                                                            let delta_att = if feedback > 275 {
+                                                                15
+                                                            } else if feedback < 25 {
+                                                                -15
+                                                            } else {
+                                                                (20.0
+                                                                    * (feedback as f64 / AUTO_ATTEN_TARGET).log10())
+                                                                .round()
+                                                                    as i32
+                                                            };
+                                                            let new_atten = (current + delta_att)
+                                                                .clamp(AUTO_ATTEN_MIN, AUTO_ATTEN_MAX);
+                                                            if new_atten != current {
+                                                                connected
+                                                                    .session
+                                                                    .ps_tx_attenuation
+                                                                    .store(new_atten as u32, Ordering::Relaxed);
+                                                                // Old collected samples are from the
+                                                                // PREVIOUS attenuation -- not valid to
+                                                                // mix with new ones, so force a fresh
+                                                                // attempt exactly like clicking
+                                                                // "Calibrate Now" (which, since this
+                                                                // session's fix, correctly resumes in
+                                                                // whichever mode -- Running/OneShot --
+                                                                // is currently selected).
+                                                                tx.ps_calibrate();
+                                                                settings_changed = true;
+                                                            }
+                                                        }
+                                                    }
+                                                }
                                             }
 
                                             ui.add_space(4.0);
