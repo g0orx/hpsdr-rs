@@ -3622,7 +3622,13 @@ impl eframe::App for HpsdrApp {
                         );
                     } else {
                         ui.painter().rect_filled(rect, 0.0, egui::Color32::BLACK);
-                        ui.put(rect, egui::Label::new(wisdom_status_text()));
+                        ui.put(
+                            rect,
+                            egui::Label::new(
+                                egui::RichText::new(wisdom_status_text())
+                                    .color(egui::Color32::from_rgb(220, 60, 60)),
+                            ),
+                        );
                     }
                     if let Some(pos) = waterfall_click_resp.hover_pos() {
                         let hover_freq = freq_at_x(pos.x, rect, freq_hz, sample_rate, connected.spectrum_zoom, pan_offset_hz);
@@ -3682,7 +3688,7 @@ impl eframe::App for HpsdrApp {
                         // unlike status_message which persists until
                         // something else overwrites it.
                         if waterfall_texture_id.is_none() {
-                            ui.weak(wisdom_status_text());
+                            ui.colored_label(egui::Color32::from_rgb(220, 60, 60), wisdom_status_text());
                         } else if let Some(msg) = &connected.status_message {
                             ui.weak(msg);
                         }
@@ -8031,7 +8037,12 @@ fn render_extra_receiver_ui(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceiver>>) {
         );
     } else {
         ui.painter().rect_filled(wf_rect, 0.0, egui::Color32::BLACK);
-        ui.put(wf_rect, egui::Label::new(wisdom_status_text()));
+        ui.put(
+            wf_rect,
+            egui::Label::new(
+                egui::RichText::new(wisdom_status_text()).color(egui::Color32::from_rgb(220, 60, 60)),
+            ),
+        );
     }
     if let Some(pos) = wf_resp.hover_pos() {
         let hover_freq = freq_at_x(pos.x, wf_rect, freq_hz, sample_rate, rx.spectrum_zoom, pan_offset_hz);
