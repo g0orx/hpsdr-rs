@@ -4443,6 +4443,13 @@ fn p2_high_priority_packet(
     // wiring + correct ADC assignment still produced nothing on RX2
     // until this was identified as the missing piece.
     alex1_rx2_freq_hz: Option<u32>,
+    // See RadioSession::puresignal_enabled's doc comment -- live value,
+    // read fresh each cycle. Drives ALEX_PS_BIT on both alex0 and alex1
+    // (see alex0_word's and this function's own alex1 upper-word doc
+    // comments) -- confirmed against deskHPSDR's new_protocol.c
+    // (2026-09-08, see memory/wdsp_210_port.md): this bit was completely
+    // missing from this project until now, on any board, in any state.
+    puresignal_enabled: bool,
 ) -> [u8; P2_PACKET_SIZE] {
     let mut p = [0u8; P2_PACKET_SIZE];
     p[0..4].copy_from_slice(&seq.to_be_bytes());
@@ -4502,7 +4509,8 @@ fn p2_high_priority_packet(
     // Antenna/filter selection is driven by receiver 0's frequency --
     // there's only one Alex front end, shared across all DDCs.
     let primary_freq = frequencies_hz.first().copied().unwrap_or(7_100_000);
-    p[1432..1436].copy_from_slice(&alex0_word(primary_freq, antenna, mox_on, disable_pa).to_be_bytes());
+    p[1432..1436]
+        .copy_from_slice(&alex0_word(primary_freq, antenna, mox_on, disable_pa, puresignal_enabled).to_be_bytes());
 
     // RX2/Alex1 bandpass filter (bytes 1430-1431) -- see this param's own
     // doc comment. BUG FIX: previously never written at all (stayed
@@ -4513,15 +4521,37 @@ fn p2_high_priority_packet(
         p[1430..1432].copy_from_slice(&alex1_word(rx2_freq, mox_on).to_be_bytes());
     }
 
-    // Bytes 1428-1429: the v4.3 spec documents this as an "Alex0 TX
-    // relay pre-stage" field, and a previous version of this file
-    // populated it on that basis -- but confirmed against three
-    // independent known-working implementations (piHPSDR, linHPSDR,
-    // rustyHPSDR), none of them set it; all three leave it at the
-    // initialized 0x0000. Reverted to match every real-world
-    // implementation actually observed, rather than a spec detail that
-    // isn't actually exercised in practice. Left at 0 (the array's
-    // default), so no explicit write needed here.
+    // Bytes 1428-1429: alex1's UPPER 16 bits. A previous version of this
+    // comment said the v4.3 spec's "Alex0 TX relay pre-stage" field here
+    // was left unwritten because piHPSDR/linHPSDR/rustyHPSDR don't set
+    // it -- true for that specific TX-antenna-prestage interpretation,
+    // but WRONG as a blanket claim about these two bytes: confirmed
+    // against deskHPSDR's new_protocol.c (2026-09-08, see
+    // memory/wdsp_210_port.md) that this board family's real firmware
+    // DOES read meaningful bits here. Per its own comment ("the upper 16
+    // bits of alex0 reflect the upper 16 bits of alex1 for the TX case,
+    // so if receiving, these bits have the state they would have during
+    // transmit"), TR_RELAY and PS_BIT are both set on alex1 UNCONDITIONALLY
+    // (not gated on mox_on, unlike their alex0 counterparts) -- alex1 is
+    // always a preview of "what alex0 would be if transmitting right
+    // now". This was the most likely reason PureSignal's calibration fit
+    // stayed broken (CONDNUM/OUTLIERS) on real hardware across every
+    // software-side (WDSP-side) change attempted all session: if the
+    // radio's own feedback-coupler relay is gated on this bit and it was
+    // never being set, the ADC0/ADC1 "feedback" samples calcc.c was
+    // fitting curves to were never actually the clean internal
+    // PA-coupled signal PureSignal needs, no matter how the DSP side is
+    // tuned.
+    const ALEX1_TR_RELAY: u16 = 0x0800; // upper half of ALEX_TX_RELAY (bit 27)
+    const ALEX1_PS_BIT: u16 = 0x0004; // upper half of ALEX_PS_BIT (bit 18)
+    let mut alex1_upper: u16 = 0;
+    if !disable_pa {
+        alex1_upper |= ALEX1_TR_RELAY;
+    }
+    if puresignal_enabled {
+        alex1_upper |= ALEX1_PS_BIT;
+    }
+    p[1428..1430].copy_from_slice(&alex1_upper.to_be_bytes());
 
     p
 }
@@ -4542,7 +4572,7 @@ fn p2_high_priority_packet(
 /// actually connected. Only the antenna/TR_RELAY handling was written
 /// by me; the two threshold ladders and every constant value came
 /// directly from the user.
-fn alex0_word(freq_hz: u32, antenna: u32, mox_on: bool, disable_pa: bool) -> u32 {
+fn alex0_word(freq_hz: u32, antenna: u32, mox_on: bool, disable_pa: bool, puresignal_enabled: bool) -> u32 {
     const HPF_13MHZ: u32 = 0x00000002;
     const HPF_20MHZ: u32 = 0x00000004;
     const PREAMP_6M: u32 = 0x00000008;
@@ -4558,6 +4588,14 @@ fn alex0_word(freq_hz: u32, antenna: u32, mox_on: bool, disable_pa: bool) -> u32
     const ANT_2: u32 = 0x02000000;
     const ANT_3: u32 = 0x04000000;
     const TR_RELAY: u32 = 0x08000000;
+    // Bit 18 -- set on alex0 while actually keyed AND PureSignal is
+    // enabled, matching deskHPSDR's `if (transmitter->puresignal) { if
+    // (xmit) {alex0 |= ALEX_PS_BIT;} ... }` (new_protocol.c, confirmed
+    // 2026-09-08 -- see p2_high_priority_packet's alex1-upper-word doc
+    // comment for the full rationale and this bit's likely significance:
+    // it plausibly gates the board's internal PA-feedback-coupler relay,
+    // not just an informational flag).
+    const PS_BIT: u32 = 0x00040000;
     const LPF_BYPASS: u32 = 0x20000000;
     const LPF_12_10: u32 = 0x40000000;
     const LPF_17_15: u32 = 0x80000000;
@@ -4617,8 +4655,9 @@ fn alex0_word(freq_hz: u32, antenna: u32, mox_on: bool, disable_pa: bool) -> u32
     // routing through the internal PA while a transverter should be
     // driven at low level instead.
     let tr = if mox_on && !disable_pa { TR_RELAY } else { 0 };
+    let ps = if mox_on && puresignal_enabled { PS_BIT } else { 0 };
 
-    hpf | lpf | ant | tr
+    hpf | lpf | ant | tr | ps
 }
 
 /// Alex1 "RX2" bandpass filter register, ANAN-7000/8000DLE (Orion2)
@@ -4934,6 +4973,7 @@ fn p2_sender_loop(
                     drive,
                     ps_tx_atten,
                     is_orion2.then_some(rx2_freq_hz),
+                    puresignal_enabled.load(Ordering::Relaxed),
                 );
 
             let sends: [(&[u8], u16); 5] = [
@@ -4978,6 +5018,7 @@ fn p2_sender_loop(
                     drive,
                     ps_tx_atten,
                     is_orion2.then_some(rx2_freq_hz),
+                    puresignal_enabled.load(Ordering::Relaxed),
                 );
             if socket.send_to(&hp, (radio_ip, P2_HIGH_PRIORITY_PORT)).is_err() {
                 return;

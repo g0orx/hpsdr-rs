@@ -289,7 +289,26 @@ unsafe extern "C" {
     pub fn SetRXAEMNRRun(channel: ::std::os::raw::c_int, run: ::std::os::raw::c_int);
 }
 unsafe extern "C" {
-    pub fn SetRXARNNRRun(channel: ::std::os::raw::c_int, run: ::std::os::raw::c_int);
+    pub fn SetRXANNRRun(channel: ::std::os::raw::c_int, setit: ::std::os::raw::c_int);
+}
+unsafe extern "C" {
+    /// The single documented operator-facing NNR tuning control (WDSP
+    /// Guide Rev 2.1.0, section 5.3.20) -- limits how far any frequency
+    /// bin can be attenuated, i.e. how much real received noise is let
+    /// through. Range -10.0 (most noise passed) to -50.0 (max
+    /// suppression), default -25.0. The guide explicitly does NOT
+    /// document Alpha/AlphaKnee/Tau/MaxGain/Smooth/cmode/TestMode as
+    /// operator controls -- only this one and the model selector below.
+    pub fn SetRXANNRMaskFloor(channel: ::std::os::raw::c_int, floor_db: f64);
+}
+unsafe extern "C" {
+    /// Selects which of the two built-in trained models NNR uses: 0 =
+    /// Standard (default, ~10% of one core), 1 = Premium (~32%,
+    /// measurably better). Both are compiled in and already loaded, so
+    /// switching is immediate with no pause (WDSP Guide 5.3.20). Returns
+    /// the slot actually in use -- may differ from the requested slot
+    /// if that slot has no model in this build.
+    pub fn SetRXANNRModel(channel: ::std::os::raw::c_int, slot: ::std::os::raw::c_int) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
     pub fn SetRXAEMNRgainMethod(channel: ::std::os::raw::c_int, method: ::std::os::raw::c_int);
@@ -304,37 +323,10 @@ unsafe extern "C" {
     pub fn SetRXAANRPosition(channel: ::std::os::raw::c_int, position: ::std::os::raw::c_int);
 }
 unsafe extern "C" {
-    pub fn SetRXARNNRPosition(channel: ::std::os::raw::c_int, position: ::std::os::raw::c_int);
-}
-unsafe extern "C" {
     pub fn SetRXAANFPosition(channel: ::std::os::raw::c_int, position: ::std::os::raw::c_int);
 }
 unsafe extern "C" {
     pub fn SetRXAANFRun(channel: ::std::os::raw::c_int, run: ::std::os::raw::c_int);
-}
-unsafe extern "C" {
-    pub fn SetRXASBNRRun(channel: ::std::os::raw::c_int, run: ::std::os::raw::c_int);
-}
-unsafe extern "C" {
-    pub fn SetRXASBNRPosition(channel: ::std::os::raw::c_int, position: ::std::os::raw::c_int);
-}
-unsafe extern "C" {
-    pub fn SetRXASBNRreductionAmount(channel: ::std::os::raw::c_int, nr4_reduction_amount: f32);
-}
-unsafe extern "C" {
-    pub fn SetRXASBNRsmoothingFactor(channel: ::std::os::raw::c_int, nr4_smooting_factor: f32);
-}
-unsafe extern "C" {
-    pub fn SetRXASBNRwhiteningFactor(channel: ::std::os::raw::c_int, nr4_whitening_factor: f32);
-}
-unsafe extern "C" {
-    pub fn SetRXASBNRpostFilterThreshold(channel: ::std::os::raw::c_int, nr4_post_filter_threshold: f32);
-}
-unsafe extern "C" {
-    pub fn SetRXASBNRnoiseRescale (channel: ::std::os::raw::c_int, nr4_noise_rescale: f32);
-}
-unsafe extern "C" {
-    pub fn SetRXASBNRnoiseScalingType(channel: ::std::os::raw::c_int, noise_scaling_type: ::std::os::raw::c_int);
 }
 unsafe extern "C" {
     pub fn GetRXAMeter(channel: ::std::os::raw::c_int, mt: ::std::os::raw::c_int) -> f64;
@@ -831,16 +823,18 @@ unsafe extern "C" {
     pub fn SetPSHWPeak(channel: ::std::os::raw::c_int, peak: f64);
 }
 unsafe extern "C" {
-    pub fn SetPSPtol(channel: ::std::os::raw::c_int, ptol: f64);
-}
-unsafe extern "C" {
-    /// Diagnostic-only -- exposes calcc's internal scatter data
-    /// (x/ym/yc/ys, nsamps=ints*spi=4096 doubles each) and fitted
-    /// correction-table coefficients (cm/cc/cs, ints*4=64 doubles
-    /// each). Caller must size buffers to match TXA.c's fixed
-    /// create_calcc call (ints=16, spi=256) -- there is no getter for
-    /// ints/spi themselves, they're a compile-time constant on the
-    /// WDSP side for this project's usage.
+    /// Diagnostic-only, unused by this project. Its old doc comment
+    /// described a fixed-size (ints*spi=4096, ints*4=64) scatter/
+    /// coefficient buffer layout matching the pre-WDSP-2.10 bucketed-
+    /// histogram calcc engine -- as of the WDSP 2.10 port
+    /// (2026-09-07), that engine was replaced with a NURBS spline fit
+    /// (see calcc.c) with a different internal data model, and
+    /// `ints`/`spi` no longer exist as concepts at all
+    /// (`SetPSIntsAndSpi` is gone upstream, removed below). GetPSDisp
+    /// itself is still exported with the same signature, but its
+    /// buffer-sizing contract is unverified against the new
+    /// implementation -- re-check calcc.c directly before ever wiring
+    /// this up.
     pub fn GetPSDisp(
         channel: ::std::os::raw::c_int,
         x: *mut f64,
@@ -856,20 +850,18 @@ unsafe extern "C" {
     pub fn SetPSFeedbackRate(channel: ::std::os::raw::c_int, rate: ::std::os::raw::c_int);
 }
 unsafe extern "C" {
-    pub fn SetPSIntsAndSpi(
-        channel: ::std::os::raw::c_int,
-        ints: ::std::os::raw::c_int,
-        spi: ::std::os::raw::c_int,
-    );
-}
-unsafe extern "C" {
-    pub fn SetPSStabilize(channel: ::std::os::raw::c_int, stbl: ::std::os::raw::c_int);
-}
-unsafe extern "C" {
-    pub fn SetPSMapMode(channel: ::std::os::raw::c_int, map: ::std::os::raw::c_int);
-}
-unsafe extern "C" {
-    pub fn SetPSPinMode(channel: ::std::os::raw::c_int, pin: ::std::os::raw::c_int);
+    /// New in the WDSP 2.10 revision synced from deskHPSDR (2026-09-08,
+    /// see memory/wdsp_210_port.md) -- not present in this project's
+    /// first, earlier WDSP 2.10 snapshot at all. Sets the minimum
+    /// fraction of "useful" (not noise-dominated) samples calcc.c's
+    /// deadlock/over-drive check requires in the highest-drive
+    /// calibration bucket before giving up and resetting (clamped
+    /// 0.0-1.0 by WDSP itself). WDSP's own compiled-in default is 0.06
+    /// ("Strict" in deskHPSDR's own UI); deskHPSDR's own app-level
+    /// default relaxes this to 0.02 for real (imperfect/noisy)
+    /// feedback hardware -- confirmed via its ps_menu.c/transmitter.c
+    /// source directly, not guessed.
+    pub fn SetPSDeadlockMinFrac(channel: ::std::os::raw::c_int, frac: f64);
 }
 unsafe extern "C" {
     pub fn GetPSInfo(channel: ::std::os::raw::c_int, info: *mut ::std::os::raw::c_int);
@@ -903,25 +895,6 @@ unsafe extern "C" {
         size: ::std::os::raw::c_int,
         tx: *mut f64,
         rx: *mut f64,
-    );
-}
-unsafe extern "C" {
-    /// Float-buffer variant of `pscc` above (wdsp/calcc.c) -- separate
-    /// I/Q buffers rather than interleaved complex pairs, and f32
-    /// rather than f64, matching this project's own convention
-    /// elsewhere (avoids a f32->f64 conversion buffer on every call).
-    /// `mox`/`solidmox` let WDSP know the current PTT state directly
-    /// as part of the call, confirmed against piHPSDR's transmitter.c
-    /// call site.
-    pub fn psccF(
-        channel: ::std::os::raw::c_int,
-        size: ::std::os::raw::c_int,
-        itxbuff: *mut f32,
-        qtxbuff: *mut f32,
-        irxbuff: *mut f32,
-        qrxbuff: *mut f32,
-        mox: ::std::os::raw::c_int,
-        solidmox: ::std::os::raw::c_int,
     );
 }
 unsafe extern "C" {

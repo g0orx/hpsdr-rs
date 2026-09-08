@@ -18,13 +18,12 @@ License along with this library; if not, write to the Free Software
 Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301  USA
 */
 
-#include "specbleach/specbleach_denoiser.h"
+#include "specbleach_denoiser.h"
 #include "denoiser/spectral_denoiser.h"
 #include "shared/configurations.h"
 #include "shared/noise_estimation/noise_profile.h"
 #include "shared/stft/stft_processor.h"
 #include "shared/utils/general_utils.h"
-#include <math.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -225,29 +224,32 @@ bool specbleach_noise_profile_available(SpectralBleachHandle instance) {
 uint32_t specbleach_get_noise_profile_blocks_averaged_for_mode(
     SpectralBleachHandle instance, int mode) {
   SbSpectralDenoiser* self = (SbSpectralDenoiser*)instance;
-  if (!self || mode < 1 || mode > 3)
+  if (!self || mode < 1 || mode > 3) {
     return 0;
+  }
   return get_noise_profile_blocks_averaged(self->noise_profile, mode);
 }
 
 float* specbleach_get_noise_profile_for_mode(SpectralBleachHandle instance,
                                              int mode) {
   SbSpectralDenoiser* self = (SbSpectralDenoiser*)instance;
-  if (!self || mode < 1 || mode > 3)
+  if (!self || mode < 1 || mode > 3) {
     return NULL;
+  }
   return get_noise_profile(self->noise_profile, mode);
 }
 
 bool specbleach_noise_profile_available_for_mode(SpectralBleachHandle instance,
                                                  int mode) {
   SbSpectralDenoiser* self = (SbSpectralDenoiser*)instance;
-  if (!self || mode < 1 || mode > 3)
+  if (!self || mode < 1 || mode > 3) {
     return false;
+  }
   return is_noise_estimation_available(self->noise_profile, mode);
 }
 
 bool specbleach_load_parameters(SpectralBleachHandle instance,
-                                SpectralBleachParameters parameters) {
+                                SpectralBleachDenoiserParameters parameters) {
   if (!instance) {
     return false;
   }

@@ -47,7 +47,7 @@
 
     PureSignal (Phase 2 -- see the plan doc for the full multi-phase
     story): feeds forward TX IQ and the two feedback streams radio.rs
-    already demuxes into WDSP's calcc engine (psccF), which lives
+    already demuxes into WDSP's calcc engine (feed_ps -> pscc), which lives
     inside this same TXA channel with no separate OpenChannel needed.
     Feedback arrives with real network latency behind the corresponding
     TX audio it's paired with here (see drain_ps_feedback) -- any
@@ -232,20 +232,6 @@ pub struct PsParams {
     /// compensation. Confirmed reference default: 150ns (Apache Labs
     /// hardware).
     pub tx_delay_ns: f64,
-    /// `SetPSPtol` -- outlier tolerance (0.0-1.0) for the correction-
-    /// table curve fit's culling step. Confirmed reference default:
-    /// 0.8 (TXA.c's create_calcc call), previously never exposed/set
-    /// by this project at all (left at that WDSP-internal default).
-    /// LOWER values allow culling MORE outlier samples before fitting
-    /// (`cull()`'s allowed-cull-count is proportional to `1.0-ptol`) --
-    /// worth lowering if `Correcting` never turns on despite
-    /// calibration attempts completing: WDSP's own scheck() function
-    /// (which gates whether a computed correction table is trusted
-    /// enough to apply) can reject an otherwise-valid table if the fit
-    /// overshoots full scale anywhere, which noisy/imprecise
-    /// calibration data (e.g. from feedback with reduced time
-    /// resolution) can cause even when the underlying signal is fine.
-    pub ptol: f64,
     /// Incremented to trigger an async save of the current correction
     /// table (`PSSaveCorr`) to the fixed per-radio path `TxProcessor`
     /// was opened with -- see `TxHandle::save_ps_corr`'s doc comment
@@ -293,7 +279,6 @@ impl Default for PsParams {
             mox_delay: 0.2,
             loop_delay: 0.0,
             tx_delay_ns: 150.0,
-            ptol: 0.8,
             save_corr_request: 0,
             restore_corr_request: 0,
             oneshot: false, // matches piHPSDR's own default (unchecked)
@@ -314,6 +299,90 @@ pub struct PsStatus {
     /// GetPSMaxTX -- measured peak TX amplitude (0.0-1.0 normalized),
     /// polled live so the user can compare against hw_peak.
     pub max_tx: f64,
+    /// GetPSInfo's info[6] & 2 -- WDSP Guide Rev 2.1.0's documented
+    /// over-drive indicator ("info[6] value of '2' indicates the
+    /// operator is likely severely over-driving the amplifier...
+    /// PureSignal will refuse to calibrate (or remain in calibration)
+    /// under these conditions"). Added specifically to diagnose
+    /// "Correcting never turns on" reports -- WDSP 2.10's calcc.c sets
+    /// this and resets to LRESET (wiping the correction table, peak
+    /// display drops back to 0) whenever too little of the collected
+    /// feedback data at the top amplitude bucket is usable, which is
+    /// exactly what an over-driven or borderline feedback signal looks
+    /// like from the state machine's point of view.
+    pub over_drive: bool,
+    /// GetPSInfo's info[0..3] -- per-curve-builder status codes,
+    /// undocumented at the bit level by the WDSP Guide (which only
+    /// names what each *index* means -- "status of correction curve
+    /// builder for rx_scale/magnitude/cos(phase)/sin(phase)") but
+    /// confirmed bit-by-bit by reading calcc.c's `calc()` directly,
+    /// since a real report of "Correcting never turns on" with
+    /// `over_drive` NOT set needed a finer-grained answer than that one
+    /// flag gives. [0]=rx_scale (bit0: LOWESS extrapolation to
+    /// full-scale reported low confidence -- likely not enough
+    /// drive-level variation in the collected data), [1]=magnitude
+    /// curve (bit0: NURBS fit failed, bit1: fit quality flagged bad,
+    /// bit2: spline build failed, bit3: spline accuracy check failed,
+    /// bit4: too many extrema in the fitted curve, bit5: implausible
+    /// near-zero-input value on a fresh/cold-start fit), [2]=
+    /// phase-cosine curve (same bit layout as [1], plus bit4 reused for
+    /// a sin/cos identity check failure), [3]=phase-sine curve (bits
+    /// 2/3/4 only: spline build/accuracy/identity-check).
+    pub curve_status: [i32; 4],
+    /// GetPSInfo's info[6] -- the raw solution-check/over-drive value
+    /// `over_drive` above is derived from (bit0: scheck() says the new
+    /// solution differs too much from the previous one -- SCHECK_TOL=
+    /// 10%; bit1: over-drive, same as `over_drive`). Kept as the raw
+    /// value alongside `over_drive` so a scheck-only failure (bit0, no
+    /// over-drive) is distinguishable in diagnostics.
+    pub solution_check: i32,
+    /// See feed_ps's low-RX-envelope filter doc comment. Running
+    /// percentage of PS feedback samples dropped by that filter since
+    /// this TX channel was opened (not per-attempt) -- purely a "is the
+    /// filter doing anything" indicator, not calibration-accuracy
+    /// diagnostic.
+    pub filtered_pct: f32,
+    /// Raw total sample count `feed_ps` has ever been called with (same
+    /// counter `filtered_pct` is derived from) -- added specifically to
+    /// tell "feed_ps isn't being invoked at all" apart from "it's being
+    /// invoked but the percentage happens to look static", which
+    /// `filtered_pct` alone can't distinguish.
+    pub feed_ps_total_samples: u64,
+    /// GetPSInfo's info[15] -- calcc.c's own `ctrl.state` enum value
+    /// (`_calcc_state`: 0=LRESET, 1=LWAIT, 2=LMOXDELAY, 3=LSETUP,
+    /// 4=LCOLLECT, 5=MOXCHECK, 6=LCALC, 7=LDELAY, 8=LSTAYON, 9=LTURNON),
+    /// as of the start of the most recent `pscc()` tick. Added alongside
+    /// the 2026-09-08 `apply_ps_params` calibrate_request fix (see
+    /// memory/wdsp_210_port.md) at the user's request, matching
+    /// deskHPSDR's own PureSignal dialog (`ps_menu.c`'s `info[15]` text
+    /// translation) which shows this as a live-updating human-readable
+    /// state name (RESET/WAIT/MOXDELAY/.../TURNON) rather than a bare
+    /// number -- see `ps_state_name` below for the exact text this maps
+    /// to.
+    pub state: i32,
+}
+
+/// Human-readable name for `PsStatus::state`, matching deskHPSDR's own
+/// `ps_menu.c` text exactly (case 0..9 -> "RESET".."TURNON") so a user
+/// already familiar with piHPSDR/deskHPSDR's PureSignal dialog sees the
+/// same vocabulary here. Falls back to the raw number for any value
+/// outside calcc.c's own `_calcc_state` enum (shouldn't happen in
+/// practice -- info[15] is written directly from that enum -- but avoids
+/// a silent blank/wrong label if a future WDSP revision adds states).
+pub fn ps_state_name(state: i32) -> String {
+    match state {
+        0 => "RESET".to_string(),
+        1 => "WAIT".to_string(),
+        2 => "MOXDELAY".to_string(),
+        3 => "SETUP".to_string(),
+        4 => "COLLECT".to_string(),
+        5 => "MOXCHECK".to_string(),
+        6 => "CALC".to_string(),
+        7 => "DELAY".to_string(),
+        8 => "STAYON".to_string(),
+        9 => "TURNON".to_string(),
+        other => other.to_string(),
+    }
 }
 
 #[derive(Copy, Clone)]
@@ -396,6 +465,19 @@ struct TxProcessor {
     last_post_gen: Option<(bool, bool)>,
     /// See set_ps_mox's doc comment.
     last_ps_mox: Option<bool>,
+    /// See feed_ps's low-RX-envelope filter doc comment. Running
+    /// totals (not reset per calibration attempt) purely for the
+    /// Settings -> PureSignal "Filtered" diagnostic -- approximate by
+    /// design, just meant to show whether the filter is actually doing
+    /// anything on real hardware.
+    ps_filter_total: u64,
+    ps_filter_dropped: u64,
+    /// Slow EMA of feed_ps's per-chunk median TX/RX envelope ratio --
+    /// see feed_ps's doc comment for why this has to be a long-run
+    /// baseline (persists across the whole TX channel's lifetime, not
+    /// reset per calibration attempt) rather than each chunk filtering
+    /// itself against its own (possibly outlier-heavy) median.
+    ps_ratio_baseline: Option<f32>,
     /// See apply_ps_params's doc comment.
     last_ps_enabled: Option<bool>,
     /// See apply_ps_params's doc comment -- PsParams::oneshot's edge
@@ -407,7 +489,6 @@ struct TxProcessor {
     last_ps_mox_delay: Option<f64>,
     last_ps_loop_delay: Option<f64>,
     last_ps_tx_delay_ns: Option<f64>,
-    last_ps_ptol: Option<f64>,
     last_ps_save_corr_request: Option<u32>,
     last_ps_restore_corr_request: Option<u32>,
     /// BUG FIX: `PSRestoreCorr` sets WDSP's internal `turnon` flag as a
@@ -644,27 +725,43 @@ impl TxProcessor {
             // psccF's feedback buffers are actually paired/fed at.
             wdsp::SetPSFeedbackRate(channel, duc_rate);
 
-            // PureSignal: enable WDSP's own table-stabilization ("Stbl"
-            // in piHPSDR's PS menu, off by default there too -- this
-            // project has no UI for it, so it's just turned on
-            // unconditionally rather than left at WDSP's default off).
-            // Confirmed via real-hardware log analysis: once calibration
-            // was otherwise succeeding, the spectrum was still visibly
-            // flickering between corrected and uncorrected about once a
-            // second. Root cause was calcc.c's scheck() (binfo[6] |=
-            // 0x0040), which rejects a newly-computed correction table
-            // if it differs from the previous cycle's by more than 5%
-            // -- a legitimate noise guard, but with `stbl` off there's
-            // no damping between cycles at all, so ordinary cycle-to-
-            // cycle measurement noise on real two-tone RF data tripped
-            // it on ~73% of attempts in that log, and two rejections in
-            // a row forces a full reset (clearing the correction table
-            // and dropping TX back to uncorrected) -- exactly the
-            // flicker observed. `SetPSStabilize` IIR-blends each new fit
-            // toward the previous table (alpha=0.9, calcc.c) before
-            // scheck() compares them, which is WDSP's own built-in
-            // answer to this, not a workaround.
-            wdsp::SetPSStabilize(channel, 1);
+            // PureSignal: relax the deadlock/over-drive check's minimum
+            // useful-sample fraction from WDSP's own compiled-in 0.06
+            // ("Strict") default to 0.02 ("Relaxed") -- matches
+            // deskHPSDR's own app-level default exactly (confirmed via
+            // its transmitter.c/ps_menu.c source directly), chosen
+            // after a real-hardware investigation traced persistent
+            // magnitude-curve-fit failures (NF_FIT_BAD_CONDNUM) on this
+            // project's own port to a WDSP source snapshot that was
+            // missing this control entirely -- see
+            // memory/wdsp_210_port.md for the full history. Set once at
+            // channel creation (not exposed as a live UI control yet,
+            // unlike deskHPSDR's 3-way Strict/Medium/Relaxed dropdown)
+            // since this is a first real-hardware test of whether it's
+            // actually the fix, not a finished feature.
+            wdsp::SetPSDeadlockMinFrac(channel, 0.02);
+
+            // PureSignal: table-stabilization -- historical note. Prior
+            // to the WDSP 2.10 port (2026-09-07), this called
+            // `SetPSStabilize(channel, 1)` to enable WDSP's IIR-blend-
+            // toward-the-previous-table damping (confirmed via real-
+            // hardware log analysis to fix a real "spectrum flickering
+            // between corrected/uncorrected ~once/second" bug: calcc.c's
+            // scheck() rejects a newly-computed correction table that
+            // differs from the previous cycle's by more than a
+            // tolerance, and ordinary cycle-to-cycle measurement noise
+            // on real two-tone RF tripped that on ~73% of attempts
+            // without damping).
+            //
+            // WDSP 2.10 rewrote the whole correction-fitting engine
+            // (bucketed histogram -> NURBS spline fit, see calcc.c) and
+            // dropped SetPSStabilize/the opt-in "Stbl" concept entirely
+            // -- confirmed by reading the new calcc.c directly: the new
+            // fit unconditionally EMA-averages each curve
+            // (`curve_ema_init2(..., PS_NS_EMA_ALPHA, ...)`) before
+            // scheck() ever compares it, i.e. the same damping this
+            // project used to opt into is now baked into WDSP's default
+            // behavior with no toggle left to call.
 
             // Panel gain: WDSP's own dedicated mic gain stage. This
             // project previously applied mic_gain by scaling raw
@@ -756,6 +853,9 @@ impl TxProcessor {
             last_eq: None,
             last_post_gen: None,
             last_ps_mox: None,
+            ps_filter_total: 0,
+            ps_filter_dropped: 0,
+            ps_ratio_baseline: None,
             last_ps_enabled: None,
             last_ps_oneshot: None,
             // BUG FIX: was `None`, but PsParams::calibrate_request
@@ -773,7 +873,6 @@ impl TxProcessor {
             last_ps_mox_delay: None,
             last_ps_loop_delay: None,
             last_ps_tx_delay_ns: None,
-            last_ps_ptol: None,
             // Same Some(0)-matches-PsParams::default reasoning as
             // last_ps_calibrate_request above -- both save_corr_request
             // and restore_corr_request also start at 0 in PsParams, so
@@ -880,16 +979,40 @@ impl TxProcessor {
                     // NOT a real, properly-spread two-tone test signal.
                     // Confirmed via piHPSDR's tx_set_twotone
                     // (transmitter.c): it explicitly sets 900/1700 Hz
-                    // (negated for LSB-ish modes) before enabling. Magnitude
-                    // also nudged from 0.45 to piHPSDR's own 0.49 for a
-                    // full match while chasing the remaining PS
-                    // calibration issue on P1/Orion2 -- see the plan
-                    // doc's real-hardware-findings section.
+                    // (negated for LSB-ish modes) before enabling.
                     let (f1, f2) = match mode {
                         Mode::Cwl | Mode::Lsb | Mode::Digl => (-900.0, -1700.0),
                         _ => (900.0, 1700.0),
                     };
                     wdsp::SetTXAPostGenTTFreq(self.channel, f1, f2);
+                    // REVERTED AGAIN (2026-09-08, see memory/wdsp_210_port.md
+                    // for the full history) -- a second, more aggressive
+                    // attempt at bounding the two-tone envelope away from
+                    // zero (0.46/0.52, ~0.06 minimum, up from the first
+                    // attempt's 0.02) was tried and DISPROVEN by real-
+                    // hardware population-count data: raising the null
+                    // meaningfully shifted the closest-observed-approach
+                    // (env_TX at the lowest-env_RX points moved ~0.0036 ->
+                    // ~0.017, ~4.7x higher) but left the AFFECTED FRACTION
+                    // (samples with fitted gain >10x baseline) essentially
+                    // unchanged, ~44-46% either way -- and a new ym>100
+                    // tail appeared that wasn't present before. Confirms the
+                    // affected population isn't concentrated at the exact
+                    // envelope null at all -- it's spread broadly across
+                    // roughly the lower half of the two-tone's own dynamic
+                    // range, which bounding just the minimum can't touch.
+                    // Two-tone envelope shaping is a dead end for this
+                    // problem; reverted to piHPSDR's exact 0.49/0.49 rather
+                    // than carry an unhelpful divergence from the reference.
+                    // The real fix, whatever it is, has to act on a much
+                    // wider swath of the sweep than "the null" -- see the
+                    // TX-delay (SetPSTXDelay/ps_tx_delay_ns) hypothesis
+                    // being investigated next: a genuine TX/RX feedback
+                    // TIME misalignment (not just the analog-domain group
+                    // delay this control is nominally for) would produce
+                    // ratio errors across most of a continuously-varying
+                    // envelope's slope, not just at its exact minimum --
+                    // a much better match to what this data actually shows.
                     wdsp::SetTXAPostGenTTMag(self.channel, 0.49, 0.49);
                     wdsp::SetTXAPostGenMode(self.channel, 1);
                     wdsp::SetTXAPostGenRun(self.channel, 1);
@@ -979,6 +1102,33 @@ impl TxProcessor {
     /// requirement.
     fn set_ps_mox(&mut self, mox_on: bool) {
         if self.last_ps_mox != Some(mox_on) {
+            if mox_on {
+                // BUG FIX (2026-09-07, real-hardware finding): feed_ps's
+                // low-RX-envelope filter's baseline (ps_ratio_baseline)
+                // persists across the whole TX channel's lifetime by
+                // design (see feed_ps's doc comment), but a real test
+                // session routinely changes drive power/attenuation
+                // BETWEEN transmissions without restarting the app --
+                // each of those changes shifts the true TX/RX ratio, so
+                // a baseline seeded under one set of conditions can end
+                // up wildly mismatched to the next. When mismatched
+                // badly enough, EVERY sample in a chunk can look like a
+                // false-positive outlier, silently skipping the `pscc`
+                // call for that whole chunk (feed_ps's `if kept == 0
+                // {return}`) -- which stalls PureSignal's state machine
+                // completely (a real report: "Running" mode showed zero
+                // activity for a full 2 minutes despite MOX genuinely
+                // held the whole time, confirmed via feed_ps's own
+                // sample counter still climbing) while looking, from the
+                // Settings -> PureSignal UI, identical to WDSP itself
+                // being stuck. Resetting on every MOX off->on transition
+                // -- the natural "start of a new attempt" moment, since
+                // any setting change happens between transmissions --
+                // means the filter starts permissive and reconverges
+                // within the new transmission instead of judging it
+                // against stale history.
+                self.ps_ratio_baseline = None;
+            }
             unsafe {
                 wdsp::SetPSMox(self.channel, mox_on as c_int);
             }
@@ -1001,6 +1151,41 @@ impl TxProcessor {
     /// (not just "became true") triggers one single-shot manual
     /// calibration (`SetPSControl(ch,1,1,0,0)`).
     fn apply_ps_params(&mut self, ps: &PsParams) {
+        // BUG FIX (2026-09-08): this resend block used to sit at the very
+        // end of this function. Every call site below that ALSO sets
+        // `ps_resend_enabled_countdown` (the mode-switch branch just
+        // below, and the calibrate_request/restore_corr_request branches
+        // further down) runs BEFORE it in a single top-to-bottom call --
+        // so on the exact same `apply_ps_params` invocation that just
+        // sent `SetPSControl(ch,1,0,0,0)` (reset alone) or otherwise
+        // changed `ctrl.reset`, this block would immediately fire too and
+        // send a follow-up `SetPSControl` call with `reset=0`,
+        // overwriting `ctrl.reset` back to 0 -- all before WDSP's own
+        // pscc() state-machine tick (which runs once per tx.rs loop
+        // iteration, strictly AFTER this whole function returns for that
+        // iteration -- never in the middle of it) ever gets a chance to
+        // actually observe `reset=1` and act on it. That silently turned
+        // every "send reset, then resend the resume command a moment
+        // later" sequence in this function into "reset is set then
+        // immediately un-set before it can ever take effect". Moving this
+        // block to the TOP fixes it for every caller below at once: on
+        // the call that sets a fresh countdown, this block still sees the
+        // OLD (already-expired, typically 0) countdown value and does
+        // nothing, so the reset just sent survives untouched into the
+        // next pscc() tick; the resend itself only starts firing on
+        // SUBSEQUENT calls, once genuinely after that tick.
+        if self.ps_resend_enabled_countdown > 0 {
+            self.ps_resend_enabled_countdown -= 1;
+            if ps.enabled {
+                unsafe {
+                    if ps.oneshot {
+                        wdsp::SetPSControl(self.channel, 0, 1, 0, 0);
+                    } else {
+                        wdsp::SetPSControl(self.channel, 0, 0, 1, 0);
+                    }
+                }
+            }
+        }
         if self.last_ps_enabled != Some(ps.enabled) {
             unsafe {
                 if ps.enabled {
@@ -1033,10 +1218,55 @@ impl TxProcessor {
             self.last_ps_oneshot = Some(ps.oneshot);
         }
         if self.last_ps_calibrate_request != Some(ps.calibrate_request) {
+            // BUG FIX (2026-09-08, real-hardware finding): this used to be
+            // a single `SetPSControl(ch,1,1,0,0)` call -- reset=1 AND
+            // mancal=1 together, with automode hardcoded to 0 regardless
+            // of whether "Running (continuous auto-calibrate)" was
+            // checked. That silently force-disabled continuous
+            // auto-calibrate on every "Calibrate Now" click, and nothing
+            // ever re-asserted automode=1 afterward (apply_ps_params's
+            // enable/oneshot edge-triggers above only refire when
+            // ps.enabled/ps.oneshot themselves change, which a
+            // Calibrate-Now click doesn't touch). WDSP's state machine
+            // (calcc.c's pscc()) only loops LSETUP<->LCALC up to 3 times
+            // on repeated `scOK` failures before falling back to LRESET,
+            // which itself only leaves LRESET again if `automode ||
+            // mancal` is still set at that point -- with automode
+            // force-cleared by the click and mancal already consumed
+            // (LWAIT unconditionally zeroes it the first time state
+            // reaches there), the whole state machine parked itself in
+            // LRESET permanently after at most 3 retries. This matches
+            // the exact symptom reported all session: "Measured Peak
+            // stays 0.0000, only nudges to a real nonzero value then
+            // back to 0 right when Calibrate Now is clicked, Running
+            // (continuous) alone never does anything" -- every real-
+            // hardware PureSignal test this session necessarily involved
+            // at least one Calibrate Now click, so PureSignal never
+            // actually got a sustained, continuous calibration window
+            // long enough to succeed, independent of WDSP/DSP tuning or
+            // the ALEX_PS_BIT hardware-routing fix -- both real, but
+            // chasing a symptom this bug alone was enough to fully
+            // explain.
+            //
+            // Confirmed against deskHPSDR's own Calibrate-Now equivalent
+            // (transmitter.c's `ps_off_on`, called via `tx_ps_reset()`
+            // then `tx_ps_resume()`, ps_menu.c): it ALWAYS issues two
+            // SEPARATE SetPSControl calls -- reset alone first
+            // (`reset=1,mancal=0,automode=0,turnon=0`), then resume in
+            // whichever mode the OneShot checkbox currently says
+            // (`mancal=1` or `automode=1`) -- never a combined
+            // reset+mancal call. Replicated here as reset-alone now, then
+            // reusing the existing short-delay resend mechanism below
+            // (already used for PSRestoreCorr) to resend the CORRECT
+            // mode a few ticks later, once WDSP's own state-machine tick
+            // has actually processed the reset -- same two-step shape as
+            // deskHPSDR's reset-then-100ms-sleep-then-resume, just paced
+            // via the resend countdown instead of a blocking sleep.
             unsafe {
-                wdsp::SetPSControl(self.channel, 1, 1, 0, 0);
+                wdsp::SetPSControl(self.channel, 1, 0, 0, 0);
             }
             self.last_ps_calibrate_request = Some(ps.calibrate_request);
+            self.ps_resend_enabled_countdown = 50; // ~530ms at TX_BUFFER_SIZE/48kHz
         }
         if self.last_ps_hw_peak != Some(ps.hw_peak) {
             unsafe {
@@ -1067,12 +1297,6 @@ impl TxProcessor {
             }
             self.last_ps_tx_delay_ns = Some(ps.tx_delay_ns);
         }
-        if self.last_ps_ptol != Some(ps.ptol) {
-            unsafe {
-                wdsp::SetPSPtol(self.channel, ps.ptol);
-            }
-            self.last_ps_ptol = Some(ps.ptol);
-        }
         if self.last_ps_save_corr_request != Some(ps.save_corr_request) {
             self.ps_corr_action(wdsp::PSSaveCorr as PsCorrFn);
             self.last_ps_save_corr_request = Some(ps.save_corr_request);
@@ -1089,18 +1313,6 @@ impl TxProcessor {
             // recalibration attempt right after every restore.
             if !ps.oneshot {
                 self.ps_resend_enabled_countdown = 50; // ~530ms at TX_BUFFER_SIZE/48kHz
-            }
-        }
-        if self.ps_resend_enabled_countdown > 0 {
-            self.ps_resend_enabled_countdown -= 1;
-            if ps.enabled {
-                unsafe {
-                    if ps.oneshot {
-                        wdsp::SetPSControl(self.channel, 0, 1, 0, 0);
-                    } else {
-                        wdsp::SetPSControl(self.channel, 0, 0, 1, 0);
-                    }
-                }
             }
         }
     }
@@ -1132,10 +1344,12 @@ impl TxProcessor {
     /// PureSignal: reads back live status for the UI (Settings ->
     /// PureSignal's feedback-level meter, Correcting indicator, and
     /// Get Peak readout) -- confirmed against Thetis/piHPSDR's own
-    /// polling of the same three values. `GetPSInfo` fills a 16-int
-    /// array; only indices 4 (feedback level) and 14 (correcting flag)
-    /// are interpreted anywhere in either reference, the rest are raw
-    /// diagnostic counters neither app gives semantic meaning to.
+    /// polling of the same three values, plus info[6]'s documented
+    /// over-drive bit (WDSP Guide Rev 2.1.0, PsStatus::over_drive's doc
+    /// comment) added during the WDSP 2.10 port's real-hardware
+    /// PureSignal debugging. `GetPSInfo` fills a 16-int array; the
+    /// remaining indices are raw diagnostic counters neither reference
+    /// app gives semantic meaning to.
     fn read_ps_status(&self) -> PsStatus {
         let mut info = [0i32; 16];
         let mut max_tx: f64 = 0.0;
@@ -1147,6 +1361,16 @@ impl TxProcessor {
             feedback_level: info[4],
             correcting: info[14] != 0,
             max_tx,
+            over_drive: info[6] & 2 != 0,
+            curve_status: [info[0], info[1], info[2], info[3]],
+            solution_check: info[6],
+            filtered_pct: if self.ps_filter_total > 0 {
+                100.0 * self.ps_filter_dropped as f32 / self.ps_filter_total as f32
+            } else {
+                0.0
+            },
+            feed_ps_total_samples: self.ps_filter_total,
+            state: info[15],
         }
     }
 
@@ -1156,24 +1380,181 @@ impl TxProcessor {
     /// and the PureSignal plan for the confidence caveats on this
     /// whole exchange (no confirmed-working reference for the exact
     /// call cadence, unlike the rest of this file's WDSP calls).
-    /// `solidmox` (WDSP: whether MOX has been continuously asserted
-    /// long enough to be considered "solid" rather than a transient
-    /// key-up) is passed the same as `mox` -- this project has no
-    /// separate debounce/hang-time tracking for that distinction yet.
-    #[allow(clippy::too_many_arguments)]
-    fn feed_ps(&self, itx: &mut [f32], qtx: &mut [f32], irx: &mut [f32], qrx: &mut [f32], mox_on: bool) {
-        let size = itx.len() as c_int;
+    ///
+    /// Calls `pscc` (double-precision I/Q pairs) directly as of the
+    /// WDSP 2.10 port (2026-09-07) -- the float-buffer `psccF` wrapper
+    /// this used to call is gone upstream. Confirmed by reading the OLD
+    /// `psccF` source before it was replaced: it was ALWAYS just this
+    /// same float->double conversion loop followed by a plain call to
+    /// `pscc`, with its `mox`/`solidmox` parameters already dead code
+    /// (commented out, never assigned) even then -- real mox state has
+    /// always flowed through the separate `SetPSMox` call this struct
+    /// already makes elsewhere, not through this function -- so doing
+    /// the same conversion here, without those two dead parameters,
+    /// changes nothing behaviorally.
+    ///
+    /// LOW-RX-ENVELOPE FILTER (added 2026-09-07, WDSP 2.10 PureSignal
+    /// calibration investigation -- see memory/wdsp_210_port.md for the
+    /// full history): real-hardware two-tone calibration was reliably
+    /// hitting calcc.c's NF_FIT_BAD_CONDNUM on the magnitude curve fit,
+    /// traced to WDSP's magnitude/gain formula (TX envelope / RX
+    /// envelope, effectively no floor beyond calcc.c's own 1e-30 guard)
+    /// producing gain "outliers" up to ~700x sane values whenever the
+    /// RX feedback envelope reads implausibly small relative to the TX
+    /// envelope driving it (real feedback-path noise/timing, not just
+    /// the two-tone envelope's own genuine nulls -- confirmed by
+    /// showing the outlier magnitude tracks null depth but never fully
+    /// clears CONDNUM even with the null bounded away from zero via a
+    /// two-tone magnitude tweak, which was reverted -- see process()'s
+    /// PostGen setup). WDSP's own outlier rejection in the NURBS fit
+    /// wasn't excluding enough of these before the fit matrix went
+    /// ill-conditioned.
+    ///
+    /// Filters candidate samples here instead, before they ever reach
+    /// WDSP: compute each sample's TX/RX envelope ratio, and drop any
+    /// sample whose ratio exceeds `PS_FEED_MAX_RATIO_MULTIPLIER` times a
+    /// long-run baseline ratio -- i.e. "this sample's RX response is
+    /// implausibly small compared to how this TX channel has been
+    /// behaving overall". A genuinely low-drive sample (needed for
+    /// calcc.c's near-zero calibration bucket) has RX scaling down
+    /// proportionally with TX, so its ratio stays near the baseline and
+    /// it's kept; only disproportionate outliers get dropped.
+    ///
+    /// FIRST ATTEMPT (kept here as a documented dead end): filtered each
+    /// `TX_BUFFER_SIZE`(512)-sample chunk against THAT SAME chunk's own
+    /// median ratio. Real-hardware testing showed 28.7% of all samples
+    /// getting dropped, and collection never completing (feedback
+    /// level/measured peak stuck at 0, same symptom as the earlier
+    /// TX-envelope-shaping regression) -- traced to the fact that a
+    /// two-tone envelope spends a substantial fraction of its time near
+    /// its nulls (a smooth minimum, not a sharp one), so a large chunk
+    /// fraction can legitimately be low-drive/low-ratio-noisy at once;
+    /// filtering each chunk against ITS OWN median lets that
+    /// concentration skew the very baseline used to judge it, over-
+    /// filtering exactly the near-zero-drive samples bucket 0 needs.
+    ///
+    /// Fixed by decoupling the two: `ps_ratio_baseline` is a slow EMA
+    /// (alpha below) updated from each chunk's median but PERSISTED
+    /// across the whole TX channel's lifetime, and each chunk is
+    /// filtered against the baseline's value from BEFORE this chunk's
+    /// own contribution is folded in -- so one contaminated chunk can't
+    /// skew the threshold used to filter itself. Also reset on every MOX
+    /// off->on transition (see set_ps_mox) after a real-hardware
+    /// finding that the persisted baseline could go stale across a
+    /// session that changes drive power/attenuation between
+    /// transmissions, silently skipping `pscc` for whole chunks and
+    /// stalling the state machine.
+    ///
+    /// SECOND ATTEMPT (also a dead end, kept for the record): multiplier
+    /// 15.0x, reasoned as "loose enough not to starve bucket 0 the way
+    /// the tight (6.0x) first attempt did, while still well below the
+    /// observed 140-765x pathological range". Real-hardware testing
+    /// (with the baseline-staleness bug above already fixed, so this
+    /// was a clean test of the multiplier alone) showed IDENTICAL
+    /// `NF_FIT_BAD_CONDNUM` results to no filtering at all. This means
+    /// the contamination isn't a small number of extreme (140x+)
+    /// spikes cleanly separable from ~1x-ish sane data -- there's
+    /// apparently a continuous spread of moderately-elevated ratios
+    /// (a handful of x up to the extreme spikes) that a loose threshold
+    /// lets straight through, and WDSP's own fit is sensitive enough to
+    /// that remaining contamination alone to still fail.
+    ///
+    /// THIRD ATTEMPT (also a dead end): tried 4.0x (real PA compression
+    /// rarely exceeds 2-3x, so this still left a little margin), to see
+    /// whether cutting into that moderate-ratio range would help.
+    /// Real-hardware result: 39.2% of samples dropped and collection
+    /// stalled again (measured peak stuck at 0.0000) -- the SAME
+    /// symptom as the very first (6.0x, self-referential-median)
+    /// attempt, but this time confirmed to be the multiplier itself,
+    /// not the baseline-staleness bug (already fixed by then).
+    ///
+    /// Between a clean 15.0x (collection fine, zero improvement) and a
+    /// clean 4.0x (collection stalls, so CONDNUM's fate at that
+    /// tightness is unknown), there's no evidence of a middle multiplier
+    /// that both preserves collection AND fixes the fit -- the "good"
+    /// (near-null, needed) and "bad" (noise-contaminated) samples
+    /// aren't cleanly separable by TX/RX ratio alone. Reverted to 15.0x
+    /// (confirmed to at least not break collection) as the current
+    /// value. A simple per-sample ratio threshold looks like a dead end
+    /// for this specific problem -- see memory/wdsp_210_port.md for
+    /// where this investigation goes next.
+    fn feed_ps(&mut self, itx: &[f32], qtx: &[f32], irx: &[f32], qrx: &[f32]) {
+        // BYPASSED (2026-09-08): disabled for a clean test of
+        // SetPSDeadlockMinFrac alone -- after re-porting from
+        // deskHPSDR's newer WDSP revision, collection started stalling
+        // again at the SAME 15.0x multiplier that was confirmed
+        // collection-safe just before the re-port, meaning the new
+        // revision's collection requirements interact with this filter
+        // differently than the old one did. deskHPSDR itself feeds
+        // pscc() zero-preprocessed samples, so matching that exactly
+        // (rather than guessing at new filter parameters on top of an
+        // already-uncertain fix) is the cleanest way to isolate whether
+        // SetPSDeadlockMinFrac alone is sufficient. Diagnostics below
+        // still compute normally (so `filtered_pct` correctly reads 0%
+        // while this is off, not stale data) -- only the actual
+        // drop/keep decision is short-circuited.
+        const FILTER_ENABLED: bool = false;
+        const MIN_ENV: f32 = 1.0e-6;
+        const PS_FEED_MAX_RATIO_MULTIPLIER: f32 = 15.0;
+        const BASELINE_EMA_ALPHA: f32 = 0.05;
+
+        let size = itx.len();
+        let mut tx_env = vec![0.0f32; size];
+        let mut rx_env = vec![0.0f32; size];
+        let mut ratios: Vec<f32> = Vec::with_capacity(size);
+        for i in 0..size {
+            tx_env[i] = (itx[i] * itx[i] + qtx[i] * qtx[i]).sqrt();
+            rx_env[i] = (irx[i] * irx[i] + qrx[i] * qrx[i]).sqrt();
+            if tx_env[i] >= MIN_ENV && rx_env[i] >= MIN_ENV {
+                ratios.push(tx_env[i] / rx_env[i]);
+            }
+        }
+        let chunk_median = if ratios.is_empty() {
+            None
+        } else {
+            let mid = ratios.len() / 2;
+            ratios.select_nth_unstable_by(mid, |a, b| a.partial_cmp(b).unwrap());
+            Some(ratios[mid])
+        };
+
+        // Snapshot the baseline BEFORE folding this chunk's own median
+        // into it, so this chunk is filtered against prior history, not
+        // partly against itself.
+        let baseline = self.ps_ratio_baseline;
+        if let Some(med) = chunk_median {
+            self.ps_ratio_baseline = Some(match baseline {
+                Some(prev) => prev + BASELINE_EMA_ALPHA * (med - prev),
+                None => med,
+            });
+        }
+
+        let mut temptx = Vec::with_capacity(size * 2);
+        let mut temprx = Vec::with_capacity(size * 2);
+        for i in 0..size {
+            self.ps_filter_total += 1;
+            let valid = tx_env[i] >= MIN_ENV && rx_env[i] >= MIN_ENV;
+            let keep = !FILTER_ENABLED
+                || (valid
+                    && match baseline {
+                        Some(base) => (tx_env[i] / rx_env[i]) <= base * PS_FEED_MAX_RATIO_MULTIPLIER,
+                        None => true,
+                    });
+            if keep {
+                temptx.push(itx[i] as f64);
+                temptx.push(qtx[i] as f64);
+                temprx.push(irx[i] as f64);
+                temprx.push(qrx[i] as f64);
+            } else {
+                self.ps_filter_dropped += 1;
+            }
+        }
+
+        let kept = temptx.len() / 2;
+        if kept == 0 {
+            return;
+        }
         unsafe {
-            wdsp::psccF(
-                self.channel,
-                size,
-                itx.as_mut_ptr(),
-                qtx.as_mut_ptr(),
-                irx.as_mut_ptr(),
-                qrx.as_mut_ptr(),
-                mox_on as c_int,
-                mox_on as c_int,
-            );
+            wdsp::pscc(self.channel, kept as c_int, temptx.as_mut_ptr(), temprx.as_mut_ptr());
         }
     }
 }
@@ -1557,10 +1938,10 @@ fn run(
         if puresignal_enabled.load(Ordering::Relaxed) {
             // Pairs, not raw floats -- iq is interleaved I,Q,I,Q,...
             let pairs_needed = iq.len() / 2;
-            if let Some((mut itx, mut qtx, mut irx, mut qrx)) =
+            if let Some((itx, qtx, irx, qrx)) =
                 drain_ps_feedback(&ps_tx_feedback_iq, &ps_rx_feedback_iq, pairs_needed)
             {
-                processor.feed_ps(&mut itx, &mut qtx, &mut irx, &mut qrx, true);
+                processor.feed_ps(&itx, &qtx, &irx, &qrx);
             }
             // else: feedback hasn't caught up yet (real network latency
             // behind this chunk's TX audio, most likely right after
@@ -1821,9 +2202,6 @@ impl TxHandle {
     }
     pub fn set_ps_tx_delay_ns(&self, tx_delay_ns: f64) {
         self.ps_params.lock().unwrap().tx_delay_ns = tx_delay_ns.max(0.0);
-    }
-    pub fn set_ps_ptol(&self, ptol: f64) {
-        self.ps_params.lock().unwrap().ptol = ptol.clamp(0.0, 1.0);
     }
     /// See PsParams::oneshot's doc comment.
     pub fn set_ps_oneshot(&self, oneshot: bool) {

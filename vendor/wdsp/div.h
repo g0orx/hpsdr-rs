@@ -1,4 +1,4 @@
-/*	div.h
+/*  div.h
 
 This file is part of a program that implements a Software-Defined Radio.
 
@@ -27,30 +27,29 @@ warren@wpratt.com
 #ifndef _div_h
 #define _div_h
 
-typedef struct _div
-{
-	int run;
-	int nr;							// number of receivers to mix
-	int size;						// size of input/output buffers
-	double **in;					// input buffers
-	double *out;					// output buffer
-	int output;						// which rcvr to output; ==nr for mix
-	double *Irotate;
-	double *Qrotate;
-	CRITICAL_SECTION cs_update;
-	double *legacy[4];																	///////////// legacy interface - remove
+typedef struct _div {
+  int run;
+  int nr;             // number of receivers to mix
+  int size;           // size of input/output buffers
+  double **in;          // input buffers
+  double *out;          // output buffer
+  int output;           // which rcvr to output; ==nr for mix
+  double *Irotate;
+  double *Qrotate;
+  CRITICAL_SECTION cs_update;
+  double *legacy[4];                                  ///////////// legacy interface - remove
 } mdiv, *MDIV;
 
-extern MDIV create_div (int run, int nr, int size, double **in, double *out);
+extern MDIV create_div(int run, int nr, int size, double **in, double *out);
 
-extern void destroy_div (MDIV pdiv);
+extern void destroy_div(MDIV pdiv);
 
-extern void xdiv (MDIV pdiv);
+extern void xdiv(MDIV pdiv);
 
-extern __declspec(dllexport) void xdivEXT (int id, int nsamples, double **in, double *out);
+extern __declspec(dllexport) void xdivEXT(int id, int nsamples, double **in, double *out);
 
-extern __declspec(dllexport) void create_divEXT (int id, int run, int nr, int size);
+extern __declspec(dllexport) void create_divEXT(int id, int run, int nr, int size);
 
-extern __declspec(dllexport) void destroy_divEXT (int id);
+extern __declspec(dllexport) void destroy_divEXT(int id);
 
 #endif

@@ -1,4 +1,4 @@
-/*	main.h
+/*  main.h
 
 This file is part of a program that implements a Software-Defined Radio.
 
@@ -27,20 +27,20 @@ warren@wpratt.com
 #ifndef _mainloop_h
 #define _mainloop_h
 
-extern void wdspmain (void *pargs);
+extern void wdspmain(void *pargs);
 
-extern void create_main (int channel);
+extern void create_main(int channel);
 
-extern void destroy_main (int channel);
+extern void destroy_main(int channel);
 
-extern void flush_main (int channel);
+extern void flush_main(int channel);
 
-extern void setInputSamplerate_main (int channel);
+extern void setInputSamplerate_main(int channel);
 
-extern void setOutputSamplerate_main (int channel);
+extern void setOutputSamplerate_main(int channel);
 
-extern void setDSPSamplerate_main (int channel);
+extern void setDSPSamplerate_main(int channel);
 
-extern void setDSPBuffsize_main (int channel);
+extern void setDSPBuffsize_main(int channel);
 
 #endif

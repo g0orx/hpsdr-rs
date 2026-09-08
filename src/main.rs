@@ -660,8 +660,6 @@ struct ConnectedState {
     ps_mox_delay: f64,
     ps_loop_delay: f64,
     ps_tx_delay_ns: f64,
-    /// See tx::PsParams::ptol's doc comment.
-    ps_ptol: f64,
     /// Per-band PA gain (dB), keyed by band name. See
     /// Config::pa_calibration and radio::drive_byte_for_watts. Resolved
     /// to the current band and pushed into session.pa_gain_db once per
@@ -1165,6 +1163,12 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
             if let Some(v) = cfg.noise_reduction {
                 spectrum.set_noise_reduction(v);
             }
+            if let Some(v) = cfg.nnr_mask_floor_db {
+                spectrum.set_nnr_mask_floor_db(v);
+            }
+            if let Some(v) = cfg.nnr_premium {
+                spectrum.set_nnr_premium(v);
+            }
             if let Some(v) = cfg.snb {
                 spectrum.set_snb(v);
             }
@@ -1191,7 +1195,6 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
             let ps_mox_delay = cfg.ps_mox_delay.unwrap_or(0.2);
             let ps_loop_delay = cfg.ps_loop_delay.unwrap_or(0.0);
             let ps_tx_delay_ns = cfg.ps_tx_delay_ns.unwrap_or(150.0);
-            let ps_ptol = cfg.ps_ptol.unwrap_or(0.8);
 
             let settings_dirty = Arc::new(std::sync::atomic::AtomicBool::new(false));
             let mut extra_receivers = Vec::new();
@@ -1265,7 +1268,6 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                     tx_handle.set_ps_mox_delay(ps_mox_delay);
                     tx_handle.set_ps_loop_delay(ps_loop_delay);
                     tx_handle.set_ps_tx_delay_ns(ps_tx_delay_ns);
-                    tx_handle.set_ps_ptol(ps_ptol);
                     if let Some(v) = cfg.tx_eq {
                         tx_handle.set_eq(v);
                     }
@@ -1395,7 +1397,6 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                 ps_mox_delay,
                 ps_loop_delay,
                 ps_tx_delay_ns,
-                ps_ptol,
                 pa_calibration: cfg.pa_calibration.clone(),
                 // Always exactly MAX_XVTRS slots so the settings tab has a
                 // stable fixed-size row list to render/edit -- a config
@@ -2512,7 +2513,7 @@ impl eframe::App for HpsdrApp {
                         let nr = connected.spectrum.noise_reduction();
                         if ui
                             .add(egui::Button::selectable(nr != spectrum::NoiseReduction::Off, nr.label()))
-                            .on_hover_text("Click to cycle: Off -> NR -> NR2 -> NR3 -> NR4 -> Off")
+                            .on_hover_text("Click to cycle: Off -> NR -> NR2 -> NR3 -> Off")
                             .clicked()
                         {
                             connected.spectrum.set_noise_reduction(nr.next());
@@ -4774,6 +4775,41 @@ impl eframe::App for HpsdrApp {
                                         }
                                     });
                                     ui.weak("Shared by both NB and NB2 (toggle either on the main panel).");
+
+                                    ui.separator();
+                                    ui.horizontal(|ui| {
+                                        let mut mask_floor = agc_params.nnr_mask_floor_db;
+                                        ui.label("NR3 Mask Floor:");
+                                        if scroll_slider_f64(
+                                            ui,
+                                            &mut connected.slider_scroll_accum,
+                                            &mut mask_floor,
+                                            -50.0..=-10.0,
+                                            1.0,
+                                            " dB",
+                                        ) {
+                                            connected.spectrum.set_nnr_mask_floor_db(mask_floor);
+                                            settings_changed = true;
+                                        }
+
+                                        let premium = agc_params.nnr_premium;
+                                        if ui
+                                            .add(egui::Button::selectable(premium, "Premium"))
+                                            .on_hover_text(
+                                                "NR3's Standard model (~10% of one core) vs Premium \
+                                                 (~32%, measurably better) -- both built in, switching \
+                                                 is instant.",
+                                            )
+                                            .clicked()
+                                        {
+                                            connected.spectrum.set_nnr_premium(!premium);
+                                            settings_changed = true;
+                                        }
+                                    });
+                                    ui.weak(
+                                        "NR3 (Neural NR) only -- lower Mask Floor removes more noise, \
+                                         higher lets more genuine band noise through.",
+                                    );
                                 }
 
                                 SettingsTab::Spectrum => {
@@ -5141,7 +5177,6 @@ impl eframe::App for HpsdrApp {
                                                     tx_handle.set_ps_mox_delay(connected.ps_mox_delay);
                                                     tx_handle.set_ps_loop_delay(connected.ps_loop_delay);
                                                     tx_handle.set_ps_tx_delay_ns(connected.ps_tx_delay_ns);
-                                                    tx_handle.set_ps_ptol(connected.ps_ptol);
                                                     // See connect_to_device's identical restore --
                                                     // this rebuild also opens a fresh WDSP channel
                                                     // with no calibration history of its own.
@@ -5654,7 +5689,67 @@ impl eframe::App for HpsdrApp {
                                                 };
                                                 ui.colored_label(color, text);
                                             });
+                                            ui.horizontal(|ui| {
+                                                // WDSP's own calcc.c state-machine state
+                                                // (GetPSInfo's info[15]), shown as text --
+                                                // matches deskHPSDR/piHPSDR's own PureSignal
+                                                // dialog, which always displays this live
+                                                // (RESET/WAIT/MOXDELAY/SETUP/COLLECT/
+                                                // MOXCHECK/CALC/DELAY/STAYON/TURNON) rather
+                                                // than only exposing it as a diagnostic
+                                                // number. Always shown (not gated on
+                                                // !correcting like the curve-fit-status line
+                                                // below) -- watching this cycle through
+                                                // SETUP/COLLECT/CALC on its own while
+                                                // "Running (continuous)" is on, with no
+                                                // Calibrate Now click, is exactly how to
+                                                // confirm continuous auto-calibrate is
+                                                // actually retrying rather than stuck.
+                                                ui.label("State:");
+                                                ui.monospace(tx::ps_state_name(status.state));
+                                            });
+                                            if status.over_drive {
+                                                ui.colored_label(
+                                                    egui::Color32::from_rgb(220, 60, 60),
+                                                    "WARNING: PROBABLE SEVERE OVER-DRIVE. CHECK YOUR \
+                                                     DRIVE LEVEL! (WDSP is refusing to calibrate/stay \
+                                                     corrected because too little of the collected \
+                                                     feedback data near your peak level is usable.)",
+                                                );
+                                            }
+                                            if !status.correcting
+                                                && (status.curve_status != [0, 0, 0, 0]
+                                                    || status.solution_check != 0)
+                                            {
+                                                ui.colored_label(
+                                                    egui::Color32::from_rgb(220, 160, 60),
+                                                    format!(
+                                                        "Curve fit status (rx/mag/cos/sin/sol): \
+                                                         {:#04x} {:#04x} {:#04x} {:#04x} {:#04x}",
+                                                        status.curve_status[0],
+                                                        status.curve_status[1],
+                                                        status.curve_status[2],
+                                                        status.curve_status[3],
+                                                        status.solution_check,
+                                                    ),
+                                                )
+                                                .on_hover_text(
+                                                    "Nonzero = that stage of PureSignal's correction-\
+                                                     table fit failed and it reset -- report this to \
+                                                     the developer along with which one(s) are nonzero.",
+                                                );
+                                            }
                                             ui.label(format!("Measured peak TX: {:.4}", status.max_tx));
+                                            ui.label(format!(
+                                                "Feedback samples filtered: {:.1}% (of {} total)",
+                                                status.filtered_pct, status.feed_ps_total_samples
+                                            ))
+                                            .on_hover_text(
+                                                "Samples dropped by feed_ps's low-RX-envelope \
+                                                 filter before reaching WDSP -- see its doc \
+                                                 comment (tx.rs). Running total since this TX \
+                                                 channel was opened, not per-attempt.",
+                                            );
 
                                             // Standard (non-HermesLite) boards only, both protocols
                                             // -- see radio::RadioSession::ps_tx_attenuation's doc
@@ -5755,12 +5850,55 @@ impl eframe::App for HpsdrApp {
                                             ui.horizontal(|ui| {
                                                 ui.label("TX Delay (ns):");
                                                 let mut tx_delay_ns = connected.ps_tx_delay_ns;
+                                                // Range widened 2026-09-08 (see
+                                                // memory/wdsp_210_port.md) --
+                                                // was 0..=2000, well under
+                                                // even one PS-feedback sample
+                                                // period (~5.2us at 192ksps).
+                                                // First widened to 0..=50_000
+                                                // (positive only), then
+                                                // ALSO extended negative:
+                                                // `SetPSTXDelay` (calcc.c)
+                                                // takes a SIGNED delay --
+                                                // positive delays the TX
+                                                // path (`a->txdelay`),
+                                                // negative delays the RX
+                                                // path instead
+                                                // (`-SetDelayValue(a->rxdelay,
+                                                // -delay)`) -- i.e. the
+                                                // control already supports
+                                                // correcting a mismatch in
+                                                // EITHER direction, but this
+                                                // UI could only ever reach
+                                                // one of them. A real-
+                                                // hardware sweep of 0/5000/
+                                                // 10000/20000/30000ns showed
+                                                // the affected sample
+                                                // fraction (env_RX-population
+                                                // dprintf's ym_over_10)
+                                                // staying flat while the
+                                                // WORST-case severity
+                                                // (ym_over_100) grew
+                                                // monotonically with more
+                                                // positive delay and no
+                                                // turnaround anywhere in that
+                                                // range -- exactly what
+                                                // you'd expect if the true
+                                                // correction lies in the
+                                                // untested negative
+                                                // direction instead. WDSP's
+                                                // underlying delay filter
+                                                // (delay.c's `xdelay`, a
+                                                // polyphase FIR) supports
+                                                // arbitrary delays either
+                                                // way, not just sub-sample
+                                                // amounts.
                                                 if scroll_slider_f64(
                                                     ui,
                                                     &mut connected.slider_scroll_accum,
                                                     &mut tx_delay_ns,
-                                                    0.0..=2000.0,
-                                                    1.0,
+                                                    -50_000.0..=50_000.0,
+                                                    10.0,
                                                     " ns",
                                                 ) {
                                                     connected.ps_tx_delay_ns = tx_delay_ns;
@@ -5768,28 +5906,6 @@ impl eframe::App for HpsdrApp {
                                                     settings_changed = true;
                                                 }
                                             });
-                                            ui.horizontal(|ui| {
-                                                ui.label("Ptol:");
-                                                let mut ptol = connected.ps_ptol;
-                                                if scroll_slider_f64(
-                                                    ui,
-                                                    &mut connected.slider_scroll_accum,
-                                                    &mut ptol,
-                                                    0.0..=1.0,
-                                                    0.01,
-                                                    "",
-                                                ) {
-                                                    connected.ps_ptol = ptol;
-                                                    tx.set_ps_ptol(ptol);
-                                                    settings_changed = true;
-                                                }
-                                            });
-                                            ui.weak(
-                                                "Correction-table outlier tolerance -- lower this if \
-                                                 Correcting never turns on despite Feedback level \
-                                                 looking reasonable and Calibrate Now running \
-                                                 repeatedly (WDSP default 0.8).",
-                                            );
                                             ui.weak("Advanced -- rarely need changing from the defaults.");
                                         } else {
                                             ui.weak("TX must be enabled for PureSignal calibration controls.");
@@ -5999,6 +6115,8 @@ impl eframe::App for HpsdrApp {
                                 noise_blanker: agc_params.noise_blanker,
                                 nb_threshold: agc_params.nb_threshold,
                                 noise_reduction: agc_params.noise_reduction,
+                                nnr_mask_floor_db: agc_params.nnr_mask_floor_db,
+                                nnr_premium: agc_params.nnr_premium,
                                 snb: agc_params.snb,
                                 anf: agc_params.anf,
                                 binaural: agc_params.binaural,
@@ -6042,6 +6160,8 @@ impl eframe::App for HpsdrApp {
                         noise_blanker: Some(agc_params_now.noise_blanker),
                         nb_threshold: Some(agc_params_now.nb_threshold),
                         noise_reduction: Some(agc_params_now.noise_reduction),
+                        nnr_mask_floor_db: Some(agc_params_now.nnr_mask_floor_db),
+                        nnr_premium: Some(agc_params_now.nnr_premium),
                         snb: Some(agc_params_now.snb),
                         anf: Some(agc_params_now.anf),
                         binaural: Some(agc_params_now.binaural),
@@ -6103,7 +6223,6 @@ impl eframe::App for HpsdrApp {
                         ps_mox_delay: Some(connected.ps_mox_delay),
                         ps_loop_delay: Some(connected.ps_loop_delay),
                         ps_tx_delay_ns: Some(connected.ps_tx_delay_ns),
-                        ps_ptol: Some(connected.ps_ptol),
                         send_rx_audio_to_radio: Some(
                             connected
                                 .session
@@ -7314,7 +7433,7 @@ fn render_extra_receiver_ui(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceiver>>) {
         let nr = rx.spectrum.noise_reduction();
         if ui
             .add(egui::Button::selectable(nr != spectrum::NoiseReduction::Off, nr.label()))
-            .on_hover_text("Click to cycle: Off -> NR -> NR2 -> NR3 -> NR4 -> Off")
+            .on_hover_text("Click to cycle: Off -> NR -> NR2 -> NR3 -> Off")
             .clicked()
         {
             rx.spectrum.set_noise_reduction(nr.next());
@@ -7933,6 +8052,30 @@ fn render_extra_receiver_settings(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceive
             ui.separator();
 
             ui.horizontal(|ui| {
+                let mut mask_floor = agc_params.nnr_mask_floor_db;
+                ui.label("NR3 Mask Floor:");
+                if scroll_slider_f64(
+                    ui,
+                    &mut rx.slider_scroll_accum,
+                    &mut mask_floor,
+                    -50.0..=-10.0,
+                    1.0,
+                    " dB",
+                ) {
+                    rx.spectrum.set_nnr_mask_floor_db(mask_floor);
+                    rx.settings_dirty.store(true, Ordering::Relaxed);
+                }
+
+                let premium = agc_params.nnr_premium;
+                if ui.add(egui::Button::selectable(premium, "Premium")).clicked() {
+                    rx.spectrum.set_nnr_premium(!premium);
+                    rx.settings_dirty.store(true, Ordering::Relaxed);
+                }
+            });
+            ui.weak("NR3 (Neural NR) only.");
+            ui.separator();
+
+            ui.horizontal(|ui| {
                 // Same picker/behavior as the main window's Settings ->
                 // Audio "Output device" -- independent per receiver, so
                 // e.g. the main receiver can go to real speakers while
@@ -8154,6 +8297,8 @@ fn spawn_extra_receiver(
         spectrum.set_noise_blanker(s.noise_blanker);
         spectrum.set_nb_threshold(s.nb_threshold);
         spectrum.set_noise_reduction(s.noise_reduction);
+        spectrum.set_nnr_mask_floor_db(s.nnr_mask_floor_db);
+        spectrum.set_nnr_premium(s.nnr_premium);
         spectrum.set_snb(s.snb);
         spectrum.set_anf(s.anf);
         spectrum.set_binaural(s.binaural);
@@ -8271,6 +8416,8 @@ fn change_sample_rate(connected: &mut ConnectedState, new_rate: u32) {
     spectrum.set_noise_blanker(agc_params.noise_blanker);
     spectrum.set_nb_threshold(agc_params.nb_threshold);
     spectrum.set_noise_reduction(agc_params.noise_reduction);
+    spectrum.set_nnr_mask_floor_db(agc_params.nnr_mask_floor_db);
+    spectrum.set_nnr_premium(agc_params.nnr_premium);
     spectrum.set_snb(agc_params.snb);
     spectrum.set_anf(agc_params.anf);
     spectrum.set_binaural(agc_params.binaural);
@@ -8355,7 +8502,6 @@ fn change_sample_rate(connected: &mut ConnectedState, new_rate: u32) {
                 tx_handle.set_ps_mox_delay(connected.ps_mox_delay);
                 tx_handle.set_ps_loop_delay(connected.ps_loop_delay);
                 tx_handle.set_ps_tx_delay_ns(connected.ps_tx_delay_ns);
-                tx_handle.set_ps_ptol(connected.ps_ptol);
                 // See connect_to_device's identical restore -- this
                 // rebuild also opens a fresh WDSP channel with no
                 // calibration history of its own.
@@ -8426,6 +8572,8 @@ fn change_extra_receiver_sample_rate(rx: &mut ExtraReceiver, new_rate: u32) {
     spectrum.set_noise_blanker(agc_params.noise_blanker);
     spectrum.set_nb_threshold(agc_params.nb_threshold);
     spectrum.set_noise_reduction(agc_params.noise_reduction);
+    spectrum.set_nnr_mask_floor_db(agc_params.nnr_mask_floor_db);
+    spectrum.set_nnr_premium(agc_params.nnr_premium);
     spectrum.set_snb(agc_params.snb);
     spectrum.set_anf(agc_params.anf);
     spectrum.set_binaural(agc_params.binaural);

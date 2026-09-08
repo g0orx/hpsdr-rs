@@ -212,19 +212,28 @@ impl NoiseBlanker {
 
 /// Noise reduction state -- same mutually-exclusive cycling treatment
 /// as NoiseBlanker above, cycling between WDSP's four RXA noise
-/// reduction stages: ANR ("NR"), EMNR ("NR2"), RNNR ("NR3" -- an
-/// RNNoise-backed stage, vendored as librnnoise.a), and SBNR ("NR4" --
-/// a libspecbleach-backed stage, vendored as liblibspecbleach.a; see
-/// build.rs for the link-order/naming notes on both). All four live
-/// inside the RXA chain, but the same convention (only one active at a
-/// time) applies in other HPSDR software, so it's kept here too.
+/// reduction stages: ANR ("NR"), EMNR ("NR2"), and NNR ("NR3" -- WDSP's
+/// built-in neural-net noise reduction stage, `nnr.c`/`nnet.c`, with two
+/// compiled-in trained models; no external file or vendored library
+/// needed). All three live inside the RXA chain, but the same
+/// convention (only one active at a time) applies in other HPSDR
+/// software, so it's kept here too.
+///
+/// Prior to the WDSP 2.10 port (2026-09-07), NR3 and NR4 were two
+/// separate externally-backed stages -- RNNR (vendored RNNoise,
+/// `librnnoise.a`) and SBNR (vendored libspecbleach,
+/// `liblibspecbleach.a`) respectively. WDSP 2.10 removed both in favor
+/// of the single NNR stage above, so NR4 no longer exists as a distinct
+/// mode -- `#[serde(alias)]` on `Nr3` below lets an old saved config
+/// that had NR4 selected land on the new merged mode instead of failing
+/// to parse.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum NoiseReduction {
     Off,
     Nr,
     Nr2,
+    #[serde(alias = "Nr4")]
     Nr3,
-    Nr4,
 }
 
 impl Default for NoiseReduction {
@@ -239,8 +248,7 @@ impl NoiseReduction {
             NoiseReduction::Off => NoiseReduction::Nr,
             NoiseReduction::Nr => NoiseReduction::Nr2,
             NoiseReduction::Nr2 => NoiseReduction::Nr3,
-            NoiseReduction::Nr3 => NoiseReduction::Nr4,
-            NoiseReduction::Nr4 => NoiseReduction::Off,
+            NoiseReduction::Nr3 => NoiseReduction::Off,
         }
     }
 
@@ -250,7 +258,6 @@ impl NoiseReduction {
             NoiseReduction::Nr => "NR: NR",
             NoiseReduction::Nr2 => "NR: NR2",
             NoiseReduction::Nr3 => "NR: NR3",
-            NoiseReduction::Nr4 => "NR: NR4",
         }
     }
 }
@@ -337,8 +344,22 @@ pub struct DemodParams {
     /// inside the RXA chain itself, so switching is just a Set*Run
     /// call, no extra buffer plumbing needed.
     pub noise_reduction: NoiseReduction,
+    /// NR3 (NNR)'s one documented operator control (WDSP Guide Rev
+    /// 2.1.0 5.3.20): how far any frequency bin may be attenuated, i.e.
+    /// how much genuine received noise is let through. -10.0 (most
+    /// noise passed) to -50.0 (max suppression), matching WDSP's own
+    /// documented range; default -25.0. Applied regardless of which NR
+    /// mode is active (harmless -- WDSP only reads it while NNR is
+    /// actually running), same convention as agc_top_db etc. always
+    /// being set even when AGC is Off.
+    pub nnr_mask_floor_db: f64,
+    /// NR3 (NNR)'s model selector: false = Standard (default, ~10% of
+    /// one core), true = Premium (~32%, measurably better) -- both
+    /// compiled in and already loaded, switching is immediate (WDSP
+    /// Guide 5.3.20).
+    pub nnr_premium: bool,
     /// SNB ("Spectral Noise Blanker", WDSP's SNBA stage) -- unlike
-    /// NoiseReduction's NR/NR2/NR3/NR4, this is an independent toggle
+    /// NoiseReduction's NR/NR2/NR3, this is an independent toggle
     /// rather than part of that mutually-exclusive cycle: SNB targets
     /// impulsive/broadband noise (clicks, ignition, etc.) while NR
     /// targets steady-state hiss, and real HPSDR clients (piHPSDR,
@@ -416,6 +437,8 @@ impl Default for DemodParams {
             noise_blanker: NoiseBlanker::Off,
             nb_threshold: 20.0,
             noise_reduction: NoiseReduction::Off,
+            nnr_mask_floor_db: -25.0,
+            nnr_premium: false,
             snb: false,
             anf: false,
             binaural: false,
@@ -501,6 +524,7 @@ struct SpectrumAnalyzer {
     last_nb_enabled: Option<NoiseBlanker>,
     last_nb_threshold: Option<f64>,
     last_nr_enabled: Option<NoiseReduction>,
+    last_nnr_params: Option<(f64, bool)>,
     last_snb_enabled: Option<bool>,
     last_anf_enabled: Option<bool>,
     last_binaural: Option<bool>,
@@ -796,6 +820,7 @@ impl SpectrumAnalyzer {
                 last_nb_enabled: None,
                 last_nb_threshold: None,
                 last_nr_enabled: None,
+                last_nnr_params: None,
                 last_snb_enabled: None,
                 last_anf_enabled: None,
                 last_binaural: None,
@@ -1057,26 +1082,33 @@ impl SpectrumAnalyzer {
             self.last_nb_threshold = Some(params.nb_threshold);
         }
 
-        // Noise reduction: NR (ANR), NR2 (EMNR), NR3 (RNNR), and NR4
-        // (SBNR) are all mutually exclusive. All four live inside the
-        // RXA chain itself, so switching is just a set of Set*Run
-        // calls -- fexchange0 below picks them up with no extra buffer
-        // plumbing needed.
+        // Noise reduction: NR (ANR), NR2 (EMNR), and NR3 (NNR) are all
+        // mutually exclusive. All three live inside the RXA chain
+        // itself, so switching is just a set of Set*Run calls --
+        // fexchange0 below picks them up with no extra buffer plumbing
+        // needed.
         if self.last_nr_enabled != Some(params.noise_reduction) {
-            let (nr_run, nr2_run, nr3_run, nr4_run) = match params.noise_reduction {
-                NoiseReduction::Off => (0, 0, 0, 0),
-                NoiseReduction::Nr => (1, 0, 0, 0),
-                NoiseReduction::Nr2 => (0, 1, 0, 0),
-                NoiseReduction::Nr3 => (0, 0, 1, 0),
-                NoiseReduction::Nr4 => (0, 0, 0, 1),
+            let (nr_run, nr2_run, nr3_run) = match params.noise_reduction {
+                NoiseReduction::Off => (0, 0, 0),
+                NoiseReduction::Nr => (1, 0, 0),
+                NoiseReduction::Nr2 => (0, 1, 0),
+                NoiseReduction::Nr3 => (0, 0, 1),
             };
             unsafe {
                 wdsp::SetRXAANRRun(self.channel, nr_run);
                 wdsp::SetRXAEMNRRun(self.channel, nr2_run);
-                wdsp::SetRXARNNRRun(self.channel, nr3_run);
-                wdsp::SetRXASBNRRun(self.channel, nr4_run);
+                wdsp::SetRXANNRRun(self.channel, nr3_run);
             }
             self.last_nr_enabled = Some(params.noise_reduction);
+        }
+
+        let nnr_params = (params.nnr_mask_floor_db, params.nnr_premium);
+        if self.last_nnr_params != Some(nnr_params) {
+            unsafe {
+                wdsp::SetRXANNRMaskFloor(self.channel, params.nnr_mask_floor_db);
+                wdsp::SetRXANNRModel(self.channel, params.nnr_premium as c_int);
+            }
+            self.last_nnr_params = Some(nnr_params);
         }
 
         // SNB ("Spectral Noise Blanker", WDSP's SNBA stage) -- see
@@ -1665,6 +1697,12 @@ impl SpectrumHandle {
     }
     pub fn set_noise_reduction(&self, v: NoiseReduction) {
         self.demod_params.lock().unwrap().noise_reduction = v;
+    }
+    pub fn set_nnr_mask_floor_db(&self, v: f64) {
+        self.demod_params.lock().unwrap().nnr_mask_floor_db = v.clamp(-50.0, -10.0);
+    }
+    pub fn set_nnr_premium(&self, v: bool) {
+        self.demod_params.lock().unwrap().nnr_premium = v;
     }
 
     pub fn snb(&self) -> bool {

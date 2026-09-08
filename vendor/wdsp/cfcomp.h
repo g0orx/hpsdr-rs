@@ -1,8 +1,8 @@
-/*	cfcomp.h
+/*  cfcomp.h
 
 This file is part of a program that implements a Software-Defined Radio.
 
-Copyright (C) 2017, 2021 Warren Pratt, NR0V
+Copyright (C) 2017, 2021, 2026 Warren Pratt, NR0V
 
 This program is free software; you can redistribute it and/or
 modify it under the terms of the GNU General Public License
@@ -20,93 +20,109 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
 
 The author can be reached by email at
 
-warren@wpratt.com
+warren@pratt.one
 
 */
 
 #ifndef _cfcomp_h
 #define _cfcomp_h
 
-typedef struct _cfcomp
-{
-	int run;
-	int position;
-	int bsize;
-	double* in;
-	double* out;
-	int fsize;
-	int ovrlp;
-	int incr;
-	double* window;
-	int iasize;
-	double* inaccum;
-	double* forfftin;
-	double* forfftout;
-	int msize;
-	double* cmask;
-	double* mask;
-	int mask_ready;
-	double* cfc_gain;
-	double* revfftin;
-	double* revfftout;
-	double** save;
-	int oasize;
-	double* outaccum;
-	double rate;
-	int wintype;
-	double pregain;
-	double postgain;
-	int nsamps;
-	int iainidx;
-	int iaoutidx;
-	int init_oainidx;
-	int oainidx;
-	int oaoutidx;
-	int saveidx;
-	fftw_plan Rfor;
-	fftw_plan Rrev;
+#include "nurbs.h"
 
-	int comp_method;
-	int nfreqs;
-	double* F;
-	double* G;
-	double* E;
-	double* fp;
-	double* gp;
-	double* ep;
-	double* comp;
-	double precomp;
-	double precomplin;
-	double* peq;
-	int peq_run;
-	double prepeq;
-	double prepeqlin;
-	double winfudge;
+typedef struct _cfcomp {
+  int run;
+  int position;
+  int bsize;
+  double *in;
+  double *out;
+  int fsize;
+  int ovrlp;
+  int incr;
+  double *window;
+  int iasize;
+  double *inaccum;
+  double *forfftin;
+  double *forfftout;
+  int msize;
+  double *cmask;
+  double *mask;
+  int mask_ready;
+  double *cfc_gain;
+  double *revfftin;
+  double *revfftout;
+  double **save;
+  int oasize;
+  double *outaccum;
+  double rate;
+  int wintype;
+  double pregain;
+  double postgain;
+  int nsamps;
+  int iainidx;
+  int iaoutidx;
+  int init_oainidx;
+  int oainidx;
+  int oaoutidx;
+  int saveidx;
+  fftw_plan Rfor;
+  fftw_plan Rrev;
 
-	double gain;
-	double mtau;
-	double mmult;
-	// display stuff
-	double dtau;
-	double dmult;
-	double* delta;
-	double* delta_copy;
-	double* cfc_gain_copy;
-}cfcomp, *CFCOMP;
+  // G/g refer to compressor; E/e refer to equalizer
+  int comp_method;
+  int max_freqs;
+  int nfreqsG;
+  int nfreqsE;
+  double *Fg;
+  double *Fe;
+  double *G;
+  double *E;
+  double *fpG;
+  double *fpE;
+  double *gp;
+  double *ep;
+  double *comp;
+  double precomp;
+  double precomplin;
+  double *peq;
+  int peq_run;
+  double prepeq;
+  double prepeqlin;
+  double winfudge;
+  double *saryG;
+  double *saryE;
 
-extern CFCOMP create_cfcomp (int run, int position, int peq_run, int size, double* in, double* out, int fsize, int ovrlp,
-	int rate, int wintype, int comp_method, int nfreqs, double precomp, double prepeq, double* F, double* G, double* E, double mtau, double dtau);
+  double gain;
+  double mtau;
+  double mmult;
+  // display stuff
+  double dtau;
+  double dmult;
+  double *delta;
+  double *delta_copy;
+  double *cfc_gain_copy;
 
-extern void destroy_cfcomp (CFCOMP a);
+  // nurbs stuff
+  int gdeg;
+  int edeg;
+  NURBS png;
+  NURBS pne;
 
-extern void flush_cfcomp (CFCOMP a);
+} cfcomp, *CFCOMP;
 
-extern void xcfcomp (CFCOMP a, int pos);
+extern CFCOMP create_cfcomp(int run, int position, int peq_run, int size, double *in, double *out, int fsize, int ovrlp,
+                            int rate, int wintype, int comp_method, int nfreqsG, int nfreqsE, double precomp, double prepeq,
+                            double *Fg, double *G, double *Fe, double *E, double mtau, double dtau);
 
-extern void setBuffers_cfcomp (CFCOMP a, double* in, double* out);
+extern void destroy_cfcomp(CFCOMP a);
 
-extern void setSamplerate_cfcomp (CFCOMP a, int rate);
+extern void flush_cfcomp(CFCOMP a);
 
-extern void setSize_cfcomp (CFCOMP a, int size);
+extern void xcfcomp(CFCOMP a, int pos);
+
+extern void setBuffers_cfcomp(CFCOMP a, double *in, double *out);
+
+extern void setSamplerate_cfcomp(CFCOMP a, int rate);
+
+extern void setSize_cfcomp(CFCOMP a, int size);
 
 #endif

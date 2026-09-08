@@ -1,4 +1,4 @@
-/*	lmath.h
+/*  lmath.h
 
 This file is part of a program that implements a Software-Defined Radio.
 
@@ -24,56 +24,55 @@ warren@wpratt.com
 
 */
 
-extern void dR (int n, double* r, double* y, double* z);
+extern void dR(int n, double *r, double *y, double *z);
 
-extern void trI (
-	int n,
-	double* r,
-	double* B,
-	double* y,
-	double* v,
-	double* dR_z
-	);
+extern void trI(
+        int n,
+        double *r,
+        double *B,
+        double *y,
+        double *v,
+        double *dR_z
+);
 
-extern void asolve(int xsize, int asize, double* x, double* a, double* r, double* z);
+extern void asolve(int xsize, int asize, double *x, double *a, double *r, double *z);
 
-extern void median(int n, double* a, double* med);
+extern void median(int n, double *a, double *med);
 
 #ifndef _bldr_h
 #define _bldr_h
 
-typedef struct _bldr
-{
-	double* catxy;
-	double* sx;
-	double* sy;
-	double* h;
-	int* p;
-	int* np;
-	double* taa;
-	double* tab;
-	double* tag;
-	double* tad;
-	double* tbb;
-	double* tbg;
-	double* tbd;
-	double* tgg;
-	double* tgd;
-	double* tdd;
-	double* A;
-	double* B;
-	double* C;
-	double* D;
-	double* E;
-	double* F;
-	double* G;
-	double* MAT;
-	double* RHS;
-	double* SLN;
-	double* z;
-	double* zp;
-	double* wrk;
-	int* ipiv;
+typedef struct _bldr {
+  double *catxy;
+  double *sx;
+  double *sy;
+  double *h;
+  int *p;
+  int *np;
+  double *taa;
+  double *tab;
+  double *tag;
+  double *tad;
+  double *tbb;
+  double *tbg;
+  double *tbd;
+  double *tgg;
+  double *tgd;
+  double *tdd;
+  double *A;
+  double *B;
+  double *C;
+  double *D;
+  double *E;
+  double *F;
+  double *G;
+  double *MAT;
+  double *RHS;
+  double *SLN;
+  double *z;
+  double *zp;
+  double *wrk;
+  int *ipiv;
 } bldr, *BLDR;
 
 extern BLDR create_builder(int points, int ints);
@@ -82,12 +81,12 @@ extern void destroy_builder(BLDR a);
 
 extern void flush_builder(BLDR a, int points, int ints);
 
-extern void xbuilder(BLDR a, int points, double* x, double* y, int ints, double* t, int* info, double* c, double ptol);
+extern void xbuilder(BLDR a, int points, double *x, double *y, int ints, double *t, int *info, double *c, double ptol);
 
-extern int fcompare(const void* a, const void* b);
+extern int fcompare(const void *a, const void *b);
 
-extern void decomp(int n, double* a, int* piv, int* info, double* wrk);
+extern void decomp(int n, double *a, int *piv, int *info, double *wrk);
 
-extern void dsolve(int n, double* a, int* piv, double* b, double* x);
+extern void dsolve(int n, double *a, int *piv, double *b, double *x);
 
 #endif

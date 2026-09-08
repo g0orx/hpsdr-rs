@@ -870,7 +870,6 @@ fn handle_client(
     let nr_stage = match params.noise_reduction {
         NoiseReduction::Nr2 => 2,
         NoiseReduction::Nr3 => 3,
-        NoiseReduction::Nr4 => 4,
         _ => 1,
     };
     send_logged(&mut ws, &logging, format!("rx_nb_enable_ex:0,{nb_on},{nb_stage};").into());
@@ -1883,12 +1882,15 @@ fn handle_command(
         }
         // rx_nr_enable_ex:receiver,bool,stage; -- ROOT CAUSE FIX, same
         // story as rx_nb_enable_ex above: `stage` is 1-indexed
-        // (confirmed via the same real TCI Remote session log: its NR/
-        // NR2/NR3/NR4 buttons send stage 1/2/3/4 respectively), not
-        // ignored as an earlier version of this did -- a real reported
-        // bug ("NR/NR2/NR3/NR4 all just set NR"). This project's own
-        // noise_reduction enum happens to have exactly four non-off
-        // stages (Nr/Nr2/Nr3/Nr4), a clean 1:1 match.
+        // (confirmed via a real TCI Remote session log: its NR/NR2/NR3/
+        // NR4 buttons send stage 1/2/3/4 respectively), not ignored as
+        // an earlier version of this did -- a real reported bug
+        // ("NR/NR2/NR3/NR4 all just set NR"). This project's own
+        // noise_reduction enum used to have a clean four-way 1:1 match
+        // (Nr/Nr2/Nr3/Nr4); the WDSP 2.10 port (2026-09-07) collapsed
+        // NR3/NR4 into one NNR-backed Nr3 stage (see NoiseReduction's
+        // own doc comment in spectrum.rs), so stage 3 and stage 4 (and
+        // anything beyond) both land on Nr3 here now.
         "rx_nr_enable_ex" => {
             let on = args.get(1)?.trim().eq_ignore_ascii_case("true");
             let stage = args.get(2).and_then(|s| s.trim().parse::<u32>().ok()).unwrap_or(1);
@@ -1898,8 +1900,7 @@ fn handle_command(
                 match stage {
                     1 => NoiseReduction::Nr,
                     2 => NoiseReduction::Nr2,
-                    3 => NoiseReduction::Nr3,
-                    _ => NoiseReduction::Nr4,
+                    _ => NoiseReduction::Nr3,
                 }
             };
             demod_params.lock().unwrap().noise_reduction = nr;

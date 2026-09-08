@@ -1,4 +1,4 @@
-/*	meterlog10.h
+/*  meterlog10.h
 
 This file is part of a program that implements a Software-Defined Radio.
 
@@ -24,4 +24,4 @@ warren@wpratt.com
 
 */
 
-extern double mlog10 (double val);
+extern double mlog10(double val);

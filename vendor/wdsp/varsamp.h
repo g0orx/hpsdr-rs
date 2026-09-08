@@ -1,4 +1,4 @@
-/*	varsamp.h
+/*  varsamp.h
 
 This file is part of a program that implements a Software-Defined Radio.
 
@@ -27,56 +27,55 @@ warren@wpratt.com
 #ifndef _varsamp_h
 #define _varsamp_h
 
-typedef struct _varsamp
-{
-	int run;
-	int size;
-	double* in;
-	double* out;
-	int in_rate;
-	int out_rate;
-	double fcin;
-	double fc;
-	double fc_low;
-	double gain;
-	int idx_in;
-	int ncoef;
-	double* h;
-	int rsize;
-	double* ring;
-	double var;
-	int varmode;
-	double cvar;
-	double inv_cvar;
-	double old_inv_cvar;
-	double dicvar;
-	double delta;
-	double* hs;
-	int R;
-	double h_offset;
-	double isamps;
-	double nom_ratio;
+typedef struct _varsamp {
+  int run;
+  int size;
+  double *in;
+  double *out;
+  int in_rate;
+  int out_rate;
+  double fcin;
+  double fc;
+  double fc_low;
+  double gain;
+  int idx_in;
+  int ncoef;
+  double *h;
+  int rsize;
+  double *ring;
+  double var;
+  int varmode;
+  double cvar;
+  double inv_cvar;
+  double old_inv_cvar;
+  double dicvar;
+  double delta;
+  double *hs;
+  int R;
+  double h_offset;
+  double isamps;
+  double nom_ratio;
 } varsamp, *VARSAMP;
 
-extern VARSAMP create_varsamp ( int run, int size, double* in, double* out,
-	int in_rate, int out_rate, double fc, double fc_low, int R, double gain, double var, int varmode);
+extern VARSAMP create_varsamp(int run, int size, double *in, double *out,
+                              int in_rate, int out_rate, double fc, double fc_low, int R, double gain, double var, int varmode);
 
-extern void destroy_varsamp (VARSAMP a);
+extern void destroy_varsamp(VARSAMP a);
 
-extern void flush_varsamp (VARSAMP a);
+extern void flush_varsamp(VARSAMP a);
 
-extern int xvarsamp (VARSAMP a, double var);
+extern int xvarsamp(VARSAMP a, double var);
 
-extern void setBuffers_varsamp (VARSAMP a, double* in, double* out);
+extern void setBuffers_varsamp(VARSAMP a, double *in, double *out);
 
-extern void setSize_varsamp (VARSAMP a, int size);
+extern void setSize_varsamp(VARSAMP a, int size);
 
-extern void setInRate_varsamp (VARSAMP a, int rate);
+extern void setInRate_varsamp(VARSAMP a, int rate);
 
-extern void setOutRate_varsamp (VARSAMP a, int rate);
+extern void setOutRate_varsamp(VARSAMP a, int rate);
 
-extern void setFCLow_varsamp (VARSAMP a, double fc_low);
+extern void setFCLow_varsamp(VARSAMP a, double fc_low);
 
-extern void setBandwidth_varsamp (VARSAMP a, double fc_low, double fc_high);
+extern void setBandwidth_varsamp(VARSAMP a, double fc_low, double fc_high);
 
 #endif

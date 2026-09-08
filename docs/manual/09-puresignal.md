@@ -39,8 +39,8 @@ Once enabled (and TX armed), the rest of this tab's controls appear:
   generally, PureSignal or not.
 - **HW Peak** -- 0.0-1.0. See below; this is the setting that actually
   matters most.
-- **MOX Delay**, **Loop Delay**, **TX Delay**, **Ptol** -- advanced timing/
-  tolerance parameters, rarely need changing from their defaults.
+- **MOX Delay**, **Loop Delay**, **TX Delay** -- advanced timing
+  parameters, rarely need changing from their defaults.
 
 The correction table auto-saves the first time calibration succeeds each
 session, and auto-restores from disk the next time you enable PureSignal on

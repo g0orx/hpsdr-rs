@@ -109,6 +109,13 @@ pub struct Config {
     pub noise_blanker: Option<NoiseBlanker>,
     pub nb_threshold: Option<f64>,
     pub noise_reduction: Option<NoiseReduction>,
+    /// See spectrum::DemodParams::nnr_mask_floor_db's doc comment.
+    /// Missing falls back to WDSP's own documented default (-25.0).
+    #[serde(default)]
+    pub nnr_mask_floor_db: Option<f64>,
+    /// See spectrum::DemodParams::nnr_premium's doc comment.
+    #[serde(default)]
+    pub nnr_premium: Option<bool>,
     /// SNB ("Spectral Noise Blanker") -- independent of noise_reduction
     /// above, see spectrum::DemodParams::snb's doc comment for why.
     pub snb: Option<bool>,
@@ -246,10 +253,6 @@ pub struct Config {
     /// behavior before this control existed).
     #[serde(default)]
     pub ps_tx_attenuation: Option<u32>,
-    /// See tx::PsParams::ptol's doc comment. Missing falls back to
-    /// WDSP's own reference default (0.8).
-    #[serde(default)]
-    pub ps_ptol: Option<f64>,
     /// See radio::RadioSession::send_rx_audio_to_radio's doc comment
     /// (Settings -> RX). Missing/never set falls back to off, same as
     /// the live default.
@@ -353,6 +356,10 @@ fn default_nb_threshold() -> f64 {
     20.0
 }
 
+fn default_nnr_mask_floor_db() -> f64 {
+    -25.0
+}
+
 #[derive(Serialize, Deserialize, Clone)]
 pub struct ExtraReceiverConfig {
     pub frequency_hz: u32,
@@ -391,6 +398,12 @@ pub struct ExtraReceiverConfig {
     pub nb_threshold: f64,
     #[serde(default)]
     pub noise_reduction: NoiseReduction,
+    /// See Config::nnr_mask_floor_db's doc comment.
+    #[serde(default = "default_nnr_mask_floor_db")]
+    pub nnr_mask_floor_db: f64,
+    /// See Config::nnr_premium's doc comment.
+    #[serde(default)]
+    pub nnr_premium: bool,
     /// See Config::snb's doc comment.
     #[serde(default)]
     pub snb: bool,

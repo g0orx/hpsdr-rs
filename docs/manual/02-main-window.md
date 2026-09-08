@@ -101,8 +101,9 @@ slider:
 
 - **NB** -- cycles Off → NB → NB2 → Off (two mutually-exclusive noise
   blanker stages; the threshold both share is in Settings → RX).
-- **NR** -- cycles Off → NR → NR2 → NR3 → NR4 → Off (four mutually-exclusive
-  noise reduction algorithms).
+- **NR** -- cycles Off → NR → NR2 → NR3 → Off (three mutually-exclusive
+  noise reduction algorithms; NR3 is WDSP's built-in neural-net noise
+  reduction).
 - **SNB** -- toggles the Spectral Noise Blanker on/off, independently of NB
   and NR (it can run alongside either).
 - **ANF** -- toggles the Automatic Notch Filter on/off, independently of

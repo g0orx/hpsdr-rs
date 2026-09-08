@@ -1,9 +1,17 @@
 /*
-    Builds WDSP, libspecbleach, and rnnoise from vendored C source
-    (vendor/wdsp, vendor/libspecbleach, vendor/rnnoise) instead of linking
-    prebuilt platform-specific binaries -- ported from rustyHPSDR's own
-    build.rs (same source, same file list), which already builds this
-    exact source tree on both Linux and Windows (MSYS2/MinGW-w64).
+    Builds WDSP from vendored C source (vendor/wdsp) instead of linking
+    a prebuilt platform-specific binary -- file list originally ported
+    from rustyHPSDR's own build.rs, which built the same source tree on
+    both Linux and Windows (MSYS2/MinGW-w64).
+
+    vendor/libspecbleach and vendor/rnnoise are built alongside WDSP too,
+    backing its NR4 ("SBNR") and NR3 ("RNNR") noise-reduction stages
+    respectively -- confirmed (2026-09-08, re-porting from a newer WDSP
+    2.10 revision after the first 2026-09-07 port from an incomplete
+    snapshot briefly dropped them) that both stages coexist alongside
+    the newer built-in neural-net stage ("NNR", vendor/wdsp/nnr.c +
+    nnet.c/nnio.c + two compiled-in trained models) rather than being
+    replaced by it -- see memory/wdsp_210_port.md.
 
     Confirmed viable cross-platform by reading the vendored source
     directly: wdsp/comm.h and wdsp/linux_port.h branch on
@@ -184,7 +192,6 @@ fn main() {
         "vendor/rnnoise/src/rnn.c",
         "vendor/rnnoise/src/rnnoise_data.c",
         "vendor/rnnoise/src/rnnoise_tables.c",
-        "vendor/wdsp/FDnoiseIQ.c",
         "vendor/wdsp/calculus.c",
         "vendor/wdsp/emnr.c",
         "vendor/wdsp/icfir.c",
@@ -240,12 +247,10 @@ fn main() {
         "vendor/wdsp/apfshadow.c",
         "vendor/wdsp/div.c",
         "vendor/wdsp/gain.c",
-        "vendor/wdsp/rnnr.c",
         "vendor/wdsp/wcpAGC.c",
         "vendor/wdsp/bandpass.c",
         "vendor/wdsp/doublepole.c",
         "vendor/wdsp/gaussian.c",
-        "vendor/wdsp/sbnr.c",
         "vendor/wdsp/wisdom.c",
         "vendor/wdsp/calcc.c",
         "vendor/wdsp/eer.c",
@@ -253,8 +258,44 @@ fn main() {
         "vendor/wdsp/matchedCW.c",
         "vendor/wdsp/sender.c",
         "vendor/wdsp/zetaHat.c",
+        // RNNoise-backed (NR3) and libspecbleach-backed (NR4) noise
+        // reduction -- confirmed present (2026-09-08) alongside the new
+        // NNR stage below, not replaced by it: the initial WDSP 2.10
+        // source drop this project first ported from (2026-09-07)
+        // simply omitted rnnr.c/sbnr.c, an incomplete snapshot, not an
+        // upstream removal -- see memory/wdsp_210_port.md.
+        "vendor/wdsp/rnnr.c",
+        "vendor/wdsp/sbnr.c",
+        // Added by the WDSP 2.10 port (2026-09-07): a new built-in
+        // neural-net NR stage, alongside (not instead of) rnnr.c/
+        // sbnr.c above -- see spectrum.rs's NoiseReduction doc comment.
+        "vendor/wdsp/nnet.c",
+        "vendor/wdsp/nnio.c",
+        "vendor/wdsp/nnr.c",
+        "vendor/wdsp/nnr_model_0.c",
+        "vendor/wdsp/nnr_model_1.c",
+        // Internal helpers/new subsystems added upstream in the same
+        // version bump -- extrapolate/nurbs/snoop have no direct Rust
+        // FFI callers yet (needed only so the library links as a whole);
+        // wbfm (wideband FM demod), phrot (phase rotation), and reshb (a
+        // resampler) are compiled in but deliberately NOT wired up to
+        // any wdsp_sys extern or UI control this round -- see the WDSP
+        // 2.10 port plan for the "compile only, wire up later" scope
+        // decision.
+        "vendor/wdsp/extrapolate.c",
+        "vendor/wdsp/nurbs.c",
+        "vendor/wdsp/nurbs_fit.c",
+        "vendor/wdsp/nurbs_spline.c",
+        "vendor/wdsp/snoop.c",
+        "vendor/wdsp/wbfm.c",
+        "vendor/wdsp/phrot.c",
+        "vendor/wdsp/reshb.c",
     ]);
 
+    // Headers live flat in include/ now (specbleach_adenoiser.h etc,
+    // no "specbleach/" subdirectory) -- matches the newer libspecbleach
+    // synced in from deskHPSDR's own WDSP 2.10 revision (2026-09-08),
+    // whose sbnr.c does `#include <specbleach_adenoiser.h>` bare.
     build.include("vendor/libspecbleach/include");
     build.include("vendor/libspecbleach/src");
     build.include("vendor/libspecbleach/src/processors");
@@ -297,12 +338,14 @@ fn main() {
     build.flag_if_supported("-march=native");
     // BUG FIX: MSVC's cl.exe, with no explicit /std: flag, defaults to a
     // pre-C11 dialect and doesn't recognize `_Static_assert` -- confirmed
-    // by a real build failure on libspecbleach's fft_transform.h, which
-    // uses it. GCC/Clang never hit this (they've always recognized
-    // _Static_assert as an extension regardless of -std=, in every
-    // dialect), so this only matters for the MSVC path -- flag_if_supported
-    // means it's silently skipped there anyway if it were ever passed to
-    // a compiler that doesn't understand /std: syntax at all.
+    // by a real build failure on (now-removed) libspecbleach's
+    // fft_transform.h, which used it. Kept regardless of that removal:
+    // GCC/Clang never hit this (they've always recognized _Static_assert
+    // as an extension regardless of -std=, in every dialect), so this
+    // only matters for the MSVC path -- flag_if_supported means it's
+    // silently skipped there anyway if it were ever passed to a compiler
+    // that doesn't understand /std: syntax at all, and it's cheap
+    // insurance against any C11 feature use elsewhere in vendored C.
     build.flag_if_supported("/std:c11");
 
     for path in fftw_include_paths {

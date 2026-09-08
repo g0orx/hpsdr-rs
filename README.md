@@ -22,7 +22,7 @@ This project started as an experiment: could Claude port the discovery code from
 - Multiple simultaneous receivers (main receiver + independent "extra receiver" windows), each with its own VFO, mode, filter width, and band memory
 - Spectrum/waterfall display with adjustable dB range, palette, and Click-to-Tune (CTUN)
 - SSB/CW/AM/FM/digital modes, per-mode/per-band filter width and mode memory
-- Noise blanker (NB/NB2), noise reduction (NR/NR2/NR3/NR4), and SNB (spectral noise blanker), independently switchable
+- Noise blanker (NB/NB2), noise reduction (NR/NR2/NR3), and SNB (spectral noise blanker), independently switchable
 - AGC with selectable Off/Long/Slow/Medium/Fast modes
 - TX: mic audio through WDSP's TXA chain, ALC, TX power/SWR meter with per-band PA calibration, and a Tune button (WDSP PostGen tone centered in the passband, at a separate reduced "Tune Power" for safe antenna/PA tuning)
 - PureSignal (PA linearization/predistortion), on both Protocol 1 and Protocol 2 — see [PureSignal calibration](#puresignal-calibration) below for how to set it up
@@ -61,10 +61,10 @@ hardware yet, since CI has no radio to connect to.
   CoreAudio directly, built in to macOS
 - Native (Apple Silicon or Intel) target, no cross-compilation flags
   needed — just `cargo build --release` like Linux
-- The vendored WDSP/libspecbleach/rnnoise C source (`build.rs`) already
-  branches on `#if defined(linux) || defined(__APPLE__)` internally (this
-  project ported that branching as-is, unmodified, from the upstream
-  source), so no source changes were needed to get this far
+- The vendored WDSP C source (`build.rs`) branches on
+  `#if defined(linux) || defined(__APPLE__)` internally via
+  `vendor/wdsp/linux_port.c`/`.h`, ported by this project's own author
+  from the upstream Windows-only source
 - Confirmed building successfully via CI on real macOS hardware — not
   yet confirmed actually *running* against a real radio, so if
   something misbehaves at runtime on your Mac, please open an issue
@@ -82,7 +82,7 @@ hardware yet, since CI has no radio to connect to.
 - The [Firmware update](#firmware-update) feature additionally needs the [Npcap SDK](https://npcap.com/#download) at build time (its `Packet.lib`) — download and extract it, then set `NPCAP_SDK_DIR` to that folder; `build.rs` adds its `Lib/x64` to the linker's search path automatically (same idea as `VCPKG_ROOT` above, not a native cargo/MSVC mechanism). A real "`Packet.lib` not found" link error on a fresh Windows build confirmed this step is actually needed — if it still can't be found with `NPCAP_SDK_DIR` set, double check the SDK zip's actual internal folder layout against `<NPCAP_SDK_DIR>\Lib\x64\Packet.lib`
 - **The Npcap *SDK* above (for building) is a separate download from the Npcap *application* (for running)** — a real report hit the built `.exe` refusing to even launch (`STATUS_DLL_NOT_FOUND` immediately on start, before reaching anything on screen) with only the SDK installed. `build.rs` now delay-loads `Packet.dll` (MSVC-only linker feature) so this should only actually matter if you use the Firmware Update feature itself, not just to run the app at all — but this isn't yet confirmed on a real Windows build, so until it is: install [Npcap itself](https://npcap.com/#download) too (not just the SDK), in "WinPcap API-compatible Mode", the same as [Firmware Update](#firmware-update)'s own runtime requirement below
 
-WDSP and its noise-reduction dependencies (libspecbleach, rnnoise) are vendored as C source under `vendor/` and built automatically from source by `build.rs` (via the `cc` crate) — no separate build step, and no prebuilt platform-specific binaries to obtain or keep in sync.
+WDSP is vendored as C source under `vendor/wdsp` and built automatically from source by `build.rs` (via the `cc` crate) — no separate build step, and no prebuilt platform-specific binaries to obtain or keep in sync.
 
 ```sh
 cargo build --release

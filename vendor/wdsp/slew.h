@@ -1,4 +1,4 @@
-/*	slew.h
+/*  slew.h
 
 This file is part of a program that implements a Software-Defined Radio.
 
@@ -27,36 +27,36 @@ warren@wpratt.com
 #ifndef _slew_h
 #define _slew_h
 
-typedef struct _uslew
-{
-	int channel;
-	volatile long *ch_upslew;
-	int size;
-	double* in;
-	double* out;
-	double rate;
-	double tdelay;
-	double tupslew;
-	int runmode;
-	int state;
-	int count;
-	int ndelup;
-	int ntup;
-	double* cup;
+typedef struct _uslew {
+  int channel;
+  volatile long *ch_upslew;
+  int size;
+  double *in;
+  double *out;
+  double rate;
+  double tdelay;
+  double tupslew;
+  int runmode;
+  int state;
+  int count;
+  int ndelup;
+  int ntup;
+  double *cup;
 } uslew, *USLEW;
 
-extern USLEW create_uslew (int channel, volatile long *ch_upslew, int size, double* in, double* out, double rate, double tdelay, double tupslew);
+extern USLEW create_uslew(int channel, volatile long *ch_upslew, int size, double *in, double *out, double rate,
+                          double tdelay, double tupslew);
 
-extern void destroy_uslew (USLEW a);
+extern void destroy_uslew(USLEW a);
 
-extern void flush_uslew (USLEW a);
+extern void flush_uslew(USLEW a);
 
-extern void xuslew (USLEW a);
+extern void xuslew(USLEW a);
 
-extern void setBuffers_uslew (USLEW a, double* in, double* out);
+extern void setBuffers_uslew(USLEW a, double *in, double *out);
 
-extern void setSamplerate_uslew (USLEW a, int rate);
+extern void setSamplerate_uslew(USLEW a, int rate);
 
-extern void setSize_uslew (USLEW a, int size);
+extern void setSize_uslew(USLEW a, int size);
 
 #endif
