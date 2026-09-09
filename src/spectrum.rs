@@ -91,6 +91,13 @@ impl Mode {
     }
 }
 
+/// CW audio pitch (Hz) that Mode::Cwl/Cwu's passband is centered on --
+/// shared with main.rs's click-to-tune handling (see resolve_tune's own
+/// doc comment) so a click on the spectrum/waterfall in CW mode lands
+/// the clicked signal centered in the filter rather than at the dial
+/// frequency itself (which would put it right at the passband's edge).
+pub const CW_PITCH_HZ: f64 = 600.0;
+
 /// Computes passband edges (Hz, relative to the tuned/dial frequency)
 /// from mode + a single "width" control. This is our own UI convention,
 /// not a WDSP requirement -- WDSP just takes whatever edges it's given
@@ -105,14 +112,8 @@ pub fn passband_for(mode: Mode, width_hz: f64) -> (f64, f64) {
         Mode::Dsb | Mode::Am | Mode::Sam | Mode::Drm | Mode::Spec | Mode::Fmn => {
             (-width_hz, width_hz)
         }
-        Mode::Cwl => {
-            const PITCH: f64 = 600.0;
-            (-(PITCH + width_hz / 2.0), -(PITCH - width_hz / 2.0))
-        }
-        Mode::Cwu => {
-            const PITCH: f64 = 600.0;
-            (PITCH - width_hz / 2.0, PITCH + width_hz / 2.0)
-        }
+        Mode::Cwl => (-(CW_PITCH_HZ + width_hz / 2.0), -(CW_PITCH_HZ - width_hz / 2.0)),
+        Mode::Cwu => (CW_PITCH_HZ - width_hz / 2.0, CW_PITCH_HZ + width_hz / 2.0),
     }
 }
 

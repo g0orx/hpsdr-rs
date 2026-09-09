@@ -3169,6 +3169,7 @@ impl eframe::App for HpsdrApp {
                         // window must NOT also do.
                         if spectrum_resp.clicked() && !suppress_refocus_click {
                             let new_freq = freq_at_x(pos.x, rect, freq_hz, sample_rate, connected.spectrum_zoom, pan_offset_hz);
+                            let new_freq = cw_center_click_freq(current_mode, new_freq);
                             let (effective_freq, retune) =
                                 resolve_tune(connected.ctun, freq_hz, sample_rate, passband, new_freq);
                             if let Some(lo) = retune {
@@ -3593,6 +3594,7 @@ impl eframe::App for HpsdrApp {
                         // See suppress_refocus_click's own doc comment.
                         if waterfall_click_resp.clicked() && !suppress_refocus_click {
                             let new_freq = freq_at_x(pos.x, rect, freq_hz, sample_rate, connected.spectrum_zoom, pan_offset_hz);
+                            let new_freq = cw_center_click_freq(current_mode, new_freq);
                             let (effective_freq, retune) =
                                 resolve_tune(connected.ctun, freq_hz, sample_rate, passband, new_freq);
                             if let Some(lo) = retune {
@@ -8039,6 +8041,7 @@ fn render_extra_receiver_ui(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceiver>>) {
     if let Some(pos) = spectrum_resp.interact_pointer_pos() {
         if spectrum_resp.clicked() {
             let new_freq = freq_at_x(pos.x, rect, freq_hz, sample_rate, rx.spectrum_zoom, pan_offset_hz);
+            let new_freq = cw_center_click_freq(current_mode, new_freq);
             let (effective_freq, retune) = resolve_tune(rx.ctun, freq_hz, sample_rate, passband, new_freq);
             if let Some(lo) = retune {
                 rx.frequency_hz.store(lo, Ordering::Relaxed);
@@ -8230,6 +8233,7 @@ fn render_extra_receiver_ui(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceiver>>) {
     if let Some(pos) = wf_resp.interact_pointer_pos() {
         if wf_resp.clicked() {
             let new_freq = freq_at_x(pos.x, wf_rect, freq_hz, sample_rate, rx.spectrum_zoom, pan_offset_hz);
+            let new_freq = cw_center_click_freq(current_mode, new_freq);
             let (effective_freq, retune) = resolve_tune(rx.ctun, freq_hz, sample_rate, passband, new_freq);
             if let Some(lo) = retune {
                 rx.frequency_hz.store(lo, Ordering::Relaxed);
@@ -8693,6 +8697,25 @@ fn scroll_tune_step_hz(cw_mode: bool, shift: bool) -> i64 {
         (true, false) => 100,
         (false, true) => 100,
         (false, false) => 1_000,
+    }
+}
+
+/// A click on the spectrum/waterfall to select a signal in CW mode
+/// should land that signal centered in the (narrow) CW filter -- at
+/// the pitch offset from the dial (spectrum::CW_PITCH_HZ) -- rather
+/// than right at the dial frequency itself, which is where every OTHER
+/// mode's click-to-tune convention intentionally lands the clicked
+/// point, but which for CW sits right at the edge of (or outside) the
+/// passband instead of centered on it (see spectrum::passband_for's
+/// own Cwl/Cwu arms: their passband is centered ±600Hz off the dial,
+/// never on it). Only used at the four actual click handlers (not
+/// drag/scroll/zoom, which are relative adjustments rather than "select
+/// this exact signal").
+fn cw_center_click_freq(mode: spectrum::Mode, clicked_freq_hz: u32) -> u32 {
+    match mode {
+        spectrum::Mode::Cwl => (clicked_freq_hz as i64 + spectrum::CW_PITCH_HZ as i64).max(0) as u32,
+        spectrum::Mode::Cwu => (clicked_freq_hz as i64 - spectrum::CW_PITCH_HZ as i64).max(0) as u32,
+        _ => clicked_freq_hz,
     }
 }
 
