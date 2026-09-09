@@ -339,4 +339,24 @@ fn main() {
     }
 
     println!("cargo:rerun-if-changed=vendor/wdsp");
+
+    // Embeds the app icon into hpsdr-rs.exe itself (taskbar/Explorer/Alt-Tab)
+    // -- separate from the icon the WiX installer shows in Add/Remove
+    // Programs (wix/main.wxs's own <Icon> element), which reads the same
+    // .ico directly and doesn't need this.
+    #[cfg(windows)]
+    embed_windows_icon();
+}
+
+// winresource (a maintained fork of the abandoned `winres` crate) is only
+// pulled in as a `[target.'cfg(windows)'.build-dependencies]` dependency
+// (see Cargo.toml), so it's not even present in the dependency graph on
+// Linux/macOS -- hence the whole function, not just its call site, needs
+// its own #[cfg(windows)] rather than a runtime `target_os` check.
+#[cfg(windows)]
+fn embed_windows_icon() {
+    winresource::WindowsResource::new()
+        .set_icon("assets/icons/hpsdr-rs.ico")
+        .compile()
+        .expect("failed to embed Windows exe icon");
 }

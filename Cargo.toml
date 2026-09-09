@@ -90,6 +90,13 @@ pkg-config = "0.3"
 # resolution for what's ultimately the same vcpkg install).
 vcpkg = "0.2"
 
+[target.'cfg(windows)'.build-dependencies]
+# Embeds assets/icons/hpsdr-rs.ico into hpsdr-rs.exe (see build.rs) --
+# Windows-only target dependency, so it's entirely absent from
+# Linux/macOS builds. winresource is a maintained fork of the abandoned
+# `winres` crate.
+winresource = "0.1"
+
 # `cargo deb` (https://crates.io/crates/cargo-deb) reads this to build a
 # .deb -- Linux only, hence no attempt to also cover Windows/macOS
 # packaging here. `depends` is left as the default "$auto": cargo-deb runs
