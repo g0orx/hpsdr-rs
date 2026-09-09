@@ -5,6 +5,7 @@
     flagged inline.
 */
 
+use crate::audio_recorder::AudioRecorder;
 use crate::cw_decoder::CwDecoder;
 use crate::radio::IqSample;
 use crate::wdsp_sys as wdsp;
@@ -1316,6 +1317,13 @@ fn run(
     // -- fed from the same mono downmix as waveform_out below, but only
     // while params.mode is actually Cwl/Cwu.
     cw_text: Arc<Mutex<String>>,
+    // WAV-recording tap for main.rs's "Record" toolbar toggle -- see
+    // audio_recorder.rs. Written from the SAME post-Audio-Gain (l, r)
+    // frame as the local speaker's own audio_out push below (matching
+    // what's actually heard), inside the same `if !mute_local` guard,
+    // so recording behaves like a second local speaker: muted the same
+    // way, unaffected by TCI. Cheap no-op when not currently recording.
+    recorder: AudioRecorder,
     rx_audio_to_radio: Option<Arc<Mutex<VecDeque<f32>>>>,
     // Muted (not pushed to any of the four audio outputs above) while
     // MOX is active -- see SpectrumHandle::start's doc comment on why.
@@ -1495,6 +1503,7 @@ fn run(
                         out.pop_front();
                     }
                     out.push_back((l, r));
+                    recorder.write_frame(l, r);
                 }
                 if tci_out.len() >= AUDIO_BUFFER_CAPACITY {
                     tci_out.pop_front();
@@ -1546,6 +1555,12 @@ pub struct SpectrumHandle {
     /// the cw_text()/clear_cw_text() accessors below rather than
     /// directly, same as demod_params.
     cw_text: Arc<Mutex<String>>,
+    /// WAV-recording control for main.rs's "Record" toolbar toggle --
+    /// see audio_recorder.rs. `AudioRecorder` is itself already a
+    /// cheap `Clone`-able handle (like this whole struct's other
+    /// pieces), so this is `pub` rather than needing its own
+    /// start()/stop() forwarding methods here.
+    pub recorder: AudioRecorder,
     demod_params: Arc<Mutex<DemodParams>>,
     /// WDSP analyzer channel this handle's run() thread opened -- kept
     /// here too (not just inside that thread) so clear_display can
@@ -1595,6 +1610,7 @@ impl SpectrumHandle {
         let waveform_out = Arc::new(Mutex::new(VecDeque::with_capacity(WAVEFORM_TAP_CAPACITY)));
         let iq_out = Arc::new(Mutex::new(VecDeque::with_capacity(IQ_OUT_CAPACITY)));
         let cw_text = Arc::new(Mutex::new(String::new()));
+        let recorder = AudioRecorder::new();
         let stop = Arc::new(AtomicBool::new(false));
         let thread = {
             let display = Arc::clone(&display);
@@ -1604,6 +1620,7 @@ impl SpectrumHandle {
             let waveform_out = Arc::clone(&waveform_out);
             let iq_out = Arc::clone(&iq_out);
             let cw_text = Arc::clone(&cw_text);
+            let recorder = recorder.clone();
             let stop = Arc::clone(&stop);
             thread::spawn(move || {
                 run(
@@ -1617,6 +1634,7 @@ impl SpectrumHandle {
                     waveform_out,
                     iq_out,
                     cw_text,
+                    recorder,
                     rx_audio_to_radio,
                     mox,
                     mute_local_for_tci,
@@ -1631,6 +1649,7 @@ impl SpectrumHandle {
             waveform_out,
             iq_out,
             cw_text,
+            recorder,
             demod_params,
             channel,
             stop,

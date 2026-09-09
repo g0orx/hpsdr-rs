@@ -10,6 +10,7 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 mod audio;
+mod audio_recorder;
 mod bootloader;
 mod bootloader_ui;
 mod cat;
@@ -2778,6 +2779,48 @@ impl eframe::App for HpsdrApp {
                                 None => (egui::Color32::GRAY, "PureSignal: enabled".to_string()),
                             };
                             ui.colored_label(color, "PS").on_hover_text(hover);
+                        }
+
+                        // Records exactly the audio the local speaker
+                        // plays (post Audio Gain, muted the same way
+                        // during TX/mute_local_for_tci -- see
+                        // spectrum.rs's recorder.write_frame call site)
+                        // to a timestamped WAV file under the
+                        // recordings folder alongside this radio's
+                        // other persisted files -- see
+                        // audio_recorder::recording_path.
+                        ui.add_space(12.0);
+                        let recording = connected.spectrum.recorder.is_enabled();
+                        let (rec_label, rec_color) = if recording {
+                            ("Recording", egui::Color32::from_rgb(210, 50, 50))
+                        } else {
+                            ("Record", egui::Color32::from_gray(60))
+                        };
+                        let rec_resp = ui
+                            .add(
+                                egui::Button::new(
+                                    egui::RichText::new(rec_label).strong().color(egui::Color32::WHITE),
+                                )
+                                .fill(rec_color),
+                            )
+                            .on_hover_text(if recording {
+                                "Click to stop recording"
+                            } else {
+                                "Record RX audio (what you hear) to a WAV file"
+                            });
+                        if rec_resp.clicked() {
+                            if recording {
+                                connected.spectrum.recorder.stop();
+                            } else {
+                                match audio_recorder::recording_path() {
+                                    Some(path) => {
+                                        if let Err(e) = connected.spectrum.recorder.start(&path) {
+                                            eprintln!("failed to start recording: {e}");
+                                        }
+                                    }
+                                    None => eprintln!("failed to start recording: could not determine the recordings folder"),
+                                }
+                            }
                         }
                     });
 
@@ -6634,6 +6677,13 @@ impl eframe::App for HpsdrApp {
                 ui.ctx().request_repaint_after(Duration::from_millis(33));
 
                 if stop_clicked {
+                    // Finalizes the WAV header (real RIFF/data sizes,
+                    // still placeholders otherwise -- see
+                    // audio_recorder::AudioRecorder::stop) if a
+                    // recording was left running through Stop, rather
+                    // than abandoning it with a truncated/placeholder
+                    // header. No-op if nothing was recording.
+                    connected.spectrum.recorder.stop();
                     connected.session.stop();
                     connected.spectrum.stop();
                     let ctx = ui.ctx().clone();
