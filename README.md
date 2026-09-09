@@ -98,6 +98,8 @@ The app opens a discovery window that listens for radios on the network; select 
 
 On Windows, a release build no longer pops up a console window alongside the app (a plain `cargo build`/`cargo run` debug build still does, for normal development) — its debug output goes to `%APPDATA%\hpsdr-rs\hpsdr-rs.log` instead.
 
+The main window's toolbar has a **Record** button that saves the RX audio you're currently hearing to a WAV file under a `recordings` folder alongside the settings above — useful for capturing a signal to play back later, or to demonstrate a feature (see the [Noise Reduction demo](#noise-reduction-demo) below for an example).
+
 See the **[User Manual](docs/manual/README.md)** for a full walkthrough of the UI -- every settings tab, tuning gestures, extra receivers, and the PureSignal/Diversity/Equalizer features.
 
 ## Firmware update
@@ -204,6 +206,17 @@ Procedure, on any radio:
 4. Re-engage Two Tone. `Correcting` should turn on within a few seconds. If it doesn't:
    - Stuck with Feedback Level at 0 and no progress: HW Peak is likely still too far from the true peak — recheck Measured Peak TX and adjust again.
    - `Correcting` flickers on/off or never turns on despite Feedback Level being nonzero: try nudging Tune Power % up or down a little and repeat from step 2 — the exact drive level a clean calibration converges at is somewhat radio-dependent.
+
+## Noise Reduction demo
+
+A real recording of 40m background noise, captured with the main window's own Record button (see [Running](#running) above), showing each of the Settings → RX → Noise Reduction options back to back on the same noisy signal: [`docs/audio/noise-reduction-demo.wav`](docs/audio/noise-reduction-demo.wav).
+
+| Time | NR setting |
+| --- | --- |
+| 0-4s | `NR: Off` |
+| 4-9s | `NR: NR` |
+| 9-13s | `NR: NR2` |
+| 13s-end | `NR: NNR` |
 
 ## Roadmap
 
