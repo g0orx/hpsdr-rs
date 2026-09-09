@@ -4181,19 +4181,19 @@ impl eframe::App for HpsdrApp {
                             ui.visuals_mut().clone_from(&light_visuals);
                             ui.horizontal(|ui| {
                                 for (tab, label) in [
-                                    (SettingsTab::Network, "Network"),
+                                    (SettingsTab::About, "About"),
                                     (SettingsTab::Audio, "Audio"),
+                                    (SettingsTab::Diversity, "Diversity"),
+                                    (SettingsTab::Equalizer, "Equalizer"),
+                                    (SettingsTab::Firmware, "Firmware"),
+                                    (SettingsTab::Network, "Network"),
+                                    (SettingsTab::OpenCollector, "Open Collector"),
+                                    (SettingsTab::PaCalibration, "PA Calibration"),
+                                    (SettingsTab::PureSignal, "PureSignal"),
                                     (SettingsTab::Agc, "RX"),
                                     (SettingsTab::Spectrum, "Spectrum"),
                                     (SettingsTab::Tx, "TX"),
-                                    (SettingsTab::PaCalibration, "PA Calibration"),
-                                    (SettingsTab::PureSignal, "PureSignal"),
-                                    (SettingsTab::Diversity, "Diversity"),
-                                    (SettingsTab::Equalizer, "Equalizer"),
                                     (SettingsTab::Xvtr, "XVTR"),
-                                    (SettingsTab::OpenCollector, "Open Collector"),
-                                    (SettingsTab::Firmware, "Firmware"),
-                                    (SettingsTab::About, "About"),
                                 ] {
                                     // Diversity requires a 2-ADC board -- see
                                     // radio::RadioSession::diversity_enabled's
