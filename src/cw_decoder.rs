@@ -58,6 +58,14 @@ pub struct CwDecoder {
 
     // Accumulated '.'/'-' for the character currently being spelled.
     symbol: String,
+
+    // Whether a word-space has already been emitted for the silence
+    // run currently in progress -- see process_sample's own comment on
+    // why gap classification is eager (during the silence) rather than
+    // reactive (on the next tone start), which is also why this can't
+    // just be inferred from `symbol` being empty the way the
+    // character-boundary case can.
+    word_space_emitted: bool,
 }
 
 impl CwDecoder {
@@ -72,6 +80,7 @@ impl CwDecoder {
             candidate_run: 0,
             unit_samples: SAMPLE_RATE_HZ * 0.060, // starting guess: ~20 WPM
             symbol: String::new(),
+            word_space_emitted: false,
         }
     }
 
@@ -88,6 +97,7 @@ impl CwDecoder {
         self.run_samples = 0;
         self.candidate_run = 0;
         self.symbol.clear();
+        self.word_space_emitted = false;
     }
 
     /// Feeds one demodulated audio sample (48kHz, already CW-filtered
@@ -141,6 +151,26 @@ impl CwDecoder {
             // genuinely part of this same committed run.
             self.run_samples += 1 + self.candidate_run;
             self.candidate_run = 0;
+
+            // Gap classification is done EAGERLY, as the silence is
+            // still ongoing, rather than reactively once a new tone
+            // starts: a signal that just stops (end of a transmission,
+            // a fade) would otherwise leave the last character's
+            // dots/dashes sitting in `symbol` forever, since nothing
+            // would ever trigger the tone-start transition that used
+            // to be the only place a character got resolved. Real bug
+            // report: the last character before a break in the signal
+            // never appeared in the decoded text.
+            if !self.tone_on {
+                let silence = self.run_samples as f32;
+                if silence >= self.unit_samples * 2.0 {
+                    self.resolve_symbol();
+                }
+                if !self.word_space_emitted && silence >= self.unit_samples * 6.0 {
+                    self.push_text(' ');
+                    self.word_space_emitted = true;
+                }
+            }
             return;
         }
 
@@ -159,11 +189,15 @@ impl CwDecoder {
         self.candidate_run = 0;
 
         if tone_now {
-            // Tone just started -- the ended run was silence.
-            self.classify_gap(ended_run);
+            // Tone just started -- nothing to do here: any character/
+            // word boundary in the silence that just ended was already
+            // resolved eagerly above, while that silence was ongoing.
         } else {
-            // Tone just ended -- the ended run was a tone.
+            // Tone just ended -- the ended run was a tone. Entering a
+            // fresh silence run, so a new word-space (if warranted) can
+            // be emitted for it.
             self.classify_tone(ended_run);
+            self.word_space_emitted = false;
         }
     }
 
@@ -178,18 +212,6 @@ impl CwDecoder {
             self.nudge_unit_time(run);
         } else {
             self.symbol.push('-');
-        }
-    }
-
-    fn classify_gap(&mut self, run_samples: u32) {
-        let run = run_samples as f32;
-        if run < self.unit_samples * 2.0 {
-            // Intra-character gap -- not a boundary, nothing to do.
-            return;
-        }
-        self.resolve_symbol();
-        if run >= self.unit_samples * 6.0 {
-            self.push_text(' ');
         }
     }
 
