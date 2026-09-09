@@ -1106,11 +1106,33 @@ fn handle_client(
                         // dequeue-and-decrement (cmaster.cs).
                         tx_chrono_outstanding = tx_chrono_outstanding.saturating_sub(1);
                         last_tx_chrono_activity = Instant::now();
-                        // Stereo -> mono: simple L/R average. No
-                        // existing precedent to match here (audio.rs's
-                        // MicInput requests mono directly from cpal
-                        // rather than downmixing stereo in software).
+                        // Stereo -> mono: take the LEFT channel only, NOT
+                        // an L/R average -- matches deskHPSDR's own real,
+                        // working TCI server (`~/github/deskhpsdr/src/
+                        // tci_audio.c`, `tci_audio_handle_tx_frame`:
+                        // `samples[i] = left;`, right discarded entirely).
                         //
+                        // A real report of WSJT-X Tune showing a clean
+                        // single tone via rigctl+PipeWire but TWO closely-
+                        // spaced tones via TCI first looked like an L/R
+                        // averaging artifact (this change was made on that
+                        // theory), but a temporary diagnostic that logged
+                        // raw stereo pairs during a real transmission
+                        // found L and R bit-identical throughout -- ruling
+                        // that out. The ACTUAL cause: TCI TX gain left at
+                        // a stale 10dB (~3.16x) from before RadioSession::
+                        // tci_tx_gain's own fix (WSJT-X's real signal
+                        // arrives already near full scale, so 0dB/1.0x is
+                        // correct). Combined with real samples already
+                        // ~0.8 peak, that clipped hard against this loop's
+                        // `.clamp(-1.0, 1.0)` on nearly every cycle --
+                        // clipping a clean tone produces strong odd
+                        // harmonics (3rd harmonic ~3x the tone frequency),
+                        // which was the actual second "tone". Fixed by the
+                        // user resetting TCI TX gain to 0dB, not a code
+                        // change -- left this left-channel-only change in
+                        // place regardless since it's still correct and
+                        // matches the reference.
                         // Sanity-check each pair before mixing: a real
                         // WSJT-X test (see decode_binary_message's doc
                         // comment) showed every 8th TxAudioStream
@@ -1186,7 +1208,13 @@ fn handle_client(
                             // splattered/broadband TX spectrum, and no
                             // PSKReporter decodes -- all consistent with
                             // a badly overdriven, clipped signal.
-                            let sample = ((l + r) * 0.5 * gain).clamp(-1.0, 1.0);
+                            // Left channel only -- see this loop's own
+                            // "Stereo -> mono" doc comment above. `r`
+                            // is still checked for finiteness/range just
+                            // above (still a useful signal that this
+                            // whole pair came from a corrupted message),
+                            // just no longer part of the actual sample.
+                            let sample = (l * gain).clamp(-1.0, 1.0);
                             // Resolve any held-back bad stretch now that
                             // we have a real value to ramp toward -- see
                             // pending_bad_count's doc comment.
