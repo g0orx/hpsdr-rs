@@ -1,3 +1,14 @@
+// Marks release builds as a GUI-subsystem binary on Windows, so
+// launching hpsdr-rs.exe from Explorer or its Start Menu shortcut no
+// longer auto-allocates a console window to show its println!/
+// eprintln! debug output in (the default "console" subsystem's
+// behavior whenever no console is already attached). Gated on
+// `not(debug_assertions)` rather than unconditionally so `cargo run`
+// on Windows during development still behaves like a normal console
+// app. fn main's own redirect_stdio_to_log_file() sends that same
+// output to a log file instead, so it isn't just silently dropped.
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
 mod audio;
 mod bootloader;
 mod bootloader_ui;
@@ -9117,7 +9128,46 @@ impl Palette {
     }
 }
 
+/// Points the process's own STDOUT/STDERR handles at a log file, so
+/// every existing `println!`/`eprintln!` call site (there was no
+/// dedicated logging crate to hook into instead -- see this project's
+/// scattered ad hoc debug output throughout) keeps working unmodified
+/// once the `windows_subsystem = "windows"` attribute above stops a
+/// console from being auto-allocated to show it in.
+///
+/// Rust's `std::io::stdout()`/`stderr()` call `GetStdHandle` fresh on
+/// every write rather than caching it at process start, which is what
+/// makes this work retroactively for code that was never written with
+/// redirection in mind. `into_raw_handle()` (rather than
+/// `as_raw_handle()`) consumes the `File` without running its `Drop`
+/// impl, so the handle stays open and valid for the rest of the
+/// process's lifetime instead of being closed out from under it the
+/// moment this function returns.
+#[cfg(all(windows, not(debug_assertions)))]
+fn redirect_stdio_to_log_file() {
+    use std::os::windows::io::IntoRawHandle;
+    use windows_sys::Win32::System::Console::{SetStdHandle, STD_ERROR_HANDLE, STD_OUTPUT_HANDLE};
+
+    let Some(path) = debug_log::log_path("hpsdr-rs.log") else {
+        return;
+    };
+    let Ok(file) = std::fs::File::create(&path) else {
+        return;
+    };
+    let handle = file.into_raw_handle() as windows_sys::Win32::Foundation::HANDLE;
+    unsafe {
+        SetStdHandle(STD_OUTPUT_HANDLE, handle);
+        SetStdHandle(STD_ERROR_HANDLE, handle);
+    }
+}
+
 fn main() -> eframe::Result<()> {
+    // See the crate-level `windows_subsystem` attribute above for why
+    // this matters: with no console auto-allocated on Windows release
+    // builds, println!/eprintln! output would otherwise go nowhere.
+    #[cfg(all(windows, not(debug_assertions)))]
+    redirect_stdio_to_log_file();
+
     // Force winit's X11 backend (via XWayland) rather than native Wayland.
     // Confirmed via `perf record`/`strace -p` on a running session: winit's
     // Wayland backend pegged one CPU core continuously on this system --

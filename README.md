@@ -96,6 +96,8 @@ cargo run --release
 
 The app opens a discovery window that listens for radios on the network; select one to connect. Settings (frequency, mode, filter width, TX power, calibration, etc.) are saved automatically per-radio under `~/.config/hpsdr-rs/` (Linux), `%APPDATA%\hpsdr-rs\` (Windows), or `~/Library/Application Support/hpsdr-rs/` (macOS).
 
+On Windows, a release build no longer pops up a console window alongside the app (a plain `cargo build`/`cargo run` debug build still does, for normal development) — its debug output goes to `%APPDATA%\hpsdr-rs\hpsdr-rs.log` instead.
+
 See the **[User Manual](docs/manual/README.md)** for a full walkthrough of the UI -- every settings tab, tuning gestures, extra receivers, and the PureSignal/Diversity/Equalizer features.
 
 ## Firmware update

@@ -70,6 +70,16 @@ rfd = "0.17.2"
 # see README's Ozy USB section.
 nusb = "0.2"
 
+[target.'cfg(windows)'.dependencies]
+# SetStdHandle, used by main.rs's redirect_stdio_to_log_file() to send
+# the app's existing println!/eprintln! debug output to a log file
+# instead of a console -- release builds mark the binary as a GUI
+# subsystem app (see the `#![windows_subsystem]` crate attribute at the
+# top of main.rs) so Windows stops auto-allocating a console window
+# when launched from Explorer/the Start Menu shortcut, which otherwise
+# silently swallows that same output with nowhere to show it.
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_Console"] }
+
 # NOTE: I could not compile-check this in the sandbox this was written in
 # (no Rust toolchain available), so treat these version numbers as a
 # starting point -- run `cargo update` / `cargo check` locally and adjust

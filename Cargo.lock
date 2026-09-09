@@ -1186,6 +1186,7 @@ dependencies = [
  "socket2",
  "tungstenite",
  "vcpkg",
+ "windows-sys 0.59.0",
  "winresource",
 ]
 
