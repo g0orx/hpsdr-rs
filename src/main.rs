@@ -3267,7 +3267,7 @@ impl eframe::App for HpsdrApp {
                             const NOTCH: f32 = 50.0;
 
                             let shift = ui.input(|i| i.modifiers.shift);
-                            let step: i64 = if shift { 100 } else { 1_000 };
+                            let step: i64 = scroll_tune_step_hz(cw_mode, shift);
 
                             let mut new_freq = dial_freq_hz as i64;
                             while connected.scroll_accum.abs() >= NOTCH {
@@ -3653,7 +3653,7 @@ impl eframe::App for HpsdrApp {
                             connected.scroll_accum += delta;
                             const NOTCH: f32 = 50.0;
                             let shift = ui.input(|i| i.modifiers.shift);
-                            let step: i64 = if shift { 100 } else { 1_000 };
+                            let step: i64 = scroll_tune_step_hz(cw_mode, shift);
 
                             let mut new_freq = dial_freq_hz as i64;
                             while connected.scroll_accum.abs() >= NOTCH {
@@ -8087,7 +8087,7 @@ fn render_extra_receiver_ui(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceiver>>) {
             // See the main receiver's own scroll-to-tune NOTCH comment.
             const NOTCH: f32 = 50.0;
             let shift = ui.input(|i| i.modifiers.shift);
-            let step: i64 = if shift { 100 } else { 1_000 };
+            let step: i64 = scroll_tune_step_hz(cw_mode, shift);
             let mut new_freq = dial_freq_hz as i64;
             while rx.scroll_accum.abs() >= NOTCH {
                 let sign = rx.scroll_accum.signum();
@@ -8282,7 +8282,7 @@ fn render_extra_receiver_ui(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceiver>>) {
             rx.scroll_accum += delta;
             const NOTCH: f32 = 50.0;
             let shift = ui.input(|i| i.modifiers.shift);
-            let step: i64 = if shift { 100 } else { 1_000 };
+            let step: i64 = scroll_tune_step_hz(cw_mode, shift);
             let mut new_freq = dial_freq_hz as i64;
             while rx.scroll_accum.abs() >= NOTCH {
                 let sign = rx.scroll_accum.signum();
@@ -8679,6 +8679,20 @@ fn render_extra_receiver_settings(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceive
                 rx.settings_dirty.store(true, Ordering::Relaxed);
             }
         }
+    }
+}
+
+/// Scroll-to-tune step size over the spectrum/waterfall panes -- finer
+/// in CW mode (100Hz normally, 10Hz with Shift) than every other mode
+/// (1kHz normally, 100Hz with Shift), since zero-beating a CW signal
+/// is commonly done within tens of Hz, far tighter than SSB/AM/FM
+/// listening ever needs.
+fn scroll_tune_step_hz(cw_mode: bool, shift: bool) -> i64 {
+    match (cw_mode, shift) {
+        (true, true) => 10,
+        (true, false) => 100,
+        (false, true) => 100,
+        (false, false) => 1_000,
     }
 }
 
