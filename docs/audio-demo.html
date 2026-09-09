@@ -1,0 +1,105 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>hpsdr-rs — Noise Reduction demo</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #ffffff;
+    --fg: #1a1a1a;
+    --muted: #5a5a5a;
+    --border: #d8d8d8;
+    --row-alt: #f6f6f6;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #16181c;
+      --fg: #e8e8e8;
+      --muted: #a3a3a3;
+      --border: #3a3d42;
+      --row-alt: #1d2025;
+    }
+  }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--fg);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    line-height: 1.5;
+  }
+  main {
+    max-width: 640px;
+    margin: 0 auto;
+    padding: 40px 20px 60px;
+  }
+  h1 {
+    font-size: 1.5rem;
+    margin-bottom: 0.25em;
+  }
+  p.subtitle {
+    color: var(--muted);
+    margin-top: 0;
+  }
+  audio {
+    width: 100%;
+    margin: 24px 0;
+  }
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    margin: 16px 0;
+  }
+  th, td {
+    text-align: left;
+    padding: 8px 12px;
+    border-bottom: 1px solid var(--border);
+  }
+  tr:nth-child(even) {
+    background: var(--row-alt);
+  }
+  code {
+    background: var(--row-alt);
+    padding: 0.15em 0.4em;
+    border-radius: 4px;
+  }
+  a {
+    color: inherit;
+  }
+  footer {
+    margin-top: 32px;
+    color: var(--muted);
+    font-size: 0.9rem;
+  }
+</style>
+</head>
+<body>
+<main>
+  <h1>Noise Reduction demo</h1>
+  <p class="subtitle">hpsdr-rs — a real 40m background-noise recording</p>
+
+  <p>Captured with the main window's own Record button, cycling through Settings → RX → Noise Reduction's four options back to back on the same noisy signal.</p>
+
+  <audio controls preload="none" src="audio/noise-reduction-demo.wav">
+    Your browser does not support the audio element — <a href="audio/noise-reduction-demo.wav">download the file</a> instead.
+  </audio>
+
+  <table>
+    <thead>
+      <tr><th>Time</th><th>NR setting</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>0–4s</td><td><code>NR: Off</code></td></tr>
+      <tr><td>4–9s</td><td><code>NR: NR</code></td></tr>
+      <tr><td>9–13s</td><td><code>NR: NR2</code></td></tr>
+      <tr><td>13s–end</td><td><code>NR: NNR</code></td></tr>
+    </tbody>
+  </table>
+
+  <footer>
+    <a href="https://github.com/g0orx/hpsdr-rs">hpsdr-rs on GitHub</a>
+  </footer>
+</main>
+</body>
+</html>

@@ -209,7 +209,7 @@ Procedure, on any radio:
 
 ## Noise Reduction demo
 
-A real recording of 40m background noise, captured with the main window's own Record button (see [Running](#running) above), showing each of the Settings → RX → Noise Reduction options back to back on the same noisy signal. **[Download `noise-reduction-demo.wav`](docs/audio/noise-reduction-demo.wav)** and play it locally — GitHub doesn't support playing audio directly from a README or a repository file page, only downloading it.
+A real recording of 40m background noise, captured with the main window's own Record button (see [Running](#running) above), showing each of the Settings → RX → Noise Reduction options back to back on the same noisy signal. **[Listen to it here](https://g0orx.github.io/hpsdr-rs/audio-demo.html)** (GitHub Pages — GitHub itself doesn't support playing audio directly from a README or a repository file page), or [download the raw file](docs/audio/noise-reduction-demo.wav).
 
 | Time | NR setting |
 | --- | --- |
