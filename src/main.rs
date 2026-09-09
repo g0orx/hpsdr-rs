@@ -1686,20 +1686,6 @@ impl eframe::App for HpsdrApp {
                 DiscoveryAction::None => {}
             },
             AppState::Connected(connected) => {
-                // Reserves a resizable strip on the right for the
-                // built-in CW decoder's text -- only while actually in
-                // Mode::Cwl/Cwu, so the spectrum/waterfall gets the
-                // full window back in every other mode. Must be added
-                // before any other panel/central content below (egui's
-                // own panel-ordering rule), which is why this comes
-                // first in this match arm.
-                if matches!(connected.spectrum.mode(), spectrum::Mode::Cwl | spectrum::Mode::Cwu) {
-                    egui::Panel::right("cw_decoder_panel_main")
-                        .resizable(true)
-                        .default_size(220.0)
-                        .show(ui, |ui| render_cw_decoder_panel(ui, &connected.spectrum));
-                }
-
                 // Shown in the OS window title bar rather than as an
                 // in-UI heading -- frees up vertical space for the
                 // spectrum/waterfall, which is at a premium in the
@@ -3162,10 +3148,20 @@ impl eframe::App for HpsdrApp {
                         (ui.available_height() - below_waterfall_reserve).max(200.0);
                     let spectrum_height =
                         (spectrum_waterfall_height * connected.spectrum_waterfall_ratio).max(80.0);
+                    // Reserves room on the right for the CW decoder panel
+                    // (drawn below, once both this rect and the
+                    // waterfall's are known) -- taken out of the
+                    // spectrum/waterfall's own width, not overlaid on top
+                    // of them, so the panel sits beside the plot rather
+                    // than covering the right edge of it.
+                    let cw_mode = matches!(connected.spectrum.mode(), spectrum::Mode::Cwl | spectrum::Mode::Cwu);
+                    let cw_panel_reserved_width = if cw_mode { CW_PANEL_WIDTH + CW_PANEL_GAP } else { 0.0 };
                     let (rect, spectrum_resp) = ui.allocate_exact_size(
-                        egui::vec2(ui.available_width(), spectrum_height),
+                        egui::vec2(ui.available_width() - cw_panel_reserved_width, spectrum_height),
                         egui::Sense::click_and_drag(),
                     );
+                    let spectrum_top = rect.top();
+                    let spectrum_right = rect.right();
 
                     if let Some(pos) = spectrum_resp.interact_pointer_pos() {
                         // See suppress_refocus_click's own doc comment --
@@ -3577,9 +3573,21 @@ impl eframe::App for HpsdrApp {
                     }
                     let waterfall_height = (spectrum_waterfall_height - spectrum_height).max(80.0);
                     let (rect, waterfall_click_resp) = ui.allocate_exact_size(
-                        egui::vec2(ui.available_width(), waterfall_height),
+                        egui::vec2(ui.available_width() - cw_panel_reserved_width, waterfall_height),
                         egui::Sense::click_and_drag(),
                     );
+                    let waterfall_bottom = rect.bottom();
+                    if cw_mode {
+                        render_cw_decoder_panel_beside(
+                            ui,
+                            &connected.spectrum,
+                            egui::Id::new("cw_decoder_panel_main"),
+                            egui::Rect::from_min_max(
+                                egui::pos2(spectrum_right + CW_PANEL_GAP, spectrum_top),
+                                egui::pos2(spectrum_right + CW_PANEL_GAP + CW_PANEL_WIDTH, waterfall_bottom),
+                            ),
+                        );
+                    }
                     if let Some(pos) = waterfall_click_resp.interact_pointer_pos() {
                         // See suppress_refocus_click's own doc comment.
                         if waterfall_click_resp.clicked() && !suppress_refocus_click {
@@ -6796,6 +6804,16 @@ fn draw_freq_axis_ticks(
 /// there, so it doesn't add extra vertical space on top of it.
 const SPECTRUM_WATERFALL_DIVIDER_HEIGHT: f32 = 8.0;
 
+/// Width of (and gap before) the CW decoder's side panel -- see
+/// render_cw_decoder_panel_beside. Fixed rather than user-resizable:
+/// it's positioned via an Area pinned to the spectrum/waterfall rect
+/// each frame (so its height tracks theirs exactly, rather than
+/// spanning the whole window like a real resizable SidePanel would),
+/// and Area doesn't support a drag-to-resize handle the way a Panel
+/// does.
+const CW_PANEL_WIDTH: f32 = 220.0;
+const CW_PANEL_GAP: f32 = 8.0;
+
 /// "Auto" Low tuning -- see ConnectedState::db_low_auto's doc comment.
 /// Bins within the excluded edge (max of 1/20th of the trace width and
 /// this minimum count) are skipped when finding the trace's minimum,
@@ -6891,12 +6909,12 @@ fn peek_recent_samples(buf: &Arc<Mutex<VecDeque<f32>>>, max_samples: usize) -> V
     b.iter().skip(skip).copied().collect()
 }
 
-/// Content of the CW decoder's resizable side panel (see the two call
-/// sites: the main receiver's AppState::Connected arm and
-/// render_extra_receiver_ui) -- just the decoded-text scrollback plus a
-/// Clear button. Shared between both so the two receiver UIs, which are
-/// otherwise independent (main vs. extra receiver has its own simpler
-/// layout throughout), don't duplicate this.
+/// Content of the CW decoder's side panel (see
+/// render_cw_decoder_panel_beside, which places this) -- just the
+/// decoded-text scrollback plus a Clear button. Shared between the
+/// main receiver and every extra receiver window, which are otherwise
+/// independent (extra receivers have their own simpler layout
+/// throughout), so this one doesn't get duplicated.
 fn render_cw_decoder_panel(ui: &mut egui::Ui, spectrum: &SpectrumHandle) {
     ui.horizontal(|ui| {
         ui.heading("CW Decoder");
@@ -6907,6 +6925,27 @@ fn render_cw_decoder_panel(ui: &mut egui::Ui, spectrum: &SpectrumHandle) {
     ui.separator();
     egui::ScrollArea::vertical().stick_to_bottom(true).show(ui, |ui| {
         ui.label(egui::RichText::new(spectrum.cw_text()).monospace());
+    });
+}
+
+/// Draws the CW decoder panel pinned to exactly `rect` (the caller
+/// works out `rect` from the spectrum/waterfall rects it already has
+/// -- see the two call sites) via an `Area` rather than a `SidePanel`,
+/// specifically so its height tracks the spectrum+waterfall's combined
+/// height each frame instead of the whole window's -- a real `Panel`
+/// always fills the full height of whichever `Ui` it's shown into, and
+/// nothing in this codebase's layout narrows that to just the
+/// spectrum/waterfall span (they're not wrapped in their own
+/// sub-region). The trade-off is no drag-to-resize handle (`Area`
+/// doesn't have one the way `Panel` does) -- see CW_PANEL_WIDTH's own
+/// doc comment.
+fn render_cw_decoder_panel_beside(ui: &mut egui::Ui, spectrum: &SpectrumHandle, id: egui::Id, rect: egui::Rect) {
+    egui::Area::new(id).fixed_pos(rect.min).show(ui, |ui| {
+        egui::Frame::group(ui.style()).show(ui, |ui| {
+            ui.set_width(rect.width());
+            ui.set_height(rect.height());
+            render_cw_decoder_panel(ui, spectrum);
+        });
     });
 }
 
@@ -7678,16 +7717,15 @@ fn s_meter_label(db: f64, s9: f64) -> String {
 fn render_extra_receiver_ui(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceiver>>) {
     let mut rx = rx.lock().unwrap();
 
-    // Same CW decoder panel as the main receiver window -- see that
-    // call site's doc comment. Each extra receiver has its own
-    // SpectrumHandle (and so its own independent decoder), gated on
-    // its own mode.
-    if matches!(rx.spectrum.mode(), spectrum::Mode::Cwl | spectrum::Mode::Cwu) {
-        egui::Panel::right(egui::Id::new(("cw_decoder_panel_extra", rx.ddc_index)))
-            .resizable(true)
-            .default_size(220.0)
-            .show(ui, |ui| render_cw_decoder_panel(ui, &rx.spectrum));
-    }
+    // Same CW decoder panel as the main receiver window -- see
+    // render_cw_decoder_panel_beside's doc comment for why this is an
+    // Area pinned to the spectrum+waterfall rect rather than a
+    // SidePanel. Each extra receiver has its own SpectrumHandle (and so
+    // its own independent decoder), gated on its own mode. Actually
+    // drawn below, once this receiver's own spectrum/waterfall rects
+    // are known.
+    let cw_mode = matches!(rx.spectrum.mode(), spectrum::Mode::Cwl | spectrum::Mode::Cwu);
+    let cw_panel_reserved_width = if cw_mode { CW_PANEL_WIDTH + CW_PANEL_GAP } else { 0.0 };
 
     let freq_hz = rx.frequency_hz.load(Ordering::Relaxed);
     let sample_rate = rx.sample_rate_hz.load(Ordering::Relaxed);
@@ -7986,9 +8024,11 @@ fn render_extra_receiver_ui(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceiver>>) {
         (ui.available_height() - zoom_pan_reserve).max(200.0);
     let spectrum_height = (spectrum_waterfall_height * rx.spectrum_waterfall_ratio).max(80.0);
     let (rect, spectrum_resp) = ui.allocate_exact_size(
-        egui::vec2(ui.available_width(), spectrum_height),
+        egui::vec2(ui.available_width() - cw_panel_reserved_width, spectrum_height),
         egui::Sense::click_and_drag(),
     );
+    let spectrum_top = rect.top();
+    let spectrum_right = rect.right();
 
     if let Some(pos) = spectrum_resp.interact_pointer_pos() {
         if spectrum_resp.clicked() {
@@ -8167,9 +8207,20 @@ fn render_extra_receiver_ui(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceiver>>) {
     }
     let waterfall_height = (spectrum_waterfall_height - spectrum_height).max(80.0);
     let (wf_rect, wf_resp) = ui.allocate_exact_size(
-        egui::vec2(ui.available_width(), waterfall_height),
+        egui::vec2(ui.available_width() - cw_panel_reserved_width, waterfall_height),
         egui::Sense::click_and_drag(),
     );
+    if cw_mode {
+        render_cw_decoder_panel_beside(
+            ui,
+            &rx.spectrum,
+            egui::Id::new(("cw_decoder_panel_extra", rx.ddc_index)),
+            egui::Rect::from_min_max(
+                egui::pos2(spectrum_right + CW_PANEL_GAP, spectrum_top),
+                egui::pos2(spectrum_right + CW_PANEL_GAP + CW_PANEL_WIDTH, wf_rect.bottom()),
+            ),
+        );
+    }
     if let Some(pos) = wf_resp.interact_pointer_pos() {
         if wf_resp.clicked() {
             let new_freq = freq_at_x(pos.x, wf_rect, freq_hz, sample_rate, rx.spectrum_zoom, pan_offset_hz);
