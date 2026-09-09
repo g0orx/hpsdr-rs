@@ -205,19 +205,42 @@ impl CwDecoder {
         let run = run_samples as f32;
         if run < self.unit_samples * 2.0 {
             self.symbol.push('.');
-            // Dots are the most reliable sync reference for the
-            // unit-time estimate -- the smallest element, least
-            // distorted by an operator's own timing variation or QSB --
-            // so only dots (not dashes) nudge the estimate.
-            self.nudge_unit_time(run);
         } else {
             self.symbol.push('-');
         }
+        self.nudge_unit_time(run);
     }
 
-    fn nudge_unit_time(&mut self, dot_samples: f32) {
-        const ALPHA: f32 = 0.15;
-        self.unit_samples += ALPHA * (dot_samples - self.unit_samples);
+    /// Adjusts the unit-time estimate toward every tone's duration, not
+    /// just ones already classified as a dot -- a real report showed
+    /// "CQ" misdecoding as "CWT" on multiple stations, always right at
+    /// the start of a transmission: the cold-start guess (20 WPM) is
+    /// just a guess, and if the real speed is faster, the classify_tone
+    /// threshold above judges the very first dash or two against that
+    /// wrong, too-slow guess before there's been any real data to learn
+    /// from -- and the old scheme (only nudging on classify_tone's own
+    /// dot/dash verdict) couldn't correct a wrong VERDICT, since a
+    /// misclassified dash's real duration would just get treated as a
+    /// "genuine" dot observation and nudge the estimate the wrong way.
+    ///
+    /// This estimator instead tracks the SHORTEST recent on-time
+    /// directly (dots are shorter than dashes by definition, so a
+    /// decaying minimum is a description of reality that doesn't
+    /// depend on classify_tone's threshold being right yet): allowed to
+    /// shrink quickly toward any newly observed shorter duration (self-
+    /// corrects a too-slow cold-start guess within the first couple of
+    /// real elements), but only allowed to grow back up from something
+    /// close to the current estimate already (roughly dot-length, not
+    /// dash-length) -- otherwise a single real dash would drag the
+    /// estimate toward 3x the true unit time.
+    fn nudge_unit_time(&mut self, on_samples: f32) {
+        const FAST_DOWN: f32 = 0.5;
+        const SLOW_UP: f32 = 0.03;
+        if on_samples < self.unit_samples {
+            self.unit_samples += FAST_DOWN * (on_samples - self.unit_samples);
+        } else if on_samples < self.unit_samples * 1.5 {
+            self.unit_samples += SLOW_UP * (on_samples - self.unit_samples);
+        }
         self.unit_samples = self.unit_samples.clamp(MIN_UNIT_SAMPLES, MAX_UNIT_SAMPLES);
     }
 
