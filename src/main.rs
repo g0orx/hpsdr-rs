@@ -3079,7 +3079,7 @@ impl eframe::App for HpsdrApp {
                                 };
                                 if delta != 0.0 {
                                     connected.rit_scroll_accum += delta;
-                                    const NOTCH: f32 = 50.0;
+                                    const NOTCH: f32 = 100.0;
                                     let shift = ui.input(|i| i.modifiers.shift);
                                     let step: i64 = if shift { 10 } else { 100 };
                                     let mut new_offset = connected.rit_offset_hz as i64;
@@ -3139,7 +3139,7 @@ impl eframe::App for HpsdrApp {
                                 };
                                 if delta != 0.0 {
                                     connected.xit_scroll_accum += delta;
-                                    const NOTCH: f32 = 50.0;
+                                    const NOTCH: f32 = 100.0;
                                     let shift = ui.input(|i| i.modifiers.shift);
                                     let step: i64 = if shift { 10 } else { 100 };
                                     let mut new_offset = connected.xit_offset_hz as i64;
@@ -3300,15 +3300,21 @@ impl eframe::App for HpsdrApp {
                         if delta != 0.0 {
                             connected.scroll_accum += delta;
 
-                            // Roughly one physical wheel "notch" on most
-                            // platforms/mice -- not verified against your
-                            // specific hardware, tune if steps feel too
-                            // coarse or too fine. Raised from an earlier
-                            // 20.0 -- reported as too sensitive (one
-                            // wheel click jumping more than a single
-                            // frequency step), so this now requires more
-                            // accumulated scroll motion per step.
-                            const NOTCH: f32 = 50.0;
+                            // Roughly two physical wheel "notches" on
+                            // most platforms/mice -- not verified
+                            // against your specific hardware, tune if
+                            // steps feel too coarse or too fine. Raised
+                            // twice now: 20.0 -> 50.0 (reported as too
+                            // sensitive, one wheel click jumping more
+                            // than a single frequency step) -> 100.0
+                            // (still reported as too fast at 50.0), so
+                            // this now requires more accumulated scroll
+                            // motion per step than either previous
+                            // value. Same NOTCH used everywhere else
+                            // frequency scroll-to-tune applies (VFO B,
+                            // RIT, XIT, both receivers) for a consistent
+                            // feel across all of them.
+                            const NOTCH: f32 = 100.0;
 
                             let shift = ui.input(|i| i.modifiers.shift);
                             let step: i64 = scroll_tune_step_hz(cw_mode, shift);
@@ -3386,7 +3392,7 @@ impl eframe::App for HpsdrApp {
                             connected.vfo_b_scroll_accum += delta;
                             // Same NOTCH/step convention as VFO A's block
                             // above.
-                            const NOTCH: f32 = 50.0;
+                            const NOTCH: f32 = 100.0;
                             let shift = ui.input(|i| i.modifiers.shift);
                             let step: i64 = if shift { 100 } else { 1_000 };
 
@@ -3696,7 +3702,7 @@ impl eframe::App for HpsdrApp {
 
                         if delta != 0.0 {
                             connected.scroll_accum += delta;
-                            const NOTCH: f32 = 50.0;
+                            const NOTCH: f32 = 100.0;
                             let shift = ui.input(|i| i.modifiers.shift);
                             let step: i64 = scroll_tune_step_hz(cw_mode, shift);
 
@@ -8046,7 +8052,7 @@ fn render_extra_receiver_ui(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceiver>>) {
                 if scroll_delta.y.abs() >= scroll_delta.x.abs() { scroll_delta.y } else { scroll_delta.x };
             if delta != 0.0 {
                 rx.rit_scroll_accum += delta;
-                const NOTCH: f32 = 50.0;
+                const NOTCH: f32 = 100.0;
                 let shift = ui.input(|i| i.modifiers.shift);
                 let step: i64 = if shift { 10 } else { 100 };
                 let mut new_offset = rx.rit_offset_hz as i64;
@@ -8138,7 +8144,7 @@ fn render_extra_receiver_ui(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceiver>>) {
         if delta != 0.0 {
             rx.scroll_accum += delta;
             // See the main receiver's own scroll-to-tune NOTCH comment.
-            const NOTCH: f32 = 50.0;
+            const NOTCH: f32 = 100.0;
             let shift = ui.input(|i| i.modifiers.shift);
             let step: i64 = scroll_tune_step_hz(cw_mode, shift);
             let mut new_freq = dial_freq_hz as i64;
@@ -8334,7 +8340,7 @@ fn render_extra_receiver_ui(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceiver>>) {
         };
         if delta != 0.0 {
             rx.scroll_accum += delta;
-            const NOTCH: f32 = 50.0;
+            const NOTCH: f32 = 100.0;
             let shift = ui.input(|i| i.modifiers.shift);
             let step: i64 = scroll_tune_step_hz(cw_mode, shift);
             let mut new_freq = dial_freq_hz as i64;
