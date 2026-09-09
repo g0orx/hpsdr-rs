@@ -3568,6 +3568,7 @@ impl eframe::App for HpsdrApp {
                         ui,
                         &mut connected.spectrum_waterfall_ratio,
                         spectrum_waterfall_height,
+                        cw_panel_reserved_width,
                     ) {
                         settings_changed = true;
                     }
@@ -6837,9 +6838,14 @@ const AUTO_DB_LOW_SMOOTHING_ALPHA: f32 = 0.03;
 /// true if the ratio actually changed this frame, so callers can flag
 /// settings_changed/settings_dirty the same way every other
 /// interactive control here does.
-fn spectrum_waterfall_divider(ui: &mut egui::Ui, ratio: &mut f32, combined_pane_height: f32) -> bool {
+fn spectrum_waterfall_divider(
+    ui: &mut egui::Ui,
+    ratio: &mut f32,
+    combined_pane_height: f32,
+    reserved_width: f32,
+) -> bool {
     let (rect, resp) = ui.allocate_exact_size(
-        egui::vec2(ui.available_width(), SPECTRUM_WATERFALL_DIVIDER_HEIGHT),
+        egui::vec2(ui.available_width() - reserved_width, SPECTRUM_WATERFALL_DIVIDER_HEIGHT),
         egui::Sense::drag(),
     );
     let mut changed = false;
@@ -8202,7 +8208,7 @@ fn render_extra_receiver_ui(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceiver>>) {
         draw_freq_hover_tooltip(ui.painter(), pos, hover_freq);
     }
 
-    if spectrum_waterfall_divider(ui, &mut rx.spectrum_waterfall_ratio, spectrum_waterfall_height) {
+    if spectrum_waterfall_divider(ui, &mut rx.spectrum_waterfall_ratio, spectrum_waterfall_height, cw_panel_reserved_width) {
         rx.settings_dirty.store(true, Ordering::Relaxed);
     }
     let waterfall_height = (spectrum_waterfall_height - spectrum_height).max(80.0);
