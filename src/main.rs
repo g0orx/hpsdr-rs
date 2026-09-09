@@ -14,6 +14,7 @@ mod bootloader;
 mod bootloader_ui;
 mod cat;
 mod config;
+mod cw_decoder;
 mod debug_log;
 mod discovery;
 mod discovery_ui;
@@ -1685,6 +1686,20 @@ impl eframe::App for HpsdrApp {
                 DiscoveryAction::None => {}
             },
             AppState::Connected(connected) => {
+                // Reserves a resizable strip on the right for the
+                // built-in CW decoder's text -- only while actually in
+                // Mode::Cwl/Cwu, so the spectrum/waterfall gets the
+                // full window back in every other mode. Must be added
+                // before any other panel/central content below (egui's
+                // own panel-ordering rule), which is why this comes
+                // first in this match arm.
+                if matches!(connected.spectrum.mode(), spectrum::Mode::Cwl | spectrum::Mode::Cwu) {
+                    egui::Panel::right("cw_decoder_panel_main")
+                        .resizable(true)
+                        .default_size(220.0)
+                        .show(ui, |ui| render_cw_decoder_panel(ui, &connected.spectrum));
+                }
+
                 // Shown in the OS window title bar rather than as an
                 // in-UI heading -- frees up vertical space for the
                 // spectrum/waterfall, which is at a premium in the
@@ -6876,6 +6891,25 @@ fn peek_recent_samples(buf: &Arc<Mutex<VecDeque<f32>>>, max_samples: usize) -> V
     b.iter().skip(skip).copied().collect()
 }
 
+/// Content of the CW decoder's resizable side panel (see the two call
+/// sites: the main receiver's AppState::Connected arm and
+/// render_extra_receiver_ui) -- just the decoded-text scrollback plus a
+/// Clear button. Shared between both so the two receiver UIs, which are
+/// otherwise independent (main vs. extra receiver has its own simpler
+/// layout throughout), don't duplicate this.
+fn render_cw_decoder_panel(ui: &mut egui::Ui, spectrum: &SpectrumHandle) {
+    ui.horizontal(|ui| {
+        ui.heading("CW Decoder");
+        if ui.button("Clear").clicked() {
+            spectrum.clear_cw_text();
+        }
+    });
+    ui.separator();
+    egui::ScrollArea::vertical().stick_to_bottom(true).show(ui, |ui| {
+        ui.label(egui::RichText::new(spectrum.cw_text()).monospace());
+    });
+}
+
 /// Small audio-waveform display drawn in the top-right corner of the
 /// spectrum plot `rect` -- output audio while receiving, whatever's
 /// actually feeding TX (mic/TCI/radio-mic) while transmitting. A quick
@@ -7643,6 +7677,17 @@ fn s_meter_label(db: f64, s9: f64) -> String {
 /// which is fine at normal UI frame rates.
 fn render_extra_receiver_ui(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceiver>>) {
     let mut rx = rx.lock().unwrap();
+
+    // Same CW decoder panel as the main receiver window -- see that
+    // call site's doc comment. Each extra receiver has its own
+    // SpectrumHandle (and so its own independent decoder), gated on
+    // its own mode.
+    if matches!(rx.spectrum.mode(), spectrum::Mode::Cwl | spectrum::Mode::Cwu) {
+        egui::Panel::right(egui::Id::new(("cw_decoder_panel_extra", rx.ddc_index)))
+            .resizable(true)
+            .default_size(220.0)
+            .show(ui, |ui| render_cw_decoder_panel(ui, &rx.spectrum));
+    }
 
     let freq_hz = rx.frequency_hz.load(Ordering::Relaxed);
     let sample_rate = rx.sample_rate_hz.load(Ordering::Relaxed);

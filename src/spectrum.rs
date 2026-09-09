@@ -5,6 +5,7 @@
     flagged inline.
 */
 
+use crate::cw_decoder::CwDecoder;
 use crate::radio::IqSample;
 use crate::wdsp_sys as wdsp;
 use std::collections::VecDeque;
@@ -1310,6 +1311,10 @@ fn run(
     tci_audio_out: Arc<Mutex<VecDeque<(f32, f32)>>>,
     waveform_out: Arc<Mutex<VecDeque<f32>>>,
     iq_out: Arc<Mutex<VecDeque<(f32, f32)>>>,
+    // Decoded-text output for the built-in CW decoder (see cw_decoder.rs)
+    // -- fed from the same mono downmix as waveform_out below, but only
+    // while params.mode is actually Cwl/Cwu.
+    cw_text: Arc<Mutex<String>>,
     rx_audio_to_radio: Option<Arc<Mutex<VecDeque<f32>>>>,
     // Muted (not pushed to any of the four audio outputs above) while
     // MOX is active -- see SpectrumHandle::start's doc comment on why.
@@ -1322,6 +1327,7 @@ fn run(
 ) {
     let mut analyzer = SpectrumAnalyzer::open(channel, sample_rate);
     let mut chunk = Vec::with_capacity(BUFFER_SIZE);
+    let mut cw_decoder = CwDecoder::new(Arc::clone(&cw_text));
     // Anti-aliasing lowpass for rx_audio_to_radio only -- confirmed via a
     // real packet capture (radio.rs's RX-audio-to-radio feature) that
     // WDSP's raw 48kHz RXA output carries a large, persistent near-
@@ -1397,6 +1403,10 @@ fn run(
         let audio = analyzer.demod(&chunk, params, passband);
         let meter_db = analyzer.meter_db();
         display.lock().unwrap().meter_db = meter_db;
+        let cw_mode = matches!(params.mode, Mode::Cwl | Mode::Cwu);
+        if !cw_mode {
+            cw_decoder.reset();
+        }
         {
             let mut out = audio_out.lock().unwrap();
             // Dedicated tap for TCI's audio_start streaming -- same
@@ -1471,6 +1481,9 @@ fn run(
                     waveform_out.pop_front();
                 }
                 waveform_out.push_back(mono.clamp(-1.0, 1.0));
+                if cw_mode {
+                    cw_decoder.process_sample(mono);
+                }
                 // Local speaker playback and TCI's RX audio stream carry
                 // the real (l, r) pair -- identical (l==r) when binaural
                 // is off, same as every consumer effectively saw before
@@ -1527,6 +1540,11 @@ pub struct SpectrumHandle {
     /// Raw wideband IQ tap for TCI's iq_start streaming, normalized
     /// the same way this file normalizes IQ elsewhere (IQ_NORM).
     pub iq_out: Arc<Mutex<VecDeque<(f32, f32)>>>,
+    /// Decoded text from the built-in CW decoder (see cw_decoder.rs) --
+    /// only actually written to while params.mode is Cwl/Cwu; read via
+    /// the cw_text()/clear_cw_text() accessors below rather than
+    /// directly, same as demod_params.
+    cw_text: Arc<Mutex<String>>,
     demod_params: Arc<Mutex<DemodParams>>,
     /// WDSP analyzer channel this handle's run() thread opened -- kept
     /// here too (not just inside that thread) so clear_display can
@@ -1575,6 +1593,7 @@ impl SpectrumHandle {
             Arc::new(Mutex::new(VecDeque::with_capacity(AUDIO_BUFFER_CAPACITY)));
         let waveform_out = Arc::new(Mutex::new(VecDeque::with_capacity(WAVEFORM_TAP_CAPACITY)));
         let iq_out = Arc::new(Mutex::new(VecDeque::with_capacity(IQ_OUT_CAPACITY)));
+        let cw_text = Arc::new(Mutex::new(String::new()));
         let stop = Arc::new(AtomicBool::new(false));
         let thread = {
             let display = Arc::clone(&display);
@@ -1583,6 +1602,7 @@ impl SpectrumHandle {
             let tci_audio_out = Arc::clone(&tci_audio_out);
             let waveform_out = Arc::clone(&waveform_out);
             let iq_out = Arc::clone(&iq_out);
+            let cw_text = Arc::clone(&cw_text);
             let stop = Arc::clone(&stop);
             thread::spawn(move || {
                 run(
@@ -1595,6 +1615,7 @@ impl SpectrumHandle {
                     tci_audio_out,
                     waveform_out,
                     iq_out,
+                    cw_text,
                     rx_audio_to_radio,
                     mox,
                     mute_local_for_tci,
@@ -1608,6 +1629,7 @@ impl SpectrumHandle {
             tci_audio_out,
             waveform_out,
             iq_out,
+            cw_text,
             demod_params,
             channel,
             stop,
@@ -1647,6 +1669,17 @@ impl SpectrumHandle {
 
     pub fn mode(&self) -> Mode {
         self.demod_params.lock().unwrap().mode
+    }
+
+    /// Current decoded text from the built-in CW decoder -- cloned, not
+    /// a reference, since the UI reads this once per frame and the
+    /// caller doesn't need to hold the lock any longer than that.
+    pub fn cw_text(&self) -> String {
+        self.cw_text.lock().unwrap().clone()
+    }
+
+    pub fn clear_cw_text(&self) {
+        self.cw_text.lock().unwrap().clear();
     }
 
     pub fn width_hz(&self) -> f64 {
