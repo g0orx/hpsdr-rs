@@ -12,6 +12,7 @@
     envelope follower on the pre-filtered audio.
 */
 
+use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
 /// Matches spectrum::DSP_RATE -- WDSP's RXA output is always 48kHz
@@ -38,6 +39,22 @@ const MAX_UNIT_SAMPLES: f32 = SAMPLE_RATE_HZ * 0.240; // 5 WPM
 /// real dot is only 20ms).
 const MIN_RUN_SAMPLES: f32 = SAMPLE_RATE_HZ * 0.008; // 8ms
 
+/// How many of the most recent tone durations (dots AND dashes both --
+/// see classify_tone's own comment) feed the unit-time estimate.
+/// Bounds how long a single bad reading (a misclassified element
+/// while there's not yet been a real dot to compare against, or a
+/// noise glitch) can skew the estimate: it only pollutes the window
+/// for this many more elements, then ages out on its own, unlike an
+/// unbounded exponential-moving-average estimator that can drift
+/// permanently in one direction with no way back (see this file's own
+/// history: a real report showed a too-slow cold-start guess
+/// misclassifying real dashes as dots for several seconds, and a
+/// first attempt at fixing that -- nudging on every tone, not just
+/// ones already classified as a dot -- caused a WORSE regression,
+/// collapsing the estimate toward the debounce floor with no way back
+/// on a single bad reading).
+const WINDOW_CAP: usize = 8;
+
 pub struct CwDecoder {
     text_out: Arc<Mutex<String>>,
 
@@ -53,8 +70,15 @@ pub struct CwDecoder {
     run_samples: u32,
     candidate_run: u32,
 
-    // Adaptive unit-time (dot length) estimate, in samples.
+    // Adaptive unit-time (dot length) estimate, in samples -- the
+    // minimum of recent_tones below, computed fresh after every tone
+    // (see classify_tone). Dots are the shortest element by
+    // definition, so tracking the minimum over a real recent window
+    // is a description of reality that doesn't depend on any
+    // classification threshold being right yet -- see WINDOW_CAP's own
+    // doc comment for why a bounded window, not an unbounded EMA.
     unit_samples: f32,
+    recent_tones: VecDeque<f32>,
 
     // Accumulated '.'/'-' for the character currently being spelled.
     symbol: String,
@@ -78,7 +102,8 @@ impl CwDecoder {
             tone_on: false,
             run_samples: 0,
             candidate_run: 0,
-            unit_samples: SAMPLE_RATE_HZ * 0.060, // starting guess: ~20 WPM
+            unit_samples: SAMPLE_RATE_HZ * 0.060, // starting guess: ~20 WPM, until recent_tones has real data
+            recent_tones: VecDeque::with_capacity(WINDOW_CAP),
             symbol: String::new(),
             word_space_emitted: false,
         }
@@ -96,6 +121,8 @@ impl CwDecoder {
         self.tone_on = false;
         self.run_samples = 0;
         self.candidate_run = 0;
+        self.unit_samples = SAMPLE_RATE_HZ * 0.060;
+        self.recent_tones.clear();
         self.symbol.clear();
         self.word_space_emitted = false;
     }
@@ -201,38 +228,41 @@ impl CwDecoder {
         }
     }
 
+    /// Classifies one just-ended tone as a dot or dash, and updates the
+    /// unit-time estimate from it first -- see WINDOW_CAP's own doc
+    /// comment for why a bounded sliding-window minimum, and why this
+    /// pushes EVERY tone into that window (not just ones already
+    /// classified as a dot the way the two previous, reverted schemes
+    /// did): dots are the shortest element by definition, so as soon
+    /// as one real dot is anywhere in the last WINDOW_CAP elements, the
+    /// window's minimum reflects the true unit time regardless of how
+    /// confused earlier classifications were. Validated against a real
+    /// recording (a fast, ~33 WPM CQ call) that used to misclassify
+    /// several seconds' worth of letters after a too-slow cold-start
+    /// guess -- with this scheme, only the first one or two elements
+    /// (before any real dot has been seen at all) are still at risk;
+    /// everything after self-corrects within a handful of elements.
     fn classify_tone(&mut self, run_samples: u32) {
         let run = run_samples as f32;
+
+        if self.recent_tones.len() >= WINDOW_CAP {
+            self.recent_tones.pop_front();
+        }
+        self.recent_tones.push_back(run);
+        // Wait for a second data point before trusting the window --
+        // a single element (which could easily be this transmission's
+        // first dash) is no better a unit-time estimate than the
+        // cold-start guess it would replace.
+        if self.recent_tones.len() >= 2 {
+            let window_min = self.recent_tones.iter().copied().fold(f32::MAX, f32::min);
+            self.unit_samples = window_min.clamp(MIN_UNIT_SAMPLES, MAX_UNIT_SAMPLES);
+        }
+
         if run < self.unit_samples * 2.0 {
             self.symbol.push('.');
-            // Dots are the most reliable sync reference for the
-            // unit-time estimate -- the smallest element, least
-            // distorted by an operator's own timing variation or QSB --
-            // so only dots (not dashes) nudge the estimate.
-            //
-            // REVERTED from a "nudge on every tone regardless of
-            // classification" scheme (meant to fix a real report of
-            // "CQ" misdecoding as "CWT" at the start of a transmission)
-            // after a second real report: that scheme let any short
-            // noise glitch or misclassified element drag the estimate
-            // toward the debounce floor with essentially no way back
-            // up (a real dash is 3x too far from a collapsed estimate
-            // to recover it), degenerating the entire decode into
-            // single-element "T"/"E" characters -- a much worse
-            // failure than the cold-start issue it was meant to fix.
-            // Back to the original, safer (if imperfect at cold start)
-            // behavior; the cold-start problem needs a more careful
-            // fix than either attempt so far.
-            self.nudge_unit_time(run);
         } else {
             self.symbol.push('-');
         }
-    }
-
-    fn nudge_unit_time(&mut self, dot_samples: f32) {
-        const ALPHA: f32 = 0.15;
-        self.unit_samples += ALPHA * (dot_samples - self.unit_samples);
-        self.unit_samples = self.unit_samples.clamp(MIN_UNIT_SAMPLES, MAX_UNIT_SAMPLES);
     }
 
     fn resolve_symbol(&mut self) {
