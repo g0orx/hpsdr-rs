@@ -410,6 +410,13 @@ struct ExtraReceiver {
     /// receiver instead of shared across the whole session.
     ctun: bool,
     ctun_frequency_hz: u32,
+    /// VFO B -- see ConnectedState::vfo_b_frequency_hz's doc comment.
+    /// Same A>B/B>A/A<>B convention as the main receiver, just per
+    /// extra receiver instead of shared -- but no Split here (extra
+    /// receivers never transmit, so there's nothing for Split to do).
+    /// No scroll-to-tune on this box either (unlike the main
+    /// receiver's VFO-B) -- not part of what this was added for.
+    vfo_b_frequency_hz: u32,
     /// RIT ("Receiver Incremental Tuning") -- see ConnectedState::rit_enabled's
     /// doc comment for the full explanation; same behavior here, just
     /// per extra receiver instead of shared. No XIT here -- extra
@@ -625,6 +632,15 @@ struct ConnectedState {
     /// unaffected -- this app has no dual-watch/second-RX-chain
     /// concept, so VFO A keeps receiving regardless of Split.
     split: bool,
+    /// UI-only visibility toggle for the CW decoder panel (see the
+    /// "CW Decode" button next to Record) -- does NOT stop the
+    /// decoder itself from running in the background (spectrum.rs's
+    /// run() thread keeps feeding it purely based on the receiver's
+    /// actual mode, unaware this flag even exists), only whether
+    /// main.rs actually draws its panel/reserves space for it. Default
+    /// true so existing behavior (decoder panel always shown in CW
+    /// mode) is unchanged for anyone who's never touched this button.
+    cw_decode_enabled: bool,
     /// RIT ("Receiver Incremental Tuning"): when on, rit_offset_hz is
     /// added to the RXA demod shift (see spectrum::SpectrumHandle::
     /// set_ctun -- RIT and CTUN share WDSP's one RXA shift register, so
@@ -1422,6 +1438,7 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
             // of never leaving a frequency field at a meaningless 0).
             let vfo_b_frequency_hz = cfg.vfo_b_frequency_hz.unwrap_or(initial_frequency_hz);
             let split = cfg.split.unwrap_or(false);
+            let cw_decode_enabled = cfg.cw_decode_enabled.unwrap_or(true);
             // RIT / XIT -- see ConnectedState's own doc comments. Values
             // themselves already computed above (before RadioSession::
             // start), reused here.
@@ -1477,6 +1494,7 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                 vfo_b_frequency_hz,
                 vfo_b_scroll_accum: 0.0,
                 split,
+                cw_decode_enabled,
                 rit_enabled,
                 rit_offset_hz,
                 rit_scroll_accum: 0.0,
@@ -2822,6 +2840,28 @@ impl eframe::App for HpsdrApp {
                                 }
                             }
                         }
+
+                        // Only shown while actually in CW mode -- there's
+                        // nothing to toggle otherwise, same reasoning as
+                        // the PS badge only appearing when PureSignal is
+                        // enabled. Purely a visibility toggle for the
+                        // panel drawn further down (see cw_panel_visible
+                        // there) -- the decoder itself keeps running in
+                        // the background regardless (spectrum.rs's run()
+                        // thread has no idea this flag exists), so
+                        // toggling this off and back on doesn't lose any
+                        // already-decoded text.
+                        if matches!(connected.spectrum.mode(), spectrum::Mode::Cwl | spectrum::Mode::Cwu) {
+                            ui.add_space(12.0);
+                            if ui
+                                .add(egui::Button::selectable(connected.cw_decode_enabled, "CW Decode"))
+                                .on_hover_text("Show/hide the CW decoder panel")
+                                .clicked()
+                            {
+                                connected.cw_decode_enabled = !connected.cw_decode_enabled;
+                                settings_changed = true;
+                            }
+                        }
                     });
 
                     if connected.tx_enabled {
@@ -3198,7 +3238,14 @@ impl eframe::App for HpsdrApp {
                     // of them, so the panel sits beside the plot rather
                     // than covering the right edge of it.
                     let cw_mode = matches!(connected.spectrum.mode(), spectrum::Mode::Cwl | spectrum::Mode::Cwu);
-                    let cw_panel_reserved_width = if cw_mode { CW_PANEL_WIDTH + CW_PANEL_GAP } else { 0.0 };
+                    // Separate from cw_mode above: cw_mode alone still
+                    // drives the finer CW scroll-tune step (still useful
+                    // even with the panel hidden), but the panel itself
+                    // -- and the width reserved for it -- also respects
+                    // the "CW Decode" toolbar toggle (see its own doc
+                    // comment above).
+                    let cw_panel_visible = cw_mode && connected.cw_decode_enabled;
+                    let cw_panel_reserved_width = if cw_panel_visible { CW_PANEL_WIDTH + CW_PANEL_GAP } else { 0.0 };
                     let (rect, spectrum_resp) = ui.allocate_exact_size(
                         egui::vec2(ui.available_width() - cw_panel_reserved_width, spectrum_height),
                         egui::Sense::click_and_drag(),
@@ -3628,7 +3675,7 @@ impl eframe::App for HpsdrApp {
                         egui::Sense::click_and_drag(),
                     );
                     let waterfall_bottom = rect.bottom();
-                    if cw_mode {
+                    if cw_panel_visible {
                         render_cw_decoder_panel_beside(
                             ui,
                             &connected.spectrum,
@@ -6546,6 +6593,7 @@ impl eframe::App for HpsdrApp {
                                 window_geometry: rx.window_geometry,
                                 ctun: rx.ctun,
                                 ctun_frequency_hz: rx.ctun_frequency_hz,
+                                vfo_b_frequency_hz: Some(rx.vfo_b_frequency_hz),
                                 spectrum_zoom: rx.spectrum_zoom,
                                 spectrum_pan: rx.spectrum_pan,
                                 db_low_auto: rx.db_low_auto,
@@ -6661,6 +6709,7 @@ impl eframe::App for HpsdrApp {
                         ctun_frequency_hz: Some(connected.ctun_frequency_hz),
                         vfo_b_frequency_hz: Some(connected.vfo_b_frequency_hz),
                         split: Some(connected.split),
+                        cw_decode_enabled: Some(connected.cw_decode_enabled),
                         rit_enabled: Some(connected.rit_enabled),
                         rit_offset_hz: Some(connected.rit_offset_hz),
                         xit_enabled: Some(connected.xit_enabled),
@@ -7852,14 +7901,109 @@ fn render_extra_receiver_ui(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceiver>>) {
     rx.spectrum.set_zoom_pan(rx.spectrum_zoom, effective_pan);
     let dial_freq_hz = if rx.ctun { rx.ctun_frequency_hz } else { freq_hz };
 
-    ui.label(
-        egui::RichText::new(format_frequency(dial_freq_hz))
-            .monospace()
-            .size(28.0)
-            .strong()
-            .color(egui::Color32::GREEN),
-    )
-    .on_hover_text("Scroll to tune -- Shift: 100 Hz, none: 1 kHz. Click spectrum/waterfall to jump.");
+    // VFO-A / VFO-B, mirroring the main receiver's own layout (see its
+    // identical block) -- A>B/B>A/A<>B, but no Split: extra receivers
+    // never transmit, so there's nothing for Split to select between.
+    // CTUN sits here too now, in the same position as the main
+    // receiver's own CTUN button (its own row underneath A<>B), not in
+    // the noise-blanker/NR row it used to share below.
+    ui.horizontal(|ui| {
+        ui.group(|ui| {
+            ui.vertical(|ui| {
+                ui.label("VFO-A");
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(format_frequency(dial_freq_hz))
+                            .monospace()
+                            .size(28.0)
+                            .strong()
+                            .color(egui::Color32::GREEN),
+                    )
+                    .sense(egui::Sense::hover()),
+                )
+                .on_hover_text("Scroll to tune -- Shift: 100 Hz, none: 1 kHz. Click spectrum/waterfall to jump.")
+            });
+        });
+
+        ui.vertical(|ui| {
+            ui.horizontal(|ui| {
+                if ui
+                    .button("A>B")
+                    .on_hover_text("Copy VFO A's frequency to VFO B")
+                    .clicked()
+                {
+                    rx.vfo_b_frequency_hz = dial_freq_hz;
+                    rx.settings_dirty.store(true, Ordering::Relaxed);
+                }
+                if ui
+                    .button("B>A")
+                    .on_hover_text("Retune VFO A to VFO B's frequency")
+                    .clicked()
+                {
+                    // See the main receiver's identical B>A handler for
+                    // why this goes through resolve_tune (CTUN-aware)
+                    // rather than just storing the frequency directly.
+                    let (effective_freq, retune) =
+                        resolve_tune(rx.ctun, freq_hz, sample_rate, passband, rx.vfo_b_frequency_hz);
+                    if let Some(lo) = retune {
+                        rx.frequency_hz.store(lo, Ordering::Relaxed);
+                    } else {
+                        rx.ctun_frequency_hz = effective_freq;
+                    }
+                    rx.settings_dirty.store(true, Ordering::Relaxed);
+                }
+            });
+            ui.horizontal(|ui| {
+                if ui
+                    .button("A<>B")
+                    .on_hover_text("Swap VFO A and VFO B")
+                    .clicked()
+                {
+                    let new_b = dial_freq_hz;
+                    let (effective_freq, retune) =
+                        resolve_tune(rx.ctun, freq_hz, sample_rate, passband, rx.vfo_b_frequency_hz);
+                    if let Some(lo) = retune {
+                        rx.frequency_hz.store(lo, Ordering::Relaxed);
+                    } else {
+                        rx.ctun_frequency_hz = effective_freq;
+                    }
+                    rx.vfo_b_frequency_hz = new_b;
+                    rx.settings_dirty.store(true, Ordering::Relaxed);
+                }
+            });
+            ui.horizontal(|ui| {
+                if ui
+                    .add(egui::Button::selectable(rx.ctun, "CTUN"))
+                    .on_hover_text("Click to Tune: browse within the spectrum without retuning the radio")
+                    .clicked()
+                {
+                    if rx.ctun {
+                        rx.frequency_hz.store(rx.ctun_frequency_hz, Ordering::Relaxed);
+                    } else {
+                        rx.ctun_frequency_hz = freq_hz;
+                    }
+                    rx.ctun = !rx.ctun;
+                    rx.settings_dirty.store(true, Ordering::Relaxed);
+                }
+            });
+        });
+
+        ui.group(|ui| {
+            ui.vertical(|ui| {
+                ui.label("VFO-B");
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(format_frequency(rx.vfo_b_frequency_hz))
+                            .monospace()
+                            .size(28.0)
+                            .strong()
+                            .color(egui::Color32::GRAY),
+                    )
+                    .sense(egui::Sense::hover()),
+                )
+            });
+        });
+    });
 
     ui.horizontal_wrapped(|ui| {
         let current_band = band_for_frequency(dial_freq_hz).map(|b| b.name);
@@ -7946,19 +8090,8 @@ fn render_extra_receiver_ui(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceiver>>) {
     });
 
     ui.horizontal_wrapped(|ui| {
-        if ui
-            .add(egui::Button::selectable(rx.ctun, "CTUN"))
-            .on_hover_text("Click to Tune: browse within the spectrum without retuning the radio")
-            .clicked()
-        {
-            if rx.ctun {
-                rx.frequency_hz.store(rx.ctun_frequency_hz, Ordering::Relaxed);
-            } else {
-                rx.ctun_frequency_hz = freq_hz;
-            }
-            rx.ctun = !rx.ctun;
-            rx.settings_dirty.store(true, Ordering::Relaxed);
-        }
+        // CTUN moved up to the VFO-A/VFO-B row above, matching the main
+        // receiver's own layout -- see that block's doc comment.
         let nb = rx.spectrum.noise_blanker();
         if ui
             .add(egui::Button::selectable(nb != spectrum::NoiseBlanker::Off, nb.label()))
@@ -8910,6 +9043,9 @@ fn spawn_extra_receiver(
     // (same reasoning, per receiver).
     let rit_enabled = saved.map(|s| s.rit_enabled).unwrap_or(false);
     let rit_offset_hz = saved.map(|s| s.rit_offset_hz).unwrap_or(0.0);
+    // Restore VFO B -- see ConnectedState::vfo_b_frequency_hz's doc
+    // comment (same "never leave it at a meaningless 0" reasoning).
+    let vfo_b_frequency_hz = saved.and_then(|s| s.vfo_b_frequency_hz).unwrap_or(initial_frequency_hz);
 
     Some(Arc::new(Mutex::new(ExtraReceiver {
         ddc_index: idx,
@@ -8949,6 +9085,7 @@ fn spawn_extra_receiver(
         width_memory: saved.map(|s| s.width_memory.clone()).unwrap_or_default(),
         ctun,
         ctun_frequency_hz,
+        vfo_b_frequency_hz,
         rit_enabled,
         rit_offset_hz,
         rit_scroll_accum: 0.0,

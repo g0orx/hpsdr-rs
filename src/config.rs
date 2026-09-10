@@ -329,6 +329,11 @@ pub struct Config {
     pub vfo_b_frequency_hz: Option<u32>,
     #[serde(default)]
     pub split: Option<bool>,
+    /// See ConnectedState::cw_decode_enabled's doc comment. `None`
+    /// (a config saved before this existed) falls back to true, same
+    /// as a fresh connect.
+    #[serde(default)]
+    pub cw_decode_enabled: Option<bool>,
     /// RIT / XIT -- see ConnectedState::rit_enabled/xit_enabled's doc
     /// comments (main.rs). `None`/missing falls back to off with a
     /// zero offset, same "a config saved before this existed shouldn't
@@ -455,6 +460,10 @@ pub struct ExtraReceiverConfig {
     pub ctun: bool,
     #[serde(default)]
     pub ctun_frequency_hz: u32,
+    /// See Config::vfo_b_frequency_hz's doc comment -- same thing, this
+    /// receiver's own. No Split here -- extra receivers never transmit.
+    #[serde(default)]
+    pub vfo_b_frequency_hz: Option<u32>,
     /// See Config::spectrum_zoom/spectrum_pan's doc comments -- same
     /// thing, this receiver's own.
     #[serde(default = "default_spectrum_zoom")]
