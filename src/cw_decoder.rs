@@ -257,7 +257,59 @@ impl CwDecoder {
         // cold-start guess it would replace.
         if self.recent_tones.len() >= 2 {
             let window_min = self.recent_tones.iter().copied().fold(f32::MAX, f32::min);
-            self.unit_samples = window_min.clamp(MIN_UNIT_SAMPLES, MAX_UNIT_SAMPLES);
+            // ROOT CAUSE FIX for a real report: a long run of all-dash
+            // characters back to back (e.g. "0" then "O": 5 dashes then
+            // 3 more, 8 dashes total with no dot anywhere in between --
+            // exactly WINDOW_CAP) ages every real dot out of the window
+            // before a new one arrives, leaving window_min describing
+            // DASH length instead of dot length. That's ~3x the real
+            // unit time -- past MAX_UNIT_SAMPLES (the 5 WPM floor), so
+            // it got clamped down to that ceiling rather than rejected,
+            // still 2x+ the real estimate. The next tone (still a real
+            // dash) then read as shorter than 2x this inflated
+            // estimate and got misclassified as a dot, which ALSO
+            // pushed the character-boundary gap threshold (2x/6x this
+            // same unit_samples) high enough that the following
+            // characters' gaps stopped registering as boundaries at
+            // all -- several real characters silently fused into one
+            // unrecognized (and therefore dropped) symbol. Confirmed
+            // against a real recording ("G0ORX" sent twice -- both
+            // instances of "OR" vanished from the decoded text, while
+            // the correctly-timed audio, verified independently,
+            // contained them).
+            //
+            // Fixed by only trusting window_min as a dot-length
+            // estimate when the window actually shows a dot/dash
+            // CONTRAST -- i.e. its longest element is meaningfully
+            // bigger than its shortest. A real dot:dash ratio is
+            // 1.8:1 to 4.2:1 across this project's whole Weight range
+            // (30-100, see CwKeyerAtomics's own doc comment); a window
+            // of same-length elements (no real dot anywhere in it)
+            // instead sits within a few percent of 1:1 -- so a 1.5x
+            // spread is a clean separator between "this window has a
+            // real dot in it" and "this window is one long run of
+            // same-type elements". When there's no contrast, the
+            // estimate is simply left unchanged rather than trusting a
+            // number that isn't describing a dot at all.
+            //
+            // A first attempt at this fix instead rejected any
+            // increase past 1.5x the CURRENT estimate directly (rather
+            // than checking the window's own internal spread) --
+            // simpler, but a real regression: at a slow cold start
+            // (the built-in ~20 WPM guess vs. a genuinely much slower
+            // sender), the correct estimate can legitimately be several
+            // times the guess, and capping growth at 1.5x per update
+            // left it permanently stuck too low, which (via the same
+            // gap-threshold mechanism above) fragmented nearly every
+            // character. The spread check doesn't have this failure
+            // mode: real speed changes still show a dot/dash contrast
+            // as soon as one dot and one dash have both been seen,
+            // however far the absolute estimate needs to move.
+            let window_max = self.recent_tones.iter().copied().fold(0.0f32, f32::max);
+            const MIN_SPREAD_RATIO: f32 = 1.5;
+            if window_max >= window_min * MIN_SPREAD_RATIO {
+                self.unit_samples = window_min.clamp(MIN_UNIT_SAMPLES, MAX_UNIT_SAMPLES);
+            }
         }
 
         if run < self.unit_samples * 2.0 {
@@ -339,4 +391,106 @@ fn morse_lookup(symbol: &str) -> Option<char> {
         "-...-" => '=',
         _ => return None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Encodes `text` via cw_encoder (the SAME logic that drives a real
+    /// on-air "send CW text" transmission -- see tx::TxHandle::
+    /// send_cw_text) into timed elements, synthesizes a crude sine-wave
+    /// "recording" from them, and decodes it end-to-end through
+    /// CwDecoder -- an encode-then-decode round trip that doubles as a
+    /// regression test for classify_tone's growth-rate-limit fix (a
+    /// real recording of "G0ORX" sent twice, over real hardware, lost
+    /// "OR" both times to exactly the failure this reproduces: a long
+    /// run of all-dash characters aging every real dot out of the
+    /// window-minimum estimate).
+    fn decode_roundtrip(text: &str, speed_wpm: u32, weight: u32) -> String {
+        let elements = crate::cw_encoder::text_to_elements(text, speed_wpm, weight, SAMPLE_RATE_HZ as u32);
+        let text_out = Arc::new(Mutex::new(String::new()));
+        let mut decoder = CwDecoder::new(Arc::clone(&text_out));
+        let mut phase = 0.0f32;
+        let tone_step = 2.0 * std::f32::consts::PI * 700.0 / SAMPLE_RATE_HZ;
+        for (on, duration) in elements {
+            for _ in 0..duration {
+                let sample = if on { phase.sin() } else { 0.0 };
+                phase += tone_step;
+                if phase >= 2.0 * std::f32::consts::PI {
+                    phase -= 2.0 * std::f32::consts::PI;
+                }
+                decoder.process_sample(sample);
+            }
+        }
+        // Trailing silence so the final character/word actually
+        // resolves (see process_sample's own doc comment on why gap
+        // classification is eager, not reactive).
+        for _ in 0..(SAMPLE_RATE_HZ as u32) {
+            decoder.process_sample(0.0);
+        }
+        let result = text_out.lock().unwrap().clone();
+        result.trim().to_string()
+    }
+
+    #[test]
+    fn real_hardware_report_g0orx_roundtrips_cleanly() {
+        // The exact real-world case this fix was written for: "OR" in
+        // "G0ORX" vanished from BOTH occurrences before the fix (a real
+        // recording, independently verified sample-by-sample to
+        // confirm the actual transmitted audio was correct -- this was
+        // a decoder bug, not an encoder bug).
+        assert_eq!(decode_roundtrip("TEST TEST G0ORX G0ORX TEST", 12, 50), "TEST TEST G0ORX G0ORX TEST");
+    }
+
+    #[test]
+    fn long_runs_of_all_dash_characters_still_decode() {
+        // Torture cases: as many consecutive all-dash characters as
+        // possible (0, O, M, T are '-', '---', '--', '-----' -- no
+        // dots anywhere), well beyond WINDOW_CAP's own 8-element span,
+        // to confirm the fix isn't just barely covering the one
+        // reported case.
+        assert_eq!(decode_roundtrip("MOTTO 000 OOMM", 12, 50), "MOTTO 000 OOMM");
+    }
+
+    #[test]
+    fn genuine_speed_change_still_tracked() {
+        // The spread-based gate must not turn into "the estimate can
+        // never move again" -- two clearly different real speeds
+        // should both decode correctly (each settles independently
+        // from this test's own fresh CwDecoder/cold start).
+        let fast = decode_roundtrip("PARIS PARIS", 30, 50);
+        let slow = decode_roundtrip("PARIS PARIS", 15, 50);
+        assert_eq!(fast, "PARIS PARIS");
+        assert_eq!(slow, "PARIS PARIS");
+    }
+
+    #[test]
+    fn straightforward_message_at_various_speeds() {
+        // A moderate, realistic operating range -- NOT the extreme
+        // 5/60 WPM ends, which are a known, PRE-EXISTING cold-start
+        // weakness this fix doesn't touch either way (confirmed via a
+        // standalone simulation: the original, unfixed window-min
+        // estimator fails those same extremes identically, with or
+        // without this fix's spread gate -- the built-in ~20 WPM
+        // cold-start guess is simply too far from either extreme for
+        // the first character or two to land correctly). See
+        // classify_tone's own doc comment for what this fix DOES
+        // address (long same-type-element runs), which is orthogonal
+        // to cold-start accuracy at extreme speeds.
+        for wpm in [15, 20, 25, 30] {
+            assert_eq!(decode_roundtrip("CQ CQ DE G0ORX G0ORX K", wpm, 50), "CQ CQ DE G0ORX G0ORX K");
+        }
+    }
+
+    #[test]
+    fn various_weights_still_decode_correctly() {
+        // 40-70 -- see straightforward_message_at_various_speeds's own
+        // comment; weight 30 (a light, unusually fast-dot-relative-to-
+        // dash setting) hits the same pre-existing cold-start weakness
+        // there, confirmed identical with or without this fix.
+        for weight in [40, 50, 60, 70] {
+            assert_eq!(decode_roundtrip("TEST 12345 67890", 18, weight), "TEST 12345 67890");
+        }
+    }
 }
