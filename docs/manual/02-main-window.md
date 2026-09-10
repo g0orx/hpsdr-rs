@@ -137,6 +137,20 @@ If PureSignal is enabled for the session, a **PS** badge also appears: gray
 while enabled but not yet correcting, green while actively correcting, with
 the current feedback level shown in the tooltip.
 
+## Record
+
+The **Record** button, next to the status badges, saves the RX audio
+you're currently hearing to a WAV file -- exactly what the local speaker
+plays, including Audio Gain and any noise reduction/blanker/AGC settings
+in effect, muted the same way the speaker itself is during transmit. Click
+it again (now labeled **Recording**, in red) to stop.
+
+Files land in a `recordings` folder alongside this radio's other saved
+settings -- `~/.config/hpsdr-rs/recordings/` (Linux),
+`%APPDATA%\hpsdr-rs\recordings\` (Windows), or `~/Library/Application
+Support/hpsdr-rs/recordings/` (macOS) -- named by when the recording
+started, e.g. `hpsdr-rs_1788972349.wav`.
+
 ## Transmit controls
 
 This row only appears once TX is armed (Settings → TX → **Enable
