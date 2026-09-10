@@ -637,7 +637,7 @@ struct ConnectedState {
     /// concept, so VFO A keeps receiving regardless of Split.
     split: bool,
     /// UI-only visibility toggle for the CW decoder panel (see the
-    /// "CW Decode" button next to Record) -- does NOT stop the
+    /// "CW Decode" button next to CTUN) -- does NOT stop the
     /// decoder itself from running in the background (spectrum.rs's
     /// run() thread keeps feeding it purely based on the receiver's
     /// actual mode, unaware this flag even exists), only whether
@@ -2302,6 +2302,26 @@ impl eframe::App for HpsdrApp {
                                         connected.ctun = !connected.ctun;
                                         settings_changed = true;
                                     }
+                                    // Only shown while actually in CW
+                                    // mode -- see cw_panel_visible's own
+                                    // doc comment further down for the
+                                    // full reasoning. Purely a
+                                    // visibility toggle for the decoder
+                                    // panel/its width reservation -- the
+                                    // decoder itself keeps running in
+                                    // the background regardless.
+                                    if matches!(connected.spectrum.mode(), spectrum::Mode::Cwl | spectrum::Mode::Cwu)
+                                        && ui
+                                            .add(egui::Button::selectable(
+                                                connected.cw_decode_enabled,
+                                                "CW Decode",
+                                            ))
+                                            .on_hover_text("Show/hide the CW decoder panel")
+                                            .clicked()
+                                    {
+                                        connected.cw_decode_enabled = !connected.cw_decode_enabled;
+                                        settings_changed = true;
+                                    }
                                 });
                             });
 
@@ -2844,28 +2864,6 @@ impl eframe::App for HpsdrApp {
                                 }
                             }
                         }
-
-                        // Only shown while actually in CW mode -- there's
-                        // nothing to toggle otherwise, same reasoning as
-                        // the PS badge only appearing when PureSignal is
-                        // enabled. Purely a visibility toggle for the
-                        // panel drawn further down (see cw_panel_visible
-                        // there) -- the decoder itself keeps running in
-                        // the background regardless (spectrum.rs's run()
-                        // thread has no idea this flag exists), so
-                        // toggling this off and back on doesn't lose any
-                        // already-decoded text.
-                        if matches!(connected.spectrum.mode(), spectrum::Mode::Cwl | spectrum::Mode::Cwu) {
-                            ui.add_space(12.0);
-                            if ui
-                                .add(egui::Button::selectable(connected.cw_decode_enabled, "CW Decode"))
-                                .on_hover_text("Show/hide the CW decoder panel")
-                                .clicked()
-                            {
-                                connected.cw_decode_enabled = !connected.cw_decode_enabled;
-                                settings_changed = true;
-                            }
-                        }
                     });
 
                     if connected.tx_enabled {
@@ -3246,8 +3244,8 @@ impl eframe::App for HpsdrApp {
                     // drives the finer CW scroll-tune step (still useful
                     // even with the panel hidden), but the panel itself
                     // -- and the width reserved for it -- also respects
-                    // the "CW Decode" toolbar toggle (see its own doc
-                    // comment above).
+                    // the "CW Decode" button next to CTUN (see its own
+                    // doc comment above).
                     let cw_panel_visible = cw_mode && connected.cw_decode_enabled;
                     let cw_panel_reserved_width = if cw_panel_visible { CW_PANEL_WIDTH + CW_PANEL_GAP } else { 0.0 };
                     let (rect, spectrum_resp) = ui.allocate_exact_size(
@@ -7998,7 +7996,7 @@ fn render_extra_receiver_ui(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceiver>>) {
                 }
                 // Only shown while this receiver is actually in CW mode
                 // -- see the main receiver's identical "CW Decode"
-                // button (next to its Record button) for the full
+                // button (next to its own CTUN) for the full
                 // reasoning. Purely a visibility toggle for this
                 // receiver's own decoder panel/width reservation (see
                 // cw_panel_visible below) -- its decoder keeps running
