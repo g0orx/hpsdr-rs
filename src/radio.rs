@@ -322,13 +322,16 @@ fn ps_feedback_config(protocol: u8, board: Boards) -> Option<(u8, u8, Option<u8>
 /// just threaded as one Arc instead of six.
 ///
 /// Values and defaults match piHPSDR's own CW menu (a known-working
-/// reference for this exact radio family) rather than being invented:
-/// Speed 1-60 WPM (default 16), Weight 0-100 (default 50), Sidetone
-/// level 0-127 on Protocol 1 / 0-255 on Protocol 2 (default 50,
-/// clamped per-protocol at the point each byte is actually built, not
-/// here), Sidetone frequency 100-1000Hz (default 800), Hang time
-/// (labeled "Break-in delay" in the UI -- matches piHPSDR's own CW
-/// menu wording for this exact value) 0-1000ms (default 500).
+/// reference for this exact radio family) rather than being invented,
+/// except Sidetone level's range -- see CwKeyerValues::ptt_delay_byte's
+/// doc comment for why deskHPSDR's own CW menu (0-127 on BOTH
+/// protocols) is trusted over piHPSDR mainline's here (0-127 on
+/// Protocol 1 / 0-255 on Protocol 2): Speed 1-60 WPM (default 16),
+/// Weight 0-100 (default 50), Sidetone level 0-127 (default 50, still
+/// clamped at the point each byte is actually built, not here),
+/// Sidetone frequency 100-1000Hz (default 800), Hang time (labeled
+/// "Break-in delay" in the UI -- matches piHPSDR's own CW menu wording
+/// for this exact value) 0-1000ms (default 500).
 pub struct CwKeyerAtomics {
     /// 0 = Straight, 1 = Iambic A, 2 = Iambic B -- see CwKeyerMode.
     pub mode: AtomicU32,
@@ -386,6 +389,30 @@ impl CwKeyerValues {
             sidetone_freq_hz: atomics.sidetone_freq_hz.load(Ordering::Relaxed),
             hang_time_ms: atomics.hang_time_ms.load(Ordering::Relaxed),
         }
+    }
+
+    /// P1 command 7's C3 / P2 tx_specific_packet's byte 13 -- the
+    /// keyer's internal "RF delay"/PTT-lead byte. piHPSDR's own
+    /// mainline reference hardcodes this to a fixed 20ms (P1) or
+    /// leaves it at 0 entirely (P2, `transmit_specific_buffer[13]=0`)
+    /// -- but deskHPSDR (a more actively hardware-tested fork, see
+    /// reference_sources_local memory) sends this exact computed value
+    /// on BOTH protocols with the comment "This is a quirk working
+    /// around a bug in the FPGA iambic keyer", clamping the configured
+    /// PTT delay to `900 / speed_wpm`. A real report matches this
+    /// precisely: Iambic A/B produced no audible individual elements
+    /// (radio's own local sidetone) at any speed down to 5 WPM, while
+    /// straight key (which never engages the FPGA's iambic engine at
+    /// all) worked correctly the whole time -- strong evidence this
+    /// project was hitting exactly the bug deskHPSDR's workaround
+    /// exists for, having previously left P2's byte 13 at 0 entirely
+    /// and P1's C3 unclamped. Uses deskHPSDR's own 30ms default (its
+    /// mainline piHPSDR counterpart, 20ms, predates this workaround and
+    /// was never validated against the bug it's meant to avoid).
+    fn ptt_delay_byte(&self) -> u8 {
+        const CW_KEYER_PTT_DELAY_MS: u32 = 30;
+        let rfmax = 900 / self.speed_wpm.max(1);
+        CW_KEYER_PTT_DELAY_MS.min(rfmax).min(u8::MAX as u32) as u8
     }
 }
 
@@ -2906,16 +2933,13 @@ fn p1_build_packet(
             // contacts close, which Two Tone testing doesn't involve.
             let c1: u8 = if cw_mode_active && !tune_active { 0x01 } else { 0x00 };
             // C2: sidetone volume, clamped to this protocol's 7-bit
-            // range (piHPSDR's own CW menu restricts this control to
-            // 0-127 specifically for old-protocol boards; Protocol 2
-            // gets the full 0-255 byte -- see p2_tx_specific_packet).
+            // range -- same 0-127 range now used on both protocols,
+            // see CwKeyerAtomics's own doc comment.
             let c2 = cw_keyer.sidetone_volume.min(127) as u8;
-            // C3: PTT delay -- fixed at piHPSDR's own default (20ms,
-            // radio.c: `cw_keyer_ptt_delay=20`), not exposed as a
-            // separate setting (not requested, and piHPSDR itself has
-            // no UI control for this either -- see CwKeyerAtomics's
-            // doc comment).
-            (0x1E, c1, c2, 20, 0x00)
+            // C3: PTT delay -- see CwKeyerValues::ptt_delay_byte's doc
+            // comment (deskHPSDR's FPGA-iambic-keyer-bug workaround,
+            // not exposed as a separate setting).
+            (0x1E, c1, c2, cw_keyer.ptt_delay_byte(), 0x00)
         }
         8 => {
             // CW keyer hang time (C1/C2, "Break-in delay" in the UI)
@@ -4767,15 +4791,29 @@ fn p2_tx_specific_packet(
         };
     }
     p[5] = b5;
-    // Full byte range on this protocol (unlike P1's 7-bit C2 -- see
-    // p1_build_packet's command 7 case).
-    p[6] = cw_keyer.sidetone_volume.min(255) as u8;
+    // 0-127, same range as P1's C2 -- an earlier version of this
+    // comment claimed P2 gets the "full 0-255 byte", but deskHPSDR
+    // (see CwKeyerValues::ptt_delay_byte's doc comment for why that
+    // reference is trusted here) caps this at 127 in its own CW menu
+    // UI unconditionally (both protocols) and masks with `& 0x7F` when
+    // building this exact byte regardless of what's configured --
+    // matched here as a precaution even though this project's own
+    // default (50) was never near the old 255 ceiling.
+    p[6] = cw_keyer.sidetone_volume.min(127) as u8;
     let sidetone_freq = cw_keyer.sidetone_freq_hz.min(u16::MAX as u32) as u16;
     p[7..9].copy_from_slice(&sidetone_freq.to_be_bytes());
     p[9] = cw_keyer.speed_wpm.min(255) as u8;
     p[10] = cw_keyer.weight.min(255) as u8;
     let hang_time = cw_keyer.hang_time_ms.min(u16::MAX as u32) as u16;
     p[11..13].copy_from_slice(&hang_time.to_be_bytes());
+    // Byte 13 -- see CwKeyerValues::ptt_delay_byte's doc comment
+    // (deskHPSDR's FPGA-iambic-keyer-bug workaround). Previously left
+    // at 0 (this byte's initial value from `[0u8; ...]`, matching
+    // piHPSDR mainline's own hardcoded 0) -- a real report (Iambic A/B
+    // producing no audible individual sidetone elements at any speed,
+    // while straight key -- which never engages the FPGA's iambic
+    // engine -- worked correctly) matches this exact known bug.
+    p[13] = cw_keyer.ptt_delay_byte();
 
     // Byte 50 -- mic/line routing flags: bits 0x01 (mic_linein) and
     // 0x02 (mic_boost) still left at 0/unimplemented (not requested).

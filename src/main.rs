@@ -5076,7 +5076,15 @@ impl eframe::App for HpsdrApp {
                                             ui,
                                             &mut connected.slider_scroll_accum,
                                             &mut level,
-                                            0.0..=255.0,
+                                            // 0-127 on both protocols, matching
+                                            // deskHPSDR's own CW menu -- piHPSDR
+                                            // mainline allows up to 255 on P2, but
+                                            // deskHPSDR (a more actively hardware-
+                                            // tested fork) caps this at 127
+                                            // unconditionally, and its own P2 byte 6
+                                            // assembly masks with `& 0x7F` regardless
+                                            // of what's configured.
+                                            0.0..=127.0,
                                             5.0,
                                             "",
                                         ) {
