@@ -1504,6 +1504,7 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
             // device/output is needed.
             let cw_sidetone = audio::CwSidetone::start(
                 Arc::clone(&spectrum.audio_out),
+                Arc::clone(&session.mox),
                 Arc::clone(&session.cw_mode_active),
                 Arc::clone(&session.cw_key_down),
                 Arc::clone(&session.cw_keyer),

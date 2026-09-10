@@ -157,12 +157,14 @@ impl AudioOutput {
     }
 }
 
-/// Small ring cap for the CW sidetone generator's own writes into
-/// audio_out -- same "small, bounded, drop-oldest" reasoning as
-/// spectrum.rs's AUDIO_BUFFER_CAPACITY (~0.3s at 48kHz): a backlog here
-/// would just be added latency between paddle and audible tone, not
-/// something that self-corrects.
-const CW_SIDETONE_BUFFER_CAPACITY: usize = 14_400;
+/// Maximum latency this generator lets its own writes carry in
+/// audio_out, enforced every tick (not just as an overflow backstop) --
+/// see run()'s own doc comment on why a large passive cap (this used to
+/// be spectrum.rs's own 0.3s AUDIO_BUFFER_CAPACITY) let a transient
+/// backlog turn into audible desync and a lingering tail after key-up.
+/// 10ms is enough slack to absorb this thread's own ~2ms poll jitter
+/// without constantly trimming in the healthy case.
+const CW_SIDETONE_TARGET_LATENCY_SAMPLES: usize = OUTPUT_SAMPLE_RATE as usize / 100;
 
 /// How long the sidetone's on/off envelope takes to ramp fully up or
 /// down, in samples at OUTPUT_SAMPLE_RATE. Same purpose as piHPSDR's own
@@ -209,6 +211,7 @@ impl CwSidetone {
     /// without a dedicated output device or a mixing stage.
     pub fn start(
         audio_out: Arc<Mutex<VecDeque<(f32, f32)>>>,
+        mox: Arc<AtomicBool>,
         cw_mode_active: Arc<AtomicBool>,
         key_down: Arc<AtomicBool>,
         cw_keyer: Arc<CwKeyerAtomics>,
@@ -218,7 +221,7 @@ impl CwSidetone {
         let thread_enabled = Arc::clone(&enabled);
         let thread_stop = Arc::clone(&stop);
         let thread = thread::spawn(move || {
-            run(audio_out, cw_mode_active, key_down, cw_keyer, thread_enabled, thread_stop);
+            run(audio_out, mox, cw_mode_active, key_down, cw_keyer, thread_enabled, thread_stop);
         });
         Self { enabled, stop, thread: Some(thread) }
     }
@@ -244,18 +247,40 @@ impl Drop for CwSidetone {
 /// clock, same idea as this project's own RateConverter but driven by
 /// Instant instead of an input sample count.
 ///
-/// Deliberately only ever WRITES to audio_out while the envelope is
-/// above silence (attacking or still ramping down), never while fully
-/// silent -- so the instant a release finishes, the queue reverts to
-/// being exclusively spectrum.rs's real RX-audio producer's again, with
-/// no risk of this thread's stale silence samples interleaving with (and
-/// stealing slots from) real RX audio the moment mox drops and RX audio
-/// resumes. In practice the ~5ms release (CW_SIDETONE_RAMP_SAMPLES) is
-/// always long finished before the Break-in Delay hang-timer (typically
-/// hundreds of ms, see RadioSession::cw_keyer's doc comment) actually
-/// drops mox, so there's no real race, just defensive ordering.
+/// ROOT CAUSE FIX for a real report: initial testing sounded "OK" at
+/// first, then some elements distorted, occasionally drifted out of
+/// sync, and the tone kept sounding briefly after releasing the key.
+/// Two compounding bugs, both in this function as first written:
+///
+/// 1. `keyed` was gated on key_down/cw_mode_active/enabled alone, NOT
+///    on mox -- but spectrum.rs's real RX-audio producer gates its own
+///    writes into this SAME queue purely on mox being false. Since
+///    main.rs's break-in hang-timer (which raises mox) reads the same
+///    key_down flag on its own ~16ms UI-frame cadence, there was a real
+///    window on every key-down where this thread could already be
+///    ramping up while spectrum.rs's thread was still pushing live RX
+///    audio into the same queue -- two producers, unsynchronized,
+///    landing in one FIFO. That's the distortion: audible RX content
+///    time-interleaved with the sidetone. Fixed by also requiring
+///    `mox` here, matching spectrum.rs's own gate exactly so the two
+///    producers are mutually exclusive rather than merely usually so.
+/// 2. The only backlog control was an overflow backstop sized for
+///    spectrum.rs's OWN continuous-stream use case (0.3s) -- fine for
+///    real RX audio, but for this thread's bursty on/off tone, any
+///    transient delay (scheduler jitter, mutex contention with
+///    spectrum.rs's thread on the same Mutex) could silently queue up
+///    to 0.3s of already-generated tone ahead of real time, which then
+///    plays out AFTER the envelope has correctly finished releasing --
+///    exactly the "still playing after I stop" and "gets out of sync"
+///    reports. Fixed by actively trimming to
+///    CW_SIDETONE_TARGET_LATENCY_SAMPLES (10ms) every tick, not just
+///    once some much larger cap is hit, and by flushing audio_out
+///    outright on every idle-to-keyed edge so a stale backlog (RX
+///    leftovers, or this thread's own prior release tail) never sits
+///    ahead of a fresh element in the queue.
 fn run(
     audio_out: Arc<Mutex<VecDeque<(f32, f32)>>>,
+    mox: Arc<AtomicBool>,
     cw_mode_active: Arc<AtomicBool>,
     key_down: Arc<AtomicBool>,
     cw_keyer: Arc<CwKeyerAtomics>,
@@ -265,8 +290,12 @@ fn run(
     let mut last = Instant::now();
     let mut phase: f32 = 0.0;
     let mut gain: f32 = 0.0;
+    let mut was_keyed = false;
     while !stop.load(Ordering::Relaxed) {
-        thread::sleep(Duration::from_millis(10));
+        // Short tick: tighter envelope/edge timing than the original
+        // 10ms, and a smaller worst-case burst size for the backlog
+        // trim below to reason about.
+        thread::sleep(Duration::from_millis(2));
         let now = Instant::now();
         let elapsed = now.duration_since(last);
         last = now;
@@ -276,8 +305,18 @@ fn run(
             continue;
         }
         let keyed = enabled.load(Ordering::Relaxed)
+            && mox.load(Ordering::Relaxed)
             && cw_mode_active.load(Ordering::Relaxed)
             && key_down.load(Ordering::Relaxed);
+        if keyed && !was_keyed {
+            // Rising edge -- see this function's own doc comment (fix
+            // #2): drop anything already queued (stale RX audio from
+            // just before mox went up, or a previous element's
+            // leftover tail) so the fresh tone starts in sync with the
+            // actual key-down instead of queued behind old content.
+            audio_out.lock().unwrap().clear();
+        }
+        was_keyed = keyed;
         let target = if keyed { 1.0 } else { 0.0 };
         let freq_hz = cw_keyer.sidetone_freq_hz.load(Ordering::Relaxed).max(1) as f32;
         // Same 0-255 full-byte range as P2's own sidetone_volume byte
@@ -298,7 +337,8 @@ fn run(
             if gain <= 0.0 && target <= 0.0 {
                 // Fully silent -- stop generating for the rest of this
                 // tick too (target can't un-ramp mid-loop; enabled/
-                // cw_mode_active/key_down are only re-read next tick).
+                // mox/cw_mode_active/key_down are only re-read next
+                // tick).
                 break;
             }
             phase += step;
@@ -310,11 +350,12 @@ fn run(
         }
         if !samples.is_empty() {
             let mut out = audio_out.lock().unwrap();
-            for pair in samples {
-                if out.len() >= CW_SIDETONE_BUFFER_CAPACITY {
-                    out.pop_front();
-                }
-                out.push_back(pair);
+            out.extend(samples);
+            // See this function's own doc comment (fix #2) -- actively
+            // keep the queue near real-time instead of only trimming
+            // once some much larger cap is hit.
+            while out.len() > CW_SIDETONE_TARGET_LATENCY_SAMPLES {
+                out.pop_front();
             }
         }
     }
