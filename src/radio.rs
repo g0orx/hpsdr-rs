@@ -3428,12 +3428,38 @@ fn p2_audio_packet(seq: u32, rx_audio: &Mutex<VecDeque<f32>>) -> [u8; P2_AUDIO_P
 /// into the send schedule); no prebuffer/warm-up needed here the way
 /// p2_tx_iq_loop has one, since this isn't a real-time-sensitive RF
 /// signal and a brief startup gap of silence is harmless.
+///
+/// ROOT CAUSE FIX for a real report (confirmed via an A/B comparison
+/// against deskHPSDR on the same radio): the radio's own internal CW
+/// keyer sidetone never produced ANY audible output via this project,
+/// on any keying mode, even though the CW-enable/sidetone-volume/
+/// frequency bytes were confirmed correct byte-for-byte against
+/// piHPSDR/deskHPSDR. The missing piece was this stream, not the CW
+/// config bytes: piHPSDR's/deskHPSDR's own transmitter.c comment reads
+/// "In the new protocol, we MUST maintain a constant flow of audio
+/// samples to the radio (at least for ANAN-200D and ANAN-7000 internal
+/// side tone generation) -- so we ship out audio: silence if CW is
+/// internal, side tone if CW is local" -- i.e. on this class of
+/// hardware, the internal keyer's own sidetone generator apparently
+/// needs this exact "RX audio to radio" pipe to be actively flowing
+/// (even carrying pure silence) in order to produce any output at all,
+/// completely independent of send_rx_audio_to_radio's own on/off
+/// setting. This function used to pause entirely (send nothing, not
+/// even silence) for the ENTIRE duration mox was set -- exactly the
+/// condition CW keying needs it most. Now kept flowing (silence,
+/// bypassing rx_audio_to_radio's own queue/warm-up machinery entirely
+/// -- there's no real RX audio to send during TX) specifically while
+/// cw_mode_active as well as mox, regardless of the user's own
+/// send_rx_audio_to_radio setting -- CW sidetone shouldn't silently
+/// depend on an unrelated, off-by-default, general-purpose setting the
+/// user has no reason to know CW needs.
 fn p2_rx_audio_loop(
     socket: UdpSocket,
     radio_ip: std::net::IpAddr,
     mox: Arc<AtomicBool>,
     send_rx_audio_to_radio: Arc<AtomicBool>,
     rx_audio_to_radio: Arc<Mutex<VecDeque<f32>>>,
+    cw_mode_active: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
 ) {
     let mut seq: u32 = 0;
@@ -3446,7 +3472,34 @@ fn p2_rx_audio_loop(
     let mut warmed_up = false;
 
     while !stop.load(Ordering::Relaxed) {
-        if mox.load(Ordering::Relaxed) || !send_rx_audio_to_radio.load(Ordering::Relaxed) {
+        let mox_on = mox.load(Ordering::Relaxed);
+        // See this function's own doc comment -- keep the stream
+        // flowing (silence) during CW TX specifically, regardless of
+        // send_rx_audio_to_radio, so the radio's own internal keyer
+        // sidetone generator has the continuous audio pipe it needs.
+        let cw_tx = mox_on && cw_mode_active.load(Ordering::Relaxed);
+        if cw_tx {
+            let mut p = [0u8; P2_AUDIO_PACKET_SIZE];
+            p[0..4].copy_from_slice(&seq.to_be_bytes());
+            if let Err(e) = socket.send_to(&p, (radio_ip, P2_AUDIO_PORT)) {
+                eprintln!("radio: RX audio socket.send_to failed, stopping RX audio streaming: {e}");
+                return;
+            }
+            seq = seq.wrapping_add(1);
+            next_send += interval;
+            let now = Instant::now();
+            if next_send > now {
+                thread::sleep(next_send - now);
+            } else {
+                next_send = now;
+            }
+            // No cushion is built while sending silence -- a real RX
+            // resume afterward (mox clearing) starts its own fresh
+            // warm-up rather than trusting anything from before.
+            warmed_up = false;
+            continue;
+        }
+        if mox_on || !send_rx_audio_to_radio.load(Ordering::Relaxed) {
             thread::sleep(Duration::from_millis(20));
             next_send = Instant::now();
             warmed_up = false;
@@ -4457,8 +4510,17 @@ fn start_protocol2(
     let rx_audio_mox = Arc::clone(&mox);
     let rx_audio_send_flag = Arc::clone(&send_rx_audio_to_radio);
     let rx_audio_buffer = Arc::clone(&rx_audio_to_radio);
+    let rx_audio_cw_mode_active = Arc::clone(&cw_mode_active);
     let rx_audio_thread = thread::spawn(move || {
-        p2_rx_audio_loop(rx_audio_socket, radio_ip, rx_audio_mox, rx_audio_send_flag, rx_audio_buffer, rx_audio_stop);
+        p2_rx_audio_loop(
+            rx_audio_socket,
+            radio_ip,
+            rx_audio_mox,
+            rx_audio_send_flag,
+            rx_audio_buffer,
+            rx_audio_cw_mode_active,
+            rx_audio_stop,
+        );
     });
 
     let receiver_socket = socket.try_clone()?;
