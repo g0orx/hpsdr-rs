@@ -876,6 +876,25 @@ struct ConnectedState {
     /// PureSignal calibration actually requires a varying-envelope
     /// signal that a steady Tune tone can never provide.
     two_tone_active: bool,
+    /// Whether the CURRENT session.mox_active()==true state was raised
+    /// by the CW break-in hang-timer below, as opposed to any other MOX
+    /// source (the on-screen MOX button, spacebar, Tune, Two-Tone, or a
+    /// rigctl/TCI/CAT PTT command). Gates the hang-timer's own ability
+    /// to LOWER mox: it only ever does so when it was the one that
+    /// raised it, so it can never stomp on a manual PTT session that
+    /// happens to outlast it. Reset to false the instant mox drops for
+    /// ANY reason (own hang-timer expiry or something else dropping it
+    /// first), so a stale true never survives into a later manual PTT.
+    cw_break_in_active: bool,
+    /// Timestamp of the most recent frame session.cw_key_down was seen
+    /// true (radio's own internal keyer reporting paddle contact
+    /// closed -- see that field's doc comment). None when no key-down
+    /// has been observed yet, or once the hang-timer has fully expired
+    /// and dropped mox. Compared each frame against session.cw_keyer's
+    /// hang_time_ms (the same Break-in Delay value already sent to the
+    /// radio as its own internal hang-time, per RadioSession::cw_keyer's
+    /// doc comment) to decide when to drop mox.
+    cw_key_last_active: Option<Instant>,
     /// Exponentially-smoothed forward/reverse power ADC counts (same
     /// raw units as session.tx_forward_power/tx_reverse_power), used
     /// only for the TX meter display -- NOT written back to the
@@ -1585,6 +1604,8 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                 tune_active: false,
                 pre_tune_power_watts: None,
                 two_tone_active: false,
+                cw_break_in_active: false,
+                cw_key_last_active: None,
                 smoothed_fwd_power: 0.0,
                 smoothed_rev_power: 0.0,
                 tx_fifo_warning_until: None,
@@ -1791,10 +1812,53 @@ impl eframe::App for HpsdrApp {
                 // radio's own internal CW keyer only actually keys
                 // anything once its own paddle contacts close, but this
                 // gates whether it's armed to respond at all.
-                connected.session.cw_mode_active.store(
-                    matches!(current_mode, spectrum::Mode::Cwl | spectrum::Mode::Cwu),
-                    std::sync::atomic::Ordering::Relaxed,
-                );
+                let cw_mode_now = matches!(current_mode, spectrum::Mode::Cwl | spectrum::Mode::Cwu);
+                connected.session.cw_mode_active.store(cw_mode_now, std::sync::atomic::Ordering::Relaxed);
+                // CW break-in: put the radio into TRANSMIT while the
+                // operator's paddle (wired directly into the radio, read
+                // back via session.cw_key_down -- see that field's doc
+                // comment) is closed, and keep it there until Break-in
+                // Delay (session.cw_keyer.hang_time_ms) has elapsed with
+                // no further key activity. Only ever RAISES mox when
+                // nothing else already holds it, and only ever LOWERS it
+                // when this logic (cw_break_in_active) was the one that
+                // raised it -- so it never stomps on a manual PTT source
+                // (on-screen MOX button, spacebar, Tune, Two-Tone,
+                // rigctl/TCI/CAT PTT). See ConnectedState::
+                // cw_break_in_active's doc comment for the full design.
+                if cw_mode_now {
+                    if connected.session.cw_key_down.load(Ordering::Relaxed) {
+                        connected.cw_key_last_active = Some(Instant::now());
+                        if !connected.session.mox_active() {
+                            connected.session.set_mox(true);
+                            connected.cw_break_in_active = true;
+                        }
+                    } else if connected.cw_break_in_active {
+                        let hang_time_ms =
+                            connected.session.cw_keyer.hang_time_ms.load(Ordering::Relaxed);
+                        let elapsed_ms = connected
+                            .cw_key_last_active
+                            .map(|t| t.elapsed().as_millis() as u32)
+                            .unwrap_or(u32::MAX);
+                        if elapsed_ms >= hang_time_ms {
+                            connected.session.set_mox(false);
+                            connected.cw_break_in_active = false;
+                        }
+                    }
+                } else if connected.cw_break_in_active {
+                    // Left CW mode while break-in still held mox up --
+                    // nothing left to hang onto, drop it immediately.
+                    connected.session.set_mox(false);
+                    connected.cw_break_in_active = false;
+                }
+                // A stale true must never survive mox dropping for some
+                // OTHER reason (manual PTT toggle, Tune ending, a
+                // disconnect, etc.) -- otherwise a later, unrelated
+                // manual PTT press could get silently cut short by this
+                // logic mistakenly believing it owns the hang-timer.
+                if connected.cw_break_in_active && !connected.session.mox_active() {
+                    connected.cw_break_in_active = false;
+                }
                 let current_width = connected.spectrum.width_hz();
                 // Reused by resolve_tune (clamping a CTUN target so the
                 // passband stays fully on-screen) and by the passband
