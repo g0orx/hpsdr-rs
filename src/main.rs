@@ -417,6 +417,10 @@ struct ExtraReceiver {
     /// No scroll-to-tune on this box either (unlike the main
     /// receiver's VFO-B) -- not part of what this was added for.
     vfo_b_frequency_hz: u32,
+    /// UI-only visibility toggle for this receiver's own CW decoder
+    /// panel -- see ConnectedState::cw_decode_enabled's doc comment for
+    /// the full reasoning (same thing, per receiver instead of shared).
+    cw_decode_enabled: bool,
     /// RIT ("Receiver Incremental Tuning") -- see ConnectedState::rit_enabled's
     /// doc comment for the full explanation; same behavior here, just
     /// per extra receiver instead of shared. No XIT here -- extra
@@ -6594,6 +6598,7 @@ impl eframe::App for HpsdrApp {
                                 ctun: rx.ctun,
                                 ctun_frequency_hz: rx.ctun_frequency_hz,
                                 vfo_b_frequency_hz: Some(rx.vfo_b_frequency_hz),
+                                cw_decode_enabled: Some(rx.cw_decode_enabled),
                                 spectrum_zoom: rx.spectrum_zoom,
                                 spectrum_pan: rx.spectrum_pan,
                                 db_low_auto: rx.db_low_auto,
@@ -7838,7 +7843,13 @@ fn render_extra_receiver_ui(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceiver>>) {
     // drawn below, once this receiver's own spectrum/waterfall rects
     // are known.
     let cw_mode = matches!(rx.spectrum.mode(), spectrum::Mode::Cwl | spectrum::Mode::Cwu);
-    let cw_panel_reserved_width = if cw_mode { CW_PANEL_WIDTH + CW_PANEL_GAP } else { 0.0 };
+    // Separate from cw_mode above: cw_mode alone still drives the finer
+    // CW scroll-tune step (still useful with the panel hidden), but the
+    // panel itself -- and the width reserved for it -- also respects
+    // this receiver's own "CW Decode" toggle (see that button's own
+    // doc comment, in the VFO-A/VFO-B block below).
+    let cw_panel_visible = cw_mode && rx.cw_decode_enabled;
+    let cw_panel_reserved_width = if cw_panel_visible { CW_PANEL_WIDTH + CW_PANEL_GAP } else { 0.0 };
 
     let freq_hz = rx.frequency_hz.load(Ordering::Relaxed);
     let sample_rate = rx.sample_rate_hz.load(Ordering::Relaxed);
@@ -7983,6 +7994,22 @@ fn render_extra_receiver_ui(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceiver>>) {
                         rx.ctun_frequency_hz = freq_hz;
                     }
                     rx.ctun = !rx.ctun;
+                    rx.settings_dirty.store(true, Ordering::Relaxed);
+                }
+                // Only shown while this receiver is actually in CW mode
+                // -- see the main receiver's identical "CW Decode"
+                // button (next to its Record button) for the full
+                // reasoning. Purely a visibility toggle for this
+                // receiver's own decoder panel/width reservation (see
+                // cw_panel_visible below) -- its decoder keeps running
+                // in the background regardless.
+                if cw_mode
+                    && ui
+                        .add(egui::Button::selectable(rx.cw_decode_enabled, "CW Decode"))
+                        .on_hover_text("Show/hide the CW decoder panel")
+                        .clicked()
+                {
+                    rx.cw_decode_enabled = !rx.cw_decode_enabled;
                     rx.settings_dirty.store(true, Ordering::Relaxed);
                 }
             });
@@ -8408,7 +8435,7 @@ fn render_extra_receiver_ui(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceiver>>) {
         egui::vec2(ui.available_width() - cw_panel_reserved_width, waterfall_height),
         egui::Sense::click_and_drag(),
     );
-    if cw_mode {
+    if cw_panel_visible {
         render_cw_decoder_panel_beside(
             ui,
             &rx.spectrum,
@@ -9046,6 +9073,7 @@ fn spawn_extra_receiver(
     // Restore VFO B -- see ConnectedState::vfo_b_frequency_hz's doc
     // comment (same "never leave it at a meaningless 0" reasoning).
     let vfo_b_frequency_hz = saved.and_then(|s| s.vfo_b_frequency_hz).unwrap_or(initial_frequency_hz);
+    let cw_decode_enabled = saved.and_then(|s| s.cw_decode_enabled).unwrap_or(true);
 
     Some(Arc::new(Mutex::new(ExtraReceiver {
         ddc_index: idx,
@@ -9086,6 +9114,7 @@ fn spawn_extra_receiver(
         ctun,
         ctun_frequency_hz,
         vfo_b_frequency_hz,
+        cw_decode_enabled,
         rit_enabled,
         rit_offset_hz,
         rit_scroll_accum: 0.0,
