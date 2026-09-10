@@ -39,6 +39,11 @@ pub struct Config {
     /// comment.
     #[serde(default)]
     pub mic_input_device: Option<String>,
+    /// See spectrum::cw_pitch_hz's doc comment -- a single global
+    /// setting (Settings -> CW), not per-receiver. `None` (a config
+    /// saved before this existed) falls back to the 600Hz default.
+    #[serde(default)]
+    pub cw_pitch_hz: Option<f64>,
     pub agc: Option<Agc>,
     pub agc_attack_ms: Option<i32>,
     pub agc_decay_ms: Option<i32>,

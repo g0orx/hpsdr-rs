@@ -5,11 +5,13 @@
     actually tuned in and audible, the same as a human ear would.
 
     Frequency selectivity is a non-problem here: spectrum::passband_for
-    centers Mode::Cwl/Cwu on a fixed 600Hz pitch, and WDSP's own RXA
+    centers Mode::Cwl/Cwu on the configured CW pitch (Settings -> CW,
+    spectrum::cw_pitch_hz -- 600Hz by default), and WDSP's own RXA
     filter (a ~200Hz-wide passband by default) has therefore already
     band-limited the audio this module sees to just that tone before it
-    ever reaches here -- no Goertzel/FFT tone detection needed, just an
-    envelope follower on the pre-filtered audio.
+    ever reaches here, regardless of the pitch's actual value -- no
+    Goertzel/FFT tone detection needed, just an envelope follower on
+    the pre-filtered audio.
 */
 
 use std::collections::VecDeque;

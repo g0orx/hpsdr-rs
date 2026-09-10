@@ -59,6 +59,14 @@ until you clear it yourself (the panel's own **Clear** button) or
 reconnect. Each extra receiver window has its own independent **CW
 Decode** button and panel, next to that receiver's own CTUN.
 
+**Settings → CW** has a **CW Pitch** slider (300-1000 Hz, 600 Hz by
+default) -- the audio pitch **CWL**/**CWU** centers on, affecting the RX
+filter, click-to-tune centering above, and the TX Tune tone. It's a
+single setting shared by the main receiver and every extra receiver (no
+per-receiver override), since it's really "what pitch do you want to
+hear/zero-beat CW at", not a per-receiver hardware setting. More CW
+options (TX keyer, break-in, etc.) are planned for this tab.
+
 ## VFO A / VFO B / Split
 
 ![VFO A and VFO B boxes with buttons between them](images/02-vfo-ab.png)

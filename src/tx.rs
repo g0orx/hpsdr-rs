@@ -893,11 +893,11 @@ impl TxProcessor {
                 wdsp::SetTXABandpassFreqs(self.channel, passband.0, passband.1);
                 // Tune tone frequency tracks the SAME passband as the
                 // bandpass filter -- its midpoint is the right tone
-                // for every mode (including CW, which centers on its
-                // 600Hz pitch via passband_for's own offset), with no
-                // mode-specific sign handling needed unlike
-                // rustyHPSDR's set_tuning, since passband_for already
-                // encodes that convention.
+                // for every mode (including CW, which centers on the
+                // configured CW pitch via passband_for's own offset --
+                // see spectrum::cw_pitch_hz), with no mode-specific
+                // sign handling needed unlike rustyHPSDR's set_tuning,
+                // since passband_for already encodes that convention.
                 wdsp::SetTXAPostGenToneFreq(self.channel, (passband.0 + passband.1) / 2.0);
             }
             self.last_passband = Some(passband);

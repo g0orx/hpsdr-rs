@@ -304,6 +304,7 @@ fn width_for_mode(width_memory: &std::collections::HashMap<String, f64>, mode: s
 enum SettingsTab {
     Network,
     Audio,
+    Cw,
     Agc,
     Spectrum,
     Tx,
@@ -1367,6 +1368,10 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                 Arc::clone(&session.mox),
                 Arc::clone(&session.mute_local_audio_for_tci),
             );
+            // A global setting (spectrum::cw_pitch_hz), not part of
+            // ConnectedState -- restored directly into the atomic here
+            // rather than round-tripped through a struct field.
+            spectrum::set_cw_pitch_hz(cfg.cw_pitch_hz.unwrap_or(600.0));
             let mic_buffer = Arc::new(Mutex::new(VecDeque::new()));
             let mic_input_device = cfg.mic_input_device.clone();
             let (tx_enabled, mic_input, tx_handle) =
@@ -4325,6 +4330,7 @@ impl eframe::App for HpsdrApp {
                                 for (tab, label) in [
                                     (SettingsTab::About, "About"),
                                     (SettingsTab::Audio, "Audio"),
+                                    (SettingsTab::Cw, "CW"),
                                     (SettingsTab::Diversity, "Diversity"),
                                     (SettingsTab::Equalizer, "Equalizer"),
                                     (SettingsTab::Firmware, "Firmware"),
@@ -4804,6 +4810,23 @@ impl eframe::App for HpsdrApp {
                                                  another application instead of a real mic.",
                                             );
                                     });
+                                }
+
+                                SettingsTab::Cw => {
+                                    ui.add_space(4.0);
+                                    let mut pitch = spectrum::cw_pitch_hz();
+                                    if ui
+                                        .add(egui::Slider::new(&mut pitch, 300.0..=1000.0).text("CW Pitch").suffix(" Hz"))
+                                        .on_hover_text(
+                                            "Audio pitch (Hz) that CWL/CWU center on -- affects the RX \
+                                             filter, click-to-tune centering, and the TX Tune tone.",
+                                        )
+                                        .changed()
+                                    {
+                                        spectrum::set_cw_pitch_hz(pitch);
+                                        settings_changed = true;
+                                    }
+                                    ui.weak("More CW options (TX keyer, break-in, etc.) are planned here.");
                                 }
 
                                 SettingsTab::Agc => {
@@ -6622,6 +6645,7 @@ impl eframe::App for HpsdrApp {
                         gain: Some(connected.spectrum.gain()),
                         audio_output_device: connected.audio_output_device.clone(),
                         mic_input_device: connected.mic_input_device.clone(),
+                        cw_pitch_hz: Some(spectrum::cw_pitch_hz()),
                         agc: Some(connected.spectrum.agc()),
                         agc_attack_ms: Some(agc_params_now.agc_attack_ms),
                         agc_decay_ms: Some(agc_params_now.agc_decay_ms),
@@ -8675,6 +8699,10 @@ fn render_extra_receiver_settings(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceive
         // tab below (and it has no mic/TX concept at all) -- redirect
         // same as Network.
         SettingsTab::Audio => rx.settings_tab = SettingsTab::Agc,
+        // CW Pitch is a single global setting (spectrum::cw_pitch_hz),
+        // not per-receiver -- no separate CW tab for extra receivers,
+        // redirect same as Audio/Network above.
+        SettingsTab::Cw => rx.settings_tab = SettingsTab::Agc,
 
         // TX (and PA Calibration/PureSignal, split out of it) are all
         // global (one radio, one PA/mic path), not per-receiver -- no
@@ -8958,19 +8986,20 @@ fn scroll_tune_step_hz(cw_mode: bool, shift: bool) -> i64 {
 
 /// A click on the spectrum/waterfall to select a signal in CW mode
 /// should land that signal centered in the (narrow) CW filter -- at
-/// the pitch offset from the dial (spectrum::CW_PITCH_HZ) -- rather
-/// than right at the dial frequency itself, which is where every OTHER
-/// mode's click-to-tune convention intentionally lands the clicked
-/// point, but which for CW sits right at the edge of (or outside) the
-/// passband instead of centered on it (see spectrum::passband_for's
-/// own Cwl/Cwu arms: their passband is centered ±600Hz off the dial,
-/// never on it). Only used at the four actual click handlers (not
-/// drag/scroll/zoom, which are relative adjustments rather than "select
-/// this exact signal").
+/// the pitch offset from the dial (Settings -> CW -> CW Pitch, see
+/// spectrum::cw_pitch_hz) -- rather than right at the dial frequency
+/// itself, which is where every OTHER mode's click-to-tune convention
+/// intentionally lands the clicked point, but which for CW sits right
+/// at the edge of (or outside) the passband instead of centered on it
+/// (see spectrum::passband_for's own Cwl/Cwu arms: their passband is
+/// centered ±pitch off the dial, never on it). Only used at the four
+/// actual click handlers (not drag/scroll/zoom, which are relative
+/// adjustments rather than "select this exact signal").
 fn cw_center_click_freq(mode: spectrum::Mode, clicked_freq_hz: u32) -> u32 {
+    let pitch = spectrum::cw_pitch_hz() as i64;
     match mode {
-        spectrum::Mode::Cwl => (clicked_freq_hz as i64 + spectrum::CW_PITCH_HZ as i64).max(0) as u32,
-        spectrum::Mode::Cwu => (clicked_freq_hz as i64 - spectrum::CW_PITCH_HZ as i64).max(0) as u32,
+        spectrum::Mode::Cwl => (clicked_freq_hz as i64 + pitch).max(0) as u32,
+        spectrum::Mode::Cwu => (clicked_freq_hz as i64 - pitch).max(0) as u32,
         _ => clicked_freq_hz,
     }
 }

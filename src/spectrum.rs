@@ -97,7 +97,33 @@ impl Mode {
 /// doc comment) so a click on the spectrum/waterfall in CW mode lands
 /// the clicked signal centered in the filter rather than at the dial
 /// frequency itself (which would put it right at the passband's edge).
-pub const CW_PITCH_HZ: f64 = 600.0;
+///
+/// Adjustable via Settings -> CW -> CW Pitch (main.rs). A plain global
+/// atomic rather than a value threaded through passband_for's own
+/// signature: passband_for is called from several places with no
+/// common "owner" object to hang a setting off of (this file's own
+/// real-time demod thread, tci.rs, tx.rs, main.rs's UI) -- see
+/// diversity_gain_db/diversity_phase_deg (radio.rs's RadioSession) for
+/// the more typical constructor-injected-Arc<Atomic> pattern this
+/// project uses when there IS one common owner. Stored as whole Hz
+/// (u32, not a float) since there's no real use for fractional-Hz
+/// pitch precision -- default 600Hz matches this project's own
+/// historical fixed value, so anyone who's never touched the new
+/// setting sees no change.
+static CW_PITCH_HZ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(600);
+
+pub fn cw_pitch_hz() -> f64 {
+    CW_PITCH_HZ.load(Ordering::Relaxed) as f64
+}
+
+/// Clamped to a broad but sane 300-1000Hz range -- outside that isn't a
+/// real CW pitch a human would zero-beat to, and passband_for's own
+/// math (below) assumes a positive pitch comfortably larger than half
+/// the passband width.
+pub fn set_cw_pitch_hz(hz: f64) {
+    let clamped = hz.round().clamp(300.0, 1000.0) as u32;
+    CW_PITCH_HZ.store(clamped, Ordering::Relaxed);
+}
 
 /// Computes passband edges (Hz, relative to the tuned/dial frequency)
 /// from mode + a single "width" control. This is our own UI convention,
@@ -113,8 +139,14 @@ pub fn passband_for(mode: Mode, width_hz: f64) -> (f64, f64) {
         Mode::Dsb | Mode::Am | Mode::Sam | Mode::Drm | Mode::Spec | Mode::Fmn => {
             (-width_hz, width_hz)
         }
-        Mode::Cwl => (-(CW_PITCH_HZ + width_hz / 2.0), -(CW_PITCH_HZ - width_hz / 2.0)),
-        Mode::Cwu => (CW_PITCH_HZ - width_hz / 2.0, CW_PITCH_HZ + width_hz / 2.0),
+        Mode::Cwl => {
+            let pitch = cw_pitch_hz();
+            (-(pitch + width_hz / 2.0), -(pitch - width_hz / 2.0))
+        }
+        Mode::Cwu => {
+            let pitch = cw_pitch_hz();
+            (pitch - width_hz / 2.0, pitch + width_hz / 2.0)
+        }
     }
 }
 
