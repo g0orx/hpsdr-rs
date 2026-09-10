@@ -34,8 +34,8 @@ use discovery::{manual_discovery, Boards, Device};
 use discovery_ui::{DiscoveryAction, DiscoveryWindow};
 use eframe::egui;
 use radio::{
-    IqSample, RadioSession, RadioSettings, TX_AUDIO_SOURCE_AUTO, TX_AUDIO_SOURCE_LOCAL_MIC,
-    TX_AUDIO_SOURCE_RADIO_MIC,
+    IqSample, RadioSession, RadioSettings, CW_KEYER_MODE_IAMBIC_A, CW_KEYER_MODE_IAMBIC_B,
+    CW_KEYER_MODE_STRAIGHT, TX_AUDIO_SOURCE_AUTO, TX_AUDIO_SOURCE_LOCAL_MIC, TX_AUDIO_SOURCE_RADIO_MIC,
 };
 use rigctl::RigctlServer;
 use spectrum::{SpectrumHandle, ALL_MODES};
@@ -1100,6 +1100,24 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
             session
                 .tx_power_watts
                 .store(cfg.tx_power_watts.unwrap_or(2), Ordering::Relaxed);
+            // CW keyer settings -- see RadioSession::cw_keyer's doc
+            // comment for the defaults (match piHPSDR's own, a known-
+            // working reference for this exact radio family).
+            session.cw_keyer.mode.store(cfg.cw_keyer_mode.unwrap_or(CW_KEYER_MODE_IAMBIC_A), Ordering::Relaxed);
+            session.cw_keyer.speed_wpm.store(cfg.cw_keyer_speed_wpm.unwrap_or(16), Ordering::Relaxed);
+            session.cw_keyer.weight.store(cfg.cw_keyer_weight.unwrap_or(50), Ordering::Relaxed);
+            session
+                .cw_keyer
+                .sidetone_volume
+                .store(cfg.cw_keyer_sidetone_volume.unwrap_or(50), Ordering::Relaxed);
+            session
+                .cw_keyer
+                .sidetone_freq_hz
+                .store(cfg.cw_keyer_sidetone_freq_hz.unwrap_or(800), Ordering::Relaxed);
+            session
+                .cw_keyer
+                .hang_time_ms
+                .store(cfg.cw_keyer_hang_time_ms.unwrap_or(500), Ordering::Relaxed);
             session.send_rx_audio_to_radio.store(
                 cfg.send_rx_audio_to_radio.unwrap_or(false),
                 Ordering::Relaxed,
@@ -1769,6 +1787,14 @@ impl eframe::App for HpsdrApp {
                     .store(connected.tune_active, std::sync::atomic::Ordering::Relaxed);
                 let sample_rate = connected.sample_rate;
                 let current_mode = connected.spectrum.mode();
+                // See RadioSession::cw_mode_active's doc comment -- the
+                // radio's own internal CW keyer only actually keys
+                // anything once its own paddle contacts close, but this
+                // gates whether it's armed to respond at all.
+                connected.session.cw_mode_active.store(
+                    matches!(current_mode, spectrum::Mode::Cwl | spectrum::Mode::Cwu),
+                    std::sync::atomic::Ordering::Relaxed,
+                );
                 let current_width = connected.spectrum.width_hz();
                 // Reused by resolve_tune (clamping a CTUN target so the
                 // passband stays fully on-screen) and by the passband
@@ -4832,7 +4858,147 @@ impl eframe::App for HpsdrApp {
                                             settings_changed = true;
                                         }
                                     });
-                                    ui.weak("More CW options (TX keyer, break-in, etc.) are planned here.");
+                                    ui.separator();
+
+                                    ui.label("Keyer (radio's own built-in/internal keyer):");
+                                    ui.weak(
+                                        "Configures the radio's own CW keyer for a paddle wired \
+                                         directly into the radio -- not a paddle connected to this PC.",
+                                    );
+
+                                    ui.horizontal(|ui| {
+                                        ui.label("Mode:");
+                                        let mode = connected.session.cw_keyer.mode.load(Ordering::Relaxed);
+                                        for (value, label) in [
+                                            (CW_KEYER_MODE_STRAIGHT, "Straight"),
+                                            (CW_KEYER_MODE_IAMBIC_A, "Iambic A"),
+                                            (CW_KEYER_MODE_IAMBIC_B, "Iambic B"),
+                                        ] {
+                                            if ui.add(egui::Button::selectable(mode == value, label)).clicked()
+                                                && mode != value
+                                            {
+                                                connected.session.cw_keyer.mode.store(value, Ordering::Relaxed);
+                                                settings_changed = true;
+                                            }
+                                        }
+                                    });
+
+                                    ui.horizontal(|ui| {
+                                        ui.label("Speed:");
+                                        let mut speed =
+                                            connected.session.cw_keyer.speed_wpm.load(Ordering::Relaxed) as f64;
+                                        if scroll_slider_f64(
+                                            ui,
+                                            &mut connected.slider_scroll_accum,
+                                            &mut speed,
+                                            1.0..=60.0,
+                                            1.0,
+                                            " WPM",
+                                        ) {
+                                            connected.session.cw_keyer.speed_wpm.store(speed as u32, Ordering::Relaxed);
+                                            settings_changed = true;
+                                        }
+                                    });
+
+                                    ui.horizontal(|ui| {
+                                        ui.label("Weight:").on_hover_text(
+                                            "Dot/dash timing ratio -- 50 is the standard 1:3 ratio; \
+                                             higher lengthens dashes/shortens dots, lower the reverse.",
+                                        );
+                                        let mut weight =
+                                            connected.session.cw_keyer.weight.load(Ordering::Relaxed) as f64;
+                                        if scroll_slider_f64(
+                                            ui,
+                                            &mut connected.slider_scroll_accum,
+                                            &mut weight,
+                                            0.0..=100.0,
+                                            1.0,
+                                            "",
+                                        ) {
+                                            connected.session.cw_keyer.weight.store(weight as u32, Ordering::Relaxed);
+                                            settings_changed = true;
+                                        }
+                                    });
+
+                                    ui.horizontal(|ui| {
+                                        ui.label("Sidetone Level:");
+                                        let mut level = connected
+                                            .session
+                                            .cw_keyer
+                                            .sidetone_volume
+                                            .load(Ordering::Relaxed) as f64;
+                                        if scroll_slider_f64(
+                                            ui,
+                                            &mut connected.slider_scroll_accum,
+                                            &mut level,
+                                            0.0..=255.0,
+                                            5.0,
+                                            "",
+                                        ) {
+                                            connected
+                                                .session
+                                                .cw_keyer
+                                                .sidetone_volume
+                                                .store(level as u32, Ordering::Relaxed);
+                                            settings_changed = true;
+                                        }
+                                    });
+
+                                    ui.horizontal(|ui| {
+                                        ui.label("Sidetone Frequency:").on_hover_text(
+                                            "What you hear in your own headphones while sending -- \
+                                             independent of CW Pitch above (which is the RX side).",
+                                        );
+                                        let mut freq = connected
+                                            .session
+                                            .cw_keyer
+                                            .sidetone_freq_hz
+                                            .load(Ordering::Relaxed) as f64;
+                                        if scroll_slider_f64(
+                                            ui,
+                                            &mut connected.slider_scroll_accum,
+                                            &mut freq,
+                                            100.0..=1000.0,
+                                            10.0,
+                                            " Hz",
+                                        ) {
+                                            connected
+                                                .session
+                                                .cw_keyer
+                                                .sidetone_freq_hz
+                                                .store(freq as u32, Ordering::Relaxed);
+                                            settings_changed = true;
+                                        }
+                                    });
+
+                                    ui.horizontal(|ui| {
+                                        ui.label("Break-in Delay:").on_hover_text(
+                                            "How long the radio holds TX after the last element \
+                                             before dropping back to RX.",
+                                        );
+                                        let mut hang = connected
+                                            .session
+                                            .cw_keyer
+                                            .hang_time_ms
+                                            .load(Ordering::Relaxed) as f64;
+                                        if scroll_slider_f64(
+                                            ui,
+                                            &mut connected.slider_scroll_accum,
+                                            &mut hang,
+                                            0.0..=1000.0,
+                                            10.0,
+                                            " ms",
+                                        ) {
+                                            connected
+                                                .session
+                                                .cw_keyer
+                                                .hang_time_ms
+                                                .store(hang as u32, Ordering::Relaxed);
+                                            settings_changed = true;
+                                        }
+                                    });
+
+                                    ui.weak("More CW options are planned here.");
                                 }
 
                                 SettingsTab::Agc => {
@@ -6671,6 +6837,18 @@ impl eframe::App for HpsdrApp {
                         tx_eq: connected.tx_handle.as_ref().map(|t| t.eq()),
                         tci_tx_gain: Some(connected.tci_tx_gain),
                         tx_power_watts: Some(connected.session.tx_power_watts.load(Ordering::Relaxed)),
+                        cw_keyer_mode: Some(connected.session.cw_keyer.mode.load(Ordering::Relaxed)),
+                        cw_keyer_speed_wpm: Some(connected.session.cw_keyer.speed_wpm.load(Ordering::Relaxed)),
+                        cw_keyer_weight: Some(connected.session.cw_keyer.weight.load(Ordering::Relaxed)),
+                        cw_keyer_sidetone_volume: Some(
+                            connected.session.cw_keyer.sidetone_volume.load(Ordering::Relaxed),
+                        ),
+                        cw_keyer_sidetone_freq_hz: Some(
+                            connected.session.cw_keyer.sidetone_freq_hz.load(Ordering::Relaxed),
+                        ),
+                        cw_keyer_hang_time_ms: Some(
+                            connected.session.cw_keyer.hang_time_ms.load(Ordering::Relaxed),
+                        ),
                         db_low: Some(connected.db_low),
                         db_low_auto: Some(connected.db_low_auto),
                         db_high: Some(connected.db_high),

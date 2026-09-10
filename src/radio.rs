@@ -311,6 +311,84 @@ fn ps_feedback_config(protocol: u8, board: Boards) -> Option<(u8, u8, Option<u8>
     }
 }
 
+/// Configuration for the radio's own built-in/internal CW keyer --
+/// see RadioSession::cw_keyer's doc comment for the full picture
+/// (Settings -> CW in main.rs). Bundled into one struct, rather than
+/// following tx_power_watts's own "one loose Arc<AtomicU32> field"
+/// pattern six separate times, purely to avoid adding six more
+/// parameters to the P1/P2 packet-builder functions below, several of
+/// which already have long signatures -- still atomic-based/lock-free
+/// internally, same read/write characteristics as tx_power_watts,
+/// just threaded as one Arc instead of six.
+///
+/// Values and defaults match piHPSDR's own CW menu (a known-working
+/// reference for this exact radio family) rather than being invented:
+/// Speed 1-60 WPM (default 16), Weight 0-100 (default 50), Sidetone
+/// level 0-127 on Protocol 1 / 0-255 on Protocol 2 (default 50,
+/// clamped per-protocol at the point each byte is actually built, not
+/// here), Sidetone frequency 100-1000Hz (default 800), Hang time
+/// (labeled "Break-in delay" in the UI -- matches piHPSDR's own CW
+/// menu wording for this exact value) 0-1000ms (default 500).
+pub struct CwKeyerAtomics {
+    /// 0 = Straight, 1 = Iambic A, 2 = Iambic B -- see CwKeyerMode.
+    pub mode: AtomicU32,
+    pub speed_wpm: AtomicU32,
+    pub weight: AtomicU32,
+    pub sidetone_volume: AtomicU32,
+    pub sidetone_freq_hz: AtomicU32,
+    pub hang_time_ms: AtomicU32,
+}
+
+/// 0 = Straight, 1 = Iambic A, 2 = Iambic B -- matches piHPSDR's
+/// KEYER_STRAIGHT/KEYER_MODE_A/KEYER_MODE_B values exactly (radio.h),
+/// which is also the numbering both protocols' own keyer-mode bits
+/// are built from below (see p1_build_packet's command 5 and
+/// p2_tx_specific_packet's byte 5).
+pub const CW_KEYER_MODE_STRAIGHT: u32 = 0;
+pub const CW_KEYER_MODE_IAMBIC_A: u32 = 1;
+pub const CW_KEYER_MODE_IAMBIC_B: u32 = 2;
+
+impl Default for CwKeyerAtomics {
+    fn default() -> Self {
+        Self {
+            mode: AtomicU32::new(CW_KEYER_MODE_IAMBIC_A),
+            speed_wpm: AtomicU32::new(16),
+            weight: AtomicU32::new(50),
+            sidetone_volume: AtomicU32::new(50),
+            sidetone_freq_hz: AtomicU32::new(800),
+            hang_time_ms: AtomicU32::new(500),
+        }
+    }
+}
+
+/// Plain snapshot of CwKeyerAtomics's values, taken once per packet
+/// cycle by each sender loop -- same "load the atomics once, pass
+/// plain values down into the packet builder" convention this file
+/// already uses for tx_power_watts_val/pa_gain_db etc., just bundled
+/// into one struct instead of six more scalar parameters.
+#[derive(Clone, Copy)]
+struct CwKeyerValues {
+    mode: u32,
+    speed_wpm: u32,
+    weight: u32,
+    sidetone_volume: u32,
+    sidetone_freq_hz: u32,
+    hang_time_ms: u32,
+}
+
+impl CwKeyerValues {
+    fn load(atomics: &CwKeyerAtomics) -> Self {
+        Self {
+            mode: atomics.mode.load(Ordering::Relaxed),
+            speed_wpm: atomics.speed_wpm.load(Ordering::Relaxed),
+            weight: atomics.weight.load(Ordering::Relaxed),
+            sidetone_volume: atomics.sidetone_volume.load(Ordering::Relaxed),
+            sidetone_freq_hz: atomics.sidetone_freq_hz.load(Ordering::Relaxed),
+            hang_time_ms: atomics.hang_time_ms.load(Ordering::Relaxed),
+        }
+    }
+}
+
 pub struct RadioSession {
     pub iq_buffers: Vec<Arc<Mutex<VecDeque<IqSample>>>>,
     pub frequency_hz: Arc<AtomicU32>,
@@ -382,6 +460,23 @@ pub struct RadioSession {
     /// PA doesn't need a separate "tune mode" signal, and HermesLite2 is
     /// P1-only hardware (P2 sender loop never reads this).
     pub tune_active: Arc<std::sync::atomic::AtomicBool>,
+    /// Live CW keyer settings (Speed/Mode/Weight/Sidetone/Break-in
+    /// delay) -- see CwKeyerAtomics's own doc comment. Read by both
+    /// protocol sender loops and sent to the radio on every packet
+    /// cycle regardless of mode (same "always sent, only meaningful
+    /// while active" convention as tx_power_watts) -- see
+    /// cw_mode_active below for the actual CW-enable gating.
+    pub cw_keyer: Arc<CwKeyerAtomics>,
+    /// Set by main.rs, once per frame, from whether the receiver's
+    /// current mode is Cwl/Cwu (spectrum::Mode) -- radio.rs has no
+    /// concept of demod modes itself (that's SpectrumHandle's), same
+    /// "main.rs pushes down whatever it already knows" reasoning as
+    /// tune_active above. Gates the CW-enable bit in both protocols'
+    /// packet builders (P1 command 7 C1 bit0, P2 tx_specific byte 5
+    /// bit 0x02) -- true only actually keys anything once the radio's
+    /// OWN paddle contacts close, this alone just arms the radio's
+    /// internal keyer to respond if they do.
+    pub cw_mode_active: Arc<std::sync::atomic::AtomicBool>,
     /// Set by main.rs, once per frame, from the currently active band's
     /// (or XVTR's) configured Open Collector Rx mask -- see main.rs's
     /// OcMask struct and its per-frame OC resolution block. Bits 0-6 =
@@ -922,6 +1017,8 @@ impl RadioSession {
         // a first-ever TX test at full drive into whatever's connected
         // to the antenna port.
         let tx_power_watts = Arc::new(AtomicU32::new(2));
+        let cw_keyer = Arc::new(CwKeyerAtomics::default());
+        let cw_mode_active = Arc::new(AtomicBool::new(false));
         let pa_gain_db = Arc::new(AtomicU32::new(DEFAULT_PA_GAIN_DB.to_bits()));
         let tx_forward_power = Arc::new(AtomicU32::new(0));
         let tx_reverse_power = Arc::new(AtomicU32::new(0));
@@ -959,7 +1056,7 @@ impl RadioSession {
         let mut result = if device.board == Boards::Ozy {
             start_protocol1_ozy_usb(
                 device, settings, frequency_hz, tx_frequency_hz, rx_frequency_hz, requested_frequency_hz, sample_rate, adc, antenna, rx_attenuation,
-                ps_tx_attenuation, mox, tx_iq, tci_tx_audio, tci_tx_gain, tx_power_watts, pa_gain_db,
+                ps_tx_attenuation, mox, tx_iq, tci_tx_audio, tci_tx_gain, tx_power_watts, cw_keyer, cw_mode_active, pa_gain_db,
                 tx_forward_power, tx_reverse_power, adc0_overload, adc1_overload,
                 tx_fifo_underrun, tx_fifo_overrun, ps_rx_feedback_iq, ps_tx_feedback_iq,
                 rx_audio_to_radio, send_rx_audio_to_radio, radio_mic_audio, tx_audio_source,
@@ -971,7 +1068,7 @@ impl RadioSession {
             match device.protocol {
             1 => start_protocol1(
                 device, settings, frequency_hz, tx_frequency_hz, rx_frequency_hz, requested_frequency_hz, sample_rate, adc, antenna, rx_attenuation,
-                ps_tx_attenuation, mox, tx_iq, tci_tx_audio, tci_tx_gain, tx_power_watts, pa_gain_db,
+                ps_tx_attenuation, mox, tx_iq, tci_tx_audio, tci_tx_gain, tx_power_watts, cw_keyer, cw_mode_active, pa_gain_db,
                 tx_forward_power, tx_reverse_power, adc0_overload, adc1_overload,
                 tx_fifo_underrun, tx_fifo_overrun, ps_rx_feedback_iq, ps_tx_feedback_iq,
                 rx_audio_to_radio, send_rx_audio_to_radio, radio_mic_audio, tx_audio_source,
@@ -981,7 +1078,7 @@ impl RadioSession {
             ),
             2 => start_protocol2(
                 device, settings, frequency_hz, tx_frequency_hz, rx_frequency_hz, requested_frequency_hz, sample_rate, adc, antenna, rx_attenuation,
-                ps_tx_attenuation, mox, tx_iq, tci_tx_audio, tci_tx_gain, tx_power_watts, pa_gain_db,
+                ps_tx_attenuation, mox, tx_iq, tci_tx_audio, tci_tx_gain, tx_power_watts, cw_keyer, cw_mode_active, pa_gain_db,
                 tx_forward_power, tx_reverse_power, adc0_overload, adc1_overload,
                 tx_fifo_underrun, tx_fifo_overrun, ps_rx_feedback_iq, ps_tx_feedback_iq,
                 rx_audio_to_radio, send_rx_audio_to_radio, radio_mic_audio, tx_audio_source,
@@ -1207,6 +1304,8 @@ fn start_protocol1(
     tci_tx_audio: Arc<Mutex<VecDeque<f32>>>,
     tci_tx_gain: Arc<Mutex<f32>>,
     tx_power_watts: Arc<AtomicU32>,
+    cw_keyer: Arc<CwKeyerAtomics>,
+    cw_mode_active: Arc<AtomicBool>,
     pa_gain_db: Arc<AtomicU32>,
     tx_forward_power: Arc<AtomicU32>,
     tx_reverse_power: Arc<AtomicU32>,
@@ -1391,6 +1490,8 @@ fn start_protocol1(
     let sender_active_receiver_count = Arc::clone(&active_receiver_count);
     let sender_extra_frequencies_hz = extra_frequencies_hz.clone();
     let sender_tx_power_watts = Arc::clone(&tx_power_watts);
+    let sender_cw_keyer = Arc::clone(&cw_keyer);
+    let sender_cw_mode_active = Arc::clone(&cw_mode_active);
     let sender_pa_gain_db = Arc::clone(&pa_gain_db);
     let sender_rx_attenuation = Arc::clone(&rx_attenuation);
     let sender_ps_tx_attenuation = Arc::clone(&ps_tx_attenuation);
@@ -1425,6 +1526,8 @@ fn start_protocol1(
             sender_extra_frequencies_hz,
             sender_antenna,
             sender_tx_power_watts,
+            sender_cw_keyer,
+            sender_cw_mode_active,
             sender_pa_gain_db,
             sender_rx_attenuation,
             sender_ps_tx_attenuation,
@@ -1533,6 +1636,8 @@ fn start_protocol1(
         diversity_main_raw_iq,
         puresignal_enabled,
         tx_power_watts,
+        cw_keyer,
+        cw_mode_active,
         pa_gain_db,
         tx_forward_power,
         tx_reverse_power,
@@ -1599,6 +1704,8 @@ fn start_protocol1_ozy_usb(
     tci_tx_audio: Arc<Mutex<VecDeque<f32>>>,
     tci_tx_gain: Arc<Mutex<f32>>,
     tx_power_watts: Arc<AtomicU32>,
+    cw_keyer: Arc<CwKeyerAtomics>,
+    cw_mode_active: Arc<AtomicBool>,
     pa_gain_db: Arc<AtomicU32>,
     tx_forward_power: Arc<AtomicU32>,
     tx_reverse_power: Arc<AtomicU32>,
@@ -1687,6 +1794,8 @@ fn start_protocol1_ozy_usb(
     let sender_active_receiver_count = Arc::clone(&active_receiver_count);
     let sender_extra_frequencies_hz = extra_frequencies_hz.clone();
     let sender_tx_power_watts = Arc::clone(&tx_power_watts);
+    let sender_cw_keyer = Arc::clone(&cw_keyer);
+    let sender_cw_mode_active = Arc::clone(&cw_mode_active);
     let sender_pa_gain_db = Arc::clone(&pa_gain_db);
     let sender_rx_attenuation = Arc::clone(&rx_attenuation);
     let sender_ps_tx_attenuation = Arc::clone(&ps_tx_attenuation);
@@ -1713,6 +1822,8 @@ fn start_protocol1_ozy_usb(
             sender_extra_frequencies_hz,
             sender_antenna,
             sender_tx_power_watts,
+            sender_cw_keyer,
+            sender_cw_mode_active,
             sender_pa_gain_db,
             sender_rx_attenuation,
             sender_ps_tx_attenuation,
@@ -1812,6 +1923,8 @@ fn start_protocol1_ozy_usb(
         diversity_main_raw_iq,
         puresignal_enabled,
         tx_power_watts,
+        cw_keyer,
+        cw_mode_active,
         pa_gain_db,
         tx_forward_power,
         tx_reverse_power,
@@ -2205,6 +2318,8 @@ fn p1_send_preconfig_and_start(
             is_hermes_lite,
             false, // disable_pa: nothing to key yet this early -- sender_loop's live value takes over immediately after
             false, // tune_active: never during startup config, nothing keyed yet
+            CwKeyerValues { mode: 0, speed_wpm: 0, weight: 0, sidetone_volume: 0, sidetone_freq_hz: 0, hang_time_ms: 0 }, // cw_keyer: irrelevant while cw_mode_active is false below
+            false, // cw_mode_active: never during startup config, nothing keyed yet
             0, // oc_rx: nothing to key yet this early -- sender_loop's live value takes over immediately after
             0, // oc_tx: not transmitting during startup config (mox false above), so never actually used
             rx_attenuation,
@@ -2289,6 +2404,10 @@ fn p1_build_packet(
     // (see this function's own HermesLite2 branch below) -- ignored
     // entirely for every other board.
     tune_active: bool,
+    // See RadioSession::cw_keyer/cw_mode_active's doc comments -- used
+    // by commands 5/7/8 below.
+    cw_keyer: CwKeyerValues,
+    cw_mode_active: bool,
     // See RadioSession::oc_rx/oc_tx's doc comments -- resolved masks
     // (bits 0-6 = OC1-OC7), used raw here (this project has no per-band
     // config infrastructure for P1 yet elsewhere -- see this function's
@@ -2651,7 +2770,20 @@ fn p1_build_packet(
             } else {
                 0x00
             };
-            (0x16, c1, 0x00, 0x00, 0x00)
+            // C3/C4: CW keyer speed/mode/weight -- see
+            // RadioSession::cw_keyer's doc comment. Sent unconditionally
+            // (not gated on cw_mode_active), same "always sent, only
+            // meaningful while the radio's own CW-enable bit -- command
+            // 7's C1 bit0 below -- is set" convention as tx_power_watts.
+            // Byte layout confirmed against piHPSDR's old_protocol.c
+            // (command 5 case): `output_buffer[C3] = cw_keyer_speed |
+            // (cw_keyer_mode<<6); output_buffer[C4] = cw_keyer_weight |
+            // (cw_keyer_spacing<<7);` -- C2's reversed-paddles bit and
+            // C4's spacing bit aren't exposed as settings yet (left at
+            // their reference defaults, both off).
+            let c3 = (cw_keyer.speed_wpm as u8 & 0x3F) | ((cw_keyer.mode as u8 & 0x3) << 6);
+            let c4 = cw_keyer.weight as u8 & 0x7F;
+            (0x16, c1, 0x00, c3, c4)
         }
         6 => {
             // Per-receiver ADC assignment (C1), 2 bits per wire index:
@@ -2720,16 +2852,57 @@ fn p1_build_packet(
         }
         7 => {
             // CW mode bit (C1) + sidetone volume/PTT delay (C2/C3).
-            // No CW support -- all off/zero.
-            (0x1E, 0x00, 0x00, 0x00, 0x00)
+            // Byte layout confirmed against piHPSDR's old_protocol.c
+            // (command 7 case): C1 bit0 set when
+            // `(txmode==CWU||CWL) && !tune && cw_keyer_internal &&
+            // !twotone` -- cw_mode_active already folds in the mode
+            // check (main.rs only sets it true for Cwl/Cwu) and the
+            // internal-keyer gate (this project has no other keyer
+            // source yet -- see CwKeyerAtomics's doc comment); !tune is
+            // reused directly from this function's own tune_active
+            // param. !twotone isn't threaded through here (radio.rs has
+            // no concept of it at all -- it's a tx.rs/WDSP-only PostGen
+            // source selection) -- low risk to omit: the CW-enable bit
+            // alone doesn't key anything by itself, it just arms the
+            // radio's internal keyer to respond if its OWN paddle
+            // contacts close, which Two Tone testing doesn't involve.
+            let c1: u8 = if cw_mode_active && !tune_active { 0x01 } else { 0x00 };
+            // C2: sidetone volume, clamped to this protocol's 7-bit
+            // range (piHPSDR's own CW menu restricts this control to
+            // 0-127 specifically for old-protocol boards; Protocol 2
+            // gets the full 0-255 byte -- see p2_tx_specific_packet).
+            let c2 = cw_keyer.sidetone_volume.min(127) as u8;
+            // C3: PTT delay -- fixed at piHPSDR's own default (20ms,
+            // radio.c: `cw_keyer_ptt_delay=20`), not exposed as a
+            // separate setting (not requested, and piHPSDR itself has
+            // no UI control for this either -- see CwKeyerAtomics's
+            // doc comment).
+            (0x1E, c1, c2, 20, 0x00)
         }
-        // Confirmed fixed values from the reference -- sent
-        // unconditionally every cycle by a working client
-        // regardless of any session state. Exact purpose not
-        // independently documented (possibly clock/codec init);
-        // included verbatim rather than omitted, since these were
-        // never sent at all before this fix.
-        8 => (0x20, 0x00, 0x00, 0x28, 0x0A),
+        8 => {
+            // CW keyer hang time (C1/C2, "Break-in delay" in the UI)
+            // and sidetone frequency (C3/C4). Byte layout confirmed
+            // against piHPSDR's old_protocol.c (command 8 case):
+            // `output_buffer[C1]=(cw_keyer_hang_time>>2)&0xFF;
+            // output_buffer[C2]=cw_keyer_hang_time&0x03;
+            // output_buffer[C3]=(cw_keyer_sidetone_frequency>>4)&0xFF;
+            // output_buffer[C4]=cw_keyer_sidetone_frequency&0x0F;` --
+            // i.e. a 10-bit hang time and a 12-bit frequency, each
+            // split high-byte/low-bits across two registers.
+            //
+            // Previously a hardcoded fixed tuple confirmed from a real
+            // reference capture (hang_time=0, sidetone_freq=650Hz) --
+            // this project had no CW keyer yet, so no live settings to
+            // encode. Replaced with the real computed values now that
+            // CwKeyerAtomics exists.
+            let hang = cw_keyer.hang_time_ms.min(1023);
+            let freq = cw_keyer.sidetone_freq_hz.min(4095);
+            let c1 = ((hang >> 2) & 0xFF) as u8;
+            let c2 = (hang & 0x03) as u8;
+            let c3 = ((freq >> 4) & 0xFF) as u8;
+            let c4 = (freq & 0x0F) as u8;
+            (0x20, c1, c2, c3, c4)
+        }
         9 => (0x22, 0x19, 0x00, 0xC8, 0x00),
         10 => {
             // BUG FIX: C2 bit 0x40 ("Synchronize RX5 and TX frequency
@@ -2863,6 +3036,8 @@ fn sender_loop(
     extra_frequencies_hz: Vec<Arc<AtomicU32>>,
     antenna: Arc<AtomicU32>,
     tx_power_watts: Arc<AtomicU32>,
+    cw_keyer: Arc<CwKeyerAtomics>,
+    cw_mode_active: Arc<AtomicBool>,
     pa_gain_db: Arc<AtomicU32>,
     rx_attenuation: Arc<AtomicU32>,
     ps_tx_attenuation: Arc<AtomicU32>,
@@ -3092,6 +3267,8 @@ fn sender_loop(
             is_hermes_lite,
             disable_pa.load(Ordering::Relaxed),
             tune_active.load(Ordering::Relaxed),
+            CwKeyerValues::load(&cw_keyer),
+            cw_mode_active.load(Ordering::Relaxed),
             oc_rx.load(Ordering::Relaxed),
             oc_tx.load(Ordering::Relaxed),
             rx_attenuation.load(Ordering::Relaxed) as u8,
@@ -3372,6 +3549,10 @@ fn ozy_sender_loop(
     extra_frequencies_hz: Vec<Arc<AtomicU32>>,
     antenna: Arc<AtomicU32>,
     tx_power_watts: Arc<AtomicU32>,
+    cw_keyer: Arc<CwKeyerAtomics>,
+    // Deliberately unused -- see this function's own p1_build_packet
+    // call site for why Ozy always sends cw_mode_active=false.
+    _cw_mode_active: Arc<AtomicBool>,
     pa_gain_db: Arc<AtomicU32>,
     rx_attenuation: Arc<AtomicU32>,
     ps_tx_attenuation: Arc<AtomicU32>,
@@ -3425,6 +3606,17 @@ fn ozy_sender_loop(
             false, // is_hermes_lite -- Ozy is never a HermesLite-family board
             disable_pa.load(Ordering::Relaxed),
             false, // tune_active -- irrelevant when is_hermes_lite is false above
+            CwKeyerValues::load(&cw_keyer),
+            // cw_mode_active: classic Ozy/Mercury/Penny hardware is a
+            // different, older device family than the Hermes/Angelia/
+            // Orion boards this feature was verified against (piHPSDR
+            // reference + this project's own real P2 packet capture,
+            // see CwKeyerAtomics's doc comment) -- no reference
+            // confirmation this board's firmware even implements the
+            // same command 5/7/8 CW keyer fields, so left inert here
+            // rather than guessed at, same "fail closed" reasoning as
+            // diversity/puresignal being hardcoded off just below.
+            false,
             oc_rx.load(Ordering::Relaxed),
             oc_tx.load(Ordering::Relaxed),
             rx_attenuation.load(Ordering::Relaxed) as u8,
@@ -3977,6 +4169,8 @@ fn start_protocol2(
     tci_tx_audio: Arc<Mutex<VecDeque<f32>>>,
     tci_tx_gain: Arc<Mutex<f32>>,
     tx_power_watts: Arc<AtomicU32>,
+    cw_keyer: Arc<CwKeyerAtomics>,
+    cw_mode_active: Arc<AtomicBool>,
     pa_gain_db: Arc<AtomicU32>,
     tx_forward_power: Arc<AtomicU32>,
     tx_reverse_power: Arc<AtomicU32>,
@@ -4127,6 +4321,8 @@ fn start_protocol2(
     let sender_active_count = Arc::clone(&active_receiver_count);
     let sender_mox = Arc::clone(&mox);
     let sender_tx_power_watts = Arc::clone(&tx_power_watts);
+    let sender_cw_keyer = Arc::clone(&cw_keyer);
+    let sender_cw_mode_active = Arc::clone(&cw_mode_active);
     let sender_pa_gain_db = Arc::clone(&pa_gain_db);
     let sender_hp_request = Arc::clone(&hp_request);
     let sender_ps_tx_attenuation = Arc::clone(&ps_tx_attenuation);
@@ -4159,6 +4355,8 @@ fn start_protocol2(
             sender_active_count,
             sender_mox,
             sender_tx_power_watts,
+            sender_cw_keyer,
+            sender_cw_mode_active,
             sender_pa_gain_db,
             sender_hp_request,
             sender_puresignal_enabled,
@@ -4278,6 +4476,8 @@ fn start_protocol2(
         diversity_main_raw_iq,
         puresignal_enabled,
         tx_power_watts,
+        cw_keyer,
+        cw_mode_active,
         pa_gain_db,
         tx_forward_power,
         tx_reverse_power,
@@ -4458,6 +4658,7 @@ fn p2_ddc_specific_packet(
 // -- see p2_tx_specific_packet.
 const P2_TX_SPECIFIC_PACKET_SIZE: usize = 60;
 
+#[allow(clippy::too_many_arguments)]
 fn p2_tx_specific_packet(
     seq: u32,
     mic_ptt_enabled: bool,
@@ -4465,6 +4666,9 @@ fn p2_tx_specific_packet(
     mic_ptt_on_tip: bool,
     mox_on: bool,
     ps_tx_attenuation: u8,
+    // See RadioSession::cw_keyer/cw_mode_active's doc comments.
+    cw_keyer: CwKeyerValues,
+    cw_mode_active: bool,
 ) -> [u8; P2_TX_SPECIFIC_PACKET_SIZE] {
     let mut p = [0u8; P2_TX_SPECIFIC_PACKET_SIZE];
     p[0..4].copy_from_slice(&seq.to_be_bytes());
@@ -4480,21 +4684,45 @@ fn p2_tx_specific_packet(
     // 14..17 -- an earlier version of this file invented one there,
     // which was wrong; removed.
     //
-    // What the reference DOES set here, which this project doesn't
-    // populate yet (left at 0, i.e. all these features off/default) --
-    // confirmed non-zero in a real working session capture (values in
-    // parens are what was actually observed, not guessed): byte 5 --
-    // CW sidetone/keyer-mode/breakin flags (0x11 observed); byte 6 --
-    // sidetone volume (0x14 observed); bytes 7-8 -- sidetone frequency
-    // (0x028a = 650Hz observed); byte 9 -- keyer speed (0x0c = 12wpm
-    // observed); byte 10 -- keyer weight (0x1e observed); bytes 11-12
-    // -- keyer hang time (0x012c = 300ms observed); byte 51 -- line-in
-    // gain (0x10 observed). None of these looked related to the "no
-    // state transition" symptom (they're CW/audio-routing config, not
-    // TX-enable), so still left as a follow-up rather than guessed at
-    // -- but now with real confirmed values to match if it turns out
-    // to matter, rather than needing to reverse-engineer them blind.
-    //
+    // Byte 5 -- CW sidetone/keyer-mode/breakin flags; bytes 6-12 --
+    // sidetone volume/frequency, keyer speed/weight, hang time. This
+    // project's own earlier real working-session capture confirmed
+    // these bytes non-zero (byte 5=0x11, byte 6=0x14, bytes 7-8=0x028a
+    // (650Hz), byte 9=0x0c (12wpm), byte 10=0x1e, bytes 11-12=0x012c
+    // (300ms)) -- cross-validated byte-for-byte against piHPSDR's
+    // new_protocol.c (its own CW-config block for this exact packet),
+    // which is what the bit layout below is built from. Sent
+    // unconditionally like every other byte in this packet; byte 5's
+    // own 0x02 bit (and everything else in it) only actually takes
+    // effect while cw_mode_active is true, same "always sent, only
+    // meaningful while active" convention as tx_power_watts.
+    let mut b5 = 0u8;
+    if cw_mode_active {
+        b5 |= 0x02; // CW enable
+        if cw_keyer.sidetone_volume != 0 {
+            b5 |= 0x10; // sidetone on
+        }
+        b5 |= 0x80; // breakin/hang -- see CwKeyerAtomics's doc comment
+                    // for why this is always set once CW-enabled rather
+                    // than a separate on/off control: hang_time itself
+                    // (bytes 11-12 below) is the adjustable "how long".
+        b5 |= match cw_keyer.mode {
+            CW_KEYER_MODE_IAMBIC_A => 0x08,
+            CW_KEYER_MODE_IAMBIC_B => 0x28,
+            _ => 0x00, // CW_KEYER_MODE_STRAIGHT (referenced in main.rs's mode selector)
+        };
+    }
+    p[5] = b5;
+    // Full byte range on this protocol (unlike P1's 7-bit C2 -- see
+    // p1_build_packet's command 7 case).
+    p[6] = cw_keyer.sidetone_volume.min(255) as u8;
+    let sidetone_freq = cw_keyer.sidetone_freq_hz.min(u16::MAX as u32) as u16;
+    p[7..9].copy_from_slice(&sidetone_freq.to_be_bytes());
+    p[9] = cw_keyer.speed_wpm.min(255) as u8;
+    p[10] = cw_keyer.weight.min(255) as u8;
+    let hang_time = cw_keyer.hang_time_ms.min(u16::MAX as u32) as u16;
+    p[11..13].copy_from_slice(&hang_time.to_be_bytes());
+
     // Byte 50 -- mic/line routing flags: bits 0x01 (mic_linein) and
     // 0x02 (mic_boost) still left at 0/unimplemented (not requested).
     // Bits 0x04/0x08/0x10 confirmed against piHPSDR's new_protocol.c --
@@ -4854,6 +5082,8 @@ fn p2_sender_loop(
     active_receiver_count: Arc<AtomicU32>,
     mox: Arc<AtomicBool>,
     tx_power_watts: Arc<AtomicU32>,
+    cw_keyer: Arc<CwKeyerAtomics>,
+    cw_mode_active: Arc<AtomicBool>,
     pa_gain_db: Arc<AtomicU32>,
     hp_request: Arc<AtomicBool>,
     // PureSignal -- see ps_feedback_config's doc comment. DDC0/DDC1's
@@ -5077,6 +5307,8 @@ fn p2_sender_loop(
                 mic_ptt_on_tip.load(Ordering::Relaxed),
                 mox_on,
                 ps_tx_atten,
+                CwKeyerValues::load(&cw_keyer),
+                cw_mode_active.load(Ordering::Relaxed),
             );
             let hp =
                 p2_high_priority_packet(

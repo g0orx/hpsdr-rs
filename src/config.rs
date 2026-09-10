@@ -160,6 +160,22 @@ pub struct Config {
     /// reasoning for persisting this despite TX arming itself not being
     /// saved.
     pub tx_power_watts: Option<u32>,
+    /// CW keyer settings (Settings -> CW) for the radio's own built-in/
+    /// internal keyer -- see radio::CwKeyerAtomics's doc comment for
+    /// defaults/ranges. `None` (a config saved before this existed)
+    /// falls back to those same defaults.
+    #[serde(default)]
+    pub cw_keyer_mode: Option<u32>,
+    #[serde(default)]
+    pub cw_keyer_speed_wpm: Option<u32>,
+    #[serde(default)]
+    pub cw_keyer_weight: Option<u32>,
+    #[serde(default)]
+    pub cw_keyer_sidetone_volume: Option<u32>,
+    #[serde(default)]
+    pub cw_keyer_sidetone_freq_hz: Option<u32>,
+    #[serde(default)]
+    pub cw_keyer_hang_time_ms: Option<u32>,
     /// Per-band PA gain (dB) entered via the PA Calibration sliders
     /// (Settings -> TX), keyed by band name (see main.rs's BANDS).
     /// Feeds radio::drive_byte_for_watts in place of the flat
