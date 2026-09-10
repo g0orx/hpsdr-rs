@@ -8235,7 +8235,6 @@ fn render_extra_receiver_ui(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceiver>>) {
     });
 
     ui.add_space(4.0);
-    ui.label("Spectrum");
     // Split the window's remaining vertical space between the spectrum
     // and waterfall, according to rx.spectrum_waterfall_ratio
     // (adjustable via the drag handle between them) -- see the main
