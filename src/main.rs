@@ -2854,7 +2854,7 @@ impl eframe::App for HpsdrApp {
                             if recording {
                                 connected.spectrum.recorder.stop();
                             } else {
-                                match audio_recorder::recording_path() {
+                                match audio_recorder::recording_path("main") {
                                     Some(path) => {
                                         if let Err(e) = connected.spectrum.recorder.start(&path) {
                                             eprintln!("failed to start recording: {e}");
@@ -7993,6 +7993,42 @@ fn render_extra_receiver_ui(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceiver>>) {
                     }
                     rx.ctun = !rx.ctun;
                     rx.settings_dirty.store(true, Ordering::Relaxed);
+                }
+                // Same RX-audio-to-WAV recording as the main window's
+                // own Record button -- see its doc comment (main.rs)
+                // and audio_recorder.rs generally. Each receiver has
+                // its own independent SpectrumHandle::recorder, so
+                // recording here doesn't affect the main receiver or
+                // any other extra receiver, and vice versa.
+                let recording = rx.spectrum.recorder.is_enabled();
+                let (rec_label, rec_color) = if recording {
+                    ("Recording", egui::Color32::from_rgb(210, 50, 50))
+                } else {
+                    ("Record", egui::Color32::from_gray(60))
+                };
+                let rec_resp = ui
+                    .add(
+                        egui::Button::new(egui::RichText::new(rec_label).strong().color(egui::Color32::WHITE))
+                            .fill(rec_color),
+                    )
+                    .on_hover_text(if recording {
+                        "Click to stop recording"
+                    } else {
+                        "Record RX audio (what you hear) to a WAV file"
+                    });
+                if rec_resp.clicked() {
+                    if recording {
+                        rx.spectrum.recorder.stop();
+                    } else {
+                        match audio_recorder::recording_path(&format!("rx{}", rx.ddc_index)) {
+                            Some(path) => {
+                                if let Err(e) = rx.spectrum.recorder.start(&path) {
+                                    eprintln!("failed to start recording: {e}");
+                                }
+                            }
+                            None => eprintln!("failed to start recording: could not determine the recordings folder"),
+                        }
+                    }
                 }
                 // Only shown while this receiver is actually in CW mode
                 // -- see the main receiver's identical "CW Decode"

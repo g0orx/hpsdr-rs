@@ -134,7 +134,14 @@ fn finalize_wav_header(file: &mut File, data_bytes: u32) -> std::io::Result<()> 
 /// sortable, just not human-readable at a glance in a file browser.
 /// `None` if settings_dir() itself is unavailable (see its own doc
 /// comment) or the recordings folder couldn't be created.
-pub fn recording_path() -> Option<PathBuf> {
+///
+/// `receiver_label` (e.g. "main", "rx1") disambiguates filenames when
+/// more than one receiver's own Record button gets clicked within the
+/// same second -- without it, the main receiver and an extra receiver
+/// (or two extra receivers) starting a recording in the same second
+/// would compute the identical filename and one would silently
+/// clobber the other's file mid-write.
+pub fn recording_path(receiver_label: &str) -> Option<PathBuf> {
     let mut dir = crate::config::settings_dir()?;
     dir.push("recordings");
     std::fs::create_dir_all(&dir).ok()?;
@@ -142,7 +149,7 @@ pub fn recording_path() -> Option<PathBuf> {
         .duration_since(std::time::UNIX_EPOCH)
         .ok()?
         .as_secs();
-    dir.push(format!("hpsdr-rs_{epoch_secs}.wav"));
+    dir.push(format!("hpsdr-rs_{epoch_secs}_{receiver_label}.wav"));
     Some(dir)
 }
 

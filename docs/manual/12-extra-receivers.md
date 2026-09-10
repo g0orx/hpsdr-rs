@@ -24,11 +24,14 @@ whether or not PureSignal is actually enabled.
 
 ## Using an extra receiver window
 
-It behaves like a scaled-down version of the main window: frequency
-display, band and mode rows, **Filter width** and **Audio gain** sliders,
-the CTUN/NB/NR/SNB/ANF/BIN/AGC/AGC Gain/RIT toggle row (unlike the main
-window, CTUN stays in this same row here rather than moving into its own
-spot -- extra receivers have no A<>B/Split box to sit below) -- RIT here
+It behaves like a scaled-down version of the main window: VFO-A/VFO-B
+boxes with **A>B**/**B>A**/**A<>B** buttons (same as the main window's own
+-- see [Frequency display and tuning](02-main-window.md#frequency-display-and-tuning)
+-- but no **Split** button, since extra receivers never transmit), with
+**CTUN** and, while in CW mode, **CW Decode** (see
+[CW decoder](02-main-window.md#cw-decoder)) in the row underneath, band
+and mode rows, **Filter width** and **Audio gain** sliders, the
+**Record**/NB/NR/SNB/ANF/BIN/AGC/AGC Gain/RIT toggle row -- RIT here
 works the same as the
 main window's own (see [Transmit controls](02-main-window.md#transmit-controls)),
 just always visible rather than tucked into a TX-only row, since it's a
@@ -38,6 +41,13 @@ transmit) -- its own spectrum and waterfall panes with their own
 the waterfall (click or scroll to tune, same conventions as the main
 window, though Ctrl+scroll's 10kHz-step tuning gesture isn't available
 here), and its own S-meter with a **Settings...** button.
+
+**Record** here works exactly like the main window's own [Record
+button](02-main-window.md#record) -- its own independent recording of
+this receiver's RX audio, landing in the same `recordings` folder,
+distinguished from the main receiver's (and any other extra receiver's)
+by a `rxN` suffix on the filename (e.g. `hpsdr-rs_<timestamp>_rx1.wav`)
+so simultaneous recordings from different receivers never collide.
 
 ## Extra receiver Settings
 

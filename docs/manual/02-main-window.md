@@ -13,7 +13,11 @@ that VFO is the one actually transmitting (see
 
 - **Scroll** while hovering the frequency display, or the spectrum/waterfall
   panes: steps by 1 kHz per notch. Hold **Shift** while scrolling for 100 Hz
-  steps.
+  steps. In CW mode (**CWL**/**CWU**), steps are finer -- 100 Hz per notch,
+  10 Hz with Shift -- matching how tightly CW is normally zero-beaten.
+  Clicking a signal on the spectrum/waterfall in CW mode also centers it in
+  the (narrow) CW filter passband rather than at the dial frequency itself
+  -- see [CW Decode](#cw-decode) below.
 - **Ctrl + scroll** (or a pinch/zoom gesture) over the spectrum: steps by
   10 kHz per notch.
 - **Click** directly on the spectrum or waterfall: retunes straight to the
@@ -41,6 +45,18 @@ visible spectrum span.
 While CTUN is on, VFO B's **B>A** and **A<>B** buttons (below) move the
 CTUN listen point the same clamped way, rather than retuning the radio's
 actual hardware oscillator.
+
+### CW Decode
+
+The **CW Decode** button (next to **CTUN**, only shown while actually in
+**CWL**/**CWU**) shows or hides a built-in, single-signal CW (Morse)
+decoder panel beside the spectrum/waterfall -- whatever signal is
+actually tuned in and audible, not a multi-signal "skimmer". Hiding it
+doesn't stop it decoding in the background, so toggling it back on
+doesn't lose anything already decoded; use its own **Clear** button to
+reset the decoded text. Each extra receiver window has its own
+independent **CW Decode** button and panel, next to that receiver's own
+CTUN.
 
 ## VFO A / VFO B / Split
 
@@ -149,7 +165,12 @@ Files land in a `recordings` folder alongside this radio's other saved
 settings -- `~/.config/hpsdr-rs/recordings/` (Linux),
 `%APPDATA%\hpsdr-rs\recordings\` (Windows), or `~/Library/Application
 Support/hpsdr-rs/recordings/` (macOS) -- named by when the recording
-started, e.g. `hpsdr-rs_1788972349.wav`.
+started plus which receiver it came from, e.g.
+`hpsdr-rs_1788972349_main.wav`. Every [extra receiver
+window](12-extra-receivers.md) has its own independent **Record** button
+too -- its recordings land in the same folder, suffixed `rxN` instead of
+`main` (e.g. `hpsdr-rs_1788972349_rx1.wav`), so simultaneous recordings
+from different receivers never collide.
 
 ## Transmit controls
 
