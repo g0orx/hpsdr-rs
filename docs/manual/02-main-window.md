@@ -49,14 +49,15 @@ actual hardware oscillator.
 ### CW Decode
 
 The **CW Decode** button (next to **CTUN**, only shown while actually in
-**CWL**/**CWU**) shows or hides a built-in, single-signal CW (Morse)
-decoder panel beside the spectrum/waterfall -- whatever signal is
-actually tuned in and audible, not a multi-signal "skimmer". Hiding it
-doesn't stop it decoding in the background, so toggling it back on
-doesn't lose anything already decoded; use its own **Clear** button to
-reset the decoded text. Each extra receiver window has its own
-independent **CW Decode** button and panel, next to that receiver's own
-CTUN.
+**CWL**/**CWU**) turns a built-in, single-signal CW (Morse) decoder on or
+off -- whatever signal is actually tuned in and audible, not a
+multi-signal "skimmer". Turning it off both hides its panel beside the
+spectrum/waterfall and stops it decoding, so turning it back on starts
+decoding fresh from that point rather than revealing a backlog of
+whatever was sent while it was off. Already-decoded text stays visible
+until you clear it yourself (the panel's own **Clear** button) or
+reconnect. Each extra receiver window has its own independent **CW
+Decode** button and panel, next to that receiver's own CTUN.
 
 ## VFO A / VFO B / Split
 

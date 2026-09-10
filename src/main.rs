@@ -636,14 +636,16 @@ struct ConnectedState {
     /// unaffected -- this app has no dual-watch/second-RX-chain
     /// concept, so VFO A keeps receiving regardless of Split.
     split: bool,
-    /// UI-only visibility toggle for the CW decoder panel (see the
-    /// "CW Decode" button next to CTUN) -- does NOT stop the
-    /// decoder itself from running in the background (spectrum.rs's
-    /// run() thread keeps feeding it purely based on the receiver's
-    /// actual mode, unaware this flag even exists), only whether
-    /// main.rs actually draws its panel/reserves space for it. Default
-    /// true so existing behavior (decoder panel always shown in CW
-    /// mode) is unchanged for anyone who's never touched this button.
+    /// "CW Decode" toggle (button next to CTUN) -- controls both
+    /// whether main.rs draws the decoder panel AND (pushed to
+    /// spectrum.rs every frame via set_cw_decode_enabled) whether the
+    /// decoder itself actually decodes: disabling it stops new text
+    /// from accumulating, not just hides the panel, so re-enabling
+    /// resumes cleanly instead of revealing a backlog decoded while
+    /// hidden (a real report against an earlier version that only
+    /// hid the panel). Default true so existing behavior (decoder
+    /// panel always shown/active in CW mode) is unchanged for anyone
+    /// who's never touched this button.
     cw_decode_enabled: bool,
     /// RIT ("Receiver Incremental Tuning"): when on, rit_offset_hz is
     /// added to the RXA demod shift (see spectrum::SpectrumHandle::
@@ -1869,6 +1871,7 @@ impl eframe::App for HpsdrApp {
                 connected
                     .spectrum
                     .set_ctun(connected.ctun || connected.rit_enabled, ctun_offset_hz + rit_offset_hz);
+                connected.spectrum.set_cw_decode_enabled(connected.cw_decode_enabled);
                 // Zoom should keep the CTUN'd listen frequency (where the
                 // filter/passband actually is) centered, not the parked
                 // hardware LO -- otherwise the filter drifts toward one
@@ -2304,12 +2307,16 @@ impl eframe::App for HpsdrApp {
                                     }
                                     // Only shown while actually in CW
                                     // mode -- see cw_panel_visible's own
-                                    // doc comment further down for the
-                                    // full reasoning. Purely a
-                                    // visibility toggle for the decoder
-                                    // panel/its width reservation -- the
-                                    // decoder itself keeps running in
-                                    // the background regardless.
+                                    // doc comment further down. Also
+                                    // pushed to the decoder itself every
+                                    // frame (spectrum.rs's
+                                    // set_cw_decode_enabled) so it
+                                    // actually stops decoding while
+                                    // disabled, not just hides the panel
+                                    // -- a real report: without that,
+                                    // re-enabling dumped whatever had
+                                    // accumulated while hidden instead
+                                    // of resuming cleanly.
                                     if matches!(connected.spectrum.mode(), spectrum::Mode::Cwl | spectrum::Mode::Cwu)
                                         && ui
                                             .add(egui::Button::selectable(
@@ -7907,6 +7914,7 @@ fn render_extra_receiver_ui(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceiver>>) {
     // above).
     let rit_offset_hz = if rx.rit_enabled { rx.rit_offset_hz } else { 0.0 };
     rx.spectrum.set_ctun(rx.ctun || rx.rit_enabled, ctun_offset_hz + rit_offset_hz);
+    rx.spectrum.set_cw_decode_enabled(rx.cw_decode_enabled);
     rx.spectrum.set_zoom_pan(rx.spectrum_zoom, effective_pan);
     let dial_freq_hz = if rx.ctun { rx.ctun_frequency_hz } else { freq_hz };
 
@@ -8032,11 +8040,10 @@ fn render_extra_receiver_ui(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceiver>>) {
                 }
                 // Only shown while this receiver is actually in CW mode
                 // -- see the main receiver's identical "CW Decode"
-                // button (next to its own CTUN) for the full
-                // reasoning. Purely a visibility toggle for this
-                // receiver's own decoder panel/width reservation (see
-                // cw_panel_visible below) -- its decoder keeps running
-                // in the background regardless.
+                // button (next to its own CTUN) for the full reasoning,
+                // including why this also has to be pushed to the
+                // decoder itself (set_cw_decode_enabled below), not
+                // just gate the panel.
                 if cw_mode
                     && ui
                         .add(egui::Button::selectable(rx.cw_decode_enabled, "CW Decode"))

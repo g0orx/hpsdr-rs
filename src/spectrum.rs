@@ -1315,8 +1315,19 @@ fn run(
     iq_out: Arc<Mutex<VecDeque<(f32, f32)>>>,
     // Decoded-text output for the built-in CW decoder (see cw_decoder.rs)
     // -- fed from the same mono downmix as waveform_out below, but only
-    // while params.mode is actually Cwl/Cwu.
+    // while params.mode is actually Cwl/Cwu AND cw_decode_enabled below
+    // is true.
     cw_text: Arc<Mutex<String>>,
+    // UI-side "CW Decode" toggle (see main.rs's button next to CTUN) --
+    // pushed here every frame regardless of change, same pattern as
+    // set_ctun/set_mode etc. below. A real report: hiding the panel
+    // alone (the UI-only toggle this started as) wasn't enough --
+    // decoding continued in the background, so re-enabling dumped
+    // whatever had accumulated while hidden instead of resuming
+    // cleanly. Stopping process_sample() calls here (not just hiding
+    // the panel in main.rs) fixes that: no new text while disabled, so
+    // there's nothing to dump when it's turned back on.
+    cw_decode_enabled: Arc<AtomicBool>,
     // WAV-recording tap for main.rs's "Record" toolbar toggle -- see
     // audio_recorder.rs. Written from the SAME post-Audio-Gain (l, r)
     // frame as the local speaker's own audio_out push below (matching
@@ -1413,7 +1424,8 @@ fn run(
         let meter_db = analyzer.meter_db();
         display.lock().unwrap().meter_db = meter_db;
         let cw_mode = matches!(params.mode, Mode::Cwl | Mode::Cwu);
-        if !cw_mode {
+        let cw_active = cw_mode && cw_decode_enabled.load(Ordering::Relaxed);
+        if !cw_active {
             cw_decoder.reset();
         }
         {
@@ -1490,7 +1502,7 @@ fn run(
                     waveform_out.pop_front();
                 }
                 waveform_out.push_back(mono.clamp(-1.0, 1.0));
-                if cw_mode {
+                if cw_active {
                     cw_decoder.process_sample(mono);
                 }
                 // Local speaker playback and TCI's RX audio stream carry
@@ -1551,10 +1563,17 @@ pub struct SpectrumHandle {
     /// the same way this file normalizes IQ elsewhere (IQ_NORM).
     pub iq_out: Arc<Mutex<VecDeque<(f32, f32)>>>,
     /// Decoded text from the built-in CW decoder (see cw_decoder.rs) --
-    /// only actually written to while params.mode is Cwl/Cwu; read via
-    /// the cw_text()/clear_cw_text() accessors below rather than
-    /// directly, same as demod_params.
+    /// only actually written to while params.mode is Cwl/Cwu AND
+    /// cw_decode_enabled below is true; read via the
+    /// cw_text()/clear_cw_text() accessors below rather than directly,
+    /// same as demod_params.
     cw_text: Arc<Mutex<String>>,
+    /// UI-side "CW Decode" toggle -- see run()'s own doc comment on
+    /// this same field for why the decoder itself needs to know about
+    /// it, not just main.rs's panel-visibility check. Defaults true
+    /// (matches this project's other "existing behavior unchanged"
+    /// toggles) via set_cw_decode_enabled's own call site.
+    cw_decode_enabled: Arc<AtomicBool>,
     /// WAV-recording control for main.rs's "Record" toolbar toggle --
     /// see audio_recorder.rs. `AudioRecorder` is itself already a
     /// cheap `Clone`-able handle (like this whole struct's other
@@ -1610,6 +1629,7 @@ impl SpectrumHandle {
         let waveform_out = Arc::new(Mutex::new(VecDeque::with_capacity(WAVEFORM_TAP_CAPACITY)));
         let iq_out = Arc::new(Mutex::new(VecDeque::with_capacity(IQ_OUT_CAPACITY)));
         let cw_text = Arc::new(Mutex::new(String::new()));
+        let cw_decode_enabled = Arc::new(AtomicBool::new(true));
         let recorder = AudioRecorder::new();
         let stop = Arc::new(AtomicBool::new(false));
         let thread = {
@@ -1620,6 +1640,7 @@ impl SpectrumHandle {
             let waveform_out = Arc::clone(&waveform_out);
             let iq_out = Arc::clone(&iq_out);
             let cw_text = Arc::clone(&cw_text);
+            let cw_decode_enabled = Arc::clone(&cw_decode_enabled);
             let recorder = recorder.clone();
             let stop = Arc::clone(&stop);
             thread::spawn(move || {
@@ -1634,6 +1655,7 @@ impl SpectrumHandle {
                     waveform_out,
                     iq_out,
                     cw_text,
+                    cw_decode_enabled,
                     recorder,
                     rx_audio_to_radio,
                     mox,
@@ -1649,6 +1671,7 @@ impl SpectrumHandle {
             waveform_out,
             iq_out,
             cw_text,
+            cw_decode_enabled,
             recorder,
             demod_params,
             channel,
@@ -1700,6 +1723,15 @@ impl SpectrumHandle {
 
     pub fn clear_cw_text(&self) {
         self.cw_text.lock().unwrap().clear();
+    }
+
+    /// Pushed from main.rs every frame regardless of change (same
+    /// pattern as set_ctun/set_mode etc. below) -- see run()'s own doc
+    /// comment on cw_decode_enabled for why the decoder itself needs to
+    /// know about the UI's "CW Decode" toggle, not just whether its
+    /// panel is being drawn.
+    pub fn set_cw_decode_enabled(&self, enabled: bool) {
+        self.cw_decode_enabled.store(enabled, Ordering::Relaxed);
     }
 
     pub fn width_hz(&self) -> f64 {
