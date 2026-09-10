@@ -157,14 +157,22 @@ impl AudioOutput {
     }
 }
 
-/// Maximum latency this generator lets its own writes carry in
-/// audio_out, enforced every tick (not just as an overflow backstop) --
-/// see run()'s own doc comment on why a large passive cap (this used to
-/// be spectrum.rs's own 0.3s AUDIO_BUFFER_CAPACITY) let a transient
-/// backlog turn into audible desync and a lingering tail after key-up.
-/// 10ms is enough slack to absorb this thread's own ~2ms poll jitter
-/// without constantly trimming in the healthy case.
-const CW_SIDETONE_TARGET_LATENCY_SAMPLES: usize = OUTPUT_SAMPLE_RATE as usize / 100;
+/// Pure overflow backstop for this generator's writes into audio_out --
+/// same "small, bounded, drop-oldest" reasoning as spectrum.rs's own
+/// AUDIO_BUFFER_CAPACITY, and deliberately the SAME size: this is only
+/// insurance against a genuine pathological stall (e.g. the process
+/// briefly suspended), not a routine control. See run()'s own doc
+/// comment for why actually keeping the queue in sync/free of a
+/// lingering tail is handled by flushing on key transitions instead of
+/// by trimming to a tight target every tick -- an earlier version of
+/// this constant (10ms, enforced every tick) fought the audio backend's
+/// OWN normal output buffering (commonly tens of ms, decided by cpal's
+/// `BufferSize::Default`/the OS, not something this code controls),
+/// repeatedly ripping out samples mid-waveform that simply hadn't been
+/// played yet -- a real report: EVERY element sounded distorted, not
+/// just some, consistent with near-constant chopping rather than an
+/// occasional real desync.
+const CW_SIDETONE_BUFFER_CAPACITY: usize = 14_400;
 
 /// How long the sidetone's on/off envelope takes to ramp fully up or
 /// down, in samples at OUTPUT_SAMPLE_RATE. Same purpose as piHPSDR's own
@@ -250,34 +258,43 @@ impl Drop for CwSidetone {
 /// ROOT CAUSE FIX for a real report: initial testing sounded "OK" at
 /// first, then some elements distorted, occasionally drifted out of
 /// sync, and the tone kept sounding briefly after releasing the key.
-/// Two compounding bugs, both in this function as first written:
 ///
-/// 1. `keyed` was gated on key_down/cw_mode_active/enabled alone, NOT
-///    on mox -- but spectrum.rs's real RX-audio producer gates its own
-///    writes into this SAME queue purely on mox being false. Since
-///    main.rs's break-in hang-timer (which raises mox) reads the same
-///    key_down flag on its own ~16ms UI-frame cadence, there was a real
-///    window on every key-down where this thread could already be
-///    ramping up while spectrum.rs's thread was still pushing live RX
-///    audio into the same queue -- two producers, unsynchronized,
-///    landing in one FIFO. That's the distortion: audible RX content
-///    time-interleaved with the sidetone. Fixed by also requiring
-///    `mox` here, matching spectrum.rs's own gate exactly so the two
-///    producers are mutually exclusive rather than merely usually so.
-/// 2. The only backlog control was an overflow backstop sized for
-///    spectrum.rs's OWN continuous-stream use case (0.3s) -- fine for
-///    real RX audio, but for this thread's bursty on/off tone, any
-///    transient delay (scheduler jitter, mutex contention with
-///    spectrum.rs's thread on the same Mutex) could silently queue up
-///    to 0.3s of already-generated tone ahead of real time, which then
-///    plays out AFTER the envelope has correctly finished releasing --
-///    exactly the "still playing after I stop" and "gets out of sync"
-///    reports. Fixed by actively trimming to
-///    CW_SIDETONE_TARGET_LATENCY_SAMPLES (10ms) every tick, not just
-///    once some much larger cap is hit, and by flushing audio_out
-///    outright on every idle-to-keyed edge so a stale backlog (RX
-///    leftovers, or this thread's own prior release tail) never sits
-///    ahead of a fresh element in the queue.
+/// Bug #1: `keyed` was gated on key_down/cw_mode_active/enabled alone,
+/// NOT on mox -- but spectrum.rs's real RX-audio producer gates its own
+/// writes into this SAME queue purely on mox being false. Since main.
+/// rs's break-in hang-timer (which raises mox) reads the same key_down
+/// flag on its own ~16ms UI-frame cadence, there was a real window on
+/// every key-down where this thread could already be ramping up while
+/// spectrum.rs's thread was still pushing live RX audio into the same
+/// queue -- two producers, unsynchronized, landing in one FIFO. That's
+/// the distortion: audible RX content time-interleaved with the
+/// sidetone. Fixed by also requiring `mox` here, matching spectrum.rs's
+/// own gate exactly so the two producers are mutually exclusive rather
+/// than merely usually so.
+///
+/// Bug #2: any stale backlog already sitting in the queue when a key
+/// transition happens (leftover RX audio from just before mox went up,
+/// or this generator's own prior-element backlog) plays out BEFORE the
+/// freshly generated samples for the new state, since it's a FIFO --
+/// audible as sync drifting worse over a longer transmission, and as
+/// the tone continuing to sound for a bit after key-up (the queue was
+/// still draining old, already-generated at-full-volume samples).
+/// Fixed by flushing the queue outright on EVERY key transition (both
+/// directions), so only what's generated AFTER a transition (the fresh
+/// tone, or the fresh ramp-down) is ever queued following it.
+///
+/// A second attempt at bug #2 tried enforcing a tight (10ms) target
+/// latency on EVERY tick instead of only at transitions -- that was
+/// itself a bug: it fought the audio backend's own normal output
+/// buffering (commonly tens of ms, decided by cpal/the OS, not
+/// something this code controls), repeatedly ripping out samples mid-
+/// waveform that simply hadn't been played yet. A real report: EVERY
+/// element sounded distorted afterward, not just some -- consistent
+/// with near-constant chopping rather than an occasional real desync.
+/// Reverted to a purely transition-triggered flush plus a generous
+/// passive overflow backstop (CW_SIDETONE_BUFFER_CAPACITY, matching
+/// spectrum.rs's own AUDIO_BUFFER_CAPACITY) that only ever fires on a
+/// genuine pathological stall, never during ordinary playback.
 fn run(
     audio_out: Arc<Mutex<VecDeque<(f32, f32)>>>,
     mox: Arc<AtomicBool>,
@@ -308,12 +325,14 @@ fn run(
             && mox.load(Ordering::Relaxed)
             && cw_mode_active.load(Ordering::Relaxed)
             && key_down.load(Ordering::Relaxed);
-        if keyed && !was_keyed {
-            // Rising edge -- see this function's own doc comment (fix
-            // #2): drop anything already queued (stale RX audio from
-            // just before mox went up, or a previous element's
-            // leftover tail) so the fresh tone starts in sync with the
-            // actual key-down instead of queued behind old content.
+        if keyed != was_keyed {
+            // Any transition -- see this function's own doc comment
+            // (bug #2): drop anything already queued (stale RX audio
+            // from just before mox went up, or this generator's own
+            // backlog from before the transition) so only what's
+            // generated AFTER this point -- the fresh tone on a rising
+            // edge, or the fresh ramp-down on a falling edge -- is ever
+            // heard following it.
             audio_out.lock().unwrap().clear();
         }
         was_keyed = keyed;
@@ -350,12 +369,11 @@ fn run(
         }
         if !samples.is_empty() {
             let mut out = audio_out.lock().unwrap();
-            out.extend(samples);
-            // See this function's own doc comment (fix #2) -- actively
-            // keep the queue near real-time instead of only trimming
-            // once some much larger cap is hit.
-            while out.len() > CW_SIDETONE_TARGET_LATENCY_SAMPLES {
-                out.pop_front();
+            for pair in samples {
+                if out.len() >= CW_SIDETONE_BUFFER_CAPACITY {
+                    out.pop_front();
+                }
+                out.push_back(pair);
             }
         }
     }
