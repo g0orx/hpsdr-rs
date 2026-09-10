@@ -897,23 +897,35 @@ pub struct RadioSession {
     /// generally useful to surface for ordinary RX too.
     pub adc0_overload: Arc<AtomicBool>,
     pub adc1_overload: Arc<AtomicBool>,
-    /// Raw, instantaneous paddle-contact state (dot OR dash currently
-    /// closed) reported back by the radio's own internal keyer status
-    /// bits -- P1: C0 byte bits 1-2 of the incoming status frame
-    /// (already parsed into `c0` in parse_iq_stream, just never
-    /// consumed before now); P2: byte 4 bits 1-2 of the incoming
-    /// High-Priority status packet (same byte tx_fifo_overrun/
+    /// The radio's own real-time "am I actually keyed/transmitting right
+    /// now" status, as reported by its internal CW keyer -- P1: C0 byte
+    /// bit 0 of the incoming status frame; P2: byte 4 bit 0x01 of the
+    /// incoming High-Priority status packet (same byte tx_fifo_overrun/
     /// tx_fifo_underrun already read bits from). Confirmed against
-    /// piHPSDR's new_protocol.c: `dot=(high_priority_buffer[4]>>1)&1;
-    /// dash=(high_priority_buffer[4]>>2)&1;`.
+    /// piHPSDR's old_protocol.c/new_protocol.c, both calling this exact
+    /// bit `local_ptt`.
     ///
-    /// main.rs drives session.mox from this (raising it on key-down,
-    /// dropping it after Break-in Delay of continued silence) so the
-    /// app's own UI/TX-audio-muting/etc. reflect reality when the
-    /// operator keys via the radio's own physical paddle without ever
-    /// touching the on-screen MOX button -- see ConnectedState's own
-    /// cw_break_in_active doc comment for the full hang-timer logic.
-    pub cw_key_down: Arc<AtomicBool>,
+    /// NOT the same thing as raw paddle-CONTACT state (dot/dash bits,
+    /// C0 bit 1-2 / byte 4 bits 0x02/0x04) -- this project used to read
+    /// those instead, which is wrong for anything but a straight key:
+    /// with Iambic sending, the OPERATOR's paddle contact can stay
+    /// physically closed (squeezed) continuously across a whole string
+    /// of dots and dashes, while the radio's own internal keyer
+    /// autonomously inserts the correct on/off timing for each element
+    /// -- a real report confirmed exactly this: straight-key sidetone
+    /// had audible gaps between elements, Iambic sidetone sounded like
+    /// one continuous tone with no gaps at all, because the raw contact
+    /// bits genuinely don't toggle during a held squeeze even though
+    /// the actual keyed RF/audio does. This bit is the radio's OWN
+    /// fully-timed answer to "is RF/sidetone audible right now",
+    /// correct for straight key, Iambic A, and Iambic B alike -- and,
+    /// per piHPSDR's own new_protocol.c comment, it already reflects
+    /// the radio's own Break-in Delay/hang-time decision too, so main.
+    /// rs just mirrors it directly into session.mox rather than running
+    /// a separate software hang-timer that would only approximate what
+    /// the hardware already gets exactly right (see ConnectedState's
+    /// own cw_break_in_active doc comment).
+    pub cw_ptt_active: Arc<AtomicBool>,
     /// P2 only (byte 4, bits 0x40/0x20 of the incoming High-Priority
     /// status packet, confirmed against piHPSDR's new_protocol.c --
     /// `tx_fifo_overrun |= (buffer[4] & 0x40) >> 6;`/`tx_fifo_underrun
@@ -1063,7 +1075,7 @@ impl RadioSession {
         let puresignal_enabled = Arc::new(AtomicBool::new(settings.puresignal_enabled));
         let adc0_overload = Arc::new(AtomicBool::new(false));
         let adc1_overload = Arc::new(AtomicBool::new(false));
-        let cw_key_down = Arc::new(AtomicBool::new(false));
+        let cw_ptt_active = Arc::new(AtomicBool::new(false));
         let tx_fifo_underrun = Arc::new(AtomicBool::new(false));
         let tx_fifo_overrun = Arc::new(AtomicBool::new(false));
         // Checked ahead of the protocol match below, not instead of it:
@@ -1075,7 +1087,7 @@ impl RadioSession {
             start_protocol1_ozy_usb(
                 device, settings, frequency_hz, tx_frequency_hz, rx_frequency_hz, requested_frequency_hz, sample_rate, adc, antenna, rx_attenuation,
                 ps_tx_attenuation, mox, tx_iq, tci_tx_audio, tci_tx_gain, tx_power_watts, cw_keyer, cw_mode_active, pa_gain_db,
-                tx_forward_power, tx_reverse_power, adc0_overload, cw_key_down, adc1_overload,
+                tx_forward_power, tx_reverse_power, adc0_overload, cw_ptt_active, adc1_overload,
                 tx_fifo_underrun, tx_fifo_overrun, ps_rx_feedback_iq, ps_tx_feedback_iq,
                 rx_audio_to_radio, send_rx_audio_to_radio, radio_mic_audio, tx_audio_source,
                 tci_wants_mic, mic_ptt_enabled, mic_bias_enabled, mic_ptt_on_tip,
@@ -1087,7 +1099,7 @@ impl RadioSession {
             1 => start_protocol1(
                 device, settings, frequency_hz, tx_frequency_hz, rx_frequency_hz, requested_frequency_hz, sample_rate, adc, antenna, rx_attenuation,
                 ps_tx_attenuation, mox, tx_iq, tci_tx_audio, tci_tx_gain, tx_power_watts, cw_keyer, cw_mode_active, pa_gain_db,
-                tx_forward_power, tx_reverse_power, adc0_overload, cw_key_down, adc1_overload,
+                tx_forward_power, tx_reverse_power, adc0_overload, cw_ptt_active, adc1_overload,
                 tx_fifo_underrun, tx_fifo_overrun, ps_rx_feedback_iq, ps_tx_feedback_iq,
                 rx_audio_to_radio, send_rx_audio_to_radio, radio_mic_audio, tx_audio_source,
                 tci_wants_mic, mic_ptt_enabled, mic_bias_enabled, mic_ptt_on_tip,
@@ -1097,7 +1109,7 @@ impl RadioSession {
             2 => start_protocol2(
                 device, settings, frequency_hz, tx_frequency_hz, rx_frequency_hz, requested_frequency_hz, sample_rate, adc, antenna, rx_attenuation,
                 ps_tx_attenuation, mox, tx_iq, tci_tx_audio, tci_tx_gain, tx_power_watts, cw_keyer, cw_mode_active, pa_gain_db,
-                tx_forward_power, tx_reverse_power, adc0_overload, cw_key_down, adc1_overload,
+                tx_forward_power, tx_reverse_power, adc0_overload, cw_ptt_active, adc1_overload,
                 tx_fifo_underrun, tx_fifo_overrun, ps_rx_feedback_iq, ps_tx_feedback_iq,
                 rx_audio_to_radio, send_rx_audio_to_radio, radio_mic_audio, tx_audio_source,
                 tci_wants_mic, mic_ptt_enabled, mic_bias_enabled, mic_ptt_on_tip,
@@ -1328,7 +1340,7 @@ fn start_protocol1(
     tx_forward_power: Arc<AtomicU32>,
     tx_reverse_power: Arc<AtomicU32>,
     adc0_overload: Arc<AtomicBool>,
-    cw_key_down: Arc<AtomicBool>,
+    cw_ptt_active: Arc<AtomicBool>,
     adc1_overload: Arc<AtomicBool>,
     tx_fifo_underrun: Arc<AtomicBool>,
     tx_fifo_overrun: Arc<AtomicBool>,
@@ -1579,7 +1591,7 @@ fn start_protocol1(
     let receiver_tx_reverse_power = Arc::clone(&tx_reverse_power);
     let receiver_adc0_overload = Arc::clone(&adc0_overload);
     let receiver_adc1_overload = Arc::clone(&adc1_overload);
-    let receiver_cw_key_down = Arc::clone(&cw_key_down);
+    let receiver_cw_ptt_active = Arc::clone(&cw_ptt_active);
     let receiver_ps_rx_feedback_iq = Arc::clone(&ps_rx_feedback_iq);
     let receiver_ps_tx_feedback_iq = Arc::clone(&ps_tx_feedback_iq);
     let receiver_radio_mic_audio = Arc::clone(&radio_mic_audio);
@@ -1595,7 +1607,7 @@ fn start_protocol1(
             receiver_tx_forward_power,
             receiver_tx_reverse_power,
             receiver_adc0_overload,
-            receiver_cw_key_down,
+            receiver_cw_ptt_active,
             receiver_adc1_overload,
             ps_wire_total,
             ps_feedback_indices,
@@ -1664,7 +1676,7 @@ fn start_protocol1(
         tx_reverse_power,
         adc0_overload,
         adc1_overload,
-        cw_key_down,
+        cw_ptt_active,
         tx_fifo_underrun,
         tx_fifo_overrun,
         stop_flag,
@@ -1732,7 +1744,7 @@ fn start_protocol1_ozy_usb(
     tx_forward_power: Arc<AtomicU32>,
     tx_reverse_power: Arc<AtomicU32>,
     adc0_overload: Arc<AtomicBool>,
-    cw_key_down: Arc<AtomicBool>,
+    cw_ptt_active: Arc<AtomicBool>,
     adc1_overload: Arc<AtomicBool>,
     tx_fifo_underrun: Arc<AtomicBool>,
     tx_fifo_overrun: Arc<AtomicBool>,
@@ -1873,7 +1885,7 @@ fn start_protocol1_ozy_usb(
     let receiver_tx_reverse_power = Arc::clone(&tx_reverse_power);
     let receiver_adc0_overload = Arc::clone(&adc0_overload);
     let receiver_adc1_overload = Arc::clone(&adc1_overload);
-    let receiver_cw_key_down = Arc::clone(&cw_key_down);
+    let receiver_cw_ptt_active = Arc::clone(&cw_ptt_active);
     let receiver_radio_mic_audio = Arc::clone(&radio_mic_audio);
     let receiver_thread = thread::spawn(move || {
         ozy_receiver_loop(
@@ -1884,7 +1896,7 @@ fn start_protocol1_ozy_usb(
             receiver_tx_forward_power,
             receiver_tx_reverse_power,
             receiver_adc0_overload,
-            receiver_cw_key_down,
+            receiver_cw_ptt_active,
             receiver_adc1_overload,
             receiver_radio_mic_audio,
             receiver_stop,
@@ -1955,7 +1967,7 @@ fn start_protocol1_ozy_usb(
         tx_reverse_power,
         adc0_overload,
         adc1_overload,
-        cw_key_down,
+        cw_ptt_active,
         tx_fifo_underrun,
         tx_fifo_overrun,
         stop_flag,
@@ -3468,7 +3480,7 @@ fn receiver_loop(
     tx_forward_power: Arc<AtomicU32>,
     tx_reverse_power: Arc<AtomicU32>,
     adc0_overload: Arc<AtomicBool>,
-    cw_key_down: Arc<AtomicBool>,
+    cw_ptt_active: Arc<AtomicBool>,
     adc1_overload: Arc<AtomicBool>,
     // PureSignal -- see start_protocol1's ps_wire_total/ps_feedback_indices
     // doc comments. All None/unused when PS wasn't requested.
@@ -3533,7 +3545,7 @@ fn receiver_loop(
                         &tx_reverse_power,
                         &adc0_overload,
                         &adc1_overload,
-                        &cw_key_down,
+                        &cw_ptt_active,
                         ps_feedback_indices,
                         &ps_rx_feedback_iq,
                         &ps_tx_feedback_iq,
@@ -3705,7 +3717,7 @@ fn ozy_receiver_loop(
     tx_forward_power: Arc<AtomicU32>,
     tx_reverse_power: Arc<AtomicU32>,
     adc0_overload: Arc<AtomicBool>,
-    cw_key_down: Arc<AtomicBool>,
+    cw_ptt_active: Arc<AtomicBool>,
     adc1_overload: Arc<AtomicBool>,
     radio_mic_audio: Arc<Mutex<VecDeque<f32>>>,
     stop: Arc<AtomicBool>,
@@ -3742,7 +3754,7 @@ fn ozy_receiver_loop(
                     &tx_reverse_power,
                     &adc0_overload,
                     &adc1_overload,
-                    &cw_key_down,
+                    &cw_ptt_active,
                     None,
                     &ps_rx_feedback_iq,
                     &ps_tx_feedback_iq,
@@ -3863,10 +3875,11 @@ fn parse_iq_stream(
     // (ADC0/ADC1 respectively).
     adc0_overload: &Arc<AtomicBool>,
     adc1_overload: &Arc<AtomicBool>,
-    // Raw paddle-contact state -- see RadioSession::cw_key_down's doc
-    // comment. P1: C0 byte bits 1-2 (dash/dot) of the incoming status
-    // frame, confirmed against piHPSDR's old_protocol.c.
-    cw_key_down: &Arc<AtomicBool>,
+    // Radio's own real-time keyed/PTT status -- see
+    // RadioSession::cw_ptt_active's doc comment. P1: C0 byte bit 0 of
+    // the incoming status frame, confirmed against piHPSDR's
+    // old_protocol.c (`local_ptt`).
+    cw_ptt_active: &Arc<AtomicBool>,
     // PureSignal: `ps_feedback_indices` is `Some((rx_feedback_idx,
     // tx_feedback_idx))` when active -- see ps_feedback_config's doc
     // comment. Those two wire indices are diverted into the dedicated
@@ -3960,11 +3973,9 @@ fn parse_iq_stream(
         let frame = &carry[0..USB_FRAME_SIZE];
         let c0 = frame[3];
         let address = (c0 >> 3) & 0x1F;
-        // See RadioSession::cw_key_down's doc comment -- either paddle
-        // contact (dot bit 0x02 or dash bit 0x04) counts as "key down"
-        // for the break-in hang-timer, so which one is which doesn't
-        // matter here.
-        cw_key_down.store(c0 & 0x06 != 0, Ordering::Relaxed);
+        // See RadioSession::cw_ptt_active's doc comment -- bit 0
+        // ("local_ptt" in piHPSDR), NOT the dot/dash contact bits.
+        cw_ptt_active.store(c0 & 0x01 != 0, Ordering::Relaxed);
         if address == 1 {
             let forward = u16::from_be_bytes([frame[6], frame[7]]) as u32;
             // ROOT CAUSE FIX for a real HL2 report (meter settling at a
@@ -4214,7 +4225,7 @@ fn start_protocol2(
     tx_forward_power: Arc<AtomicU32>,
     tx_reverse_power: Arc<AtomicU32>,
     adc0_overload: Arc<AtomicBool>,
-    cw_key_down: Arc<AtomicBool>,
+    cw_ptt_active: Arc<AtomicBool>,
     adc1_overload: Arc<AtomicBool>,
     tx_fifo_underrun: Arc<AtomicBool>,
     tx_fifo_overrun: Arc<AtomicBool>,
@@ -4435,7 +4446,7 @@ fn start_protocol2(
     let receiver_tx_reverse_power = Arc::clone(&tx_reverse_power);
     let receiver_adc0_overload = Arc::clone(&adc0_overload);
     let receiver_adc1_overload = Arc::clone(&adc1_overload);
-    let receiver_cw_key_down = Arc::clone(&cw_key_down);
+    let receiver_cw_ptt_active = Arc::clone(&cw_ptt_active);
     let receiver_tx_fifo_underrun = Arc::clone(&tx_fifo_underrun);
     let receiver_tx_fifo_overrun = Arc::clone(&tx_fifo_overrun);
     let receiver_ps_rx_feedback_iq = Arc::clone(&ps_rx_feedback_iq);
@@ -4455,7 +4466,7 @@ fn start_protocol2(
             receiver_tx_forward_power,
             receiver_tx_reverse_power,
             receiver_adc0_overload,
-            receiver_cw_key_down,
+            receiver_cw_ptt_active,
             receiver_adc1_overload,
             receiver_tx_fifo_underrun,
             receiver_tx_fifo_overrun,
@@ -4525,7 +4536,7 @@ fn start_protocol2(
         tx_reverse_power,
         adc0_overload,
         adc1_overload,
-        cw_key_down,
+        cw_ptt_active,
         tx_fifo_underrun,
         tx_fifo_overrun,
         stop_flag,
@@ -5430,7 +5441,7 @@ fn p2_receiver_loop(
     tx_forward_power: Arc<AtomicU32>,
     tx_reverse_power: Arc<AtomicU32>,
     adc0_overload: Arc<AtomicBool>,
-    cw_key_down: Arc<AtomicBool>,
+    cw_ptt_active: Arc<AtomicBool>,
     adc1_overload: Arc<AtomicBool>,
     tx_fifo_underrun: Arc<AtomicBool>,
     tx_fifo_overrun: Arc<AtomicBool>,
@@ -5600,12 +5611,11 @@ fn p2_receiver_loop(
                     if n >= 5 {
                         tx_fifo_overrun.store(buf[4] & 0x40 != 0, Ordering::Relaxed);
                         tx_fifo_underrun.store(buf[4] & 0x20 != 0, Ordering::Relaxed);
-                        // Raw paddle-contact state -- see
-                        // RadioSession::cw_key_down's doc comment. Byte 4,
-                        // bits 0x02 (dot)/0x04 (dash), confirmed against
-                        // piHPSDR's new_protocol.c. Either bit counts as
-                        // "key down" for the break-in hang-timer.
-                        cw_key_down.store(buf[4] & 0x06 != 0, Ordering::Relaxed);
+                        // Radio's own real-time keyed/PTT status -- see
+                        // RadioSession::cw_ptt_active's doc comment. Byte
+                        // 4 bit 0x01 ("local_ptt" in piHPSDR), NOT the
+                        // dot/dash contact bits (0x02/0x04).
+                        cw_ptt_active.store(buf[4] & 0x01 != 0, Ordering::Relaxed);
                     }
                     hp_request.store(true, Ordering::Relaxed);
                 } else if port == P2_TX_SPECIFIC_PORT {

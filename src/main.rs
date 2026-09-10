@@ -139,6 +139,28 @@ fn resolved_pa_drive_adjust_db(
 /// about that number; this is just a fixed-size settings-UI/config cap).
 const MAX_XVTRS: usize = 8;
 
+/// How long session.cw_ptt_active is allowed to stay continuously true
+/// before the CW break-in logic treats it as a stuck key (e.g. a bad
+/// paddle connector or a genuinely shorted contact, not real sending)
+/// and forcibly de-arms the radio's internal keyer -- see
+/// ConnectedState::cw_stuck_key_lockout's doc comment for the full
+/// mechanism. Added after a real report of the internal keyer staying
+/// keyed continuously from a momentary bad paddle connection (resolved
+/// by unplugging/replugging; no actual RF was confirmed transmitting
+/// that time, but the same failure mode with a genuinely shorted
+/// contact could key real RF indefinitely with nothing in this app to
+/// stop it, since the radio's own FPGA -- not session.mox -- owns PTT
+/// once the internal keyer is armed).
+///
+/// 10 seconds is comfortably longer than any single element/word a
+/// human operator would plausibly hold continuously (even a slow 5 WPM
+/// dash is under a second; Break-in Delay -- typically well under a
+/// second -- normally lets mox/PTT drop between words long before
+/// this), while still being short enough that a genuine stuck key
+/// can't run unbounded. Not exposed as a setting -- ask if a different
+/// value is wanted.
+const CW_STUCK_KEY_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// A user-configured transverter: converts the radio's real tunable range
 /// (its IF -- e.g. 28-29.7MHz on 10m) to some other displayed/operating
 /// frequency (RF -- e.g. 144-144.5MHz on 2m) via an external analog box.
@@ -882,24 +904,36 @@ struct ConnectedState {
     /// signal that a steady Tune tone can never provide.
     two_tone_active: bool,
     /// Whether the CURRENT session.mox_active()==true state was raised
-    /// by the CW break-in hang-timer below, as opposed to any other MOX
+    /// by the CW break-in mirror below, as opposed to any other MOX
     /// source (the on-screen MOX button, spacebar, Tune, Two-Tone, or a
-    /// rigctl/TCI/CAT PTT command). Gates the hang-timer's own ability
-    /// to LOWER mox: it only ever does so when it was the one that
-    /// raised it, so it can never stomp on a manual PTT session that
-    /// happens to outlast it. Reset to false the instant mox drops for
-    /// ANY reason (own hang-timer expiry or something else dropping it
-    /// first), so a stale true never survives into a later manual PTT.
+    /// rigctl/TCI/CAT PTT command). Gates the mirror's own ability to
+    /// LOWER mox: it only ever does so when it was the one that raised
+    /// it, so it can never stomp on a manual PTT session that happens
+    /// to outlast it. Reset to false the instant mox drops for ANY
+    /// reason (the radio itself reporting unkeyed, or something else
+    /// dropping it first), so a stale true never survives into a later
+    /// manual PTT.
     cw_break_in_active: bool,
-    /// Timestamp of the most recent frame session.cw_key_down was seen
-    /// true (radio's own internal keyer reporting paddle contact
-    /// closed -- see that field's doc comment). None when no key-down
-    /// has been observed yet, or once the hang-timer has fully expired
-    /// and dropped mox. Compared each frame against session.cw_keyer's
-    /// hang_time_ms (the same Break-in Delay value already sent to the
-    /// radio as its own internal hang-time, per RadioSession::cw_keyer's
-    /// doc comment) to decide when to drop mox.
-    cw_key_last_active: Option<Instant>,
+    /// When the CURRENT continuous streak of session.cw_ptt_active
+    /// being true began -- None whenever it's currently false. Used
+    /// only for CW_STUCK_KEY_TIMEOUT (see its own doc comment); the
+    /// break-in mirror itself no longer needs a timestamp at all, since
+    /// it just mirrors the radio's own already-timed keying status
+    /// directly rather than running a separate software hang-timer.
+    cw_ptt_continuous_since: Option<Instant>,
+    /// Set once the current streak above has exceeded
+    /// CW_STUCK_KEY_TIMEOUT -- see that constant's own doc comment.
+    /// While true, forces session.cw_mode_active off regardless of the
+    /// actual mode selector, de-arming the radio's internal keyer (the
+    /// only lever this app has over it once armed) so its own FPGA
+    /// drops PTT on its own. Cleared the instant session.cw_ptt_active
+    /// is next observed false (whether that's a real paddle release or
+    /// the radio responding to being de-armed), at which point normal
+    /// arming resumes -- if the paddle is still genuinely stuck, this
+    /// will simply retrigger after another full timeout, giving a
+    /// bounded on/off cycle rather than a single permanent lockout, but
+    /// never an unbounded continuous transmission.
+    cw_stuck_key_lockout: bool,
     /// Exponentially-smoothed forward/reverse power ADC counts (same
     /// raw units as session.tx_forward_power/tx_reverse_power), used
     /// only for the TX meter display -- NOT written back to the
@@ -1497,16 +1531,16 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
             // start), reused here.
             // PC-side CW sidetone -- see audio::CwSidetone's doc comment.
             // A separate, additive feature from the radio's own
-            // internal-keyer sidetone; reads the SAME live paddle-
-            // contact/keyer-config atomics main.rs's break-in hang-timer
-            // already reads, and writes into spectrum's own audio_out
-            // (the main receiver's local-speaker queue), so no new audio
-            // device/output is needed.
+            // internal-keyer sidetone; reads the SAME live keyed/PTT-
+            // readback and keyer-config atomics main.rs's break-in
+            // mirror already reads, and writes into spectrum's own
+            // audio_out (the main receiver's local-speaker queue), so
+            // no new audio device/output is needed.
             let cw_sidetone = audio::CwSidetone::start(
                 Arc::clone(&spectrum.audio_out),
                 Arc::clone(&session.mox),
                 Arc::clone(&session.cw_mode_active),
-                Arc::clone(&session.cw_key_down),
+                Arc::clone(&session.cw_ptt_active),
                 Arc::clone(&session.cw_keyer),
             );
             cw_sidetone.enabled.store(cfg.cw_pc_sidetone_enabled.unwrap_or(false), Ordering::Relaxed);
@@ -1626,7 +1660,8 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                 pre_tune_power_watts: None,
                 two_tone_active: false,
                 cw_break_in_active: false,
-                cw_key_last_active: None,
+                cw_ptt_continuous_since: None,
+                cw_stuck_key_lockout: false,
                 smoothed_fwd_power: 0.0,
                 smoothed_rev_power: 0.0,
                 tx_fifo_warning_until: None,
@@ -1829,45 +1864,70 @@ impl eframe::App for HpsdrApp {
                     .store(connected.tune_active, std::sync::atomic::Ordering::Relaxed);
                 let sample_rate = connected.sample_rate;
                 let current_mode = connected.spectrum.mode();
+                let cw_mode_selected = matches!(current_mode, spectrum::Mode::Cwl | spectrum::Mode::Cwu);
+                // Stuck-key protection -- see CW_STUCK_KEY_TIMEOUT and
+                // ConnectedState::cw_stuck_key_lockout's own doc
+                // comments. Tracked from the radio's own real-time
+                // keyed/PTT readback independent of cw_mode_selected
+                // below, so a stuck paddle is caught the same way
+                // regardless of exactly when CW mode was selected.
+                let radio_keyed = connected.session.cw_ptt_active.load(Ordering::Relaxed);
+                if radio_keyed {
+                    let since = *connected.cw_ptt_continuous_since.get_or_insert_with(Instant::now);
+                    if !connected.cw_stuck_key_lockout && since.elapsed() >= CW_STUCK_KEY_TIMEOUT {
+                        eprintln!(
+                            "radio: CW paddle held continuously for over {:.0}s -- disarming the internal keyer (stuck key protection) until it's released",
+                            CW_STUCK_KEY_TIMEOUT.as_secs_f32()
+                        );
+                        connected.cw_stuck_key_lockout = true;
+                    }
+                } else {
+                    connected.cw_ptt_continuous_since = None;
+                    connected.cw_stuck_key_lockout = false;
+                }
                 // See RadioSession::cw_mode_active's doc comment -- the
                 // radio's own internal CW keyer only actually keys
                 // anything once its own paddle contacts close, but this
-                // gates whether it's armed to respond at all.
-                let cw_mode_now = matches!(current_mode, spectrum::Mode::Cwl | spectrum::Mode::Cwu);
+                // gates whether it's armed to respond at all. Forced
+                // off during a stuck-key lockout regardless of the mode
+                // selector -- de-arming is the only lever this app has
+                // over the radio's internal keyer once it's armed, so
+                // this is what actually makes the radio's own FPGA drop
+                // PTT on its own.
+                let cw_mode_now = cw_mode_selected && !connected.cw_stuck_key_lockout;
                 connected.session.cw_mode_active.store(cw_mode_now, std::sync::atomic::Ordering::Relaxed);
-                // CW break-in: put the radio into TRANSMIT while the
-                // operator's paddle (wired directly into the radio, read
-                // back via session.cw_key_down -- see that field's doc
-                // comment) is closed, and keep it there until Break-in
-                // Delay (session.cw_keyer.hang_time_ms) has elapsed with
-                // no further key activity. Only ever RAISES mox when
-                // nothing else already holds it, and only ever LOWERS it
-                // when this logic (cw_break_in_active) was the one that
-                // raised it -- so it never stomps on a manual PTT source
+                // CW break-in: mirror the radio's own real-time keyed/
+                // PTT status (session.cw_ptt_active) directly into
+                // session.mox, so the app's own UI/TX-audio-muting/etc.
+                // reflect reality when the operator keys via the
+                // radio's own physical paddle without ever touching the
+                // on-screen MOX button. A plain mirror, not a separate
+                // software hang-timer -- session.cw_ptt_active already
+                // reflects the radio's OWN Break-in Delay/hang-time
+                // decision (see that field's doc comment: this used to
+                // read raw paddle-contact bits and run its own hang-
+                // timer here instead, which both mistimed Iambic
+                // elements and duplicated logic the hardware already
+                // gets right). Only ever RAISES mox when nothing else
+                // already holds it, and only ever LOWERS it when this
+                // logic (cw_break_in_active) was the one that raised
+                // it -- so it never stomps on a manual PTT source
                 // (on-screen MOX button, spacebar, Tune, Two-Tone,
                 // rigctl/TCI/CAT PTT). See ConnectedState::
                 // cw_break_in_active's doc comment for the full design.
                 if cw_mode_now {
-                    if connected.session.cw_key_down.load(Ordering::Relaxed) {
-                        connected.cw_key_last_active = Some(Instant::now());
+                    if radio_keyed {
                         if !connected.session.mox_active() {
                             connected.session.set_mox(true);
                             connected.cw_break_in_active = true;
                         }
                     } else if connected.cw_break_in_active {
-                        let hang_time_ms =
-                            connected.session.cw_keyer.hang_time_ms.load(Ordering::Relaxed);
-                        let elapsed_ms = connected
-                            .cw_key_last_active
-                            .map(|t| t.elapsed().as_millis() as u32)
-                            .unwrap_or(u32::MAX);
-                        if elapsed_ms >= hang_time_ms {
-                            connected.session.set_mox(false);
-                            connected.cw_break_in_active = false;
-                        }
+                        connected.session.set_mox(false);
+                        connected.cw_break_in_active = false;
                     }
                 } else if connected.cw_break_in_active {
-                    // Left CW mode while break-in still held mox up --
+                    // Left CW mode (or a stuck-key lockout just
+                    // engaged) while break-in still held mox up --
                     // nothing left to hang onto, drop it immediately.
                     connected.session.set_mox(false);
                     connected.cw_break_in_active = false;
@@ -1876,7 +1936,7 @@ impl eframe::App for HpsdrApp {
                 // OTHER reason (manual PTT toggle, Tune ending, a
                 // disconnect, etc.) -- otherwise a later, unrelated
                 // manual PTT press could get silently cut short by this
-                // logic mistakenly believing it owns the hang-timer.
+                // logic mistakenly believing it owns the mirror.
                 if connected.cw_break_in_active && !connected.session.mox_active() {
                     connected.cw_break_in_active = false;
                 }

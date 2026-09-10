@@ -188,11 +188,14 @@ const CW_SIDETONE_RAMP_SAMPLES: f32 = 0.005 * OUTPUT_SAMPLE_RATE as f32;
 /// headphone jack, generated autonomously by its FPGA once armed with
 /// the Sidetone Level/Frequency settings, no PC audio involved at all.
 /// This one exists for the OPERATING position instead -- synthesizes
-/// the same tone in software from the radio's own paddle-contact
-/// readback (RadioSession::cw_key_down) and plays it out the PC's own
-/// audio output, for setups where the radio's local audio jack isn't
-/// wired to anything the operator can hear (e.g. HermesLite2, which has
-/// no local audio output hardware at all) or for remote operation.
+/// the same tone in software from the radio's own real-time keyed/PTT
+/// status readback (RadioSession::cw_ptt_active -- see its own doc
+/// comment on why this is the radio's fully-timed keying status, not
+/// raw paddle-contact state, and why that distinction matters for
+/// Iambic sending specifically) and plays it out the PC's own audio
+/// output, for setups where the radio's local audio jack isn't wired to
+/// anything the operator can hear (e.g. HermesLite2, which has no local
+/// audio output hardware at all) or for remote operation.
 ///
 /// Added specifically as an opt-in (Settings -> CW's own checkbox, see
 /// `enabled`), NOT tied unconditionally to CW mode being selected --
@@ -221,7 +224,7 @@ impl CwSidetone {
         audio_out: Arc<Mutex<VecDeque<(f32, f32)>>>,
         mox: Arc<AtomicBool>,
         cw_mode_active: Arc<AtomicBool>,
-        key_down: Arc<AtomicBool>,
+        cw_ptt_active: Arc<AtomicBool>,
         cw_keyer: Arc<CwKeyerAtomics>,
     ) -> Self {
         let enabled = Arc::new(AtomicBool::new(false));
@@ -229,7 +232,7 @@ impl CwSidetone {
         let thread_enabled = Arc::clone(&enabled);
         let thread_stop = Arc::clone(&stop);
         let thread = thread::spawn(move || {
-            run(audio_out, mox, cw_mode_active, key_down, cw_keyer, thread_enabled, thread_stop);
+            run(audio_out, mox, cw_mode_active, cw_ptt_active, cw_keyer, thread_enabled, thread_stop);
         });
         Self { enabled, stop, thread: Some(thread) }
     }
@@ -259,18 +262,25 @@ impl Drop for CwSidetone {
 /// first, then some elements distorted, occasionally drifted out of
 /// sync, and the tone kept sounding briefly after releasing the key.
 ///
-/// Bug #1: `keyed` was gated on key_down/cw_mode_active/enabled alone,
-/// NOT on mox -- but spectrum.rs's real RX-audio producer gates its own
-/// writes into this SAME queue purely on mox being false. Since main.
-/// rs's break-in hang-timer (which raises mox) reads the same key_down
-/// flag on its own ~16ms UI-frame cadence, there was a real window on
-/// every key-down where this thread could already be ramping up while
-/// spectrum.rs's thread was still pushing live RX audio into the same
-/// queue -- two producers, unsynchronized, landing in one FIFO. That's
-/// the distortion: audible RX content time-interleaved with the
-/// sidetone. Fixed by also requiring `mox` here, matching spectrum.rs's
-/// own gate exactly so the two producers are mutually exclusive rather
-/// than merely usually so.
+/// Bug #1: `keyed` was gated on the radio's keying readback/
+/// cw_mode_active/enabled alone, NOT on mox -- but spectrum.rs's real
+/// RX-audio producer gates its own writes into this SAME queue purely
+/// on mox being false. Since main.rs's break-in logic (which raises
+/// mox) reads that same readback on its own ~16ms UI-frame cadence,
+/// there was a real window on every key-down where this thread could
+/// already be ramping up while spectrum.rs's thread was still pushing
+/// live RX audio into the same queue -- two producers, unsynchronized,
+/// landing in one FIFO. That's the distortion: audible RX content
+/// time-interleaved with the sidetone. Fixed by also requiring `mox`
+/// here, matching spectrum.rs's own gate exactly so the two producers
+/// are mutually exclusive rather than merely usually so.
+///
+/// (A separate, later fix changed WHICH bit `cw_ptt_active` itself
+/// reads -- see RadioSession::cw_ptt_active's own doc comment -- from
+/// raw paddle-contact state to the radio's actual fully-timed keying
+/// status. That fixed a different symptom, individual elements not
+/// being audible during Iambic sending, but is the same underlying
+/// signal referred to here.)
 ///
 /// Bug #2: any stale backlog already sitting in the queue when a key
 /// transition happens (leftover RX audio from just before mox went up,
@@ -299,7 +309,7 @@ fn run(
     audio_out: Arc<Mutex<VecDeque<(f32, f32)>>>,
     mox: Arc<AtomicBool>,
     cw_mode_active: Arc<AtomicBool>,
-    key_down: Arc<AtomicBool>,
+    cw_ptt_active: Arc<AtomicBool>,
     cw_keyer: Arc<CwKeyerAtomics>,
     enabled: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
@@ -324,7 +334,7 @@ fn run(
         let keyed = enabled.load(Ordering::Relaxed)
             && mox.load(Ordering::Relaxed)
             && cw_mode_active.load(Ordering::Relaxed)
-            && key_down.load(Ordering::Relaxed);
+            && cw_ptt_active.load(Ordering::Relaxed);
         if keyed != was_keyed {
             // Any transition -- see this function's own doc comment
             // (bug #2): drop anything already queued (stale RX audio
@@ -356,8 +366,8 @@ fn run(
             if gain <= 0.0 && target <= 0.0 {
                 // Fully silent -- stop generating for the rest of this
                 // tick too (target can't un-ramp mid-loop; enabled/
-                // mox/cw_mode_active/key_down are only re-read next
-                // tick).
+                // mox/cw_mode_active/cw_ptt_active are only re-read
+                // next tick).
                 break;
             }
             phase += step;
