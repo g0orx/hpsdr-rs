@@ -24,9 +24,13 @@
     even when PipeWire/PulseAudio/JACK are the actual runtime backend.
 */
 
+use crate::radio::CwKeyerAtomics;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::{Duration, Instant};
 
 const OUTPUT_SAMPLE_RATE: u32 = 48_000; // matches spectrum.rs's fixed WDSP output rate
 const OUTPUT_CHANNELS: u16 = 2; // interleaved stereo, matches fexchange0's output convention
@@ -150,6 +154,169 @@ impl AudioOutput {
             .map_err(|e| format!("failed to start audio playback: {e}"))?;
 
         Ok(Self { _stream: stream })
+    }
+}
+
+/// Small ring cap for the CW sidetone generator's own writes into
+/// audio_out -- same "small, bounded, drop-oldest" reasoning as
+/// spectrum.rs's AUDIO_BUFFER_CAPACITY (~0.3s at 48kHz): a backlog here
+/// would just be added latency between paddle and audible tone, not
+/// something that self-corrects.
+const CW_SIDETONE_BUFFER_CAPACITY: usize = 14_400;
+
+/// How long the sidetone's on/off envelope takes to ramp fully up or
+/// down, in samples at OUTPUT_SAMPLE_RATE. Same purpose as piHPSDR's own
+/// CW pulse-shaping ramp (transmitter.c's RAMPLEN): a hard on/off edge on
+/// a sine tone is an audible click. 5ms is comfortably inside typical
+/// CW envelope shaping recommendations (2-8ms) without softening dots at
+/// high WPM.
+const CW_SIDETONE_RAMP_SAMPLES: f32 = 0.005 * OUTPUT_SAMPLE_RATE as f32;
+
+/// PC-side software CW sidetone -- a SEPARATE, additional feature from
+/// the radio's own internal-keyer sidetone (see RadioSession::cw_keyer's
+/// doc comment): that one plays out the radio's own local speaker/
+/// headphone jack, generated autonomously by its FPGA once armed with
+/// the Sidetone Level/Frequency settings, no PC audio involved at all.
+/// This one exists for the OPERATING position instead -- synthesizes
+/// the same tone in software from the radio's own paddle-contact
+/// readback (RadioSession::cw_key_down) and plays it out the PC's own
+/// audio output, for setups where the radio's local audio jack isn't
+/// wired to anything the operator can hear (e.g. HermesLite2, which has
+/// no local audio output hardware at all) or for remote operation.
+///
+/// Added specifically as an opt-in (Settings -> CW's own checkbox, see
+/// `enabled`), NOT tied unconditionally to CW mode being selected --
+/// unlike the radio-side sidetone, this one competes for the same
+/// audio_out queue newRX audio uses (see spectrum.rs's own doc comment:
+/// audio_out is unmuted the instant mox drops), so a user who only has
+/// the radio's own local sidetone wired up and finds a second PC-side
+/// copy redundant can turn this off without losing the radio's own.
+pub struct CwSidetone {
+    /// Live on/off toggle -- Settings -> CW's checkbox writes here
+    /// directly, no reconnect needed (same pattern as RadioSession::
+    /// puresignal_enabled/diversity_enabled).
+    pub enabled: Arc<AtomicBool>,
+    stop: Arc<AtomicBool>,
+    thread: Option<thread::JoinHandle<()>>,
+}
+
+impl CwSidetone {
+    /// `audio_out`: the SAME queue AudioOutput's cpal callback drains
+    /// (RadioSession's main-receiver SpectrumHandle's own audio_out) --
+    /// this generator only ever writes into it while ramped above
+    /// silence (see run()'s own doc comment for why that matters), so
+    /// it can share the queue with spectrum.rs's real RX-audio producer
+    /// without a dedicated output device or a mixing stage.
+    pub fn start(
+        audio_out: Arc<Mutex<VecDeque<(f32, f32)>>>,
+        cw_mode_active: Arc<AtomicBool>,
+        key_down: Arc<AtomicBool>,
+        cw_keyer: Arc<CwKeyerAtomics>,
+    ) -> Self {
+        let enabled = Arc::new(AtomicBool::new(false));
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread_enabled = Arc::clone(&enabled);
+        let thread_stop = Arc::clone(&stop);
+        let thread = thread::spawn(move || {
+            run(audio_out, cw_mode_active, key_down, cw_keyer, thread_enabled, thread_stop);
+        });
+        Self { enabled, stop, thread: Some(thread) }
+    }
+
+    pub fn stop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+    }
+}
+
+impl Drop for CwSidetone {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+/// Background loop backing CwSidetone::start. Wakes on a short, fixed
+/// tick (independent of the UI's own frame rate, which can hitch/vary)
+/// and, each tick, generates however many samples real wall-clock time
+/// says should exist since the last tick -- a simple free-running audio
+/// clock, same idea as this project's own RateConverter but driven by
+/// Instant instead of an input sample count.
+///
+/// Deliberately only ever WRITES to audio_out while the envelope is
+/// above silence (attacking or still ramping down), never while fully
+/// silent -- so the instant a release finishes, the queue reverts to
+/// being exclusively spectrum.rs's real RX-audio producer's again, with
+/// no risk of this thread's stale silence samples interleaving with (and
+/// stealing slots from) real RX audio the moment mox drops and RX audio
+/// resumes. In practice the ~5ms release (CW_SIDETONE_RAMP_SAMPLES) is
+/// always long finished before the Break-in Delay hang-timer (typically
+/// hundreds of ms, see RadioSession::cw_keyer's doc comment) actually
+/// drops mox, so there's no real race, just defensive ordering.
+fn run(
+    audio_out: Arc<Mutex<VecDeque<(f32, f32)>>>,
+    cw_mode_active: Arc<AtomicBool>,
+    key_down: Arc<AtomicBool>,
+    cw_keyer: Arc<CwKeyerAtomics>,
+    enabled: Arc<AtomicBool>,
+    stop: Arc<AtomicBool>,
+) {
+    let mut last = Instant::now();
+    let mut phase: f32 = 0.0;
+    let mut gain: f32 = 0.0;
+    while !stop.load(Ordering::Relaxed) {
+        thread::sleep(Duration::from_millis(10));
+        let now = Instant::now();
+        let elapsed = now.duration_since(last);
+        last = now;
+        let samples_needed =
+            (elapsed.as_secs_f64() * OUTPUT_SAMPLE_RATE as f64).round() as usize;
+        if samples_needed == 0 {
+            continue;
+        }
+        let keyed = enabled.load(Ordering::Relaxed)
+            && cw_mode_active.load(Ordering::Relaxed)
+            && key_down.load(Ordering::Relaxed);
+        let target = if keyed { 1.0 } else { 0.0 };
+        let freq_hz = cw_keyer.sidetone_freq_hz.load(Ordering::Relaxed).max(1) as f32;
+        // Same 0-255 full-byte range as P2's own sidetone_volume byte
+        // (see p2_tx_specific_packet) -- reused directly as a 0.0-1.0
+        // amplitude scalar rather than inventing a separate PC-only
+        // volume control, so the existing Sidetone Level slider governs
+        // both the radio's own sidetone AND this one together.
+        let amplitude = (cw_keyer.sidetone_volume.load(Ordering::Relaxed).min(255) as f32) / 255.0;
+        let step = 2.0 * std::f32::consts::PI * freq_hz / OUTPUT_SAMPLE_RATE as f32;
+        let ramp_step = 1.0 / CW_SIDETONE_RAMP_SAMPLES;
+        let mut samples: Vec<(f32, f32)> = Vec::with_capacity(samples_needed);
+        for _ in 0..samples_needed {
+            if gain < target {
+                gain = (gain + ramp_step).min(target);
+            } else if gain > target {
+                gain = (gain - ramp_step).max(target);
+            }
+            if gain <= 0.0 && target <= 0.0 {
+                // Fully silent -- stop generating for the rest of this
+                // tick too (target can't un-ramp mid-loop; enabled/
+                // cw_mode_active/key_down are only re-read next tick).
+                break;
+            }
+            phase += step;
+            if phase >= 2.0 * std::f32::consts::PI {
+                phase -= 2.0 * std::f32::consts::PI;
+            }
+            let s = amplitude * gain * phase.sin();
+            samples.push((s, s));
+        }
+        if !samples.is_empty() {
+            let mut out = audio_out.lock().unwrap();
+            for pair in samples {
+                if out.len() >= CW_SIDETONE_BUFFER_CAPACITY {
+                    out.pop_front();
+                }
+                out.push_back(pair);
+            }
+        }
     }
 }
 

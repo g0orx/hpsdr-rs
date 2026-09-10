@@ -176,6 +176,12 @@ pub struct Config {
     pub cw_keyer_sidetone_freq_hz: Option<u32>,
     #[serde(default)]
     pub cw_keyer_hang_time_ms: Option<u32>,
+    /// See audio::CwSidetone's doc comment -- separate, additive PC-
+    /// side software sidetone (opt-in, off by default) alongside the
+    /// radio's own internal-keyer sidetone above. `None`/missing
+    /// (a config saved before this existed) falls back to off.
+    #[serde(default)]
+    pub cw_pc_sidetone_enabled: Option<bool>,
     /// Per-band PA gain (dB) entered via the PA Calibration sliders
     /// (Settings -> TX), keyed by band name (see main.rs's BANDS).
     /// Feeds radio::drive_byte_for_watts in place of the flat

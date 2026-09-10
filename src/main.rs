@@ -487,6 +487,11 @@ struct ConnectedState {
     /// `spectrum` whenever `session.mox_active()` is true (see the
     /// main panel's spectrum-drawing code).
     tx_spectrum: SpectrumHandle,
+    /// PC-side software CW sidetone -- see audio::CwSidetone's doc
+    /// comment. Its own background thread is torn down automatically
+    /// (Drop) whenever this ConnectedState is (disconnect/reconnect),
+    /// same as session/spectrum's own threads.
+    cw_sidetone: audio::CwSidetone,
     audio_output: Option<AudioOutput>,
     /// Selected output device name for `audio_output` above (Settings ->
     /// Audio's "Output device" picker) -- see ExtraReceiver's identical
@@ -1490,12 +1495,27 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
             // RIT / XIT -- see ConnectedState's own doc comments. Values
             // themselves already computed above (before RadioSession::
             // start), reused here.
+            // PC-side CW sidetone -- see audio::CwSidetone's doc comment.
+            // A separate, additive feature from the radio's own
+            // internal-keyer sidetone; reads the SAME live paddle-
+            // contact/keyer-config atomics main.rs's break-in hang-timer
+            // already reads, and writes into spectrum's own audio_out
+            // (the main receiver's local-speaker queue), so no new audio
+            // device/output is needed.
+            let cw_sidetone = audio::CwSidetone::start(
+                Arc::clone(&spectrum.audio_out),
+                Arc::clone(&session.cw_mode_active),
+                Arc::clone(&session.cw_key_down),
+                Arc::clone(&session.cw_keyer),
+            );
+            cw_sidetone.enabled.store(cfg.cw_pc_sidetone_enabled.unwrap_or(false), Ordering::Relaxed);
             Ok(ConnectedState {
                 interface_name: discovery::interface_name_for(device.my_address.ip()),
                 device,
                 session,
                 spectrum,
                 tx_spectrum,
+                cw_sidetone,
                 audio_output,
                 audio_output_device,
                 tx_audio_monitor_output: None,
@@ -5062,7 +5082,23 @@ impl eframe::App for HpsdrApp {
                                         }
                                     });
 
-                                    ui.weak("More CW options are planned here.");
+                                    ui.separator();
+                                    let mut pc_sidetone = connected.cw_sidetone.enabled.load(Ordering::Relaxed);
+                                    if ui
+                                        .checkbox(&mut pc_sidetone, "PC Sidetone")
+                                        .on_hover_text(
+                                            "Also play the sidetone through this PC's own audio \
+                                             output (using the Sidetone Level/Frequency above), \
+                                             in addition to whatever the radio's own internal \
+                                             keyer does on its own local speaker/headphone \
+                                             output. Useful when the radio has no local audio \
+                                             output of its own, or for remote operation.",
+                                        )
+                                        .changed()
+                                    {
+                                        connected.cw_sidetone.enabled.store(pc_sidetone, Ordering::Relaxed);
+                                        settings_changed = true;
+                                    }
                                 }
 
                                 SettingsTab::Agc => {
@@ -6913,6 +6949,7 @@ impl eframe::App for HpsdrApp {
                         cw_keyer_hang_time_ms: Some(
                             connected.session.cw_keyer.hang_time_ms.load(Ordering::Relaxed),
                         ),
+                        cw_pc_sidetone_enabled: Some(connected.cw_sidetone.enabled.load(Ordering::Relaxed)),
                         db_low: Some(connected.db_low),
                         db_low_auto: Some(connected.db_low_auto),
                         db_high: Some(connected.db_high),
