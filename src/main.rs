@@ -1541,6 +1541,7 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                 Arc::clone(&session.mox),
                 Arc::clone(&session.cw_mode_active),
                 Arc::clone(&session.cw_ptt_active),
+                Arc::clone(&session.cw_paddle_contacts),
                 Arc::clone(&session.cw_keyer),
             );
             cw_sidetone.enabled.store(cfg.cw_pc_sidetone_enabled.unwrap_or(false), Ordering::Relaxed);

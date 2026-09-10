@@ -24,10 +24,10 @@
     even when PipeWire/PulseAudio/JACK are the actual runtime backend.
 */
 
-use crate::radio::CwKeyerAtomics;
+use crate::radio::{CwKeyerAtomics, CW_KEYER_MODE_IAMBIC_A, CW_KEYER_MODE_IAMBIC_B};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -182,6 +182,165 @@ const CW_SIDETONE_BUFFER_CAPACITY: usize = 14_400;
 /// high WPM.
 const CW_SIDETONE_RAMP_SAMPLES: f32 = 0.005 * OUTPUT_SAMPLE_RATE as f32;
 
+/// Software reconstruction of the radio's own internal Iambic keyer,
+/// used ONLY to drive the PC sidetone's on/off envelope during Iambic
+/// A/B sending -- NEVER for any real keying decision, which remains
+/// entirely the radio's own (see RadioSession::cw_ptt_active's doc
+/// comment on why the status bits available can't distinguish
+/// individual elements during a held squeeze on their own). Ported from
+/// deskHPSDR's iambic.c (itself adapted from Phil Harman VK6PH's
+/// Verilog Hermes iambic.v), specifically its `keyer_thread` state
+/// machine and `keyer_event`'s dot/dash-memory latching -- the well-
+/// established/documented Curtis-style Iambic A/B algorithm, not
+/// invented here. Deliberately narrower than the reference: no Bug
+/// mode, no external-straight-key input, and no Letter Spacing (this
+/// project has no such setting) -- straight key doesn't need this
+/// simulator at all (see CwSidetone::start's doc comment), and those
+/// other reference features aren't exposed by CwKeyerAtomics.
+///
+/// Driven by RAW paddle-contact bits (RadioSession::cw_paddle_contacts)
+/// polled once per CwSidetone tick rather than interrupt-driven like
+/// the reference -- fine-grained enough (see run()'s own tick interval)
+/// for this to be inaudibly different from a true interrupt-driven
+/// implementation at any CW speed this project supports (1-60 WPM).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum IambicElement {
+    Idle,
+    SendDot,
+    DotDelay,
+    SendDash,
+    DashDelay,
+}
+
+struct IambicSimulator {
+    state: IambicElement,
+    dot_memory: bool,
+    dash_memory: bool,
+    dot_held: bool,
+    dash_held: bool,
+    prev_dot: bool,
+    prev_dash: bool,
+    /// Samples remaining in the current SendDot/DotDelay/SendDash/
+    /// DashDelay phase; meaningless (and unused) while Idle.
+    remaining: i64,
+}
+
+impl IambicSimulator {
+    fn new() -> Self {
+        Self {
+            state: IambicElement::Idle,
+            dot_memory: false,
+            dash_memory: false,
+            dot_held: false,
+            dash_held: false,
+            prev_dot: false,
+            prev_dash: false,
+            remaining: 0,
+        }
+    }
+
+    fn enter_dot(&mut self, dash: bool, dot_samples: i64) {
+        self.dash_memory = false;
+        self.dash_held = dash;
+        self.state = IambicElement::SendDot;
+        self.remaining += dot_samples;
+    }
+
+    fn enter_dash(&mut self, dot: bool, dash_samples: i64) {
+        self.dot_memory = false;
+        self.dot_held = dot;
+        self.state = IambicElement::SendDash;
+        self.remaining += dash_samples;
+    }
+
+    /// Advances the state machine by `samples` (audio samples' worth of
+    /// elapsed time) given the current paddle-contact state and keyer
+    /// config, returning whether the reconstructed element output
+    /// should be sounding at the end of this step. `mode_a`: true for
+    /// Iambic A, false for Iambic B -- see this struct's own doc
+    /// comment; only affects whether a paddle "held" memory survives an
+    /// inter-element delay where BOTH paddles are currently released.
+    fn step(&mut self, samples: u32, dot: bool, dash: bool, mode_a: bool, dot_samples: i64, dash_samples: i64) -> bool {
+        // Dot/dash "hit" memory -- latched on a rising edge (matches
+        // keyer_event's own `if (state) { *kmem = 1; }`), consumed
+        // (cleared) only when entering the corresponding element.
+        if dot && !self.prev_dot {
+            self.dot_memory = true;
+        }
+        if dash && !self.prev_dash {
+            self.dash_memory = true;
+        }
+        self.prev_dot = dot;
+        self.prev_dash = dash;
+
+        self.remaining -= samples as i64;
+        // Bounded loop, not `while` unconditionally -- defensive only;
+        // a single tick should never legitimately cross more than one
+        // or two element boundaries at this project's tick rate.
+        for _ in 0..8 {
+            if self.remaining > 0 {
+                break;
+            }
+            match self.state {
+                IambicElement::Idle => {
+                    // Matches the reference's own CHECK state (both
+                    // conditions checked, not else-if, so a perfectly
+                    // simultaneous squeeze favors dot -- the second
+                    // check wins) -- but calling BOTH enter_dot/
+                    // enter_dash here (as the reference's overwrite-
+                    // style code effectively does) would double-count
+                    // `remaining`, since both add to it rather than
+                    // replace it. Enter exactly one.
+                    if dot {
+                        self.enter_dot(dash, dot_samples);
+                    } else if dash {
+                        self.enter_dash(dot, dash_samples);
+                    } else {
+                        // Nothing to do -- stop advancing this tick.
+                        self.remaining = 0;
+                        break;
+                    }
+                }
+                IambicElement::SendDot => {
+                    self.state = IambicElement::DotDelay;
+                    self.remaining += dot_samples; // inter-element gap is always one dot length
+                }
+                IambicElement::DotDelay => {
+                    if mode_a && !dot && !dash {
+                        self.dash_held = false;
+                    }
+                    if self.dash_memory || dash || self.dash_held {
+                        self.enter_dash(dot, dash_samples);
+                    } else if dot {
+                        self.enter_dot(dash, dot_samples);
+                    } else {
+                        self.state = IambicElement::Idle;
+                        self.remaining = 0;
+                    }
+                }
+                IambicElement::SendDash => {
+                    self.state = IambicElement::DashDelay;
+                    self.remaining += dot_samples; // gap is one dot length even after a dash
+                }
+                IambicElement::DashDelay => {
+                    if mode_a && !dot && !dash {
+                        self.dot_held = false;
+                    }
+                    if self.dot_memory || dot || self.dot_held {
+                        self.enter_dot(dash, dot_samples);
+                    } else if dash {
+                        self.enter_dash(dot, dash_samples);
+                    } else {
+                        self.state = IambicElement::Idle;
+                        self.remaining = 0;
+                    }
+                }
+            }
+        }
+        matches!(self.state, IambicElement::SendDot | IambicElement::SendDash)
+    }
+}
+
 /// PC-side software CW sidetone -- a SEPARATE, additional feature from
 /// the radio's own internal-keyer sidetone (see RadioSession::cw_keyer's
 /// doc comment): that one plays out the radio's own local speaker/
@@ -189,13 +348,15 @@ const CW_SIDETONE_RAMP_SAMPLES: f32 = 0.005 * OUTPUT_SAMPLE_RATE as f32;
 /// the Sidetone Level/Frequency settings, no PC audio involved at all.
 /// This one exists for the OPERATING position instead -- synthesizes
 /// the same tone in software from the radio's own real-time keyed/PTT
-/// status readback (RadioSession::cw_ptt_active -- see its own doc
-/// comment on why this is the radio's fully-timed keying status, not
-/// raw paddle-contact state, and why that distinction matters for
-/// Iambic sending specifically) and plays it out the PC's own audio
-/// output, for setups where the radio's local audio jack isn't wired to
-/// anything the operator can hear (e.g. HermesLite2, which has no local
-/// audio output hardware at all) or for remote operation.
+/// status readback (RadioSession::cw_ptt_active) for straight key, and
+/// from a small reconstructed Iambic state machine (IambicSimulator,
+/// driven by RadioSession::cw_paddle_contacts) for Iambic A/B, since
+/// cw_ptt_active alone can't distinguish individual elements during a
+/// held squeeze (see its own doc comment) -- and plays it out the PC's
+/// own audio output, for setups where the radio's local audio jack
+/// isn't wired to anything the operator can hear (e.g. HermesLite2,
+/// which has no local audio output hardware at all) or for remote
+/// operation.
 ///
 /// Added specifically as an opt-in (Settings -> CW's own checkbox, see
 /// `enabled`), NOT tied unconditionally to CW mode being selected --
@@ -225,6 +386,7 @@ impl CwSidetone {
         mox: Arc<AtomicBool>,
         cw_mode_active: Arc<AtomicBool>,
         cw_ptt_active: Arc<AtomicBool>,
+        cw_paddle_contacts: Arc<AtomicU8>,
         cw_keyer: Arc<CwKeyerAtomics>,
     ) -> Self {
         let enabled = Arc::new(AtomicBool::new(false));
@@ -232,7 +394,16 @@ impl CwSidetone {
         let thread_enabled = Arc::clone(&enabled);
         let thread_stop = Arc::clone(&stop);
         let thread = thread::spawn(move || {
-            run(audio_out, mox, cw_mode_active, cw_ptt_active, cw_keyer, thread_enabled, thread_stop);
+            run(
+                audio_out,
+                mox,
+                cw_mode_active,
+                cw_ptt_active,
+                cw_paddle_contacts,
+                cw_keyer,
+                thread_enabled,
+                thread_stop,
+            );
         });
         Self { enabled, stop, thread: Some(thread) }
     }
@@ -305,11 +476,21 @@ impl Drop for CwSidetone {
 /// passive overflow backstop (CW_SIDETONE_BUFFER_CAPACITY, matching
 /// spectrum.rs's own AUDIO_BUFFER_CAPACITY) that only ever fires on a
 /// genuine pathological stall, never during ordinary playback.
+///
+/// Iambic A/B: `keyed` comes from IambicSimulator instead of
+/// cw_ptt_active directly -- see that struct's own doc comment for
+/// why (cw_ptt_active can't distinguish individual elements during a
+/// held squeeze). Straight key still uses cw_ptt_active directly
+/// (unaffected, already correct, and simpler/more trustworthy than
+/// running it through the simulator's own Straight-key handling, which
+/// isn't implemented here at all -- see IambicSimulator's own doc
+/// comment on what's deliberately narrower than the reference).
 fn run(
     audio_out: Arc<Mutex<VecDeque<(f32, f32)>>>,
     mox: Arc<AtomicBool>,
     cw_mode_active: Arc<AtomicBool>,
     cw_ptt_active: Arc<AtomicBool>,
+    cw_paddle_contacts: Arc<AtomicU8>,
     cw_keyer: Arc<CwKeyerAtomics>,
     enabled: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
@@ -318,6 +499,7 @@ fn run(
     let mut phase: f32 = 0.0;
     let mut gain: f32 = 0.0;
     let mut was_keyed = false;
+    let mut iambic = IambicSimulator::new();
     while !stop.load(Ordering::Relaxed) {
         // Short tick: tighter envelope/edge timing than the original
         // 10ms, and a smaller worst-case burst size for the backlog
@@ -331,10 +513,33 @@ fn run(
         if samples_needed == 0 {
             continue;
         }
-        let keyed = enabled.load(Ordering::Relaxed)
-            && mox.load(Ordering::Relaxed)
-            && cw_mode_active.load(Ordering::Relaxed)
-            && cw_ptt_active.load(Ordering::Relaxed);
+        let mode = cw_keyer.mode.load(Ordering::Relaxed);
+        let speed_wpm = cw_keyer.speed_wpm.load(Ordering::Relaxed).max(1);
+        let weight = cw_keyer.weight.load(Ordering::Relaxed).max(1);
+        // Same formulas deskHPSDR's own keyer_update() uses (48kHz
+        // sample counts): dot_length_ms = 1200/wpm, so dot_samples =
+        // dot_length_ms * 48 = 57600/wpm; dash_samples scales the same
+        // dot length by weight/50 relative to the standard 3:1 dash:dot
+        // ratio (weight=50 is neutral, matching CwKeyerAtomics's own
+        // default).
+        let dot_samples = (57_600 / speed_wpm).max(1) as i64;
+        let dash_samples = (3_456 * weight / speed_wpm).max(1) as i64;
+        let contacts = cw_paddle_contacts.load(Ordering::Relaxed);
+        let dot = contacts & 0x01 != 0;
+        let dash = contacts & 0x02 != 0;
+        // See IambicSimulator::step's own doc comment on `mode_a`.
+        // Always stepped (not just while Iambic-active) so its internal
+        // state -- dot/dash memory in particular -- never goes stale
+        // relative to real paddle events between mode changes.
+        let mode_a = mode != CW_KEYER_MODE_IAMBIC_B;
+        let iambic_keyed = iambic.step(samples_needed as u32, dot, dash, mode_a, dot_samples, dash_samples);
+        let radio_keyed = if mode == CW_KEYER_MODE_IAMBIC_A || mode == CW_KEYER_MODE_IAMBIC_B {
+            iambic_keyed
+        } else {
+            cw_ptt_active.load(Ordering::Relaxed)
+        };
+        let keyed =
+            enabled.load(Ordering::Relaxed) && mox.load(Ordering::Relaxed) && cw_mode_active.load(Ordering::Relaxed) && radio_keyed;
         if keyed != was_keyed {
             // Any transition -- see this function's own doc comment
             // (bug #2): drop anything already queued (stale RX audio
@@ -615,6 +820,113 @@ mod tests {
         }
         let diff = (whole_out.len() as i64 - chunked_out.len() as i64).abs();
         assert!(diff <= 2, "whole={} chunked={}", whole_out.len(), chunked_out.len());
+    }
+
+    /// Runs `sim` for `total_samples` (in small, irregular-size steps --
+    /// same "chunk boundaries shouldn't matter" reasoning as
+    /// rate_converter_is_consistent_across_chunk_boundaries above) with
+    /// a fixed paddle state throughout, and returns the number of
+    /// samples the reconstructed output was "keyed" (on).
+    fn run_iambic(sim: &mut IambicSimulator, total_samples: i64, dot: bool, dash: bool, mode_a: bool, dot_samples: i64, dash_samples: i64) -> i64 {
+        let mut on = 0i64;
+        let mut remaining = total_samples;
+        while remaining > 0 {
+            let step = remaining.min(37) as u32; // deliberately not a clean divisor
+            if sim.step(step, dot, dash, mode_a, dot_samples, dash_samples) {
+                on += step as i64;
+            }
+            remaining -= step as i64;
+        }
+        on
+    }
+
+    #[test]
+    fn iambic_dot_held_alone_produces_continuous_dots_at_50_percent_duty() {
+        // Holding only the dot paddle in Iambic mode repeats dots
+        // forever (PreDot -> SendDot -> DotDelay -> dot still held ->
+        // PreDot ...), each dot followed by a one-dot-length gap -- a
+        // steady 50% duty cycle.
+        let mut sim = IambicSimulator::new();
+        let dot_samples = 1000;
+        let dash_samples = 3000;
+        let total = dot_samples * 20; // 10 full dot+gap cycles
+        let on = run_iambic(&mut sim, total, true, false, true, dot_samples, dash_samples);
+        let expected = total / 2;
+        assert!((on - expected).abs() <= dot_samples, "on={on} expected~{expected}");
+    }
+
+    #[test]
+    fn iambic_dash_held_alone_produces_continuous_dashes() {
+        let mut sim = IambicSimulator::new();
+        let dot_samples = 1000;
+        let dash_samples = 3000;
+        let total = (dot_samples + dash_samples) * 10;
+        let on = run_iambic(&mut sim, total, false, true, true, dot_samples, dash_samples);
+        // Duty cycle is dash_samples / (dash_samples + dot_samples) --
+        // element on, then a one-dot-length gap, repeating.
+        let expected = total * dash_samples / (dash_samples + dot_samples);
+        assert!((on - expected).abs() <= dash_samples, "on={on} expected~{expected}");
+    }
+
+    #[test]
+    fn iambic_squeeze_alternates_dot_and_dash() {
+        // Holding BOTH paddles (a "squeeze") must alternate dot/dash
+        // elements indefinitely, not get stuck sending only one -- the
+        // entire point of "Iambic". Starting from Idle with both
+        // pressed favors dot first (see IambicSimulator::step's own
+        // doc comment on the reference's dot-overrides-dash tie-break).
+        let mut sim = IambicSimulator::new();
+        let dot_samples = 1000;
+        let dash_samples = 3000;
+        // One full dot+gap+dash+gap cycle, several times over.
+        let cycle = 2 * dot_samples + dot_samples + dash_samples;
+        let total = cycle * 8;
+        let on = run_iambic(&mut sim, total, true, true, true, dot_samples, dash_samples);
+        let expected_on = (dot_samples + dash_samples) * 8;
+        assert!((on - expected_on).abs() <= dash_samples, "on={on} expected~{expected_on}");
+    }
+
+    #[test]
+    fn iambic_mode_a_completes_current_element_then_stops() {
+        // Mode A: releasing both paddles during the delay after an
+        // element completes that element and then falls silent -- no
+        // "extra" opposite element gets appended. Squeeze until partway
+        // through a dash's own delay, release, then confirm no further
+        // dot follows.
+        let mut sim = IambicSimulator::new();
+        let dot_samples = 1000;
+        let dash_samples = 3000;
+        // Drive with a squeeze (dot wins first) through: dot, gap, into
+        // the dash that follows -- release both right at the start of
+        // the dash's own trailing delay.
+        let into_dash_delay = dot_samples + dot_samples + dash_samples + 10;
+        let _ = run_iambic(&mut sim, into_dash_delay, true, true, true, dot_samples, dash_samples);
+        // Now release both paddles and run well past what a further
+        // dot would need -- Mode A must not produce one.
+        let on_after_release = run_iambic(&mut sim, dot_samples * 3, false, false, true, dot_samples, dash_samples);
+        assert_eq!(on_after_release, 0, "Mode A produced an extra element after both paddles released");
+    }
+
+    #[test]
+    fn iambic_mode_b_adds_trailing_opposite_element() {
+        // Mode B: the same scenario as above, but a Mode-B keyer sends
+        // one more (opposite) element after release before falling
+        // silent -- the well-known Mode A/B behavioral difference this
+        // whole simulator exists to reproduce.
+        let mut sim = IambicSimulator::new();
+        let dot_samples = 1000;
+        let dash_samples = 3000;
+        let into_dash_delay = dot_samples + dot_samples + dash_samples + 10;
+        let _ = run_iambic(&mut sim, into_dash_delay, true, true, false, dot_samples, dash_samples);
+        let on_after_release = run_iambic(&mut sim, dot_samples * 4, false, false, false, dot_samples, dash_samples);
+        assert!(on_after_release > 0, "Mode B failed to produce the trailing opposite element after release");
+    }
+
+    #[test]
+    fn iambic_idle_paddle_up_produces_no_sound() {
+        let mut sim = IambicSimulator::new();
+        let on = run_iambic(&mut sim, 48_000, false, false, true, 1000, 3000);
+        assert_eq!(on, 0);
     }
 }
 
