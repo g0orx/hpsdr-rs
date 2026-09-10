@@ -182,6 +182,21 @@ pub struct Config {
     /// (a config saved before this existed) falls back to off.
     #[serde(default)]
     pub cw_pc_sidetone_enabled: Option<bool>,
+    /// Up to 5 saved CW text messages (Settings -> CW), sent via the
+    /// main window's Send CW control at whatever speed/weight is
+    /// currently set above -- see tx::TxHandle::send_cw_text's doc
+    /// comment for how sending actually works. `None`/missing (a
+    /// config saved before this existed) falls back to an empty
+    /// string, same as a never-filled-in slot.
+    #[serde(default)]
+    pub cw_text_messages: [Option<String>; 5],
+    /// Which of cw_text_messages the main window's dropdown last had
+    /// selected -- purely a UI convenience (which slot to preselect on
+    /// reconnect), never affects what actually gets sent (that's
+    /// always read fresh from cw_text_messages at Send time). `None`/
+    /// out-of-range falls back to 0.
+    #[serde(default)]
+    pub cw_text_selected: Option<usize>,
     /// Per-band PA gain (dB) entered via the PA Calibration sliders
     /// (Settings -> TX), keyed by band name (see main.rs's BANDS).
     /// Feeds radio::drive_byte_for_watts in place of the flat

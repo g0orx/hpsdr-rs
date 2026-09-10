@@ -64,7 +64,7 @@
 */
 
 use crate::radio::{
-    IqSample, TX_AUDIO_SOURCE_LOCAL_MIC, TX_AUDIO_SOURCE_RADIO_MIC,
+    CwKeyerAtomics, IqSample, TX_AUDIO_SOURCE_LOCAL_MIC, TX_AUDIO_SOURCE_RADIO_MIC,
 };
 use crate::spectrum::{EqBandCount, EqualizerParams, Mode};
 use crate::wdsp_sys as wdsp;
@@ -1576,6 +1576,127 @@ fn drain_ps_feedback(
     Some((itx, qtx, irx, qrx))
 }
 
+/// Generates the actual on-air RF envelope for "send CW text" (Settings
+/// -> CW's 5 message slots, sent via the main window's CW send
+/// control) -- see TxHandle::send_cw_text's doc comment for the whole
+/// feature.
+///
+/// Deliberately bypasses TxProcessor/WDSP's fexchange0 entirely, unlike
+/// Tune/Two-Tone (which stay inside the normal mic-audio -> WDSP TXA
+/// pipeline, using WDSP's own PostGen tone generator -- see run()'s own
+/// doc comment on that mechanism). CW can't reuse that path: PostGen's
+/// generated tone still passes through TXA's own bandpass filter
+/// (always active, SetTXABandpassFreqs), which would filter out a
+/// literal on-frequency (0Hz-offset) carrier -- exactly what CW keying
+/// needs, and exactly what piHPSDR's own CW implementation does
+/// (`I(t)=1, Q(t)=0`, i.e. a plain carrier at the dial frequency, shaped
+/// only by an envelope, generated OUTSIDE WDSP's normal SSB-modulation
+/// chain for precisely this reason).
+///
+/// `elements`/`active`/`busy` are the three points of contact with the
+/// controlling UI thread (main.rs): `elements` is loaded (replaced
+/// wholesale) by TxHandle::send_cw_text before `active` is set true;
+/// this generator only ever pops from the FRONT and never re-reads it
+/// once started (main.rs owns the write side entirely). `active` false
+/// means "stop as soon as reasonably possible" (TxHandle::stop_cw_text)
+/// -- ramps the CURRENT element down over one short envelope-ramp
+/// rather than cutting off abruptly (a hard edge is an audible/visible
+/// key click), then clears whatever's left in `elements` so a later,
+/// unrelated send doesn't inherit a stale backlog. `busy` is owned
+/// entirely by THIS generator (main.rs only ever reads it, via
+/// TxHandle::cw_text_busy) -- true from the moment TxHandle::
+/// send_cw_text sets it (so the UI reflects "sending" immediately, not
+/// only once this thread notices), false the instant generation
+/// actually stops (natural completion OR abort-ramp-finished).
+struct CwTextGen {
+    elements: Arc<Mutex<VecDeque<(bool, u32)>>>,
+    active: Arc<AtomicBool>,
+    busy: Arc<AtomicBool>,
+    /// `Some((keyed, remaining_samples))` while partway through a
+    /// specific element (on OR off); `None` between elements/when
+    /// idle. Persists across chunks -- even a fast (60 WPM) dot is
+    /// several chunks long at typical DUC rates.
+    current: Option<(bool, i64)>,
+    /// Envelope amplitude, ramped toward 0.0 or 1.0 by a fixed per-
+    /// sample step -- never stepped directly to the target, same
+    /// click-avoidance reasoning as audio.rs's CwSidetone.
+    gain: f32,
+    sidetone_phase: f32,
+}
+
+impl CwTextGen {
+    fn new(elements: Arc<Mutex<VecDeque<(bool, u32)>>>, active: Arc<AtomicBool>, busy: Arc<AtomicBool>) -> Self {
+        Self { elements, active, busy, current: None, gain: 0.0, sidetone_phase: 0.0 }
+    }
+
+    /// Whether this generator has anything left to do THIS chunk --
+    /// either genuinely active, or still ramping down/settling after
+    /// `active` went false. run()'s main loop uses this (not `active`
+    /// directly) to decide whether to take the CW-text branch at all,
+    /// so an abort's trailing ramp-down still gets to complete cleanly
+    /// even after the controlling flag has already flipped.
+    fn is_active(&self) -> bool {
+        self.active.load(Ordering::Relaxed) || self.current.is_some() || self.gain > 0.0
+    }
+
+    /// Fills `iq` (cleared first, then `2*count` interleaved I,Q
+    /// samples -- I=envelope, Q=0.0) and `mono` (cleared first, then
+    /// `count` samples -- a sidetone-frequency tone gated by the SAME
+    /// envelope, for TxHandle::tx_audio_monitor/waveform_tap so the
+    /// operator can actually hear what's being sent) at `rate` (the
+    /// DUC rate -- iq's own envelope timing is denominated in this same
+    /// rate, matching how `elements`' durations were encoded by
+    /// cw_encoder::text_to_elements).
+    fn fill(&mut self, count: usize, rate: u32, sidetone_freq_hz: f32, sidetone_volume: f32, iq: &mut Vec<f32>, mono: &mut Vec<f32>) {
+        iq.clear();
+        mono.clear();
+        // Same 5ms envelope-ramp reasoning as audio.rs's
+        // CW_SIDETONE_RAMP_SAMPLES -- long enough to be genuinely
+        // click-free, short enough not to audibly soften dots even at
+        // 60 WPM.
+        let ramp_step = 1.0 / (0.005 * rate as f32).max(1.0);
+        let tone_step = 2.0 * std::f32::consts::PI * sidetone_freq_hz / rate as f32;
+        let aborting = !self.active.load(Ordering::Relaxed);
+        for _ in 0..count {
+            if self.current.is_none() && !aborting {
+                match self.elements.lock().unwrap().pop_front() {
+                    Some((on, duration)) => self.current = Some((on, duration as i64)),
+                    None => self.busy.store(false, Ordering::Relaxed), // drained naturally
+                }
+            }
+            let target: f32 = match self.current {
+                Some((true, _)) if !aborting => 1.0,
+                _ => 0.0, // off element, aborting, or nothing queued -- settle to silence
+            };
+            if self.gain < target {
+                self.gain = (self.gain + ramp_step).min(target);
+            } else if self.gain > target {
+                self.gain = (self.gain - ramp_step).max(target);
+            }
+            if let Some((_, remaining)) = self.current.as_mut() {
+                *remaining -= 1;
+                if *remaining <= 0 {
+                    self.current = None;
+                }
+            }
+            iq.push(self.gain);
+            iq.push(0.0);
+            self.sidetone_phase += tone_step;
+            if self.sidetone_phase >= 2.0 * std::f32::consts::PI {
+                self.sidetone_phase -= 2.0 * std::f32::consts::PI;
+            }
+            mono.push(sidetone_volume * self.gain * self.sidetone_phase.sin());
+        }
+        if aborting && self.gain <= 0.0 {
+            // Ramp-down finished -- drop whatever was left unsent so a
+            // later, unrelated send never inherits this backlog.
+            self.current = None;
+            self.elements.lock().unwrap().clear();
+            self.busy.store(false, Ordering::Relaxed);
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run(
     mic_buffer: Arc<Mutex<VecDeque<f32>>>,
@@ -1630,9 +1751,20 @@ fn run(
     ps_params: Arc<Mutex<PsParams>>,
     ps_status: Arc<Mutex<PsStatus>>,
     ps_corr_path: Option<PathBuf>,
+    // See TxHandle::send_cw_text's doc comment and CwTextGen's own doc
+    // comment for the full "send CW text" mechanism.
+    cw_keyer: Arc<CwKeyerAtomics>,
+    cw_text_elements: Arc<Mutex<VecDeque<(bool, u32)>>>,
+    cw_text_active: Arc<AtomicBool>,
+    cw_text_busy: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
 ) {
     let mut processor = TxProcessor::open(channel, protocol, mic_rate, duc_rate, ps_corr_path);
+    let mut cw_text_gen = CwTextGen::new(Arc::clone(&cw_text_elements), Arc::clone(&cw_text_active), Arc::clone(&cw_text_busy));
+    let mut cw_iq_scratch: Vec<f32> = Vec::new();
+    let mut cw_mono_scratch: Vec<f32> = Vec::new();
+    let duc_ratio = ((duc_rate / mic_rate).max(1)) as usize;
+    let out_iq_pairs = TX_BUFFER_SIZE * duc_ratio;
     let mut chunk = vec![0.0f32; TX_BUFFER_SIZE];
     // Real-time duration of one TX_BUFFER_SIZE chunk at the mic capture
     // rate -- e.g. ~11ms for 512 samples at 48kHz. Without this, the
@@ -1730,12 +1862,77 @@ fn run(
                 ps_tx_feedback_iq.lock().unwrap().clear();
                 processor.set_ps_mox(false);
             }
+            // Same reasoning -- if MOX dropped for some OTHER reason
+            // while a CW-text send was mid-flight (e.g. an external
+            // PTT toggle, a disconnect), never let it silently resume
+            // later against an unrelated transmission. See CwTextGen's
+            // own doc comment on `active`/`busy` ownership.
+            if cw_text_active.load(Ordering::Relaxed) || cw_text_gen.is_active() {
+                cw_text_active.store(false, Ordering::Relaxed);
+                cw_text_elements.lock().unwrap().clear();
+                cw_text_gen = CwTextGen::new(Arc::clone(&cw_text_elements), Arc::clone(&cw_text_active), Arc::clone(&cw_text_busy));
+                cw_text_busy.store(false, Ordering::Relaxed);
+            }
             mox_active_since = None;
             thread::sleep(Duration::from_millis(20));
             // Resync so the first chunk after PTT is produced against a
             // fresh schedule, not delayed by however long MOX was off --
             // same reasoning as p2_tx_iq_loop's own resync here.
             next_chunk = Instant::now();
+            continue;
+        }
+        if cw_text_gen.is_active() {
+            // See CwTextGen's own doc comment -- bypasses source
+            // selection and WDSP entirely; a plain shaped on-frequency
+            // carrier, not something fexchange0's SSB-modulation chain
+            // can produce.
+            let sidetone_freq_hz = cw_keyer.sidetone_freq_hz.load(Ordering::Relaxed) as f32;
+            // Same 0-255 full-byte range reused as a 0.0-1.0 amplitude
+            // scalar as audio.rs's CwSidetone -- the Sidetone Level
+            // slider governs this monitor tone too.
+            let sidetone_volume = (cw_keyer.sidetone_volume.load(Ordering::Relaxed).min(255) as f32) / 255.0;
+            cw_text_gen.fill(out_iq_pairs, duc_rate as u32, sidetone_freq_hz, sidetone_volume, &mut cw_iq_scratch, &mut cw_mono_scratch);
+
+            {
+                let mut spec = tx_spectrum_iq.lock().unwrap();
+                for pair in cw_iq_scratch.chunks_exact(2) {
+                    if spec.len() >= TX_SPECTRUM_IQ_CAPACITY {
+                        spec.pop_front();
+                    }
+                    spec.push_back(IqSample { i: (pair[0] * PS_IQ_NORM) as i32, q: (pair[1] * PS_IQ_NORM) as i32 });
+                }
+            }
+            {
+                let mut out = tx_iq_out.lock().unwrap();
+                for &v in &cw_iq_scratch {
+                    if out.len() >= TX_IQ_BUFFER_CAPACITY {
+                        out.pop_front();
+                    }
+                    out.push_back(v);
+                }
+            }
+            {
+                let mut mon = tx_audio_monitor.lock().unwrap();
+                let mut wave = waveform_tap.lock().unwrap();
+                for &sample in &cw_mono_scratch {
+                    if mon.len() >= TX_AUDIO_MONITOR_CAPACITY {
+                        mon.pop_front();
+                    }
+                    mon.push_back((sample, sample));
+                    if wave.len() >= WAVEFORM_TAP_CAPACITY {
+                        wave.pop_front();
+                    }
+                    wave.push_back(sample);
+                }
+            }
+
+            next_chunk += chunk_interval;
+            let now = Instant::now();
+            if next_chunk > now {
+                thread::sleep(next_chunk - now);
+            } else {
+                next_chunk = now;
+            }
             continue;
         }
         if puresignal_enabled.load(Ordering::Relaxed) {
@@ -2006,6 +2203,15 @@ pub struct TxHandle {
     ps_params: Arc<Mutex<PsParams>>,
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
+    /// "Send CW text" (Settings -> CW's 5 message slots) -- see
+    /// send_cw_text's own doc comment for the full mechanism.
+    cw_text_elements: Arc<Mutex<VecDeque<(bool, u32)>>>,
+    cw_text_active: Arc<AtomicBool>,
+    cw_text_busy: Arc<AtomicBool>,
+    /// Needed by send_cw_text to encode text at the right sample rate
+    /// (matches whatever this instance's own `run()` thread was opened
+    /// with -- see TxHandle::start's own doc comment on `duc_rate`).
+    duc_rate: i32,
 }
 
 impl TxHandle {
@@ -2047,6 +2253,8 @@ impl TxHandle {
         // harmless to have set even when unused; nothing reads it unless
         // save_ps_corr/restore_ps_corr are actually called.
         ps_corr_path: Option<PathBuf>,
+        // See TxHandle::send_cw_text's doc comment.
+        cw_keyer: Arc<CwKeyerAtomics>,
     ) -> Self {
         let display = Arc::new(Mutex::new(TxDisplay::default()));
         let params = Arc::new(Mutex::new(TxParams::default()));
@@ -2057,6 +2265,9 @@ impl TxHandle {
         // Live -- see TxHandle::puresignal_enabled's doc comment.
         let puresignal_enabled = Arc::new(AtomicBool::new(puresignal_enabled));
         let stop = Arc::new(AtomicBool::new(false));
+        let cw_text_elements = Arc::new(Mutex::new(VecDeque::new()));
+        let cw_text_active = Arc::new(AtomicBool::new(false));
+        let cw_text_busy = Arc::new(AtomicBool::new(false));
 
         let thread = {
             let display = Arc::clone(&display);
@@ -2067,12 +2278,15 @@ impl TxHandle {
             let waveform_tap = Arc::clone(&waveform_tap);
             let puresignal_enabled = Arc::clone(&puresignal_enabled);
             let stop = Arc::clone(&stop);
+            let cw_text_elements = Arc::clone(&cw_text_elements);
+            let cw_text_active = Arc::clone(&cw_text_active);
+            let cw_text_busy = Arc::clone(&cw_text_busy);
             thread::spawn(move || {
                 run(
                     mic_buffer, tci_tx_audio, radio_mic_audio, tx_audio_source, tci_wants_mic,
                     tx_iq_out, tx_spectrum_iq, tx_audio_monitor, waveform_tap, mox, params, display, channel,
                     protocol, mic_rate, duc_rate, puresignal_enabled, ps_rx_feedback_iq, ps_tx_feedback_iq,
-                    ps_params, ps_status, ps_corr_path, stop,
+                    ps_params, ps_status, ps_corr_path, cw_keyer, cw_text_elements, cw_text_active, cw_text_busy, stop,
                 )
             })
         };
@@ -2087,7 +2301,59 @@ impl TxHandle {
             ps_params,
             stop,
             thread: Some(thread),
+            cw_text_elements,
+            cw_text_active,
+            cw_text_busy,
+            duc_rate,
         }
+    }
+
+    /// Encodes `text` as Morse at `speed_wpm`/`weight` (pass
+    /// RadioSession::cw_keyer's own current values -- "Send at the
+    /// speed defined in the CW tab", per the original request) and
+    /// starts sending it as an actual, real-time-generated CW carrier
+    /// -- see CwTextGen's own doc comment for how. The CALLER (main.rs)
+    /// is responsible for asserting session.mox (this has no PTT
+    /// concept of its own, same as Tune/Two-Tone) and for keeping the
+    /// radio's OWN mode selector on CWL/CWU throughout -- this doesn't
+    /// touch WDSP/TxParams::mode at all, so it works regardless of
+    /// which mode string happens to be selected, but generating a CW
+    /// carrier while some OTHER mode's filter/BFO is dialed in on the
+    /// operator's own dial would be confusing/wrong, hence main.rs's
+    /// own "only enabled while CWL/CWU is already selected" gate.
+    ///
+    /// Overwrites any previously loaded (but not yet fully sent)
+    /// message outright -- the caller's own UI is expected to disable
+    /// this control while cw_text_busy() is true, so this should only
+    /// ever be reached with nothing in flight.
+    pub fn send_cw_text(&self, text: &str, speed_wpm: u32, weight: u32) {
+        let elements = crate::cw_encoder::text_to_elements(text, speed_wpm, weight, self.duc_rate as u32);
+        *self.cw_text_elements.lock().unwrap() = elements.into_iter().collect();
+        // busy before active -- see CwTextGen's own doc comment on why
+        // this generator's background thread only ever reads `active`
+        // once `elements` is fully loaded, but the UI-visible `busy`
+        // flag should already reflect "sending" for THIS call's caller
+        // immediately, not only once that thread next wakes up.
+        self.cw_text_busy.store(true, Ordering::Relaxed);
+        self.cw_text_active.store(true, Ordering::Relaxed);
+    }
+
+    /// Stops a "send CW text" in progress -- see CwTextGen's own doc
+    /// comment for the ramp-down/cleanup this triggers. A no-op if
+    /// nothing is currently sending. Does NOT drop session.mox --
+    /// same division of responsibility as send_cw_text, the caller
+    /// owns PTT.
+    pub fn stop_cw_text(&self) {
+        self.cw_text_active.store(false, Ordering::Relaxed);
+    }
+
+    /// True from the moment send_cw_text is called until sending
+    /// actually stops (message fully sent, or stop_cw_text's ramp-down
+    /// finished) -- poll this once per frame to know when to drop
+    /// session.mox and update the Send/Stop button back to its idle
+    /// state.
+    pub fn cw_text_busy(&self) -> bool {
+        self.cw_text_busy.load(Ordering::Relaxed)
     }
 
     pub fn set_mode(&self, mode: Mode) {

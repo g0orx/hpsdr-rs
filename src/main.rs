@@ -16,6 +16,7 @@ mod bootloader_ui;
 mod cat;
 mod config;
 mod cw_decoder;
+mod cw_encoder;
 mod debug_log;
 mod discovery;
 mod discovery_ui;
@@ -934,6 +935,23 @@ struct ConnectedState {
     /// bounded on/off cycle rather than a single permanent lockout, but
     /// never an unbounded continuous transmission.
     cw_stuck_key_lockout: bool,
+    /// 5 saved CW text messages (Settings -> CW) -- see
+    /// tx::TxHandle::send_cw_text's doc comment for how the selected
+    /// one actually gets sent. Loaded from/saved to Config::
+    /// cw_text_messages verbatim.
+    cw_text_messages: [String; 5],
+    /// Which of cw_text_messages the main window's dropdown currently
+    /// has selected (0-4) -- see Config::cw_text_selected's doc comment.
+    cw_text_selected: usize,
+    /// Whether a "send CW text" is currently in flight -- set true the
+    /// instant the Send button is clicked (mirrors tx_handle's own
+    /// cw_text_busy() immediately, rather than waiting a frame to
+    /// notice), cleared once tx_handle.cw_text_busy() is next observed
+    /// false (message fully sent, Stop was clicked, or session.mox got
+    /// dropped by something else entirely -- see the per-frame poll
+    /// site's own comment for the full cleanup, mirroring tune_active/
+    /// two_tone_active's own established "safety net" pattern).
+    cw_text_sending: bool,
     /// Exponentially-smoothed forward/reverse power ADC counts (same
     /// raw units as session.tx_forward_power/tx_reverse_power), used
     /// only for the TX meter display -- NOT written back to the
@@ -1470,6 +1488,7 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                         Arc::clone(&session.ps_rx_feedback_iq),
                         Arc::clone(&session.ps_tx_feedback_iq),
                         ps_corr_path(device.mac),
+                        Arc::clone(&session.cw_keyer),
                     );
                     tx_handle.set_mic_gain(mic_gain);
                     tx_handle.set_mode(spectrum.mode());
@@ -1663,6 +1682,9 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                 cw_break_in_active: false,
                 cw_ptt_continuous_since: None,
                 cw_stuck_key_lockout: false,
+                cw_text_messages: cfg.cw_text_messages.clone().map(|m| m.unwrap_or_default()),
+                cw_text_selected: cfg.cw_text_selected.filter(|&i| i < 5).unwrap_or(0),
+                cw_text_sending: false,
                 smoothed_fwd_power: 0.0,
                 smoothed_rev_power: 0.0,
                 tx_fifo_warning_until: None,
@@ -3102,8 +3124,9 @@ impl eframe::App for HpsdrApp {
                             // transmission; still clickable to turn
                             // OFF if tune itself is what's currently
                             // keying.
-                            let tune_may_start =
-                                (!mox_now || connected.tune_active) && !connected.two_tone_active;
+                            let tune_may_start = (!mox_now || connected.tune_active)
+                                && !connected.two_tone_active
+                                && !connected.cw_text_sending;
                             let tune_label = if connected.tune_active { "TUNE ON" } else { "TUNE" };
                             let tune_color = if connected.tune_active {
                                 egui::Color32::from_rgb(230, 140, 20)
@@ -3179,8 +3202,9 @@ impl eframe::App for HpsdrApp {
                             // never provide. Mutually exclusive with
                             // Tune (tune_may_start above already
                             // excludes two_tone_active; mirrored here).
-                            let two_tone_may_start =
-                                (!mox_now || connected.two_tone_active) && !connected.tune_active;
+                            let two_tone_may_start = (!mox_now || connected.two_tone_active)
+                                && !connected.tune_active
+                                && !connected.cw_text_sending;
                             let two_tone_label =
                                 if connected.two_tone_active { "TWO TONE ON" } else { "TWO TONE" };
                             let two_tone_color = if connected.two_tone_active {
@@ -3236,6 +3260,97 @@ impl eframe::App for HpsdrApp {
                                     connected.session.tx_power_watts.store(prev, Ordering::Relaxed);
                                 }
                                 connected.two_tone_active = false;
+                            }
+
+                            // CW text send -- see tx::TxHandle::
+                            // send_cw_text's doc comment for the actual
+                            // generation mechanism. Requires a CW mode
+                            // already selected (per the user's own
+                            // request, no auto-switch) and, like Tune/
+                            // Two-Tone, can't hijack an externally-keyed
+                            // transmission or run concurrently with
+                            // either of them.
+                            let cw_text_mode_selected =
+                                matches!(connected.spectrum.mode(), spectrum::Mode::Cwl | spectrum::Mode::Cwu);
+                            // Once already sending, the button must
+                            // stay clickable (to STOP) regardless of
+                            // mode/mox/Tune/Two-Tone changing under it
+                            // -- only the conditions for STARTING a new
+                            // send require CW mode/nothing else already
+                            // using mox.
+                            let cw_text_may_start = connected.cw_text_sending
+                                || (cw_text_mode_selected
+                                    && !mox_now
+                                    && !connected.tune_active
+                                    && !connected.two_tone_active);
+                            egui::ComboBox::from_id_salt("cw_text_message_select")
+                                .selected_text(format!("{}", connected.cw_text_selected + 1))
+                                .show_ui(ui, |ui| {
+                                    for i in 0..connected.cw_text_messages.len() {
+                                        let preview = connected.cw_text_messages[i].chars().take(20).collect::<String>();
+                                        let label = if preview.is_empty() {
+                                            format!("{} (empty)", i + 1)
+                                        } else {
+                                            format!("{}: {}", i + 1, preview)
+                                        };
+                                        ui.selectable_value(&mut connected.cw_text_selected, i, label);
+                                    }
+                                })
+                                .response
+                                .on_hover_text("Which of Settings -> CW's 5 saved messages to send");
+                            let cw_text_label = if connected.cw_text_sending { "STOP" } else { "SEND CW" };
+                            let cw_text_color = if connected.cw_text_sending {
+                                egui::Color32::from_rgb(210, 50, 50)
+                            } else {
+                                egui::Color32::from_gray(60)
+                            };
+                            let cw_text_resp = ui
+                                .add_enabled(
+                                    cw_text_may_start,
+                                    egui::Button::new(
+                                        egui::RichText::new(cw_text_label).strong().color(egui::Color32::WHITE),
+                                    )
+                                    .fill(cw_text_color),
+                                )
+                                .on_hover_text(
+                                    "Send the selected message (Settings -> CW) as real CW, at \
+                                     the Speed/Weight set there -- click again to stop mid-message.",
+                                );
+                            if cw_text_resp.clicked() {
+                                if connected.cw_text_sending {
+                                    if let Some(tx) = &connected.tx_handle {
+                                        tx.stop_cw_text();
+                                    }
+                                } else {
+                                    let text = connected.cw_text_messages[connected.cw_text_selected].clone();
+                                    if !text.trim().is_empty() {
+                                        if let Some(tx) = &connected.tx_handle {
+                                            let speed_wpm =
+                                                connected.session.cw_keyer.speed_wpm.load(Ordering::Relaxed);
+                                            let weight = connected.session.cw_keyer.weight.load(Ordering::Relaxed);
+                                            tx.send_cw_text(&text, speed_wpm, weight);
+                                            connected.session.set_mox(true);
+                                            connected.cw_text_sending = true;
+                                        }
+                                    }
+                                }
+                            }
+                            // Per-frame poll: drop mox/reset the button
+                            // once tx_handle reports done (message
+                            // fully sent, Stop finished its ramp-down),
+                            // or if session.mox got dropped by
+                            // something else entirely -- same "safety
+                            // net" pattern as Tune/Two-Tone above.
+                            if connected.cw_text_sending {
+                                let still_busy =
+                                    connected.tx_handle.as_ref().map(|tx| tx.cw_text_busy()).unwrap_or(false);
+                                if !still_busy || !connected.session.mox_active() {
+                                    if let Some(tx) = &connected.tx_handle {
+                                        tx.stop_cw_text();
+                                    }
+                                    connected.session.set_mox(false);
+                                    connected.cw_text_sending = false;
+                                }
                             }
 
                             // Spacebar: hold-to-talk, the traditional
@@ -5169,6 +5284,23 @@ impl eframe::App for HpsdrApp {
                                         connected.cw_sidetone.enabled.store(pc_sidetone, Ordering::Relaxed);
                                         settings_changed = true;
                                     }
+
+                                    ui.separator();
+                                    ui.label("CW Text Messages:").on_hover_text(
+                                        "Up to 5 saved messages, sent as real CW via the main \
+                                         window's Send control -- at the Speed/Weight set above, \
+                                         through the radio's own transmitter (not the internal \
+                                         keyer -- this project generates the CW carrier directly, \
+                                         since there's no paddle involved).",
+                                    );
+                                    for (i, message) in connected.cw_text_messages.iter_mut().enumerate() {
+                                        ui.horizontal(|ui| {
+                                            ui.label(format!("{}:", i + 1));
+                                            if ui.text_edit_singleline(message).changed() {
+                                                settings_changed = true;
+                                            }
+                                        });
+                                    }
                                 }
 
                                 SettingsTab::Agc => {
@@ -5820,6 +5952,7 @@ impl eframe::App for HpsdrApp {
                                                         Arc::clone(&connected.session.ps_rx_feedback_iq),
                                                         Arc::clone(&connected.session.ps_tx_feedback_iq),
                                                         ps_corr_path(connected.device.mac),
+                                                        Arc::clone(&connected.session.cw_keyer),
                                                     );
                                                     tx_handle.set_mic_gain(connected.mic_gain);
                                                     tx_handle.set_mode(connected.spectrum.mode());
@@ -7020,6 +7153,8 @@ impl eframe::App for HpsdrApp {
                             connected.session.cw_keyer.hang_time_ms.load(Ordering::Relaxed),
                         ),
                         cw_pc_sidetone_enabled: Some(connected.cw_sidetone.enabled.load(Ordering::Relaxed)),
+                        cw_text_messages: connected.cw_text_messages.clone().map(|m| if m.is_empty() { None } else { Some(m) }),
+                        cw_text_selected: Some(connected.cw_text_selected),
                         db_low: Some(connected.db_low),
                         db_low_auto: Some(connected.db_low_auto),
                         db_high: Some(connected.db_high),
@@ -9678,6 +9813,7 @@ fn change_sample_rate(connected: &mut ConnectedState, new_rate: u32) {
                     Arc::clone(&connected.session.ps_rx_feedback_iq),
                     Arc::clone(&connected.session.ps_tx_feedback_iq),
                     ps_corr_path(connected.device.mac),
+                    Arc::clone(&connected.session.cw_keyer),
                 );
                 tx_handle.set_mic_gain(mic_gain);
                 tx_handle.set_mode(connected.spectrum.mode());
