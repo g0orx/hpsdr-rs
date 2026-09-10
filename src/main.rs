@@ -4814,18 +4814,24 @@ impl eframe::App for HpsdrApp {
 
                                 SettingsTab::Cw => {
                                     ui.add_space(4.0);
-                                    let mut pitch = spectrum::cw_pitch_hz();
-                                    if ui
-                                        .add(egui::Slider::new(&mut pitch, 300.0..=1000.0).text("CW Pitch").suffix(" Hz"))
-                                        .on_hover_text(
+                                    ui.horizontal(|ui| {
+                                        ui.label("CW Pitch:").on_hover_text(
                                             "Audio pitch (Hz) that CWL/CWU center on -- affects the RX \
                                              filter, click-to-tune centering, and the TX Tune tone.",
-                                        )
-                                        .changed()
-                                    {
-                                        spectrum::set_cw_pitch_hz(pitch);
-                                        settings_changed = true;
-                                    }
+                                        );
+                                        let mut pitch = spectrum::cw_pitch_hz();
+                                        if scroll_slider_f64(
+                                            ui,
+                                            &mut connected.slider_scroll_accum,
+                                            &mut pitch,
+                                            300.0..=1000.0,
+                                            10.0,
+                                            " Hz",
+                                        ) {
+                                            spectrum::set_cw_pitch_hz(pitch);
+                                            settings_changed = true;
+                                        }
+                                    });
                                     ui.weak("More CW options (TX keyer, break-in, etc.) are planned here.");
                                 }
 
