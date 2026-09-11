@@ -15,7 +15,7 @@ window titled **Receiver N** opens. This button disappears (replaced by
 **All N receivers active**) once you've reached the radio's maximum
 receiver count.
 
-On a [PureSignal](12-puresignal.md)-capable radio, "max" here is 2 lower
+On a [PureSignal](13-puresignal.md)-capable radio, "max" here is 2 lower
 than the radio's full receiver capacity -- PureSignal's two feedback
 receivers are reserved for the whole session as soon as you connect,
 whether or not PureSignal is actually enabled.
@@ -29,7 +29,7 @@ boxes with **A>B**/**B>A**/**A<>B** buttons (same as the main window's own
 -- see [Frequency display and tuning](02-main-window.md#frequency-display-and-tuning)
 -- but no **Split** button, since extra receivers never transmit), with
 **CTUN** and, while in CW mode, **CW Decode** (see
-[CW decoder](02-main-window.md#cw-decoder)) in the row underneath, band
+[CW decoder](02-main-window.md#cw-decode)) in the row underneath, band
 and mode rows, **Filter width** and **Audio gain** sliders, the
 **Record**/NB/NR/SNB/ANF/BIN/AGC/AGC Gain/RIT toggle row -- RIT here
 works the same as the
@@ -66,7 +66,7 @@ Calibration, PureSignal, and Diversity are session-wide, not per-receiver:
 - **Spectrum** -- display range and waterfall palette, same as the main
   window's Spectrum tab (no separate TX range here, since extra receivers
   never transmit).
-- **EQ** -- its own independent [graphic equalizer](07-equalizer.md),
+- **EQ** -- its own independent [graphic equalizer](08-equalizer.md),
   RX-only.
 
 ![Extra receiver settings window](images/11-extra-receiver-settings.png)

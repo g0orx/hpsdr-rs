@@ -11,18 +11,19 @@ from source and project status, see the [top-level README](../../README.md).
 3. [Extra Receivers](03-extra-receivers.md) -- adding independent receiver windows
 4. [Settings: About](04-about.md) -- connected radio details and author info
 5. [Settings: Audio](05-settings-audio.md) -- RX output device, TX input device
-6. [Settings: Diversity](06-diversity.md) -- 2-ADC diversity reception
-7. [Settings: Equalizer](07-equalizer.md) -- RX/TX graphic EQ
-8. [Firmware Update](08-firmware-update.md) -- updating FPGA firmware and changing a radio's IP, in bootloader mode or in-application
-9. [Settings: Network](09-settings-network.md) -- rigctl, TCI, and CAT control servers
-10. [Settings: Open Collector](10-open-collector.md) -- per-band relay-driver output configuration
-11. [Settings: PA Calibration](11-pa-calibration.md) -- per-band power calibration
-12. [Settings: PureSignal](12-puresignal.md) -- PA linearization setup and calibration procedure
-13. [Settings: RX](13-settings-rx.md) -- sample rate, ADC/antenna, AGC, noise blanker/reduction
-14. [Settings: Spectrum](14-settings-spectrum.md) -- display range, waterfall palette
-15. [Settings: TX](15-settings-tx.md) -- TX power, mic source, safety notes
-16. [Settings: XVTR](16-xvtr.md) -- defining transverters (IF-to-RF band conversion)
-17. [Ozy USB](17-ozy-usb.md) -- connecting the original Ozy/Mercury/Penny hardware over USB (new, unconfirmed)
+6. [Settings: CW](06-settings-cw.md) -- CW Pitch, the radio's internal keyer, and saved CW text messages
+7. [Settings: Diversity](07-diversity.md) -- 2-ADC diversity reception
+8. [Settings: Equalizer](08-equalizer.md) -- RX/TX graphic EQ
+9. [Firmware Update](09-firmware-update.md) -- updating FPGA firmware and changing a radio's IP, in bootloader mode or in-application
+10. [Settings: Network](10-settings-network.md) -- rigctl, TCI, and CAT control servers
+11. [Settings: Open Collector](11-open-collector.md) -- per-band relay-driver output configuration
+12. [Settings: PA Calibration](12-pa-calibration.md) -- per-band power calibration
+13. [Settings: PureSignal](13-puresignal.md) -- PA linearization setup and calibration procedure
+14. [Settings: RX](14-settings-rx.md) -- sample rate, ADC/antenna, AGC, noise blanker/reduction
+15. [Settings: Spectrum](15-settings-spectrum.md) -- display range, waterfall palette
+16. [Settings: TX](16-settings-tx.md) -- TX power, mic source, safety notes
+17. [Settings: XVTR](17-xvtr.md) -- defining transverters (IF-to-RF band conversion)
+18. [Ozy USB](18-ozy-usb.md) -- connecting the original Ozy/Mercury/Penny hardware over USB (new, unconfirmed)
 
 **PDF**: this whole manual is also available as a single PDF, useful for
 offline/printed reading. It's built automatically by the "Manual PDF"

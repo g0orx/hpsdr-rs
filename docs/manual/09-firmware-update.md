@@ -1,4 +1,4 @@
-[← Equalizer](07-equalizer.md) | [Index](README.md) | [Network →](09-settings-network.md)
+[← Equalizer](08-equalizer.md) | [Index](README.md) | [Network →](10-settings-network.md)
 
 # Firmware Update
 
@@ -110,4 +110,4 @@ check the error shown before trying again.
 
 ---
 
-[← Equalizer](07-equalizer.md) | [Index](README.md) | [Network →](09-settings-network.md)
+[← Equalizer](08-equalizer.md) | [Index](README.md) | [Network →](10-settings-network.md)

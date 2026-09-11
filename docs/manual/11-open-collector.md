@@ -1,4 +1,4 @@
-[← Network](09-settings-network.md) | [Index](README.md) | [PA Calibration →](11-pa-calibration.md)
+[← Network](10-settings-network.md) | [Index](README.md) | [PA Calibration →](12-pa-calibration.md)
 
 # Settings: Open Collector
 
@@ -12,7 +12,7 @@ switching, bandpass filter selection, or amplifier keying. This tab lets you
 configure which outputs are active on each band, separately for receive and
 transmit.
 
-One row per band, plus a row per configured [XVTR](16-xvtr.md) slot with a
+One row per band, plus a row per configured [XVTR](17-xvtr.md) slot with a
 non-empty name:
 
 - **Rx** -- which of OC1-OC7 are active while receiving on that band.
@@ -43,4 +43,4 @@ windows don't have their own Open Collector settings.
 
 ---
 
-[← Network](09-settings-network.md) | [Index](README.md) | [PA Calibration →](11-pa-calibration.md)
+[← Network](10-settings-network.md) | [Index](README.md) | [PA Calibration →](12-pa-calibration.md)

@@ -1,4 +1,4 @@
-[← Diversity](06-diversity.md) | [Index](README.md) | [Firmware Update →](08-firmware-update.md)
+[← Diversity](07-diversity.md) | [Index](README.md) | [Firmware Update →](09-firmware-update.md)
 
 # Settings: Equalizer
 
@@ -36,4 +36,4 @@ independently -- flipping back and forth doesn't lose either set.
 
 ---
 
-[← Diversity](06-diversity.md) | [Index](README.md) | [Firmware Update →](08-firmware-update.md)
+[← Diversity](07-diversity.md) | [Index](README.md) | [Firmware Update →](09-firmware-update.md)

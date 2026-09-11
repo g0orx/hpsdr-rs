@@ -4,6 +4,8 @@
 
 Open **Settings...** from the main window, then the **About** tab.
 
+![About settings tab](images/about-tab.png)
+
 Shows details of the radio currently connected to:
 
 - **Board** -- the detected board type (e.g. Orion2, HermesLite2).
@@ -11,7 +13,7 @@ Shows details of the radio currently connected to:
   Ethernet).
 - **Protocol Version** -- the firmware's reported protocol version.
 - **IP Address** -- the radio's own address on the network. Shows "USB"
-  for [Ozy USB](17-ozy-usb.md) instead, which has no network address.
+  for [Ozy USB](18-ozy-usb.md) instead, which has no network address.
 - **MAC Address** -- the radio's hardware Ethernet address. Not shown
   for Ozy (no real MAC).
 - **Interface** -- which of this computer's own network interfaces (e.g.

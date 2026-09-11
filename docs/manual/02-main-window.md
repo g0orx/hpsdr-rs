@@ -59,13 +59,14 @@ until you clear it yourself (the panel's own **Clear** button) or
 reconnect. Each extra receiver window has its own independent **CW
 Decode** button and panel, next to that receiver's own CTUN.
 
-**Settings → CW** has a **CW Pitch** slider (300-1000 Hz, 600 Hz by
-default) -- the audio pitch **CWL**/**CWU** centers on, affecting the RX
-filter, click-to-tune centering above, and the TX Tune tone. It's a
-single setting shared by the main receiver and every extra receiver (no
-per-receiver override), since it's really "what pitch do you want to
-hear/zero-beat CW at", not a per-receiver hardware setting. More CW
-options (TX keyer, break-in, etc.) are planned for this tab.
+[Settings: CW](06-settings-cw.md) has a **CW Pitch** slider (300-1000 Hz,
+600 Hz by default) -- the audio pitch **CWL**/**CWU** centers on,
+affecting the RX filter, click-to-tune centering above, and the TX Tune
+tone. It's a single setting shared by the main receiver and every extra
+receiver (no per-receiver override), since it's really "what pitch do you
+want to hear/zero-beat CW at", not a per-receiver hardware setting. That
+same tab also configures the radio's internal CW keyer (speed, weight,
+sidetone, break-in) and up to 5 saved CW text messages.
 
 ## VFO A / VFO B / Split
 
@@ -100,10 +101,10 @@ all -- e.g. HermesLite/HermesLite2 cap out around 30.72MHz, so **6m**
 → PA Calibration's per-band list and to extra receiver windows' own band
 row.
 
-A configured [transverter](16-xvtr.md) (Settings → **XVTR**) appears as an
+A configured [transverter](17-xvtr.md) (Settings → **XVTR**) appears as an
 extra button alongside the band row, showing the real RF frequency (e.g.
 2m) while the radio's actual hardware stays tuned to its true IF
-underneath -- see [Settings: XVTR](16-xvtr.md) for how to define one.
+underneath -- see [Settings: XVTR](17-xvtr.md) for how to define one.
 
 Below that, a row of mode buttons: **LSB, USB, DSB, CWL, CWU, FM, AM, DIGU,
 SPEC, DIGL, SAM, DRM**.
@@ -193,7 +194,7 @@ Transmit**):
   TX Power) -- for safely tuning an antenna or amplifier.
 - **TWO TONE** -- transmits a two-tone test signal instead of a steady
   tone, also at Tune Power. This is required (not just an alternative) for
-  PureSignal calibration -- see [PureSignal](12-puresignal.md).
+  PureSignal calibration -- see [PureSignal](13-puresignal.md).
 - **RIT** (Receiver Incremental Tuning) -- nudges what you actually hear
   without touching VFO A's displayed or logged frequency, useful for
   zero-beating a station that's drifted slightly off frequency without
@@ -226,7 +227,7 @@ project's current TX verification status.
 The spectrum pane shows the live signal trace with a shaded band marking
 the current filter passband and a vertical line marking the dial frequency
 -- blue while receiving, red/orange while transmitting (see
-[Settings: Spectrum](14-settings-spectrum.md#while-transmitting) for what
+[Settings: Spectrum](15-settings-spectrum.md#while-transmitting) for what
 changes about this while Split is in use). Ten frequency-axis gridlines
 span the pane; the label at the very first and last one is skipped (the
 gridline itself still draws) since it would otherwise get clipped or hang
@@ -275,12 +276,12 @@ Anchored in the top-right of the window:
   configured **Max TX Power** (Settings → TX). The needle is red whenever
   you're transmitting at all, and if SWR reaches or exceeds **Max SWR**
   (Settings → TX) at more than 35W, **TX Power** is automatically cut to
-  10W to protect the PA -- see [Settings: TX](15-settings-tx.md#max-swr)
+  10W to protect the PA -- see [Settings: TX](16-settings-tx.md#max-swr)
   for the full behavior.
 
 Below the meter:
 
-- **Settings...** opens the [Settings window](09-settings-network.md).
+- **Settings...** opens the [Settings window](10-settings-network.md).
 - **Add Receiver (n/max)** adds another independent receiver window (see
   [Extra Receivers](03-extra-receivers.md)) -- hidden once you've reached
   the radio's maximum receiver count, replaced with **All N receivers

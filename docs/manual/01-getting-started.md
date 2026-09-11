@@ -54,12 +54,12 @@ broadcast-discovered one.
 
 **Firmware Update...** opens a separate window for updating a radio's FPGA
 firmware or changing its IP address while it's in bootloader mode -- see
-[Firmware Update](08-firmware-update.md).
+[Firmware Update](09-firmware-update.md).
 
 **Ozy USB setup** is for the original HPSDR hardware (an Ozy board with
 separate Mercury/Penny boards), which connects over USB instead of the
 network and needs a one-time driver/firmware setup before it shows up in
-this list -- see [Ozy USB](17-ozy-usb.md) for the full walkthrough.
+this list -- see [Ozy USB](18-ozy-usb.md) for the full walkthrough.
 
 ## Connecting
 

@@ -1,4 +1,4 @@
-[← About](04-about.md) | [Index](README.md) | [Diversity →](06-diversity.md)
+[← About](04-about.md) | [Index](README.md) | [CW →](06-settings-cw.md)
 
 # Settings: Audio
 
@@ -43,4 +43,4 @@ disable/re-enable transmit (Settings → TX).
 
 ---
 
-[← About](04-about.md) | [Index](README.md) | [Diversity →](06-diversity.md)
+[← About](04-about.md) | [Index](README.md) | [CW →](06-settings-cw.md)

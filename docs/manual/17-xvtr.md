@@ -1,4 +1,4 @@
-[← TX](15-settings-tx.md) | [Index](README.md) | [Ozy USB →](17-ozy-usb.md)
+[← TX](16-settings-tx.md) | [Index](README.md) | [Ozy USB →](18-ozy-usb.md)
 
 # Settings: XVTR
 
@@ -36,7 +36,7 @@ corresponding IF range actually fits this radio's native tunable range.
 Clicking it retunes to the slot's RF minimum. While active:
 
 - VFO-A, the spectrum/waterfall frequency axis, and
-  [CAT/rigctl/TCI](09-settings-network.md) frequency reporting all show the
+  [CAT/rigctl/TCI](10-settings-network.md) frequency reporting all show the
   real RF frequency, even though the radio's actual hardware LO stays at
   the true IF underneath.
 - Clicking back to an ordinary band leaves the transverter and returns to
@@ -47,7 +47,7 @@ Clicking it retunes to the slot's RF minimum. While active:
 - Supports up to ~4.3GHz of RF range (covers roughly 2m through 9cm) -- not
   microwave/QO-100-class transverters.
 - Main receiver only -- extra receiver windows and
-  [PA Calibration](11-pa-calibration.md) don't know about configured
+  [PA Calibration](12-pa-calibration.md) don't know about configured
   transverters.
 - This feature has not been verified against real transverter hardware --
   bench-test at low power before relying on it, same as any other TX-path
@@ -55,4 +55,4 @@ Clicking it retunes to the slot's RF minimum. While active:
 
 ---
 
-[← TX](15-settings-tx.md) | [Index](README.md) | [Ozy USB →](17-ozy-usb.md)
+[← TX](16-settings-tx.md) | [Index](README.md) | [Ozy USB →](18-ozy-usb.md)

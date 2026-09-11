@@ -1,4 +1,4 @@
-[← XVTR](16-xvtr.md) | [Index](README.md)
+[← XVTR](17-xvtr.md) | [Index](README.md)
 
 # Ozy USB (legacy hardware)
 
@@ -65,11 +65,11 @@ actually begins.
   reports these over a separate I2C channel (Penny/Mercury telemetry)
   rather than in the main data stream the way Metis/Hermes-class boards
   do, but they feed the exact same meter and Max SWR protection (see
-  [Settings: TX](15-settings-tx.md)) as every other board.
+  [Settings: TX](16-settings-tx.md)) as every other board.
 - See [Settings: About](04-about.md) for what the About tab shows for
   an Ozy connection specifically (firmware versions, "USB" in place of
   network details).
 
 ---
 
-[← XVTR](16-xvtr.md) | [Index](README.md)
+[← XVTR](17-xvtr.md) | [Index](README.md)

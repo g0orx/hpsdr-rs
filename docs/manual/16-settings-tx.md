@@ -1,4 +1,4 @@
-[← Spectrum](14-settings-spectrum.md) | [Index](README.md) | [XVTR →](16-xvtr.md)
+[← Spectrum](15-settings-spectrum.md) | [Index](README.md) | [XVTR →](17-xvtr.md)
 
 # Settings: TX
 
@@ -43,7 +43,7 @@ Protects ADC0's front end from this radio's own TX leakage while
 transmitting (0-31dB, default 20dB). If you see an **ADC0 Overload**
 warning while transmitting, raise this. Not shown on HermesLite/
 HermesLite2, which handle RX gain differently. Same underlying value as
-[PureSignal](12-puresignal.md)'s **Feedback Attenuation** slider --
+[PureSignal](13-puresignal.md)'s **Feedback Attenuation** slider --
 adjusting either one changes both.
 
 ## Enable Transmit
@@ -79,4 +79,4 @@ Two settings for boards with a shared PTT/mic/bias connector:
 
 ---
 
-[← Spectrum](14-settings-spectrum.md) | [Index](README.md) | [XVTR →](16-xvtr.md)
+[← Spectrum](15-settings-spectrum.md) | [Index](README.md) | [XVTR →](17-xvtr.md)

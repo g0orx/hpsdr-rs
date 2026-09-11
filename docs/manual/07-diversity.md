@@ -1,10 +1,10 @@
-[← Audio](05-settings-audio.md) | [Index](README.md) | [Equalizer →](07-equalizer.md)
+[← CW](06-settings-cw.md) | [Index](README.md) | [Equalizer →](08-equalizer.md)
 
 # Settings: Diversity
 
 Open **Settings...** from the main window, then the **Diversity** tab. This
 tab only appears on radios with two ADCs. It's mutually exclusive with
-[PureSignal](12-puresignal.md).
+[PureSignal](13-puresignal.md).
 
 ![Diversity settings tab](images/09-diversity-tab.png)
 
@@ -37,4 +37,4 @@ best peak of a wanted one. Both sliders take effect live as you move them.
 
 ---
 
-[← Audio](05-settings-audio.md) | [Index](README.md) | [Equalizer →](07-equalizer.md)
+[← CW](06-settings-cw.md) | [Index](README.md) | [Equalizer →](08-equalizer.md)
