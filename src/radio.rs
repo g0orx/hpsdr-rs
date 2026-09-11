@@ -433,7 +433,14 @@ pub struct RadioSession {
     /// Equals `frequency_hz` whenever CTUN is off, preserving this
     /// project's existing simplex-only assumption (see p1_build_packet's
     /// TX-frequency command / p2_high_priority_packet's tx_freq_hz doc
-    /// comments) for the common case.
+    /// comments) for the common case -- EXCEPT in Cwl/Cwu, where main.rs
+    /// also applies a +/- CW Pitch offset on top (see that same per-
+    /// frame update site's own doc comment): this project's CW RX
+    /// convention (spectrum::passband_for) tunes the filter, not the
+    /// dial/LO, by that pitch, so a matching TX-side offset is needed
+    /// for a zero-beat reply to actually land on the other station's
+    /// frequency -- confirmed against piHPSDR's own old_protocol.c
+    /// (get_tx_vfo's frequency resolution does exactly this).
     pub tx_frequency_hz: Arc<AtomicU32>,
     /// The frequency the user should currently perceive as "where I am"
     /// -- `ConnectedState::ctun_frequency_hz` while CTUN is on, otherwise

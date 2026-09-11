@@ -2176,6 +2176,35 @@ impl eframe::App for HpsdrApp {
                 // exists in this project's WDSP bindings).
                 let xit_offset_hz = if connected.xit_enabled { connected.xit_offset_hz } else { 0.0 };
                 let tx_dial_freq_hz = (tx_dial_freq_hz as i64 + xit_offset_hz.round() as i64).max(0) as u32;
+                // ROOT CAUSE FIX for a real report: this project's own
+                // CW RX convention (spectrum::passband_for's Cwl/Cwu
+                // arms) puts the filter -- and therefore the signal
+                // you're actually zero-beat on -- at `dial +/- CW
+                // Pitch`, NOT at the dial frequency itself (the dial/
+                // hardware LO never moves for CW specifically; only
+                // WDSP's own audio-domain passband is offset). Without
+                // an equivalent TX-side adjustment, replying to a
+                // station you've correctly zero-beat (tuned so you
+                // hear them at your own pitch) transmitted `CW Pitch`
+                // Hz AWAY from their actual frequency, not on it --
+                // confirmed against piHPSDR's own old_protocol.c
+                // (get_tx_vfo's frequency resolution): when its
+                // equivalent "CW is NOT on the raw VFO frequency"
+                // convention is active (this project's only
+                // convention -- there's no toggle here), it applies
+                // exactly this same `freq += cw_keyer_sidetone_frequency`
+                // (CWU) / `-=` (CWL) adjustment for TX, pairing the RX
+                // offset above with a matching TX one so a zero-beat
+                // reply lands exactly on the other station's frequency.
+                // No effect on any other mode (XIT above already
+                // covers "nudge the real TX frequency independent of
+                // the dial" for those).
+                let cw_pitch_hz = spectrum::cw_pitch_hz().round() as i64;
+                let tx_dial_freq_hz = match current_mode {
+                    spectrum::Mode::Cwu => (tx_dial_freq_hz as i64 + cw_pitch_hz).max(0) as u32,
+                    spectrum::Mode::Cwl => (tx_dial_freq_hz as i64 - cw_pitch_hz).max(0) as u32,
+                    _ => tx_dial_freq_hz,
+                };
                 connected.session.tx_frequency_hz.store(tx_dial_freq_hz, std::sync::atomic::Ordering::Relaxed);
 
                 // While transmitting, show tx_spectrum (fed with the
