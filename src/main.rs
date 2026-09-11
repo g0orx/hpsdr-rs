@@ -10220,8 +10220,18 @@ fn main() -> eframe::Result<()> {
     // threads exist -- is enough to force X11 without needing the user to
     // remember an env var on every launch. Revisit if a real Wayland fix
     // ever lands upstream and this workaround is no longer needed.
-    unsafe {
-        std::env::remove_var("WAYLAND_DISPLAY");
+    //
+    // Escape hatch: set HPSDR_FORCE_X11=0 to skip this and run native
+    // Wayland instead -- added after a Raspberry Pi 5 report of UI
+    // flicker (VFO-A/S-meter/spectrum/waterfall/waveform) that
+    // persisted even after forcing PresentMode::Fifo, to test whether
+    // XWayland's extra compositing hop (rather than the present mode)
+    // is the actual cause on that GPU/driver.
+    let force_x11 = std::env::var("HPSDR_FORCE_X11").map(|v| v != "0").unwrap_or(true);
+    if force_x11 {
+        unsafe {
+            std::env::remove_var("WAYLAND_DISPLAY");
+        }
     }
 
     // eframe's default inner size (~430x300 as of 0.35) is far too
