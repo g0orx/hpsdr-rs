@@ -10258,6 +10258,21 @@ fn main() -> eframe::Result<()> {
             .with_min_inner_size([900.0, 520.0])
             .with_icon(icon),
         wgpu_options: eframe::egui_wgpu::WgpuConfiguration {
+            // egui-wgpu's default surface config (SurfaceConfig::
+            // HIGH_THROUGHPUT) uses PresentMode::AutoVsync, which falls
+            // back to FifoRelaxed (allows a frame to present slightly
+            // late, tearing, rather than waiting for the next vblank)
+            // whenever the driver offers it. This app throttles its own
+            // repaint rate to ~30Hz (see request_repaint_after below),
+            // well under a typical 60Hz display -- exactly the situation
+            // FifoRelaxed tears in. Force plain Fifo (true vsync,
+            // supported by every wgpu backend) to eliminate that as a
+            // source of the flicker seen on Raspberry Pi 5's Mesa V3D
+            // driver.
+            surface: eframe::egui_wgpu::SurfaceConfig {
+                present_mode: eframe::wgpu::PresentMode::Fifo,
+                ..eframe::egui_wgpu::SurfaceConfig::HIGH_THROUGHPUT
+            },
             // egui-wgpu's own default device_descriptor requests
             // wgpu::Limits::default() unconditionally on non-GL backends,
             // which asks for max_color_attachments: 8 -- more than some
