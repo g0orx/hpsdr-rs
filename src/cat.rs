@@ -16,17 +16,29 @@
     Ported from piHPSDR's src/rigctl.c (hardware-tested reference,
     written by the same author as this app), scoped down to a practical
     subset rather than porting its full ~5900 lines. Implemented:
-    ID, IF, FA, FB, FR, FT, MD, AI, PS, TX, RX, SM, TY, RT, RC, RD, RU, XT.
-    Deliberately NOT implemented (unlike the reference) because this app
-    has no clean value/range to back them with yet, matching rigctl.rs's
-    own "respond unsupported rather than a made-up value" philosophy:
+    ID, IF, FA, FB, FR, FT, MD, AI, PS, TX, RX, SM, TY, RT, RC, RD, RU,
+    XT, KY. Deliberately NOT implemented (unlike the reference) because
+    this app has no clean value/range to back them with yet, matching
+    rigctl.rs's own "respond unsupported rather than a made-up value"
+    philosophy:
       - PC (drive/power level): max_tx_power_watts isn't currently
         shared via an Arc the way frequency/mox are, and the reference's
         0-100 scale doesn't map cleanly onto watts without it.
       - MG (mic gain): this app's mic_gain is a linear 0.0-8.0
         multiplier, not the reference's -12..+50 dB range -- no honest
         conversion between the two.
-      - KS/KY (CW keyer speed/send): no CW keyer exists in this app.
+      - KS (CW keyer speed): KY (CW keyer send -- see this file's own
+        "KY" match arm) IS implemented, feeding tx::TxHandle's "send CW
+        text" machinery (see main.rs's own reconciliation of
+        cw_remote_pending/cw_remote_busy/cw_remote_stop -- this server
+        thread can't reach TxHandle directly, same "write intent into a
+        shared cell, let main.rs's frame loop drive the real call"
+        pattern requested_frequency_hz already uses for FA). KS itself
+        (setting the keyer's SPEED via CAT) isn't -- KY always sends at
+        whatever Settings -> CW's own Speed/Weight are currently set to,
+        matching how the main window's own Send button already works;
+        a logger wanting a different speed would need to change that
+        setting directly, not via CAT.
       - Split (FT accepted but always reports/treats as off), CTCSS,
         memory channels, SAT mode: none of these have any backing state
         in this app. RIT/XIT DO now (RT/RC/RD/RU/XT, and the IF
@@ -63,6 +75,7 @@
 
 use crate::debug_log::DebugLog;
 use crate::spectrum::{DemodParams, Mode, SpectrumDisplay};
+use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
@@ -122,6 +135,12 @@ impl CatServer {
         rit_enabled: Arc<AtomicBool>,
         rit_offset_hz: Arc<AtomicI32>,
         xit_enabled: Arc<AtomicBool>,
+        // "KY" -- see this module's own doc comment. Shared with
+        // rigctl.rs's send_morse/stop_morse (main.rs passes the SAME
+        // Arcs to both servers) so either protocol's client sees
+        // consistent behavior/status.
+        cw_remote_pending: Arc<Mutex<VecDeque<String>>>,
+        cw_remote_busy: Arc<AtomicBool>,
         logging: DebugLog,
     ) -> std::io::Result<Self> {
         let listener = TcpListener::bind(addr)?;
@@ -156,6 +175,8 @@ impl CatServer {
                         let conn_rit_enabled = Arc::clone(&rit_enabled);
                         let conn_rit_offset_hz = Arc::clone(&rit_offset_hz);
                         let conn_xit_enabled = Arc::clone(&xit_enabled);
+                        let conn_cw_remote_pending = Arc::clone(&cw_remote_pending);
+                        let conn_cw_remote_busy = Arc::clone(&cw_remote_busy);
                         let conn_stop = Arc::clone(&accept_stop);
                         let conn_connected = Arc::clone(&accept_connected);
                         let conn_logging = accept_logging.clone();
@@ -163,7 +184,8 @@ impl CatServer {
                             conn_connected.fetch_add(1, Ordering::Relaxed);
                             handle_client(
                                 stream, freq, rx_freq, params, disp, conn_mox, conn_rit_enabled,
-                                conn_rit_offset_hz, conn_xit_enabled, conn_stop, conn_logging,
+                                conn_rit_offset_hz, conn_xit_enabled, conn_cw_remote_pending,
+                                conn_cw_remote_busy, conn_stop, conn_logging,
                             );
                             conn_connected.fetch_sub(1, Ordering::Relaxed);
                         });
@@ -234,6 +256,8 @@ fn handle_client(
     rit_enabled: Arc<AtomicBool>,
     rit_offset_hz: Arc<AtomicI32>,
     xit_enabled: Arc<AtomicBool>,
+    cw_remote_pending: Arc<Mutex<VecDeque<String>>>,
+    cw_remote_busy: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
     logging: DebugLog,
 ) {
@@ -288,6 +312,8 @@ fn handle_client(
                         &rit_offset_hz,
                         &xit_enabled,
                         &mut auto_reporting,
+                        &cw_remote_pending,
+                        &cw_remote_busy,
                     ) {
                         logging.log(&format!(">> {response}"));
                         if writer.write_all(response.as_bytes()).is_err() {
@@ -325,6 +351,11 @@ fn handle_command(
     rit_offset_hz: &Arc<AtomicI32>,
     xit_enabled: &Arc<AtomicBool>,
     auto_reporting: &mut u8,
+    // "KY" -- see this module's own doc comment on why CW text sending
+    // is reconciled through main.rs rather than reaching tx::TxHandle
+    // directly from this server thread.
+    cw_remote_pending: &Arc<Mutex<VecDeque<String>>>,
+    cw_remote_busy: &Arc<AtomicBool>,
 ) -> Option<String> {
     if cmd.len() < 2 {
         return None;
@@ -479,6 +510,33 @@ fn handle_command(
                 None
             }
         }
+        // CW keyer send -- see this module's own doc comment. Real
+        // Kenwood TS-2000: "KY;" (bare) queries the keyer buffer
+        // (KY0; = ready for more, KY1; = still busy sending); "KY1
+        // <text>;" (the "1" is a fixed marker, not a flag -- some
+        // clients send "KY0<text>;" instead, so both are accepted the
+        // same way) queues that text to be sent as CW at the rig's
+        // own configured speed. Longer messages arrive as several
+        // successive KY-set commands (the real TS-2000's own buffer
+        // field is a fixed 24 characters) -- see tx::TxHandle::
+        // queue_cw_text's own doc comment for how those get appended
+        // rather than replacing whatever's already in flight.
+        "KY" => {
+            if suffix.is_empty() {
+                let busy = cw_remote_busy.load(Ordering::Relaxed);
+                Some(if busy { "KY1;".to_string() } else { "KY0;".to_string() })
+            } else {
+                // Strip the leading 0/1 marker if present, and trim
+                // trailing padding (a fixed-width field on real
+                // hardware) so it doesn't insert a spurious extra word
+                // gap between this chunk and whatever's sent next.
+                let text = suffix.strip_prefix(['0', '1']).unwrap_or(suffix).trim_end();
+                if !text.is_empty() {
+                    cw_remote_pending.lock().unwrap().push_back(text.to_string());
+                }
+                None
+            }
+        }
         "TX" => {
             if suffix.is_empty() {
                 mox.store(true, Ordering::Relaxed);
@@ -589,6 +647,8 @@ mod tests {
         Arc<AtomicBool>,
         Arc<AtomicI32>,
         Arc<AtomicBool>,
+        Arc<Mutex<VecDeque<String>>>,
+        Arc<AtomicBool>,
     ) {
         let frequency_hz = Arc::new(AtomicU32::new(14_074_000));
         let demod_params = Arc::new(Mutex::new(DemodParams::default()));
@@ -602,7 +662,12 @@ mod tests {
         let rit_enabled = Arc::new(AtomicBool::new(false));
         let rit_offset_hz = Arc::new(AtomicI32::new(0));
         let xit_enabled = Arc::new(AtomicBool::new(false));
-        (frequency_hz, demod_params, display, mox, rit_enabled, rit_offset_hz, xit_enabled)
+        let cw_remote_pending = Arc::new(Mutex::new(VecDeque::new()));
+        let cw_remote_busy = Arc::new(AtomicBool::new(false));
+        (
+            frequency_hz, demod_params, display, mox, rit_enabled, rit_offset_hz, xit_enabled,
+            cw_remote_pending, cw_remote_busy,
+        )
     }
 
     #[test]
@@ -624,85 +689,85 @@ mod tests {
 
     #[test]
     fn id_reports_ts2000() {
-        let (f, p, d, m, rit, rit_hz, xit) = fixture();
+        let (f, p, d, m, rit, rit_hz, xit, cw_pending, cw_busy) = fixture();
         let mut ai = 0;
-        assert_eq!(handle_command("ID", &f, &f, &p, &d, &m, &rit, &rit_hz, &xit, &mut ai), Some("ID019;".to_string()));
+        assert_eq!(handle_command("ID", &f, &f, &p, &d, &m, &rit, &rit_hz, &xit, &mut ai, &cw_pending, &cw_busy), Some("ID019;".to_string()));
     }
 
     #[test]
     fn fa_read_reflects_current_frequency() {
-        let (f, p, d, m, rit, rit_hz, xit) = fixture();
+        let (f, p, d, m, rit, rit_hz, xit, cw_pending, cw_busy) = fixture();
         let mut ai = 0;
-        assert_eq!(handle_command("FA", &f, &f, &p, &d, &m, &rit, &rit_hz, &xit, &mut ai), Some("FA00014074000;".to_string()));
+        assert_eq!(handle_command("FA", &f, &f, &p, &d, &m, &rit, &rit_hz, &xit, &mut ai, &cw_pending, &cw_busy), Some("FA00014074000;".to_string()));
     }
 
     #[test]
     fn fa_set_updates_frequency_and_sends_no_reply() {
-        let (f, p, d, m, rit, rit_hz, xit) = fixture();
+        let (f, p, d, m, rit, rit_hz, xit, cw_pending, cw_busy) = fixture();
         let mut ai = 0;
-        assert_eq!(handle_command("FA00007074000", &f, &f, &p, &d, &m, &rit, &rit_hz, &xit, &mut ai), None);
+        assert_eq!(handle_command("FA00007074000", &f, &f, &p, &d, &m, &rit, &rit_hz, &xit, &mut ai, &cw_pending, &cw_busy), None);
         assert_eq!(f.load(Ordering::Relaxed), 7_074_000);
     }
 
     #[test]
     fn fb_read_mirrors_fa() {
-        let (f, p, d, m, rit, rit_hz, xit) = fixture();
+        let (f, p, d, m, rit, rit_hz, xit, cw_pending, cw_busy) = fixture();
         let mut ai = 0;
-        assert_eq!(handle_command("FB", &f, &f, &p, &d, &m, &rit, &rit_hz, &xit, &mut ai), Some("FB00014074000;".to_string()));
+        assert_eq!(handle_command("FB", &f, &f, &p, &d, &m, &rit, &rit_hz, &xit, &mut ai, &cw_pending, &cw_busy), Some("FB00014074000;".to_string()));
     }
 
     #[test]
     fn md_get_set_round_trip() {
-        let (f, p, d, m, rit, rit_hz, xit) = fixture();
+        let (f, p, d, m, rit, rit_hz, xit, cw_pending, cw_busy) = fixture();
         let mut ai = 0;
         // Default DemodParams starts at USB (code 2).
-        assert_eq!(handle_command("MD", &f, &f, &p, &d, &m, &rit, &rit_hz, &xit, &mut ai), Some("MD2;".to_string()));
-        assert_eq!(handle_command("MD3", &f, &f, &p, &d, &m, &rit, &rit_hz, &xit, &mut ai), None); // CWU
+        assert_eq!(handle_command("MD", &f, &f, &p, &d, &m, &rit, &rit_hz, &xit, &mut ai, &cw_pending, &cw_busy), Some("MD2;".to_string()));
+        assert_eq!(handle_command("MD3", &f, &f, &p, &d, &m, &rit, &rit_hz, &xit, &mut ai, &cw_pending, &cw_busy), None); // CWU
         assert_eq!(p.lock().unwrap().mode, Mode::Cwu);
-        assert_eq!(handle_command("MD", &f, &f, &p, &d, &m, &rit, &rit_hz, &xit, &mut ai), Some("MD3;".to_string()));
+        assert_eq!(handle_command("MD", &f, &f, &p, &d, &m, &rit, &rit_hz, &xit, &mut ai, &cw_pending, &cw_busy), Some("MD3;".to_string()));
     }
 
     #[test]
     fn rt_get_set_round_trip() {
-        let (f, p, d, m, rit, rit_hz, xit) = fixture();
+        let (f, p, d, m, rit, rit_hz, xit, cw_pending, cw_busy) = fixture();
         let mut ai = 0;
-        assert_eq!(handle_command("RT", &f, &f, &p, &d, &m, &rit, &rit_hz, &xit, &mut ai), Some("RT0;".to_string()));
-        assert_eq!(handle_command("RT1", &f, &f, &p, &d, &m, &rit, &rit_hz, &xit, &mut ai), None);
+        assert_eq!(handle_command("RT", &f, &f, &p, &d, &m, &rit, &rit_hz, &xit, &mut ai, &cw_pending, &cw_busy), Some("RT0;".to_string()));
+        assert_eq!(handle_command("RT1", &f, &f, &p, &d, &m, &rit, &rit_hz, &xit, &mut ai, &cw_pending, &cw_busy), None);
         assert!(rit.load(Ordering::Relaxed));
-        assert_eq!(handle_command("RT", &f, &f, &p, &d, &m, &rit, &rit_hz, &xit, &mut ai), Some("RT1;".to_string()));
+        assert_eq!(handle_command("RT", &f, &f, &p, &d, &m, &rit, &rit_hz, &xit, &mut ai, &cw_pending, &cw_busy), Some("RT1;".to_string()));
     }
 
     #[test]
     fn rc_clears_rit_offset() {
-        let (f, p, d, m, rit, rit_hz, xit) = fixture();
+        let (f, p, d, m, rit, rit_hz, xit, cw_pending, cw_busy) = fixture();
         let mut ai = 0;
         rit_hz.store(250, Ordering::Relaxed);
-        assert_eq!(handle_command("RC", &f, &f, &p, &d, &m, &rit, &rit_hz, &xit, &mut ai), None);
+        assert_eq!(handle_command("RC", &f, &f, &p, &d, &m, &rit, &rit_hz, &xit, &mut ai, &cw_pending, &cw_busy), None);
         assert_eq!(rit_hz.load(Ordering::Relaxed), 0);
     }
 
     #[test]
     fn rd_ru_step_and_absolute_set() {
-        let (f, p, d, m, rit, rit_hz, xit) = fixture();
+        let (f, p, d, m, rit, rit_hz, xit, cw_pending, cw_busy) = fixture();
         let mut ai = 0;
         // Default mode (USB) steps by 50Hz.
-        assert_eq!(handle_command("RU", &f, &f, &p, &d, &m, &rit, &rit_hz, &xit, &mut ai), None);
+        assert_eq!(handle_command("RU", &f, &f, &p, &d, &m, &rit, &rit_hz, &xit, &mut ai, &cw_pending, &cw_busy), None);
         assert_eq!(rit_hz.load(Ordering::Relaxed), 50);
-        assert_eq!(handle_command("RD", &f, &f, &p, &d, &m, &rit, &rit_hz, &xit, &mut ai), None);
+        assert_eq!(handle_command("RD", &f, &f, &p, &d, &m, &rit, &rit_hz, &xit, &mut ai, &cw_pending, &cw_busy), None);
         assert_eq!(rit_hz.load(Ordering::Relaxed), 0);
         // CW modes step by 10Hz instead of 50Hz.
         p.lock().unwrap().mode = Mode::Cwl;
-        assert_eq!(handle_command("RU", &f, &f, &p, &d, &m, &rit, &rit_hz, &xit, &mut ai), None);
+        assert_eq!(handle_command("RU", &f, &f, &p, &d, &m, &rit, &rit_hz, &xit, &mut ai, &cw_pending, &cw_busy), None);
         assert_eq!(rit_hz.load(Ordering::Relaxed), 10);
         // An explicit value is an ABSOLUTE set, negated for RD -- matches
         // piHPSDR's rigctl.c exactly (see handle_command's own comment).
         assert_eq!(
-            handle_command("RU00500", &f, &f, &p, &d, &m, &rit, &rit_hz, &xit, &mut ai),
+            handle_command("RU00500", &f, &f, &p, &d, &m, &rit, &rit_hz, &xit, &mut ai, &cw_pending, &cw_busy),
             None
         );
         assert_eq!(rit_hz.load(Ordering::Relaxed), 500);
         assert_eq!(
-            handle_command("RD00500", &f, &f, &p, &d, &m, &rit, &rit_hz, &xit, &mut ai),
+            handle_command("RD00500", &f, &f, &p, &d, &m, &rit, &rit_hz, &xit, &mut ai, &cw_pending, &cw_busy),
             None
         );
         assert_eq!(rit_hz.load(Ordering::Relaxed), -500);
@@ -710,27 +775,64 @@ mod tests {
 
     #[test]
     fn xt_get_set_round_trip() {
-        let (f, p, d, m, rit, rit_hz, xit) = fixture();
+        let (f, p, d, m, rit, rit_hz, xit, cw_pending, cw_busy) = fixture();
         let mut ai = 0;
-        assert_eq!(handle_command("XT", &f, &f, &p, &d, &m, &rit, &rit_hz, &xit, &mut ai), Some("XT0;".to_string()));
-        assert_eq!(handle_command("XT1", &f, &f, &p, &d, &m, &rit, &rit_hz, &xit, &mut ai), None);
+        assert_eq!(handle_command("XT", &f, &f, &p, &d, &m, &rit, &rit_hz, &xit, &mut ai, &cw_pending, &cw_busy), Some("XT0;".to_string()));
+        assert_eq!(handle_command("XT1", &f, &f, &p, &d, &m, &rit, &rit_hz, &xit, &mut ai, &cw_pending, &cw_busy), None);
         assert!(xit.load(Ordering::Relaxed));
-        assert_eq!(handle_command("XT", &f, &f, &p, &d, &m, &rit, &rit_hz, &xit, &mut ai), Some("XT1;".to_string()));
+        assert_eq!(handle_command("XT", &f, &f, &p, &d, &m, &rit, &rit_hz, &xit, &mut ai, &cw_pending, &cw_busy), Some("XT1;".to_string()));
     }
 
     #[test]
     fn tx_rx_drive_mox() {
-        let (f, p, d, m, rit, rit_hz, xit) = fixture();
+        let (f, p, d, m, rit, rit_hz, xit, cw_pending, cw_busy) = fixture();
         let mut ai = 0;
-        assert_eq!(handle_command("TX", &f, &f, &p, &d, &m, &rit, &rit_hz, &xit, &mut ai), None);
+        assert_eq!(handle_command("TX", &f, &f, &p, &d, &m, &rit, &rit_hz, &xit, &mut ai, &cw_pending, &cw_busy), None);
         assert!(m.load(Ordering::Relaxed));
-        assert_eq!(handle_command("RX", &f, &f, &p, &d, &m, &rit, &rit_hz, &xit, &mut ai), None);
+        assert_eq!(handle_command("RX", &f, &f, &p, &d, &m, &rit, &rit_hz, &xit, &mut ai, &cw_pending, &cw_busy), None);
         assert!(!m.load(Ordering::Relaxed));
     }
 
     #[test]
+    fn ky_query_reflects_busy_status() {
+        let (f, p, d, m, rit, rit_hz, xit, cw_pending, cw_busy) = fixture();
+        let mut ai = 0;
+        assert_eq!(
+            handle_command("KY", &f, &f, &p, &d, &m, &rit, &rit_hz, &xit, &mut ai, &cw_pending, &cw_busy),
+            Some("KY0;".to_string())
+        );
+        cw_busy.store(true, Ordering::Relaxed);
+        assert_eq!(
+            handle_command("KY", &f, &f, &p, &d, &m, &rit, &rit_hz, &xit, &mut ai, &cw_pending, &cw_busy),
+            Some("KY1;".to_string())
+        );
+    }
+
+    #[test]
+    fn ky_set_queues_text_and_strips_marker_and_padding() {
+        let (f, p, d, m, rit, rit_hz, xit, cw_pending, cw_busy) = fixture();
+        let mut ai = 0;
+        assert_eq!(
+            handle_command("KY1CQ CQ DE G0ORX  ", &f, &f, &p, &d, &m, &rit, &rit_hz, &xit, &mut ai, &cw_pending, &cw_busy),
+            None
+        );
+        assert_eq!(cw_pending.lock().unwrap().pop_front(), Some("CQ CQ DE G0ORX".to_string()));
+    }
+
+    #[test]
+    fn ky_set_without_leading_marker_still_works() {
+        let (f, p, d, m, rit, rit_hz, xit, cw_pending, cw_busy) = fixture();
+        let mut ai = 0;
+        assert_eq!(
+            handle_command("KYTEST", &f, &f, &p, &d, &m, &rit, &rit_hz, &xit, &mut ai, &cw_pending, &cw_busy),
+            None
+        );
+        assert_eq!(cw_pending.lock().unwrap().pop_front(), Some("TEST".to_string()));
+    }
+
+    #[test]
     fn if_response_has_expected_length_and_frequency() {
-        let (f, p, _d, m, rit, rit_hz, xit) = fixture();
+        let (f, p, _d, m, rit, rit_hz, xit, _cw_pending, _cw_busy) = fixture();
         let resp = build_if_response(&f, &p, &m, &rit, &rit_hz, &xit);
         assert!(resp.starts_with("IF00014074000"), "{resp}");
         assert!(resp.ends_with(';'));
@@ -741,39 +843,39 @@ mod tests {
 
     #[test]
     fn sm_reports_s9_as_midscale() {
-        let (f, p, d, m, rit, rit_hz, xit) = fixture();
+        let (f, p, d, m, rit, rit_hz, xit, cw_pending, cw_busy) = fixture();
         let mut ai = 0;
         // fixture() sets meter_db to -73 (S9); piHPSDR's formula maps
         // that to roughly the middle of the 0-30 scale.
-        let resp = handle_command("SM0", &f, &f, &p, &d, &m, &rit, &rit_hz, &xit, &mut ai).unwrap();
+        let resp = handle_command("SM0", &f, &f, &p, &d, &m, &rit, &rit_hz, &xit, &mut ai, &cw_pending, &cw_busy).unwrap();
         assert!(resp.starts_with("SM0"), "{resp}");
         assert!(resp.ends_with(';'));
     }
 
     #[test]
     fn ai_get_set_round_trip() {
-        let (f, p, d, m, rit, rit_hz, xit) = fixture();
+        let (f, p, d, m, rit, rit_hz, xit, cw_pending, cw_busy) = fixture();
         let mut ai = 0;
-        assert_eq!(handle_command("AI", &f, &f, &p, &d, &m, &rit, &rit_hz, &xit, &mut ai), Some("AI0;".to_string()));
-        assert_eq!(handle_command("AI2", &f, &f, &p, &d, &m, &rit, &rit_hz, &xit, &mut ai), None);
+        assert_eq!(handle_command("AI", &f, &f, &p, &d, &m, &rit, &rit_hz, &xit, &mut ai, &cw_pending, &cw_busy), Some("AI0;".to_string()));
+        assert_eq!(handle_command("AI2", &f, &f, &p, &d, &m, &rit, &rit_hz, &xit, &mut ai, &cw_pending, &cw_busy), None);
         assert_eq!(ai, 2);
-        assert_eq!(handle_command("AI", &f, &f, &p, &d, &m, &rit, &rit_hz, &xit, &mut ai), Some("AI2;".to_string()));
+        assert_eq!(handle_command("AI", &f, &f, &p, &d, &m, &rit, &rit_hz, &xit, &mut ai, &cw_pending, &cw_busy), Some("AI2;".to_string()));
     }
 
     #[test]
     fn ps_read_always_reports_on_and_set_is_ignored() {
-        let (f, p, d, m, rit, rit_hz, xit) = fixture();
+        let (f, p, d, m, rit, rit_hz, xit, cw_pending, cw_busy) = fixture();
         let mut ai = 0;
-        assert_eq!(handle_command("PS", &f, &f, &p, &d, &m, &rit, &rit_hz, &xit, &mut ai), Some("PS1;".to_string()));
+        assert_eq!(handle_command("PS", &f, &f, &p, &d, &m, &rit, &rit_hz, &xit, &mut ai, &cw_pending, &cw_busy), Some("PS1;".to_string()));
         // "PS0;" (power off) is deliberately a no-op, not a shutdown --
         // see this module's doc comment.
-        assert_eq!(handle_command("PS0", &f, &f, &p, &d, &m, &rit, &rit_hz, &xit, &mut ai), None);
+        assert_eq!(handle_command("PS0", &f, &f, &p, &d, &m, &rit, &rit_hz, &xit, &mut ai, &cw_pending, &cw_busy), None);
     }
 
     #[test]
     fn unknown_command_gets_question_mark() {
-        let (f, p, d, m, rit, rit_hz, xit) = fixture();
+        let (f, p, d, m, rit, rit_hz, xit, cw_pending, cw_busy) = fixture();
         let mut ai = 0;
-        assert_eq!(handle_command("ZZ", &f, &f, &p, &d, &m, &rit, &rit_hz, &xit, &mut ai), Some("?;".to_string()));
+        assert_eq!(handle_command("ZZ", &f, &f, &p, &d, &m, &rit, &rit_hz, &xit, &mut ai, &cw_pending, &cw_busy), Some("?;".to_string()));
     }
 }

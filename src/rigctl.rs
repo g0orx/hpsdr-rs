@@ -5,7 +5,19 @@
     the raw dBm value from the same calibrated GetRXAMeter reading
     main.rs's on-screen S-meter uses). Every other Hamlib level (SWR,
     ALC, RFPOWER, ...) responds RPRT -1 (unsupported) rather than a
-    made-up value. Listens on 0.0.0.0:4532 by default --
+    made-up value.
+
+    `send_morse`/`stop_morse` (`b`/`\send_morse`, `\stop_morse`) feed
+    tx::TxHandle's "send CW text" machinery (see cw_encoder.rs) -- this
+    server thread can't reach TxHandle directly (it's owned on the UI
+    thread, not behind an Arc), so a request just gets written into a
+    shared cell (cw_remote_pending/cw_remote_stop, passed in from
+    main.rs) that main.rs's own per-frame loop drains and turns into
+    the real TxHandle call -- the same "write intent, let the frame
+    loop reconcile it" pattern requested_frequency_hz already uses for
+    `F`/`\set_freq`. Shared with cat.rs's "KY" command (main.rs passes
+    the SAME cells to both servers), so either protocol's client sees
+    consistent behavior/status. Listens on 0.0.0.0:4532 by default --
     Hamlib's own standard default port for this, but bound to all
     interfaces rather than just loopback, so a client on another
     machine on the network (a remote-operating laptop, a tablet, a
@@ -38,6 +50,7 @@
 
 use crate::debug_log::DebugLog;
 use crate::spectrum::{DemodParams, Mode, SpectrumDisplay};
+use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
@@ -114,6 +127,11 @@ impl RigctlServer {
         rit_offset_hz: Arc<AtomicI32>,
         xit_enabled: Arc<AtomicBool>,
         xit_offset_hz: Arc<AtomicI32>,
+        // send_morse/stop_morse -- see this module's own doc comment.
+        // Shared with cat.rs's "KY" command (main.rs passes the SAME
+        // Arcs to both servers).
+        cw_remote_pending: Arc<Mutex<VecDeque<String>>>,
+        cw_remote_stop: Arc<AtomicBool>,
         logging: DebugLog,
     ) -> std::io::Result<Self> {
         let listener = TcpListener::bind(addr)?;
@@ -156,6 +174,8 @@ impl RigctlServer {
                         let conn_rit_offset_hz = Arc::clone(&rit_offset_hz);
                         let conn_xit_enabled = Arc::clone(&xit_enabled);
                         let conn_xit_offset_hz = Arc::clone(&xit_offset_hz);
+                        let conn_cw_remote_pending = Arc::clone(&cw_remote_pending);
+                        let conn_cw_remote_stop = Arc::clone(&cw_remote_stop);
                         let conn_stop = Arc::clone(&accept_stop);
                         let conn_connected = Arc::clone(&accept_connected);
                         let conn_logging = accept_logging.clone();
@@ -163,7 +183,8 @@ impl RigctlServer {
                             conn_connected.fetch_add(1, Ordering::Relaxed);
                             handle_client(
                                 stream, freq, rx_freq, params, disp, conn_mox, conn_rit_enabled,
-                                conn_rit_offset_hz, conn_xit_enabled, conn_xit_offset_hz, conn_stop, conn_logging,
+                                conn_rit_offset_hz, conn_xit_enabled, conn_xit_offset_hz,
+                                conn_cw_remote_pending, conn_cw_remote_stop, conn_stop, conn_logging,
                             );
                             conn_connected.fetch_sub(1, Ordering::Relaxed);
                         });
@@ -256,6 +277,8 @@ fn handle_client(
     rit_offset_hz: Arc<AtomicI32>,
     xit_enabled: Arc<AtomicBool>,
     xit_offset_hz: Arc<AtomicI32>,
+    cw_remote_pending: Arc<Mutex<VecDeque<String>>>,
+    cw_remote_stop: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
     logging: DebugLog,
 ) {
@@ -297,6 +320,8 @@ fn handle_client(
                     &rit_offset_hz,
                     &xit_enabled,
                     &xit_offset_hz,
+                    &cw_remote_pending,
+                    &cw_remote_stop,
                 ) {
                     Some(response) => {
                         logging.log(&format!(">> {}", response.trim_end()));
@@ -347,6 +372,11 @@ fn handle_command(
     rit_offset_hz: &Arc<AtomicI32>,
     xit_enabled: &Arc<AtomicBool>,
     xit_offset_hz: &Arc<AtomicI32>,
+    // send_morse/stop_morse -- see this module's own doc comment on
+    // why CW text sending is reconciled through main.rs rather than
+    // reaching tx::TxHandle directly from this server thread.
+    cw_remote_pending: &Arc<Mutex<VecDeque<String>>>,
+    cw_remote_stop: &Arc<AtomicBool>,
 ) -> Option<String> {
     let mut parts = cmd.split_whitespace();
     let op = parts.next().unwrap_or("");
@@ -464,6 +494,29 @@ fn handle_command(
             }
             None => "RPRT -1\n".to_string(),
         },
+        // CW keyer send/stop -- see this module's own doc comment.
+        // Sends at whatever Settings -> CW's own Speed/Weight are
+        // currently set to (Hamlib's send_morse has no speed argument
+        // of its own, unlike a real rig's separately-settable keyer
+        // speed level). Takes the literal REST of the line after the
+        // opcode (not another `parts.next()`, which would only grab
+        // the next single whitespace-delimited token) since the
+        // message itself may contain spaces -- every other command in
+        // this file takes single-token arguments, this is the one
+        // exception. `cmd` is already trimmed by the caller and `op`
+        // is its own first token, so `op`'s length is exactly how far
+        // to skip.
+        "b" | "\\send_morse" => {
+            let text = cmd.get(op.len()..).unwrap_or("").trim();
+            if !text.is_empty() {
+                cw_remote_pending.lock().unwrap().push_back(text.to_string());
+            }
+            "RPRT 0\n".to_string()
+        }
+        "\\stop_morse" => {
+            cw_remote_stop.store(true, Ordering::Relaxed);
+            "RPRT 0\n".to_string()
+        }
         "l" | "\\get_level" => {
             let level = parts.next().unwrap_or("");
             match level {

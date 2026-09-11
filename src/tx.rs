@@ -2338,6 +2338,38 @@ impl TxHandle {
         self.cw_text_active.store(true, Ordering::Relaxed);
     }
 
+    /// APPENDS `text` to whatever's already queued/sending, instead of
+    /// replacing it -- for CAT's Kenwood-style `KY` command and
+    /// rigctl's `send_morse`, both of which let an external program
+    /// (a logger, a contest program) feed a message piece by piece
+    /// (Kenwood's own KY buffer is a fixed-width field, so a message
+    /// longer than that limit arrives as several successive KY1
+    /// commands) rather than as one complete string the way the main
+    /// window's own Send button provides it. Starts sending
+    /// immediately if nothing was already in flight (same busy/active
+    /// sequencing as send_cw_text); otherwise just grows the queue --
+    /// the generator keeps draining it with no gap, so a message fed
+    /// in promptly-arriving chunks sounds identical to one sent whole.
+    ///
+    /// NOT continuation-aware across chunk boundaries: each chunk is
+    /// encoded independently via cw_encoder::text_to_elements, so if a
+    /// message happens to be split exactly mid-word (only possible for
+    /// messages longer than one chunk), the boundary gets treated as a
+    /// word gap even if the two chunks were really one continuous
+    /// word. Deliberately not solved here -- real messages sent this
+    /// way are typically short callsigns/exchanges well under a single
+    /// chunk's limit, and the fix would need passing hidden state
+    /// between calls for a rare edge case.
+    pub fn queue_cw_text(&self, text: &str, speed_wpm: u32, weight: u32) {
+        let elements = crate::cw_encoder::text_to_elements(text, speed_wpm, weight, self.duc_rate as u32);
+        let was_busy = self.cw_text_busy.load(Ordering::Relaxed);
+        self.cw_text_elements.lock().unwrap().extend(elements);
+        if !was_busy {
+            self.cw_text_busy.store(true, Ordering::Relaxed);
+            self.cw_text_active.store(true, Ordering::Relaxed);
+        }
+    }
+
     /// Stops a "send CW text" in progress -- see CwTextGen's own doc
     /// comment for the ramp-down/cleanup this triggers. A no-op if
     /// nothing is currently sending. Does NOT drop session.mox --

@@ -535,6 +535,19 @@ struct ConnectedState {
     rigctl_server: Option<RigctlServer>,
     tci_server: Option<TciServer>,
     cat_server: Option<CatServer>,
+    /// CAT "KY" / rigctl "send_morse" requests from an external
+    /// client, and the live status those protocols report back -- see
+    /// cat.rs's/rigctl.rs's own doc comments, and this struct's own
+    /// per-frame reconciliation of these (search for cw_remote_pending
+    /// elsewhere in this file). Created once at connect time and
+    /// handed to every RigctlServer/CatServer this connection ever
+    /// starts (initial + any later manual Start from Settings ->
+    /// Network), so a client sees consistent behavior regardless of
+    /// which protocol -- or how many times the server's been
+    /// restarted -- it's actually using.
+    cw_remote_pending: Arc<Mutex<VecDeque<String>>>,
+    cw_remote_stop: Arc<std::sync::atomic::AtomicBool>,
+    cw_remote_busy: Arc<std::sync::atomic::AtomicBool>,
     waterfall_texture: Option<egui::TextureHandle>,
     /// (SpectrumDisplay::revision, palette, db_low, db_high) the
     /// waterfall texture was last built from -- lets the UI skip
@@ -1251,6 +1264,21 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
             );
             cat_debug_log.set_enabled(cfg.cat_logging_enabled.unwrap_or(false));
 
+            // CW keyer send (CAT "KY" / rigctl "send_morse") -- see
+            // tx::TxHandle::queue_cw_text's, cat.rs's, and rigctl.rs's
+            // own doc comments. Created once per connection (this
+            // server thread can't reach tx_handle directly, so a
+            // request just lands here) and shared between BOTH
+            // servers -- including whichever gets (re)started later
+            // from Settings -> Network, see those call sites below --
+            // plus main.rs's own per-frame reconciliation loop
+            // (search this file for cw_remote_pending's other uses),
+            // the only thing that actually CAN reach tx_handle to act
+            // on them.
+            let cw_remote_pending: Arc<Mutex<VecDeque<String>>> = Arc::new(Mutex::new(VecDeque::new()));
+            let cw_remote_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let cw_remote_busy = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
             // rigctl/TCI are started/stopped manually from the Network
             // settings tab rather than always-on, but their run state
             // is still persisted -- so a fresh connect restores
@@ -1271,6 +1299,8 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                     Arc::clone(&session.rit_offset_hz),
                     Arc::clone(&session.xit_enabled),
                     Arc::clone(&session.xit_offset_hz),
+                    Arc::clone(&cw_remote_pending),
+                    Arc::clone(&cw_remote_stop),
                     rigctl_debug_log.clone(),
                 ) {
                     Ok(s) => Some(s),
@@ -1327,6 +1357,8 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                     Arc::clone(&session.rit_enabled),
                     Arc::clone(&session.rit_offset_hz),
                     Arc::clone(&session.xit_enabled),
+                    Arc::clone(&cw_remote_pending),
+                    Arc::clone(&cw_remote_busy),
                     cat_debug_log.clone(),
                 ) {
                     Ok(s) => Some(s),
@@ -1577,6 +1609,9 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                 rigctl_server,
                 tci_server,
                 cat_server,
+                cw_remote_pending,
+                cw_remote_stop,
+                cw_remote_busy,
                 waterfall_texture: None,
                 waterfall_signature: None,
                 scroll_accum: 0.0,
@@ -3382,6 +3417,53 @@ impl eframe::App for HpsdrApp {
                                 }
                             }
 
+                            // Remote (CAT "KY" / rigctl "send_morse")
+                            // CW text -- see cat.rs's "KY" case /
+                            // rigctl.rs's "send_morse" case doc
+                            // comments. Neither server thread can
+                            // reach tx_handle directly, so they just
+                            // write intent into cw_remote_pending/
+                            // cw_remote_stop; this is where that intent
+                            // actually gets turned into real
+                            // tx_handle/session.mox calls, reusing the
+                            // SAME cw_text_may_start gate and busy/
+                            // cleanup handling the Send button above
+                            // already has -- an external logger's
+                            // request behaves identically (same mode/
+                            // Tune/Two-Tone gating, same automatic mox
+                            // drop once done), not a separate code
+                            // path with its own rules.
+                            if connected.cw_remote_stop.swap(false, Ordering::Relaxed) {
+                                connected.cw_remote_pending.lock().unwrap().clear();
+                                if let Some(tx) = &connected.tx_handle {
+                                    tx.stop_cw_text();
+                                }
+                            }
+                            if cw_text_may_start {
+                                let mut pending = connected.cw_remote_pending.lock().unwrap();
+                                if !pending.is_empty() {
+                                    if let Some(tx) = &connected.tx_handle {
+                                        let speed_wpm =
+                                            connected.session.cw_keyer.speed_wpm.load(Ordering::Relaxed);
+                                        let weight = connected.session.cw_keyer.weight.load(Ordering::Relaxed);
+                                        while let Some(text) = pending.pop_front() {
+                                            tx.queue_cw_text(&text, speed_wpm, weight);
+                                        }
+                                        drop(pending);
+                                        if !connected.cw_text_sending {
+                                            connected.session.set_mox(true);
+                                            connected.cw_text_sending = true;
+                                        }
+                                    }
+                                }
+                            }
+                            // Live status for CAT's "KY;" query -- see
+                            // that command's own doc comment. Written
+                            // every frame regardless of source (button
+                            // or remote), so it stays accurate either
+                            // way.
+                            connected.cw_remote_busy.store(connected.cw_text_sending, Ordering::Relaxed);
+
                             // Spacebar: hold-to-talk, the traditional
                             // PTT gesture (mirrors a physical
                             // footswitch/mic button) -- deliberately a
@@ -4705,6 +4787,8 @@ impl eframe::App for HpsdrApp {
                                                 Arc::clone(&connected.session.rit_offset_hz),
                                                 Arc::clone(&connected.session.xit_enabled),
                                                 Arc::clone(&connected.session.xit_offset_hz),
+                                                Arc::clone(&connected.cw_remote_pending),
+                                                Arc::clone(&connected.cw_remote_stop),
                                                 connected.rigctl_debug_log.clone(),
                                             ) {
                                                 Ok(s) => Some(s),
@@ -4864,6 +4948,8 @@ impl eframe::App for HpsdrApp {
                                                 Arc::clone(&connected.session.rit_enabled),
                                                 Arc::clone(&connected.session.rit_offset_hz),
                                                 Arc::clone(&connected.session.xit_enabled),
+                                                Arc::clone(&connected.cw_remote_pending),
+                                                Arc::clone(&connected.cw_remote_busy),
                                                 connected.cat_debug_log.clone(),
                                             ) {
                                                 Ok(s) => Some(s),
