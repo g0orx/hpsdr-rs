@@ -10257,6 +10257,26 @@ fn main() -> eframe::Result<()> {
             .with_inner_size([1200.0, 660.0])
             .with_min_inner_size([900.0, 520.0])
             .with_icon(icon),
+        wgpu_options: eframe::egui_wgpu::WgpuConfiguration {
+            // egui-wgpu's own default device_descriptor requests
+            // wgpu::Limits::default() unconditionally on non-GL backends,
+            // which asks for max_color_attachments: 8 -- more than some
+            // real GPU drivers actually support (e.g. Mesa's V3D driver
+            // on Raspberry Pi 5, which only offers 4). Request the
+            // adapter's own advertised limits instead, which by
+            // definition it can satisfy.
+            wgpu_setup: eframe::egui_wgpu::WgpuSetup::CreateNew(
+                eframe::egui_wgpu::WgpuSetupCreateNew {
+                    device_descriptor: std::sync::Arc::new(|adapter| eframe::wgpu::DeviceDescriptor {
+                        label: Some("egui wgpu device"),
+                        required_limits: adapter.limits(),
+                        ..Default::default()
+                    }),
+                    ..eframe::egui_wgpu::WgpuSetupCreateNew::without_display_handle()
+                },
+            ),
+            ..Default::default()
+        },
         ..Default::default()
     };
     eframe::run_native(
