@@ -1,4 +1,4 @@
-[← RX](05-settings-rx.md) | [Index](README.md) | [TX →](07-settings-tx.md)
+[← RX](13-settings-rx.md) | [Index](README.md) | [TX →](15-settings-tx.md)
 
 # Settings: Spectrum
 
@@ -51,4 +51,4 @@ is engaged.
 
 ---
 
-[← RX](05-settings-rx.md) | [Index](README.md) | [TX →](07-settings-tx.md)
+[← RX](13-settings-rx.md) | [Index](README.md) | [TX →](15-settings-tx.md)

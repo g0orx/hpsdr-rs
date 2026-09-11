@@ -1,4 +1,4 @@
-[← Open Collector](15-open-collector.md) | [Index](README.md) | [Ozy USB →](17-ozy-usb.md)
+[← Extra Receivers](03-extra-receivers.md) | [Index](README.md) | [Audio →](05-settings-audio.md)
 
 # Settings: About
 
@@ -26,4 +26,4 @@ Also shows the hpsdr-rs version, and the author's name and contact email.
 
 ---
 
-[← Open Collector](15-open-collector.md) | [Index](README.md) | [Ozy USB →](17-ozy-usb.md)
+[← Extra Receivers](03-extra-receivers.md) | [Index](README.md) | [Audio →](05-settings-audio.md)

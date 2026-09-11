@@ -1,4 +1,4 @@
-[← Extra Receivers](12-extra-receivers.md) | [Index](README.md) | [XVTR →](14-xvtr.md)
+[← Equalizer](07-equalizer.md) | [Index](README.md) | [Network →](09-settings-network.md)
 
 # Firmware Update
 
@@ -110,4 +110,4 @@ check the error shown before trying again.
 
 ---
 
-[← Extra Receivers](12-extra-receivers.md) | [Index](README.md) | [XVTR →](14-xvtr.md)
+[← Equalizer](07-equalizer.md) | [Index](README.md) | [Network →](09-settings-network.md)

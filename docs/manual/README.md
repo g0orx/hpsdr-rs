@@ -8,20 +8,20 @@ from source and project status, see the [top-level README](../../README.md).
 
 1. [Getting Started](01-getting-started.md) -- installing, launching, discovering and connecting to a radio
 2. [Main Window](02-main-window.md) -- tuning, VFO A/B and Split, bands/modes, PTT, spectrum/waterfall, S-meter
-3. [Settings: Network](03-settings-network.md) -- rigctl, TCI, and CAT control servers
-4. [Settings: Audio](04-settings-audio.md) -- RX output device, TX input device
-5. [Settings: RX](05-settings-rx.md) -- sample rate, ADC/antenna, AGC, noise blanker/reduction
-6. [Settings: Spectrum](06-settings-spectrum.md) -- display range, waterfall palette
-7. [Settings: TX](07-settings-tx.md) -- TX power, mic source, safety notes
-8. [Settings: PA Calibration](08-pa-calibration.md) -- per-band power calibration
-9. [Settings: PureSignal](09-puresignal.md) -- PA linearization setup and calibration procedure
-10. [Settings: Diversity](10-diversity.md) -- 2-ADC diversity reception
-11. [Settings: Equalizer](11-equalizer.md) -- RX/TX graphic EQ
-12. [Extra Receivers](12-extra-receivers.md) -- adding independent receiver windows
-13. [Firmware Update](13-firmware-update.md) -- updating FPGA firmware and changing a radio's IP, in bootloader mode or in-application
-14. [Settings: XVTR](14-xvtr.md) -- defining transverters (IF-to-RF band conversion)
-15. [Settings: Open Collector](15-open-collector.md) -- per-band relay-driver output configuration
-16. [Settings: About](16-about.md) -- connected radio details and author info
+3. [Extra Receivers](03-extra-receivers.md) -- adding independent receiver windows
+4. [Settings: About](04-about.md) -- connected radio details and author info
+5. [Settings: Audio](05-settings-audio.md) -- RX output device, TX input device
+6. [Settings: Diversity](06-diversity.md) -- 2-ADC diversity reception
+7. [Settings: Equalizer](07-equalizer.md) -- RX/TX graphic EQ
+8. [Firmware Update](08-firmware-update.md) -- updating FPGA firmware and changing a radio's IP, in bootloader mode or in-application
+9. [Settings: Network](09-settings-network.md) -- rigctl, TCI, and CAT control servers
+10. [Settings: Open Collector](10-open-collector.md) -- per-band relay-driver output configuration
+11. [Settings: PA Calibration](11-pa-calibration.md) -- per-band power calibration
+12. [Settings: PureSignal](12-puresignal.md) -- PA linearization setup and calibration procedure
+13. [Settings: RX](13-settings-rx.md) -- sample rate, ADC/antenna, AGC, noise blanker/reduction
+14. [Settings: Spectrum](14-settings-spectrum.md) -- display range, waterfall palette
+15. [Settings: TX](15-settings-tx.md) -- TX power, mic source, safety notes
+16. [Settings: XVTR](16-xvtr.md) -- defining transverters (IF-to-RF band conversion)
 17. [Ozy USB](17-ozy-usb.md) -- connecting the original Ozy/Mercury/Penny hardware over USB (new, unconfirmed)
 
 **PDF**: this whole manual is also available as a single PDF, useful for

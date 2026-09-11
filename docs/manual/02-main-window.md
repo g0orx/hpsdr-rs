@@ -1,4 +1,4 @@
-[← Getting Started](01-getting-started.md) | [Index](README.md) | [Network →](03-settings-network.md)
+[← Getting Started](01-getting-started.md) | [Index](README.md) | [Extra Receivers →](03-extra-receivers.md)
 
 # Main Window
 
@@ -100,10 +100,10 @@ all -- e.g. HermesLite/HermesLite2 cap out around 30.72MHz, so **6m**
 → PA Calibration's per-band list and to extra receiver windows' own band
 row.
 
-A configured [transverter](14-xvtr.md) (Settings → **XVTR**) appears as an
+A configured [transverter](16-xvtr.md) (Settings → **XVTR**) appears as an
 extra button alongside the band row, showing the real RF frequency (e.g.
 2m) while the radio's actual hardware stays tuned to its true IF
-underneath -- see [Settings: XVTR](14-xvtr.md) for how to define one.
+underneath -- see [Settings: XVTR](16-xvtr.md) for how to define one.
 
 Below that, a row of mode buttons: **LSB, USB, DSB, CWL, CWU, FM, AM, DIGU,
 SPEC, DIGL, SAM, DRM**.
@@ -176,7 +176,7 @@ settings -- `~/.config/hpsdr-rs/recordings/` (Linux),
 Support/hpsdr-rs/recordings/` (macOS) -- named by when the recording
 started plus which receiver it came from, e.g.
 `hpsdr-rs_1788972349_main.wav`. Every [extra receiver
-window](12-extra-receivers.md) has its own independent **Record** button
+window](03-extra-receivers.md) has its own independent **Record** button
 too -- its recordings land in the same folder, suffixed `rxN` instead of
 `main` (e.g. `hpsdr-rs_1788972349_rx1.wav`), so simultaneous recordings
 from different receivers never collide.
@@ -193,7 +193,7 @@ Transmit**):
   TX Power) -- for safely tuning an antenna or amplifier.
 - **TWO TONE** -- transmits a two-tone test signal instead of a steady
   tone, also at Tune Power. This is required (not just an alternative) for
-  PureSignal calibration -- see [PureSignal](09-puresignal.md).
+  PureSignal calibration -- see [PureSignal](12-puresignal.md).
 - **RIT** (Receiver Incremental Tuning) -- nudges what you actually hear
   without touching VFO A's displayed or logged frequency, useful for
   zero-beating a station that's drifted slightly off frequency without
@@ -226,7 +226,7 @@ project's current TX verification status.
 The spectrum pane shows the live signal trace with a shaded band marking
 the current filter passband and a vertical line marking the dial frequency
 -- blue while receiving, red/orange while transmitting (see
-[Settings: Spectrum](06-settings-spectrum.md#while-transmitting) for what
+[Settings: Spectrum](14-settings-spectrum.md#while-transmitting) for what
 changes about this while Split is in use). Ten frequency-axis gridlines
 span the pane; the label at the very first and last one is skipped (the
 gridline itself still draws) since it would otherwise get clipped or hang
@@ -275,14 +275,14 @@ Anchored in the top-right of the window:
   configured **Max TX Power** (Settings → TX). The needle is red whenever
   you're transmitting at all, and if SWR reaches or exceeds **Max SWR**
   (Settings → TX) at more than 35W, **TX Power** is automatically cut to
-  10W to protect the PA -- see [Settings: TX](07-settings-tx.md#max-swr)
+  10W to protect the PA -- see [Settings: TX](15-settings-tx.md#max-swr)
   for the full behavior.
 
 Below the meter:
 
-- **Settings...** opens the [Settings window](03-settings-network.md).
+- **Settings...** opens the [Settings window](09-settings-network.md).
 - **Add Receiver (n/max)** adds another independent receiver window (see
-  [Extra Receivers](12-extra-receivers.md)) -- hidden once you've reached
+  [Extra Receivers](03-extra-receivers.md)) -- hidden once you've reached
   the radio's maximum receiver count, replaced with **All N receivers
   active**.
 
@@ -297,4 +297,4 @@ and returns to the discovery window.
 
 ---
 
-[← Getting Started](01-getting-started.md) | [Index](README.md) | [Network →](03-settings-network.md)
+[← Getting Started](01-getting-started.md) | [Index](README.md) | [Extra Receivers →](03-extra-receivers.md)

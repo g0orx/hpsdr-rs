@@ -1,4 +1,4 @@
-[← Main Window](02-main-window.md) | [Index](README.md) | [Audio →](04-settings-audio.md)
+[← Firmware Update](08-firmware-update.md) | [Index](README.md) | [Open Collector →](10-open-collector.md)
 
 # Settings: Network
 
@@ -111,4 +111,4 @@ session, or whenever you need them.
 
 ---
 
-[← Main Window](02-main-window.md) | [Index](README.md) | [Audio →](04-settings-audio.md)
+[← Firmware Update](08-firmware-update.md) | [Index](README.md) | [Open Collector →](10-open-collector.md)

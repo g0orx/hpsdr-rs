@@ -11,13 +11,11 @@ and instructions. Once built:
 cargo run --release
 ```
 
-hpsdr-rs currently runs on Linux only.
-
 ## Discovering your radio
 
 On launch, the **Discover HPSDR Radios** window opens automatically and
-immediately starts listening for radios on the network (standard openHPSDR
-UDP discovery broadcast, port 1024).
+immediately starts discovering radios on all the network interfaces (standard
+openHPSDR UDP discovery broadcast, port 1024).
 
 ![Discovery window](images/01-discovery-window.png)
 
@@ -56,7 +54,12 @@ broadcast-discovered one.
 
 **Firmware Update...** opens a separate window for updating a radio's FPGA
 firmware or changing its IP address while it's in bootloader mode -- see
-[Firmware Update](13-firmware-update.md).
+[Firmware Update](08-firmware-update.md).
+
+**Ozy USB setup** is for the original HPSDR hardware (an Ozy board with
+separate Mercury/Penny boards), which connects over USB instead of the
+network and needs a one-time driver/firmware setup before it shows up in
+this list -- see [Ozy USB](17-ozy-usb.md) for the full walkthrough.
 
 ## Connecting
 

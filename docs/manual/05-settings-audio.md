@@ -1,4 +1,4 @@
-[← Network](03-settings-network.md) | [Index](README.md) | [RX →](05-settings-rx.md)
+[← About](04-about.md) | [Index](README.md) | [Diversity →](06-diversity.md)
 
 # Settings: Audio
 
@@ -36,11 +36,11 @@ disable/re-enable transmit (Settings → TX).
   (e.g. a saved virtual-cable choice on a machine that doesn't have it
   installed), hpsdr-rs falls back to the system default rather than
   failing to start audio at all.
-- Each [extra receiver](12-extra-receivers.md) has its own, independent
+- Each [extra receiver](03-extra-receivers.md) has its own, independent
   Output device picker in its own Settings window's **RX** tab -- so, for
   example, the main receiver can go to real speakers while an extra
   receiver feeds a virtual cable for a second decoder, or vice versa.
 
 ---
 
-[← Network](03-settings-network.md) | [Index](README.md) | [RX →](05-settings-rx.md)
+[← About](04-about.md) | [Index](README.md) | [Diversity →](06-diversity.md)

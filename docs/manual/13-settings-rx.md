@@ -1,4 +1,4 @@
-[← Audio](04-settings-audio.md) | [Index](README.md) | [Spectrum →](06-settings-spectrum.md)
+[← PureSignal](12-puresignal.md) | [Index](README.md) | [Spectrum →](14-settings-spectrum.md)
 
 # Settings: RX
 
@@ -58,4 +58,4 @@ stage is active uses it.
 
 ---
 
-[← Audio](04-settings-audio.md) | [Index](README.md) | [Spectrum →](06-settings-spectrum.md)
+[← PureSignal](12-puresignal.md) | [Index](README.md) | [Spectrum →](14-settings-spectrum.md)

@@ -1,4 +1,4 @@
-[← Equalizer](11-equalizer.md) | [Index](README.md) | [Firmware Update →](13-firmware-update.md)
+[← Main Window](02-main-window.md) | [Index](README.md) | [About →](04-about.md)
 
 # Extra Receivers
 
@@ -15,7 +15,7 @@ window titled **Receiver N** opens. This button disappears (replaced by
 **All N receivers active**) once you've reached the radio's maximum
 receiver count.
 
-On a [PureSignal](09-puresignal.md)-capable radio, "max" here is 2 lower
+On a [PureSignal](12-puresignal.md)-capable radio, "max" here is 2 lower
 than the radio's full receiver capacity -- PureSignal's two feedback
 receivers are reserved for the whole session as soon as you connect,
 whether or not PureSignal is actually enabled.
@@ -61,12 +61,12 @@ Calibration, PureSignal, and Diversity are session-wide, not per-receiver:
   ADC/antenna selection, the same AGC attack/decay/hang/top/slope/thresh
   and NB threshold controls as the main window's RX tab, and its own
   independent **Output device** picker (same device list and fallback
-  behavior as the main window's [Audio tab](04-settings-audio.md)) -- so
+  behavior as the main window's [Audio tab](05-settings-audio.md)) -- so
   this receiver can play to a different device than the main receiver.
 - **Spectrum** -- display range and waterfall palette, same as the main
   window's Spectrum tab (no separate TX range here, since extra receivers
   never transmit).
-- **EQ** -- its own independent [graphic equalizer](11-equalizer.md),
+- **EQ** -- its own independent [graphic equalizer](07-equalizer.md),
   RX-only.
 
 ![Extra receiver settings window](images/11-extra-receiver-settings.png)
@@ -76,4 +76,4 @@ window's.
 
 ---
 
-[← Equalizer](11-equalizer.md) | [Index](README.md) | [Firmware Update →](13-firmware-update.md)
+[← Main Window](02-main-window.md) | [Index](README.md) | [About →](04-about.md)

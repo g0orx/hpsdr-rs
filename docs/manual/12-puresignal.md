@@ -1,10 +1,10 @@
-[← PA Calibration](08-pa-calibration.md) | [Index](README.md) | [Diversity →](10-diversity.md)
+[← PA Calibration](11-pa-calibration.md) | [Index](README.md) | [RX →](13-settings-rx.md)
 
 # Settings: PureSignal
 
 Open **Settings...** from the main window, then the **PureSignal** tab.
 PureSignal predistorts your TX signal to linearize your amplifier, reducing
-splatter/IMD. It's mutually exclusive with [Diversity](10-diversity.md) --
+splatter/IMD. It's mutually exclusive with [Diversity](06-diversity.md) --
 both reserve extra receiver resources on the radio in incompatible ways, so
 only one can be enabled at a time.
 
@@ -16,7 +16,7 @@ Check **Enable PureSignal**. This takes effect immediately -- no
 reconnect needed, and it can be toggled on/off freely. Note that on a
 PureSignal-capable radio, the two feedback receivers PureSignal needs are
 reserved for the whole session as soon as you connect, whether or not
-PureSignal is actually enabled -- so [Extra Receivers](12-extra-receivers.md)'
+PureSignal is actually enabled -- so [Extra Receivers](03-extra-receivers.md)'
 maximum count is 2 lower than the radio's full capacity on any such radio.
 
 Once enabled (and TX armed), the rest of this tab's controls appear:
@@ -54,7 +54,7 @@ Once enabled (and TX armed), the rest of this tab's controls appear:
   measuring.
 - **Feedback Attenuation** (non-HermesLite boards) -- 0-31 dB, adjust to
   keep Feedback Level in the ideal range. Same underlying value as
-  [Settings: TX](07-settings-tx.md)'s **TX ADC0 Attenuation** -- it isn't
+  [Settings: TX](15-settings-tx.md)'s **TX ADC0 Attenuation** -- it isn't
   PureSignal-specific, it protects ADC0 from this radio's own TX leakage
   generally, PureSignal or not.
 - **Auto Attenuate (Two Tone)** (non-HermesLite boards) -- periodically
@@ -99,4 +99,4 @@ per-board constant to leave alone.
 
 ---
 
-[← PA Calibration](08-pa-calibration.md) | [Index](README.md) | [Diversity →](10-diversity.md)
+[← PA Calibration](11-pa-calibration.md) | [Index](README.md) | [RX →](13-settings-rx.md)
