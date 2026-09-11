@@ -121,6 +121,28 @@
                                 Source='$(var.CargoTargetBinDir)\hpsdr-rs.exe'
                                 KeyPath='yes'/>
                         </Component>
+                        <!--
+                          Ozy USB (legacy Ozy/Mercury/Penny hardware) FX2/FPGA
+                          firmware, mirroring the .deb package's bundled copy
+                          -- see src/ozy.rs's `bundled_path()`, which checks
+                          the exe's own directory joined with "ozy" as one of
+                          its fallback search locations.
+                        -->
+                        <Directory Id='OzyDir' Name='ozy'>
+                            <Component Id='OzyFirmware' Guid='6B6E6B2C-6E8D-4B6F-9E0C-8B7B6F6C5A3D'>
+                                <File
+                                    Id='OzyHex'
+                                    Name='ozyfw-sdr1k.hex'
+                                    DiskId='1'
+                                    Source='assets\ozy\ozyfw-sdr1k.hex'
+                                    KeyPath='yes'/>
+                                <File
+                                    Id='OzyRbf'
+                                    Name='Ozy_Janus.rbf'
+                                    DiskId='1'
+                                    Source='assets\ozy\Ozy_Janus.rbf'/>
+                            </Component>
+                        </Directory>
                     </Directory>
                 </Directory>
             </Directory>
@@ -166,6 +188,7 @@
             <ComponentRef Id='License'/>
 
             <ComponentRef Id='binary0'/>
+            <ComponentRef Id='OzyFirmware'/>
             <ComponentRef Id='ApplicationShortcut'/>
 
             <Feature
