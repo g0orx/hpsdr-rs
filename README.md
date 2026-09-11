@@ -179,6 +179,8 @@ This produces `target/debian/hpsdr-rs_<version>_amd64.deb`, installing the binar
 sudo apt install ./target/debian/hpsdr-rs_<version>_amd64.deb
 ```
 
+If the project directory is under your home directory (the normal case), `apt` will likely print `Notice: Download is performed unsandboxed as root as file '...' couldn't be accessed by user '_apt'.` — harmless: `_apt` (the low-privilege user apt sandboxes its acquire step with) can't traverse into a private home directory (`drwxr-x---` by default), so apt just does that one step unsandboxed as root instead and warns about it. The install still succeeds; confirm with `dpkg -l hpsdr-rs`. To avoid the warning entirely, either `sudo dpkg -i` the file directly instead of `apt install`, or copy it to a world-readable path first (e.g. `/tmp`) before running `apt install` on it.
+
 Rebuilding and reinstalling repeatedly (e.g. while testing local changes) with the crate's own `version` unchanged produces the exact same package version every time — `dpkg`/`apt` treat that as nothing to do, requiring `sudo dpkg -r hpsdr-rs` before the new one will install. `./scripts/build-deb.sh` avoids this: it's a thin wrapper around `cargo deb --deb-revision <n>` that auto-increments a local counter (`.deb-revision`, gitignored) on every run, so each build gets a genuinely newer Debian revision and installs over the previous one cleanly. Use it exactly like `cargo deb` — extra arguments are passed through, e.g. `./scripts/build-deb.sh --no-build`.
 
 ## Packaging (Windows)
