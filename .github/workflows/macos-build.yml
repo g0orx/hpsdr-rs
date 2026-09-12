@@ -48,3 +48,27 @@ jobs:
 
       - name: cargo build --release
         run: cargo build --release
+
+      # Packaged as a plain tarball, not a signed/notarized .app or
+      # .dmg -- there's no Apple Developer ID available to sign with
+      # (no Mac in this project's normal toolchain, see the comment at
+      # the top of this file), so Gatekeeper will warn on first launch;
+      # right-click -> Open (or `xattr -d com.apple.quarantine`) gets
+      # past that. Retrievable as a workflow artifact from any run,
+      # release or not -- see the repo's Actions tab.
+      - name: Package release tarball
+        run: |
+          arch=$(uname -m)
+          version=$(grep -m1 '^version' Cargo.toml | cut -d '"' -f2)
+          name="hpsdr-rs-${version}-macos-${arch}"
+          mkdir "$name"
+          cp target/release/hpsdr-rs "$name"/
+          cp README.md LICENSE "$name"/
+          tar czf "${name}.tar.gz" "$name"
+          echo "ASSET_NAME=${name}.tar.gz" >> "$GITHUB_ENV"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ASSET_NAME }}
+          path: ${{ env.ASSET_NAME }}
