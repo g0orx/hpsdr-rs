@@ -123,8 +123,8 @@
                         </Component>
                         <!--
                           Ozy USB (legacy Ozy/Mercury/Penny hardware) FX2/FPGA
-                          firmware, mirroring the .deb package's bundled copy
-                          -- see src/ozy.rs's `bundled_path()`, which checks
+                          firmware, mirroring the .deb package's bundled copy.
+                          See src/ozy.rs's `bundled_path()`, which checks
                           the exe's own directory joined with "ozy" as one of
                           its fallback search locations.
                         -->
