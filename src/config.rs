@@ -323,6 +323,11 @@ pub struct Config {
     /// the live default.
     #[serde(default)]
     pub send_rx_audio_to_radio: Option<bool>,
+    /// See radio::RadioSession::hl2_ak4951_codec's doc comment
+    /// (Settings -> RX, HermesLite2 + Protocol 1 only). Missing/never
+    /// set falls back to off, same as the live default.
+    #[serde(default)]
+    pub hl2_ak4951_codec: Option<bool>,
     /// See radio::RadioSession::tx_audio_source's doc comment (Settings
     /// -> TX) -- one of radio::TX_AUDIO_SOURCE_AUTO/RADIO_MIC/LOCAL_MIC.
     /// Missing/never set falls back to Auto, same as the live default.

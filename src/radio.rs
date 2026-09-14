@@ -870,19 +870,41 @@ pub struct RadioSession {
     /// radio"). Default off: most setups have no use for a radio-side
     /// headphone/speaker jack and this adds continuous extra traffic.
     ///
-    /// P1's sender_loop used to also exclude HermesLite/HermesLite2 here
-    /// (on the assumption that board's firmware repurposes these same
-    /// wire bytes for extended-address writes) -- ROOT CAUSE FIX for a
-    /// real report: that blanket exclusion was wrong. There's an add-on
-    /// board for the HermesLite2 (built around an AK4951 codec) that
-    /// adds PHONES/MIC/KEY jacks to emulate a standard HPSDR radio's
-    /// audio I/O, using its own dedicated firmware build -- confirmed by
-    /// the user that this feature DOES work with it. Sending these bytes
-    /// to a stock HermesLite/HermesLite2 (no add-on board) is confirmed
-    /// harmless -- that firmware just discards them -- so there's no
-    /// reason to gate this by board type at all; the checkbox is already
-    /// off by default and purely opt-in, same as for every other board.
+    /// P1's sender_loop ALSO requires `hl2_ak4951_codec` (below) to be
+    /// set before actually sending real audio to a HermesLite/
+    /// HermesLite2 -- see that field's own doc comment for why. P2 has
+    /// no such restriction at all (separate UDP stream, doesn't share
+    /// bytes with anything else).
     pub send_rx_audio_to_radio: Arc<AtomicBool>,
+    /// Live toggle (Settings -> RX, HermesLite2 + Protocol 1 only --
+    /// "HL2+ Audio Codec (AK4951)") declaring that a real add-on board
+    /// (an AK4951 codec providing PHONES/MIC/KEY jacks, emulating a
+    /// standard HPSDR radio's local audio I/O, running its own dedicated
+    /// firmware build) is physically present. There is no way to detect
+    /// this from discovery -- same board/discovery response either way
+    /// -- so, matching deskhpsdr's own `hl2_audio_codec` RADIO-menu
+    /// setting (`old_protocol.c`), this has to be an explicit opt-in the
+    /// user sets, not an assumption.
+    ///
+    /// Two effects while this is on, both P1/command-4 only, ported
+    /// directly from deskhpsdr: (1) `send_rx_audio_to_radio` above is
+    /// actually allowed to send real samples to a HermesLite/
+    /// HermesLite2 (see sender_loop's own send_rx_audio computation) --
+    /// while OFF, those bytes are always sent as zero instead, matching
+    /// deskhpsdr's own precaution ("The HL2 makes no use of audio
+    /// samples, but instead uses them to write to extended addrs which
+    /// we do not want to do un-intentionally... special variants of the
+    /// HL2 *do* have an audio codec"); (2) command 4's C3 byte gets
+    /// `LT2208_DITHER_ON` (0x08) forced on permanently, in
+    /// p1_build_packet -- the addon's gateware apparently uses that bit
+    /// as its own "codec present" flag, unrelated to any actual dither/
+    /// random-generator setting (this project doesn't implement real
+    /// ADC dither/random bits at all yet). Deliberately does NOT cover
+    /// deskhpsdr's third option, "SQUARE SDR 2" (a different addon that
+    /// repurposes the very same bit to switch an internal loudspeaker
+    /// instead) -- out of scope until this project has real per-ADC
+    /// dither/random UI to hang that on.
+    pub hl2_ak4951_codec: Arc<AtomicBool>,
     /// Desired TX output power in watts, converted to each protocol's
     /// actual drive byte via drive_byte_for_watts -- see that
     /// function's doc comment. Confirmed by the user to belong at byte
@@ -1114,6 +1136,8 @@ impl RadioSession {
         let ps_tx_feedback_iq = Arc::new(Mutex::new(VecDeque::with_capacity(PS_FEEDBACK_BUFFER_CAPACITY)));
         let rx_audio_to_radio = Arc::new(Mutex::new(VecDeque::with_capacity(RX_AUDIO_TO_RADIO_CAPACITY)));
         let send_rx_audio_to_radio = Arc::new(AtomicBool::new(false));
+        // See RadioSession::hl2_ak4951_codec's doc comment.
+        let hl2_ak4951_codec = Arc::new(AtomicBool::new(false));
         let radio_mic_audio = Arc::new(Mutex::new(VecDeque::with_capacity(RADIO_MIC_AUDIO_CAPACITY)));
         let tx_audio_source = Arc::new(AtomicU8::new(TX_AUDIO_SOURCE_AUTO));
         let tci_wants_mic = Arc::new(AtomicBool::new(false));
@@ -1149,7 +1173,7 @@ impl RadioSession {
                 ps_tx_attenuation, mox, tx_iq, tci_tx_audio, tci_tx_gain, tx_power_watts, cw_keyer, cw_mode_active, pa_gain_db,
                 tx_forward_power, tx_reverse_power, adc0_overload, cw_ptt_active, cw_paddle_contacts, adc1_overload,
                 tx_fifo_underrun, tx_fifo_overrun, ps_rx_feedback_iq, ps_tx_feedback_iq,
-                rx_audio_to_radio, send_rx_audio_to_radio, radio_mic_audio, tx_audio_source,
+                rx_audio_to_radio, send_rx_audio_to_radio, hl2_ak4951_codec, radio_mic_audio, tx_audio_source,
                 tci_wants_mic, mic_ptt_enabled, mic_bias_enabled, mic_ptt_on_tip,
                 diversity_enabled, diversity_gain_db, diversity_phase_deg, diversity_main_raw_iq,
                 puresignal_enabled,
@@ -1161,7 +1185,7 @@ impl RadioSession {
                 ps_tx_attenuation, mox, tx_iq, tci_tx_audio, tci_tx_gain, tx_power_watts, cw_keyer, cw_mode_active, pa_gain_db,
                 tx_forward_power, tx_reverse_power, adc0_overload, cw_ptt_active, cw_paddle_contacts, adc1_overload,
                 tx_fifo_underrun, tx_fifo_overrun, ps_rx_feedback_iq, ps_tx_feedback_iq,
-                rx_audio_to_radio, send_rx_audio_to_radio, radio_mic_audio, tx_audio_source,
+                rx_audio_to_radio, send_rx_audio_to_radio, hl2_ak4951_codec, radio_mic_audio, tx_audio_source,
                 tci_wants_mic, mic_ptt_enabled, mic_bias_enabled, mic_ptt_on_tip,
                 diversity_enabled, diversity_gain_db, diversity_phase_deg, diversity_main_raw_iq,
                 puresignal_enabled,
@@ -1171,7 +1195,7 @@ impl RadioSession {
                 ps_tx_attenuation, mox, tx_iq, tci_tx_audio, tci_tx_gain, tx_power_watts, cw_keyer, cw_mode_active, pa_gain_db,
                 tx_forward_power, tx_reverse_power, adc0_overload, cw_ptt_active, cw_paddle_contacts, adc1_overload,
                 tx_fifo_underrun, tx_fifo_overrun, ps_rx_feedback_iq, ps_tx_feedback_iq,
-                rx_audio_to_radio, send_rx_audio_to_radio, radio_mic_audio, tx_audio_source,
+                rx_audio_to_radio, send_rx_audio_to_radio, hl2_ak4951_codec, radio_mic_audio, tx_audio_source,
                 tci_wants_mic, mic_ptt_enabled, mic_bias_enabled, mic_ptt_on_tip,
                 diversity_enabled, diversity_gain_db, diversity_phase_deg, diversity_main_raw_iq,
                 puresignal_enabled,
@@ -1409,6 +1433,8 @@ fn start_protocol1(
     ps_tx_feedback_iq: Arc<Mutex<VecDeque<IqSample>>>,
     rx_audio_to_radio: Arc<Mutex<VecDeque<f32>>>,
     send_rx_audio_to_radio: Arc<AtomicBool>,
+    // See RadioSession::hl2_ak4951_codec's doc comment.
+    hl2_ak4951_codec: Arc<AtomicBool>,
     radio_mic_audio: Arc<Mutex<VecDeque<f32>>>,
     tx_audio_source: Arc<AtomicU8>,
     tci_wants_mic: Arc<AtomicBool>,
@@ -1595,6 +1621,7 @@ fn start_protocol1(
     let sender_num_adcs = device.adcs;
     let sender_rx_audio_to_radio = Arc::clone(&rx_audio_to_radio);
     let sender_send_rx_audio_to_radio = Arc::clone(&send_rx_audio_to_radio);
+    let sender_hl2_ak4951_codec = Arc::clone(&hl2_ak4951_codec);
     let sender_mic_ptt_enabled = Arc::clone(&mic_ptt_enabled);
     let sender_mic_bias_enabled = Arc::clone(&mic_bias_enabled);
     let sender_mic_ptt_on_tip = Arc::clone(&mic_ptt_on_tip);
@@ -1636,6 +1663,7 @@ fn start_protocol1(
             sender_puresignal_enabled,
             sender_rx_audio_to_radio,
             sender_send_rx_audio_to_radio,
+            sender_hl2_ak4951_codec,
             sender_mic_ptt_enabled,
             sender_mic_bias_enabled,
             sender_mic_ptt_on_tip,
@@ -1720,6 +1748,7 @@ fn start_protocol1(
         tci_tx_gain,
         rx_audio_to_radio,
         send_rx_audio_to_radio,
+        hl2_ak4951_codec,
         radio_mic_audio,
         tx_audio_source,
         tci_wants_mic,
@@ -1817,6 +1846,8 @@ fn start_protocol1_ozy_usb(
     ps_tx_feedback_iq: Arc<Mutex<VecDeque<IqSample>>>,
     rx_audio_to_radio: Arc<Mutex<VecDeque<f32>>>,
     send_rx_audio_to_radio: Arc<AtomicBool>,
+    // See RadioSession::hl2_ak4951_codec's doc comment.
+    hl2_ak4951_codec: Arc<AtomicBool>,
     radio_mic_audio: Arc<Mutex<VecDeque<f32>>>,
     tx_audio_source: Arc<AtomicU8>,
     tci_wants_mic: Arc<AtomicBool>,
@@ -2015,6 +2046,7 @@ fn start_protocol1_ozy_usb(
         tci_tx_gain,
         rx_audio_to_radio,
         send_rx_audio_to_radio,
+        hl2_ak4951_codec,
         radio_mic_audio,
         tx_audio_source,
         tci_wants_mic,
@@ -2422,6 +2454,7 @@ fn p1_send_preconfig_and_start(
             sample_rate,
             false, // mox: never keyed during startup config
             is_hermes_lite,
+            false, // hl2_ak4951_codec: irrelevant this early -- no RX audio flows until sender_loop takes over, whose live value applies to every subsequent packet
             false, // disable_pa: nothing to key yet this early -- sender_loop's live value takes over immediately after
             false, // tune_active: never during startup config, nothing keyed yet
             CwKeyerValues { mode: 0, speed_wpm: 0, weight: 0, sidetone_volume: 0, sidetone_freq_hz: 0, hang_time_ms: 0 }, // cw_keyer: irrelevant while cw_mode_active is false below
@@ -2505,6 +2538,12 @@ fn p1_build_packet(
     sample_rate_hz: u32,
     mox_on: bool,
     is_hermes_lite: bool,
+    // See RadioSession::hl2_ak4951_codec's doc comment. Only consulted
+    // for command 4's C3 byte below (forces the codec-present/dither
+    // bit) -- the RX-audio-vs-zeros decision itself is made by the
+    // caller (see sender_loop's own send_rx_audio computation), not
+    // here.
+    hl2_ak4951_codec: bool,
     disable_pa: bool,
     // See RadioSession::tune_active's doc comment. HermesLite2-only
     // (see this function's own HermesLite2 branch below) -- ignored
@@ -2836,7 +2875,13 @@ fn p1_build_packet(
             if mic_ptt_on_tip {
                 c1 |= 0x10;
             }
-            (0x14, c1, 0x00, 0x00, c4)
+            // See RadioSession::hl2_ak4951_codec's doc comment -- the
+            // addon board's gateware uses this bit (LT2208_DITHER_ON,
+            // 0x08 -- otherwise a real ADC dither-generator control this
+            // project doesn't implement) as its own "codec present"
+            // flag, ported directly from deskhpsdr's old_protocol.c.
+            let c3: u8 = if is_hermes_lite && hl2_ak4951_codec { 0x08 } else { 0x00 };
+            (0x14, c1, 0x00, c3, c4)
         }
         5 => {
             // CW keyer settings (C2-C4) -- this project has no CW
@@ -3181,6 +3226,8 @@ fn sender_loop(
     puresignal_enabled: Arc<AtomicBool>,
     rx_audio_to_radio: Arc<Mutex<VecDeque<f32>>>,
     send_rx_audio_to_radio: Arc<AtomicBool>,
+    // See RadioSession::hl2_ak4951_codec's doc comment.
+    hl2_ak4951_codec: Arc<AtomicBool>,
     mic_ptt_enabled: Arc<AtomicBool>,
     mic_bias_enabled: Arc<AtomicBool>,
     mic_ptt_on_tip: Arc<AtomicBool>,
@@ -3340,11 +3387,19 @@ fn sender_loop(
         let samples_per_packet = samples_per_frame * 2; // two USB frames per packet
         let interval = Duration::from_secs_f64(samples_per_packet as f64 / current_rate as f64);
         let mox_on = mox.load(Ordering::Relaxed);
+        let hl2_ak4951_codec_on = hl2_ak4951_codec.load(Ordering::Relaxed);
         // See RadioSession::send_rx_audio_to_radio's doc comment -- never
         // sent while transmitting (fill_tx_payload owns this slot then).
-        // No longer excludes HermesLite/HermesLite2 -- see that doc
-        // comment for why the earlier blanket exclusion was wrong.
-        let send_rx_audio = !mox_on && send_rx_audio_to_radio.load(Ordering::Relaxed);
+        // On HermesLite/HermesLite2, also requires hl2_ak4951_codec --
+        // see RadioSession::hl2_ak4951_codec's doc comment for why real
+        // audio is only sent there when that add-on board (and its
+        // firmware) is actually present; the bytes are sent as zero
+        // otherwise (fill_rx_audio_payload/fill_tx_payload are simply
+        // not called below, and build_usb_frame already zero-
+        // initializes the frame).
+        let send_rx_audio = !mox_on
+            && send_rx_audio_to_radio.load(Ordering::Relaxed)
+            && (!is_hermes_lite || hl2_ak4951_codec_on);
         // See RxAudioPacer's doc comment -- the true per-slot rate this
         // packet cadence works out to (126 fixed slots/packet, see
         // fill_rx_audio_payload's HEADER_SIZE-based stride), versus the
@@ -3368,6 +3423,7 @@ fn sender_loop(
             current_rate,
             mox_on,
             is_hermes_lite,
+            hl2_ak4951_codec_on,
             disable_pa.load(Ordering::Relaxed),
             tune_active.load(Ordering::Relaxed),
             CwKeyerValues::load(&cw_keyer),
@@ -3764,6 +3820,7 @@ fn ozy_sender_loop(
             current_rate,
             mox_on,
             false, // is_hermes_lite -- Ozy is never a HermesLite-family board
+            false, // hl2_ak4951_codec -- irrelevant when is_hermes_lite is false above
             disable_pa.load(Ordering::Relaxed),
             false, // tune_active -- irrelevant when is_hermes_lite is false above
             CwKeyerValues::load(&cw_keyer),
@@ -4366,6 +4423,8 @@ fn start_protocol2(
     ps_tx_feedback_iq: Arc<Mutex<VecDeque<IqSample>>>,
     rx_audio_to_radio: Arc<Mutex<VecDeque<f32>>>,
     send_rx_audio_to_radio: Arc<AtomicBool>,
+    // See RadioSession::hl2_ak4951_codec's doc comment.
+    hl2_ak4951_codec: Arc<AtomicBool>,
     radio_mic_audio: Arc<Mutex<VecDeque<f32>>>,
     tx_audio_source: Arc<AtomicU8>,
     tci_wants_mic: Arc<AtomicBool>,
@@ -4661,6 +4720,7 @@ fn start_protocol2(
         tci_tx_gain,
         rx_audio_to_radio,
         send_rx_audio_to_radio,
+        hl2_ak4951_codec,
         radio_mic_audio,
         tx_audio_source,
         tci_wants_mic,

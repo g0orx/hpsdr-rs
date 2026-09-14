@@ -30,14 +30,28 @@ down if signals seem unusually weak.
 ## Send RX audio to radio
 
 A checkbox that routes the demodulated audio back out through the radio's
-own local audio jack, in addition to your computer's speakers. On a
-HermesLite2, this is how you'd feed the PHONES jack on an add-on board
-(e.g. one built around an AK4951 codec) that adds PHONES, MIC, and KEY
-jacks to emulate a standard HPSDR radio's audio I/O -- that board uses
-its own dedicated firmware build. On a stock HermesLite/HermesLite2 with
-no such add-on, enabling this is harmless (the firmware simply has
-nothing to do with the audio) but obviously won't produce any audible
-output, since there's no local audio hardware to play it through.
+own local audio jack, in addition to your computer's speakers.
+
+On a HermesLite2 running Protocol 1 with the **HL2+ Audio Codec** option
+below left off (the default), this has no effect -- that board's stock
+firmware repurposes the same wire bytes for something else, so nothing is
+actually sent. Protocol 2 has no such restriction and always works.
+
+### HL2+ Audio Codec (AK4951 add-on board)
+
+Shown only for a HermesLite2 on Protocol 1. A checkbox declaring that
+this radio has a real add-on board installed -- one built around an
+AK4951 codec, adding PHONES, MIC, and KEY jacks to emulate a standard
+HPSDR radio's local audio I/O -- running that board's own dedicated
+firmware build. There's no way to detect this automatically, so it has
+to be set explicitly, same as piHPSDR-family apps' own equivalent RADIO
+menu setting.
+
+Enabling it does two things: lets **Send RX audio to radio** above
+actually reach this board, and permanently sets a bit in the radio
+command stream that board's gateware uses to recognize the codec is
+present. Leave this off on a stock HermesLite/HermesLite2 with no add-on
+board -- there's nothing for it to do there.
 
 ## AGC tuning
 

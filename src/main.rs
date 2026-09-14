@@ -1659,6 +1659,9 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                 Ordering::Relaxed,
             );
             session
+                .hl2_ak4951_codec
+                .store(cfg.hl2_ak4951_codec.unwrap_or(false), Ordering::Relaxed);
+            session
                 .tx_audio_source
                 .store(cfg.tx_audio_source.unwrap_or(TX_AUDIO_SOURCE_AUTO), Ordering::Relaxed);
             session
@@ -6321,16 +6324,52 @@ impl eframe::App for HpsdrApp {
                                                 .store(send_rx_audio, Ordering::Relaxed);
                                             settings_changed = true;
                                         }
+                                        // See radio::RadioSession::hl2_ak4951_codec's doc
+                                        // comment. HermesLite2 + Protocol 1 only -- the
+                                        // add-on board it declares doesn't exist for the
+                                        // original HermesLite, and Protocol 2 has no wire-
+                                        // byte conflict to protect against in the first
+                                        // place (send_rx_audio_to_radio already just works
+                                        // there, nothing to opt into).
+                                        let hl2_p1 = connected.device.protocol == 1
+                                            && matches!(connected.device.board, Boards::HermesLite2);
+                                        let mut hl2_ak4951_codec = false;
+                                        if hl2_p1 {
+                                            hl2_ak4951_codec =
+                                                connected.session.hl2_ak4951_codec.load(Ordering::Relaxed);
+                                            if ui
+                                                .checkbox(
+                                                    &mut hl2_ak4951_codec,
+                                                    "HL2+ Audio Codec (AK4951 add-on board)",
+                                                )
+                                                .on_hover_text(
+                                                    "Enable only if this HermesLite2 has the AK4951 \
+                                                     companion board (PHONES/MIC/KEY jacks) installed \
+                                                     and is running its dedicated firmware build -- \
+                                                     required for \"Send RX audio to radio\" above to \
+                                                     actually reach it.",
+                                                )
+                                                .changed()
+                                            {
+                                                connected
+                                                    .session
+                                                    .hl2_ak4951_codec
+                                                    .store(hl2_ak4951_codec, Ordering::Relaxed);
+                                                settings_changed = true;
+                                            }
+                                        }
                                         if send_rx_audio
                                             && connected.device.protocol == 1
                                             && matches!(
                                                 connected.device.board,
                                                 Boards::HermesLite | Boards::HermesLite2
                                             )
+                                            && !(hl2_p1 && hl2_ak4951_codec)
                                         {
                                             ui.weak(
-                                                "No effect on this board over Protocol 1 -- its \
-                                                 firmware reuses this slot for something else.",
+                                                "No effect on this board over Protocol 1 unless the \
+                                                 HL2+ Audio Codec option above is enabled (requires \
+                                                 the AK4951 add-on board's own firmware).",
                                             );
                                         }
                                         ui.separator();
@@ -8084,6 +8123,9 @@ impl eframe::App for HpsdrApp {
                                 .session
                                 .send_rx_audio_to_radio
                                 .load(std::sync::atomic::Ordering::Relaxed),
+                        ),
+                        hl2_ak4951_codec: Some(
+                            connected.session.hl2_ak4951_codec.load(std::sync::atomic::Ordering::Relaxed),
                         ),
                         tx_audio_source: Some(
                             connected.session.tx_audio_source.load(std::sync::atomic::Ordering::Relaxed),
