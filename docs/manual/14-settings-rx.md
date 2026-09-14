@@ -30,8 +30,14 @@ down if signals seem unusually weak.
 ## Send RX audio to radio
 
 A checkbox that routes the demodulated audio back out through the radio's
-own local audio jack, in addition to your computer's speakers. Has no
-effect on HermesLite/HermesLite2 under Protocol 1.
+own local audio jack, in addition to your computer's speakers. On a
+HermesLite2, this is how you'd feed the PHONES jack on an add-on board
+(e.g. one built around an AK4951 codec) that adds PHONES, MIC, and KEY
+jacks to emulate a standard HPSDR radio's audio I/O -- that board uses
+its own dedicated firmware build. On a stock HermesLite/HermesLite2 with
+no such add-on, enabling this is harmless (the firmware simply has
+nothing to do with the audio) but obviously won't produce any audible
+output, since there's no local audio hardware to play it through.
 
 ## AGC tuning
 

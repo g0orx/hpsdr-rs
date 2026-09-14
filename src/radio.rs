@@ -869,12 +869,19 @@ pub struct RadioSession {
     /// own local audio output (Settings -> RX -- "Send RX audio to
     /// radio"). Default off: most setups have no use for a radio-side
     /// headphone/speaker jack and this adds continuous extra traffic.
-    /// No effect on HermesLite/HermesLite2 over Protocol 1 regardless
-    /// of this setting -- see p1_build_packet's send_rx_audio note
-    /// (that board's firmware repurposes the same wire bytes for
-    /// extended-address writes, confirmed via piHPSDR's own explicit
-    /// precaution). Protocol 2 has no such restriction (separate UDP
-    /// port, not sharing bytes with anything else).
+    ///
+    /// P1's sender_loop used to also exclude HermesLite/HermesLite2 here
+    /// (on the assumption that board's firmware repurposes these same
+    /// wire bytes for extended-address writes) -- ROOT CAUSE FIX for a
+    /// real report: that blanket exclusion was wrong. There's an add-on
+    /// board for the HermesLite2 (built around an AK4951 codec) that
+    /// adds PHONES/MIC/KEY jacks to emulate a standard HPSDR radio's
+    /// audio I/O, using its own dedicated firmware build -- confirmed by
+    /// the user that this feature DOES work with it. Sending these bytes
+    /// to a stock HermesLite/HermesLite2 (no add-on board) is confirmed
+    /// harmless -- that firmware just discards them -- so there's no
+    /// reason to gate this by board type at all; the checkbox is already
+    /// off by default and purely opt-in, same as for every other board.
     pub send_rx_audio_to_radio: Arc<AtomicBool>,
     /// Desired TX output power in watts, converted to each protocol's
     /// actual drive byte via drive_byte_for_watts -- see that
@@ -3333,11 +3340,11 @@ fn sender_loop(
         let samples_per_packet = samples_per_frame * 2; // two USB frames per packet
         let interval = Duration::from_secs_f64(samples_per_packet as f64 / current_rate as f64);
         let mox_on = mox.load(Ordering::Relaxed);
-        // See RadioSession::send_rx_audio_to_radio's doc comment --
-        // never sent while transmitting (fill_tx_payload owns this
-        // slot then) or on HermesLite/HermesLite2 (firmware repurposes
-        // these bytes for extended-address writes there).
-        let send_rx_audio = !mox_on && !is_hermes_lite && send_rx_audio_to_radio.load(Ordering::Relaxed);
+        // See RadioSession::send_rx_audio_to_radio's doc comment -- never
+        // sent while transmitting (fill_tx_payload owns this slot then).
+        // No longer excludes HermesLite/HermesLite2 -- see that doc
+        // comment for why the earlier blanket exclusion was wrong.
+        let send_rx_audio = !mox_on && send_rx_audio_to_radio.load(Ordering::Relaxed);
         // See RxAudioPacer's doc comment -- the true per-slot rate this
         // packet cadence works out to (126 fixed slots/packet, see
         // fill_rx_audio_payload's HEADER_SIZE-based stride), versus the
