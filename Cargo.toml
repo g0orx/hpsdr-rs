@@ -69,6 +69,14 @@ rfd = "0.17.2"
 # choice (a Windows driver-model fact, not a libusb-specific one) --
 # see README's Ozy USB section.
 nusb = "0.2"
+# MIDI control-surface input (learn-mode mapping of a class-compliant USB/
+# DIN MIDI controller's notes/CCs to radio actions -- see midi.rs). On
+# Linux this resolves to the SAME `alsa` crate (0.11.0, confirmed in
+# Cargo.lock) that cpal above already links against for audio, so there's
+# no new system library on Linux; CoreMIDI on macOS and WinMM on Windows
+# are likewise OS-native, same as cpal's own per-platform backends -- no
+# new system dependency on any platform.
+midir = "0.11"
 
 [target.'cfg(windows)'.dependencies]
 # SetStdHandle, used by main.rs's redirect_stdio_to_log_file() to send

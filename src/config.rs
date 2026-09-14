@@ -420,6 +420,22 @@ pub struct Config {
     /// doc comment.
     #[serde(default)]
     pub oc_tune: u8,
+    /// Whether the MIDI worker should actually open a device -- see
+    /// main.rs's MidiWorker::enabled (a live toggle, no reconnect needed).
+    /// `#[serde(default)]` so configs saved before this existed just
+    /// start with MIDI disabled.
+    #[serde(default)]
+    pub midi_enabled: Option<bool>,
+    /// Target MIDI input port name, matched by name (see midi.rs's
+    /// `connect()` doc comment for why name rather than a backend-
+    /// specific port id).
+    #[serde(default)]
+    pub midi_device_name: Option<String>,
+    /// User-configured note/CC-to-action bindings (Settings -> MIDI's
+    /// learn mode) -- see crate::midi::MidiBinding. A naturally repeated/
+    /// keyed list, same precedent as `xvtrs` above, not a flat field.
+    #[serde(default)]
+    pub midi_bindings: Vec<crate::midi::MidiBinding>,
 }
 
 fn default_nb_threshold() -> f64 {

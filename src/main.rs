@@ -20,6 +20,7 @@ mod cw_encoder;
 mod debug_log;
 mod discovery;
 mod discovery_ui;
+mod midi;
 mod ozy;
 mod radio;
 mod rigctl;
@@ -34,6 +35,10 @@ use config::{ps_corr_path, Config, ExtraReceiverConfig, WindowGeometry};
 use discovery::{manual_discovery, Boards, Device};
 use discovery_ui::{DiscoveryAction, DiscoveryWindow};
 use eframe::egui;
+use midi::{
+    MidiAction, MidiBinding, MidiBindingKind, MidiEventKind, MidiStatus, MidiWorker, RawMidiEvent, KEY_ACTIONS,
+    KNOB_ACTIONS, WHEEL_ACTIONS,
+};
 use radio::{
     IqSample, RadioSession, RadioSettings, CW_KEYER_MODE_IAMBIC_A, CW_KEYER_MODE_IAMBIC_B,
     CW_KEYER_MODE_STRAIGHT, TX_AUDIO_SOURCE_AUTO, TX_AUDIO_SOURCE_LOCAL_MIC, TX_AUDIO_SOURCE_RADIO_MIC,
@@ -323,6 +328,380 @@ fn width_for_mode(width_memory: &std::collections::HashMap<String, f64>, mode: s
         .unwrap_or_else(|| spectrum::default_width_hz(mode))
 }
 
+/// Switches to `band`: recalls its last frequency/mode/spectrum-range (via
+/// `band_memory`), or its configured default the first time it's visited.
+/// Shared by the band-button click handler and MIDI's BandUp/BandDown --
+/// extracted (unlike most of this file's inline UI-handler logic) because
+/// it touches enough fields (active_xvtr, band_memory, mode, width, the TX
+/// mirror) that duplicating it risks the two call sites drifting apart.
+fn apply_band(connected: &mut ConnectedState, band: &'static Band) {
+    connected.active_xvtr = None;
+    let saved = connected.band_memory.get(band.name).copied();
+    let target = saved.map(|s| s.frequency_hz).unwrap_or(band.default_hz);
+    connected.session.set_frequency(target);
+    connected.ctun_frequency_hz = target;
+    if let Some(s) = saved {
+        connected.db_low = s.db_low;
+        connected.db_high = s.db_high;
+        connected.waterfall_db_low = s.waterfall_db_low;
+        connected.waterfall_db_high = s.waterfall_db_high;
+    }
+    let resolved_mode = saved.and_then(|s| s.mode).unwrap_or(band.default_mode);
+    remember_band_settings(
+        &mut connected.band_memory,
+        target,
+        connected.db_low,
+        connected.db_high,
+        connected.waterfall_db_low,
+        connected.waterfall_db_high,
+        resolved_mode,
+    );
+    connected.spectrum.set_mode(resolved_mode);
+    let resolved_width_hz = width_for_mode(&connected.width_memory, resolved_mode);
+    connected.spectrum.set_width_hz(resolved_width_hz);
+    if let Some(tx) = &connected.tx_handle {
+        tx.set_mode(resolved_mode);
+        tx.set_width_hz(resolved_width_hz);
+    }
+}
+
+/// Switches to `mode` at the current dial frequency. Shared by the
+/// mode-button click handler and MIDI's ModeUp/ModeDown, same reasoning as
+/// `apply_band` above.
+fn apply_mode(connected: &mut ConnectedState, mode: spectrum::Mode, dial_freq_hz: u32) {
+    connected.spectrum.set_mode(mode);
+    let mode_width_hz = width_for_mode(&connected.width_memory, mode);
+    connected.spectrum.set_width_hz(mode_width_hz);
+    if let Some(tx) = &connected.tx_handle {
+        tx.set_mode(mode);
+        tx.set_width_hz(mode_width_hz);
+    }
+    remember_band_settings(
+        &mut connected.band_memory,
+        dial_freq_hz,
+        connected.db_low,
+        connected.db_high,
+        connected.waterfall_db_low,
+        connected.waterfall_db_high,
+        mode,
+    );
+}
+
+/// Linearly maps a 7-bit MIDI knob value (0-127) onto `lo..=hi`.
+fn midi_knob_range(value: u8, lo: f64, hi: f64) -> f64 {
+    lo + (value as f64 / 127.0) * (hi - lo)
+}
+
+/// Fixed Hz-per-MESSAGE for a Wheel binding, before `MidiBinding::
+/// sensitivity` is applied (default sensitivity 1.0 -> this value as-is).
+///
+/// Deliberately per-message, not per-unit-of-delta-magnitude (an earlier
+/// version of this multiplied the step by `ev.value - 64`'s raw
+/// magnitude, piHPSDR's own convention for a relative encoder) -- a real
+/// report: that made landing on an exact frequency hard, because the
+/// same physical motion could produce wildly different step sizes
+/// depending on what magnitude value the encoder happened to report for
+/// it, which isn't something the operator can see or predict. Using a
+/// FIXED step per message instead means tuning speed is governed purely
+/// by how many messages a spin produces (i.e. how fast you turn it) --
+/// spin slowly near your target frequency and each message nudges by
+/// exactly this many Hz; spin fast and more messages arrive per second,
+/// so it still moves quickly. `sensitivity` (Settings -> MIDI) scales
+/// this without a code change, e.g. down for a very chatty encoder that
+/// sends many messages even for a slight touch.
+const MIDI_WHEEL_HZ_PER_MESSAGE: i64 = 10;
+
+/// Signed step for a Wheel binding: a fixed `MIDI_WHEEL_HZ_PER_MESSAGE`
+/// in the direction `ev.value - 64` (piHPSDR's own centered-at-64
+/// relative-encoder convention) indicates, scaled by the binding's own
+/// sensitivity -- see MIDI_WHEEL_HZ_PER_MESSAGE's own doc comment for why
+/// this ignores the delta's magnitude. Returns `None` for a centered/
+/// no-op value (delta == 0) so callers can bail out without touching
+/// anything.
+fn midi_wheel_step_hz(ev: RawMidiEvent, binding: &MidiBinding) -> Option<i64> {
+    let delta = ev.value as i64 - 64;
+    if delta == 0 {
+        return None;
+    }
+    let direction = delta.signum();
+    Some((MIDI_WHEEL_HZ_PER_MESSAGE as f64 * direction as f64 * binding.sensitivity as f64).round() as i64)
+}
+
+/// Looks up `ev` against `connected.midi_bindings` and, on a match, applies
+/// the bound action -- mirroring, field-for-field, the mouse/keyboard
+/// handler for the same control (see the MIDI support plan's dispatch
+/// table for exactly which handler each action mirrors). `freq_hz`/
+/// `sample_rate`/`passband` are the same per-frame values the rigctl/CAT/
+/// TCI frequency-request reconciliation just above this call site already
+/// resolved, so tuning actions respect CTUN identically to every other
+/// tuning path in this app.
+fn dispatch_midi_event(connected: &mut ConnectedState, ev: RawMidiEvent, freq_hz: u32, sample_rate: u32, passband: (f64, f64)) {
+    let Some(binding) = connected.midi_bindings.iter().find(|b| b.matches(&ev)).copied() else { return };
+
+    // A Key binding without `momentary` only fires on press; WITH
+    // momentary it fires on both press AND release (piHPSDR's ONOFF
+    // modifier) -- e.g. so Mox can be bound press-to-transmit/release-to-
+    // receive instead of toggle-per-press. Non-Key bindings have no
+    // press/release distinction to begin with.
+    if binding.kind == MidiBindingKind::Key && ev.off && !binding.momentary {
+        return;
+    }
+
+    // Rate-limit a Wheel binding -- see MidiBinding::debounce_ms's doc
+    // comment for why this exists (a real report: a continuous, no-
+    // detent encoder can send far more relative messages for a brief
+    // touch than any per-message step size alone can stay controllable
+    // against). Checked/updated here, once, rather than duplicated in
+    // each of VfoTune/RitAdjust/XitAdjust's own match arms below.
+    if binding.kind == MidiBindingKind::Wheel && binding.debounce_ms > 0 {
+        let key = (binding.event, binding.channel, binding.number);
+        let now = Instant::now();
+        if let Some(last) = connected.midi_wheel_last_step.get(&key) {
+            if now.duration_since(*last) < Duration::from_millis(binding.debounce_ms as u64) {
+                return;
+            }
+        }
+        connected.midi_wheel_last_step.insert(key, now);
+    }
+
+    let current_mode = connected.spectrum.mode();
+    let cw_mode = matches!(current_mode, spectrum::Mode::Cwl | spectrum::Mode::Cwu);
+    let dial_freq_hz = if connected.ctun { connected.ctun_frequency_hz } else { freq_hz };
+
+    match binding.action {
+        MidiAction::Mox => {
+            if binding.momentary {
+                connected.session.set_mox(!ev.off);
+            } else {
+                connected.session.set_mox(!connected.session.mox_active());
+            }
+        }
+        // Mirrors the TUNE button handler -- see its own comments for why
+        // tune_may_start excludes Two-Tone/CW-text-sending and an
+        // externally-keyed transmission.
+        MidiAction::Tune => {
+            if connected.tune_active {
+                connected.session.set_mox(false);
+                if let Some(tx) = &connected.tx_handle {
+                    tx.set_tune(false);
+                }
+                if let Some(prev) = connected.pre_tune_power_watts.take() {
+                    connected.session.tx_power_watts.store(prev, Ordering::Relaxed);
+                }
+                connected.tune_active = false;
+            } else {
+                let tune_may_start = !connected.session.mox_active()
+                    && !connected.two_tone_active
+                    && !connected.cw_text_sending;
+                if tune_may_start {
+                    let current_watts = connected.session.tx_power_watts.load(Ordering::Relaxed);
+                    connected.pre_tune_power_watts = Some(current_watts);
+                    let tune_watts = current_watts * connected.tune_power_percent / 100;
+                    connected.session.tx_power_watts.store(tune_watts, Ordering::Relaxed);
+                    if let Some(tx) = &connected.tx_handle {
+                        tx.set_tune(true);
+                    }
+                    connected.session.set_mox(true);
+                    connected.tune_active = true;
+                }
+            }
+        }
+        MidiAction::Split => connected.split = !connected.split,
+        MidiAction::RitToggle => {
+            connected.rit_enabled = !connected.rit_enabled;
+            connected.session.rit_enabled.store(connected.rit_enabled, Ordering::Relaxed);
+        }
+        MidiAction::RitClear => {
+            connected.rit_offset_hz = 0.0;
+            connected.session.rit_offset_hz.store(0, Ordering::Relaxed);
+        }
+        MidiAction::XitToggle => {
+            connected.xit_enabled = !connected.xit_enabled;
+            connected.session.xit_enabled.store(connected.xit_enabled, Ordering::Relaxed);
+        }
+        MidiAction::XitClear => {
+            connected.xit_offset_hz = 0.0;
+            connected.session.xit_offset_hz.store(0, Ordering::Relaxed);
+        }
+        MidiAction::VfoAtoB => connected.vfo_b_frequency_hz = dial_freq_hz,
+        MidiAction::VfoBtoA => {
+            let (effective_freq, retune) =
+                resolve_tune(connected.ctun, freq_hz, sample_rate, passband, connected.vfo_b_frequency_hz);
+            if let Some(lo) = retune {
+                connected.session.set_frequency(lo);
+            } else {
+                connected.ctun_frequency_hz = effective_freq;
+            }
+        }
+        MidiAction::VfoSwap => {
+            let new_b = dial_freq_hz;
+            let (effective_freq, retune) =
+                resolve_tune(connected.ctun, freq_hz, sample_rate, passband, connected.vfo_b_frequency_hz);
+            if let Some(lo) = retune {
+                connected.session.set_frequency(lo);
+            } else {
+                connected.ctun_frequency_hz = effective_freq;
+            }
+            connected.vfo_b_frequency_hz = new_b;
+        }
+        MidiAction::ModeUp | MidiAction::ModeDown => {
+            let idx = ALL_MODES.iter().position(|&m| m == current_mode).unwrap_or(0);
+            let len = ALL_MODES.len();
+            let new_idx =
+                if binding.action == MidiAction::ModeUp { (idx + 1) % len } else { (idx + len - 1) % len };
+            apply_mode(connected, ALL_MODES[new_idx], dial_freq_hz);
+        }
+        MidiAction::BandUp | MidiAction::BandDown => {
+            let reachable: Vec<&'static Band> = BANDS
+                .iter()
+                .filter(|b| {
+                    (b.low_hz as u64) >= connected.device.frequency_min
+                        && b.high_hz as u64 <= connected.device.frequency_max
+                })
+                .collect();
+            if reachable.is_empty() {
+                return;
+            }
+            // No active XVTR check -- see the band-button loop's own
+            // comment on why current_band is suppressed while an XVTR is
+            // selected. If the current frequency doesn't land in any
+            // reachable band (e.g. an XVTR is active, or a custom
+            // frequency outside every band), there's no "current" band to
+            // step from -- just land on the first/last one, same
+            // direction sense as stepping off either end of the list.
+            let current_band_name =
+                if connected.active_xvtr.is_none() { band_for_frequency(dial_freq_hz).map(|b| b.name) } else { None };
+            let current_idx = current_band_name.and_then(|name| reachable.iter().position(|b| b.name == name));
+            let next_idx = match (binding.action, current_idx) {
+                (MidiAction::BandUp, Some(i)) => (i + 1) % reachable.len(),
+                (MidiAction::BandUp, None) => 0,
+                (MidiAction::BandDown, Some(i)) => (i + reachable.len() - 1) % reachable.len(),
+                (MidiAction::BandDown, None) => reachable.len() - 1,
+                _ => unreachable!(),
+            };
+            apply_band(connected, reachable[next_idx]);
+        }
+        MidiAction::FilterWidthUp | MidiAction::FilterWidthDown => {
+            let current_width = connected.spectrum.width_hz();
+            let step = if binding.action == MidiAction::FilterWidthUp { 50.0 } else { -50.0 };
+            let width = (current_width + step).clamp(50.0, 5000.0);
+            connected.spectrum.set_width_hz(width);
+            if let Some(tx) = &connected.tx_handle {
+                tx.set_width_hz(width);
+            }
+            connected.width_memory.insert(current_mode.label().to_string(), width);
+        }
+        MidiAction::FilterWidth => {
+            let width = midi_knob_range(ev.value, 50.0, 5000.0);
+            connected.spectrum.set_width_hz(width);
+            if let Some(tx) = &connected.tx_handle {
+                tx.set_width_hz(width);
+            }
+            connected.width_memory.insert(current_mode.label().to_string(), width);
+        }
+        MidiAction::VfoStepUp | MidiAction::VfoStepDown => {
+            let step = scroll_tune_step_hz(cw_mode, false);
+            let signed_step = if binding.action == MidiAction::VfoStepUp { step } else { -step };
+            let new_freq = (dial_freq_hz as i64 + signed_step).max(0) as u32;
+            let (effective_freq, retune) = resolve_tune(connected.ctun, freq_hz, sample_rate, passband, new_freq);
+            if let Some(lo) = retune {
+                connected.session.set_frequency(lo);
+            } else {
+                connected.ctun_frequency_hz = effective_freq;
+            }
+            remember_band_settings(
+                &mut connected.band_memory,
+                effective_freq,
+                connected.db_low,
+                connected.db_high,
+                connected.waterfall_db_low,
+                connected.waterfall_db_high,
+                current_mode,
+            );
+        }
+        MidiAction::VfoTune => {
+            let Some(step) = midi_wheel_step_hz(ev, &binding) else { return };
+            let new_freq = (dial_freq_hz as i64 + step).max(0) as u32;
+            let (effective_freq, retune) = resolve_tune(connected.ctun, freq_hz, sample_rate, passband, new_freq);
+            if let Some(lo) = retune {
+                connected.session.set_frequency(lo);
+            } else {
+                connected.ctun_frequency_hz = effective_freq;
+            }
+            remember_band_settings(
+                &mut connected.band_memory,
+                effective_freq,
+                connected.db_low,
+                connected.db_high,
+                connected.waterfall_db_low,
+                connected.waterfall_db_high,
+                current_mode,
+            );
+        }
+        MidiAction::NoiseBlankerCycle => {
+            connected.spectrum.set_noise_blanker(connected.spectrum.noise_blanker().next());
+        }
+        MidiAction::NoiseReductionCycle => {
+            connected.spectrum.set_noise_reduction(connected.spectrum.noise_reduction().next());
+        }
+        MidiAction::AfGain => {
+            let db = midi_knob_range(ev.value, -100.0, 18.0);
+            connected.spectrum.set_gain(10f32.powf(db as f32 / 20.0));
+        }
+        MidiAction::MicGain => {
+            if connected.tx_enabled && connected.tx_handle.is_some() {
+                let db = midi_knob_range(ev.value, -60.0, 6.0);
+                let gain = 10f32.powf(db as f32 / 20.0);
+                connected.mic_gain = gain;
+                if let Some(tx) = &connected.tx_handle {
+                    tx.set_mic_gain(gain);
+                }
+            }
+        }
+        MidiAction::RfAttenuation => {
+            // Only meaningful on P1, and not on HermesLite/HermesLite2 --
+            // see the RX Attenuation slider's own comment (Settings ->
+            // RX) for why.
+            if connected.device.protocol == 1
+                && !matches!(connected.device.board, Boards::HermesLite | Boards::HermesLite2)
+            {
+                let atten = (ev.value as u32 * 31) / 127;
+                connected.session.rx_attenuation.store(atten, Ordering::Relaxed);
+            }
+        }
+        MidiAction::TxDrive => {
+            if connected.tx_enabled {
+                let watts = (ev.value as u32 * connected.max_tx_power_watts) / 127;
+                connected.session.tx_power_watts.store(watts, Ordering::Relaxed);
+                // A manual adjustment while Tune/Two-Tone is active should
+                // stick when it ends, same as the TX Power slider's own
+                // comment explains.
+                if connected.tune_active || connected.two_tone_active {
+                    connected.pre_tune_power_watts = None;
+                }
+            }
+        }
+        MidiAction::CwSpeed => {
+            let speed = 1 + (ev.value as u32 * 59) / 127;
+            connected.session.cw_keyer.speed_wpm.store(speed, Ordering::Relaxed);
+        }
+        MidiAction::RitAdjust => {
+            let Some(step) = midi_wheel_step_hz(ev, &binding) else { return };
+            let new_offset = (connected.rit_offset_hz as i64 + step).clamp(-9_999, 9_999);
+            connected.rit_offset_hz = new_offset as f64;
+            connected.session.rit_offset_hz.store(new_offset as i32, Ordering::Relaxed);
+        }
+        MidiAction::XitAdjust => {
+            let Some(step) = midi_wheel_step_hz(ev, &binding) else { return };
+            let new_offset = (connected.xit_offset_hz as i64 + step).clamp(-9_999, 9_999);
+            connected.xit_offset_hz = new_offset as f64;
+            connected.session.xit_offset_hz.store(new_offset as i32, Ordering::Relaxed);
+        }
+    }
+
+    connected.settings_dirty.store(true, Ordering::Relaxed);
+}
+
 #[derive(Copy, Clone, PartialEq, Eq)]
 enum SettingsTab {
     Network,
@@ -338,6 +717,7 @@ enum SettingsTab {
     Xvtr,
     OpenCollector,
     Firmware,
+    Midi,
     About,
 }
 
@@ -486,6 +866,53 @@ struct ExtraReceiver {
     initial_window_geometry: Option<WindowGeometry>,
 }
 
+/// Settings -> MIDI's "learn mode" scratch state: while `listening`, the
+/// next raw MIDI event is captured here instead of being matched against
+/// `ConnectedState::midi_bindings` and dispatched (see the per-frame MIDI
+/// drain). The remaining fields are the in-progress edit form for turning
+/// that capture into a binding (or editing an existing one, when
+/// `edit_index` is set). Never persisted -- a fresh one each connection.
+struct MidiLearnState {
+    listening: bool,
+    captured: Option<RawMidiEvent>,
+    /// User's Knob-vs-Wheel choice for a captured ControlChange/PitchBend
+    /// (ambiguous on the wire -- see MidiBindingKind's doc comment). Not
+    /// used for a captured NoteKey, which is always Key.
+    captured_kind: Option<MidiBindingKind>,
+    channel_any: bool,
+    selected_action: Option<MidiAction>,
+    /// Key bindings only -- see MidiBinding::momentary.
+    momentary: bool,
+    /// Wheel bindings only -- see MidiBinding::sensitivity. Defaults to
+    /// 1.0, not 0.0 (a derived `Default` would give), since 0.0 would
+    /// silently make a brand new Wheel binding do nothing at all.
+    sensitivity: f32,
+    /// Wheel bindings only -- see MidiBinding::debounce_ms. A brand new
+    /// Wheel binding defaults to a non-zero rate limit (unlike the 0/
+    /// unlimited a loaded-from-disk binding predating this field gets),
+    /// since 0 is exactly the behavior that prompted adding this.
+    debounce_ms: u32,
+    /// `Some(i)` while editing `ConnectedState::midi_bindings[i]`, `None`
+    /// while building a brand new binding from a fresh capture.
+    edit_index: Option<usize>,
+}
+
+impl Default for MidiLearnState {
+    fn default() -> Self {
+        Self {
+            listening: false,
+            captured: None,
+            captured_kind: None,
+            channel_any: false,
+            selected_action: None,
+            momentary: false,
+            sensitivity: 1.0,
+            debounce_ms: 25,
+            edit_index: None,
+        }
+    }
+}
+
 struct ConnectedState {
     device: Device,
     /// The local network interface (e.g. "eth0") `device.my_address`
@@ -515,6 +942,26 @@ struct ConnectedState {
     /// (Drop) whenever this ConnectedState is (disconnect/reconnect),
     /// same as session/spectrum's own threads.
     cw_sidetone: audio::CwSidetone,
+    /// MIDI control-surface input -- see midi::MidiWorker's doc comment.
+    /// Always running once connected (enabled flag gates whether it
+    /// actually opens a device, same live-toggle pattern as cw_sidetone
+    /// above), and torn down automatically (Drop) on disconnect.
+    midi: MidiWorker,
+    /// User-configured note/CC-to-action mappings -- see
+    /// midi::MidiBinding. Loaded from Config at connect time, written
+    /// back to Config on save; edited directly by Settings -> MIDI.
+    midi_bindings: Vec<MidiBinding>,
+    /// Settings -> MIDI's "learn mode" scratch state -- UI-only, never
+    /// persisted (see MidiLearnState's own doc comment).
+    midi_learn: MidiLearnState,
+    /// Per-Wheel-binding rate limiting -- see MidiBinding::debounce_ms's
+    /// doc comment. Keyed by the binding's own identity (event/channel/
+    /// number, the same fields MidiBinding::matches compares), not its
+    /// index in midi_bindings, so a timestamp survives the user editing
+    /// or reordering other bindings. UI-only/transient, never persisted
+    /// (a fresh one each connection is correct -- there's nothing to
+    /// "resume" about a debounce timer).
+    midi_wheel_last_step: std::collections::HashMap<(MidiEventKind, Option<u8>, u8), Instant>,
     audio_output: Option<AudioOutput>,
     /// Selected output device name for `audio_output` above (Settings ->
     /// Audio's "Output device" picker) -- see ExtraReceiver's identical
@@ -1596,6 +2043,10 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                 Arc::clone(&session.cw_keyer),
             );
             cw_sidetone.enabled.store(cfg.cw_pc_sidetone_enabled.unwrap_or(false), Ordering::Relaxed);
+            let midi = MidiWorker::start();
+            midi.enabled.store(cfg.midi_enabled.unwrap_or(false), Ordering::Relaxed);
+            *midi.device_name.lock().unwrap() = cfg.midi_device_name.clone();
+            let midi_bindings = cfg.midi_bindings.clone();
             Ok(ConnectedState {
                 interface_name: discovery::interface_name_for(device.my_address.ip()),
                 device,
@@ -1603,6 +2054,10 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                 spectrum,
                 tx_spectrum,
                 cw_sidetone,
+                midi,
+                midi_bindings,
+                midi_learn: MidiLearnState::default(),
+                midi_wheel_last_step: std::collections::HashMap::new(),
                 audio_output,
                 audio_output_device,
                 tx_audio_monitor_output: None,
@@ -2073,6 +2528,28 @@ impl eframe::App for HpsdrApp {
                     connected.xit_enabled = net_xit_enabled;
                     connected.xit_offset_hz = net_xit_offset_hz;
                     connected.settings_dirty.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+
+                // MIDI control surface: drain whatever arrived on the
+                // worker thread's queue since last frame (see
+                // midi::MidiWorker's own doc comment for why that thread
+                // only parses bytes and queues them, rather than matching/
+                // dispatching itself). While Settings -> MIDI's Learn
+                // button is active, the first event is captured for the
+                // binding-editor form instead of being dispatched --
+                // piHPSDR's own "MIDI Configure" behavior.
+                loop {
+                    let ev = {
+                        let mut events = connected.midi.events.lock().unwrap();
+                        events.pop_front()
+                    };
+                    let Some(ev) = ev else { break };
+                    if connected.midi_learn.listening {
+                        connected.midi_learn.listening = false;
+                        connected.midi_learn.captured = Some(ev);
+                        break;
+                    }
+                    dispatch_midi_event(connected, ev, freq_hz, sample_rate, passband);
                 }
 
                 let current_gain = connected.spectrum.gain();
@@ -2652,47 +3129,12 @@ impl eframe::App for HpsdrApp {
                             if ui.add(egui::Button::selectable(selected, band.name)).clicked() && !selected {
                                 // Explicitly leaving any active XVTR --
                                 // see ConnectedState::active_xvtr's doc
-                                // comment.
-                                connected.active_xvtr = None;
-                                let saved = connected.band_memory.get(band.name).copied();
-                                let target = saved.map(|s| s.frequency_hz).unwrap_or(band.default_hz);
-                                connected.session.set_frequency(target);
-                                // Keep CTUN on but re-center it at the
-                                // new band's frequency (offset 0) rather
-                                // than carrying over an offset that made
-                                // sense for the old band.
-                                connected.ctun_frequency_hz = target;
-                                if let Some(s) = saved {
-                                    connected.db_low = s.db_low;
-                                    connected.db_high = s.db_high;
-                                    connected.waterfall_db_low = s.waterfall_db_low;
-                                    connected.waterfall_db_high = s.waterfall_db_high;
-                                }
-                                // Restore whatever mode was last used on
-                                // this band, if any -- falls back to the
-                                // band's own default_mode the first time
-                                // it's visited. Width follows the mode
-                                // (width_for_mode's own per-mode memory),
-                                // not a per-band value.
-                                let resolved_mode =
-                                    saved.and_then(|s| s.mode).unwrap_or(band.default_mode);
-                                remember_band_settings(
-                                    &mut connected.band_memory,
-                                    target,
-                                    connected.db_low,
-                                    connected.db_high,
-                                    connected.waterfall_db_low,
-                                    connected.waterfall_db_high,
-                                    resolved_mode,
-                                );
-                                connected.spectrum.set_mode(resolved_mode);
-                                let resolved_width_hz =
-                                    width_for_mode(&connected.width_memory, resolved_mode);
-                                connected.spectrum.set_width_hz(resolved_width_hz);
-                                if let Some(tx) = &connected.tx_handle {
-                                    tx.set_mode(resolved_mode);
-                                    tx.set_width_hz(resolved_width_hz);
-                                }
+                                // comment. Rest of the switch (recall
+                                // last frequency/mode/range for this
+                                // band, or its default) is apply_band's
+                                // job -- shared with MIDI's BandUp/
+                                // BandDown.
+                                apply_band(connected, band);
                                 settings_changed = true;
                             }
                         }
@@ -2750,22 +3192,7 @@ impl eframe::App for HpsdrApp {
                                 .clicked()
                                 && !selected
                             {
-                                connected.spectrum.set_mode(mode);
-                                let mode_width_hz = width_for_mode(&connected.width_memory, mode);
-                                connected.spectrum.set_width_hz(mode_width_hz);
-                                if let Some(tx) = &connected.tx_handle {
-                                    tx.set_mode(mode);
-                                    tx.set_width_hz(mode_width_hz);
-                                }
-                                remember_band_settings(
-                                    &mut connected.band_memory,
-                                    dial_freq_hz,
-                                    connected.db_low,
-                                    connected.db_high,
-                                    connected.waterfall_db_low,
-                                    connected.waterfall_db_high,
-                                    mode,
-                                );
+                                apply_mode(connected, mode, dial_freq_hz);
                                 settings_changed = true;
                             }
                         }
@@ -4720,6 +5147,23 @@ impl eframe::App for HpsdrApp {
                                 close_requested = true;
                                 return;
                             }
+                            // Skip building this window's content while
+                            // minimized -- nothing useful would be visible
+                            // anyway, so it's a harmless micro-optimization.
+                            // NOTE: this does NOT fix the real "minimizing
+                            // Settings stalls the whole app to ~1/sec"
+                            // report -- that was tried first and confirmed
+                            // (via a real winit/eframe trace capture) to be
+                            // unrelated to this window's own content/paint
+                            // cost. The actual cause is the window manager/
+                            // XWayland layer throttling redraw delivery for
+                            // the whole process while any one of its windows
+                            // is iconified -- outside this app's control; see
+                            // main()'s HPSDR_FORCE_X11 comment and project
+                            // memory: settings_viewport_minimize_stall.
+                            if ui.input(|i| i.viewport().minimized).unwrap_or(false) {
+                                return;
+                            }
                             egui::CentralPanel::default()
                                 .frame(egui::Frame::central_panel(&light_style))
                                 .show(ui, |ui| {
@@ -4732,6 +5176,7 @@ impl eframe::App for HpsdrApp {
                                     (SettingsTab::Diversity, "Diversity"),
                                     (SettingsTab::Equalizer, "Equalizer"),
                                     (SettingsTab::Firmware, "Firmware"),
+                                    (SettingsTab::Midi, "MIDI"),
                                     (SettingsTab::Network, "Network"),
                                     (SettingsTab::OpenCollector, "Open Collector"),
                                     (SettingsTab::PaCalibration, "PA Calibration"),
@@ -5018,6 +5463,315 @@ impl eframe::App for HpsdrApp {
                                             connected.device.address.ip(),
                                             connected.device.mac,
                                         ));
+                                    }
+                                }
+
+                                SettingsTab::Midi => {
+                                    ui.label("MIDI control surface:");
+                                    let mut midi_enabled_ui = connected.midi.enabled.load(Ordering::Relaxed);
+                                    if ui.checkbox(&mut midi_enabled_ui, "Enable MIDI control").changed() {
+                                        connected.midi.enabled.store(midi_enabled_ui, Ordering::Relaxed);
+                                        settings_changed = true;
+                                    }
+
+                                    ui.horizontal(|ui| {
+                                        ui.label("Device:");
+                                        let ports = midi::list_port_names();
+                                        let current_device = connected.midi.device_name.lock().unwrap().clone();
+                                        let current_label =
+                                            current_device.clone().unwrap_or_else(|| "(None)".to_string());
+                                        egui::ComboBox::from_id_salt("midi_device")
+                                            .selected_text(current_label)
+                                            .show_ui(ui, |ui| {
+                                                if ui
+                                                    .selectable_label(current_device.is_none(), "(None)")
+                                                    .clicked()
+                                                    && current_device.is_some()
+                                                {
+                                                    *connected.midi.device_name.lock().unwrap() = None;
+                                                    settings_changed = true;
+                                                }
+                                                for name in &ports {
+                                                    let selected = current_device.as_deref() == Some(name.as_str());
+                                                    if ui.selectable_label(selected, name).clicked() && !selected {
+                                                        *connected.midi.device_name.lock().unwrap() =
+                                                            Some(name.clone());
+                                                        settings_changed = true;
+                                                    }
+                                                }
+                                            });
+                                    });
+
+                                    let status_text = match &*connected.midi.status.lock().unwrap() {
+                                        MidiStatus::Disabled => "Disabled".to_string(),
+                                        MidiStatus::Searching => "Searching...".to_string(),
+                                        MidiStatus::Connected(name) => format!("Connected to \"{name}\""),
+                                        MidiStatus::Error(e) => format!("Error: {e}"),
+                                    };
+                                    ui.label(format!("Status: {status_text}"));
+
+                                    ui.add_space(8.0);
+                                    ui.separator();
+                                    ui.add_space(8.0);
+
+                                    ui.horizontal(|ui| {
+                                        if ui
+                                            .add(egui::Button::selectable(connected.midi_learn.listening, "Learn"))
+                                            .on_hover_text(
+                                                "Move a control on your MIDI device, then pick an action \
+                                                 to bind it to -- mirrors piHPSDR's own MIDI learn mode.",
+                                            )
+                                            .clicked()
+                                        {
+                                            connected.midi_learn.listening = !connected.midi_learn.listening;
+                                            if connected.midi_learn.listening {
+                                                connected.midi_learn.captured = None;
+                                            }
+                                        }
+                                        if connected.midi_learn.listening {
+                                            ui.label("Move a control on your MIDI device...");
+                                        }
+                                    });
+
+                                    if let Some(ev) = connected.midi_learn.captured {
+                                        let event_desc = match ev.kind {
+                                            MidiEventKind::NoteKey => format!("Note {} on Channel {}", ev.number, ev.channel + 1),
+                                            MidiEventKind::ControlChange => format!("CC {} on Channel {}", ev.number, ev.channel + 1),
+                                            MidiEventKind::PitchBend => format!("Pitch Bend on Channel {}", ev.channel + 1),
+                                        };
+                                        ui.label(format!("Captured: {event_desc}"));
+
+                                        if ev.kind != MidiEventKind::NoteKey {
+                                            ui.horizontal(|ui| {
+                                                ui.label("Type:");
+                                                let kind =
+                                                    connected.midi_learn.captured_kind.unwrap_or(MidiBindingKind::Knob);
+                                                if ui
+                                                    .selectable_label(kind == MidiBindingKind::Knob, "Knob (absolute)")
+                                                    .clicked()
+                                                {
+                                                    connected.midi_learn.captured_kind = Some(MidiBindingKind::Knob);
+                                                }
+                                                if ui
+                                                    .selectable_label(kind == MidiBindingKind::Wheel, "Wheel (relative)")
+                                                    .clicked()
+                                                {
+                                                    connected.midi_learn.captured_kind = Some(MidiBindingKind::Wheel);
+                                                }
+                                            });
+                                        }
+
+                                        ui.checkbox(&mut connected.midi_learn.channel_any, "Any channel");
+
+                                        let binding_kind = if ev.kind == MidiEventKind::NoteKey {
+                                            MidiBindingKind::Key
+                                        } else {
+                                            connected.midi_learn.captured_kind.unwrap_or(MidiBindingKind::Knob)
+                                        };
+                                        let action_choices: &[MidiAction] = match binding_kind {
+                                            MidiBindingKind::Key => KEY_ACTIONS,
+                                            MidiBindingKind::Knob => KNOB_ACTIONS,
+                                            MidiBindingKind::Wheel => WHEEL_ACTIONS,
+                                        };
+
+                                        ui.horizontal(|ui| {
+                                            ui.label("Action:");
+                                            let current_label = connected
+                                                .midi_learn
+                                                .selected_action
+                                                .map(MidiAction::label)
+                                                .unwrap_or("(choose)");
+                                            egui::ComboBox::from_id_salt("midi_learn_action")
+                                                .selected_text(current_label)
+                                                .show_ui(ui, |ui| {
+                                                    for &action in action_choices {
+                                                        let selected =
+                                                            connected.midi_learn.selected_action == Some(action);
+                                                        if ui.selectable_label(selected, action.label()).clicked() {
+                                                            connected.midi_learn.selected_action = Some(action);
+                                                        }
+                                                    }
+                                                });
+                                        });
+
+                                        if binding_kind == MidiBindingKind::Key
+                                            && matches!(
+                                                connected.midi_learn.selected_action,
+                                                Some(MidiAction::Mox) | Some(MidiAction::Tune)
+                                            )
+                                        {
+                                            ui.checkbox(
+                                                &mut connected.midi_learn.momentary,
+                                                "Momentary (act on press AND release)",
+                                            );
+                                        }
+
+                                        if binding_kind == MidiBindingKind::Wheel {
+                                            ui.horizontal(|ui| {
+                                                ui.label("Sensitivity:").on_hover_text(
+                                                    "Scales how far one movement of this control \
+                                                     moves the value -- lower it if a light touch \
+                                                     moves too far (common on a continuous, \
+                                                     no-detent encoder), raise it if it feels \
+                                                     sluggish. 1.0 is the default.",
+                                                );
+                                                scroll_drag_value_f32(
+                                                    ui,
+                                                    &mut connected.slider_scroll_accum,
+                                                    &mut connected.midi_learn.sensitivity,
+                                                    0.05..=10.0,
+                                                    0.05,
+                                                );
+                                            });
+                                            ui.horizontal(|ui| {
+                                                ui.label("Rate limit (ms):").on_hover_text(
+                                                    "Minimum time between two applied steps from this \
+                                                     control -- raise this if it's still jumpy even at \
+                                                     a low Sensitivity, which usually means the \
+                                                     hardware is sending a burst of many messages for \
+                                                     even a brief touch (common on a continuous, \
+                                                     no-detent encoder); 0 disables the limit.",
+                                                );
+                                                let mut debounce_ms = connected.midi_learn.debounce_ms as i32;
+                                                if scroll_slider_i32(
+                                                    ui,
+                                                    &mut connected.slider_scroll_accum,
+                                                    &mut debounce_ms,
+                                                    0..=500,
+                                                    5,
+                                                    " ms",
+                                                ) {
+                                                    connected.midi_learn.debounce_ms = debounce_ms as u32;
+                                                }
+                                            });
+                                        }
+
+                                        ui.horizontal(|ui| {
+                                            let add_label =
+                                                if connected.midi_learn.edit_index.is_some() { "Update" } else { "Add" };
+                                            if ui
+                                                .add_enabled(
+                                                    connected.midi_learn.selected_action.is_some(),
+                                                    egui::Button::new(add_label),
+                                                )
+                                                .clicked()
+                                            {
+                                                if let Some(action) = connected.midi_learn.selected_action {
+                                                    let binding = MidiBinding {
+                                                        event: ev.kind,
+                                                        channel: if connected.midi_learn.channel_any {
+                                                            None
+                                                        } else {
+                                                            Some(ev.channel)
+                                                        },
+                                                        number: ev.number,
+                                                        kind: binding_kind,
+                                                        action,
+                                                        momentary: connected.midi_learn.momentary,
+                                                        sensitivity: connected.midi_learn.sensitivity,
+                                                        debounce_ms: connected.midi_learn.debounce_ms,
+                                                    };
+                                                    if let Some(i) = connected.midi_learn.edit_index {
+                                                        connected.midi_bindings[i] = binding;
+                                                    } else {
+                                                        connected.midi_bindings.push(binding);
+                                                    }
+                                                    settings_changed = true;
+                                                    connected.midi_learn = MidiLearnState::default();
+                                                }
+                                            }
+                                            if ui.button("Cancel").clicked() {
+                                                connected.midi_learn = MidiLearnState::default();
+                                            }
+                                        });
+                                    }
+
+                                    ui.add_space(8.0);
+                                    ui.separator();
+                                    ui.add_space(8.0);
+
+                                    ui.label("Bindings:");
+                                    if connected.midi_bindings.is_empty() {
+                                        ui.weak("No bindings yet -- use Learn above to add one.");
+                                    } else {
+                                        let mut delete_index = None;
+                                        let mut edit_request = None;
+                                        egui::Grid::new("midi_bindings_grid").striped(true).show(ui, |ui| {
+                                            ui.label("Event");
+                                            ui.label("Channel");
+                                            ui.label("Number");
+                                            ui.label("Type");
+                                            ui.label("Action");
+                                            ui.label("Momentary");
+                                            ui.label("Sensitivity");
+                                            ui.label("Rate Limit");
+                                            ui.label("");
+                                            ui.end_row();
+                                            for (i, binding) in connected.midi_bindings.iter().enumerate() {
+                                                let event_label = match binding.event {
+                                                    MidiEventKind::NoteKey => "Note",
+                                                    MidiEventKind::ControlChange => "CC",
+                                                    MidiEventKind::PitchBend => "Pitch Bend",
+                                                };
+                                                ui.label(event_label);
+                                                ui.label(
+                                                    binding
+                                                        .channel
+                                                        .map(|c| (c + 1).to_string())
+                                                        .unwrap_or_else(|| "Any".to_string()),
+                                                );
+                                                ui.label(binding.number.to_string());
+                                                ui.label(match binding.kind {
+                                                    MidiBindingKind::Key => "Key",
+                                                    MidiBindingKind::Knob => "Knob",
+                                                    MidiBindingKind::Wheel => "Wheel",
+                                                });
+                                                ui.label(binding.action.label());
+                                                ui.label(if binding.momentary { "Yes" } else { "" });
+                                                ui.label(if binding.kind == MidiBindingKind::Wheel {
+                                                    format!("{:.2}", binding.sensitivity)
+                                                } else {
+                                                    String::new()
+                                                });
+                                                ui.label(if binding.kind == MidiBindingKind::Wheel {
+                                                    format!("{} ms", binding.debounce_ms)
+                                                } else {
+                                                    String::new()
+                                                });
+                                                ui.horizontal(|ui| {
+                                                    if ui.small_button("Edit").clicked() {
+                                                        edit_request = Some((i, *binding));
+                                                    }
+                                                    if ui.small_button("Delete").clicked() {
+                                                        delete_index = Some(i);
+                                                    }
+                                                });
+                                                ui.end_row();
+                                            }
+                                        });
+                                        if let Some((i, binding)) = edit_request {
+                                            connected.midi_learn = MidiLearnState {
+                                                listening: false,
+                                                captured: Some(RawMidiEvent {
+                                                    kind: binding.event,
+                                                    channel: binding.channel.unwrap_or(0),
+                                                    number: binding.number,
+                                                    value: 0,
+                                                    off: false,
+                                                }),
+                                                captured_kind: Some(binding.kind),
+                                                channel_any: binding.channel.is_none(),
+                                                selected_action: Some(binding.action),
+                                                momentary: binding.momentary,
+                                                sensitivity: binding.sensitivity,
+                                                debounce_ms: binding.debounce_ms,
+                                                edit_index: Some(i),
+                                            };
+                                        }
+                                        if let Some(i) = delete_index {
+                                            connected.midi_bindings.remove(i);
+                                            settings_changed = true;
+                                        }
                                     }
                                 }
 
@@ -7357,6 +8111,9 @@ impl eframe::App for HpsdrApp {
                         active_xvtr: connected.active_xvtr.clone(),
                         oc_settings: connected.oc_settings.clone(),
                         oc_tune: connected.oc_tune,
+                        midi_enabled: Some(connected.midi.enabled.load(Ordering::Relaxed)),
+                        midi_device_name: connected.midi.device_name.lock().unwrap().clone(),
+                        midi_bindings: connected.midi_bindings.clone(),
                     }
                     .save(connected.device.mac);
                 }
@@ -9327,6 +10084,10 @@ fn render_extra_receiver_settings(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceive
         // Firmware update is against the whole radio, not a per-receiver
         // concept -- redirect same as Network.
         SettingsTab::Firmware => rx.settings_tab = SettingsTab::Agc,
+        // MIDI control targets the primary receiver/VFO A+B only (see
+        // dispatch_midi_event) -- not a per-receiver concept, redirect
+        // same as Firmware.
+        SettingsTab::Midi => rx.settings_tab = SettingsTab::Agc,
         // About shows this connection's own device/network details
         // (main.rs's ConnectedState::device/interface_name), which this
         // struct doesn't carry -- redirect same as Firmware.
@@ -10227,6 +10988,21 @@ fn main() -> eframe::Result<()> {
     // persisted even after forcing PresentMode::Fifo, to test whether
     // XWayland's extra compositing hop (rather than the present mode)
     // is the actual cause on that GPU/driver.
+    //
+    // SECOND confirmed reason to use this escape hatch (2026-09-14): a
+    // real report that minimizing the Settings window (a second OS-level
+    // window this app opens, see show_viewport_immediate's own call site
+    // comment) throttled the WHOLE app's updates to ~1/sec until it was
+    // restored -- confirmed via a real winit/eframe trace capture (see
+    // project memory: settings_viewport_minimize_stall) to be the window
+    // manager/XWayland layer throttling redraw delivery for every window
+    // of this process while any one of them is iconified, not something
+    // this app's own rendering code does. Confirmed via the same A/B
+    // test this comment already recommends: HPSDR_FORCE_X11=0 (native
+    // Wayland) does NOT have this problem. Left forcing X11 as the
+    // DEFAULT anyway -- native Wayland's own known CPU-pegging bug (see
+    // below) is a continuous cost for the whole session, worse than an
+    // occasional, self-clearing stall from minimizing one window.
     let force_x11 = std::env::var("HPSDR_FORCE_X11").map(|v| v != "0").unwrap_or(true);
     if force_x11 {
         unsafe {
@@ -10268,21 +11044,35 @@ fn main() -> eframe::Result<()> {
             .with_min_inner_size([900.0, 520.0])
             .with_icon(icon),
         wgpu_options: eframe::egui_wgpu::WgpuConfiguration {
-            // egui-wgpu's default surface config (SurfaceConfig::
-            // HIGH_THROUGHPUT) uses PresentMode::AutoVsync, which falls
-            // back to FifoRelaxed (allows a frame to present slightly
-            // late, tearing, rather than waiting for the next vblank)
-            // whenever the driver offers it. This app throttles its own
-            // repaint rate to ~30Hz (see request_repaint_after below),
-            // well under a typical 60Hz display -- exactly the situation
-            // FifoRelaxed tears in. Force plain Fifo (true vsync,
-            // supported by every wgpu backend) to eliminate that as a
-            // source of the flicker seen on Raspberry Pi 5's Mesa V3D
-            // driver.
-            surface: eframe::egui_wgpu::SurfaceConfig {
-                present_mode: eframe::wgpu::PresentMode::Fifo,
-                ..eframe::egui_wgpu::SurfaceConfig::HIGH_THROUGHPUT
-            },
+            // NOTE: this used to override `surface` to force
+            // PresentMode::Fifo (true vsync), added 2026-09-11 on
+            // suspicion it was the source of a Raspberry Pi 5 Mesa V3D
+            // flicker (egui-wgpu's default AutoVsync can fall back to
+            // FifoRelaxed, which tears by design for a "late" frame --
+            // this app's own ~30Hz repaint throttle, see
+            // request_repaint_after below, makes most frames "late"
+            // against a 60Hz display). That flicker turned out to
+            // persist even WITH Fifo forced, and was ultimately fixed by
+            // a Raspberry Pi OS update, unrelated to present mode at all
+            // -- so Fifo was never confirmed to fix anything here, it was
+            // just left in as "probably harmless" (see project memory:
+            // pi5_wgpu_flicker). REMOVED 2026-09-14 after a real report
+            // this had a genuine cost: minimizing the Settings window
+            // (an immediate/synchronous viewport, so its own render+
+            // present happens inline with the main window's frame) made
+            // the whole app's updates drop to ~1/sec -- consistent with
+            // Fifo's present call blocking on a real vblank signal that
+            // a compositor may throttle hard for a minimized window.
+            // egui-wgpu's DEFAULT config already has an `on_surface_status`
+            // callback that skips a frame cleanly on `Occluded` (see its
+            // own doc comment: "App is hidden (minimized / behind
+            // another window). Skip silently."), which AutoVsync/
+            // FifoRelaxed can actually benefit from where Fifo's strict
+            // wait-for-vblank contract can't. If a future report finds
+            // real tearing on specific hardware, re-investigate with
+            // that hardware in hand rather than re-adding this blind --
+            // it cost more than it ever proved to fix.
+            //
             // egui-wgpu's own default device_descriptor requests
             // wgpu::Limits::default() unconditionally on non-GL backends,
             // which asks for max_color_attachments: 8 -- more than some
