@@ -2265,54 +2265,119 @@ fn fill_tx_payload(
     }
 }
 
-/// Linear-interpolation pacing state for fill_rx_audio_payload -- see
-/// that function's doc comment for why pacing is needed at all: the
-/// 8-byte slot cadence sender_loop sends at tracks the RX ADC sample
-/// rate (and receiver count), NOT the fixed 48kHz spectrum.rs's demod
-/// audio is actually produced at.
+/// Wall-clock pacing state for fill_rx_audio_payload -- see that
+/// function's doc comment for why pacing is needed at all: the 8-byte
+/// slot cadence sender_loop sends at tracks the RX ADC sample rate (and
+/// receiver count), NOT the fixed 48kHz spectrum.rs's demod audio is
+/// actually produced at, so at any ADC rate above 48kHz there are more
+/// slots per second than real audio samples.
 ///
-/// ROOT CAUSE FIX for a second real report: an earlier version of this
-/// held a queued sample flat (zero-order hold) across however many
-/// slots `slots_per_sample` worked out to, rather than draining the
-/// queue every slot -- that fixed a first report of scratchy/staticky
-/// audio (see the git history of this comment/struct), but a follow-up
-/// report of persistent noise, specifically at a high main sample rate
-/// (192kHz -- where `slots_per_sample` is largest, so each real sample
-/// gets held flat across the most slots) and confirmed absent from
-/// BOTH the local PC speaker path and the Record-to-WAV tap (both fed
-/// and drained at the same true 48kHz rate throughout, no pacing
-/// involved) and unaffected by the Audio Gain slider (ruling out
-/// clipping), pointed squarely at this zero-order-hold step itself: a
-/// flat-held value repeated across many consecutive slots is a genuine
-/// staircase waveform, not a reconstruction of the original one, and
-/// the existing anti-aliasing lowpass (spectrum.rs's radio_audio_lpf)
-/// runs BEFORE this pacing step, at the source 48kHz rate, so it can't
-/// remove artifacts this step introduces downstream.
+/// History of fixes for a persistent real report (noise on the radio's
+/// own audio-codec output, specifically for "Send RX audio to radio"):
+/// (1) a flat zero-order hold across a theoretical `slots_per_sample`
+/// ratio; (2) linear interpolation across that same theoretical ratio
+/// -- a real A/B test against deskhpsdr on the same hardware found no
+/// audible difference between (1) and (2), which pointed at the ratio
+/// itself (computed from the nominal ADC rate, silently assuming every
+/// packet lands exactly on schedule) rather than the smoothing choice,
+/// confirmed by direct comparison against deskhpsdr's own
+/// old_protocol.c pacing this stream from real measured audio arrival,
+/// not a fixed ratio; (3) replaced the ratio with `tick()`, measuring
+/// real elapsed wall-clock time since the last packet and holding the
+/// result flat across however many slots that elapsed time spans --
+/// this actually had its OWN bug (see tick()'s own doc comment: elapsed
+/// time was measured per-FRAME instead of per-PACKET, discarding
+/// roughly half of every real sample at 48/96kHz), confirmed via a
+/// second real regression report (ANAN-100D) immediately after (3)
+/// shipped. Fixing that accounting bug alone wasn't enough either -- a
+/// THIRD real report, after the accounting fix, described the
+/// remaining noise as "raspy, changes when someone is talking": that's
+/// the textbook signature of a zero-order-hold reconstruction (more
+/// audible exactly when the signal has more dynamic/high-frequency
+/// content, i.e. active speech), which step (1) above already showed
+/// was audible on its own -- but the earlier "no difference vs.
+/// interpolation" A/B test was run while the accounting bug from (3)
+/// was ALSO present, which very plausibly dominated/masked whatever
+/// benefit smoothing would have shown. With that accounting now fixed,
+/// linear interpolation is reinstated (this time on top of the
+/// correctly-accounted real-time measurement, not the old theoretical
+/// ratio) rather than discarded a second time on the strength of a
+/// confounded comparison.
 ///
-/// Fixed by linearly interpolating between the current and next queued
-/// sample as the slot position advances through the interval between
-/// them, instead of holding either one flat -- same interpolation math
-/// as audio::RateConverter (already proven/tested elsewhere in this
-/// codebase for an analogous resampling problem), adapted to this
-/// module's pull-one-slot-at-a-time style rather than RateConverter's
-/// whole-buffer-at-once one.
+/// Reproducing deskhpsdr's architecture exactly would mean decoupling
+/// this packet stream's send cadence from sender_loop's own (which
+/// also carries the C&C register rotation and TX IQ, both already
+/// relying on that cadence being ADC-rate-paced) -- a much bigger,
+/// riskier change, deliberately not attempted here; this stays within
+/// sender_loop's existing cadence and self-corrects for its real
+/// timing via `tick()` instead of trusting a nominal one.
 ///
-/// Owned by sender_loop for the whole session so the pacing ratio can
-/// change live (sample rate change, Add Receiver) without more than
-/// the one glitch the change itself would cause anyway.
+/// Owned by sender_loop for the whole session, same as before.
 struct RxAudioPacer {
-    /// Fractional position within the current inter-sample interval,
-    /// 0.0..1.0 -- advances by `1.0/slots_per_sample` each slot; a
-    /// wraparound past 1.0 means a full interval has elapsed, so `next`
-    /// becomes `prev` and a fresh sample is pulled to be the new `next`.
+    /// Wall-clock time this pacer's sample timing was last anchored
+    /// to -- real elapsed time since this (not a theoretical ratio)
+    /// determines how many real samples get consumed next. See this
+    /// struct's own doc comment.
+    last_tick: Instant,
+    /// Fractional progress (0.0..1.0) toward consuming the next queued
+    /// sample, carried across calls so real elapsed time that doesn't
+    /// add up to a whole sample yet isn't lost between them. Position
+    /// within the interpolation interval between `prev` and `next`.
     frac: f64,
     prev: f32,
     next: f32,
 }
 
+/// One full P1 packet's audio-carrying capacity: 2 USB frames x 63
+/// 8-byte slots each (see fill_rx_audio_payload's HEADER_SIZE-based
+/// stride) -- see RxAudioPacer::tick's doc comment for why this,
+/// rather than one frame's own 63, is the right budget to cap a real-
+/// time measurement against.
+const PACKET_SLOT_COUNT: f64 = 126.0;
+
 impl RxAudioPacer {
     fn new() -> Self {
-        Self { frac: 0.0, prev: 0.0, next: 0.0 }
+        Self { last_tick: Instant::now(), frac: 0.0, prev: 0.0, next: 0.0 }
+    }
+
+    /// Call exactly ONCE per packet (not once per frame -- see this
+    /// struct's own doc comment and fill_rx_audio_payload's call site
+    /// for why): measures real elapsed wall-clock time since the last
+    /// tick and returns how much fractional-sample progress each of
+    /// this packet's 126 slots should advance by, so both frames share
+    /// the SAME measurement instead of each re-measuring independently.
+    ///
+    /// BUG FIX for a real regression report (ANAN-100D, Protocol 1,
+    /// "Send RX audio to radio" -- immediately after this pacer first
+    /// switched from a nominal ratio to real-time measurement): an
+    /// earlier version of this measured and capped elapsed time
+    /// SEPARATELY inside each of fill_rx_audio_payload's two per-packet
+    /// calls (frame0, then frame1), capped to that single call's own 63
+    /// slots. Since frame1 is called immediately after frame0 with
+    /// ~zero elapsed time of its own, essentially the ENTIRE packet's
+    /// real elapsed time (up to 126 samples' worth, at 48kHz -- the
+    /// lower, more common ADC rate a standard board like a 100D would
+    /// actually run at, unlike the 192kHz this was originally verified
+    /// against) landed in frame0's own measurement alone, and got
+    /// silently capped to 63 -- discarding roughly HALF of every real
+    /// sample, every single packet, at any ADC rate at or below 96kHz.
+    /// Tracking one shared measurement per packet instead fixes that:
+    /// the cap is now the full 126-slot packet budget, and both frames
+    /// draw from the identical `per_slot_advance`, so a fast-changing
+    /// packet's content is spread evenly across all 126 slots instead
+    /// of crammed into frame0 while frame1 just repeats its last value.
+    fn tick(&mut self) -> f64 {
+        let now = Instant::now();
+        // Capped to PACKET_SLOT_COUNT so a long stall -- a paused
+        // thread, a sample-rate change, or simply this pacer's first-
+        // ever tick -- can't burst-drain the whole queue trying to
+        // "catch up": last_tick moves to `now` regardless, so any
+        // backlog beyond the cap is simply dropped, same "resync,
+        // don't chase" choice already made for sender_loop's own
+        // next_send and tci.rs's next_audio_send.
+        let total_advance = (now.duration_since(self.last_tick).as_secs_f64() * 48_000.0).min(PACKET_SLOT_COUNT);
+        self.last_tick = now;
+        total_advance / PACKET_SLOT_COUNT
     }
 }
 
@@ -2347,16 +2412,24 @@ impl TxIqPacer {
 /// out in this slot while not transmitting). Only ever called while
 /// !mox_on -- see p1_build_packet's call site.
 ///
-/// `slots_per_sample` (>= 1.0, see RxAudioPacer's doc comment): a new
-/// sample is only actually popped from the queue once per this many
-/// slots; slots in between are linearly interpolated between the
-/// previous and next real sample rather than either holding one flat
-/// or draining the queue empty and falling back to silence.
+/// `per_slot_advance` -- see RxAudioPacer::tick's doc comment: computed
+/// ONCE per packet by the caller (not once per frame -- fill_rx_audio_payload
+/// itself is called twice per packet, frame0 then frame1) from real
+/// measured elapsed time, not a nominal ADC-rate ratio, so it self-
+/// corrects for however long packets are actually taking to go out.
+/// Linearly interpolates between the previous and next real sample as
+/// `frac` advances through the interval between them (see
+/// RxAudioPacer's own doc comment for why a flat hold was tried and
+/// reverted back to this) -- same interpolation math as
+/// audio::RateConverter (already proven/tested elsewhere in this
+/// codebase for an analogous resampling problem), adapted to this
+/// module's pull-one-slot-at-a-time style rather than RateConverter's
+/// whole-buffer-at-once one.
 fn fill_rx_audio_payload(
     frame: &mut [u8; USB_FRAME_SIZE],
     rx_audio: &Mutex<VecDeque<f32>>,
     pacer: &mut RxAudioPacer,
-    slots_per_sample: f64,
+    per_slot_advance: f64,
 ) {
     let mut buf = rx_audio.lock().unwrap();
     let mut b = HEADER_SIZE;
@@ -2373,7 +2446,7 @@ fn fill_rx_audio_payload(
         frame[b + 7] = 0;
         b += 8;
 
-        pacer.frac += 1.0 / slots_per_sample;
+        pacer.frac += per_slot_advance;
         while pacer.frac >= 1.0 {
             pacer.frac -= 1.0;
             pacer.prev = pacer.next;
@@ -2572,11 +2645,11 @@ fn p1_send_preconfig_and_start(
             diversity_enabled,
             tx_iq,
             &mut dummy_tx_iq_pacer,
+            1.0, // tx_iq_slots_per_sample: irrelevant, mox is false below so fill_tx_payload never runs
             puresignal_enabled,
             tx_iq, // send_rx_audio is false below, so this is never actually read -- reusing tx_iq's Mutex just to satisfy the type, not a real audio source
             false, // send_rx_audio: never during startup config, nothing keyed yet
             &mut dummy_rx_audio_pacer,
-            1.0,
             mic_ptt_enabled,
             mic_bias_enabled,
             mic_ptt_on_tip,
@@ -2699,12 +2772,14 @@ fn p1_build_packet(
     diversity_enabled: bool,
     tx_iq: &Mutex<VecDeque<f32>>,
     // See fill_tx_payload's own doc comment -- paces TX IQ against the
-    // same fixed-48kHz-vs-variable-slot-cadence mismatch
-    // rx_audio_pacer/rx_audio_slots_per_sample already handle for the
-    // RX-audio-to-radio direction. Reuses rx_audio_slots_per_sample
-    // itself (see its own call site below) rather than a separate
-    // parameter, since both are pacing the identical ratio.
+    // fixed-48kHz-vs-variable-slot-cadence mismatch (the same class of
+    // issue RxAudioPacer handles for the RX-audio-to-radio direction,
+    // though that one now paces by a real wall-clock deadline instead
+    // of this kind of ratio -- see its own doc comment for why this
+    // side wasn't changed to match: TX IQ pacing is a separate, still-
+    // open issue, not part of the report this fixed).
     tx_iq_pacer: &mut TxIqPacer,
+    tx_iq_slots_per_sample: f64,
     // PureSignal: command 10 (0x24)'s C2 bit 0x40 -- see that command's
     // own doc comment below for what it does and why it matters.
     puresignal_enabled: bool,
@@ -2714,7 +2789,6 @@ fn p1_build_packet(
     // RadioSession::send_rx_audio_to_radio's doc comment.
     send_rx_audio: bool,
     rx_audio_pacer: &mut RxAudioPacer,
-    rx_audio_slots_per_sample: f64,
     // See RadioSession::mic_ptt_enabled/mic_bias_enabled/mic_ptt_on_tip's
     // doc comments.
     mic_ptt_enabled: bool,
@@ -3332,8 +3406,8 @@ fn p1_build_packet(
     // under-full or garbage payload going out while the
     // transmitter is actually keyed is worse than silence.
     if mox_on {
-        fill_tx_payload(&mut frame0, tx_iq, tx_iq_pacer, rx_audio_slots_per_sample, tx_drive_scale);
-        fill_tx_payload(&mut frame1, tx_iq, tx_iq_pacer, rx_audio_slots_per_sample, tx_drive_scale);
+        fill_tx_payload(&mut frame0, tx_iq, tx_iq_pacer, tx_iq_slots_per_sample, tx_drive_scale);
+        fill_tx_payload(&mut frame1, tx_iq, tx_iq_pacer, tx_iq_slots_per_sample, tx_drive_scale);
     } else if send_rx_audio {
         // Same 8-byte-per-sample slot fill_tx_payload uses while
         // transmitting, but for the receive side: local audio in
@@ -3343,9 +3417,12 @@ fn p1_build_packet(
         // NOT transmitting). Paced via rx_audio_pacer -- see its doc
         // comment for why a straight one-sample-per-slot pop would
         // starve/glitch at any ADC rate other than exactly 48kHz with
-        // 1 receiver.
-        fill_rx_audio_payload(&mut frame0, rx_audio, rx_audio_pacer, rx_audio_slots_per_sample);
-        fill_rx_audio_payload(&mut frame1, rx_audio, rx_audio_pacer, rx_audio_slots_per_sample);
+        // 1 receiver. tick() called ONCE here, shared by both frame
+        // calls below -- see its own doc comment for why measuring
+        // separately per frame was a real, confirmed bug.
+        let per_slot_advance = rx_audio_pacer.tick();
+        fill_rx_audio_payload(&mut frame0, rx_audio, rx_audio_pacer, per_slot_advance);
+        fill_rx_audio_payload(&mut frame1, rx_audio, rx_audio_pacer, per_slot_advance);
     }
 
     packet[HEADER_SIZE..HEADER_SIZE + USB_FRAME_SIZE].copy_from_slice(&frame0);
@@ -3545,33 +3622,52 @@ fn sender_loop(
         let receivers =
             ps_wire_total.unwrap_or_else(|| (active_receiver_count.load(Ordering::Relaxed) as u8).max(1));
 
-        // ROOT CAUSE FIX: this used to hardcode "126 samples per
-        // 1032-byte packet" regardless of `receivers`, which only
-        // happens to be correct for the single-receiver case (63
-        // sample-groups/frame * 2 frames -- see parse_iq_packet's
-        // identical stride formula). More receivers means fewer
-        // sample-groups fit in the same fixed 512-byte USB frame, so
-        // a real packet actually represents LESS wall-clock time as
-        // receiver count grows -- pacing against a fixed 126 paced
-        // this host's outgoing C&C/TX-audio stream 4x+ too slowly
-        // whenever receivers>1 relative to what the radio's own
-        // real-time ADC production needs, throwing off the return IQ
-        // stream's framing (P1's simple USB-audio-style protocol has
-        // no independent flow control -- the host's own outgoing
-        // cadence doubles as the radio's timing reference). This went
-        // completely unexercised until PureSignal became the first
-        // thing to ever force receivers>1 in a real session (confirmed
-        // via a real hardware test: a garbled/aliased-looking waterfall
-        // with PS enabled, gone the moment PS -- and therefore the
-        // forced receivers=5 -- was disabled again).
-        // The `8` here is the per-FRAME 3-byte-sync + 5-byte-C&C prefix
-        // build_usb_frame writes (NOT the same thing as this file's
-        // top-level HEADER_SIZE constant, which is the OUTER packet's
-        // header -- same numeric value, 8, but a different 8 bytes) --
-        // matches parse_iq_packet's identical stride formula exactly.
-        let samples_per_frame = (USB_FRAME_SIZE - 8) / ((receivers as usize * 6) + 2);
-        let samples_per_packet = samples_per_frame * 2; // two USB frames per packet
-        let interval = Duration::from_secs_f64(samples_per_packet as f64 / current_rate as f64);
+        // ROOT CAUSE FIX for a persistent real report (raspy/distorted
+        // "Send RX audio to radio" output, confirmed on three separate
+        // P1 boards -- ANAN-100D, HermesLite2+AK4951, and an
+        // ANAN-8000DLE specifically when switched from a clean-sounding
+        // Protocol 2 to Protocol 1 on the SAME hardware, ruling out any
+        // board-specific cause). Confirmed via the ORIGINAL piHPSDR/
+        // deskHPSDR author (this project's P1 wire format is ported
+        // from their code): the real reference implementation has NO
+        // explicit send-interval timer at all. WDSP's OpenChannel fixes
+        // audio output at 48000 regardless of ADC rate; fexchange0
+        // produces audio at that fixed rate; those bytes accumulate
+        // into a fixed-size output buffer, and a packet is sent only
+        // when that buffer fills -- a purely event-driven design whose
+        // EMERGENT packet rate is always ~48000/126 ~= 381/sec,
+        // independent of ADC rate. Audio sent to the radio is single-
+        // active-receiver only (no mixing), so receiver count was never
+        // a factor in that timing either.
+        //
+        // This function instead computed an explicit interval scaled by
+        // BOTH current_rate and receivers (see git history for the
+        // removed samples_per_frame/samples_per_packet computation) --
+        // a design that was never part of the original architecture. A
+        // real Wireshark capture confirmed this pushed the packet rate
+        // to ~6400/sec (156us apart) with PureSignal's reserved
+        // receivers=5 at 192kHz -- 16x the original design's natural
+        // cadence. A careful two-pass reconstruction of the actual wire
+        // bytes from that capture, resampled onto a true 48kHz grid and
+        // confirmed clean by ear, ruled out RxAudioPacer's content/
+        // sample-selection logic -- the remaining difference was purely
+        // this cadence.
+        //
+        // KNOWN RISK: an earlier "ROOT CAUSE FIX" (now removed, see git
+        // history) added the receivers-based scaling this reverts,
+        // citing a real hardware test where a fixed, receivers-
+        // unaware rate caused a garbled/aliased waterfall with
+        // PureSignal's forced receivers=5. The original author's
+        // description of the real design doesn't mention receiver count
+        // affecting send timing at all, and piHPSDR/deskHPSDR support
+        // PureSignal today with no such scaling -- strongly suggesting
+        // that old bug was actually compensating for a problem specific
+        // to THIS project's own now-removed timer formula, not a
+        // genuine protocol requirement. Not proven with certainty,
+        // though -- if a garbled/aliased P1 waterfall resurfaces
+        // specifically with PureSignal/Diversity (receivers>1) active,
+        // this is the first place to look.
+        let interval = Duration::from_secs_f64(PACKET_SLOT_COUNT / 48_000.0);
         let mox_on = mox.load(Ordering::Relaxed);
         let hl2_ak4951_codec_on = hl2_ak4951_codec.load(Ordering::Relaxed);
         // See RadioSession::send_rx_audio_to_radio's doc comment -- never
@@ -3586,15 +3682,16 @@ fn sender_loop(
         let send_rx_audio = !mox_on
             && send_rx_audio_to_radio.load(Ordering::Relaxed)
             && (!is_hermes_lite || hl2_ak4951_codec_on);
-        // See RxAudioPacer's doc comment -- the true per-slot rate this
-        // packet cadence works out to (126 fixed slots/packet, see
-        // fill_rx_audio_payload's HEADER_SIZE-based stride), versus the
-        // fixed 48kHz rate rx_audio_to_radio is actually filled at.
-        // Always >= 1.0 in any realistic configuration (current_rate is
-        // always >= 48000), but clamped defensively regardless.
-        const SLOTS_PER_PACKET: f64 = 126.0;
-        let rx_audio_slots_per_sample =
-            (SLOTS_PER_PACKET * current_rate as f64 / (samples_per_packet as f64 * 48_000.0)).max(1.0);
+        // See TxIqPacer's doc comment -- TX IQ is still zero-order-hold
+        // (a separate, previously-flagged, not-yet-fixed issue), but
+        // the ratio it's fed is now always exactly 1.0: `interval` above
+        // is fixed to represent precisely 126 real 48kHz-rate samples,
+        // so there's no longer a mismatch to bridge with a computed
+        // ratio the way there was when interval scaled with
+        // current_rate/receivers. RxAudioPacer doesn't use this ratio
+        // at all -- see its own doc comment (it measures real elapsed
+        // time directly instead).
+        let tx_iq_slots_per_sample = 1.0;
 
         let packet = p1_build_packet(
             seq,
@@ -3628,11 +3725,11 @@ fn sender_loop(
             now_diversity_enabled,
             &tx_iq,
             &mut tx_iq_pacer,
+            tx_iq_slots_per_sample,
             now_puresignal_enabled,
             &rx_audio_to_radio,
             send_rx_audio,
             &mut rx_audio_pacer,
-            rx_audio_slots_per_sample,
             mic_ptt_enabled.load(Ordering::Relaxed),
             mic_bias_enabled.load(Ordering::Relaxed),
             mic_ptt_on_tip.load(Ordering::Relaxed),
@@ -3985,17 +4082,16 @@ fn ozy_sender_loop(
     while !stop.load(Ordering::Relaxed) {
         let current_rate = sample_rate.load(Ordering::Relaxed);
         let receivers = (active_receiver_count.load(Ordering::Relaxed) as u8).max(1);
-        // Same stride formula as sender_loop -- see its own doc comment
-        // (the "ROOT CAUSE FIX" one) for why this must be computed live
-        // per-receivers rather than a fixed constant.
-        let samples_per_frame = (USB_FRAME_SIZE - 8) / ((receivers as usize * 6) + 2);
-        let samples_per_packet = samples_per_frame * 2;
-        let interval = Duration::from_secs_f64(samples_per_packet as f64 / current_rate as f64);
+        // See sender_loop's own "ROOT CAUSE FIX" doc comment for the
+        // full story: the send interval is fixed to the original
+        // design's natural event-driven cadence (126 real 48kHz-rate
+        // samples), not scaled by current_rate/receivers.
+        let interval = Duration::from_secs_f64(PACKET_SLOT_COUNT / 48_000.0);
         let mox_on = mox.load(Ordering::Relaxed);
         let send_rx_audio = !mox_on && send_rx_audio_to_radio.load(Ordering::Relaxed);
-        const SLOTS_PER_PACKET: f64 = 126.0;
-        let rx_audio_slots_per_sample =
-            (SLOTS_PER_PACKET * current_rate as f64 / (samples_per_packet as f64 * 48_000.0)).max(1.0);
+        // See sender_loop's own identical comment -- always unity now
+        // that interval is fixed to represent exactly 126 samples.
+        let tx_iq_slots_per_sample = 1.0;
 
         let packet = p1_build_packet(
             seq,
@@ -4038,11 +4134,11 @@ fn ozy_sender_loop(
             false, // diversity -- out of scope for Ozy, see start_protocol1_ozy_usb's doc comment
             &tx_iq,
             &mut tx_iq_pacer,
+            tx_iq_slots_per_sample,
             false, // puresignal -- out of scope for Ozy, same reasoning
             &rx_audio_to_radio,
             send_rx_audio,
             &mut rx_audio_pacer,
-            rx_audio_slots_per_sample,
             mic_ptt_enabled.load(Ordering::Relaxed),
             mic_bias_enabled.load(Ordering::Relaxed),
             mic_ptt_on_tip.load(Ordering::Relaxed),
@@ -6474,38 +6570,167 @@ fn p2_tx_iq_loop(
 mod tests {
     use super::*;
 
-    /// A real report: at a high main-sample-rate-to-48kHz ratio (e.g.
-    /// 192kHz, where slots_per_sample works out to 4.0), the previous
-    /// zero-order-hold RxAudioPacer held each queued sample flat across
-    /// multiple consecutive slots, producing an audible staircase --
-    /// confirmed via a real recording as noise on the radio's own local
-    /// audio output, absent from the local PC speaker/Record paths
-    /// (which don't go through this pacer at all) and unaffected by
-    /// Audio Gain (ruling out clipping). This asserts the fix's actual
-    /// smoothness property directly: no single-slot jump larger than
-    /// one linear-interpolation step can produce, even when the queued
-    /// samples swing across the whole -1.0..1.0 range every sample --
-    /// a zero-order hold at this ratio would instead show a jump of
-    /// nearly the full 2.0 swing once every 4 slots.
+    /// See RxAudioPacer's own doc comment for the full history this
+    /// asserts against. Core property: with `last_tick` set to barely
+    /// half a real sample-period in the past, `tick()`'s returned
+    /// `per_slot_advance` can never accumulate to a whole sample across
+    /// one frame's 63 slots, so with `prev == next` every slot must
+    /// show that same flat value untouched -- no premature consumption.
+    /// Deliberately NOT "zero elapsed" (which would be sensitive to how
+    /// long the two Instant::now() calls involved actually take on the
+    /// test machine) -- half a sample-period of comfortable margin
+    /// makes this robust regardless.
+    #[test]
+    fn rx_audio_pacer_holds_flat_within_half_a_real_sample_period() {
+        let queue: Mutex<VecDeque<f32>> = Mutex::new(VecDeque::from(vec![-1.0, 1.0, -1.0, 1.0]));
+        let mut pacer = RxAudioPacer::new();
+        pacer.prev = 0.25;
+        pacer.next = 0.25;
+        pacer.last_tick = Instant::now() - Duration::from_secs_f64(0.5 / 48_000.0);
+
+        let per_slot_advance = pacer.tick();
+        let mut frame = [0u8; USB_FRAME_SIZE];
+        fill_rx_audio_payload(&mut frame, &queue, &mut pacer, per_slot_advance);
+
+        let mut b = HEADER_SIZE;
+        while b + 8 <= USB_FRAME_SIZE {
+            let s = i16::from_be_bytes([frame[b], frame[b + 1]]);
+            let sample = s as f32 / i16::MAX as f32;
+            assert!((sample - 0.25).abs() < 0.01, "expected flat 0.25, got {sample}");
+            // No IQ goes out in this slot while receiving.
+            assert_eq!(&frame[b + 4..b + 8], &[0, 0, 0, 0]);
+            b += 8;
+        }
+        // Queue must be untouched -- nothing was due yet.
+        assert_eq!(queue.lock().unwrap().len(), 4);
+    }
+
+    /// With `last_tick` set 1.5 real sample-periods in the past, ONE
+    /// packet (both frames -- see tick()'s doc comment for why
+    /// per_slot_advance is scaled for the whole 126-slot packet, not
+    /// one frame's own 63) must consume exactly ONE real queued value
+    /// (frac crosses 1.0 partway through, never reaches 2.0), and the
+    /// output must have moved TOWARD that value (interpolating), not
+    /// jumped straight to it or stayed at the starting 0.0.
+    #[test]
+    fn rx_audio_pacer_consumes_exactly_one_sample_after_one_real_interval() {
+        let queue: Mutex<VecDeque<f32>> = Mutex::new(VecDeque::from(vec![0.5, -0.5]));
+        let mut pacer = RxAudioPacer::new();
+        pacer.last_tick = Instant::now() - Duration::from_secs_f64(1.5 / 48_000.0);
+
+        let per_slot_advance = pacer.tick();
+        let mut frame0 = [0u8; USB_FRAME_SIZE];
+        let mut frame1 = [0u8; USB_FRAME_SIZE];
+        fill_rx_audio_payload(&mut frame0, &queue, &mut pacer, per_slot_advance);
+        fill_rx_audio_payload(&mut frame1, &queue, &mut pacer, per_slot_advance);
+
+        assert_eq!(queue.lock().unwrap().len(), 1, "exactly one sample should have been consumed");
+        let last = HEADER_SIZE + 62 * 8;
+        let s = i16::from_be_bytes([frame1[last], frame1[last + 1]]);
+        let sample = s as f32 / i16::MAX as f32;
+        assert!(sample > 0.0 && sample <= 0.5, "expected interpolation toward the queued 0.5, got {sample}");
+    }
+
+    /// A long stall (thread scheduling, sample-rate change, etc.)
+    /// leaving `last_tick` far in the past must resync to real time
+    /// rather than burst-draining the whole backlog to "catch up" --
+    /// same "resync, don't chase" choice already made for sender_loop's
+    /// own next_send and tci.rs's next_audio_send (see RxAudioPacer's
+    /// doc comment): consumption this call is capped to PACKET_SLOT_COUNT
+    /// (126 -- a full packet's worth), nowhere near the 48000 nominally
+    /// "due" after a full second, and last_tick moves to ~now
+    /// regardless so the rest of that backlog is simply dropped, not
+    /// carried forward to burst through on a later call.
+    #[test]
+    fn rx_audio_pacer_resyncs_after_a_long_stall_without_bursting() {
+        let queue: Mutex<VecDeque<f32>> = Mutex::new(VecDeque::from(vec![0.1; 400]));
+        let mut pacer = RxAudioPacer::new();
+        pacer.last_tick = Instant::now() - Duration::from_secs(1);
+
+        let per_slot_advance = pacer.tick();
+        let mut frame0 = [0u8; USB_FRAME_SIZE];
+        let mut frame1 = [0u8; USB_FRAME_SIZE];
+        fill_rx_audio_payload(&mut frame0, &queue, &mut pacer, per_slot_advance);
+        fill_rx_audio_payload(&mut frame1, &queue, &mut pacer, per_slot_advance);
+
+        let remaining = queue.lock().unwrap().len();
+        assert!(
+            remaining >= 400 - PACKET_SLOT_COUNT as usize,
+            "consumed more than the per-packet cap of {PACKET_SLOT_COUNT} allows: {remaining} left"
+        );
+        assert!(pacer.last_tick.elapsed() < Duration::from_millis(50), "last_tick should have resynced to ~now");
+    }
+
+    /// ROOT CAUSE regression test for a real report (ANAN-100D, Protocol
+    /// 1, "Send RX audio to radio" -- immediately after RxAudioPacer
+    /// first switched to real-time measurement): at 48kHz (the unity-
+    /// ratio case, and the lower/more common ADC rate a standard board
+    /// like a 100D actually runs at, unlike this pacer's original
+    /// 192kHz-only verification), a full real second/48000 sample
+    /// interval elapsed since the last tick should let one packet (both
+    /// frames combined, 126 slots) consume up to a full 126 real
+    /// samples -- confirmed here by calling tick() ONCE (as
+    /// p1_build_packet's real call site now does) and filling BOTH
+    /// frames from that single per_slot_advance: all 126 queued values
+    /// must be consumed, not just 63 (which an earlier, buggy version
+    /// -- measuring and capping separately inside each frame call --
+    /// would have silently discarded).
+    #[test]
+    fn rx_audio_pacer_consumes_a_full_packet_across_both_frames_at_unity_ratio() {
+        let queue: Mutex<VecDeque<f32>> = Mutex::new(VecDeque::from(vec![0.2; 200]));
+        let mut pacer = RxAudioPacer::new();
+        // A full packet's worth of real time at 48kHz (126 samples).
+        pacer.last_tick = Instant::now() - Duration::from_secs_f64(126.0 / 48_000.0);
+
+        let per_slot_advance = pacer.tick();
+        assert!((per_slot_advance - 1.0).abs() < 0.001, "expected unity advance, got {per_slot_advance}");
+        let mut frame0 = [0u8; USB_FRAME_SIZE];
+        let mut frame1 = [0u8; USB_FRAME_SIZE];
+        fill_rx_audio_payload(&mut frame0, &queue, &mut pacer, per_slot_advance);
+        fill_rx_audio_payload(&mut frame1, &queue, &mut pacer, per_slot_advance);
+
+        let remaining = queue.lock().unwrap().len();
+        assert_eq!(remaining, 200 - 126, "expected a full packet (126) consumed across both frames, got {remaining} left");
+    }
+
+    /// Direct smoothness check for the interpolation this pacer went
+    /// back to (see RxAudioPacer's own doc comment for why): at a
+    /// ~4-slots-per-real-sample ratio (matching 192kHz, where this was
+    /// originally verified), consecutive slots must never jump by more
+    /// than one interpolation step can produce, even when the queued
+    /// samples swing across the whole -1.0..1.0 range every real
+    /// sample -- a flat zero-order hold at this ratio would instead
+    /// show a jump of nearly the full 2.0 swing every ~4 slots, which
+    /// is the "raspy... changes when someone is talking" artifact a
+    /// real report described.
     #[test]
     fn rx_audio_pacer_interpolates_without_staircase_steps() {
         let queue: Mutex<VecDeque<f32>> =
             Mutex::new(VecDeque::from(vec![-1.0, 1.0, -1.0, 1.0, -1.0, 1.0, -1.0, 1.0]));
         let mut pacer = RxAudioPacer::new();
-        let slots_per_sample = 4.0;
+        // 31.5 real samples' worth of elapsed time over one packet's
+        // 126 slots = per_slot_advance of 31.5/126 = 0.25, i.e. one
+        // real sample consumed every 4 slots -- the same ratio 192kHz
+        // works out to (this pacer's original verification case).
+        pacer.last_tick = Instant::now() - Duration::from_secs_f64(31.5 / 48_000.0);
+        let per_slot_advance = pacer.tick();
+        assert!((per_slot_advance - 0.25).abs() < 0.001, "expected 0.25, got {per_slot_advance}");
 
-        let mut frame = [0u8; USB_FRAME_SIZE];
-        fill_rx_audio_payload(&mut frame, &queue, &mut pacer, slots_per_sample);
+        let mut frame0 = [0u8; USB_FRAME_SIZE];
+        let mut frame1 = [0u8; USB_FRAME_SIZE];
+        fill_rx_audio_payload(&mut frame0, &queue, &mut pacer, per_slot_advance);
+        fill_rx_audio_payload(&mut frame1, &queue, &mut pacer, per_slot_advance);
 
         let mut samples = Vec::new();
-        let mut b = HEADER_SIZE;
-        while b + 8 <= USB_FRAME_SIZE {
-            let s = i16::from_be_bytes([frame[b], frame[b + 1]]);
-            samples.push(s as f32 / i16::MAX as f32);
-            b += 8;
+        for frame in [&frame0, &frame1] {
+            let mut b = HEADER_SIZE;
+            while b + 8 <= USB_FRAME_SIZE {
+                let s = i16::from_be_bytes([frame[b], frame[b + 1]]);
+                samples.push(s as f32 / i16::MAX as f32);
+                b += 8;
+            }
         }
-
-        let max_reasonable_step = 2.0 / slots_per_sample as f32 + 0.05;
+        let max_reasonable_step = 2.0 * per_slot_advance as f32 + 0.05;
         for w in samples.windows(2) {
             let step = (w[1] - w[0]).abs();
             assert!(
@@ -6513,25 +6738,5 @@ mod tests {
                 "jump of {step} between consecutive slots exceeds {max_reasonable_step} -- looks held, not interpolated"
             );
         }
-    }
-
-    /// At slots_per_sample == 1.0 (the old exactly-1:1 case, e.g. a
-    /// 48kHz main rate with 1 receiver), every slot should still
-    /// advance to a new real sample -- interpolation shouldn't
-    /// introduce any smearing/lag beyond the one-slot latency inherent
-    /// to needing the next sample before interpolating toward it (see
-    /// RxAudioPacer's own doc comment).
-    #[test]
-    fn rx_audio_pacer_tracks_input_at_unity_ratio() {
-        let queue: Mutex<VecDeque<f32>> = Mutex::new(VecDeque::from(vec![0.5; 100]));
-        let mut pacer = RxAudioPacer::new();
-        let mut frame = [0u8; USB_FRAME_SIZE];
-        fill_rx_audio_payload(&mut frame, &queue, &mut pacer, 1.0);
-
-        // Well past the one-slot startup latency, output should have
-        // settled on the (constant) input value.
-        let s = i16::from_be_bytes([frame[HEADER_SIZE + 80], frame[HEADER_SIZE + 81]]);
-        let sample = s as f32 / i16::MAX as f32;
-        assert!((sample - 0.5).abs() < 0.01, "expected ~0.5, got {sample}");
     }
 }
