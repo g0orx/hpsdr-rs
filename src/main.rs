@@ -6264,43 +6264,92 @@ impl eframe::App for HpsdrApp {
                                     }
                                     ui.separator();
 
-                                    // Protocol 1, standard (non-HermesLite) boards only --
-                                    // HermesLite/HermesLite2 use a different RX gain mechanism
-                                    // this project doesn't expose a control for yet (see
-                                    // radio.rs's p1_build_packet command-4 doc comment), and P2
-                                    // doesn't use this field at all. ROOT CAUSE FIX: this was
-                                    // previously hardcoded to 0dB (no attenuation), which real
-                                    // hardware testing (ANAN-100D/Angelia on an HF antenna)
-                                    // confirmed causes front-end overload from ordinary band
-                                    // signals -- visible as an intermod comb pattern or
-                                    // sustained broadband noise depending on band conditions at
-                                    // the moment, which is why it looked random between connects.
-                                    if connected.device.protocol == 1
-                                        && !matches!(connected.device.board, Boards::HermesLite | Boards::HermesLite2)
+                                    // Shown on both protocols now -- P2's High Priority
+                                    // packet carries this too (bytes 1442/1443, see
+                                    // p2_high_priority_packet), a real gap fixed alongside
+                                    // P1's. HermesLite/HermesLite2 and standard boards share
+                                    // the SAME underlying RadioSession::rx_attenuation
+                                    // storage (see that field's own doc comment for the real
+                                    // dB range/semantics of each) but are genuinely different
+                                    // controls -- and the HermesLite-specific "RX Gain"
+                                    // control only actually exists on Protocol 1 (P2 has no
+                                    // equivalent of P1's wire-sharing quirk, see that same
+                                    // doc comment), so a HermesLite2 on Protocol 2 gets the
+                                    // plain "RX Attenuation" slider too, same as any other
+                                    // board there.
                                     {
-                                        let mut atten =
-                                            connected.session.rx_attenuation.load(Ordering::Relaxed) as i32;
-                                        ui.horizontal(|ui| {
-                                            ui.label("RX Attenuation:");
-                                            if scroll_slider_i32(
-                                                ui,
-                                                &mut connected.slider_scroll_accum,
-                                                &mut atten,
-                                                0..=31,
-                                                1,
-                                                " dB",
-                                            ) {
-                                                connected
-                                                    .session
-                                                    .rx_attenuation
-                                                    .store(atten as u32, Ordering::Relaxed);
-                                                settings_changed = true;
-                                            }
-                                        });
-                                        ui.weak(
-                                            "Raise this if the spectrum looks garbled/overloaded on a \
-                                             strong band -- 0dB is maximum sensitivity, not a safe default.",
-                                        );
+                                        if connected.device.protocol == 1
+                                            && matches!(connected.device.board, Boards::HermesLite | Boards::HermesLite2)
+                                        {
+                                            // ROOT CAUSE FIX: this was hardcoded to wire value 0
+                                            // (-12dB, maximum attenuation) with no UI at all -- a
+                                            // real report (RX Gain control expected, same as
+                                            // other HPSDR radios' RX Attenuation) plus direct
+                                            // inspection of piHPSDR's old_protocol.c/sliders.c
+                                            // confirmed this is meant to be a live, user-
+                                            // adjustable -12..+48 dB value (piHPSDR's own "RX
+                                            // GAIN - ADC-%d (dB)" slider), not a constant. The
+                                            // stored wire value is gain_db+12 (0-60) -- see
+                                            // RadioSession::rx_attenuation's doc comment -- so
+                                            // the conversion happens at this UI boundary only.
+                                            let mut gain_db =
+                                                connected.session.rx_attenuation.load(Ordering::Relaxed) as i32 - 12;
+                                            ui.horizontal(|ui| {
+                                                ui.label("RX Gain:");
+                                                if scroll_slider_i32(
+                                                    ui,
+                                                    &mut connected.slider_scroll_accum,
+                                                    &mut gain_db,
+                                                    -12..=48,
+                                                    1,
+                                                    " dB",
+                                                ) {
+                                                    connected
+                                                        .session
+                                                        .rx_attenuation
+                                                        .store((gain_db + 12).clamp(0, 60) as u32, Ordering::Relaxed);
+                                                    settings_changed = true;
+                                                }
+                                            });
+                                            ui.weak(
+                                                "Extra front-end gain (positive) or attenuation \
+                                                 (negative) -- lower this if the spectrum looks \
+                                                 garbled/overloaded on a strong band, raise it if \
+                                                 signals seem unusually weak.",
+                                            );
+                                        } else {
+                                            // ROOT CAUSE FIX: this was previously hardcoded to
+                                            // 0dB (no attenuation), which real hardware testing
+                                            // (ANAN-100D/Angelia on an HF antenna) confirmed
+                                            // causes front-end overload from ordinary band
+                                            // signals -- visible as an intermod comb pattern or
+                                            // sustained broadband noise depending on band
+                                            // conditions at the moment, which is why it looked
+                                            // random between connects.
+                                            let mut atten =
+                                                connected.session.rx_attenuation.load(Ordering::Relaxed) as i32;
+                                            ui.horizontal(|ui| {
+                                                ui.label("RX Attenuation:");
+                                                if scroll_slider_i32(
+                                                    ui,
+                                                    &mut connected.slider_scroll_accum,
+                                                    &mut atten,
+                                                    0..=31,
+                                                    1,
+                                                    " dB",
+                                                ) {
+                                                    connected
+                                                        .session
+                                                        .rx_attenuation
+                                                        .store(atten as u32, Ordering::Relaxed);
+                                                    settings_changed = true;
+                                                }
+                                            });
+                                            ui.weak(
+                                                "Raise this if the spectrum looks garbled/overloaded on a \
+                                                 strong band -- 0dB is maximum sensitivity, not a safe default.",
+                                            );
+                                        }
                                         ui.separator();
                                     }
 

@@ -522,21 +522,51 @@ pub struct RadioSession {
     /// block), so the sender loops use this value directly while keyed,
     /// with no separate Tune handling needed at the protocol layer.
     pub oc_tx: Arc<AtomicU8>,
-    /// Protocol 1, standard (non-HermesLite) boards only -- RX step
-    /// attenuator, 0-31 dB, encoded into the C4 byte of command 4
-    /// (0x14) as `0x20 | attenuation` (bit 5 = attenuator-enable,
-    /// confirmed against piHPSDR's old_protocol.c: `output_buffer[C4]
-    /// = 0x20 | ((int)adc[0].gain & 0x1F)` while receiving). ROOT CAUSE
-    /// FIX: this was previously hardcoded to a fixed 0x20 (0dB, no
-    /// attenuation at all) -- confirmed via real hardware testing
-    /// (ANAN-100D/Angelia on a real HF antenna) that this causes
-    /// genuine front-end overload from ordinary band signals, visible
-    /// as either a comb-shaped intermod pattern or sustained broadband
-    /// noise depending on exactly what's on the band at the moment,
-    /// randomly varying between connections since real RF conditions
-    /// vary. HermesLite/HermesLite2 are unaffected -- they use a
-    /// different, already-separate RX gain mechanism (bit 6 of the
-    /// same byte, see p1_build_packet's is_hermes_lite branch).
+    /// One field, reused across both protocols and two genuinely
+    /// different board-specific controls:
+    ///
+    /// - P1: command 4's C4 byte (see p1_build_packet's own command-4
+    ///   match arm). This project has no separate TX-time value for
+    ///   either case there, so the same live setting applies whether
+    ///   receiving or transmitting.
+    /// - P2: the High Priority packet's byte 1443 (ADC0) and 1442
+    ///   (ADC1), see p2_high_priority_packet -- ALWAYS the plain 0-31 dB
+    ///   meaning there, even on a HermesLite2, since P2's packet layout
+    ///   has no equivalent of P1's bit-6 "this is a HermesLite gain
+    ///   value" wire-sharing quirk (confirmed against piHPSDR's
+    ///   new_protocol.c, which has no have_rx_gain-style special case
+    ///   for this byte at all). Masked to 5 bits at the point of use as
+    ///   a defensive guard against a stray >31 value left over from a
+    ///   prior P1-HermesLite session on the same radio (config is
+    ///   per-MAC, and this field's OTHER valid range there is 0-60).
+    ///
+    /// Standard (non-HermesLite) boards: RX step attenuator, 0-31 dB,
+    /// stored and displayed directly, encoded as `0x20 | attenuation`
+    /// (bit 5 = attenuator-enable, confirmed against piHPSDR's
+    /// old_protocol.c: `output_buffer[C4] = 0x20 | ((int)adc[0].gain &
+    /// 0x1F)` while receiving). ROOT CAUSE FIX: this was previously
+    /// hardcoded to a fixed 0x20 (0dB, no attenuation at all) --
+    /// confirmed via real hardware testing (ANAN-100D/Angelia on a real
+    /// HF antenna) that this causes genuine front-end overload from
+    /// ordinary band signals.
+    ///
+    /// HermesLite/HermesLite2: a different control entirely, "RX Gain"
+    /// -- confirmed against piHPSDR's old_protocol.c/sliders.c: that
+    /// board has no step attenuator at all, instead a -12..+48 dB front-
+    /// end gain value (negative = attenuation, positive = extra gain),
+    /// encoded as `0x40 | (gain_db + 12)` (bit 6 = "this is a HermesLite
+    /// gain value, not a standard attenuator" flag the firmware itself
+    /// checks, 6 value bits spanning the offset 0-60 range). Stored here
+    /// as that same 0-60 WIRE value (not the signed dB value main.rs's
+    /// UI displays) purely because this field is `u32` -- main.rs's "RX
+    /// Gain" slider does the +/-12 conversion at the UI boundary. ROOT
+    /// CAUSE FIX: this was previously hardcoded to a fixed 0x40 (wire
+    /// value 0, i.e. -12dB, maximum attenuation) with no UI at all, on
+    /// the mistaken assumption that piHPSDR always sends 0 there -- a
+    /// real report (RX Gain control expected, same as other HPSDR
+    /// radios' RX Attenuation) plus direct source inspection showed
+    /// piHPSDR exposes a live, user-adjustable slider for this exact
+    /// value (`sliders.c`'s "RX GAIN - ADC-%d (dB)" dialog).
     pub rx_attenuation: Arc<AtomicU32>,
     /// TX-time step attenuator (0-31 dB) applied to ADC0's input while
     /// transmitting, on both protocols. Standard (non-HermesLite) boards
@@ -2841,9 +2871,7 @@ fn p1_build_packet(
             // (command 5/0x16's C1, the SECOND ADC's attenuator on
             // 2-ADC boards) -- conflating the two was the bug. This
             // project has no separate TX-attenuation setting, so reuses
-            // RadioSession::rx_attenuation for both cases (matching
-            // this project's existing simplification pattern for the
-            // HermesLite RX-gain case just below), removing the
+            // RadioSession::rx_attenuation for both cases, removing the
             // mox_on-dependent branch entirely for standard boards.
             //
             // ROOT CAUSE FIX (RX case, still valid): this was hardcoded
@@ -2855,16 +2883,25 @@ fn p1_build_packet(
             // `0x20 | ((int)adc[0].gain & 0x1F)` -- a real,
             // user-configured value, not a constant.
             //
-            // HermesLite/HermesLite2 repurpose this byte entirely:
-            // bit 6 (0x40) must always be set, with bits 0-5 as an
-            // extended RX gain value (0-60) this project has no UI
-            // for yet, left at 0 -- which happens to exactly match
-            // what piHPSDR itself forces RX gain to while
-            // transmitting with the PA enabled, so this simplification
-            // costs nothing on TX and is a reasonable "no extra RX
-            // gain boost" default otherwise.
-            let c4: u8 =
-                if is_hermes_lite { 0x40 } else { 0x20 | (rx_attenuation & 0x1F) };
+            // HermesLite/HermesLite2 repurpose this byte entirely for a
+            // completely different control, "RX Gain" -- see
+            // RadioSession::rx_attenuation's own doc comment for the
+            // real dB range/semantics and why the SAME field stores
+            // both boards' values. bit 6 (0x40) flags "this is a
+            // HermesLite gain value", bits 0-5 the wire-space 0-60
+            // value. ROOT CAUSE FIX: this was hardcoded to a fixed 0x40
+            // (wire value 0, i.e. -12dB / maximum attenuation) with no
+            // UI at all -- a real report (RX Gain control expected,
+            // same as other HPSDR radios' RX Attenuation) plus direct
+            // inspection of piHPSDR's old_protocol.c/sliders.c showed
+            // this is meant to be a live, user-adjustable value, not a
+            // constant, exactly mirroring the standard-board case just
+            // above.
+            let c4: u8 = if is_hermes_lite {
+                0x40 | (rx_attenuation & 0x3F)
+            } else {
+                0x20 | (rx_attenuation & 0x1F)
+            };
             let mut c1 = 0u8;
             if !mic_ptt_enabled {
                 c1 |= 0x40;
@@ -4569,6 +4606,7 @@ fn start_protocol2(
     let sender_pa_gain_db = Arc::clone(&pa_gain_db);
     let sender_hp_request = Arc::clone(&hp_request);
     let sender_ps_tx_attenuation = Arc::clone(&ps_tx_attenuation);
+    let sender_rx_attenuation = Arc::clone(&rx_attenuation);
     let sender_mic_ptt_enabled = Arc::clone(&mic_ptt_enabled);
     let sender_mic_bias_enabled = Arc::clone(&mic_bias_enabled);
     let sender_mic_ptt_on_tip = Arc::clone(&mic_ptt_on_tip);
@@ -4604,6 +4642,7 @@ fn start_protocol2(
             sender_hp_request,
             sender_puresignal_enabled,
             sender_ps_tx_attenuation,
+            sender_rx_attenuation,
             sender_mic_ptt_enabled,
             sender_mic_bias_enabled,
             sender_mic_ptt_on_tip,
@@ -5052,6 +5091,9 @@ fn p2_high_priority_packet(
     tx_freq_hz: u32,
     tx_drive: u8,
     ps_tx_attenuation: u8,
+    // See RadioSession::rx_attenuation's doc comment -- the plain 0-31
+    // dB value, already masked by the caller (p2_sender_loop).
+    rx_attenuation: u8,
     // RX2/Alex1 bandpass-filter selection (bytes 1430-1431) -- Some(freq)
     // on Orion2-class boards (see p2_sender_loop's is_orion2/rx2_freq_hz
     // doc comments), None elsewhere (byte pair left at 0, this board
@@ -5112,18 +5154,20 @@ fn p2_high_priority_packet(
     p[1401] = (if mox_on { oc_tx } else { oc_rx }) << 1;
 
     // BUG FIX: bytes 1442/1443 (ADC1/ADC0 step attenuators) were never
-    // written at all, staying at the zero-initialized default -- a real
-    // gap matching the one found and fixed on Protocol 1 (see
-    // RadioSession::ps_tx_attenuation's doc comment). Confirmed against
-    // piHPSDR's new_protocol.c: "Upon transmitting, set the attenuator
-    // of ADC0 to the 'transmitter attenuation' (used in PURESIGNAL
-    // signal strength adjustment) and the attenuator of ADC1 to the
-    // maximum value (to protect RX2 in DIVERSITY setups)." This project
-    // has no P2 RX-attenuation setting yet (unlike P1's rx_attenuation),
-    // so the non-transmitting byte 1443 case is left at 0 for now --
-    // only the TX-time PureSignal attenuation path is implemented here.
-    p[1443] = if mox_on { ps_tx_attenuation } else { 0 };
-    p[1442] = if mox_on { 31 } else { 0 };
+    // written at all while receiving, staying at the zero-initialized
+    // default (0dB, no attenuation, same front-end-overload risk as the
+    // P1 gap this mirrors -- see RadioSession::rx_attenuation's doc
+    // comment) -- a real report (no RX Attenuation control visible at
+    // all for a Protocol 2 connection). Confirmed against piHPSDR's
+    // new_protocol.c: "Upon transmitting, set the attenuator of ADC0 to
+    // the 'transmitter attenuation' (used in PURESIGNAL signal strength
+    // adjustment) and the attenuator of ADC1 to the maximum value (to
+    // protect RX2 in DIVERSITY setups)," and while receiving, both ADCs
+    // just get the plain user-configured RX attenuation value (ADC1
+    // mirrors ADC0 -- this project has no separate per-ADC attenuation
+    // setting, same simplification already used elsewhere).
+    p[1443] = if mox_on { ps_tx_attenuation } else { rx_attenuation };
+    p[1442] = if mox_on { 31 } else { rx_attenuation };
 
     // Antenna/filter selection is driven by receiver 0's frequency --
     // there's only one Alex front end, shared across all DDCs.
@@ -5371,6 +5415,16 @@ fn p2_sender_loop(
     puresignal_enabled: Arc<AtomicBool>,
     // See RadioSession::ps_tx_attenuation's doc comment.
     ps_tx_attenuation: Arc<AtomicU32>,
+    // See RadioSession::rx_attenuation's doc comment. Unlike P1, this is
+    // ALWAYS the plain 0-31 dB meaning here, even on a HermesLite2 --
+    // confirmed against piHPSDR's new_protocol.c, which has no
+    // have_rx_gain-style special case for this byte at all (that's a P1/
+    // command-4 wire-sharing quirk with no equivalent in P2's much less
+    // cramped packet layout). Masked to 5 bits below purely as a
+    // defensive guard against a stray >31 value left over from a prior
+    // P1-HermesLite session on the same radio (config is per-MAC, and
+    // that field's OTHER valid range there is 0-60).
+    rx_attenuation: Arc<AtomicU32>,
     // See RadioSession::mic_ptt_enabled/mic_bias_enabled/mic_ptt_on_tip's
     // doc comments.
     mic_ptt_enabled: Arc<AtomicBool>,
@@ -5569,6 +5623,7 @@ fn p2_sender_loop(
         // carries the live on/off + MOX state instead.
         let ps_mox_gate = Some(puresignal_enabled.load(Ordering::Relaxed) && mox_on);
         let ps_tx_atten = ps_tx_attenuation.load(Ordering::Relaxed) as u8;
+        let rx_atten = (rx_attenuation.load(Ordering::Relaxed) as u8) & 0x1F;
 
         if due_for_keepalive {
             let general = p2_general_packet(general_seq, num_adcs, disable_pa.load(Ordering::Relaxed));
@@ -5595,6 +5650,7 @@ fn p2_sender_loop(
                     tx_freq_hz,
                     drive,
                     ps_tx_atten,
+                    rx_atten,
                     is_orion2.then_some(rx2_freq_hz),
                     puresignal_enabled.load(Ordering::Relaxed),
                 );
@@ -5640,6 +5696,7 @@ fn p2_sender_loop(
                     tx_freq_hz,
                     drive,
                     ps_tx_atten,
+                    rx_atten,
                     is_orion2.then_some(rx2_freq_hz),
                     puresignal_enabled.load(Ordering::Relaxed),
                 );
