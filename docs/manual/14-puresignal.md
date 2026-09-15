@@ -1,4 +1,4 @@
-[← PA Calibration](12-pa-calibration.md) | [Index](README.md) | [RX →](14-settings-rx.md)
+[← PA Calibration](13-pa-calibration.md) | [Index](README.md) | [RX →](15-settings-rx.md)
 
 # Settings: PureSignal
 
@@ -54,7 +54,7 @@ Once enabled (and TX armed), the rest of this tab's controls appear:
   measuring.
 - **Feedback Attenuation** (non-HermesLite boards) -- 0-31 dB, adjust to
   keep Feedback Level in the ideal range. Same underlying value as
-  [Settings: TX](16-settings-tx.md)'s **TX ADC0 Attenuation** -- it isn't
+  [Settings: TX](17-settings-tx.md)'s **TX ADC0 Attenuation** -- it isn't
   PureSignal-specific, it protects ADC0 from this radio's own TX leakage
   generally, PureSignal or not.
 - **Auto Attenuate (Two Tone)** (non-HermesLite boards) -- periodically
@@ -99,4 +99,4 @@ per-board constant to leave alone.
 
 ---
 
-[← PA Calibration](12-pa-calibration.md) | [Index](README.md) | [RX →](14-settings-rx.md)
+[← PA Calibration](13-pa-calibration.md) | [Index](README.md) | [RX →](15-settings-rx.md)

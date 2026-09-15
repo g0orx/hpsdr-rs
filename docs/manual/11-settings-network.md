@@ -1,4 +1,4 @@
-[← Firmware Update](09-firmware-update.md) | [Index](README.md) | [Open Collector →](11-open-collector.md)
+[← MIDI](10-settings-midi.md) | [Index](README.md) | [Open Collector →](12-open-collector.md)
 
 # Settings: Network
 
@@ -111,4 +111,4 @@ session, or whenever you need them.
 
 ---
 
-[← Firmware Update](09-firmware-update.md) | [Index](README.md) | [Open Collector →](11-open-collector.md)
+[← MIDI](10-settings-midi.md) | [Index](README.md) | [Open Collector →](12-open-collector.md)

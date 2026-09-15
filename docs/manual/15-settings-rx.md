@@ -1,4 +1,4 @@
-[← PureSignal](13-puresignal.md) | [Index](README.md) | [Spectrum →](15-settings-spectrum.md)
+[← PureSignal](14-puresignal.md) | [Index](README.md) | [Spectrum →](16-settings-spectrum.md)
 
 # Settings: RX
 
@@ -86,4 +86,4 @@ stage is active uses it.
 
 ---
 
-[← PureSignal](13-puresignal.md) | [Index](README.md) | [Spectrum →](15-settings-spectrum.md)
+[← PureSignal](14-puresignal.md) | [Index](README.md) | [Spectrum →](16-settings-spectrum.md)

@@ -13,7 +13,7 @@ Shows details of the radio currently connected to:
   Ethernet).
 - **Protocol Version** -- the firmware's reported protocol version.
 - **IP Address** -- the radio's own address on the network. Shows "USB"
-  for [Ozy USB](18-ozy-usb.md) instead, which has no network address.
+  for [Ozy USB](19-ozy-usb.md) instead, which has no network address.
 - **MAC Address** -- the radio's hardware Ethernet address. Not shown
   for Ozy (no real MAC).
 - **Interface** -- which of this computer's own network interfaces (e.g.

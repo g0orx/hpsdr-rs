@@ -1,4 +1,4 @@
-[← Open Collector](11-open-collector.md) | [Index](README.md) | [PureSignal →](13-puresignal.md)
+[← Open Collector](12-open-collector.md) | [Index](README.md) | [PureSignal →](14-puresignal.md)
 
 # Settings: PA Calibration
 
@@ -33,4 +33,4 @@ per band, per radio.
 
 ---
 
-[← Open Collector](11-open-collector.md) | [Index](README.md) | [PureSignal →](13-puresignal.md)
+[← Open Collector](12-open-collector.md) | [Index](README.md) | [PureSignal →](14-puresignal.md)
