@@ -2224,29 +2224,54 @@ fn fill_tx_payload(
     }
 }
 
-/// Zero-order-hold pacing state for fill_rx_audio_payload -- see that
-/// function's doc comment for why this is needed at all: the 8-byte
-/// slot cadence sender_loop sends at tracks the RX ADC sample rate (and
-/// receiver count), NOT the fixed 48kHz spectrum.rs's demod audio is
-/// actually produced at. Popping a "new" queued sample on every single
-/// slot regardless of that mismatch drains rx_audio_to_radio far faster
-/// than it's filled whenever the slot rate exceeds 48kHz (the common
-/// case -- anything other than exactly 48kHz/1 receiver), so most slots
-/// fall back to silence -- confirmed as the cause of a real report of
-/// scratchy/staticky audio at the radio's own local output, while the
-/// local PC speaker path (fed and drained at the same true 48kHz rate
-/// throughout) sounded fine. Owned by sender_loop for the whole
-/// session so the pacing ratio can change live (sample rate change,
-/// Add Receiver) without more than the one glitch the change itself
-/// would cause anyway.
+/// Linear-interpolation pacing state for fill_rx_audio_payload -- see
+/// that function's doc comment for why pacing is needed at all: the
+/// 8-byte slot cadence sender_loop sends at tracks the RX ADC sample
+/// rate (and receiver count), NOT the fixed 48kHz spectrum.rs's demod
+/// audio is actually produced at.
+///
+/// ROOT CAUSE FIX for a second real report: an earlier version of this
+/// held a queued sample flat (zero-order hold) across however many
+/// slots `slots_per_sample` worked out to, rather than draining the
+/// queue every slot -- that fixed a first report of scratchy/staticky
+/// audio (see the git history of this comment/struct), but a follow-up
+/// report of persistent noise, specifically at a high main sample rate
+/// (192kHz -- where `slots_per_sample` is largest, so each real sample
+/// gets held flat across the most slots) and confirmed absent from
+/// BOTH the local PC speaker path and the Record-to-WAV tap (both fed
+/// and drained at the same true 48kHz rate throughout, no pacing
+/// involved) and unaffected by the Audio Gain slider (ruling out
+/// clipping), pointed squarely at this zero-order-hold step itself: a
+/// flat-held value repeated across many consecutive slots is a genuine
+/// staircase waveform, not a reconstruction of the original one, and
+/// the existing anti-aliasing lowpass (spectrum.rs's radio_audio_lpf)
+/// runs BEFORE this pacing step, at the source 48kHz rate, so it can't
+/// remove artifacts this step introduces downstream.
+///
+/// Fixed by linearly interpolating between the current and next queued
+/// sample as the slot position advances through the interval between
+/// them, instead of holding either one flat -- same interpolation math
+/// as audio::RateConverter (already proven/tested elsewhere in this
+/// codebase for an analogous resampling problem), adapted to this
+/// module's pull-one-slot-at-a-time style rather than RateConverter's
+/// whole-buffer-at-once one.
+///
+/// Owned by sender_loop for the whole session so the pacing ratio can
+/// change live (sample rate change, Add Receiver) without more than
+/// the one glitch the change itself would cause anyway.
 struct RxAudioPacer {
-    accum: f64,
-    held: i16,
+    /// Fractional position within the current inter-sample interval,
+    /// 0.0..1.0 -- advances by `1.0/slots_per_sample` each slot; a
+    /// wraparound past 1.0 means a full interval has elapsed, so `next`
+    /// becomes `prev` and a fresh sample is pulled to be the new `next`.
+    frac: f64,
+    prev: f32,
+    next: f32,
 }
 
 impl RxAudioPacer {
     fn new() -> Self {
-        Self { accum: 0.0, held: 0 }
+        Self { frac: 0.0, prev: 0.0, next: 0.0 }
     }
 }
 
@@ -2283,8 +2308,9 @@ impl TxIqPacer {
 ///
 /// `slots_per_sample` (>= 1.0, see RxAudioPacer's doc comment): a new
 /// sample is only actually popped from the queue once per this many
-/// slots; slots in between repeat `pacer.held` (zero-order hold) rather
-/// than draining the queue empty and falling back to silence.
+/// slots; slots in between are linearly interpolated between the
+/// previous and next real sample rather than either holding one flat
+/// or draining the queue empty and falling back to silence.
 fn fill_rx_audio_payload(
     frame: &mut [u8; USB_FRAME_SIZE],
     rx_audio: &Mutex<VecDeque<f32>>,
@@ -2294,13 +2320,8 @@ fn fill_rx_audio_payload(
     let mut buf = rx_audio.lock().unwrap();
     let mut b = HEADER_SIZE;
     while b + 8 <= USB_FRAME_SIZE {
-        pacer.accum += 1.0;
-        if pacer.accum >= slots_per_sample {
-            pacer.accum -= slots_per_sample;
-            let sample = buf.pop_front().unwrap_or(0.0);
-            pacer.held = (sample.clamp(-1.0, 1.0) * 32767.0) as i16;
-        }
-        let s = pacer.held;
+        let interpolated = pacer.prev + (pacer.next - pacer.prev) * pacer.frac as f32;
+        let s = (interpolated.clamp(-1.0, 1.0) * 32767.0) as i16;
         frame[b] = (s >> 8) as u8;
         frame[b + 1] = s as u8;
         frame[b + 2] = (s >> 8) as u8;
@@ -2310,6 +2331,13 @@ fn fill_rx_audio_payload(
         frame[b + 6] = 0;
         frame[b + 7] = 0;
         b += 8;
+
+        pacer.frac += 1.0 / slots_per_sample;
+        while pacer.frac >= 1.0 {
+            pacer.frac -= 1.0;
+            pacer.prev = pacer.next;
+            pacer.next = buf.pop_front().unwrap_or(pacer.prev);
+        }
     }
 }
 
@@ -6190,5 +6218,71 @@ fn p2_tx_iq_loop(
             // would be worse than the drift it's correcting for.
             next_send = now;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A real report: at a high main-sample-rate-to-48kHz ratio (e.g.
+    /// 192kHz, where slots_per_sample works out to 4.0), the previous
+    /// zero-order-hold RxAudioPacer held each queued sample flat across
+    /// multiple consecutive slots, producing an audible staircase --
+    /// confirmed via a real recording as noise on the radio's own local
+    /// audio output, absent from the local PC speaker/Record paths
+    /// (which don't go through this pacer at all) and unaffected by
+    /// Audio Gain (ruling out clipping). This asserts the fix's actual
+    /// smoothness property directly: no single-slot jump larger than
+    /// one linear-interpolation step can produce, even when the queued
+    /// samples swing across the whole -1.0..1.0 range every sample --
+    /// a zero-order hold at this ratio would instead show a jump of
+    /// nearly the full 2.0 swing once every 4 slots.
+    #[test]
+    fn rx_audio_pacer_interpolates_without_staircase_steps() {
+        let queue: Mutex<VecDeque<f32>> =
+            Mutex::new(VecDeque::from(vec![-1.0, 1.0, -1.0, 1.0, -1.0, 1.0, -1.0, 1.0]));
+        let mut pacer = RxAudioPacer::new();
+        let slots_per_sample = 4.0;
+
+        let mut frame = [0u8; USB_FRAME_SIZE];
+        fill_rx_audio_payload(&mut frame, &queue, &mut pacer, slots_per_sample);
+
+        let mut samples = Vec::new();
+        let mut b = HEADER_SIZE;
+        while b + 8 <= USB_FRAME_SIZE {
+            let s = i16::from_be_bytes([frame[b], frame[b + 1]]);
+            samples.push(s as f32 / i16::MAX as f32);
+            b += 8;
+        }
+
+        let max_reasonable_step = 2.0 / slots_per_sample as f32 + 0.05;
+        for w in samples.windows(2) {
+            let step = (w[1] - w[0]).abs();
+            assert!(
+                step <= max_reasonable_step,
+                "jump of {step} between consecutive slots exceeds {max_reasonable_step} -- looks held, not interpolated"
+            );
+        }
+    }
+
+    /// At slots_per_sample == 1.0 (the old exactly-1:1 case, e.g. a
+    /// 48kHz main rate with 1 receiver), every slot should still
+    /// advance to a new real sample -- interpolation shouldn't
+    /// introduce any smearing/lag beyond the one-slot latency inherent
+    /// to needing the next sample before interpolating toward it (see
+    /// RxAudioPacer's own doc comment).
+    #[test]
+    fn rx_audio_pacer_tracks_input_at_unity_ratio() {
+        let queue: Mutex<VecDeque<f32>> = Mutex::new(VecDeque::from(vec![0.5; 100]));
+        let mut pacer = RxAudioPacer::new();
+        let mut frame = [0u8; USB_FRAME_SIZE];
+        fill_rx_audio_payload(&mut frame, &queue, &mut pacer, 1.0);
+
+        // Well past the one-slot startup latency, output should have
+        // settled on the (constant) input value.
+        let s = i16::from_be_bytes([frame[HEADER_SIZE + 80], frame[HEADER_SIZE + 81]]);
+        let sample = s as f32 / i16::MAX as f32;
+        assert!((sample - 0.5).abs() < 0.01, "expected ~0.5, got {sample}");
     }
 }
