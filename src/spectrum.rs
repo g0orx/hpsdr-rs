@@ -38,7 +38,22 @@ const KEEP_TIME: f32 = 0.1;
 // check against whatever `self.win_type` actually held in your code.
 const WIN_TYPE: i32 = 5;
 
-pub const WATERFALL_HISTORY: usize = 200;
+/// Upper bound on retained waterfall history. main.rs now sizes the
+/// actually-DISPLAYED texture to the waterfall pane's real on-screen
+/// pixel height (see build_waterfall_image's own doc comment) rather
+/// than always stretching a fixed number of rows to fill whatever
+/// height the pane happens to be -- a real report: expanding the pane
+/// vertically used to just make each row taller (more pixels per row,
+/// same ~20s of history visible), not show more time. This constant is
+/// now just the ceiling on how tall a pane can usefully get before
+/// running out of real history to show (past it, the extra pane height
+/// stays black rather than repeating/stretching old rows) -- raised
+/// from 200 (~20s) to 1000 (~100s at this analyzer's ~10Hz rate) to
+/// give that real headroom. Each row is SPECTRUM_WIDTH*ZOOM f32s (4KB
+/// at the default 1024-wide/no-zoom case), so 1000 rows is ~4MB per
+/// receiver's waterfall -- negligible on any machine capable of running
+/// this app's own wgpu rendering at all.
+pub const WATERFALL_HISTORY: usize = 1000;
 
 /// Confirmed against the user's own `Modes` enum -- these numeric values
 /// are exactly what WDSP's SetRXAMode expects.
@@ -1719,8 +1734,9 @@ impl SpectrumHandle {
     /// blending/scrolling in whatever a *previous*, possibly very
     /// different transmission looked like for many seconds after a
     /// new one starts, since neither the Rust-side waterfall_rows
-    /// history (WATERFALL_HISTORY = 200 rows, ~20s at this analyzer's
-    /// ~10Hz rate) nor WDSP's own AVERAGE_MODE_LOG_RECURSIVE
+    /// history (up to WATERFALL_HISTORY rows retained, ~10Hz analyzer
+    /// rate -- see that constant's own doc comment) nor WDSP's own
+    /// AVERAGE_MODE_LOG_RECURSIVE
     /// accumulator get reset just because a new PTT began.
     /// SetDisplayAverageMode's own C source (analyzer.c) only resets
     /// its internal av_sum accumulator when the mode value actually

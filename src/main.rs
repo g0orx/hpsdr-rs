@@ -795,12 +795,25 @@ struct ExtraReceiver {
     /// installed) falls back to the default rather than erroring.
     audio_output_device: Option<String>,
     waterfall_texture: Option<egui::TextureHandle>,
-    /// (SpectrumDisplay::revision, palette, db_low, db_high) the
-    /// waterfall texture was last built from -- lets the UI skip
-    /// re-cloning waterfall_rows and rebuilding/re-uploading the
-    /// texture on repaints where nothing that affects its pixels has
-    /// actually changed (new analyzer data, or the palette/range).
-    waterfall_signature: Option<(u64, Palette, f32, f32)>,
+    /// (SpectrumDisplay::revision, palette, db_low, db_high,
+    /// waterfall_display_rows) the waterfall texture was last built
+    /// from -- lets the UI skip re-cloning waterfall_rows and
+    /// rebuilding/re-uploading the texture on repaints where nothing
+    /// that affects its pixels has actually changed (new analyzer data,
+    /// the palette/range, or the pane being resized).
+    waterfall_signature: Option<(u64, Palette, f32, f32, usize)>,
+    /// The waterfall pane's own on-screen pixel height, as of the end
+    /// of the PREVIOUS frame -- see build_waterfall_image's own doc
+    /// comment for why the texture is now sized to this instead of
+    /// always the full WATERFALL_HISTORY. One frame behind because the
+    /// texture is rebuilt before this frame's panel layout runs (same
+    /// ordering constraint as waterfall_texture itself -- needs
+    /// &egui::Context, done ahead of the panel closure), so a resize
+    /// takes one extra frame to fully apply -- imperceptible in
+    /// practice. Defaults to WATERFALL_HISTORY so the very first frame
+    /// (before any real size is known) errs toward "too much" rather
+    /// than a visibly tiny sliver.
+    waterfall_display_rows: usize,
     scroll_accum: f32,
     slider_scroll_accum: f32,
     /// See ConnectedState::drag_tune_accum_hz's doc comment -- same
@@ -1022,12 +1035,10 @@ struct ConnectedState {
     cw_remote_stop: Arc<std::sync::atomic::AtomicBool>,
     cw_remote_busy: Arc<std::sync::atomic::AtomicBool>,
     waterfall_texture: Option<egui::TextureHandle>,
-    /// (SpectrumDisplay::revision, palette, db_low, db_high) the
-    /// waterfall texture was last built from -- lets the UI skip
-    /// re-cloning waterfall_rows and rebuilding/re-uploading the
-    /// texture on repaints where nothing that affects its pixels has
-    /// actually changed (new analyzer data, or the palette/range).
-    waterfall_signature: Option<(u64, Palette, f32, f32)>,
+    /// See ExtraReceiver::waterfall_signature's identical doc comment.
+    waterfall_signature: Option<(u64, Palette, f32, f32, usize)>,
+    /// See ExtraReceiver::waterfall_display_rows's doc comment.
+    waterfall_display_rows: usize,
     scroll_accum: f32,
     zoom_accum: f32,
     /// Fractional-Hz leftover for click-and-drag tuning on the spectrum/
@@ -2098,6 +2109,7 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                 cw_remote_busy,
                 waterfall_texture: None,
                 waterfall_signature: None,
+                waterfall_display_rows: spectrum::WATERFALL_HISTORY,
                 scroll_accum: 0.0,
                 zoom_accum: 0.0,
                 drag_tune_accum_hz: 0.0,
@@ -2887,7 +2899,13 @@ impl eframe::App for HpsdrApp {
                 // analyzer's own ~10Hz update rate, and redoing this
                 // work on every one of those repaints for no reason was
                 // enough to peg a CPU core.
-                let wanted_signature = (waterfall_data_revision, connected.waterfall_palette, wf_db_low, wf_db_high);
+                let wanted_signature = (
+                    waterfall_data_revision,
+                    connected.waterfall_palette,
+                    wf_db_low,
+                    wf_db_high,
+                    connected.waterfall_display_rows,
+                );
                 if connected.waterfall_signature != Some(wanted_signature) {
                     let waterfall_rows: Vec<Vec<f32>> = {
                         let d = if transmitting {
@@ -2897,8 +2915,13 @@ impl eframe::App for HpsdrApp {
                         };
                         d.waterfall_rows.iter().cloned().collect()
                     };
-                    let waterfall_image =
-                        build_waterfall_image(&waterfall_rows, connected.waterfall_palette, wf_db_low, wf_db_high);
+                    let waterfall_image = build_waterfall_image(
+                        &waterfall_rows,
+                        connected.waterfall_palette,
+                        wf_db_low,
+                        wf_db_high,
+                        connected.waterfall_display_rows,
+                    );
                     if let Some(image) = &waterfall_image {
                         match &mut connected.waterfall_texture {
                             Some(tex) => tex.set(image.clone(), egui::TextureOptions::LINEAR),
@@ -4669,13 +4692,22 @@ impl eframe::App for HpsdrApp {
                         }
                     }
 
+                    // See ExtraReceiver::waterfall_display_rows's doc
+                    // comment -- captured here (this frame's real pane
+                    // rect, known only once layout has actually run)
+                    // for the texture-build step to use NEXT frame.
+                    connected.waterfall_display_rows =
+                        (rect.height().round() as usize).clamp(1, spectrum::WATERFALL_HISTORY);
                     if let Some(tex_id) = waterfall_texture_id {
                         // No zoom-aware UV cropping needed -- see the
                         // spectrum trace's identical note above. Each
                         // waterfall row already covers only the current
                         // zoomed/panned window (WDSP's own analyzer did
                         // the real cropping), so the texture is drawn at
-                        // its full [0,1] UV range as-is.
+                        // its full [0,1] UV range as-is. The texture is
+                        // now already sized to this exact pane height
+                        // (see build_waterfall_image's own doc comment),
+                        // so this draws 1:1, not stretched.
                         ui.painter().image(
                             tex_id,
                             rect,
@@ -10070,13 +10102,14 @@ fn render_extra_receiver_ui(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceiver>>) {
         }
     }
 
-    let wanted_signature = (waterfall_data_revision, palette, wf_db_low, wf_db_high);
+    let wanted_signature = (waterfall_data_revision, palette, wf_db_low, wf_db_high, rx.waterfall_display_rows);
     if rx.waterfall_signature != Some(wanted_signature) {
         let waterfall_rows: Vec<Vec<f32>> = {
             let d = rx.spectrum.display.lock().unwrap();
             d.waterfall_rows.iter().cloned().collect()
         };
-        let waterfall_image = build_waterfall_image(&waterfall_rows, palette, wf_db_low, wf_db_high);
+        let waterfall_image =
+            build_waterfall_image(&waterfall_rows, palette, wf_db_low, wf_db_high, rx.waterfall_display_rows);
         if let Some(image) = &waterfall_image {
             let texture_name = format!("waterfall_rx{}", rx.ddc_index);
             match &mut rx.waterfall_texture {
@@ -10091,9 +10124,14 @@ fn render_extra_receiver_ui(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceiver>>) {
         // else: no rows yet -- leave waterfall_signature unset so this
         // retries (cheaply) next frame, same as the main receiver.
     }
+    // See ConnectedState's identical capture, and ExtraReceiver::
+    // waterfall_display_rows's own doc comment.
+    rx.waterfall_display_rows = (wf_rect.height().round() as usize).clamp(1, spectrum::WATERFALL_HISTORY);
     if rx.waterfall_texture.is_some() {
         // No zoom-aware UV cropping needed -- see the main receiver's
-        // identical treatment.
+        // identical treatment. The texture is now already sized to this
+        // exact pane height (see build_waterfall_image's own doc
+        // comment), so this draws 1:1, not stretched.
         ui.painter().image(
             rx.waterfall_texture.as_ref().unwrap().id(),
             wf_rect,
@@ -10648,6 +10686,7 @@ fn spawn_extra_receiver(
         audio_output_device,
         waterfall_texture: None,
         waterfall_signature: None,
+        waterfall_display_rows: spectrum::WATERFALL_HISTORY,
         scroll_accum: 0.0,
         slider_scroll_accum: 0.0,
         drag_tune_accum_hz: 0.0,
@@ -10935,21 +10974,35 @@ fn wisdom_status_text() -> String {
     }
 }
 
+/// `display_rows`: the waterfall pane's own real on-screen pixel height
+/// (from last frame -- see the call site's doc comment on why it's one
+/// frame behind, and why that's fine), clamped by the caller to
+/// `spectrum::WATERFALL_HISTORY`. The built texture is exactly this
+/// tall -- ROOT CAUSE FIX for a real report: this used to always be the
+/// fixed WATERFALL_HISTORY row count regardless of the pane's actual
+/// size, drawn stretched to fill it (egui::Painter::image scales
+/// whatever texture it's given to the target rect) -- so expanding the
+/// pane vertically just made each row taller, showing the SAME ~20s of
+/// history at lower density instead of more history. Building the
+/// texture at the pane's real pixel height instead means the draw call
+/// (already just `rect`-sized, no explicit scaling) ends up 1:1 --
+/// taller pane, more real rows shown, same row height throughout.
 fn build_waterfall_image(
     rows: &[Vec<f32>],
     palette: Palette,
     db_low: f32,
     db_high: f32,
+    display_rows: usize,
 ) -> Option<egui::ColorImage> {
     if rows.is_empty() || rows[0].is_empty() {
         return None;
     }
     let width = rows[0].len();
-    // Fixed height from the start (rather than rows.len(), which grows
-    // from 1 to WATERFALL_HISTORY over time) so the image doesn't need
-    // to "fill up" to look right -- new rows land at the top, the rest
-    // stays black until real data arrives there.
-    let height = spectrum::WATERFALL_HISTORY;
+    // Grows toward `display_rows` as real history accumulates (rather
+    // than always allocating the full height up front) so the image
+    // doesn't need to "fill up" to look right -- new rows land at the
+    // top, the rest stays black until real data arrives there.
+    let height = display_rows.min(spectrum::WATERFALL_HISTORY).max(1);
     let mut image = egui::ColorImage::new([width, height], vec![egui::Color32::BLACK; width * height]);
 
     // Same fixed range as the spectrum trace/gridlines, rather than
