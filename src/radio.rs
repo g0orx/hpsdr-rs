@@ -471,13 +471,22 @@ pub struct RadioSession {
     pub sample_rate: Arc<AtomicU32>,
     /// Which ADC (0-indexed) the primary receiver's DDC pulls from.
     pub adc: Arc<AtomicU32>,
-    /// Antenna port selection (0=ANT1, 1=ANT2, 2=ANT3). This is a
-    /// single shared value, not per-receiver -- Alex's antenna relays
-    /// are one physical shared resource, only meaningful when ADC0 is
-    /// in use (only ADC0's signal path runs through the Alex relay
+    /// Antenna port selection while receiving (0=ANT1, 1=ANT2, 2=ANT3).
+    /// This is a single shared value, not per-receiver -- Alex's antenna
+    /// relays are one physical shared resource, only meaningful when ADC0
+    /// is in use (only ADC0's signal path runs through the Alex relay
     /// bank on this board family). Whichever receiver last changes it
-    /// affects every receiver sharing ADC0.
-    pub antenna: Arc<AtomicU32>,
+    /// affects every receiver sharing ADC0. Independently selectable from
+    /// `tx_antenna` (see that field's doc comment) -- both resolve onto
+    /// the identical wire bits based on mox state at packet-build time
+    /// (P1's sender_loop/ozy_sender_loop, P2's p2_sender_loop), matching
+    /// piHPSDR's own alexRxAntenna/alexTxAntenna split.
+    pub rx_antenna: Arc<AtomicU32>,
+    /// Antenna port selection while transmitting -- same encoding/scope
+    /// as `rx_antenna` above, but only takes effect while keyed. Lets an
+    /// operator receive on one antenna (e.g. a receive-only loop) and
+    /// transmit on another without manually switching between them.
+    pub tx_antenna: Arc<AtomicU32>,
     /// Set by main.rs, once per frame, from whether the currently active
     /// transverter (if any -- see main.rs's Xvtr::disable_pa doc comment)
     /// wants the internal PA/antenna-relay left alone while transmitting,
@@ -935,6 +944,18 @@ pub struct RadioSession {
     /// instead) -- out of scope until this project has real per-ADC
     /// dither/random UI to hang that on.
     pub hl2_ak4951_codec: Arc<AtomicBool>,
+    /// Live toggle (Settings -> Antenna, Hermes/Angelia/Orion boards
+    /// only -- "ANAN 100/200 new PA board") declaring which of two
+    /// incompatible PA board revisions the ANAN-10/100/200 family
+    /// shipped with is physically installed. There is no way to detect
+    /// this from discovery, matching piHPSDR's own `new_pa_board`
+    /// setting (ant_menu.c) -- it changes which relay bits actually
+    /// route the EXT1/EXT2/XVTR-in jacks to RX (see p1_build_packet's
+    /// and alex0_word's antenna sections for the exact bit differences).
+    /// Meaningless (ignored) on Orion2-family boards, which use a
+    /// different, unambiguous bit layout regardless of this setting --
+    /// see is_orion2's doc comment at each of those call sites.
+    pub new_pa_board: Arc<AtomicBool>,
     /// Desired TX output power in watts, converted to each protocol's
     /// actual drive byte via drive_byte_for_watts -- see that
     /// function's doc comment. Confirmed by the user to belong at byte
@@ -1139,7 +1160,8 @@ impl RadioSession {
         let requested_frequency_hz = Arc::new(AtomicU32::new(settings.frequency_hz));
         let sample_rate = Arc::new(AtomicU32::new(settings.sample_rate));
         let adc = Arc::new(AtomicU32::new(0));
-        let antenna = Arc::new(AtomicU32::new(0));
+        let rx_antenna = Arc::new(AtomicU32::new(0));
+        let tx_antenna = Arc::new(AtomicU32::new(0));
         // See RadioSettings::rx_attenuation's doc comment -- main.rs
         // loads this from Config, falling back to RadioSettings::default's
         // own non-zero default rather than the old hardcoded 0dB, which
@@ -1168,6 +1190,7 @@ impl RadioSession {
         let send_rx_audio_to_radio = Arc::new(AtomicBool::new(false));
         // See RadioSession::hl2_ak4951_codec's doc comment.
         let hl2_ak4951_codec = Arc::new(AtomicBool::new(false));
+        let new_pa_board = Arc::new(AtomicBool::new(false));
         let radio_mic_audio = Arc::new(Mutex::new(VecDeque::with_capacity(RADIO_MIC_AUDIO_CAPACITY)));
         let tx_audio_source = Arc::new(AtomicU8::new(TX_AUDIO_SOURCE_AUTO));
         let tci_wants_mic = Arc::new(AtomicBool::new(false));
@@ -1199,11 +1222,11 @@ impl RadioSession {
         // `device.protocol == 1` already does the right thing for it.
         let mut result = if device.board == Boards::Ozy {
             start_protocol1_ozy_usb(
-                device, settings, frequency_hz, tx_frequency_hz, rx_frequency_hz, requested_frequency_hz, sample_rate, adc, antenna, rx_attenuation,
+                device, settings, frequency_hz, tx_frequency_hz, rx_frequency_hz, requested_frequency_hz, sample_rate, adc, rx_antenna, tx_antenna, rx_attenuation,
                 ps_tx_attenuation, mox, tx_iq, tci_tx_audio, tci_tx_gain, tx_power_watts, cw_keyer, cw_mode_active, pa_gain_db,
                 tx_forward_power, tx_reverse_power, adc0_overload, cw_ptt_active, cw_paddle_contacts, adc1_overload,
                 tx_fifo_underrun, tx_fifo_overrun, ps_rx_feedback_iq, ps_tx_feedback_iq,
-                rx_audio_to_radio, send_rx_audio_to_radio, hl2_ak4951_codec, radio_mic_audio, tx_audio_source,
+                rx_audio_to_radio, send_rx_audio_to_radio, hl2_ak4951_codec, new_pa_board, radio_mic_audio, tx_audio_source,
                 tci_wants_mic, mic_ptt_enabled, mic_bias_enabled, mic_ptt_on_tip,
                 diversity_enabled, diversity_gain_db, diversity_phase_deg, diversity_main_raw_iq,
                 puresignal_enabled,
@@ -1211,21 +1234,21 @@ impl RadioSession {
         } else {
             match device.protocol {
             1 => start_protocol1(
-                device, settings, frequency_hz, tx_frequency_hz, rx_frequency_hz, requested_frequency_hz, sample_rate, adc, antenna, rx_attenuation,
+                device, settings, frequency_hz, tx_frequency_hz, rx_frequency_hz, requested_frequency_hz, sample_rate, adc, rx_antenna, tx_antenna, rx_attenuation,
                 ps_tx_attenuation, mox, tx_iq, tci_tx_audio, tci_tx_gain, tx_power_watts, cw_keyer, cw_mode_active, pa_gain_db,
                 tx_forward_power, tx_reverse_power, adc0_overload, cw_ptt_active, cw_paddle_contacts, adc1_overload,
                 tx_fifo_underrun, tx_fifo_overrun, ps_rx_feedback_iq, ps_tx_feedback_iq,
-                rx_audio_to_radio, send_rx_audio_to_radio, hl2_ak4951_codec, radio_mic_audio, tx_audio_source,
+                rx_audio_to_radio, send_rx_audio_to_radio, hl2_ak4951_codec, new_pa_board, radio_mic_audio, tx_audio_source,
                 tci_wants_mic, mic_ptt_enabled, mic_bias_enabled, mic_ptt_on_tip,
                 diversity_enabled, diversity_gain_db, diversity_phase_deg, diversity_main_raw_iq,
                 puresignal_enabled,
             ),
             2 => start_protocol2(
-                device, settings, frequency_hz, tx_frequency_hz, rx_frequency_hz, requested_frequency_hz, sample_rate, adc, antenna, rx_attenuation,
+                device, settings, frequency_hz, tx_frequency_hz, rx_frequency_hz, requested_frequency_hz, sample_rate, adc, rx_antenna, tx_antenna, rx_attenuation,
                 ps_tx_attenuation, mox, tx_iq, tci_tx_audio, tci_tx_gain, tx_power_watts, cw_keyer, cw_mode_active, pa_gain_db,
                 tx_forward_power, tx_reverse_power, adc0_overload, cw_ptt_active, cw_paddle_contacts, adc1_overload,
                 tx_fifo_underrun, tx_fifo_overrun, ps_rx_feedback_iq, ps_tx_feedback_iq,
-                rx_audio_to_radio, send_rx_audio_to_radio, hl2_ak4951_codec, radio_mic_audio, tx_audio_source,
+                rx_audio_to_radio, send_rx_audio_to_radio, hl2_ak4951_codec, new_pa_board, radio_mic_audio, tx_audio_source,
                 tci_wants_mic, mic_ptt_enabled, mic_bias_enabled, mic_ptt_on_tip,
                 diversity_enabled, diversity_gain_db, diversity_phase_deg, diversity_main_raw_iq,
                 puresignal_enabled,
@@ -1440,7 +1463,8 @@ fn start_protocol1(
     requested_frequency_hz: Arc<AtomicU32>,
     sample_rate: Arc<AtomicU32>,
     adc: Arc<AtomicU32>,
-    antenna: Arc<AtomicU32>,
+    rx_antenna: Arc<AtomicU32>,
+    tx_antenna: Arc<AtomicU32>,
     rx_attenuation: Arc<AtomicU32>,
     ps_tx_attenuation: Arc<AtomicU32>,
     mox: Arc<AtomicBool>,
@@ -1465,6 +1489,8 @@ fn start_protocol1(
     send_rx_audio_to_radio: Arc<AtomicBool>,
     // See RadioSession::hl2_ak4951_codec's doc comment.
     hl2_ak4951_codec: Arc<AtomicBool>,
+    // See RadioSession::new_pa_board's doc comment.
+    new_pa_board: Arc<AtomicBool>,
     radio_mic_audio: Arc<Mutex<VecDeque<f32>>>,
     tx_audio_source: Arc<AtomicU8>,
     tci_wants_mic: Arc<AtomicBool>,
@@ -1634,7 +1660,10 @@ fn start_protocol1(
     let sender_sample_rate = Arc::clone(&sample_rate);
     let sender_mox = Arc::clone(&mox);
     let sender_tx_iq = Arc::clone(&tx_iq);
-    let sender_antenna = Arc::clone(&antenna);
+    let sender_rx_antenna = Arc::clone(&rx_antenna);
+    let sender_tx_antenna = Arc::clone(&tx_antenna);
+    let sender_new_pa_board = Arc::clone(&new_pa_board);
+    let sender_is_orion2 = device.board == Boards::Orion2;
     let sender_active_receiver_count = Arc::clone(&active_receiver_count);
     let sender_extra_frequencies_hz = extra_frequencies_hz.clone();
     let sender_tx_power_watts = Arc::clone(&tx_power_watts);
@@ -1673,7 +1702,10 @@ fn start_protocol1(
             sender_tx_iq,
             sender_active_receiver_count,
             sender_extra_frequencies_hz,
-            sender_antenna,
+            sender_rx_antenna,
+            sender_tx_antenna,
+            sender_new_pa_board,
+            sender_is_orion2,
             sender_tx_power_watts,
             sender_cw_keyer,
             sender_cw_mode_active,
@@ -1754,7 +1786,8 @@ fn start_protocol1(
         requested_frequency_hz,
         sample_rate,
         adc,
-        antenna,
+        rx_antenna,
+        tx_antenna,
         disable_pa,
         tune_active,
         oc_rx,
@@ -1779,6 +1812,7 @@ fn start_protocol1(
         rx_audio_to_radio,
         send_rx_audio_to_radio,
         hl2_ak4951_codec,
+        new_pa_board,
         radio_mic_audio,
         tx_audio_source,
         tci_wants_mic,
@@ -1853,7 +1887,8 @@ fn start_protocol1_ozy_usb(
     requested_frequency_hz: Arc<AtomicU32>,
     sample_rate: Arc<AtomicU32>,
     adc: Arc<AtomicU32>,
-    antenna: Arc<AtomicU32>,
+    rx_antenna: Arc<AtomicU32>,
+    tx_antenna: Arc<AtomicU32>,
     rx_attenuation: Arc<AtomicU32>,
     ps_tx_attenuation: Arc<AtomicU32>,
     mox: Arc<AtomicBool>,
@@ -1878,6 +1913,8 @@ fn start_protocol1_ozy_usb(
     send_rx_audio_to_radio: Arc<AtomicBool>,
     // See RadioSession::hl2_ak4951_codec's doc comment.
     hl2_ak4951_codec: Arc<AtomicBool>,
+    // See RadioSession::new_pa_board's doc comment.
+    new_pa_board: Arc<AtomicBool>,
     radio_mic_audio: Arc<Mutex<VecDeque<f32>>>,
     tx_audio_source: Arc<AtomicU8>,
     tci_wants_mic: Arc<AtomicBool>,
@@ -1951,7 +1988,8 @@ fn start_protocol1_ozy_usb(
     let sender_sample_rate = Arc::clone(&sample_rate);
     let sender_mox = Arc::clone(&mox);
     let sender_tx_iq = Arc::clone(&tx_iq);
-    let sender_antenna = Arc::clone(&antenna);
+    let sender_rx_antenna = Arc::clone(&rx_antenna);
+    let sender_tx_antenna = Arc::clone(&tx_antenna);
     let sender_active_receiver_count = Arc::clone(&active_receiver_count);
     let sender_extra_frequencies_hz = extra_frequencies_hz.clone();
     let sender_tx_power_watts = Arc::clone(&tx_power_watts);
@@ -1981,7 +2019,8 @@ fn start_protocol1_ozy_usb(
             sender_tx_iq,
             sender_active_receiver_count,
             sender_extra_frequencies_hz,
-            sender_antenna,
+            sender_rx_antenna,
+            sender_tx_antenna,
             sender_tx_power_watts,
             sender_cw_keyer,
             sender_cw_mode_active,
@@ -2052,7 +2091,8 @@ fn start_protocol1_ozy_usb(
         requested_frequency_hz,
         sample_rate,
         adc,
-        antenna,
+        rx_antenna,
+        tx_antenna,
         disable_pa,
         tune_active,
         oc_rx,
@@ -2077,6 +2117,7 @@ fn start_protocol1_ozy_usb(
         rx_audio_to_radio,
         send_rx_audio_to_radio,
         hl2_ak4951_codec,
+        new_pa_board,
         radio_mic_audio,
         tx_audio_source,
         tci_wants_mic,
@@ -2506,7 +2547,10 @@ fn p1_send_preconfig_and_start(
             ps_wire_total.unwrap_or(receivers_fallback),
             frequency_hz,
             frequency_hz, // tx_frequency_hz: nothing keyed yet this early (mox false below), so this value is never actually used
-            0, // antenna: ANT1 default: nothing to key yet, live antenna updates once running
+            0, // rx_antenna_val: ANT1 default: nothing to key yet, live antenna updates once running
+            0, // tx_antenna_val: ANT1 default, same reasoning
+            false, // is_orion2: irrelevant at ANT1/no-EXT-selected default
+            false, // new_pa_board: irrelevant at ANT1/no-EXT-selected default
             0, // tx_power_watts: not transmitting during startup config
             DEFAULT_PA_GAIN_DB, // irrelevant while not transmitting (drive forced to 0 above)
             sample_rate,
@@ -2590,7 +2634,28 @@ fn p1_build_packet(
     // actually programmed into command 1 (TX frequency) below, distinct
     // from `frequency_hz` (RX0/dial) so CTUN can be honored for TX.
     tx_frequency_hz: u32,
-    antenna_val: u32,
+    // Raw RX/TX antenna port selections (0=ANT1, 1=ANT2, 2=ANT3, 3=EXT1,
+    // 4=EXT2, 5=XVTR -- see AntennaMask's doc comment in main.rs). Passed
+    // as a pair, not pre-resolved by mox_on like most other per-mode
+    // values in this function, because the general-control register's
+    // antenna encoding below needs BOTH simultaneously: rx_antenna_val
+    // picks the EXT1/EXT2/XVTR/BYPASS routing bits while receiving, but
+    // tx_antenna_val (clamped to 0-2) is also needed as the ANT1/2/3
+    // relay-position fallback in that same case -- see the antenna
+    // section's own doc comment below for why.
+    rx_antenna_val: u32,
+    tx_antenna_val: u32,
+    // True for Orion2-family boards (ANAN-7000/7000DLE/8000/8000DLE) --
+    // selects the ANAN7000_RX_SELECT bit layout for EXT1/EXT2/XVTR
+    // routing, confirmed against piHPSDR's new_protocol.c AND
+    // old_protocol.c (identical `device == *_ORION2` gate in both, this
+    // board family supports EXT1/EXT2/XVTR on either protocol).
+    is_orion2: bool,
+    // See RadioSession::new_pa_board's doc comment -- only meaningful for
+    // non-Orion2 Hermes/Angelia/Orion boards (the ANAN-10/100/200 family,
+    // which shipped with two incompatible PA board revisions); ignored
+    // when is_orion2 is true (that family is never ambiguous this way).
+    new_pa_board: bool,
     tx_power_watts_val: u32,
     pa_gain_db: f32,
     sample_rate_hz: u32,
@@ -2705,18 +2770,58 @@ fn p1_build_packet(
     // not just a missing nicety, since the receiver count directly
     // determines the byte stride of the interleaved IQ stream the
     // radio sends back. Duplex (bit 2) is unconditionally set in
-    // the reference; antenna selection (bits 0-1) now uses the
-    // same antenna value P2 already tracks. NOT yet implemented,
-    // unlike the reference: per-band attenuation, EXT1/EXT2/XVTR
-    // antenna types, and separate TX-vs-RX antenna selection while
-    // keyed -- this project doesn't have equivalent per-band
-    // config infrastructure for P1 yet.
+    // the reference.
     let c1 = sample_rate_code(sample_rate_hz);
+
+    // Antenna selection: C3 bits 5-7 route Ext1/Ext2/XVTR-in to RX1
+    // (BYPASS-style relay boards) or select the Orion2-family "master RX
+    // select" bit, C4 bits 0-1 pick which of ANT1/2/3 the relay sits on
+    // (or, on a "new PA board" Hermes/Angelia/Orion unit using Ext/XVTR,
+    // disconnects ANT1/2/3 entirely) -- both confirmed against piHPSDR's
+    // old_protocol.c (general-control-register case, immediately before
+    // its own `output_buffer[C4]=0x04` duplex write). Ext1/Ext2/XVTR are
+    // RX-only in the reference (TX always uses a plain ANT1/2/3 relay
+    // position, matching this project's own Settings -> Antenna UI,
+    // which only ever offers TX EXT/XVTR -- so tx_antenna_val is always
+    // 0-2 here), and are meaningfully different per board family:
+    // Orion2-class boards use a distinct "master select" bit unrelated to
+    // Hermes/Angelia/Orion's two incompatible PA board revisions (the
+    // `new_pa_board` setting -- see its own doc comment), which this
+    // project has no way to auto-detect. Harmless (no-op) on any board
+    // without a physical Alex front end, same as PA Calibration/Open
+    // Collector.
+    let ext_xvtr_selector = if mox_on { tx_antenna_val } else { rx_antenna_val };
+    const EXT1: u8 = 0x40; // C3 bit 6
+    const EXT2: u8 = 0x20; // C3 bit 5
+    const XVTR: u8 = 0x60; // C3 bits 5+6 (EXT1|EXT2 together)
+    const BYPASS: u8 = 0x80; // C3 bit 7 -- old (non-Orion2, non-new-PA-board) relay boards only
+    let c3: u8 = match ext_xvtr_selector {
+        // EXT2 on an Orion2-family board (ANAN-7000/8000/DLE) is
+        // physically aliased to the SAME jack/bit as EXT1 -- confirmed
+        // against piHPSDR's new_protocol.c ("EXT2 with ANAN-7000: does
+        // not exist, use EXT1"), not a bug here.
+        3 | 4 if is_orion2 => EXT1,
+        3 if new_pa_board => EXT1,
+        4 if new_pa_board => EXT2,
+        3 => EXT1 | BYPASS,
+        4 => EXT2 | BYPASS,
+        5 if is_orion2 => XVTR,
+        5 if new_pa_board => XVTR,
+        5 => XVTR | BYPASS,
+        _ => 0x00,
+    };
     let mut c4: u8 = 0x04; // Duplex -- confirmed always set
-    c4 |= match antenna_val {
-        1 => 0x01, // ANT2
-        2 => 0x02, // ANT3
-        _ => 0x00, // ANT1
+    c4 |= if ext_xvtr_selector > 2 {
+        // Using Ext1/Ext2/XVTR for RX: the ANT1/2/3 relay position is
+        // either left on the TX antenna's own choice (harmless on most
+        // boards, since that relay isn't in the EXT/XVTR signal path
+        // anyway) or explicitly disconnected on a "new PA board" unit,
+        // whose physical relay wiring does conflict -- see piHPSDR's own
+        // "this happens only with the new pa board... here we have to
+        // disconnect ANT1,2,3" comment.
+        if new_pa_board { 0x03 } else { tx_antenna_val.min(2) as u8 }
+    } else {
+        ext_xvtr_selector as u8 // 0/1/2 = ANT1/2/3, matches C4 bits 0-1 directly
     };
     c4 |= (receivers.max(1) - 1) << 3;
     // BUG FIX (diversity): bit 7 was never set at all. Confirmed against
@@ -2740,7 +2845,7 @@ fn p1_build_packet(
     // any active Tune mask ORed in), same rx/tx split as everything
     // else in this function that depends on mox_on.
     let oc_byte = (if mox_on { oc_tx } else { oc_rx }) << 1;
-    let mut frame0 = build_usb_frame(0x00 | mox_bit, c1, oc_byte, 0x00, c4);
+    let mut frame0 = build_usb_frame(0x00 | mox_bit, c1, oc_byte, c3, c4);
 
     // USB frame 2: the rotating command. Ported directly from the
     // reference where this project has equivalent state to feed
@@ -3200,7 +3305,17 @@ fn p1_build_packet(
                 0x00
             };
             let c1 = bpf2 | if mox_on { 0x80 } else { 0x00 };
-            let c2 = if puresignal_enabled { 0x40 } else { 0x00 };
+            // Alex2 XVTR enable -- confirmed against piHPSDR's
+            // old_protocol.c (command 10/0x24 case): gated on the RX
+            // antenna preference alone (`receiver[0]->alex_antenna==5`),
+            // NOT on mox_on/ext_xvtr_selector like the general-control
+            // register's C3/C4 antenna bits above -- the XVTR input
+            // jack's own enable relay stays armed whenever XVTR is the
+            // configured RX antenna, transmitting or not.
+            let mut c2 = if rx_antenna_val == 5 { 0x02 } else { 0x00 };
+            if puresignal_enabled {
+                c2 |= 0x40;
+            }
             (0x24, c1, c2, 0x00, 0x00)
         }
         _ => (0x2E, 0x00, 0x00, 0x04, 0x15),
@@ -3247,7 +3362,13 @@ fn sender_loop(
     tx_iq: Arc<Mutex<VecDeque<f32>>>,
     active_receiver_count: Arc<AtomicU32>,
     extra_frequencies_hz: Vec<Arc<AtomicU32>>,
-    antenna: Arc<AtomicU32>,
+    rx_antenna: Arc<AtomicU32>,
+    tx_antenna: Arc<AtomicU32>,
+    // See RadioSession::new_pa_board's doc comment. is_orion2 is a plain
+    // bool (not Arc) since board type is fixed for the session, same as
+    // is_hermes_lite below.
+    new_pa_board: Arc<AtomicBool>,
+    is_orion2: bool,
     tx_power_watts: Arc<AtomicU32>,
     cw_keyer: Arc<CwKeyerAtomics>,
     cw_mode_active: Arc<AtomicBool>,
@@ -3482,7 +3603,10 @@ fn sender_loop(
             receivers,
             frequency_hz.load(Ordering::Relaxed),
             tx_frequency_hz.load(Ordering::Relaxed),
-            antenna.load(Ordering::Relaxed),
+            rx_antenna.load(Ordering::Relaxed),
+            tx_antenna.load(Ordering::Relaxed),
+            is_orion2,
+            new_pa_board.load(Ordering::Relaxed),
             tx_power_watts.load(Ordering::Relaxed),
             f32::from_bits(pa_gain_db.load(Ordering::Relaxed)),
             current_rate,
@@ -3828,7 +3952,8 @@ fn ozy_sender_loop(
     tx_iq: Arc<Mutex<VecDeque<f32>>>,
     active_receiver_count: Arc<AtomicU32>,
     extra_frequencies_hz: Vec<Arc<AtomicU32>>,
-    antenna: Arc<AtomicU32>,
+    rx_antenna: Arc<AtomicU32>,
+    tx_antenna: Arc<AtomicU32>,
     tx_power_watts: Arc<AtomicU32>,
     cw_keyer: Arc<CwKeyerAtomics>,
     // Deliberately unused -- see this function's own p1_build_packet
@@ -3879,7 +4004,10 @@ fn ozy_sender_loop(
             receivers,
             frequency_hz.load(Ordering::Relaxed),
             tx_frequency_hz.load(Ordering::Relaxed),
-            antenna.load(Ordering::Relaxed),
+            rx_antenna.load(Ordering::Relaxed),
+            tx_antenna.load(Ordering::Relaxed),
+            false, // is_orion2 -- Ozy is never an Orion2-family board
+            false, // new_pa_board -- Ozy predates the Hermes-family PA board revision this distinguishes; irrelevant here
             tx_power_watts.load(Ordering::Relaxed),
             f32::from_bits(pa_gain_db.load(Ordering::Relaxed)),
             current_rate,
@@ -4465,7 +4593,8 @@ fn start_protocol2(
     requested_frequency_hz: Arc<AtomicU32>,
     sample_rate: Arc<AtomicU32>,
     adc: Arc<AtomicU32>,
-    antenna: Arc<AtomicU32>,
+    rx_antenna: Arc<AtomicU32>,
+    tx_antenna: Arc<AtomicU32>,
     rx_attenuation: Arc<AtomicU32>, // P1-only setting; carried here purely to populate RadioSession's shared field
     ps_tx_attenuation: Arc<AtomicU32>, // P1-only setting; carried here purely to populate RadioSession's shared field
     mox: Arc<AtomicBool>,
@@ -4490,6 +4619,8 @@ fn start_protocol2(
     send_rx_audio_to_radio: Arc<AtomicBool>,
     // See RadioSession::hl2_ak4951_codec's doc comment.
     hl2_ak4951_codec: Arc<AtomicBool>,
+    // See RadioSession::new_pa_board's doc comment.
+    new_pa_board: Arc<AtomicBool>,
     radio_mic_audio: Arc<Mutex<VecDeque<f32>>>,
     tx_audio_source: Arc<AtomicU8>,
     tci_wants_mic: Arc<AtomicBool>,
@@ -4619,7 +4750,9 @@ fn start_protocol2(
     let sender_tx_frequency = Arc::clone(&tx_frequency_hz);
     let sender_sample_rate = Arc::clone(&sample_rate);
     let sender_adc = Arc::clone(&adc);
-    let sender_antenna = Arc::clone(&antenna);
+    let sender_rx_antenna = Arc::clone(&rx_antenna);
+    let sender_tx_antenna = Arc::clone(&tx_antenna);
+    let sender_new_pa_board = Arc::clone(&new_pa_board);
     let sender_disable_pa = Arc::clone(&disable_pa);
     let sender_oc_rx = Arc::clone(&oc_rx);
     let sender_oc_tx = Arc::clone(&oc_tx);
@@ -4654,7 +4787,9 @@ fn start_protocol2(
             sender_tx_frequency,
             sender_sample_rate,
             sender_adc,
-            sender_antenna,
+            sender_rx_antenna,
+            sender_tx_antenna,
+            sender_new_pa_board,
             sender_disable_pa,
             sender_oc_rx,
             sender_oc_tx,
@@ -4763,7 +4898,8 @@ fn start_protocol2(
         requested_frequency_hz,
         sample_rate,
         adc,
-        antenna,
+        rx_antenna,
+        tx_antenna,
         disable_pa,
         tune_active,
         oc_rx,
@@ -4788,6 +4924,7 @@ fn start_protocol2(
         rx_audio_to_radio,
         send_rx_audio_to_radio,
         hl2_ak4951_codec,
+        new_pa_board,
         radio_mic_audio,
         tx_audio_source,
         tci_wants_mic,
@@ -5105,7 +5242,13 @@ fn p2_tx_specific_packet(
 fn p2_high_priority_packet(
     seq: u32,
     frequencies_hz: &[u32],
-    antenna: u32,
+    // See alex0_word's identical rx_antenna/tx_antenna doc comment.
+    rx_antenna: u32,
+    tx_antenna: u32,
+    // See RadioSession::new_pa_board's doc comment -- ignored when
+    // is_orion2 is true.
+    is_orion2: bool,
+    new_pa_board: bool,
     mox_on: bool,
     // See RadioSession::disable_pa's doc comment -- passed through to
     // alex0_word so the T/R relay doesn't switch to the internal PA's TX
@@ -5181,6 +5324,21 @@ fn p2_high_priority_packet(
     // OCtx << 1` (bit 0 unused, OC1-OC7 in bits 1-7).
     p[1401] = (if mox_on { oc_tx } else { oc_rx }) << 1;
 
+    // Orion2-family boards (ANAN-7000/8000/DLE): when the RX antenna
+    // preference is XVTR, also route TX output back out through the same
+    // XVTR jack (for an actual transverter IF loop-through -- receiving
+    // AND transmitting on the transverter's IF port) -- confirmed
+    // against piHPSDR's new_protocol.c: "route TXout to XvtrOut out when
+    // using XVTR input... the firmware does a logical AND with the T/R
+    // bit such that upon RX, Xvtr port is input, and on TX, Xvrt port is
+    // output." Gated on the RX antenna preference alone (not mox_on),
+    // same reasoning as p1_build_packet's XVTR-enable bit. A no-op on
+    // non-Orion2 boards (this bit has no meaning there) and for anyone
+    // not using XVTR as their RX antenna.
+    if is_orion2 && rx_antenna == 5 {
+        p[1400] |= 0x01;
+    }
+
     // BUG FIX: bytes 1442/1443 (ADC1/ADC0 step attenuators) were never
     // written at all while receiving, staying at the zero-initialized
     // default (0dB, no attenuation, same front-end-overload risk as the
@@ -5201,7 +5359,19 @@ fn p2_high_priority_packet(
     // there's only one Alex front end, shared across all DDCs.
     let primary_freq = frequencies_hz.first().copied().unwrap_or(7_100_000);
     p[1432..1436]
-        .copy_from_slice(&alex0_word(primary_freq, antenna, mox_on, disable_pa, puresignal_enabled).to_be_bytes());
+        .copy_from_slice(
+            &alex0_word(
+                primary_freq,
+                rx_antenna,
+                tx_antenna,
+                mox_on,
+                disable_pa,
+                puresignal_enabled,
+                is_orion2,
+                new_pa_board,
+            )
+            .to_be_bytes(),
+        );
 
     // RX2/Alex1 bandpass filter (bytes 1430-1431) -- see this param's own
     // doc comment. BUG FIX: previously never written at all (stayed
@@ -5263,7 +5433,24 @@ fn p2_high_priority_packet(
 /// actually connected. Only the antenna/TR_RELAY handling was written
 /// by me; the two threshold ladders and every constant value came
 /// directly from the user.
-fn alex0_word(freq_hz: u32, antenna: u32, mox_on: bool, disable_pa: bool, puresignal_enabled: bool) -> u32 {
+#[allow(clippy::too_many_arguments)]
+fn alex0_word(
+    freq_hz: u32,
+    // Raw RX/TX antenna port selections (0=ANT1, 1=ANT2, 2=ANT3, 3=EXT1,
+    // 4=EXT2, 5=XVTR) -- see p1_build_packet's identical rx_antenna_val/
+    // tx_antenna_val doc comment for why both are needed simultaneously
+    // rather than a single mox-resolved value, and AntennaMask's doc
+    // comment in main.rs for the value encoding.
+    rx_antenna: u32,
+    tx_antenna: u32,
+    mox_on: bool,
+    disable_pa: bool,
+    puresignal_enabled: bool,
+    // See RadioSession::new_pa_board's doc comment -- ignored when
+    // is_orion2 is true.
+    is_orion2: bool,
+    new_pa_board: bool,
+) -> u32 {
     const HPF_13MHZ: u32 = 0x00000002;
     const HPF_20MHZ: u32 = 0x00000004;
     const PREAMP_6M: u32 = 0x00000008;
@@ -5333,10 +5520,60 @@ fn alex0_word(freq_hz: u32, antenna: u32, mox_on: bool, disable_pa: bool, puresi
         LPF_BYPASS
     };
 
-    let ant = match antenna {
-        1 => ANT_2,
-        2 => ANT_3,
-        _ => ANT_1,
+    // Ext1/Ext2/XVTR-in routing (RX-only -- TX always uses a plain
+    // ANT1/2/3 relay position, matching this project's own Settings ->
+    // Antenna UI, which only ever offers TX EXT/XVTR, so tx_antenna is
+    // always 0-2 here) plus the ANT1/2/3 relay-position bits themselves.
+    // Both confirmed against piHPSDR's new_protocol.c -- see
+    // p1_build_packet's identical (and more heavily commented) P1
+    // equivalent for the full per-board-family reasoning; only the bit
+    // VALUES differ here, not the resolution logic.
+    const ALEX_RX_ANTENNA_XVTR: u32 = 0x00000100;
+    const ALEX_RX_ANTENNA_EXT1: u32 = 0x00000200;
+    const ALEX_RX_ANTENNA_EXT2: u32 = 0x00000400;
+    const ALEX_RX_ANTENNA_BYPASS: u32 = 0x00000800;
+    const ANAN7000_RX_SELECT: u32 = 0x00004000;
+    let ext_xvtr_selector = if mox_on { tx_antenna } else { rx_antenna };
+    let ext = match ext_xvtr_selector {
+        // EXT2 on an Orion2-family board (ANAN-7000/8000/DLE) is
+        // physically aliased to the SAME jack/bit as EXT1 -- confirmed
+        // against piHPSDR's new_protocol.c ("EXT2 with ANAN-7000: does
+        // not exist, use EXT1"), not a bug here.
+        3 | 4 if is_orion2 => ALEX_RX_ANTENNA_EXT1 | ANAN7000_RX_SELECT,
+        3 if new_pa_board => ALEX_RX_ANTENNA_EXT1,
+        4 if new_pa_board => ALEX_RX_ANTENNA_EXT2,
+        3 => ALEX_RX_ANTENNA_EXT1 | ALEX_RX_ANTENNA_BYPASS,
+        4 => ALEX_RX_ANTENNA_EXT2 | ALEX_RX_ANTENNA_BYPASS,
+        5 if is_orion2 => ALEX_RX_ANTENNA_XVTR | ANAN7000_RX_SELECT,
+        5 if new_pa_board => ALEX_RX_ANTENNA_XVTR,
+        5 => ALEX_RX_ANTENNA_XVTR | ALEX_RX_ANTENNA_BYPASS,
+        _ => 0,
+    };
+    let ant = if ext_xvtr_selector > 2 {
+        // Using Ext1/Ext2/XVTR for RX: the ANT1/2/3 relay position is
+        // either left on the TX antenna's own choice (harmless on most
+        // boards) or explicitly left disconnected (no ANT_1/2/3 bit set
+        // at all) on a "new PA board" unit, whose physical relay wiring
+        // does conflict -- see piHPSDR's own "this happens only with the
+        // new pa board... here we have to disconnect ANT1,2,3" comment.
+        // P2's alex0 has no explicit "disconnect" bit the way P1's C4
+        // does -- leaving all three ANT_x bits unset achieves the same
+        // physical effect.
+        if new_pa_board {
+            0
+        } else {
+            match tx_antenna.min(2) {
+                1 => ANT_2,
+                2 => ANT_3,
+                _ => ANT_1,
+            }
+        }
+    } else {
+        match ext_xvtr_selector {
+            1 => ANT_2,
+            2 => ANT_3,
+            _ => ANT_1,
+        }
     };
 
     // See RadioSession::disable_pa's doc comment -- matches piHPSDR's own
@@ -5348,7 +5585,7 @@ fn alex0_word(freq_hz: u32, antenna: u32, mox_on: bool, disable_pa: bool, puresi
     let tr = if mox_on && !disable_pa { TR_RELAY } else { 0 };
     let ps = if mox_on && puresignal_enabled { PS_BIT } else { 0 };
 
-    hpf | lpf | ant | tr | ps
+    hpf | lpf | ant | ext | tr | ps
 }
 
 /// Alex1 "RX2" bandpass filter register, ANAN-7000/8000DLE (Orion2)
@@ -5416,7 +5653,11 @@ fn p2_sender_loop(
     tx_frequency_hz: Arc<AtomicU32>,
     sample_rate: Arc<AtomicU32>,
     adc: Arc<AtomicU32>,
-    antenna: Arc<AtomicU32>,
+    rx_antenna: Arc<AtomicU32>,
+    tx_antenna: Arc<AtomicU32>,
+    // See RadioSession::new_pa_board's doc comment -- ignored when
+    // is_orion2 is true.
+    new_pa_board: Arc<AtomicBool>,
     disable_pa: Arc<AtomicBool>,
     // See RadioSession::oc_rx/oc_tx's doc comments.
     oc_rx: Arc<AtomicU8>,
@@ -5629,7 +5870,9 @@ fn p2_sender_loop(
             }
         }
 
-        let antenna_now = antenna.load(Ordering::Relaxed);
+        let rx_antenna_now = rx_antenna.load(Ordering::Relaxed);
+        let tx_antenna_now = tx_antenna.load(Ordering::Relaxed);
+        let new_pa_board_now = new_pa_board.load(Ordering::Relaxed);
         let drive = drive_byte_for_watts(
             tx_power_watts.load(Ordering::Relaxed) as f32,
             f32::from_bits(pa_gain_db.load(Ordering::Relaxed)),
@@ -5670,7 +5913,10 @@ fn p2_sender_loop(
                 p2_high_priority_packet(
                     hp_seq,
                     &freqs,
-                    antenna_now,
+                    rx_antenna_now,
+                    tx_antenna_now,
+                    is_orion2,
+                    new_pa_board_now,
                     mox_on,
                     disable_pa.load(Ordering::Relaxed),
                     oc_rx.load(Ordering::Relaxed),
@@ -5716,7 +5962,10 @@ fn p2_sender_loop(
                 p2_high_priority_packet(
                     hp_seq,
                     &freqs,
-                    antenna_now,
+                    rx_antenna_now,
+                    tx_antenna_now,
+                    is_orion2,
+                    new_pa_board_now,
                     mox_on,
                     disable_pa.load(Ordering::Relaxed),
                     oc_rx.load(Ordering::Relaxed),

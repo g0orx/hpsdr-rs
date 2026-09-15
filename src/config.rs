@@ -73,6 +73,10 @@ pub struct Config {
     #[serde(default)]
     pub spectrum_pan: Option<f32>,
     pub adc: Option<u8>,
+    /// Legacy single global antenna value, from before per-band RX/TX
+    /// antenna existed (see antenna_settings below) -- kept only as a
+    /// one-time migration source (see its load site in main.rs) for
+    /// configs saved before that. No longer written on save.
     pub antenna: Option<u8>,
     pub rigctl_addr: Option<String>,
     pub tci_addr: Option<String>,
@@ -328,6 +332,12 @@ pub struct Config {
     /// set falls back to off, same as the live default.
     #[serde(default)]
     pub hl2_ak4951_codec: Option<bool>,
+    /// See radio::RadioSession::new_pa_board's doc comment (Settings ->
+    /// Antenna, Hermes/Angelia/Orion boards only). Missing/never set
+    /// falls back to the "old PA board" default, same as the live
+    /// default.
+    #[serde(default)]
+    pub new_pa_board: Option<bool>,
     /// See radio::RadioSession::tx_audio_source's doc comment (Settings
     /// -> TX) -- one of radio::TX_AUDIO_SOURCE_AUTO/RADIO_MIC/LOCAL_MIC.
     /// Missing/never set falls back to Auto, same as the live default.
@@ -425,6 +435,13 @@ pub struct Config {
     /// doc comment.
     #[serde(default)]
     pub oc_tune: u8,
+    /// Per-band (or XVTR) RX/TX antenna port selection -- see main.rs's
+    /// AntennaMask struct doc comment. Keyed by band/XVTR name, same
+    /// pattern as oc_settings above. `#[serde(default)]` so configs saved
+    /// before this existed just load with every band defaulting to ANT1
+    /// (matching the single global antenna's old default).
+    #[serde(default)]
+    pub antenna_settings: std::collections::HashMap<String, crate::AntennaMask>,
     /// Whether the MIDI worker should actually open a device -- see
     /// main.rs's MidiWorker::enabled (a live toggle, no reconnect needed).
     /// `#[serde(default)]` so configs saved before this existed just

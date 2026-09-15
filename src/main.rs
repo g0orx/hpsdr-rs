@@ -261,6 +261,23 @@ pub struct OcMask {
     pub tx: u8,
 }
 
+/// Per-band Alex antenna port selection (0=ANT1, 1=ANT2, 2=ANT3), RX and
+/// TX independently -- same HashMap-by-name pattern as OcMask above,
+/// keyed by band/XVTR name in ConnectedState::antenna_settings. Resolved
+/// into RadioSession::rx_antenna/tx_antenna once per frame from the
+/// current band, exactly like OcMask's oc_rx/oc_tx resolution -- see that
+/// call site's doc comment. A never-configured band defaults to ANT1 for
+/// both (0/0), matching the single global antenna's old default before
+/// this per-band table existed. RadioSession::rx_antenna/tx_antenna then
+/// resolve onto the identical wire bits based on mox state at packet-
+/// build time (P1's sender_loop/ozy_sender_loop, P2's p2_sender_loop),
+/// matching piHPSDR's own alexRxAntenna/alexTxAntenna split.
+#[derive(Clone, Copy, Default, serde::Serialize, serde::Deserialize)]
+pub struct AntennaMask {
+    pub rx: u32,
+    pub tx: u32,
+}
+
 /// Everything remembered per-band: not just the last frequency used,
 /// but also the spectrum/waterfall level ranges, since different bands
 /// often want different level settings (e.g. a noisy 160m vs a quiet
@@ -742,6 +759,7 @@ enum SettingsTab {
     Equalizer,
     Xvtr,
     OpenCollector,
+    Antenna,
     Firmware,
     Midi,
     About,
@@ -771,9 +789,6 @@ struct ExtraReceiver {
     /// reach (e.g. 6m on a HermesLite/HermesLite2).
     frequency_min: u64,
     frequency_max: u64,
-    /// Shared with every other receiver (including the primary) --
-    /// Alex's antenna relays are one physical resource, not per-DDC.
-    antenna: Arc<std::sync::atomic::AtomicU32>,
     /// Same Arc as RadioSession::mox -- MOX is a whole-session concept,
     /// not per-receiver. Kept here (not just read once at spawn time) so
     /// change_extra_receiver_sample_rate can pass it to a rebuilt
@@ -1359,6 +1374,11 @@ struct ConnectedState {
     /// whenever tune_active is true -- the simpler case piHPSDR's own
     /// logic degenerates to without that feature.
     oc_tune: u8,
+    /// Per-band (or XVTR) RX/TX antenna port selection -- see
+    /// AntennaMask's doc comment. Same HashMap-by-name pattern as
+    /// oc_settings above, resolved to the current band and pushed into
+    /// session.rx_antenna/tx_antenna once per frame alongside oc_rx/oc_tx.
+    antenna_settings: std::collections::HashMap<String, AntennaMask>,
     /// Upper bound (watts) for the main panel's TX Power slider. The
     /// discovery protocol only reports board *type* (Boards), not the
     /// specific radio model or its PA's actual max output -- e.g.
@@ -1699,6 +1719,9 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                 .hl2_ak4951_codec
                 .store(cfg.hl2_ak4951_codec.unwrap_or(false), Ordering::Relaxed);
             session
+                .new_pa_board
+                .store(cfg.new_pa_board.unwrap_or(false), Ordering::Relaxed);
+            session
                 .tx_audio_source
                 .store(cfg.tx_audio_source.unwrap_or(TX_AUDIO_SOURCE_AUTO), Ordering::Relaxed);
             session
@@ -1863,9 +1886,9 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
             if let Some(a) = cfg.adc {
                 session.adc.store(a as u32, Ordering::Relaxed);
             }
-            if let Some(a) = cfg.antenna {
-                session.antenna.store(a as u32, Ordering::Relaxed);
-            }
+            // No direct antenna load here -- session.rx_antenna/tx_antenna
+            // are resolved every frame from ConnectedState::antenna_settings
+            // (see that field's doc comment), same as oc_rx/oc_tx.
             if let Some(m) = cfg.mode {
                 spectrum.set_mode(m);
             }
@@ -2200,6 +2223,35 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                 active_xvtr: cfg.active_xvtr.clone(),
                 oc_settings: cfg.oc_settings.clone(),
                 oc_tune: cfg.oc_tune,
+                // One-time migration: a config saved before per-band
+                // RX/TX antenna existed had a single flat `antenna`
+                // value used for everything -- seed every reachable band
+                // (and configured XVTR) with it so upgrading doesn't
+                // silently reset an existing user's antenna choice back
+                // to ANT1 (could matter for TX into a specific antenna/
+                // dummy load). Only runs when antenna_settings itself is
+                // empty, so it never overwrites a config that's already
+                // using the new per-band table.
+                antenna_settings: {
+                    let mut antenna_settings = cfg.antenna_settings.clone();
+                    if antenna_settings.is_empty() {
+                        if let Some(v) = cfg.antenna {
+                            for name in BANDS
+                                .iter()
+                                .filter(|b| {
+                                    (b.low_hz as u64) >= device.frequency_min
+                                        && (b.high_hz as u64) <= device.frequency_max
+                                })
+                                .map(|b| b.name)
+                                .chain(cfg.xvtrs.iter().filter(|x| !x.name.is_empty()).map(|x| x.name.as_str()))
+                            {
+                                antenna_settings
+                                    .insert(name.to_string(), AntennaMask { rx: v as u32, tx: v as u32 });
+                            }
+                        }
+                    }
+                    antenna_settings
+                },
                 max_tx_power_watts: cfg
                     .max_tx_power_watts
                     .unwrap_or_else(|| default_max_tx_power_watts(device.board)),
@@ -2705,6 +2757,11 @@ impl eframe::App for HpsdrApp {
                 let oc_tx_resolved = if connected.tune_active { oc.tx | connected.oc_tune } else { oc.tx };
                 connected.session.oc_rx.store(oc.rx, std::sync::atomic::Ordering::Relaxed);
                 connected.session.oc_tx.store(oc_tx_resolved, std::sync::atomic::Ordering::Relaxed);
+                // RX/TX antenna -- see AntennaMask's doc comment. Same
+                // per-band resolution as OC just above, same current_band_name.
+                let ant = connected.antenna_settings.get(current_band_name).copied().unwrap_or_default();
+                connected.session.rx_antenna.store(ant.rx, std::sync::atomic::Ordering::Relaxed);
+                connected.session.tx_antenna.store(ant.tx, std::sync::atomic::Ordering::Relaxed);
                 // See RadioSession::rx_frequency_hz's doc comment -- kept
                 // in sync every frame here so rigctl/TCI/CAT report the
                 // CTUN'd listen frequency, not the parked hardware LO --
@@ -5197,7 +5254,21 @@ impl eframe::App for HpsdrApp {
                         egui::ViewportId::from_hash_of("settings_window"),
                         egui::ViewportBuilder::default()
                             .with_title("Settings")
-                            .with_inner_size([860.0, 700.0])
+                            // ROOT CAUSE FIX for a real report: 860 was
+                            // wide enough for the tab row back when it
+                            // had fewer tabs, but adding MIDI brought
+                            // the total to 15 -- with a plain
+                            // ui.horizontal (no wrap) row, that's wider
+                            // than 860px actually fits, so the row was
+                            // simply cut off mid-label (into "TX") with
+                            // everything past it invisible rather than
+                            // wrapping to a second line. Widened with
+                            // real headroom for the current tab count;
+                            // the row below is now wrapped too, so a
+                            // user manually shrinking the window (or a
+                            // future tab addition) degrades to a second
+                            // line instead of reproducing this exact cutoff.
+                            .with_inner_size([1100.0, 700.0])
                             // Same "keep the window from getting buried
                             // behind other windows" reasoning as the
                             // discovery window -- see its own doc
@@ -5229,9 +5300,17 @@ impl eframe::App for HpsdrApp {
                                 .frame(egui::Frame::central_panel(&light_style))
                                 .show(ui, |ui| {
                             ui.visuals_mut().clone_from(&light_visuals);
-                            ui.horizontal(|ui| {
+                            // Wrapped (not a plain ui.horizontal) so a
+                            // narrower window degrades to a second line
+                            // of tabs instead of silently cutting the
+                            // row off mid-label past whatever width
+                            // happens to be available -- see this
+                            // viewport's own with_inner_size comment for
+                            // the real report this fixes.
+                            ui.horizontal_wrapped(|ui| {
                                 for (tab, label) in [
                                     (SettingsTab::About, "About"),
+                                    (SettingsTab::Antenna, "Antenna"),
                                     (SettingsTab::Audio, "Audio"),
                                     (SettingsTab::Cw, "CW"),
                                     (SettingsTab::Diversity, "Diversity"),
@@ -6306,23 +6385,8 @@ impl eframe::App for HpsdrApp {
                                         }
                                     });
 
-                                    if current_adc == 0 {
-                                        let current_ant = connected.session.antenna.load(Ordering::Relaxed);
-                                        ui.label("Antenna (shared across all ADC0 receivers):");
-                                        ui.horizontal_wrapped(|ui| {
-                                            for (ant, label) in [(0u32, "ANT1"), (1, "ANT2"), (2, "ANT3")] {
-                                                let selected = ant == current_ant;
-                                                if ui
-                                                    .add(egui::Button::selectable(selected, label))
-                                                    .clicked()
-                                                    && !selected
-                                                {
-                                                    connected.session.antenna.store(ant, Ordering::Relaxed);
-                                                    settings_changed = true;
-                                                }
-                                            }
-                                        });
-                                    }
+                                    // RX/TX antenna selection is per-band now -- see
+                                    // Settings -> Antenna and AntennaMask's doc comment.
                                     ui.separator();
 
                                     // Shown on both protocols now -- P2's High Priority
@@ -7457,6 +7521,137 @@ impl eframe::App for HpsdrApp {
                                         ui.end_row();
                                     });
                                 }
+                                SettingsTab::Antenna => {
+                                    // See AntennaMask's doc comment. Board-
+                                    // agnostic (no per-board gating), same as
+                                    // Open Collector just above -- harmless
+                                    // on a board with only one antenna port.
+                                    ui.add_space(4.0);
+                                    ui.label(
+                                        "Alex's RX antenna ports (ANT1-3, EXT1/EXT2, XVTR) and TX \
+                                         antenna ports (ANT1-3 only -- Ext/XVTR are RX-only, matching \
+                                         the reference), configured per band -- e.g. to receive on a \
+                                         separate listening antenna or a transverter's IF port, or to \
+                                         transmit into a dummy load/different antenna than you \
+                                         receive on. Driven by the primary front end's band, shared \
+                                         across every receiver -- not a per-extra-receiver setting.",
+                                    );
+                                    // Hermes/Angelia/Orion (the ANAN-10/100/200
+                                    // family, pre-Orion2) shipped with two
+                                    // incompatible PA board revisions that wire
+                                    // EXT1/EXT2/XVTR differently -- there's no way
+                                    // to auto-detect which one is physically
+                                    // installed (matching piHPSDR's own ant_menu.c
+                                    // "ANAN 100/200 new PA board" checkbox, same
+                                    // gating). Meaningless on every other board
+                                    // (Orion2 uses an unambiguous bit layout of its
+                                    // own; anything without a full Alex front end
+                                    // ignores these bits entirely) -- hidden rather
+                                    // than shown-disabled there, since it would
+                                    // just be a confusing no-op.
+                                    if matches!(connected.device.board, Boards::Hermes | Boards::Angelia | Boards::Orion) {
+                                        ui.add_space(4.0);
+                                        let mut new_pa_board =
+                                            connected.session.new_pa_board.load(Ordering::Relaxed);
+                                        if ui
+                                            .checkbox(&mut new_pa_board, "ANAN 100/200 new PA board")
+                                            .on_hover_text(
+                                                "Only matters if you use EXT1/EXT2/XVTR as an RX \
+                                                 antenna below -- selects which of two incompatible \
+                                                 PA board revisions this radio has. If EXT1/EXT2/XVTR \
+                                                 reception doesn't work, try toggling this.",
+                                            )
+                                            .clicked()
+                                        {
+                                            connected.session.new_pa_board.store(new_pa_board, Ordering::Relaxed);
+                                            settings_changed = true;
+                                        }
+                                    }
+                                    ui.add_space(6.0);
+                                    egui::Grid::new("antenna_grid").striped(true).show(ui, |ui| {
+                                        ui.label("Band");
+                                        ui.label("RX Antenna");
+                                        ui.label("TX Antenna");
+                                        ui.end_row();
+
+                                        // Reachable BANDS, then configured
+                                        // XVTRs -- same combined row list as
+                                        // Open Collector just above.
+                                        let names: Vec<&str> = BANDS
+                                            .iter()
+                                            .filter(|band| {
+                                                (band.low_hz as u64) >= connected.device.frequency_min
+                                                    && (band.high_hz as u64) <= connected.device.frequency_max
+                                            })
+                                            .map(|band| band.name)
+                                            .chain(
+                                                connected
+                                                    .xvtrs
+                                                    .iter()
+                                                    .filter(|x| !x.name.is_empty())
+                                                    .map(|x| x.name.as_str()),
+                                            )
+                                            .collect();
+                                        // (port, label) tables -- RX gets all
+                                        // six ports, TX only ANT1-3 (see this
+                                        // tab's own intro label for why).
+                                        const RX_PORTS: [(u32, &str); 6] = [
+                                            (0, "ANT1"),
+                                            (1, "ANT2"),
+                                            (2, "ANT3"),
+                                            (3, "EXT1"),
+                                            (4, "EXT2"),
+                                            (5, "XVTR"),
+                                        ];
+                                        const TX_PORTS: [(u32, &str); 3] = [(0, "ANT1"), (1, "ANT2"), (2, "ANT3")];
+                                        for name in names {
+                                            ui.label(name);
+                                            let mut ant =
+                                                connected.antenna_settings.get(name).copied().unwrap_or_default();
+                                            let mut changed = false;
+                                            // Dropdowns, not a button row --
+                                            // RX's 6 options made a button
+                                            // row too wide for the window at
+                                            // any reasonable band-name column
+                                            // width. ID salted per band/
+                                            // direction so egui doesn't
+                                            // collide state across rows.
+                                            egui::ComboBox::from_id_salt(("antenna_rx", name))
+                                                .selected_text(
+                                                    RX_PORTS.iter().find(|(p, _)| *p == ant.rx).map_or("ANT1", |(_, l)| l),
+                                                )
+                                                .show_ui(ui, |ui| {
+                                                    for (port, label) in RX_PORTS {
+                                                        if ui.selectable_label(port == ant.rx, label).clicked()
+                                                            && port != ant.rx
+                                                        {
+                                                            ant.rx = port;
+                                                            changed = true;
+                                                        }
+                                                    }
+                                                });
+                                            egui::ComboBox::from_id_salt(("antenna_tx", name))
+                                                .selected_text(
+                                                    TX_PORTS.iter().find(|(p, _)| *p == ant.tx).map_or("ANT1", |(_, l)| l),
+                                                )
+                                                .show_ui(ui, |ui| {
+                                                    for (port, label) in TX_PORTS {
+                                                        if ui.selectable_label(port == ant.tx, label).clicked()
+                                                            && port != ant.tx
+                                                        {
+                                                            ant.tx = port;
+                                                            changed = true;
+                                                        }
+                                                    }
+                                                });
+                                            if changed {
+                                                connected.antenna_settings.insert(name.to_string(), ant);
+                                                settings_changed = true;
+                                            }
+                                            ui.end_row();
+                                        }
+                                    });
+                                }
                                 SettingsTab::PureSignal => {
                                     // See radio::RadioSettings::puresignal_enabled
                                     // and radio::ps_feedback_config for what
@@ -8187,9 +8382,10 @@ impl eframe::App for HpsdrApp {
                         spectrum_zoom: Some(connected.spectrum_zoom),
                         spectrum_pan: Some(connected.spectrum_pan),
                         adc: Some(connected.session.adc.load(std::sync::atomic::Ordering::Relaxed) as u8),
-                        antenna: Some(
-                            connected.session.antenna.load(std::sync::atomic::Ordering::Relaxed) as u8,
-                        ),
+                        // Legacy field, no longer written -- see Config::
+                        // antenna's doc comment. antenna_settings (below)
+                        // is the real per-band table now.
+                        antenna: None,
                         band_settings: connected.band_memory.clone(),
                         width_memory: connected.width_memory.clone(),
                         pa_calibration: connected.pa_calibration.clone(),
@@ -8237,6 +8433,9 @@ impl eframe::App for HpsdrApp {
                         hl2_ak4951_codec: Some(
                             connected.session.hl2_ak4951_codec.load(std::sync::atomic::Ordering::Relaxed),
                         ),
+                        new_pa_board: Some(
+                            connected.session.new_pa_board.load(std::sync::atomic::Ordering::Relaxed),
+                        ),
                         tx_audio_source: Some(
                             connected.session.tx_audio_source.load(std::sync::atomic::Ordering::Relaxed),
                         ),
@@ -8263,6 +8462,7 @@ impl eframe::App for HpsdrApp {
                         active_xvtr: connected.active_xvtr.clone(),
                         oc_settings: connected.oc_settings.clone(),
                         oc_tune: connected.oc_tune,
+                        antenna_settings: connected.antenna_settings.clone(),
                         midi_enabled: Some(connected.midi.enabled.load(Ordering::Relaxed)),
                         midi_device_name: connected.midi.device_name.lock().unwrap().clone(),
                         midi_bindings: connected.midi_bindings.clone(),
@@ -10239,6 +10439,10 @@ fn render_extra_receiver_settings(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceive
         // band, shared across every receiver (see OcMask's doc comment)
         // -- not a per-receiver concept, redirect same as Xvtr above.
         SettingsTab::OpenCollector => rx.settings_tab = SettingsTab::Agc,
+        // Antenna is driven by the primary front end's band, shared
+        // across every receiver (see AntennaMask's doc comment) -- not a
+        // per-receiver concept, redirect same as OpenCollector above.
+        SettingsTab::Antenna => rx.settings_tab = SettingsTab::Agc,
         // Firmware update is against the whole radio, not a per-receiver
         // concept -- redirect same as Network.
         SettingsTab::Firmware => rx.settings_tab = SettingsTab::Agc,
@@ -10296,17 +10500,14 @@ fn render_extra_receiver_settings(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceive
             });
 
             if current_adc == 0 {
-                let current_ant = rx.antenna.load(Ordering::Relaxed);
-                ui.label("Antenna (shared across all ADC0 receivers):");
-                ui.horizontal_wrapped(|ui| {
-                    for (ant, label) in [(0u32, "ANT1"), (1, "ANT2"), (2, "ANT3")] {
-                        let selected = ant == current_ant;
-                        if ui.add(egui::Button::selectable(selected, label)).clicked() && !selected {
-                            rx.antenna.store(ant, Ordering::Relaxed);
-                            rx.settings_dirty.store(true, Ordering::Relaxed);
-                        }
-                    }
-                });
+                // RX-only, and no editable control here -- Alex's antenna
+                // relay is one physical resource shared across every
+                // receiver, driven every frame by the primary receiver's
+                // Settings -> Antenna per-band table, same as Open Collector.
+                ui.weak(
+                    "RX Antenna is set per-band in the main receiver's \
+                     Settings -> Antenna tab (shared across all ADC0 receivers).",
+                );
             }
             ui.separator();
 
@@ -10610,7 +10811,6 @@ fn spawn_extra_receiver(
     let freq_arc = Arc::clone(&session.extra_frequencies_hz[idx - 1]);
     let rate_arc = Arc::clone(&session.extra_sample_rates_hz[idx - 1]);
     let adc_arc = Arc::clone(&session.extra_adcs[idx - 1]);
-    let antenna_arc = Arc::clone(&session.antenna);
 
     if let Some(s) = saved {
         freq_arc.store(s.frequency_hz, Ordering::Relaxed);
@@ -10678,7 +10878,6 @@ fn spawn_extra_receiver(
         protocol,
         frequency_min,
         frequency_max,
-        antenna: antenna_arc,
         mox: Arc::clone(&session.mox),
         mute_local_audio_for_tci: Arc::clone(&session.mute_local_audio_for_tci),
         spectrum,
