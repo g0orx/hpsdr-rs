@@ -392,6 +392,24 @@ fn midi_knob_range(value: u8, lo: f64, hi: f64) -> f64 {
     lo + (value as f64 / 127.0) * (hi - lo)
 }
 
+/// Display label for a MIDI action, given the currently connected radio
+/// -- same board/protocol-dependent naming as Settings -> RX's own
+/// slider (see dispatch_midi_event's RfAttenuation arm and
+/// RadioSession::rx_attenuation's doc comment): a HermesLite/
+/// HermesLite2 on Protocol 1 has "RF Gain", not a step attenuator, so
+/// the learn-mode UI should call it that rather than MidiAction::
+/// RfAttenuation's generic, board-agnostic label.
+fn midi_action_label(action: MidiAction, connected: &ConnectedState) -> &'static str {
+    if action == MidiAction::RfAttenuation
+        && connected.device.protocol == 1
+        && matches!(connected.device.board, Boards::HermesLite | Boards::HermesLite2)
+    {
+        "RF Gain"
+    } else {
+        action.label()
+    }
+}
+
 /// Fixed Hz-per-MESSAGE for a Wheel binding, before `MidiBinding::
 /// sensitivity` is applied (default sensitivity 1.0 -> this value as-is).
 ///
@@ -659,12 +677,20 @@ fn dispatch_midi_event(connected: &mut ConnectedState, ev: RawMidiEvent, freq_hz
             }
         }
         MidiAction::RfAttenuation => {
-            // Only meaningful on P1, and not on HermesLite/HermesLite2 --
-            // see the RX Attenuation slider's own comment (Settings ->
-            // RX) for why.
+            // Mirrors Settings -> RX's own RX Attenuation/RX Gain
+            // sliders exactly -- see RadioSession::rx_attenuation's doc
+            // comment for why both share this one field. A HermesLite/
+            // HermesLite2 on Protocol 1 has no step attenuator at all,
+            // instead a -12..+48 dB RF Gain value (stored as the wire
+            // value gain_db+12, 0-60); every other case (including a
+            // HermesLite2 on Protocol 2, which has no RF Gain concept)
+            // is the standard 0-31 dB attenuator.
             if connected.device.protocol == 1
-                && !matches!(connected.device.board, Boards::HermesLite | Boards::HermesLite2)
+                && matches!(connected.device.board, Boards::HermesLite | Boards::HermesLite2)
             {
+                let gain_db = midi_knob_range(ev.value, -12.0, 48.0);
+                connected.session.rx_attenuation.store((gain_db + 12.0).clamp(0.0, 60.0) as u32, Ordering::Relaxed);
+            } else {
                 let atten = (ev.value as u32 * 31) / 127;
                 connected.session.rx_attenuation.store(atten, Ordering::Relaxed);
             }
@@ -5582,7 +5608,7 @@ impl eframe::App for HpsdrApp {
                                             let current_label = connected
                                                 .midi_learn
                                                 .selected_action
-                                                .map(MidiAction::label)
+                                                .map(|a| midi_action_label(a, connected))
                                                 .unwrap_or("(choose)");
                                             egui::ComboBox::from_id_salt("midi_learn_action")
                                                 .selected_text(current_label)
@@ -5590,7 +5616,10 @@ impl eframe::App for HpsdrApp {
                                                     for &action in action_choices {
                                                         let selected =
                                                             connected.midi_learn.selected_action == Some(action);
-                                                        if ui.selectable_label(selected, action.label()).clicked() {
+                                                        if ui
+                                                            .selectable_label(selected, midi_action_label(action, connected))
+                                                            .clicked()
+                                                        {
                                                             connected.midi_learn.selected_action = Some(action);
                                                         }
                                                     }
@@ -5729,7 +5758,7 @@ impl eframe::App for HpsdrApp {
                                                     MidiBindingKind::Knob => "Knob",
                                                     MidiBindingKind::Wheel => "Wheel",
                                                 });
-                                                ui.label(binding.action.label());
+                                                ui.label(midi_action_label(binding.action, connected));
                                                 ui.label(if binding.momentary { "Yes" } else { "" });
                                                 ui.label(if binding.kind == MidiBindingKind::Wheel {
                                                     format!("{:.2}", binding.sensitivity)
