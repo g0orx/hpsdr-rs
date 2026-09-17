@@ -41,17 +41,17 @@
 //!   need to read at all as a result).
 //! - `CatCmdId` is `Midi2Cat.Data.CatCmd`'s numeric value -- decoded via
 //!   `CAT_CMD_TABLE` below, hand-built from that same enum
-//!   (`CatCmdDb.cs`) restricted to commands with a clean hpsdr-rs
+//!   (`CatCmdDb.cs`) restricted to commands with a usable hpsdr-rs
 //!   `MidiAction` equivalent of the *same* binding kind (Key/Knob/
-//!   Wheel). Deliberately conservative: several Thetis commands look
-//!   similar to an hpsdr-rs action but aren't an exact behavioral match
-//!   (e.g. Thetis's per-type Noise Blanker/Reduction On/Off buttons vs
-//!   this project's single "cycle" action, or Thetis's *absolute*
-//!   Knob-type "RIT" (`CatCmdId=201`) vs this project's only
-//!   *relative* `RitAdjust` wheel action) -- those are left out of the
-//!   table rather than force a mapping that would behave differently
-//!   than the original Thetis binding did, and get reported to the user
-//!   as skipped with a reason instead.
+//!   Wheel). Deliberately conservative about anything that isn't an
+//!   exact behavioral match -- e.g. Thetis's *absolute* Knob-type "RIT"
+//!   (`CatCmdId=201`) has no equivalent at all (this project only has a
+//!   *relative* `RitAdjust` wheel action) and is left out of the table
+//!   entirely, reported to the user as skipped with a reason. Thetis's
+//!   per-type Noise Blanker/Reduction On/Off buttons are a *partial*
+//!   match instead (see `CAT_CMD_TABLE`'s own comment on those entries
+//!   for the one-way-only caveat) and ARE imported, on the reasoning
+//!   that one press still does the useful thing.
 
 use crate::midi::{MidiAction, MidiBinding, MidiBindingKind, MidiEventKind};
 
@@ -92,6 +92,17 @@ const CAT_CMD_TABLE: &[(u32, MidiAction, MidiBindingKind)] = &[
     (33, MidiAction::DiversityToggle, MidiBindingKind::Key),
     (21, MidiAction::BinauralToggle, MidiBindingKind::Key),
     (44, MidiAction::SnbToggle, MidiBindingKind::Key),
+    // Thetis's NB1/NR/NR2 "On Off" commands are independent TOGGLE
+    // buttons (press to turn on, press again to turn off); hpsdr-rs's
+    // matching actions each just SET that one state (mutually exclusive
+    // with the others, per NoiseBlanker/NoiseReduction's own doc
+    // comments in spectrum.rs) -- a second press does nothing, it's
+    // already there. Imported anyway since one press still does the
+    // useful thing (turns that stage on); bind NoiseBlankerOff/
+    // NoiseReductionOff to another control to turn it back off.
+    (16, MidiAction::NoiseBlankerNb, MidiBindingKind::Key),
+    (19, MidiAction::NoiseReductionNr, MidiBindingKind::Key),
+    (20, MidiAction::NoiseReductionNr2, MidiBindingKind::Key),
     (78, MidiAction::Band160m, MidiBindingKind::Key),
     (79, MidiAction::Band80m, MidiBindingKind::Key),
     (81, MidiAction::Band40m, MidiBindingKind::Key),
