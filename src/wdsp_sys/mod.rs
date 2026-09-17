@@ -223,6 +223,19 @@ unsafe extern "C" {
     );
 }
 unsafe extern "C" {
+    // Added in WDSP 2.10.2 (see vendor/wdsp/analyzer.c's own "[2.10.2]
+    // MW0LGE reset all the pixel and average buffers" comment) -- resets
+    // FAR more than toggling SetDisplayAverageMode does: pixel/average
+    // buffers (t_pixels/av_sum/av_buff), AND the raw-sample accumulation
+    // state (have_samples/IQin_index/IQout_index/buff_ready) that feeds
+    // the next FFT window. The SetDisplayAverageMode toggle trick this
+    // project used before only reset av_sum, leaving whatever raw IQ
+    // samples were already accumulated toward the in-progress FFT window
+    // untouched -- so a fresh PTT's first FFT(s) could still be built
+    // partly from samples belonging to the transmission that just ended.
+    pub fn ResetPixelBuffers(disp: ::std::os::raw::c_int);
+}
+unsafe extern "C" {
     pub fn SetDisplayNumAverage(
         disp: ::std::os::raw::c_int,
         pixout: ::std::os::raw::c_int,

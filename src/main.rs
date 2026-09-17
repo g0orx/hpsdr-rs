@@ -21,6 +21,7 @@ mod debug_log;
 mod discovery;
 mod discovery_ui;
 mod midi;
+mod midi_import;
 mod ozy;
 mod radio;
 mod rigctl;
@@ -471,7 +472,31 @@ fn midi_wheel_step_hz(ev: RawMidiEvent, binding: &MidiBinding) -> Option<i64> {
 /// resolved, so tuning actions respect CTUN identically to every other
 /// tuning path in this app.
 fn dispatch_midi_event(connected: &mut ConnectedState, ev: RawMidiEvent, freq_hz: u32, sample_rate: u32, passband: (f64, f64)) {
-    let Some(binding) = connected.midi_bindings.iter().find(|b| b.matches(&ev)).copied() else { return };
+    let Some(binding) = connected.midi_bindings.iter().find(|b| b.matches(&ev)).copied() else {
+        // Previously silent -- a real gap while testing a new controller
+        // or a freshly-imported binding set (see midi_import.rs): there
+        // was no way to see what a control actually sends without
+        // opening Settings -> MIDI and using Learn mode one control at a
+        // time. Logged to stderr instead, rate-limited to at most one
+        // line per 250ms (not per-control) since a continuous/no-detent
+        // wheel can send many messages for even a brief touch (see
+        // MidiBinding::debounce_ms's doc comment) -- fast enough to
+        // catch individual button presses/knob turns during interactive
+        // testing without flooding the console from an unbound wheel.
+        let now = Instant::now();
+        if connected.midi_unmatched_last_logged.is_none_or(|t| now.duration_since(t) >= Duration::from_millis(250)) {
+            eprintln!(
+                "midi: unmatched {:?} channel={} number={} value={}{}",
+                ev.kind,
+                ev.channel,
+                ev.number,
+                ev.value,
+                if ev.off { " (off)" } else { "" }
+            );
+            connected.midi_unmatched_last_logged = Some(now);
+        }
+        return;
+    };
 
     // A Key binding without `momentary` only fires on press; WITH
     // momentary it fires on both press AND release (piHPSDR's ONOFF
@@ -673,6 +698,80 @@ fn dispatch_midi_event(connected: &mut ConnectedState, ev: RawMidiEvent, freq_hz
                 current_mode,
             );
         }
+        MidiAction::VfoBTune => {
+            // Simpler than VfoTune above -- VFO B is just a stored
+            // frequency (Split/A<>B swap), no CTUN/band-memory concept
+            // of its own. tx_dial_freq_hz's own per-frame reconciliation
+            // (just above this dispatch call site) already reads this
+            // field fresh every frame, so nothing else needs to react.
+            let Some(step) = midi_wheel_step_hz(ev, &binding) else { return };
+            connected.vfo_b_frequency_hz = (connected.vfo_b_frequency_hz as i64 + step).max(0) as u32;
+        }
+        MidiAction::CtunToggle => {
+            // Mirrors the on-screen CTUN button's click handler exactly
+            // (main window, Settings -> CTUN checkbox).
+            if connected.ctun {
+                connected.session.set_frequency(connected.ctun_frequency_hz);
+            } else {
+                connected.ctun_frequency_hz = freq_hz;
+            }
+            connected.ctun = !connected.ctun;
+        }
+        MidiAction::RxEqToggle => {
+            let mut eq = connected.spectrum.eq();
+            eq.enabled = !eq.enabled;
+            connected.spectrum.set_eq(eq);
+        }
+        MidiAction::DiversityToggle => {
+            // Mutually exclusive with PureSignal -- mirrors the
+            // Settings -> Diversity checkbox's own guard.
+            if !connected.puresignal_enabled {
+                connected.diversity_enabled = !connected.diversity_enabled;
+                connected.session.set_diversity_enabled(connected.diversity_enabled);
+            }
+        }
+        MidiAction::BinauralToggle => {
+            connected.spectrum.set_binaural(!connected.spectrum.binaural());
+        }
+        MidiAction::SnbToggle => {
+            connected.spectrum.set_snb(!connected.spectrum.snb());
+        }
+        MidiAction::Band160m
+        | MidiAction::Band80m
+        | MidiAction::Band40m
+        | MidiAction::Band30m
+        | MidiAction::Band20m
+        | MidiAction::Band17m
+        | MidiAction::Band15m
+        | MidiAction::Band12m
+        | MidiAction::Band10m
+        | MidiAction::Band6m => {
+            // BANDS is [160m, 80m, 60m, 40m, 30m, 20m, 17m, 15m, 12m,
+            // 10m, 6m] -- 60m has no direct-select MIDI action (none of
+            // this project's Thetis-import table entries asked for one;
+            // BandUp/BandDown already reach it).
+            let band = match binding.action {
+                MidiAction::Band160m => &BANDS[0],
+                MidiAction::Band80m => &BANDS[1],
+                MidiAction::Band40m => &BANDS[3],
+                MidiAction::Band30m => &BANDS[4],
+                MidiAction::Band20m => &BANDS[5],
+                MidiAction::Band17m => &BANDS[6],
+                MidiAction::Band15m => &BANDS[7],
+                MidiAction::Band12m => &BANDS[8],
+                MidiAction::Band10m => &BANDS[9],
+                MidiAction::Band6m => &BANDS[10],
+                _ => unreachable!(),
+            };
+            // Same reachability guard as the on-screen band-button row
+            // and MidiAction::BandUp/BandDown just above -- e.g. never
+            // jump to 6m on a HermesLite/HermesLite2.
+            if (band.low_hz as u64) >= connected.device.frequency_min
+                && band.high_hz as u64 <= connected.device.frequency_max
+            {
+                apply_band(connected, band);
+            }
+        }
         MidiAction::NoiseBlankerCycle => {
             connected.spectrum.set_noise_blanker(connected.spectrum.noise_blanker().next());
         }
@@ -682,6 +781,13 @@ fn dispatch_midi_event(connected: &mut ConnectedState, ev: RawMidiEvent, freq_hz
         MidiAction::AfGain => {
             let db = midi_knob_range(ev.value, -100.0, 18.0);
             connected.spectrum.set_gain(10f32.powf(db as f32 / 20.0));
+        }
+        MidiAction::AgcGain => {
+            // Same range/call as the main window's own AGC Gain slider
+            // (see its doc comment -- WDSP's SetRXAAGCTop, "Top" in
+            // Settings -> RX under a different name).
+            let agc_top_db = midi_knob_range(ev.value, 0.0, 140.0);
+            connected.spectrum.set_agc_top_db(agc_top_db);
         }
         MidiAction::MicGain => {
             if connected.tx_enabled && connected.tx_handle.is_some() {
@@ -1008,6 +1114,18 @@ struct ConnectedState {
     /// Settings -> MIDI's "learn mode" scratch state -- UI-only, never
     /// persisted (see MidiLearnState's own doc comment).
     midi_learn: MidiLearnState,
+    /// Rate-limits midi::dispatch_midi_event's "unmatched" stderr
+    /// diagnostic -- see that function's own doc comment. `None` until
+    /// the first unmatched event; UI-only/transient, never persisted.
+    midi_unmatched_last_logged: Option<Instant>,
+    /// Result summary of the last "Import Thetis Midi2Cat XML..." click
+    /// (see midi_import.rs) -- shown right under that button rather than
+    /// via ConnectedState::status_message, since that's rendered on the
+    /// main window's toolbar and this action happens entirely inside the
+    /// Settings window; a user watching the button they just clicked
+    /// would otherwise miss it. UI-only, never persisted. `None` shows
+    /// nothing; overwritten by the next import attempt.
+    midi_import_message: Option<String>,
     /// Per-Wheel-binding rate limiting -- see MidiBinding::debounce_ms's
     /// doc comment. Keyed by the binding's own identity (event/channel/
     /// number, the same fields MidiBinding::matches compares), not its
@@ -2120,6 +2238,8 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                 midi,
                 midi_bindings,
                 midi_learn: MidiLearnState::default(),
+                midi_unmatched_last_logged: None,
+                midi_import_message: None,
                 midi_wheel_last_step: std::collections::HashMap::new(),
                 audio_output,
                 audio_output_device,
@@ -2861,8 +2981,25 @@ impl eframe::App for HpsdrApp {
                 // scale, but real multi-Hz-wide voice/digital-mode audio
                 // visibly spreads when relabeled onto the wrong (usually
                 // much wider) span.
+                //
+                // BUG FIX (2026-09-17, real-hardware report): this only
+                // special-cased protocol 2, leaving protocol 1 with
+                // exactly the bug described above -- tx_spectrum is
+                // ALWAYS opened at `duc_rate` (see this same `if
+                // device.protocol == 2 { 192_000 } else { 48_000 }`
+                // formula at this function's own tx_spectrum construction
+                // site above), so P1's TX analyzer is a fixed 48kHz span,
+                // never the RX ADC rate. Confirmed via a real WSJT-X/TCI
+                // transmission on a P1 Orion2: a genuine 2825Hz TCI audio
+                // tone (dial+2825Hz) was measured landing ~4x too far
+                // right on screen (~11.4kHz from dial) at a 192kHz RX
+                // rate -- exactly the 192000/48000 ratio this mismatch
+                // predicts, and exactly why the filter passband overlay
+                // (computed independently, correctly, from dial+mode
+                // width) looked "wrong" -- it was correct; the signal
+                // trace was mislabeled onto 4x too wide an axis.
                 let sample_rate = if transmitting {
-                    if connected.device.protocol == 2 { 192_000 } else { sample_rate }
+                    if connected.device.protocol == 2 { 192_000 } else { 48_000 }
                 } else {
                     sample_rate
                 };
@@ -5833,64 +5970,148 @@ impl eframe::App for HpsdrApp {
                                     ui.separator();
                                     ui.add_space(8.0);
 
-                                    ui.label("Bindings:");
+                                    ui.horizontal(|ui| {
+                                        ui.label("Bindings:");
+                                        if ui
+                                            .button("Import Thetis Midi2Cat XML...")
+                                            .on_hover_text(
+                                                "Import bindings from a Thetis \"Midi2Cat\" XML export \
+                                                 (Settings -> CAT/Midi -> Save As in Thetis). Only \
+                                                 controls whose assigned CAT command has a matching \
+                                                 hpsdr-rs action of the same kind (button/knob/wheel) \
+                                                 import -- see the summary shown after for what was \
+                                                 skipped and why.",
+                                            )
+                                            .clicked()
+                                        {
+                                            if let Some(path) =
+                                                rfd::FileDialog::new().add_filter("XML", &["xml"]).pick_file()
+                                            {
+                                                match std::fs::read_to_string(&path) {
+                                                    Ok(xml) => match midi_import::import_thetis_midi2cat(&xml) {
+                                                        Ok(result) => {
+                                                            // Replace any existing binding on the exact same
+                                                            // raw control (event+channel+number) rather than
+                                                            // add a duplicate that would never fire (the
+                                                            // first match in midi_bindings wins, per
+                                                            // dispatch_midi_event's own .find() lookup) --
+                                                            // same "re-importing updates in place" behavior
+                                                            // as Learn mode's own Add/Update button.
+                                                            for imported in result.imported() {
+                                                                if let Some(existing) =
+                                                                    connected.midi_bindings.iter_mut().find(|b| {
+                                                                        b.event == imported.event
+                                                                            && b.channel == imported.channel
+                                                                            && b.number == imported.number
+                                                                    })
+                                                                {
+                                                                    *existing = *imported;
+                                                                } else {
+                                                                    connected.midi_bindings.push(*imported);
+                                                                }
+                                                            }
+                                                            let skipped: Vec<String> = result
+                                                                .outcomes
+                                                                .iter()
+                                                                .filter_map(|o| {
+                                                                    o.result.as_ref().err().map(|reason| {
+                                                                        format!("{}: {reason}", o.control_name)
+                                                                    })
+                                                                })
+                                                                .collect();
+                                                            let mut msg = format!(
+                                                                "Imported {} binding(s), skipped {}",
+                                                                result.imported_count(),
+                                                                result.skipped_count()
+                                                            );
+                                                            if !skipped.is_empty() {
+                                                                msg.push_str(" (");
+                                                                msg.push_str(&skipped.join("; "));
+                                                                msg.push(')');
+                                                            }
+                                                            connected.midi_import_message = Some(msg);
+                                                            settings_changed = true;
+                                                        }
+                                                        Err(e) => {
+                                                            connected.midi_import_message =
+                                                                Some(format!("Import failed: {e}"));
+                                                        }
+                                                    },
+                                                    Err(e) => {
+                                                        connected.midi_import_message =
+                                                            Some(format!("Couldn't read {}: {e}", path.display()));
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    });
+                                    if let Some(msg) = &connected.midi_import_message {
+                                        ui.weak(msg);
+                                    }
                                     if connected.midi_bindings.is_empty() {
                                         ui.weak("No bindings yet -- use Learn above to add one.");
                                     } else {
                                         let mut delete_index = None;
                                         let mut edit_request = None;
-                                        egui::Grid::new("midi_bindings_grid").striped(true).show(ui, |ui| {
-                                            ui.label("Event");
-                                            ui.label("Channel");
-                                            ui.label("Number");
-                                            ui.label("Type");
-                                            ui.label("Action");
-                                            ui.label("Momentary");
-                                            ui.label("Sensitivity");
-                                            ui.label("Rate Limit");
-                                            ui.label("");
-                                            ui.end_row();
-                                            for (i, binding) in connected.midi_bindings.iter().enumerate() {
-                                                let event_label = match binding.event {
-                                                    MidiEventKind::NoteKey => "Note",
-                                                    MidiEventKind::ControlChange => "CC",
-                                                    MidiEventKind::PitchBend => "Pitch Bend",
-                                                };
-                                                ui.label(event_label);
-                                                ui.label(
-                                                    binding
-                                                        .channel
-                                                        .map(|c| (c + 1).to_string())
-                                                        .unwrap_or_else(|| "Any".to_string()),
-                                                );
-                                                ui.label(binding.number.to_string());
-                                                ui.label(match binding.kind {
-                                                    MidiBindingKind::Key => "Key",
-                                                    MidiBindingKind::Knob => "Knob",
-                                                    MidiBindingKind::Wheel => "Wheel",
-                                                });
-                                                ui.label(midi_action_label(binding.action, connected));
-                                                ui.label(if binding.momentary { "Yes" } else { "" });
-                                                ui.label(if binding.kind == MidiBindingKind::Wheel {
-                                                    format!("{:.2}", binding.sensitivity)
-                                                } else {
-                                                    String::new()
-                                                });
-                                                ui.label(if binding.kind == MidiBindingKind::Wheel {
-                                                    format!("{} ms", binding.debounce_ms)
-                                                } else {
-                                                    String::new()
-                                                });
-                                                ui.horizontal(|ui| {
-                                                    if ui.small_button("Edit").clicked() {
-                                                        edit_request = Some((i, *binding));
-                                                    }
-                                                    if ui.small_button("Delete").clicked() {
-                                                        delete_index = Some(i);
-                                                    }
-                                                });
+                                        // Scrollable -- a real report: with enough bindings
+                                        // (e.g. after importing a Thetis Midi2Cat XML, see
+                                        // midi_import.rs) this grid grew taller than the
+                                        // Settings window, pushing later rows off-screen
+                                        // with no way to reach them.
+                                        egui::ScrollArea::vertical().max_height(300.0).show(ui, |ui| {
+                                            egui::Grid::new("midi_bindings_grid").striped(true).show(ui, |ui| {
+                                                ui.label("Event");
+                                                ui.label("Channel");
+                                                ui.label("Number");
+                                                ui.label("Type");
+                                                ui.label("Action");
+                                                ui.label("Momentary");
+                                                ui.label("Sensitivity");
+                                                ui.label("Rate Limit");
+                                                ui.label("");
                                                 ui.end_row();
-                                            }
+                                                for (i, binding) in connected.midi_bindings.iter().enumerate() {
+                                                    let event_label = match binding.event {
+                                                        MidiEventKind::NoteKey => "Note",
+                                                        MidiEventKind::ControlChange => "CC",
+                                                        MidiEventKind::PitchBend => "Pitch Bend",
+                                                    };
+                                                    ui.label(event_label);
+                                                    ui.label(
+                                                        binding
+                                                            .channel
+                                                            .map(|c| (c + 1).to_string())
+                                                            .unwrap_or_else(|| "Any".to_string()),
+                                                    );
+                                                    ui.label(binding.number.to_string());
+                                                    ui.label(match binding.kind {
+                                                        MidiBindingKind::Key => "Key",
+                                                        MidiBindingKind::Knob => "Knob",
+                                                        MidiBindingKind::Wheel => "Wheel",
+                                                    });
+                                                    ui.label(midi_action_label(binding.action, connected));
+                                                    ui.label(if binding.momentary { "Yes" } else { "" });
+                                                    ui.label(if binding.kind == MidiBindingKind::Wheel {
+                                                        format!("{:.2}", binding.sensitivity)
+                                                    } else {
+                                                        String::new()
+                                                    });
+                                                    ui.label(if binding.kind == MidiBindingKind::Wheel {
+                                                        format!("{} ms", binding.debounce_ms)
+                                                    } else {
+                                                        String::new()
+                                                    });
+                                                    ui.horizontal(|ui| {
+                                                        if ui.small_button("Edit").clicked() {
+                                                            edit_request = Some((i, *binding));
+                                                        }
+                                                        if ui.small_button("Delete").clicked() {
+                                                            delete_index = Some(i);
+                                                        }
+                                                    });
+                                                    ui.end_row();
+                                                }
+                                            });
                                         });
                                         if let Some((i, binding)) = edit_request {
                                             connected.midi_learn = MidiLearnState {

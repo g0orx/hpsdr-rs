@@ -1628,6 +1628,21 @@ pub struct SpectrumHandle {
     /// start()/stop() forwarding methods here.
     pub recorder: AudioRecorder,
     demod_params: Arc<Mutex<DemodParams>>,
+    /// The IQ input queue run()'s analyzer thread consumes from -- kept
+    /// here too (not just inside that thread) so clear_display can drain
+    /// it. BUG FIX (2026-09-17, real report on tx_spectrum): clearing
+    /// `display` alone left a backlog of already-queued-but-not-yet-FFT'd
+    /// IQ samples from the *previous* transmission sitting in this queue;
+    /// run()'s loop is a plain FIFO consumer with no notion of "a fresh
+    /// PTT happened, discard anything older than this", so it kept
+    /// processing that stale backlog for a few more frames after
+    /// clear_display() reset `display` -- visible on WSJT-X's Tune as a
+    /// brief flash of the OLD tune signal, a blank gap while clear_display
+    /// won that race, then the NEW signal starting a moment later once
+    /// the backlog finally drained. Clearing this queue alongside
+    /// `display` removes the backlog outright instead of waiting for it
+    /// to drain.
+    iq_buffer: Arc<Mutex<VecDeque<IqSample>>>,
     /// WDSP analyzer channel this handle's run() thread opened -- kept
     /// here too (not just inside that thread) so clear_display can
     /// reach the same WDSP display state from the UI thread. Analyzer
@@ -1679,6 +1694,7 @@ impl SpectrumHandle {
         let cw_decode_enabled = Arc::new(AtomicBool::new(true));
         let recorder = AudioRecorder::new();
         let stop = Arc::new(AtomicBool::new(false));
+        let iq_buffer_for_clear = Arc::clone(&iq_buffer);
         let thread = {
             let display = Arc::clone(&display);
             let demod_params = Arc::clone(&demod_params);
@@ -1721,6 +1737,7 @@ impl SpectrumHandle {
             cw_decode_enabled,
             recorder,
             demod_params,
+            iq_buffer: iq_buffer_for_clear,
             channel,
             stop,
             thread: Some(thread),
@@ -1738,23 +1755,31 @@ impl SpectrumHandle {
     /// rate -- see that constant's own doc comment) nor WDSP's own
     /// AVERAGE_MODE_LOG_RECURSIVE
     /// accumulator get reset just because a new PTT began.
-    /// SetDisplayAverageMode's own C source (analyzer.c) only resets
-    /// its internal av_sum accumulator when the mode value actually
-    /// *changes* (`if (a->av_mode[pixout] != mode)`) -- so this
-    /// toggles away to AVERAGE_MODE_NONE and back to force that reset
-    /// rather than calling it once with the same mode, which would be
-    /// a no-op.
+    ///
+    /// BUG FIX (2026-09-17, real report): this used to toggle
+    /// SetDisplayAverageMode away to AVERAGE_MODE_NONE and back (its own
+    /// C source only resets av_sum when the mode value actually
+    /// *changes*) instead of calling a dedicated reset. That only ever
+    /// reset the pixel-averaging accumulator, not WDSP's raw-sample
+    /// accumulation state (have_samples/IQin_index/IQout_index/
+    /// buff_ready in analyzer.c) that the next FFT window gets built
+    /// from -- so even with `iq_buffer` cleared above, WDSP's analyzer
+    /// could still have some of the ending transmission's raw samples
+    /// already latched into its in-progress FFT window, producing one
+    /// or two more frames that were part old/part new before genuinely
+    /// fresh samples fully displaced them. Confirmed real: clearing
+    /// iq_buffer (this fix) plus clearing tx_spectrum_iq in tx.rs's own
+    /// mox-off handling (see run()'s doc comment there) both landed and
+    /// the stale-signal flash was STILL visible. `ResetPixelBuffers`
+    /// (WDSP 2.10.2, see wdsp_sys::ResetPixelBuffers's own doc comment)
+    /// is the real, dedicated reset for exactly this: pixel/average
+    /// buffers AND the raw-sample accumulation state together, in one
+    /// call, with no toggle trick needed.
     pub fn clear_display(&self) {
         *self.display.lock().unwrap() = SpectrumDisplay::default();
+        self.iq_buffer.lock().unwrap().clear();
         unsafe {
-            for pixout in 0..2 {
-                wdsp::SetDisplayAverageMode(self.channel, pixout, wdsp::AVERAGE_MODE_NONE as c_int);
-                wdsp::SetDisplayAverageMode(
-                    self.channel,
-                    pixout,
-                    wdsp::AVERAGE_MODE_LOG_RECURSIVE as c_int,
-                );
-            }
+            wdsp::ResetPixelBuffers(self.channel);
         }
     }
 

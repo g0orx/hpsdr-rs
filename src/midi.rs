@@ -131,6 +131,7 @@ pub enum MidiAction {
     NoiseBlankerCycle,
     NoiseReductionCycle,
     AfGain,
+    AgcGain,
     MicGain,
     RfAttenuation,
     TxDrive,
@@ -139,6 +140,22 @@ pub enum MidiAction {
     VfoTune,
     RitAdjust,
     XitAdjust,
+    VfoBTune,
+    CtunToggle,
+    RxEqToggle,
+    DiversityToggle,
+    BinauralToggle,
+    SnbToggle,
+    Band160m,
+    Band80m,
+    Band40m,
+    Band30m,
+    Band20m,
+    Band17m,
+    Band15m,
+    Band12m,
+    Band10m,
+    Band6m,
 }
 
 impl MidiAction {
@@ -165,6 +182,7 @@ impl MidiAction {
             MidiAction::NoiseBlankerCycle => "Noise Blanker Cycle",
             MidiAction::NoiseReductionCycle => "Noise Reduction Cycle",
             MidiAction::AfGain => "AF Gain",
+            MidiAction::AgcGain => "AGC Gain",
             MidiAction::MicGain => "Mic Gain",
             MidiAction::RfAttenuation => "RF Attenuation",
             MidiAction::TxDrive => "TX Drive",
@@ -173,6 +191,22 @@ impl MidiAction {
             MidiAction::VfoTune => "VFO Tune",
             MidiAction::RitAdjust => "RIT Adjust",
             MidiAction::XitAdjust => "XIT Adjust",
+            MidiAction::VfoBTune => "VFO B Tune",
+            MidiAction::CtunToggle => "CTUN On/Off",
+            MidiAction::RxEqToggle => "RX Equalizer On/Off",
+            MidiAction::DiversityToggle => "Diversity On/Off",
+            MidiAction::BinauralToggle => "Binaural On/Off",
+            MidiAction::SnbToggle => "Spectral Noise Blanker On/Off",
+            MidiAction::Band160m => "Band 160m",
+            MidiAction::Band80m => "Band 80m",
+            MidiAction::Band40m => "Band 40m",
+            MidiAction::Band30m => "Band 30m",
+            MidiAction::Band20m => "Band 20m",
+            MidiAction::Band17m => "Band 17m",
+            MidiAction::Band15m => "Band 15m",
+            MidiAction::Band12m => "Band 12m",
+            MidiAction::Band10m => "Band 10m",
+            MidiAction::Band6m => "Band 6m",
         }
     }
 }
@@ -199,11 +233,27 @@ pub const KEY_ACTIONS: &[MidiAction] = &[
     MidiAction::VfoStepDown,
     MidiAction::NoiseBlankerCycle,
     MidiAction::NoiseReductionCycle,
+    MidiAction::CtunToggle,
+    MidiAction::RxEqToggle,
+    MidiAction::DiversityToggle,
+    MidiAction::BinauralToggle,
+    MidiAction::SnbToggle,
+    MidiAction::Band160m,
+    MidiAction::Band80m,
+    MidiAction::Band40m,
+    MidiAction::Band30m,
+    MidiAction::Band20m,
+    MidiAction::Band17m,
+    MidiAction::Band15m,
+    MidiAction::Band12m,
+    MidiAction::Band10m,
+    MidiAction::Band6m,
 ];
 
 /// Actions valid for a Knob (absolute value) binding.
 pub const KNOB_ACTIONS: &[MidiAction] = &[
     MidiAction::AfGain,
+    MidiAction::AgcGain,
     MidiAction::MicGain,
     MidiAction::RfAttenuation,
     MidiAction::TxDrive,
@@ -212,7 +262,8 @@ pub const KNOB_ACTIONS: &[MidiAction] = &[
 ];
 
 /// Actions valid for a Wheel (relative encoder) binding.
-pub const WHEEL_ACTIONS: &[MidiAction] = &[MidiAction::VfoTune, MidiAction::RitAdjust, MidiAction::XitAdjust];
+pub const WHEEL_ACTIONS: &[MidiAction] =
+    &[MidiAction::VfoTune, MidiAction::RitAdjust, MidiAction::XitAdjust, MidiAction::VfoBTune];
 
 /// How a ControlChange/PitchBend binding's value should be interpreted.
 /// (A Key/Note binding has no ambiguity, so this only matters for CC and

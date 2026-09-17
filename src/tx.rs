@@ -1854,6 +1854,22 @@ fn run(
             mic_buffer.lock().unwrap().clear();
             tci_tx_audio.lock().unwrap().clear();
             radio_mic_audio.lock().unwrap().clear();
+            // BUG FIX (2026-09-17, real report): main.rs's
+            // SpectrumHandle::clear_display already clears tx_spectrum's
+            // own IQ input queue on a fresh PTT, but that's a UI-thread
+            // detection racing THIS thread's own production of new
+            // content -- clearing it here too, right where this thread
+            // itself notices MOX went idle (the same place/reasoning as
+            // the mic/TCI clears above), is authoritative: nothing from
+            // the transmission that just ended can possibly still be
+            // sitting in this queue by the time the next PTT's first
+            // real chunk gets pushed, no matter how the two threads'
+            // timing lines up. Confirmed real: a WSJT-X Tune immediately
+            // followed by hpsdr-rs's own Tune (different frequency
+            // within the filter) briefly showed the PREVIOUS (WSJT-X)
+            // signal on the new Tune's spectrum before the new one
+            // appeared, even after the UI-side clear_display fix.
+            tx_spectrum_iq.lock().unwrap().clear();
             if puresignal_enabled.load(Ordering::Relaxed) {
                 // Same reasoning as the mic/TCI clears above -- a
                 // feedback backlog from before this idle period is
