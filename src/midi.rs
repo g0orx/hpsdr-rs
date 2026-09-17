@@ -156,6 +156,13 @@ pub enum MidiAction {
     Band12m,
     Band10m,
     Band6m,
+    NoiseBlankerOff,
+    NoiseBlankerNb,
+    NoiseBlankerNb2,
+    NoiseReductionOff,
+    NoiseReductionNr,
+    NoiseReductionNr2,
+    NoiseReductionNr3,
 }
 
 impl MidiAction {
@@ -207,6 +214,13 @@ impl MidiAction {
             MidiAction::Band12m => "Band 12m",
             MidiAction::Band10m => "Band 10m",
             MidiAction::Band6m => "Band 6m",
+            MidiAction::NoiseBlankerOff => "Noise Blanker: Off",
+            MidiAction::NoiseBlankerNb => "Noise Blanker: NB",
+            MidiAction::NoiseBlankerNb2 => "Noise Blanker: NB2",
+            MidiAction::NoiseReductionOff => "Noise Reduction: Off",
+            MidiAction::NoiseReductionNr => "Noise Reduction: NR",
+            MidiAction::NoiseReductionNr2 => "Noise Reduction: NR2",
+            MidiAction::NoiseReductionNr3 => "Noise Reduction: NNR",
         }
     }
 }
@@ -248,6 +262,13 @@ pub const KEY_ACTIONS: &[MidiAction] = &[
     MidiAction::Band12m,
     MidiAction::Band10m,
     MidiAction::Band6m,
+    MidiAction::NoiseBlankerOff,
+    MidiAction::NoiseBlankerNb,
+    MidiAction::NoiseBlankerNb2,
+    MidiAction::NoiseReductionOff,
+    MidiAction::NoiseReductionNr,
+    MidiAction::NoiseReductionNr2,
+    MidiAction::NoiseReductionNr3,
 ];
 
 /// Actions valid for a Knob (absolute value) binding.

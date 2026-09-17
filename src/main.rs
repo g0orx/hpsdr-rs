@@ -778,6 +778,18 @@ fn dispatch_midi_event(connected: &mut ConnectedState, ev: RawMidiEvent, freq_hz
         MidiAction::NoiseReductionCycle => {
             connected.spectrum.set_noise_reduction(connected.spectrum.noise_reduction().next());
         }
+        // Direct-select alternatives to the Cycle actions above -- mutually
+        // exclusive (only one NB/NR state active at a time, same as the
+        // Cycle actions and the on-screen NB/NR buttons), but each bound
+        // to its own control instead of sharing one "step to the next
+        // state" button -- e.g. three pads on a controller, one per state.
+        MidiAction::NoiseBlankerOff => connected.spectrum.set_noise_blanker(spectrum::NoiseBlanker::Off),
+        MidiAction::NoiseBlankerNb => connected.spectrum.set_noise_blanker(spectrum::NoiseBlanker::Nb),
+        MidiAction::NoiseBlankerNb2 => connected.spectrum.set_noise_blanker(spectrum::NoiseBlanker::Nb2),
+        MidiAction::NoiseReductionOff => connected.spectrum.set_noise_reduction(spectrum::NoiseReduction::Off),
+        MidiAction::NoiseReductionNr => connected.spectrum.set_noise_reduction(spectrum::NoiseReduction::Nr),
+        MidiAction::NoiseReductionNr2 => connected.spectrum.set_noise_reduction(spectrum::NoiseReduction::Nr2),
+        MidiAction::NoiseReductionNr3 => connected.spectrum.set_noise_reduction(spectrum::NoiseReduction::Nr3),
         MidiAction::AfGain => {
             let db = midi_knob_range(ev.value, -100.0, 18.0);
             connected.spectrum.set_gain(10f32.powf(db as f32 / 20.0));
