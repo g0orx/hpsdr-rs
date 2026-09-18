@@ -3477,58 +3477,101 @@ impl eframe::App for HpsdrApp {
                         }
                     });
 
-                    ui.horizontal_wrapped(|ui| {
-                        ui.label("Audio gain:");
-                        let mut gain = current_gain;
-                        // ROOT CAUSE FIX: max raised from 1.5 -- a real
-                        // report needed more than that even with the
-                        // system output already at 100%/0dB (pavucontrol).
-                        // WDSP's RXA output level is apparently on the
-                        // conservative side for this radio/setup, and
-                        // this is a plain linear multiply against that
-                        // sample before the -1.0..1.0 clamp (see
-                        // spectrum.rs's run()), so there's no correctness
-                        // reason to cap it as low as 1.5 -- just headroom.
-                        // Displayed/dragged in dB (see scroll_slider_f32_db's
-                        // doc comment) -- +18dB ceiling matches the old
-                        // 8.0 linear max; -100dB floor is effectively
-                        // silent (0.00001 linear) while still being a
-                        // finite, draggable slider position.
-                        if scroll_slider_f32_db(
-                            ui,
-                            &mut connected.slider_scroll_accum,
-                            &mut gain,
-                            -100.0,
-                            18.0,
-                            1.0,
-                        ) {
-                            connected.spectrum.set_gain(gain);
-                            settings_changed = true;
-                        }
+                    ui.scope(|ui| {
+                        // Reserve room for the S-meter/Settings/Add
+                        // Receiver column -- a separately-positioned
+                        // egui::Area anchored to the window's top-right
+                        // corner (see "s_meter_area"'s own comment
+                        // further down), not part of this normal layout
+                        // flow at all. BUG FIX for a real report: TX
+                        // Power (the last, rightmost slider in this row)
+                        // could end up positioned exactly where that
+                        // Area sits at some window widths -- and since
+                        // the Area is a separate UI layer drawn after
+                        // this content, it silently captured clicks/
+                        // scroll meant for whatever was underneath, with
+                        // no visible sign anything was wrong. Resizing
+                        // the window (changing how many lines the rows
+                        // above this one wrap to, shifting this row's Y)
+                        // was the only way to dodge the collision before
+                        // this fix -- reserving width here instead makes
+                        // this row wrap BEFORE ever reaching under that
+                        // Area, at any window size. 220px comfortably
+                        // covers the Area's own ~180px-wide content (the
+                        // meter, and "Add Receiver (N/N)", its widest
+                        // button label) plus its -10px right margin and
+                        // a visible gap.
+                        ui.set_max_width((ui.available_width() - 220.0).max(0.0));
+                        ui.horizontal_wrapped(|ui| {
+                        // Each label+slider pair below is its own nested
+                        // ui.horizontal (not just a label call followed by
+                        // a slider call directly in the outer
+                        // horizontal_wrapped) -- BUG FIX for a real report:
+                        // horizontal_wrapped wraps at the granularity of
+                        // its own direct children, so without this
+                        // nesting, a label and its slider are two SEPARATE
+                        // wrap units and can end up split across two
+                        // lines at a narrow window width (e.g. "TX Power:"
+                        // staying on the line above while its slider wraps
+                        // down alone) -- clearly broken-looking, and
+                        // confusing about which slider a wrapped-down
+                        // label even belongs to. Nesting them means the
+                        // whole pair wraps together as one atomic unit.
+                        ui.horizontal(|ui| {
+                            ui.label("Audio gain:");
+                            let mut gain = current_gain;
+                            // ROOT CAUSE FIX: max raised from 1.5 -- a real
+                            // report needed more than that even with the
+                            // system output already at 100%/0dB (pavucontrol).
+                            // WDSP's RXA output level is apparently on the
+                            // conservative side for this radio/setup, and
+                            // this is a plain linear multiply against that
+                            // sample before the -1.0..1.0 clamp (see
+                            // spectrum.rs's run()), so there's no correctness
+                            // reason to cap it as low as 1.5 -- just headroom.
+                            // Displayed/dragged in dB (see scroll_slider_f32_db's
+                            // doc comment) -- +18dB ceiling matches the old
+                            // 8.0 linear max; -100dB floor is effectively
+                            // silent (0.00001 linear) while still being a
+                            // finite, draggable slider position.
+                            if scroll_slider_f32_db(
+                                ui,
+                                &mut connected.slider_scroll_accum,
+                                &mut gain,
+                                -100.0,
+                                18.0,
+                                1.0,
+                            ) {
+                                connected.spectrum.set_gain(gain);
+                                settings_changed = true;
+                            }
+                        });
 
                         if connected.tx_enabled {
                             if connected.tx_handle.is_some() {
                                 ui.add_space(12.0);
-                                ui.label("Mic gain:");
-                                let mut mic_gain = connected.mic_gain;
-                                // Displayed/dragged in dB (see
-                                // scroll_slider_f32_db's doc comment) --
-                                // +6dB ceiling matches the old 2.0 linear
-                                // max, -60dB floor matches Audio gain's own.
-                                if scroll_slider_f32_db(
-                                    ui,
-                                    &mut connected.slider_scroll_accum,
-                                    &mut mic_gain,
-                                    -60.0,
-                                    6.0,
-                                    1.0,
-                                ) {
-                                    connected.mic_gain = mic_gain;
-                                    if let Some(tx) = &connected.tx_handle {
-                                        tx.set_mic_gain(mic_gain);
+                                ui.horizontal(|ui| {
+                                    ui.label("Mic gain:");
+                                    let mut mic_gain = connected.mic_gain;
+                                    // Displayed/dragged in dB (see
+                                    // scroll_slider_f32_db's doc comment) --
+                                    // +6dB ceiling matches the old 2.0 linear
+                                    // max, -60dB floor matches Audio gain's own.
+                                    if scroll_slider_f32_db(
+                                        ui,
+                                        &mut connected.slider_scroll_accum,
+                                        &mut mic_gain,
+                                        -60.0,
+                                        6.0,
+                                        1.0,
+                                    ) {
+                                        connected.mic_gain = mic_gain;
+                                        if let Some(tx) = &connected.tx_handle {
+                                            tx.set_mic_gain(mic_gain);
+                                        }
+                                        settings_changed = true;
                                     }
-                                    settings_changed = true;
-                                }
+                                });
 
                                 // Separate from Mic gain above -- a real
                                 // test against WSJT-X found its TCI TX
@@ -3546,20 +3589,22 @@ impl eframe::App for HpsdrApp {
                                 // max exactly, -60dB floor matches Audio
                                 // gain's own.
                                 ui.add_space(12.0);
-                                ui.label("TCI TX gain:");
-                                let mut tci_tx_gain = connected.tci_tx_gain;
-                                if scroll_slider_f32_db(
-                                    ui,
-                                    &mut connected.slider_scroll_accum,
-                                    &mut tci_tx_gain,
-                                    -60.0,
-                                    60.0,
-                                    1.0,
-                                ) {
-                                    connected.tci_tx_gain = tci_tx_gain;
-                                    *connected.session.tci_tx_gain.lock().unwrap() = tci_tx_gain;
-                                    settings_changed = true;
-                                }
+                                ui.horizontal(|ui| {
+                                    ui.label("TCI TX gain:");
+                                    let mut tci_tx_gain = connected.tci_tx_gain;
+                                    if scroll_slider_f32_db(
+                                        ui,
+                                        &mut connected.slider_scroll_accum,
+                                        &mut tci_tx_gain,
+                                        -60.0,
+                                        60.0,
+                                        1.0,
+                                    ) {
+                                        connected.tci_tx_gain = tci_tx_gain;
+                                        *connected.session.tci_tx_gain.lock().unwrap() = tci_tx_gain;
+                                        settings_changed = true;
+                                    }
+                                });
                             }
                             // Neither protocol's wire-level drive byte is
                             // linear with actual output watts on real
@@ -3577,39 +3622,42 @@ impl eframe::App for HpsdrApp {
                             // real wattmeter reading the way P1's watts
                             // slider already could.
                             ui.add_space(12.0);
-                            ui.label("TX Power:");
-                            // Adjustable during Tune too, not just
-                            // normal TX -- Tune Power only sets the
-                            // starting reduced level when TUNE is
-                            // pressed (see the Tune button handler), it
-                            // doesn't keep re-enforcing a ratio, so
-                            // adjusting here works exactly like normal
-                            // operation while tuning.
-                            let mut watts =
-                                connected.session.tx_power_watts.load(Ordering::Relaxed) as i32;
-                            if scroll_slider_i32(
-                                ui,
-                                &mut connected.slider_scroll_accum,
-                                &mut watts,
-                                0..=connected.max_tx_power_watts as i32,
-                                1,
-                                "W",
-                            ) {
-                                connected.session.tx_power_watts.store(watts as u32, Ordering::Relaxed);
-                                settings_changed = true;
-                                // A manual adjustment while Tune is active is
-                                // a real, intentional power change (e.g.
-                                // gradually raising drive while watching SWR
-                                // on an antenna tuner) -- it should stick
-                                // when Tune ends, not get silently discarded
-                                // by the Tune button's restore-previous-value
-                                // logic. Clearing pre_tune_power_watts makes
-                                // that restore a no-op.
-                                if connected.tune_active || connected.two_tone_active {
-                                    connected.pre_tune_power_watts = None;
+                            ui.horizontal(|ui| {
+                                ui.label("TX Power:");
+                                // Adjustable during Tune too, not just
+                                // normal TX -- Tune Power only sets the
+                                // starting reduced level when TUNE is
+                                // pressed (see the Tune button handler), it
+                                // doesn't keep re-enforcing a ratio, so
+                                // adjusting here works exactly like normal
+                                // operation while tuning.
+                                let mut watts =
+                                    connected.session.tx_power_watts.load(Ordering::Relaxed) as i32;
+                                if scroll_slider_i32(
+                                    ui,
+                                    &mut connected.slider_scroll_accum,
+                                    &mut watts,
+                                    0..=connected.max_tx_power_watts as i32,
+                                    1,
+                                    "W",
+                                ) {
+                                    connected.session.tx_power_watts.store(watts as u32, Ordering::Relaxed);
+                                    settings_changed = true;
+                                    // A manual adjustment while Tune is active is
+                                    // a real, intentional power change (e.g.
+                                    // gradually raising drive while watching SWR
+                                    // on an antenna tuner) -- it should stick
+                                    // when Tune ends, not get silently discarded
+                                    // by the Tune button's restore-previous-value
+                                    // logic. Clearing pre_tune_power_watts makes
+                                    // that restore a no-op.
+                                    if connected.tune_active || connected.two_tone_active {
+                                        connected.pre_tune_power_watts = None;
+                                    }
                                 }
-                            }
+                            });
                         }
+                        });
                     });
 
                     // Moved here from Settings -> TX (still shown there
@@ -4670,15 +4718,25 @@ impl eframe::App for HpsdrApp {
                         // WDSP's log-average detector outputs -- real dB,
                         // but not calibrated to absolute dBm since the
                         // analyzer's fscLin/fscHin were left at 0.0.
-                        let num_db_ticks = 4;
-                        for t in 0..=num_db_ticks {
-                            let frac = t as f32 / num_db_ticks as f32;
+                        //
+                        // Snapped to multiples of 10 dB (not equal
+                        // fractions of whatever db_low/db_high happen to
+                        // be) -- BUG FIX for a real report: the old equal-
+                        // fraction spacing produced arbitrary-looking
+                        // labels (e.g. "-2 dB"/"-15 dB"/"-28 dB") instead
+                        // of round, glanceable numbers. Same "nice tick"
+                        // idea as the frequency axis, just a fixed step
+                        // rather than an adaptive one, since 10dB is the
+                        // conventional spectrum-display grid spacing
+                        // regardless of the configured range.
+                        let mut db = (db_low / 10.0).ceil() * 10.0;
+                        while db <= db_high {
+                            let frac = (db - db_low) / range;
                             let y = plot_bottom - frac * plot_height;
                             ui.painter().line_segment(
                                 [egui::pos2(rect.left(), y), egui::pos2(rect.right(), y)],
                                 egui::Stroke::new(1.0, egui::Color32::from_gray(55)),
                             );
-                            let db = db_low + frac * range;
                             ui.painter().text(
                                 egui::pos2(rect.left() + 2.0, y),
                                 egui::Align2::LEFT_TOP,
@@ -4686,6 +4744,7 @@ impl eframe::App for HpsdrApp {
                                 egui::FontId::monospace(10.0),
                                 egui::Color32::GRAY,
                             );
+                            db += 10.0;
                         }
 
                         // Plain full-width bin mapping -- unlike an
@@ -4998,8 +5057,14 @@ impl eframe::App for HpsdrApp {
                 egui::Area::new(egui::Id::new("s_meter_area"))
                     .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-10.0, 10.0))
                     .show(ui, |ui| {
+                        // Height lowered from 110 -- once draw_s_meter's
+                        // Y_SQUASH flattened the arc, 110 left a real gap
+                        // of unused gray background above it; 85 fits the
+                        // flattened gauge with just a little headroom
+                        // (see draw_s_meter's own Y_SQUASH/TOP_MARGIN for
+                        // the actual space math).
                         let (meter_rect, _resp) =
-                            ui.allocate_exact_size(egui::vec2(180.0, 110.0), egui::Sense::hover());
+                            ui.allocate_exact_size(egui::vec2(180.0, 85.0), egui::Sense::hover());
                         if connected.session.mox_active() {
                             let raw_fwd = connected
                                 .session
@@ -5320,7 +5385,7 @@ impl eframe::App for HpsdrApp {
                                 .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-10.0, 10.0))
                                 .show(ui, |ui| {
                                     let (meter_rect, _resp) =
-                                        ui.allocate_exact_size(egui::vec2(180.0, 110.0), egui::Sense::hover());
+                                        ui.allocate_exact_size(egui::vec2(180.0, 85.0), egui::Sense::hover());
                                     draw_s_meter(ui, meter_rect, meter_db);
 
                                     ui.add_space(4.0);
@@ -8929,7 +8994,15 @@ const AUTO_DB_LOW_MIN_EDGE_EXCLUDE: usize = 4;
 /// Per-frame smoothing factor for db_low_auto_smoothed -- same
 /// ballistics pattern as the TX power meter's own SMOOTHING_ALPHA,
 /// just slower (a noise floor should drift, not visibly jump).
-const AUTO_DB_LOW_SMOOTHING_ALPHA: f32 = 0.03;
+///
+/// LOWERED from 0.03 (real report: the trace/noise floor was still
+/// visibly shifting) -- at this app's ~30Hz repaint rate, 0.03 was only
+/// about a 1-second time constant, fast enough to track ordinary
+/// per-frame noise-floor wobble as visible movement rather than a slow
+/// drift. 0.01 stretches that to roughly 3 seconds, closer to "the
+/// floor quietly settles in over a few seconds" than "the display is
+/// visibly moving".
+const AUTO_DB_LOW_SMOOTHING_ALPHA: f32 = 0.01;
 
 /// Draggable divider between the spectrum and waterfall displays.
 /// Updates `ratio` (spectrum's share of their combined height, see
@@ -9637,12 +9710,19 @@ fn draw_s_meter(ui: &mut egui::Ui, rect: egui::Rect, db: f64) {
     // ever changes again.
     const TEXT_ZONE: f32 = 26.0;
     const TOP_MARGIN: f32 = 6.0;
+    // Flattens the arc into a shallow, wide curve (a real commercial
+    // S-meter faceplate's look -- a real reference photo was matched
+    // against) instead of a tall half-moon dome -- applied uniformly
+    // via point_at below, so the arc/ticks/labels/needle all follow the
+    // same flattened curve consistently. 1.0 would be a true semicircle.
+    const Y_SQUASH: f32 = 0.55;
     let center = egui::pos2(rect.center().x, rect.bottom() - TEXT_ZONE);
     // The S9 tick label (closest to straight up, at angle_for_db(S9))
     // is the tallest thing drawn above center -- its label sits at
-    // radius*1.16 from center, so that's what TOP_MARGIN is measured
-    // against, not the bare arc radius itself.
-    let radius = (rect.width() * 0.45).min((rect.height() - TEXT_ZONE - TOP_MARGIN) / 1.16);
+    // radius*1.16*Y_SQUASH from center (the squash applies to its
+    // height same as everything else), so that's what TOP_MARGIN is
+    // measured against, not the bare arc radius itself.
+    let radius = (rect.width() * 0.45).min((rect.height() - TEXT_ZONE - TOP_MARGIN) / (1.16 * Y_SQUASH));
 
     const S9: f64 = -73.0;
     const DB_MIN: f64 = S9 - 54.0; // S0
@@ -9652,44 +9732,64 @@ fn draw_s_meter(ui: &mut egui::Ui, rect: egui::Rect, db: f64) {
         let t = ((v - DB_MIN) / (DB_MAX - DB_MIN)).clamp(0.0, 1.0) as f32;
         std::f32::consts::PI - t * std::f32::consts::PI // left (180deg) to right (0deg)
     };
-    let point_at = |angle: f32, r: f32| -> egui::Pos2 { center + egui::vec2(angle.cos(), -angle.sin()) * r };
+    let point_at = |angle: f32, r: f32| -> egui::Pos2 {
+        center + egui::vec2(angle.cos() * r, -angle.sin() * r * Y_SQUASH)
+    };
 
-    // Face arc
-    let arc: Vec<egui::Pos2> = (0..=60)
-        .map(|i| point_at(std::f32::consts::PI - (i as f32 / 60.0) * std::f32::consts::PI, radius))
-        .collect();
-    painter.add(egui::Shape::line(arc, egui::Stroke::new(2.0, egui::Color32::WHITE)));
+    // Face arc -- two segments, split exactly at S9, so the arc LINE
+    // itself (not just the tick marks) turns red past S9, matching a
+    // real S-meter faceplate's printed scale.
+    let arc_points = |db_start: f64, db_end: f64| -> Vec<egui::Pos2> {
+        (0..=30)
+            .map(|i| point_at(angle_for_db(db_start + (db_end - db_start) * (i as f64 / 30.0)), radius))
+            .collect()
+    };
+    painter.add(egui::Shape::line(arc_points(DB_MIN, S9), egui::Stroke::new(2.0, egui::Color32::WHITE)));
+    painter.add(egui::Shape::line(arc_points(S9, DB_MAX), egui::Stroke::new(2.0, egui::Color32::RED)));
 
-    // S1, S3, S5, S7, S9 ticks (white)
-    for s in [1, 3, 5, 7, 9] {
+    // S1 (labeled "S"), S3, S5, S7, S9 major ticks, white; S2/S4/S6/S8
+    // minor (shorter, unlabeled) ticks in between -- matches a real
+    // faceplate's odd-numbered-major/even-numbered-minor convention.
+    for s in 1..=9 {
         let v = S9 - (9 - s) as f64 * 6.0;
         let angle = angle_for_db(v);
+        let major = s % 2 == 1;
+        let inner = if major { radius * 0.85 } else { radius * 0.92 };
         painter.line_segment(
-            [point_at(angle, radius * 0.85), point_at(angle, radius)],
+            [point_at(angle, inner), point_at(angle, radius)],
             egui::Stroke::new(2.0, egui::Color32::WHITE),
         );
-        painter.text(
-            point_at(angle, radius * 1.16),
-            egui::Align2::CENTER_CENTER,
-            format!("{s}"),
-            egui::FontId::proportional(11.0),
-            egui::Color32::WHITE,
-        );
+        if major {
+            painter.text(
+                point_at(angle, radius * 1.16),
+                egui::Align2::CENTER_CENTER,
+                if s == 1 { "S".to_string() } else { format!("{s}") },
+                egui::FontId::proportional(11.0),
+                egui::Color32::WHITE,
+            );
+        }
     }
-    // +20/+40/+60 over S9 ticks (red zone)
-    for over in [20, 40, 60] {
+    // +10/+30/+60 major (labeled) and +20/+40/+50 minor (unlabeled)
+    // ticks over S9, red zone -- same major/minor treatment as the
+    // S-side above, matching a real faceplate's own (non-uniform)
+    // labeled steps.
+    for over in [10, 20, 30, 40, 50, 60] {
         let angle = angle_for_db(S9 + over as f64);
+        let major = matches!(over, 10 | 30 | 60);
+        let inner = if major { radius * 0.85 } else { radius * 0.92 };
         painter.line_segment(
-            [point_at(angle, radius * 0.85), point_at(angle, radius)],
+            [point_at(angle, inner), point_at(angle, radius)],
             egui::Stroke::new(2.0, egui::Color32::RED),
         );
-        painter.text(
-            point_at(angle, radius * 1.18),
-            egui::Align2::CENTER_CENTER,
-            format!("+{over}"),
-            egui::FontId::proportional(10.0),
-            egui::Color32::RED,
-        );
+        if major {
+            painter.text(
+                point_at(angle, radius * 1.18),
+                egui::Align2::CENTER_CENTER,
+                format!("+{over}"),
+                egui::FontId::proportional(10.0),
+                egui::Color32::RED,
+            );
+        }
     }
 
     // Needle
@@ -9722,20 +9822,25 @@ fn draw_power_meter(ui: &mut egui::Ui, rect: egui::Rect, watts: f32, swr: f32, m
     painter.rect_filled(rect, 4.0, egui::Color32::from_gray(20));
 
     // Same reserved-bottom-space approach as draw_s_meter, and the same
-    // TEXT_ZONE/TOP_MARGIN values -- see its doc comment for why they
-    // exist -- so this gauge ends up the same size, not a smaller one
-    // just because its readout happens to say more.
+    // TEXT_ZONE/TOP_MARGIN/Y_SQUASH values -- see its doc comment for
+    // why they exist -- so this gauge ends up the same size/shape, not
+    // a differently-flattened one just because its readout happens to
+    // say more; the two swap in place of each other while transmitting,
+    // so they need to look like the same gauge family.
     const TEXT_ZONE: f32 = 26.0;
     const TOP_MARGIN: f32 = 6.0;
+    const Y_SQUASH: f32 = 0.55;
     let center = egui::pos2(rect.center().x, rect.bottom() - TEXT_ZONE);
-    let radius = (rect.width() * 0.45).min((rect.height() - TEXT_ZONE - TOP_MARGIN) / 1.16);
+    let radius = (rect.width() * 0.45).min((rect.height() - TEXT_ZONE - TOP_MARGIN) / (1.16 * Y_SQUASH));
 
     let max_watts = max_watts.max(1.0);
     let angle_for_watts = |w: f32| -> f32 {
         let t = (w / max_watts).clamp(0.0, 1.0);
         std::f32::consts::PI - t * std::f32::consts::PI // left (180deg) to right (0deg)
     };
-    let point_at = |angle: f32, r: f32| -> egui::Pos2 { center + egui::vec2(angle.cos(), -angle.sin()) * r };
+    let point_at = |angle: f32, r: f32| -> egui::Pos2 {
+        center + egui::vec2(angle.cos() * r, -angle.sin() * r * Y_SQUASH)
+    };
 
     // Face arc
     let arc: Vec<egui::Pos2> = (0..=60)
@@ -9806,12 +9911,19 @@ fn draw_power_meter(ui: &mut egui::Ui, rect: egui::Rect, watts: f32, swr: f32, m
 }
 
 fn s_meter_label(db: f64, s9: f64) -> String {
-    if db >= s9 {
+    let s_part = if db >= s9 {
         format!("S9+{:.0}", db - s9)
     } else {
         let s = (((db - s9) / 6.0) + 9.0).round().clamp(0.0, 9.0);
         format!("S{s:.0}")
-    }
+    };
+    // dBm alongside the S-unit reading (e.g. "S9 -73dBm") -- `db` is
+    // already the real calibrated dBm value the S-unit scale itself is
+    // derived from (see this function's callers/draw_s_meter's own doc
+    // comment: WDSP's GetRXAMeter(RXA_S_AV)), so no extra conversion is
+    // needed, just formatting it alongside the S-unit for operators who
+    // want the precise reading, not just the S-unit bucket.
+    format!("{s_part} {db:.0}dBm")
 }
 
 /// Inverse of the frequency axis mapping used for the tick labels:
@@ -10392,16 +10504,17 @@ fn render_extra_receiver_ui(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceiver>>) {
         let plot_bottom = rect.bottom() - FREQ_AXIS_MARGIN;
         let plot_height = plot_bottom - rect.top();
 
-        // Power-level gridlines, same treatment as the main window.
-        let num_db_ticks = 4;
-        for t in 0..=num_db_ticks {
-            let frac = t as f32 / num_db_ticks as f32;
+        // Power-level gridlines, same treatment as the main window --
+        // snapped to multiples of 10 dB rather than equal fractions of
+        // db_low/db_high (see that copy's own doc comment for why).
+        let mut db = (db_low / 10.0).ceil() * 10.0;
+        while db <= db_high {
+            let frac = (db - db_low) / range;
             let y = plot_bottom - frac * plot_height;
             ui.painter().line_segment(
                 [egui::pos2(rect.left(), y), egui::pos2(rect.right(), y)],
                 egui::Stroke::new(1.0, egui::Color32::from_gray(55)),
             );
-            let db = db_low + frac * range;
             ui.painter().text(
                 egui::pos2(rect.left() + 2.0, y),
                 egui::Align2::LEFT_TOP,
@@ -10409,6 +10522,7 @@ fn render_extra_receiver_ui(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceiver>>) {
                 egui::FontId::monospace(10.0),
                 egui::Color32::GRAY,
             );
+            db += 10.0;
         }
 
         // Plain full-width bin mapping -- see the main receiver's
