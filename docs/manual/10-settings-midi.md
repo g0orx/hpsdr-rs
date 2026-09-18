@@ -57,7 +57,55 @@ The new binding appears in the table below and takes effect immediately.
 To change an existing binding, click **Edit** on its row (this re-opens
 the same form, with an **Update** button in place of **Add**); click
 **Delete** to remove it. Bindings are saved automatically along with
-every other radio setting -- no separate save step.
+every other radio setting -- no separate save step. The table scrolls
+once it grows past a few rows, so a controller with many mapped
+controls -- or a full import, see below -- stays reachable.
+
+## Importing from Thetis (Midi2Cat XML)
+
+![MIDI import](images/10-midi-import.png)
+
+If you already have a MIDI controller mapped in
+[Thetis](https://github.com/ramdor/Thetis)'s **Midi2Cat** feature, you
+can import that mapping instead of re-learning every control by hand:
+
+1. In Thetis, open **Setup -> MIDI -> Configure MIDI**, then use **Save
+   Mapping As** (in the window that opens, or a device-setup sub-window
+   reached from it) to export your mapping to an XML file.
+2. In hpsdr-rs, click **Import Thetis Midi2Cat XML...** (next to
+   **Bindings:**) and pick that file.
+3. A summary appears underneath the button: how many controls imported,
+   and how many were skipped (with a reason for each).
+
+Not every Thetis command has an hpsdr-rs equivalent, so some controls
+are always expected to be skipped -- e.g. Thetis's absolute-knob RIT
+control has no match here (hpsdr-rs's RIT is wheel/relative-adjust
+only), and anything tied to a Thetis feature hpsdr-rs doesn't have
+(VOX, VFO Lock, a second independent receiver's own AGC/volume) can't
+be imported at all. The skip reason names the specific Thetis command
+so you can tell at a glance whether it's worth re-learning that control
+by hand instead.
+
+Importing a control that's already bound (to the exact same MIDI
+event/channel/number) replaces the existing binding rather than adding
+a duplicate -- safe to re-import the same file, or import a second
+controller's file on top, without cleaning up first.
+
+## Troubleshooting: seeing what a control sends
+
+If a control doesn't do what you expect -- or you're not sure what a
+freshly-imported binding actually maps to on your hardware -- run
+hpsdr-rs from a terminal and watch its output while you move the
+control. Any MIDI message that doesn't match a configured binding
+prints a line like:
+
+```
+midi: unmatched ControlChange channel=0 number=45 value=90
+```
+
+showing exactly what the control sent (event type, channel, CC/note
+number, value), which is often faster than opening **Learn** mode just
+to check.
 
 ## Actions
 
@@ -73,15 +121,24 @@ every other radio setting -- no separate save step.
 | VFO A -> B, VFO B -> A, VFO A/B Swap | Copy or swap VFO frequencies |
 | Mode Up, Mode Down | Cycle through modes |
 | Band Up, Band Down | Cycle through bands |
+| Band 160m ... Band 6m | Jump directly to that band (ten separate actions, one per band from 160m to 6m; there's no direct action for 60m -- use Band Up/Down to reach it). Ignored if the connected radio can't tune that band (e.g. 6m on a HermesLite/HermesLite2) |
 | Filter Width Up, Filter Width Down | Step the filter width |
 | VFO Step Up, VFO Step Down | Nudge the VFO by one tuning step |
-| Noise Blanker Cycle, Noise Reduction Cycle | Cycle through NB/NR states |
+| CTUN On/Off | Toggle Click-to-Tune |
+| RX Equalizer On/Off | Toggle the RX [graphic equalizer](08-equalizer.md) |
+| Diversity On/Off | Toggle [Diversity](07-diversity.md) reception (ignored while PureSignal is enabled -- the two are mutually exclusive) |
+| Binaural On/Off | Toggle binaural (phasing) RX audio |
+| Spectral Noise Blanker On/Off | Toggle the spectral noise blanker |
+| Noise Blanker Cycle, Noise Reduction Cycle | Step through NB/NR states in order (Off -> NB -> NB2 -> Off, and Off -> NR -> NR2 -> NNR -> Off) -- handy for a single button |
+| Noise Blanker: Off, Noise Blanker: NB, Noise Blanker: NB2 | Jump directly to that NB state -- handy for one button per state instead of cycling. These only ever turn a state *on*; pressing the same button again does nothing (it's already there) -- bind "Noise Blanker: Off" to a separate control to turn it back off |
+| Noise Reduction: Off, Noise Reduction: NR, Noise Reduction: NR2, Noise Reduction: NNR | Same idea as the Noise Blanker direct-select actions above, one per NR state |
 
 **Knob** (absolute 0-127 value) actions:
 
 | Action | Effect |
 |---|---|
 | AF Gain | Local speaker/headphone volume |
+| AGC Gain | AGC gain -- the same control as the main window's **AGC Gain** slider (called **Top** in [Settings: RX](15-settings-rx.md#agc-tuning)) |
 | Mic Gain | Microphone input level |
 | RF Attenuation | RX step attenuator (0-31 dB) -- shown as **RF Gain** (-12 to +48 dB) instead when bound while connected to a HermesLite/HermesLite2 over Protocol 1, which has no step attenuator; see [Settings: RX](15-settings-rx.md#rx-attenuation--rx-gain) |
 | TX Drive | Transmit power |
@@ -92,7 +149,8 @@ every other radio setting -- no separate save step.
 
 | Action | Effect |
 |---|---|
-| VFO Tune | Tune the VFO |
+| VFO Tune | Tune the VFO (VFO A, or whichever is active) |
+| VFO B Tune | Tune VFO B directly, without switching to it -- useful for Split operation |
 | RIT Adjust | Nudge the RIT offset |
 | XIT Adjust | Nudge the XIT offset |
 
@@ -105,11 +163,11 @@ speed centered around 64, with no fixed position of its own). hpsdr-rs
 can't tell these apart automatically, so Learn mode asks:
 
 - **Knob (absolute)** -- for a fader, slider, or a knob with a fixed
-  end-to-end travel. Use this for AF Gain, Mic Gain, RF Attenuation/RF
-  Gain, TX Drive, CW Speed, and Filter Width.
+  end-to-end travel. Use this for AF Gain, AGC Gain, Mic Gain, RF
+  Attenuation/RF Gain, TX Drive, CW Speed, and Filter Width.
 - **Wheel (relative)** -- for an endless rotary encoder (no mechanical
   stops) commonly used for jog wheels/VFO knobs. Use this for VFO Tune,
-  RIT Adjust, and XIT Adjust.
+  VFO B Tune, RIT Adjust, and XIT Adjust.
 
 A Note On/Off message (a button) is never ambiguous -- it's always a
 **Key**.

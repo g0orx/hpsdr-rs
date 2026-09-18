@@ -5417,12 +5417,27 @@ impl eframe::App for HpsdrApp {
                             // user manually shrinking the window (or a
                             // future tab addition) degrades to a second
                             // line instead of reproducing this exact cutoff.
-                            .with_inner_size([1100.0, 700.0])
-                            // Same "keep the window from getting buried
-                            // behind other windows" reasoning as the
-                            // discovery window -- see its own doc
-                            // comment on window_level.
-                            .with_window_level(egui::WindowLevel::AlwaysOnTop),
+                            // No .with_window_level(AlwaysOnTop) here --
+                            // REMOVED (2026-09-18, real report). Unlike
+                            // the discovery window (which has its own
+                            // confirmed report of getting buried behind
+                            // a terminal/browser during a long
+                            // unattended wait -- see its own doc comment
+                            // on window_level), this was applied to
+                            // Settings by analogy, not its own report,
+                            // and Settings is something the user is
+                            // actively working in rather than leaving
+                            // open in the background. AlwaysOnTop had a
+                            // real cost: a native file dialog (e.g. the
+                            // MIDI tab's "Import Thetis Midi2Cat
+                            // XML..." button, or the bootloader firmware
+                            // pickers) opened from inside this window is
+                            // an independent OS-level window, not a true
+                            // child of it, so it doesn't inherit the
+                            // always-on-top level -- it opened BEHIND
+                            // this window instead, invisible without
+                            // moving Settings out of the way first.
+                            .with_inner_size([1100.0, 700.0]),
                         |ui, _class| {
                             if ui.input(|i| i.viewport().close_requested()) {
                                 close_requested = true;
@@ -11608,8 +11623,20 @@ fn main() -> eframe::Result<()> {
     // DEFAULT anyway -- native Wayland's own known CPU-pegging bug (see
     // below) is a continuous cost for the whole session, worse than an
     // occasional, self-clearing stall from minimizing one window.
+    // BUG FIX (2026-09-18, real report): unconditionally clearing
+    // WAYLAND_DISPLAY assumed X11/XWayland was always there as a working
+    // fallback -- a real report on Debian (a pure-Wayland session with no
+    // XWayland running/available, DISPLAY unset too) showed winit failing
+    // outright at startup instead ("neither WAYLAND_DISPLAY nor
+    // WAYLAND_SOCKET nor DISPLAY is set"), taking away the only display
+    // connection that would have worked with nothing to fall back to.
+    // Only force X11 when DISPLAY is actually set -- i.e. XWayland (or a
+    // native X11 session) is genuinely available to switch to; otherwise
+    // leave WAYLAND_DISPLAY alone and let winit use native Wayland, which
+    // at least runs (with the known CPU-pegging cost documented above)
+    // instead of not starting at all.
     let force_x11 = std::env::var("HPSDR_FORCE_X11").map(|v| v != "0").unwrap_or(true);
-    if force_x11 {
+    if force_x11 && std::env::var_os("DISPLAY").is_some() {
         unsafe {
             std::env::remove_var("WAYLAND_DISPLAY");
         }
