@@ -966,6 +966,9 @@ struct ExtraReceiver {
     /// See ConnectedState::spectrum_waterfall_ratio's doc comment --
     /// same thing, per extra receiver instead of shared.
     spectrum_waterfall_ratio: f32,
+    /// See ConnectedState::waterfall_enabled's doc comment -- same
+    /// thing, per extra receiver instead of shared.
+    waterfall_enabled: bool,
     /// See ConnectedState::spectrum_zoom/spectrum_pan's doc comments --
     /// same thing, per extra receiver instead of shared.
     spectrum_zoom: i32,
@@ -1232,6 +1235,12 @@ struct ConnectedState {
     /// height, adjustable via the drag handle between them -- see
     /// Config::spectrum_waterfall_ratio's doc comment.
     spectrum_waterfall_ratio: f32,
+    /// Whether the waterfall is drawn at all (Settings -> Spectrum). When
+    /// off, the spectrum trace takes the full spectrum+waterfall height
+    /// (no divider drawn either) instead of sharing it per
+    /// spectrum_waterfall_ratio. Defaults to on -- this project's own
+    /// long-standing behavior before this toggle existed.
+    waterfall_enabled: bool,
     /// Spectrum/waterfall zoom (1 = full sample-rate span, higher =
     /// narrower, higher-resolution visible window), set via the Zoom
     /// slider below the waterfall. Pushed to the analyzer thread every
@@ -2287,6 +2296,7 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                 spectrum_waterfall_ratio: cfg
                     .spectrum_waterfall_ratio
                     .unwrap_or(150.0 / 350.0),
+                waterfall_enabled: cfg.waterfall_enabled.unwrap_or(true),
                 spectrum_zoom: cfg.spectrum_zoom.unwrap_or(1),
                 spectrum_pan: cfg.spectrum_pan.unwrap_or(0.0),
                 slider_scroll_accum: 0.0,
@@ -3354,6 +3364,55 @@ impl eframe::App for HpsdrApp {
                                 })
                                 .inner;
 
+                            // Moved here (2026-09-18, real request) from
+                            // the floating "s_meter_area" Area (top-right
+                            // corner) -- these two buttons belong in
+                            // normal layout flow now, not a separately-
+                            // positioned floating layer; see that Area's
+                            // own history (TX Power slider overlap fix)
+                            // for why mixing floating and normal-flow
+                            // content in the same screen region is worth
+                            // avoiding.
+                            ui.add_space(12.0);
+                            ui.vertical(|ui| {
+                                if ui.button("Settings...").clicked() {
+                                    connected.show_settings_window = !connected.show_settings_window;
+                                }
+                                // Used to be gated to protocol == 2 only -- P1
+                                // genuinely supports independent per-receiver
+                                // tuning too (classic Metis/Ozy DDC round-robin),
+                                // it just wasn't wired up: see start_protocol1's
+                                // extra_frequencies_hz and p1_build_packet's
+                                // ozy_command==2 branch for the actual fix.
+                                let active =
+                                    connected.session.active_receiver_count.load(Ordering::Relaxed) as usize;
+                                let max = connected.session.iq_buffers.len();
+                                if active < max {
+                                    if ui.button(format!("Add Receiver ({active}/{max})")).clicked() {
+                                        if let Some(rx) = spawn_extra_receiver(
+                                            &connected.session,
+                                            connected.device.adcs,
+                                            connected.device.protocol,
+                                            connected.device.frequency_min,
+                                            connected.device.frequency_max,
+                                            Arc::clone(&connected.settings_dirty),
+                                            None,
+                                        ) {
+                                            connected.extra_receivers.push(rx);
+                                            // Without this, a freshly added
+                                            // receiver is only persisted if
+                                            // some other setting happens to
+                                            // change afterward -- closing the
+                                            // app right after adding one
+                                            // would silently lose it.
+                                            connected.settings_dirty.store(true, Ordering::Relaxed);
+                                        }
+                                    }
+                                } else {
+                                    ui.weak(format!("All {max} receivers active"));
+                                }
+                            });
+
                             (freq_label, vfo_b_label)
                         })
                         .inner;
@@ -4374,8 +4433,15 @@ impl eframe::App for HpsdrApp {
                         + SPECTRUM_WATERFALL_DIVIDER_HEIGHT;
                     let spectrum_waterfall_height =
                         (ui.available_height() - below_waterfall_reserve).max(200.0);
-                    let spectrum_height =
-                        (spectrum_waterfall_height * connected.spectrum_waterfall_ratio).max(80.0);
+                    // Waterfall disabled (Settings -> Spectrum): give the
+                    // spectrum trace the FULL combined height instead of
+                    // its ratio-based share -- no divider to drag against
+                    // when there's nothing below it to divide.
+                    let spectrum_height = if connected.waterfall_enabled {
+                        (spectrum_waterfall_height * connected.spectrum_waterfall_ratio).max(80.0)
+                    } else {
+                        spectrum_waterfall_height
+                    };
                     // Reserves room on the right for the CW decoder panel
                     // (drawn below, once both this rect and the
                     // waterfall's are known) -- taken out of the
@@ -4397,6 +4463,11 @@ impl eframe::App for HpsdrApp {
                     );
                     let spectrum_top = rect.top();
                     let spectrum_right = rect.right();
+                    // Used as the CW panel's bottom edge when the
+                    // waterfall is disabled (see waterfall_enabled below)
+                    // -- otherwise the waterfall rect's own bottom is used
+                    // instead, same as before this toggle existed.
+                    let spectrum_bottom = rect.bottom();
 
                     if let Some(pos) = spectrum_resp.interact_pointer_pos() {
                         // See suppress_refocus_click's own doc comment --
@@ -4817,20 +4888,184 @@ impl eframe::App for HpsdrApp {
                         draw_freq_hover_tooltip(ui.painter(), pos, hover_freq_shown);
                     }
 
-                    if spectrum_waterfall_divider(
-                        ui,
-                        &mut connected.spectrum_waterfall_ratio,
-                        spectrum_waterfall_height,
-                        cw_panel_reserved_width,
-                    ) {
-                        settings_changed = true;
-                    }
-                    let waterfall_height = (spectrum_waterfall_height - spectrum_height).max(80.0);
-                    let (rect, waterfall_click_resp) = ui.allocate_exact_size(
-                        egui::vec2(ui.available_width() - cw_panel_reserved_width, waterfall_height),
-                        egui::Sense::click_and_drag(),
-                    );
-                    let waterfall_bottom = rect.bottom();
+                    // Waterfall disabled (Settings -> Spectrum): skip the
+                    // divider, the whole waterfall pane, and its click/
+                    // drag/scroll/zoom/texture handling entirely -- the
+                    // CW panel (below, runs either way) just uses the
+                    // spectrum pane's own bottom edge instead of the
+                    // waterfall's.
+                    let waterfall_bottom = if connected.waterfall_enabled {
+                        if spectrum_waterfall_divider(
+                            ui,
+                            &mut connected.spectrum_waterfall_ratio,
+                            spectrum_waterfall_height,
+                            cw_panel_reserved_width,
+                        ) {
+                            settings_changed = true;
+                        }
+                        let waterfall_height = (spectrum_waterfall_height - spectrum_height).max(80.0);
+                        let (rect, waterfall_click_resp) = ui.allocate_exact_size(
+                            egui::vec2(ui.available_width() - cw_panel_reserved_width, waterfall_height),
+                            egui::Sense::click_and_drag(),
+                        );
+                        if let Some(pos) = waterfall_click_resp.interact_pointer_pos() {
+                            // See suppress_refocus_click's own doc comment.
+                            if waterfall_click_resp.clicked() && !suppress_refocus_click {
+                                let new_freq = freq_at_x(pos.x, rect, freq_hz, sample_rate, connected.spectrum_zoom, pan_offset_hz);
+                                let new_freq = cw_center_click_freq(current_mode, new_freq);
+                                let (effective_freq, retune) =
+                                    resolve_tune(connected.ctun, freq_hz, sample_rate, passband, new_freq);
+                                if let Some(lo) = retune {
+                                    connected.session.set_frequency(lo);
+                                } else {
+                                    connected.ctun_frequency_hz = effective_freq;
+                                }
+                                remember_band_settings(&mut connected.band_memory, effective_freq, connected.db_low, connected.db_high, connected.waterfall_db_low, connected.waterfall_db_high, current_mode);
+                                settings_changed = true;
+                            }
+                        }
+                        // Click-and-drag -- see the spectrum pane's identical
+                        // treatment above for why this uses drag_delta()
+                        // rather than an absolute cursor-position mapping,
+                        // and why the sign flips depending on CTUN.
+                        if waterfall_click_resp.dragged() && !suppress_refocus_click {
+                            let hz_per_px = (2.0 * visible_half_span_hz) / rect.width().max(1.0) as f64;
+                            let drag_sign = if connected.ctun { 1.0 } else { -1.0 };
+                            connected.drag_tune_accum_hz += drag_sign * waterfall_click_resp.drag_delta().x as f64 * hz_per_px;
+                            const STEP_HZ: i64 = 1_000;
+                            let mut new_freq = dial_freq_hz as i64;
+                            while connected.drag_tune_accum_hz.abs() >= STEP_HZ as f64 {
+                                let sign = connected.drag_tune_accum_hz.signum();
+                                connected.drag_tune_accum_hz -= sign * STEP_HZ as f64;
+                                new_freq += STEP_HZ * sign as i64;
+                            }
+                            new_freq = new_freq.max(0);
+                            if new_freq as u32 != dial_freq_hz {
+                                let (effective_freq, retune) =
+                                    resolve_tune(connected.ctun, freq_hz, sample_rate, passband, new_freq as u32);
+                                if let Some(lo) = retune {
+                                    connected.session.set_frequency(lo);
+                                } else {
+                                    connected.ctun_frequency_hz = effective_freq;
+                                }
+                                remember_band_settings(&mut connected.band_memory, effective_freq, connected.db_low, connected.db_high, connected.waterfall_db_low, connected.waterfall_db_high, current_mode);
+                                settings_changed = true;
+                            }
+                        }
+
+                        // Scroll-to-tune -- see the spectrum pane's identical
+                        // treatment above (including the Ctrl+scroll zoom-
+                        // gesture case) for the full reasoning; this was
+                        // missing entirely for the waterfall (only click and
+                        // drag were wired up), confirmed by a real report.
+                        // Shares connected.scroll_accum/zoom_accum with the
+                        // spectrum pane -- only one pane can be hovered at
+                        // once, so there's no cross-talk.
+                        if waterfall_click_resp.hovered() {
+                            let scroll_delta = ui.input(|i| i.smooth_scroll_delta);
+                            let delta = if scroll_delta.y.abs() >= scroll_delta.x.abs() {
+                                scroll_delta.y
+                            } else {
+                                scroll_delta.x
+                            };
+
+                            if delta != 0.0 {
+                                connected.scroll_accum += delta;
+                                const NOTCH: f32 = 100.0;
+                                let shift = ui.input(|i| i.modifiers.shift);
+                                let step: i64 = scroll_tune_step_hz(cw_mode, shift);
+
+                                let mut new_freq = dial_freq_hz as i64;
+                                while connected.scroll_accum.abs() >= NOTCH {
+                                    let sign = connected.scroll_accum.signum();
+                                    connected.scroll_accum -= sign * NOTCH;
+                                    new_freq += step * sign as i64;
+                                }
+                                new_freq = new_freq.max(0);
+
+                                if new_freq as u32 != dial_freq_hz {
+                                    let (effective_freq, retune) =
+                                        resolve_tune(connected.ctun, freq_hz, sample_rate, passband, new_freq as u32);
+                                    if let Some(lo) = retune {
+                                        connected.session.set_frequency(lo);
+                                    } else {
+                                        connected.ctun_frequency_hz = effective_freq;
+                                    }
+                                    remember_band_settings(&mut connected.band_memory, effective_freq, connected.db_low, connected.db_high, connected.waterfall_db_low, connected.waterfall_db_high, current_mode);
+                                    settings_changed = true;
+                                }
+                            }
+
+                            let zoom = ui.input(|i| i.zoom_delta());
+                            if zoom != 1.0 {
+                                connected.zoom_accum += zoom - 1.0;
+                                const ZOOM_NOTCH: f32 = 0.05;
+
+                                let mut new_freq = dial_freq_hz as i64;
+                                while connected.zoom_accum.abs() >= ZOOM_NOTCH {
+                                    let sign = connected.zoom_accum.signum();
+                                    connected.zoom_accum -= sign * ZOOM_NOTCH;
+                                    new_freq += 10_000 * sign as i64;
+                                }
+                                new_freq = new_freq.max(0);
+
+                                if new_freq as u32 != dial_freq_hz {
+                                    let (effective_freq, retune) =
+                                        resolve_tune(connected.ctun, freq_hz, sample_rate, passband, new_freq as u32);
+                                    if let Some(lo) = retune {
+                                        connected.session.set_frequency(lo);
+                                    } else {
+                                        connected.ctun_frequency_hz = effective_freq;
+                                    }
+                                    remember_band_settings(&mut connected.band_memory, effective_freq, connected.db_low, connected.db_high, connected.waterfall_db_low, connected.waterfall_db_high, current_mode);
+                                    settings_changed = true;
+                                }
+                            }
+                        }
+
+                        // See ExtraReceiver::waterfall_display_rows's doc
+                        // comment -- captured here (this frame's real pane
+                        // rect, known only once layout has actually run)
+                        // for the texture-build step to use NEXT frame.
+                        connected.waterfall_display_rows =
+                            (rect.height().round() as usize).clamp(1, spectrum::WATERFALL_HISTORY);
+                        if let Some(tex_id) = waterfall_texture_id {
+                            // No zoom-aware UV cropping needed -- see the
+                            // spectrum trace's identical note above. Each
+                            // waterfall row already covers only the current
+                            // zoomed/panned window (WDSP's own analyzer did
+                            // the real cropping), so the texture is drawn at
+                            // its full [0,1] UV range as-is. The texture is
+                            // now already sized to this exact pane height
+                            // (see build_waterfall_image's own doc comment),
+                            // so this draws 1:1, not stretched.
+                            ui.painter().image(
+                                tex_id,
+                                rect,
+                                egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                                egui::Color32::WHITE,
+                            );
+                        } else {
+                            ui.painter().rect_filled(rect, 0.0, egui::Color32::BLACK);
+                            ui.put(
+                                rect,
+                                egui::Label::new(
+                                    egui::RichText::new(wisdom_status_text())
+                                        .color(egui::Color32::from_rgb(220, 60, 60)),
+                                ),
+                            );
+                        }
+                        if let Some(pos) = waterfall_click_resp.hover_pos() {
+                            let hover_freq = freq_at_x(pos.x, rect, freq_hz, sample_rate, connected.spectrum_zoom, pan_offset_hz);
+                            // See the spectrum pane's identical treatment above.
+                            let hover_freq_shown = (hover_freq as i64 + xvtr_rf_offset_hz).clamp(0, u32::MAX as i64) as u32;
+                            draw_freq_hover_tooltip(ui.painter(), pos, hover_freq_shown);
+                        }
+
+                        rect.bottom()
+                    } else {
+                        spectrum_bottom
+                    };
                     if cw_panel_visible {
                         render_cw_decoder_panel_beside(
                             ui,
@@ -4841,159 +5076,6 @@ impl eframe::App for HpsdrApp {
                                 egui::pos2(spectrum_right + CW_PANEL_GAP + CW_PANEL_WIDTH, waterfall_bottom),
                             ),
                         );
-                    }
-                    if let Some(pos) = waterfall_click_resp.interact_pointer_pos() {
-                        // See suppress_refocus_click's own doc comment.
-                        if waterfall_click_resp.clicked() && !suppress_refocus_click {
-                            let new_freq = freq_at_x(pos.x, rect, freq_hz, sample_rate, connected.spectrum_zoom, pan_offset_hz);
-                            let new_freq = cw_center_click_freq(current_mode, new_freq);
-                            let (effective_freq, retune) =
-                                resolve_tune(connected.ctun, freq_hz, sample_rate, passband, new_freq);
-                            if let Some(lo) = retune {
-                                connected.session.set_frequency(lo);
-                            } else {
-                                connected.ctun_frequency_hz = effective_freq;
-                            }
-                            remember_band_settings(&mut connected.band_memory, effective_freq, connected.db_low, connected.db_high, connected.waterfall_db_low, connected.waterfall_db_high, current_mode);
-                            settings_changed = true;
-                        }
-                    }
-                    // Click-and-drag -- see the spectrum pane's identical
-                    // treatment above for why this uses drag_delta()
-                    // rather than an absolute cursor-position mapping,
-                    // and why the sign flips depending on CTUN.
-                    if waterfall_click_resp.dragged() && !suppress_refocus_click {
-                        let hz_per_px = (2.0 * visible_half_span_hz) / rect.width().max(1.0) as f64;
-                        let drag_sign = if connected.ctun { 1.0 } else { -1.0 };
-                        connected.drag_tune_accum_hz += drag_sign * waterfall_click_resp.drag_delta().x as f64 * hz_per_px;
-                        const STEP_HZ: i64 = 1_000;
-                        let mut new_freq = dial_freq_hz as i64;
-                        while connected.drag_tune_accum_hz.abs() >= STEP_HZ as f64 {
-                            let sign = connected.drag_tune_accum_hz.signum();
-                            connected.drag_tune_accum_hz -= sign * STEP_HZ as f64;
-                            new_freq += STEP_HZ * sign as i64;
-                        }
-                        new_freq = new_freq.max(0);
-                        if new_freq as u32 != dial_freq_hz {
-                            let (effective_freq, retune) =
-                                resolve_tune(connected.ctun, freq_hz, sample_rate, passband, new_freq as u32);
-                            if let Some(lo) = retune {
-                                connected.session.set_frequency(lo);
-                            } else {
-                                connected.ctun_frequency_hz = effective_freq;
-                            }
-                            remember_band_settings(&mut connected.band_memory, effective_freq, connected.db_low, connected.db_high, connected.waterfall_db_low, connected.waterfall_db_high, current_mode);
-                            settings_changed = true;
-                        }
-                    }
-
-                    // Scroll-to-tune -- see the spectrum pane's identical
-                    // treatment above (including the Ctrl+scroll zoom-
-                    // gesture case) for the full reasoning; this was
-                    // missing entirely for the waterfall (only click and
-                    // drag were wired up), confirmed by a real report.
-                    // Shares connected.scroll_accum/zoom_accum with the
-                    // spectrum pane -- only one pane can be hovered at
-                    // once, so there's no cross-talk.
-                    if waterfall_click_resp.hovered() {
-                        let scroll_delta = ui.input(|i| i.smooth_scroll_delta);
-                        let delta = if scroll_delta.y.abs() >= scroll_delta.x.abs() {
-                            scroll_delta.y
-                        } else {
-                            scroll_delta.x
-                        };
-
-                        if delta != 0.0 {
-                            connected.scroll_accum += delta;
-                            const NOTCH: f32 = 100.0;
-                            let shift = ui.input(|i| i.modifiers.shift);
-                            let step: i64 = scroll_tune_step_hz(cw_mode, shift);
-
-                            let mut new_freq = dial_freq_hz as i64;
-                            while connected.scroll_accum.abs() >= NOTCH {
-                                let sign = connected.scroll_accum.signum();
-                                connected.scroll_accum -= sign * NOTCH;
-                                new_freq += step * sign as i64;
-                            }
-                            new_freq = new_freq.max(0);
-
-                            if new_freq as u32 != dial_freq_hz {
-                                let (effective_freq, retune) =
-                                    resolve_tune(connected.ctun, freq_hz, sample_rate, passband, new_freq as u32);
-                                if let Some(lo) = retune {
-                                    connected.session.set_frequency(lo);
-                                } else {
-                                    connected.ctun_frequency_hz = effective_freq;
-                                }
-                                remember_band_settings(&mut connected.band_memory, effective_freq, connected.db_low, connected.db_high, connected.waterfall_db_low, connected.waterfall_db_high, current_mode);
-                                settings_changed = true;
-                            }
-                        }
-
-                        let zoom = ui.input(|i| i.zoom_delta());
-                        if zoom != 1.0 {
-                            connected.zoom_accum += zoom - 1.0;
-                            const ZOOM_NOTCH: f32 = 0.05;
-
-                            let mut new_freq = dial_freq_hz as i64;
-                            while connected.zoom_accum.abs() >= ZOOM_NOTCH {
-                                let sign = connected.zoom_accum.signum();
-                                connected.zoom_accum -= sign * ZOOM_NOTCH;
-                                new_freq += 10_000 * sign as i64;
-                            }
-                            new_freq = new_freq.max(0);
-
-                            if new_freq as u32 != dial_freq_hz {
-                                let (effective_freq, retune) =
-                                    resolve_tune(connected.ctun, freq_hz, sample_rate, passband, new_freq as u32);
-                                if let Some(lo) = retune {
-                                    connected.session.set_frequency(lo);
-                                } else {
-                                    connected.ctun_frequency_hz = effective_freq;
-                                }
-                                remember_band_settings(&mut connected.band_memory, effective_freq, connected.db_low, connected.db_high, connected.waterfall_db_low, connected.waterfall_db_high, current_mode);
-                                settings_changed = true;
-                            }
-                        }
-                    }
-
-                    // See ExtraReceiver::waterfall_display_rows's doc
-                    // comment -- captured here (this frame's real pane
-                    // rect, known only once layout has actually run)
-                    // for the texture-build step to use NEXT frame.
-                    connected.waterfall_display_rows =
-                        (rect.height().round() as usize).clamp(1, spectrum::WATERFALL_HISTORY);
-                    if let Some(tex_id) = waterfall_texture_id {
-                        // No zoom-aware UV cropping needed -- see the
-                        // spectrum trace's identical note above. Each
-                        // waterfall row already covers only the current
-                        // zoomed/panned window (WDSP's own analyzer did
-                        // the real cropping), so the texture is drawn at
-                        // its full [0,1] UV range as-is. The texture is
-                        // now already sized to this exact pane height
-                        // (see build_waterfall_image's own doc comment),
-                        // so this draws 1:1, not stretched.
-                        ui.painter().image(
-                            tex_id,
-                            rect,
-                            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-                            egui::Color32::WHITE,
-                        );
-                    } else {
-                        ui.painter().rect_filled(rect, 0.0, egui::Color32::BLACK);
-                        ui.put(
-                            rect,
-                            egui::Label::new(
-                                egui::RichText::new(wisdom_status_text())
-                                    .color(egui::Color32::from_rgb(220, 60, 60)),
-                            ),
-                        );
-                    }
-                    if let Some(pos) = waterfall_click_resp.hover_pos() {
-                        let hover_freq = freq_at_x(pos.x, rect, freq_hz, sample_rate, connected.spectrum_zoom, pan_offset_hz);
-                        // See the spectrum pane's identical treatment above.
-                        let hover_freq_shown = (hover_freq as i64 + xvtr_rf_offset_hz).clamp(0, u32::MAX as i64) as u32;
-                        draw_freq_hover_tooltip(ui.painter(), pos, hover_freq_shown);
                     }
 
                     ui.horizontal(|ui| {
@@ -5243,44 +5325,6 @@ impl eframe::App for HpsdrApp {
                             }
                         }
 
-                        ui.add_space(4.0);
-                        if ui.button("Settings...").clicked() {
-                            connected.show_settings_window = !connected.show_settings_window;
-                        }
-
-                        // Used to be gated to protocol == 2 only -- P1
-                        // genuinely supports independent per-receiver
-                        // tuning too (classic Metis/Ozy DDC round-robin),
-                        // it just wasn't wired up: see start_protocol1's
-                        // extra_frequencies_hz and p1_build_packet's
-                        // ozy_command==2 branch for the actual fix.
-                        let active =
-                            connected.session.active_receiver_count.load(Ordering::Relaxed) as usize;
-                        let max = connected.session.iq_buffers.len();
-                        if active < max {
-                            if ui.button(format!("Add Receiver ({active}/{max})")).clicked() {
-                                if let Some(rx) = spawn_extra_receiver(
-                                    &connected.session,
-                                    connected.device.adcs,
-                                    connected.device.protocol,
-                                    connected.device.frequency_min,
-                                    connected.device.frequency_max,
-                                    Arc::clone(&connected.settings_dirty),
-                                    None,
-                                ) {
-                                    connected.extra_receivers.push(rx);
-                                    // Without this, a freshly added
-                                    // receiver is only persisted if
-                                    // some other setting happens to
-                                    // change afterward -- closing the
-                                    // app right after adding one
-                                    // would silently lose it.
-                                    connected.settings_dirty.store(true, Ordering::Relaxed);
-                                }
-                            }
-                        } else {
-                            ui.weak(format!("All {max} receivers active"));
-                        }
                     });
 
                 // One native OS window per extra receiver. Must be called
@@ -5387,12 +5431,6 @@ impl eframe::App for HpsdrApp {
                                     let (meter_rect, _resp) =
                                         ui.allocate_exact_size(egui::vec2(180.0, 85.0), egui::Sense::hover());
                                     draw_s_meter(ui, meter_rect, meter_db);
-
-                                    ui.add_space(4.0);
-                                    if ui.button("Settings...").clicked() {
-                                        let mut rx = rx_for_closure.lock().unwrap();
-                                        rx.show_settings_window = !rx.show_settings_window;
-                                    }
                                 });
 
                             egui::CentralPanel::default().show(ui, |ui| {
@@ -7052,6 +7090,16 @@ impl eframe::App for HpsdrApp {
                                     });
 
                                     ui.separator();
+                                    if ui
+                                        .checkbox(&mut connected.waterfall_enabled, "Enable Waterfall")
+                                        .on_hover_text(
+                                            "When off, the spectrum trace uses the full \
+                                             spectrum+waterfall height instead of sharing it.",
+                                        )
+                                        .changed()
+                                    {
+                                        settings_changed = true;
+                                    }
                                     ui.horizontal(|ui| {
                                         ui.label("Waterfall palette:");
                                         for palette in ALL_PALETTES {
@@ -8619,6 +8667,7 @@ impl eframe::App for HpsdrApp {
                                 waterfall_db_high: rx.waterfall_db_high,
                                 waterfall_palette: rx.waterfall_palette,
                                 spectrum_waterfall_ratio: rx.spectrum_waterfall_ratio,
+                                waterfall_enabled: rx.waterfall_enabled,
                                 adc: rx.adc.load(std::sync::atomic::Ordering::Relaxed) as u8,
                                 band_settings: rx.band_memory.clone(),
                                 width_memory: rx.width_memory.clone(),
@@ -8692,6 +8741,7 @@ impl eframe::App for HpsdrApp {
                         tx_waterfall_db_high: Some(connected.tx_waterfall_db_high),
                         waterfall_palette: Some(connected.waterfall_palette),
                         spectrum_waterfall_ratio: Some(connected.spectrum_waterfall_ratio),
+                        waterfall_enabled: Some(connected.waterfall_enabled),
                         spectrum_zoom: Some(connected.spectrum_zoom),
                         spectrum_pan: Some(connected.spectrum_pan),
                         adc: Some(connected.session.adc.load(std::sync::atomic::Ordering::Relaxed) as u8),
@@ -10169,6 +10219,15 @@ fn render_extra_receiver_ui(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceiver>>) {
                 )
             });
         });
+
+        // Moved here (2026-09-18, real request) from the floating
+        // "extra_s_meter" Area (top-right corner), same reasoning/
+        // location as the main receiver's own Settings/Add Receiver
+        // move -- see that block's own comment.
+        ui.add_space(12.0);
+        if ui.button("Settings...").clicked() {
+            rx.show_settings_window = !rx.show_settings_window;
+        }
     });
 
     ui.horizontal_wrapped(|ui| {
@@ -10384,13 +10443,23 @@ fn render_extra_receiver_ui(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceiver>>) {
     let zoom_pan_reserve = ui.spacing().interact_size.y + 8.0 + SPECTRUM_WATERFALL_DIVIDER_HEIGHT;
     let spectrum_waterfall_height =
         (ui.available_height() - zoom_pan_reserve).max(200.0);
-    let spectrum_height = (spectrum_waterfall_height * rx.spectrum_waterfall_ratio).max(80.0);
+    // Waterfall disabled (Settings -> Spectrum): give the spectrum trace
+    // the FULL combined height -- see the main receiver's identical
+    // treatment for the full reasoning.
+    let spectrum_height = if rx.waterfall_enabled {
+        (spectrum_waterfall_height * rx.spectrum_waterfall_ratio).max(80.0)
+    } else {
+        spectrum_waterfall_height
+    };
     let (rect, spectrum_resp) = ui.allocate_exact_size(
         egui::vec2(ui.available_width() - cw_panel_reserved_width, spectrum_height),
         egui::Sense::click_and_drag(),
     );
     let spectrum_top = rect.top();
     let spectrum_right = rect.right();
+    // Used as the CW panel's bottom edge when the waterfall is disabled
+    // -- see the main receiver's identical treatment.
+    let spectrum_bottom = rect.bottom();
 
     if let Some(pos) = spectrum_resp.interact_pointer_pos() {
         if spectrum_resp.clicked() {
@@ -10567,92 +10636,23 @@ fn render_extra_receiver_ui(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceiver>>) {
         draw_freq_hover_tooltip(ui.painter(), pos, hover_freq);
     }
 
-    if spectrum_waterfall_divider(ui, &mut rx.spectrum_waterfall_ratio, spectrum_waterfall_height, cw_panel_reserved_width) {
-        rx.settings_dirty.store(true, Ordering::Relaxed);
-    }
-    let waterfall_height = (spectrum_waterfall_height - spectrum_height).max(80.0);
-    let (wf_rect, wf_resp) = ui.allocate_exact_size(
-        egui::vec2(ui.available_width() - cw_panel_reserved_width, waterfall_height),
-        egui::Sense::click_and_drag(),
-    );
-    if cw_panel_visible {
-        render_cw_decoder_panel_beside(
-            ui,
-            &rx.spectrum,
-            egui::Id::new(("cw_decoder_panel_extra", rx.ddc_index)),
-            egui::Rect::from_min_max(
-                egui::pos2(spectrum_right + CW_PANEL_GAP, spectrum_top),
-                egui::pos2(spectrum_right + CW_PANEL_GAP + CW_PANEL_WIDTH, wf_rect.bottom()),
-            ),
+    // Waterfall disabled (Settings -> Spectrum): skip the divider, the
+    // whole waterfall pane, and its click/drag/scroll/texture handling
+    // entirely -- see the main receiver's identical treatment.
+    let waterfall_bottom = if rx.waterfall_enabled {
+        if spectrum_waterfall_divider(ui, &mut rx.spectrum_waterfall_ratio, spectrum_waterfall_height, cw_panel_reserved_width) {
+            rx.settings_dirty.store(true, Ordering::Relaxed);
+        }
+        let waterfall_height = (spectrum_waterfall_height - spectrum_height).max(80.0);
+        let (wf_rect, wf_resp) = ui.allocate_exact_size(
+            egui::vec2(ui.available_width() - cw_panel_reserved_width, waterfall_height),
+            egui::Sense::click_and_drag(),
         );
-    }
-    if let Some(pos) = wf_resp.interact_pointer_pos() {
-        if wf_resp.clicked() {
-            let new_freq = freq_at_x(pos.x, wf_rect, freq_hz, sample_rate, rx.spectrum_zoom, pan_offset_hz);
-            let new_freq = cw_center_click_freq(current_mode, new_freq);
-            let (effective_freq, retune) = resolve_tune(rx.ctun, freq_hz, sample_rate, passband, new_freq);
-            if let Some(lo) = retune {
-                rx.frequency_hz.store(lo, Ordering::Relaxed);
-            } else {
-                rx.ctun_frequency_hz = effective_freq;
-            }
-            remember_band_settings(&mut rx.band_memory, effective_freq, db_low, db_high, wf_db_low, wf_db_high, current_mode);
-            rx.settings_dirty.store(true, Ordering::Relaxed);
-        }
-    }
-    // Click-and-drag -- see the main receiver's identical treatment for
-    // why this uses drag_delta() rather than an absolute cursor-position
-    // mapping, and why the sign flips depending on CTUN.
-    if wf_resp.dragged() {
-        let hz_per_px = (2.0 * visible_half_span_hz) / wf_rect.width().max(1.0) as f64;
-        let drag_sign = if rx.ctun { 1.0 } else { -1.0 };
-        rx.drag_tune_accum_hz += drag_sign * wf_resp.drag_delta().x as f64 * hz_per_px;
-        const STEP_HZ: i64 = 1_000;
-        let mut new_freq = dial_freq_hz as i64;
-        while rx.drag_tune_accum_hz.abs() >= STEP_HZ as f64 {
-            let sign = rx.drag_tune_accum_hz.signum();
-            rx.drag_tune_accum_hz -= sign * STEP_HZ as f64;
-            new_freq += STEP_HZ * sign as i64;
-        }
-        new_freq = new_freq.max(0);
-        if new_freq as u32 != dial_freq_hz {
-            let (effective_freq, retune) = resolve_tune(rx.ctun, freq_hz, sample_rate, passband, new_freq as u32);
-            if let Some(lo) = retune {
-                rx.frequency_hz.store(lo, Ordering::Relaxed);
-            } else {
-                rx.ctun_frequency_hz = effective_freq;
-            }
-            remember_band_settings(&mut rx.band_memory, effective_freq, db_low, db_high, wf_db_low, wf_db_high, current_mode);
-            rx.settings_dirty.store(true, Ordering::Relaxed);
-        }
-    }
-
-    // Scroll-to-tune -- see the spectrum pane's identical treatment
-    // above; this was missing entirely for the waterfall (only click and
-    // drag were wired up), same gap confirmed and fixed on the main
-    // receiver window.
-    if wf_resp.hovered() {
-        let scroll_delta = ui.input(|i| i.smooth_scroll_delta);
-        let delta = if scroll_delta.y.abs() >= scroll_delta.x.abs() {
-            scroll_delta.y
-        } else {
-            scroll_delta.x
-        };
-        if delta != 0.0 {
-            rx.scroll_accum += delta;
-            const NOTCH: f32 = 100.0;
-            let shift = ui.input(|i| i.modifiers.shift);
-            let step: i64 = scroll_tune_step_hz(cw_mode, shift);
-            let mut new_freq = dial_freq_hz as i64;
-            while rx.scroll_accum.abs() >= NOTCH {
-                let sign = rx.scroll_accum.signum();
-                rx.scroll_accum -= sign * NOTCH;
-                new_freq += step * sign as i64;
-            }
-            new_freq = new_freq.max(0);
-            if new_freq as u32 != dial_freq_hz {
-                let (effective_freq, retune) =
-                    resolve_tune(rx.ctun, freq_hz, sample_rate, passband, new_freq as u32);
+        if let Some(pos) = wf_resp.interact_pointer_pos() {
+            if wf_resp.clicked() {
+                let new_freq = freq_at_x(pos.x, wf_rect, freq_hz, sample_rate, rx.spectrum_zoom, pan_offset_hz);
+                let new_freq = cw_center_click_freq(current_mode, new_freq);
+                let (effective_freq, retune) = resolve_tune(rx.ctun, freq_hz, sample_rate, passband, new_freq);
                 if let Some(lo) = retune {
                     rx.frequency_hz.store(lo, Ordering::Relaxed);
                 } else {
@@ -10662,56 +10662,134 @@ fn render_extra_receiver_ui(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceiver>>) {
                 rx.settings_dirty.store(true, Ordering::Relaxed);
             }
         }
-    }
+        // Click-and-drag -- see the main receiver's identical treatment for
+        // why this uses drag_delta() rather than an absolute cursor-position
+        // mapping, and why the sign flips depending on CTUN.
+        if wf_resp.dragged() {
+            let hz_per_px = (2.0 * visible_half_span_hz) / wf_rect.width().max(1.0) as f64;
+            let drag_sign = if rx.ctun { 1.0 } else { -1.0 };
+            rx.drag_tune_accum_hz += drag_sign * wf_resp.drag_delta().x as f64 * hz_per_px;
+            const STEP_HZ: i64 = 1_000;
+            let mut new_freq = dial_freq_hz as i64;
+            while rx.drag_tune_accum_hz.abs() >= STEP_HZ as f64 {
+                let sign = rx.drag_tune_accum_hz.signum();
+                rx.drag_tune_accum_hz -= sign * STEP_HZ as f64;
+                new_freq += STEP_HZ * sign as i64;
+            }
+            new_freq = new_freq.max(0);
+            if new_freq as u32 != dial_freq_hz {
+                let (effective_freq, retune) = resolve_tune(rx.ctun, freq_hz, sample_rate, passband, new_freq as u32);
+                if let Some(lo) = retune {
+                    rx.frequency_hz.store(lo, Ordering::Relaxed);
+                } else {
+                    rx.ctun_frequency_hz = effective_freq;
+                }
+                remember_band_settings(&mut rx.band_memory, effective_freq, db_low, db_high, wf_db_low, wf_db_high, current_mode);
+                rx.settings_dirty.store(true, Ordering::Relaxed);
+            }
+        }
 
-    let wanted_signature = (waterfall_data_revision, palette, wf_db_low, wf_db_high, rx.waterfall_display_rows);
-    if rx.waterfall_signature != Some(wanted_signature) {
-        let waterfall_rows: Vec<Vec<f32>> = {
-            let d = rx.spectrum.display.lock().unwrap();
-            d.waterfall_rows.iter().cloned().collect()
-        };
-        let waterfall_image =
-            build_waterfall_image(&waterfall_rows, palette, wf_db_low, wf_db_high, rx.waterfall_display_rows);
-        if let Some(image) = &waterfall_image {
-            let texture_name = format!("waterfall_rx{}", rx.ddc_index);
-            match &mut rx.waterfall_texture {
-                Some(tex) => tex.set(image.clone(), egui::TextureOptions::LINEAR),
-                None => {
-                    let tex = ui.ctx().load_texture(texture_name, image.clone(), egui::TextureOptions::LINEAR);
-                    rx.waterfall_texture = Some(tex);
+        // Scroll-to-tune -- see the spectrum pane's identical treatment
+        // above; this was missing entirely for the waterfall (only click and
+        // drag were wired up), same gap confirmed and fixed on the main
+        // receiver window.
+        if wf_resp.hovered() {
+            let scroll_delta = ui.input(|i| i.smooth_scroll_delta);
+            let delta = if scroll_delta.y.abs() >= scroll_delta.x.abs() {
+                scroll_delta.y
+            } else {
+                scroll_delta.x
+            };
+            if delta != 0.0 {
+                rx.scroll_accum += delta;
+                const NOTCH: f32 = 100.0;
+                let shift = ui.input(|i| i.modifiers.shift);
+                let step: i64 = scroll_tune_step_hz(cw_mode, shift);
+                let mut new_freq = dial_freq_hz as i64;
+                while rx.scroll_accum.abs() >= NOTCH {
+                    let sign = rx.scroll_accum.signum();
+                    rx.scroll_accum -= sign * NOTCH;
+                    new_freq += step * sign as i64;
+                }
+                new_freq = new_freq.max(0);
+                if new_freq as u32 != dial_freq_hz {
+                    let (effective_freq, retune) =
+                        resolve_tune(rx.ctun, freq_hz, sample_rate, passband, new_freq as u32);
+                    if let Some(lo) = retune {
+                        rx.frequency_hz.store(lo, Ordering::Relaxed);
+                    } else {
+                        rx.ctun_frequency_hz = effective_freq;
+                    }
+                    remember_band_settings(&mut rx.band_memory, effective_freq, db_low, db_high, wf_db_low, wf_db_high, current_mode);
+                    rx.settings_dirty.store(true, Ordering::Relaxed);
                 }
             }
-            rx.waterfall_signature = Some(wanted_signature);
         }
-        // else: no rows yet -- leave waterfall_signature unset so this
-        // retries (cheaply) next frame, same as the main receiver.
-    }
-    // See ConnectedState's identical capture, and ExtraReceiver::
-    // waterfall_display_rows's own doc comment.
-    rx.waterfall_display_rows = (wf_rect.height().round() as usize).clamp(1, spectrum::WATERFALL_HISTORY);
-    if rx.waterfall_texture.is_some() {
-        // No zoom-aware UV cropping needed -- see the main receiver's
-        // identical treatment. The texture is now already sized to this
-        // exact pane height (see build_waterfall_image's own doc
-        // comment), so this draws 1:1, not stretched.
-        ui.painter().image(
-            rx.waterfall_texture.as_ref().unwrap().id(),
-            wf_rect,
-            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-            egui::Color32::WHITE,
-        );
+
+        let wanted_signature = (waterfall_data_revision, palette, wf_db_low, wf_db_high, rx.waterfall_display_rows);
+        if rx.waterfall_signature != Some(wanted_signature) {
+            let waterfall_rows: Vec<Vec<f32>> = {
+                let d = rx.spectrum.display.lock().unwrap();
+                d.waterfall_rows.iter().cloned().collect()
+            };
+            let waterfall_image =
+                build_waterfall_image(&waterfall_rows, palette, wf_db_low, wf_db_high, rx.waterfall_display_rows);
+            if let Some(image) = &waterfall_image {
+                let texture_name = format!("waterfall_rx{}", rx.ddc_index);
+                match &mut rx.waterfall_texture {
+                    Some(tex) => tex.set(image.clone(), egui::TextureOptions::LINEAR),
+                    None => {
+                        let tex = ui.ctx().load_texture(texture_name, image.clone(), egui::TextureOptions::LINEAR);
+                        rx.waterfall_texture = Some(tex);
+                    }
+                }
+                rx.waterfall_signature = Some(wanted_signature);
+            }
+            // else: no rows yet -- leave waterfall_signature unset so this
+            // retries (cheaply) next frame, same as the main receiver.
+        }
+        // See ConnectedState's identical capture, and ExtraReceiver::
+        // waterfall_display_rows's own doc comment.
+        rx.waterfall_display_rows = (wf_rect.height().round() as usize).clamp(1, spectrum::WATERFALL_HISTORY);
+        if rx.waterfall_texture.is_some() {
+            // No zoom-aware UV cropping needed -- see the main receiver's
+            // identical treatment. The texture is now already sized to this
+            // exact pane height (see build_waterfall_image's own doc
+            // comment), so this draws 1:1, not stretched.
+            ui.painter().image(
+                rx.waterfall_texture.as_ref().unwrap().id(),
+                wf_rect,
+                egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                egui::Color32::WHITE,
+            );
+        } else {
+            ui.painter().rect_filled(wf_rect, 0.0, egui::Color32::BLACK);
+            ui.put(
+                wf_rect,
+                egui::Label::new(
+                    egui::RichText::new(wisdom_status_text()).color(egui::Color32::from_rgb(220, 60, 60)),
+                ),
+            );
+        }
+        if let Some(pos) = wf_resp.hover_pos() {
+            let hover_freq = freq_at_x(pos.x, wf_rect, freq_hz, sample_rate, rx.spectrum_zoom, pan_offset_hz);
+            draw_freq_hover_tooltip(ui.painter(), pos, hover_freq);
+        }
+
+        wf_rect.bottom()
     } else {
-        ui.painter().rect_filled(wf_rect, 0.0, egui::Color32::BLACK);
-        ui.put(
-            wf_rect,
-            egui::Label::new(
-                egui::RichText::new(wisdom_status_text()).color(egui::Color32::from_rgb(220, 60, 60)),
+        spectrum_bottom
+    };
+    if cw_panel_visible {
+        render_cw_decoder_panel_beside(
+            ui,
+            &rx.spectrum,
+            egui::Id::new(("cw_decoder_panel_extra", rx.ddc_index)),
+            egui::Rect::from_min_max(
+                egui::pos2(spectrum_right + CW_PANEL_GAP, spectrum_top),
+                egui::pos2(spectrum_right + CW_PANEL_GAP + CW_PANEL_WIDTH, waterfall_bottom),
             ),
         );
-    }
-    if let Some(pos) = wf_resp.hover_pos() {
-        let hover_freq = freq_at_x(pos.x, wf_rect, freq_hz, sample_rate, rx.spectrum_zoom, pan_offset_hz);
-        draw_freq_hover_tooltip(ui.painter(), pos, hover_freq);
     }
 
     // Zoom/Pan -- see the main receiver's identical controls.
@@ -11015,6 +11093,16 @@ fn render_extra_receiver_settings(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceive
             });
 
             ui.separator();
+            if ui
+                .checkbox(&mut rx.waterfall_enabled, "Enable Waterfall")
+                .on_hover_text(
+                    "When off, the spectrum trace uses the full \
+                     spectrum+waterfall height instead of sharing it.",
+                )
+                .changed()
+            {
+                rx.settings_dirty.store(true, Ordering::Relaxed);
+            }
             ui.horizontal(|ui| {
                 ui.label("Waterfall palette:");
                 for palette in ALL_PALETTES {
@@ -11259,6 +11347,7 @@ fn spawn_extra_receiver(
         waterfall_db_high: saved.map(|s| s.waterfall_db_high).unwrap_or(-60.0),
         waterfall_palette: saved.map(|s| s.waterfall_palette).unwrap_or(Palette::Ocean),
         spectrum_waterfall_ratio: saved.map(|s| s.spectrum_waterfall_ratio).unwrap_or(150.0 / 350.0),
+        waterfall_enabled: saved.map(|s| s.waterfall_enabled).unwrap_or(true),
         spectrum_zoom: saved.map(|s| s.spectrum_zoom).unwrap_or(1),
         spectrum_pan: saved.map(|s| s.spectrum_pan).unwrap_or(0.0),
         show_settings_window: false,

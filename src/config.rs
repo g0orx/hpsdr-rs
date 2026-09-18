@@ -64,6 +64,12 @@ pub struct Config {
     /// height -- draggable via the divider between them. Missing falls
     /// back to their old fixed 150/350 proportions.
     pub spectrum_waterfall_ratio: Option<f32>,
+    /// Whether the waterfall is drawn at all (Settings -> Spectrum) --
+    /// see ConnectedState::waterfall_enabled's doc comment. Missing
+    /// (a config saved before this existed) falls back to on, this
+    /// feature's default.
+    #[serde(default)]
+    pub waterfall_enabled: Option<bool>,
     /// Spectrum/waterfall zoom/pan -- see ConnectedState::spectrum_zoom/
     /// spectrum_pan's doc comments (main.rs). Missing (a config saved
     /// before this existed) falls back to zoom 1 / pan 0.0, i.e. the
@@ -524,6 +530,9 @@ pub struct ExtraReceiverConfig {
     /// See Config::spectrum_waterfall_ratio's doc comment.
     #[serde(default = "default_spectrum_waterfall_ratio")]
     pub spectrum_waterfall_ratio: f32,
+    /// See Config::waterfall_enabled's doc comment.
+    #[serde(default = "default_waterfall_enabled")]
+    pub waterfall_enabled: bool,
     /// See Config::rx_eq's doc comment -- same type, this receiver's own
     /// independent copy.
     #[serde(default)]
@@ -576,6 +585,10 @@ fn default_spectrum_zoom() -> i32 {
 
 fn default_spectrum_waterfall_ratio() -> f32 {
     150.0 / 350.0
+}
+
+fn default_waterfall_enabled() -> bool {
+    true
 }
 
 /// Per-platform settings directory, created if it doesn't exist yet.
