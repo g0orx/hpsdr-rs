@@ -9387,16 +9387,19 @@ fn tci_status_hover(status: Option<bool>, addr: &str, server: Option<&TciServer>
 }
 
 fn format_frequency(hz: u32) -> String {
+    // "." as the thousands separator, no "Hz" suffix -- matches piHPSDR's
+    // own VFO display convention (real request), rather than this
+    // project's earlier ","-separated "... Hz" format.
     let digits = hz.to_string();
     let bytes = digits.as_bytes();
     let mut out = String::new();
     for (i, b) in bytes.iter().enumerate() {
         if i > 0 && (bytes.len() - i) % 3 == 0 {
-            out.push(',');
+            out.push('.');
         }
         out.push(*b as char);
     }
-    format!("{out} Hz")
+    out
 }
 
 /// Same accumulate-and-threshold pattern as frequency scroll-to-tune:
