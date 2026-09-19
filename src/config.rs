@@ -257,6 +257,14 @@ pub struct Config {
     /// README's Ozy USB section for where to get them.
     pub ozy_firmware_path: Option<String>,
     pub ozy_fpga_path: Option<String>,
+    /// RX-888 Mk2 only (see radio.rs's start_rx888_usb) -- path to the
+    /// user-supplied Cypress FX3 RAM image (`SDDC_FX3.img`), set via the
+    /// Discover window's "RX-888 USB setup" file picker. Deliberately
+    /// NOT bundled (unlike Ozy's own firmware, sourced from the user's
+    /// own same-license piHPSDR repo) -- this is a different, unverified
+    /// third-party upstream, see rx888.rs's module doc comment.
+    #[serde(default)]
+    pub rx888_firmware_path: Option<String>,
     /// Spectrum/waterfall display range while transmitting -- separate
     /// from db_low/db_high/waterfall_db_low/waterfall_db_high (which
     /// are for receiving) because a locally-picked-up TX signal is

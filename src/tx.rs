@@ -1529,6 +1529,12 @@ impl TxProcessor {
 
 impl Drop for TxProcessor {
     fn drop(&mut self) {
+        // Same lock TxProcessor::open takes around OpenChannel -- see
+        // wdsp_sys::SETUP_LOCK's doc comment and spectrum.rs's
+        // SpectrumAnalyzer::drop (identical fix, same root cause: a
+        // real "double free or corruption" from CloseChannel never
+        // being covered by this lock, only setup was).
+        let _guard = wdsp::SETUP_LOCK.lock().unwrap();
         unsafe {
             wdsp::CloseChannel(self.channel);
         }

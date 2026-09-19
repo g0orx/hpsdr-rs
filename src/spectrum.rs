@@ -1343,6 +1343,26 @@ impl SpectrumAnalyzer {
 
 impl Drop for SpectrumAnalyzer {
     fn drop(&mut self) {
+        // Same lock SpectrumAnalyzer::open takes around OpenChannel --
+        // see wdsp_sys::SETUP_LOCK's doc comment. ROOT CAUSE FIX for a
+        // real report: CloseChannel/DestroyAnalyzer touch the same
+        // FFTW-planner-adjacent global state OpenChannel does, and were
+        // NEVER covered by this lock -- only setup was. Two channels
+        // (e.g. this RX channel and a TX channel, each on its own
+        // background thread -- see tx.rs's TxProcessor::drop, which has
+        // the identical fix) tearing down at close to the same moment
+        // on disconnect could race and corrupt FFTW's shared state,
+        // surfacing as a glibc "double free or corruption" abort --
+        // sometimes much later, inside an unrelated allocation (a real
+        // trace showed it detected inside WDSP's own SNB cleanup, not
+        // at the point of corruption). Confirmed via a real gdb
+        // backtrace landing in CloseChannel with no lock held anywhere
+        // on the stack, and by two other fixes (consolidating this
+        // project's own USB threading, and moving the RX-888 DDC's
+        // reported sample rate onto an exact 48kHz multiple) NOT
+        // resolving it -- ruling both out and pointing back at this
+        // exact gap.
+        let _guard = wdsp::SETUP_LOCK.lock().unwrap();
         unsafe {
             wdsp::DestroyAnalyzer(self.channel);
             wdsp::CloseChannel(self.channel);

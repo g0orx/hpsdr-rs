@@ -38,6 +38,8 @@ Any board the standard openHPSDR discovery protocol reports as one of: Metis, He
 
 Also, separately: the original Ozy/Mercury/Penny hardware (Protocol 1 over USB rather than Ethernet) — see [Ozy USB](#ozy-usb-legacy-hardware) below. **New, partially confirmed against real hardware.**
 
+And separately again: the receive-only [RX-888 Mk2](#rx-888-mk2-receive-only-direct-sampling-sdr) direct-sampling SDR — see that section below. **v1, unconfirmed against real hardware.**
+
 ## Building
 
 Developed and tested primarily on Linux. A Windows build (via MSVC + vcpkg)
@@ -163,6 +165,45 @@ Classic Ozy hardware is capped at 2 receivers (matching piHPSDR's own
 documented limit — these boards are reported to hang with more), and
 Diversity/PureSignal aren't available on it (no independent feedback
 ADC in this hardware generation).
+
+## RX-888 Mk2 (receive-only direct-sampling SDR)
+
+> **v1, unconfirmed against real hardware.** This development
+> environment has no USB access at all — every USB/firmware/streaming
+> detail is ported directly from a real, working reference driver
+> (ka9q-radio), but none of it has actually been run against a real
+> RX-888 yet. If you try it, reports (good or bad) are very welcome.
+
+An RX-888 Mk2 is a receive-only, direct-sampling HF SDR (Cypress FX3 +
+LTC2208-class ADC) that streams its *entire* captured bandwidth as raw
+ADC samples over USB, with no on-board tuner/DDC — hpsdr-rs does the
+digital down-conversion (NCO mixer + CIC decimator) itself in software.
+This first version is deliberately narrow in scope: **one receiver,
+direct-sampling HF mode only, fixed decimation** (no "Add Receiver", no
+tuner/VHF mode, no adjustable IF bandwidth yet) — proving the concept
+before expanding it.
+
+1. **Firmware file** — you need your own copy of the Cypress FX3 RAM
+   image (`SDDC_FX3.img`, from your device vendor or the SDDC firmware
+   project for this hardware). **Not bundled** with hpsdr-rs (unlike
+   Ozy's own firmware — this is a different, unverified third-party
+   upstream) — point the Discover window's **RX-888 USB setup** section
+   at your own copy via **Choose...**.
+2. **Linux only**: a udev rule for non-root USB access. Copy
+   [`assets/90-rx888.rules`](assets/90-rx888.rules) to
+   `/etc/udev/rules.d/`, then
+   `sudo udevadm control --reload-rules && sudo udevadm trigger` (or
+   just replug the device).
+3. **Windows only**: needs a WinUSB driver bound to both the unloaded
+   (`04b4:00f3`) and loaded (`04b4:00f1`) PIDs via
+   [Zadig](https://zadig.akeo.ie/), same reasoning as Ozy's `fffe:0007`.
+4. **macOS**: no extra driver needed (nusb talks to IOKit directly) —
+   untested either way.
+
+Once set up, the RX-888 shows up in the normal Discover window like any
+other radio (as "USB" instead of an IP address) — select it and click
+Start. The receiver's step attenuator (0-31dB) reuses the existing
+Settings → RX Attenuation control rather than adding a new one.
 
 ## Packaging (Debian/Ubuntu)
 

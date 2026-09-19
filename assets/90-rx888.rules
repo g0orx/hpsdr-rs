@@ -1,0 +1,10 @@
+# udev rule for non-root USB access to an RX-888 Mk2 (Cypress FX3,
+# VID:PID 04b4:00f3 unloaded / 04b4:00f1 once firmware is loaded) --
+# same "standard permission rule" reasoning as 90-ozy.rules, covering
+# both PIDs since the device re-enumerates under a different PID once
+# this project's own rx888::initialise loads firmware into it.
+#
+# Install: copy to /etc/udev/rules.d/, then either replug the device or
+# run: sudo udevadm control --reload-rules && sudo udevadm trigger
+SUBSYSTEMS=="usb",ATTRS{idVendor}=="04b4",ATTRS{idProduct}=="00f3",SYMLINK+="rx888",MODE="666"
+SUBSYSTEMS=="usb",ATTRS{idVendor}=="04b4",ATTRS{idProduct}=="00f1",SYMLINK+="rx888",MODE="666"

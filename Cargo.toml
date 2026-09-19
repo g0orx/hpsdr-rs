@@ -156,6 +156,10 @@ assets = [
     # reference copy alongside the docs, see README's Ozy USB section
     # for the install command.
     ["assets/90-ozy.rules", "usr/share/doc/hpsdr-rs/90-ozy.rules", "644"],
+    # RX-888's own firmware is NOT bundled (unverified third-party
+    # upstream, unlike Ozy's -- see rx888.rs's module doc comment), only
+    # the udev rule, same "not auto-installed" reasoning as Ozy's above.
+    ["assets/90-rx888.rules", "usr/share/doc/hpsdr-rs/90-rx888.rules", "644"],
     # Ozy's FX2 firmware + FPGA bitstream -- sourced from the author's
     # own piHPSDR repo (github.com/g0orx/pihpsdr), same GPL-2.0 license
     # as this project, not a third-party blob. Installed to

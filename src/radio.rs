@@ -19,6 +19,7 @@
 
 use crate::discovery::{Boards, Device};
 use crate::ozy;
+use crate::rx888;
 use std::collections::VecDeque;
 use std::io;
 use std::net::UdpSocket;
@@ -210,6 +211,11 @@ pub struct RadioSettings {
     /// error rather than attempting anything over USB.
     pub ozy_firmware_path: Option<String>,
     pub ozy_fpga_path: Option<String>,
+    /// RX-888 Mk2 only (see start_rx888_usb) -- path to the user-
+    /// supplied Cypress FX3 RAM image (SDDC_FX3.img), set in the
+    /// Discover window's "RX-888 USB setup" and loaded from Config the
+    /// same way ozy_firmware_path is.
+    pub rx888_firmware_path: Option<String>,
 }
 
 impl Default for RadioSettings {
@@ -244,6 +250,7 @@ impl Default for RadioSettings {
             xit_offset_hz: 0,
             ozy_firmware_path: None,
             ozy_fpga_path: None,
+            rx888_firmware_path: None,
         }
     }
 }
@@ -301,7 +308,9 @@ fn ps_feedback_config(protocol: u8, board: Boards) -> Option<(u8, u8, Option<u8>
             // Classic Ozy+Mercury+Penny hardware has no PureSignal
             // feedback ADC wiring in this project's scope (see
             // start_protocol1_ozy_usb's doc comment) -- no reservation.
-            Boards::Saturn | Boards::Ozy | Boards::Unknown => None,
+            // RX-888: receive-only hardware, no TX/feedback path at all
+            // (see start_rx888_usb's doc comment).
+            Boards::Saturn | Boards::Ozy | Boards::Rx888 | Boards::Unknown => None,
         },
         // P2: DDC0/DDC1 reservation is universal, not board-dependent --
         // confirmed via new_protocol.c, no per-board variation in that
@@ -1143,6 +1152,17 @@ pub struct RadioSession {
     /// ozy_i2c_loop's handle -- joined in `stop()` alongside the other
     /// threads. Always None on every other transport.
     ozy_i2c_thread: Option<JoinHandle<()>>,
+    /// True only for an RX-888 session -- same "no UDP peer to send a
+    /// stop packet to" reasoning as `is_ozy`, see send_stop_command.
+    is_rx888: bool,
+    /// rx888_control_loop's handle (attenuator polling, on its own
+    /// thread separate from the bulk-streaming receiver_thread -- see
+    /// that function's own doc comment for why: a real report that
+    /// issuing the attenuator's USB control transfer from the SAME
+    /// thread as the hot bulk-read loop corrupted the ADC sample
+    /// stream). Joined in `stop()` alongside the other threads. Always
+    /// None on every other transport.
+    rx888_control_thread: Option<JoinHandle<()>>,
 }
 
 impl RadioSession {
@@ -1222,6 +1242,17 @@ impl RadioSession {
         // `device.protocol == 1` already does the right thing for it.
         let mut result = if device.board == Boards::Ozy {
             start_protocol1_ozy_usb(
+                device, settings, frequency_hz, tx_frequency_hz, rx_frequency_hz, requested_frequency_hz, sample_rate, adc, rx_antenna, tx_antenna, rx_attenuation,
+                ps_tx_attenuation, mox, tx_iq, tci_tx_audio, tci_tx_gain, tx_power_watts, cw_keyer, cw_mode_active, pa_gain_db,
+                tx_forward_power, tx_reverse_power, adc0_overload, cw_ptt_active, cw_paddle_contacts, adc1_overload,
+                tx_fifo_underrun, tx_fifo_overrun, ps_rx_feedback_iq, ps_tx_feedback_iq,
+                rx_audio_to_radio, send_rx_audio_to_radio, hl2_ak4951_codec, new_pa_board, radio_mic_audio, tx_audio_source,
+                tci_wants_mic, mic_ptt_enabled, mic_bias_enabled, mic_ptt_on_tip,
+                diversity_enabled, diversity_gain_db, diversity_phase_deg, diversity_main_raw_iq,
+                puresignal_enabled,
+            )
+        } else if device.board == Boards::Rx888 {
+            start_rx888_usb(
                 device, settings, frequency_hz, tx_frequency_hz, rx_frequency_hz, requested_frequency_hz, sample_rate, adc, rx_antenna, tx_antenna, rx_attenuation,
                 ps_tx_attenuation, mox, tx_iq, tci_tx_audio, tci_tx_gain, tx_power_watts, cw_keyer, cw_mode_active, pa_gain_db,
                 tx_forward_power, tx_reverse_power, adc0_overload, cw_ptt_active, cw_paddle_contacts, adc1_overload,
@@ -1412,16 +1443,19 @@ impl RadioSession {
         if let Some(t) = self.ozy_i2c_thread.take() {
             let _ = t.join();
         }
+        if let Some(t) = self.rx888_control_thread.take() {
+            let _ = t.join();
+        }
         self.stop_diversity_combiner_now();
     }
 
     fn send_stop_command(&self) {
-        // Ozy/USB: no UDP peer to send a stop packet to at all --
-        // stopping is just stop_flag + thread joins (already done by
-        // the time this is called) + dropping ozy_device. Matches
-        // piHPSDR's own old_protocol.c, which short-circuits equivalent
-        // stop-packet logic for DEVICE_OZY the same way.
-        if self.is_ozy {
+        // Ozy/RX-888 (USB): no UDP peer to send a stop packet to at all
+        // -- stopping is just stop_flag + thread joins (already done by
+        // the time this is called) + dropping the USB device handle.
+        // Matches piHPSDR's own old_protocol.c, which short-circuits
+        // equivalent stop-packet logic for DEVICE_OZY the same way.
+        if self.is_ozy || self.is_rx888 {
             return;
         }
         // See stop_socket's own doc comment -- sent from the SAME local
@@ -1849,6 +1883,8 @@ fn start_protocol1(
         is_ozy: false,
         ozy_versions: None,
         ozy_i2c_thread: None,
+        is_rx888: false,
+        rx888_control_thread: None,
     })
 }
 
@@ -2154,7 +2190,303 @@ fn start_protocol1_ozy_usb(
         is_ozy: true,
         ozy_versions: Some(ozy_versions),
         ozy_i2c_thread: Some(i2c_thread),
+        is_rx888: false,
+        rx888_control_thread: None,
     })
+}
+
+/// RX-888 Mk2 over USB -- see rx888.rs's module doc comment for the
+/// hardware/protocol grounding. Structurally mirrors
+/// start_protocol1_ozy_usb's shape (same giant RadioSession field
+/// construction, same "store every Arc on the returned session even
+/// when this board's own loops never touch it" pattern -- diversity/
+/// PureSignal/TX/CW/antenna/etc. all land in that "stored but inert"
+/// bucket here, since this is receive-only, single-receiver, direct-
+/// sampling-only hardware with no wire protocol of its own to carry any
+/// of it), but is MUCH smaller: there is no sender thread at all (no
+/// TX, no C&C packets -- `mox` being set true simply has no effect,
+/// same as flipping a toggle Ozy doesn't wire up already does nothing
+/// today), and the receiver side is this project's own from-scratch
+/// NCO+CIC DDC (rx888::Ddc) rather than a P1/P2 frame parser.
+///
+/// `settings.sample_rate` is expected to already be
+/// rx888::OUTPUT_SAMPLE_RATE_HZ by the time this is called (see
+/// connect_to_device's own override in main.rs) -- this function
+/// doesn't re-derive it, just stores whatever was passed through, same
+/// as every other start_protocol*/start_*_usb function does.
+///
+/// UNTESTED end-to-end -- see rx888.rs's own doc comment.
+#[allow(clippy::too_many_arguments)]
+fn start_rx888_usb(
+    device: &Device,
+    settings: RadioSettings,
+    frequency_hz: Arc<AtomicU32>,
+    tx_frequency_hz: Arc<AtomicU32>,
+    rx_frequency_hz: Arc<AtomicU32>,
+    requested_frequency_hz: Arc<AtomicU32>,
+    sample_rate: Arc<AtomicU32>,
+    adc: Arc<AtomicU32>,
+    rx_antenna: Arc<AtomicU32>,
+    tx_antenna: Arc<AtomicU32>,
+    rx_attenuation: Arc<AtomicU32>,
+    ps_tx_attenuation: Arc<AtomicU32>,
+    mox: Arc<AtomicBool>,
+    tx_iq: Arc<Mutex<VecDeque<f32>>>,
+    tci_tx_audio: Arc<Mutex<VecDeque<f32>>>,
+    tci_tx_gain: Arc<Mutex<f32>>,
+    tx_power_watts: Arc<AtomicU32>,
+    cw_keyer: Arc<CwKeyerAtomics>,
+    cw_mode_active: Arc<AtomicBool>,
+    pa_gain_db: Arc<AtomicU32>,
+    tx_forward_power: Arc<AtomicU32>,
+    tx_reverse_power: Arc<AtomicU32>,
+    adc0_overload: Arc<AtomicBool>,
+    cw_ptt_active: Arc<AtomicBool>,
+    cw_paddle_contacts: Arc<AtomicU8>,
+    adc1_overload: Arc<AtomicBool>,
+    tx_fifo_underrun: Arc<AtomicBool>,
+    tx_fifo_overrun: Arc<AtomicBool>,
+    ps_rx_feedback_iq: Arc<Mutex<VecDeque<IqSample>>>,
+    ps_tx_feedback_iq: Arc<Mutex<VecDeque<IqSample>>>,
+    rx_audio_to_radio: Arc<Mutex<VecDeque<f32>>>,
+    send_rx_audio_to_radio: Arc<AtomicBool>,
+    hl2_ak4951_codec: Arc<AtomicBool>,
+    new_pa_board: Arc<AtomicBool>,
+    radio_mic_audio: Arc<Mutex<VecDeque<f32>>>,
+    tx_audio_source: Arc<AtomicU8>,
+    tci_wants_mic: Arc<AtomicBool>,
+    mic_ptt_enabled: Arc<AtomicBool>,
+    mic_bias_enabled: Arc<AtomicBool>,
+    mic_ptt_on_tip: Arc<AtomicBool>,
+    diversity_enabled: Arc<AtomicBool>,
+    diversity_gain_db: Arc<AtomicU32>,
+    diversity_phase_deg: Arc<AtomicU32>,
+    diversity_main_raw_iq: Arc<Mutex<VecDeque<IqSample>>>,
+    puresignal_enabled: Arc<AtomicBool>,
+) -> io::Result<RadioSession> {
+    let firmware_path = settings
+        .rx888_firmware_path
+        .map(std::path::PathBuf::from)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "RX-888 firmware (.img) not set -- go back to the Discover window's \"RX-888 USB setup\" section",
+            )
+        })?;
+    let (rx888_device, rx_endpoint) = rx888::initialise(&firmware_path, rx_attenuation.load(Ordering::Relaxed))?;
+
+    let stop_flag = Arc::new(AtomicBool::new(false));
+    // v1 scope: single receiver only -- see rx888.rs's module doc
+    // comment and discover_rx888_usb's synthetic Device entry.
+    let iq_buffers: Vec<Arc<Mutex<VecDeque<IqSample>>>> =
+        vec![Arc::new(Mutex::new(VecDeque::with_capacity(IQ_BUFFER_CAPACITY)))];
+    let active_receiver_count = Arc::new(AtomicU32::new(1));
+    let disable_pa = Arc::new(AtomicBool::new(false));
+    let tune_active = Arc::new(AtomicBool::new(false));
+    let oc_rx = Arc::new(AtomicU8::new(0));
+    let oc_tx = Arc::new(AtomicU8::new(0));
+    let rit_enabled = Arc::new(AtomicBool::new(settings.rit_enabled));
+    let rit_offset_hz = Arc::new(AtomicI32::new(settings.rit_offset_hz));
+    let xit_enabled = Arc::new(AtomicBool::new(settings.xit_enabled));
+    let xit_offset_hz = Arc::new(AtomicI32::new(settings.xit_offset_hz));
+
+    let receiver_stop = Arc::clone(&stop_flag);
+    let receiver_buffers = iq_buffers.clone();
+    let receiver_frequency_hz = Arc::clone(&frequency_hz);
+    let receiver_thread = thread::spawn(move || {
+        rx888_receiver_loop(rx_endpoint, receiver_buffers, receiver_frequency_hz, receiver_stop);
+    });
+
+    let control_stop = Arc::clone(&stop_flag);
+    let control_rx_attenuation = Arc::clone(&rx_attenuation);
+    let control_thread = thread::spawn(move || {
+        rx888_control_loop(rx888_device, control_rx_attenuation, control_stop);
+    });
+
+    let mute_local_audio_for_tci = Arc::new(AtomicBool::new(false));
+
+    Ok(RadioSession {
+        iq_buffers,
+        frequency_hz,
+        tx_frequency_hz,
+        rx_frequency_hz,
+        requested_frequency_hz,
+        sample_rate,
+        adc,
+        rx_antenna,
+        tx_antenna,
+        disable_pa,
+        tune_active,
+        oc_rx,
+        oc_tx,
+        rx_attenuation,
+        ps_tx_attenuation,
+        extra_frequencies_hz: Vec::new(),
+        extra_sample_rates_hz: Vec::new(),
+        extra_adcs: Vec::new(),
+        active_receiver_count,
+        ps_rx_feedback_iq,
+        ps_tx_feedback_iq,
+        mox,
+        mute_local_audio_for_tci,
+        rit_enabled,
+        rit_offset_hz,
+        xit_enabled,
+        xit_offset_hz,
+        tx_iq,
+        tci_tx_audio,
+        tci_tx_gain,
+        rx_audio_to_radio,
+        send_rx_audio_to_radio,
+        hl2_ak4951_codec,
+        new_pa_board,
+        radio_mic_audio,
+        tx_audio_source,
+        tci_wants_mic,
+        mic_ptt_enabled,
+        mic_bias_enabled,
+        mic_ptt_on_tip,
+        diversity_enabled,
+        diversity_gain_db,
+        diversity_phase_deg,
+        diversity_main_raw_iq,
+        puresignal_enabled,
+        tx_power_watts,
+        cw_keyer,
+        cw_mode_active,
+        pa_gain_db,
+        tx_forward_power,
+        tx_reverse_power,
+        adc0_overload,
+        adc1_overload,
+        cw_ptt_active,
+        cw_paddle_contacts,
+        tx_fifo_underrun,
+        tx_fifo_overrun,
+        stop_flag,
+        sender_thread: None,
+        receiver_thread: Some(receiver_thread),
+        tx_iq_thread: None,
+        rx_audio_thread: None,
+        diversity_combiner_thread: None,
+        diversity_combiner_stop: None,
+        protocol: 1,
+        radio_ip: device.address.ip(),
+        stop_socket: UdpSocket::bind(("0.0.0.0", 0))?,
+        is_ozy: false,
+        ozy_versions: None,
+        ozy_i2c_thread: None,
+        is_rx888: true,
+        rx888_control_thread: Some(control_thread),
+    })
+}
+
+/// RX-888 receiver thread -- owns the bulk streaming `RxEndpoint`
+/// EXCLUSIVELY, doing nothing else on this thread. Deliberately does
+/// NOT also own the control-transfer `Rx888Device` (see
+/// rx888_control_loop below for that) -- an earlier version of this
+/// code merged both onto one thread, checking/pushing attenuator
+/// changes once per bulk read in this same loop. A real report traced a
+/// severe bug to exactly that: changing the RX Attenuation slider
+/// caused the audio to lock up at a constant full-scale value (100% of
+/// samples pinned to exactly +32767, confirmed by direct WAV analysis,
+/// not just "sounds distorted") from that point on, for the rest of the
+/// session. Root cause theory: this thread's own blocking USB control
+/// transfer (the attenuator command) pauses its bulk reads for the
+/// transfer's round-trip time; the RX-888's own onboard buffer is small
+/// relative to its ~130MB/s streaming rate, so even a few milliseconds
+/// of not reading it can overflow and drop real ADC bytes at the
+/// firmware level -- and since this module's own sample parser is a
+/// simple sequential 2-byte-pair split with NO resync mechanism (raw
+/// ADC noise has no natural sync pattern to lock onto, unlike a real
+/// protocol's framing), losing even a single byte permanently shifts
+/// every subsequent sample's byte alignment for the rest of the
+/// connection, turning real data into garbage from that point on.
+/// Splitting the control transfer back onto its own thread (this
+/// module's ORIGINAL design, before a since-understood-to-be-unrelated
+/// "double free" bug -- actually a missing wdsp_sys::SETUP_LOCK on
+/// WDSP's own CloseChannel, see SpectrumAnalyzer::drop's doc comment --
+/// led to merging them) removes the artificial pause this loop would
+/// otherwise impose on itself.
+///
+/// Reads raw real i16 ADC samples, runs each through the NCO+CIC DDC
+/// retuned to whatever `frequency_hz` currently holds (checked once per
+/// USB read, not once per sample -- retuning takes effect within one
+/// read's worth of latency, plenty responsive for a user turning a VFO
+/// knob), and pushes the result into `iq_buffers[0]` via the same
+/// drop-oldest `push_sample` every other board's receiver loop uses.
+fn rx888_receiver_loop(
+    mut rx_endpoint: rx888::RxEndpoint,
+    iq_buffers: Vec<Arc<Mutex<VecDeque<IqSample>>>>,
+    frequency_hz: Arc<AtomicU32>,
+    stop_flag: Arc<AtomicBool>,
+) {
+    let mut ddc = rx888::Ddc::new(rx888::DEFAULT_SAMPLE_RATE_HZ, rx888::CIC_DECIMATION, rx888::CIC_STAGES);
+    let mut last_freq = frequency_hz.load(Ordering::Relaxed);
+    ddc.set_tune_freq(last_freq as f64);
+    let mut buf = vec![0u8; rx888::STREAM_READ_SIZE];
+    // Reused scratch buffer for the raw-bytes-to-i16 conversion below --
+    // avoids a per-read allocation. Processing a whole block at once via
+    // Ddc::process_block (rather than one sample at a time) is a real
+    // performance requirement, not just style -- see that function's own
+    // doc comment: an earlier one-sample-at-a-time design measured at
+    // 2.11s of CPU time per 1s of real audio (literally could not keep
+    // up with this board's real-time data rate), confirmed as the root
+    // cause of a real report (stale/backlogged spectrum display, missing
+    // discrete signals, corrupted audio).
+    let mut i16_samples: Vec<i16> = Vec::with_capacity(rx888::STREAM_READ_SIZE / 2);
+
+    while !stop_flag.load(Ordering::Relaxed) {
+        let n = match rx_endpoint.read(&mut buf) {
+            Ok(n) => n,
+            Err(e) if e.kind() == io::ErrorKind::TimedOut => continue, // normal idle case, see rx888.rs's IO_TIMEOUT doc comment
+            Err(_) => break,
+        };
+
+        let freq = frequency_hz.load(Ordering::Relaxed);
+        if freq != last_freq {
+            ddc.set_tune_freq(freq as f64);
+            last_freq = freq;
+        }
+
+        i16_samples.clear();
+        // rx888::derandomize: REQUIRED because initialise() enables the
+        // ADC's output randomizer (GPIO_RANDO) -- see that function's
+        // own doc comment. Without this, roughly half of all samples
+        // (every one with the LSB set) have their upper 15 bits
+        // inverted -- not subtly wrong, full-scale noise on half the
+        // stream.
+        i16_samples.extend(
+            buf[..n].chunks_exact(2).map(|pair| rx888::derandomize(i16::from_le_bytes([pair[0], pair[1]]))),
+        );
+
+        ddc.process_block(&i16_samples, |(i, q)| {
+            push_sample(&iq_buffers[0], IqSample { i, q }, IQ_BUFFER_CAPACITY);
+        });
+    }
+}
+
+/// Small periodic control loop -- owns the RX-888's control-transfer
+/// `Rx888Device` exclusively, on its OWN thread separate from
+/// rx888_receiver_loop's bulk streaming (see that function's own doc
+/// comment for why this split matters -- a real, confirmed data-
+/// corruption bug when the two were merged onto one thread). Polls
+/// `rx_attenuation` (the SAME shared setting standard boards' own step
+/// attenuator uses -- reused here rather than adding a new UI control,
+/// see rx888::Rx888Device::set_attenuator_db's doc comment) for changes
+/// and pushes them down to the hardware, same "small, bounded poll"
+/// idiom as ozy_i2c_loop.
+fn rx888_control_loop(device: rx888::Rx888Device, rx_attenuation: Arc<AtomicU32>, stop_flag: Arc<AtomicBool>) {
+    let mut last_atten = u32::MAX; // force an initial push even if the setting is 0
+    while !stop_flag.load(Ordering::Relaxed) {
+        let atten = rx_attenuation.load(Ordering::Relaxed);
+        if atten != last_atten {
+            let _ = device.set_attenuator_db(atten);
+            last_atten = atten;
+        }
+        thread::sleep(Duration::from_millis(200));
+    }
+    rx888::stop(&device);
 }
 
 /// Builds one 512-byte USB frame: 3 sync bytes, 5 C&C bytes, rest
@@ -5057,6 +5389,8 @@ fn start_protocol2(
         is_ozy: false,
         ozy_versions: None,
         ozy_i2c_thread: None,
+        is_rx888: false,
+        rx888_control_thread: None,
     })
 }
 

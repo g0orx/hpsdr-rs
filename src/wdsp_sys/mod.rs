@@ -28,15 +28,16 @@
 // library sitting there for when it's needed.
 #![allow(dead_code)]
 
-/// Serializes one-time WDSP channel setup (OpenChannel and everything
-/// around it, including the FFTW wisdom-generation pass triggered on a
-/// fresh machine/config -- see spectrum.rs's WDSPwisdom call) across
-/// EVERY channel this process opens, RXA and TXA alike -- not just
-/// among receivers. FFTW's planner is well-documented as unsafe to
-/// call concurrently from multiple threads, and every WDSP channel
-/// (spectrum.rs's SpectrumAnalyzer::open for RXA, tx.rs's
-/// TxProcessor::open for TXA) does exactly that during its one-time
-/// setup, each on its own independent background thread.
+/// Serializes WDSP channel setup AND teardown (OpenChannel/
+/// CloseChannel/DestroyAnalyzer and everything around them, including
+/// the FFTW wisdom-generation pass triggered on a fresh machine/config
+/// -- see spectrum.rs's WDSPwisdom call) across EVERY channel this
+/// process opens or closes, RXA and TXA alike -- not just among
+/// receivers. FFTW's planner is well-documented as unsafe to call
+/// concurrently from multiple threads, and every WDSP channel
+/// (spectrum.rs's SpectrumAnalyzer::open/drop for RXA, tx.rs's
+/// TxProcessor::open/drop for TXA) touches it during both setup and
+/// teardown, each on its own independent background thread.
 ///
 /// Previously this was a `Mutex` local to SpectrumAnalyzer::open,
 /// added after a segfault reproduced when multiple *receiver* threads
@@ -50,9 +51,20 @@
 /// shared planner state (glibc's "double free or corruption (!prev)"
 /// is the classic symptom). Now shared here so both call sites
 /// serialize against each other, not just against their own kind.
-/// Each channel's own steady-state feed()/demod()/run() loop
-/// afterward is untouched by this lock and continues to run fully
-/// concurrently -- only the one-time setup sequence takes it.
+///
+/// EXTENDED to teardown (2026-09-19) after a real report: closing two
+/// channels (e.g. an RX channel and a TX channel, each torn down on its
+/// own background thread at disconnect) at close to the same moment
+/// could race the exact same way OpenChannel could, but CloseChannel/
+/// DestroyAnalyzer were never covered by this lock -- only setup was.
+/// Confirmed via a real gdb backtrace: a "double free or corruption"
+/// abort inside CloseChannel's own call chain, with no lock held
+/// anywhere on the stack. See SpectrumAnalyzer::drop/TxProcessor::drop.
+///
+/// Each channel's own steady-state feed()/demod()/run() loop, in
+/// between setup and teardown, is untouched by this lock and continues
+/// to run fully concurrently -- only the one-time setup sequence and
+/// the equally one-time teardown sequence take it.
 pub static SETUP_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 pub const DETECTOR_MODE_PEAK: u32 = 0;

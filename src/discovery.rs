@@ -11,6 +11,7 @@
 */
 
 use crate::ozy;
+use crate::rx888;
 use network_interface::{Addr, NetworkInterface, NetworkInterfaceConfig};
 use serde::{Deserialize, Serialize};
 use socket2::{Domain, Socket, Type};
@@ -39,6 +40,14 @@ pub enum Boards {
     /// (`Device::protocol` is 1 for this board too) -- see ozy.rs and
     /// radio.rs's start_protocol1_ozy_usb.
     Ozy,
+    /// RX-888 Mk2 -- a receive-only, direct-sampling HF SDR reached over
+    /// raw USB bulk transfers, same as Ozy, but with NO relation to P1/P2
+    /// framing at all: it has no on-board DDC, so this project does its
+    /// own digital down-conversion in software -- see rx888.rs and
+    /// radio.rs's start_rx888_usb. `Device::protocol` is meaningless for
+    /// this board (set to 1 only as a harmless placeholder; nothing
+    /// reads it for an Rx888 device).
+    Rx888,
     Unknown,
 }
 
@@ -287,6 +296,7 @@ pub fn discover(devices: Arc<Mutex<Vec<Device>>>, interface_names: Arc<Mutex<Has
     // independent of the network-interface loop below, so there's no
     // real cost to doing it inline first.
     discover_ozy_usb(&devices);
+    discover_rx888_usb(&devices);
 
     let interfaces = match NetworkInterface::show() {
         Ok(v) => v,
@@ -347,6 +357,39 @@ fn discover_ozy_usb(devices: &Arc<Mutex<Vec<Device>>>) {
         adcs: 2,
         frequency_min: 0,
         frequency_max: 61_440_000,
+    });
+}
+
+/// Sentinel MAC for the synthetic RX-888 `Device` entry below --
+/// deliberately different from `discover_ozy_usb`'s `[0; 6]` so the two
+/// don't collide (and overwrite each other's persisted Config) if both
+/// happen to be plugged in at once.
+pub const RX888_SENTINEL_MAC: [u8; 6] = [0, 0, 0, 0, 0, 1];
+
+/// USB-side counterpart to discover_ozy_usb, same reasoning -- no real
+/// network address/discovery reply to build a Device from, just a
+/// synthetic entry so the RX-888 shows up as a selectable row. Real
+/// bring-up (firmware load, ADC rate/attenuator programming) happens at
+/// connect time in radio.rs's start_rx888_usb, same as Ozy.
+fn discover_rx888_usb(devices: &Arc<Mutex<Vec<Device>>>) {
+    if !rx888::discover() {
+        return;
+    }
+    let sentinel = SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0);
+    devices.lock().unwrap().push(Device {
+        address: sentinel,
+        my_address: sentinel,
+        device: 0,
+        board: Boards::Rx888,
+        protocol: 1, // meaningless for this board -- see Boards::Rx888's doc comment
+        version: 0,
+        status: 2, // available
+        mac: RX888_SENTINEL_MAC,
+        supported_receivers: 1, // v1 scope: single receiver only, see start_rx888_usb
+        supported_transmitters: 0, // receive-only hardware
+        adcs: 1,
+        frequency_min: 0,
+        frequency_max: (rx888::DEFAULT_SAMPLE_RATE_HZ / 2) as u64,
     });
 }
 
