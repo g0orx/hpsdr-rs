@@ -411,7 +411,19 @@ fn discover_rx888_usb(devices: &Arc<Mutex<Vec<Device>>>) {
         version: 0,
         status: 2, // available
         mac: RX888_SENTINEL_MAC,
-        supported_receivers: 1, // v1 scope: single receiver only, see start_rx888_usb
+        // ADDED (2026-09-20, real request: "can we have more than 1 DDC
+        // for the RX888") -- up from v1's single-receiver-only scope.
+        // RAISED from an initial cap of 3 to 8 after real-hardware
+        // confirmation ("CPU usage with 3 running is no problem on this
+        // PC") once each DDC got its own worker thread (see
+        // rx888_receiver_loop's own doc comment) rather than all
+        // running sequentially on one -- with that change, this cap is
+        // no longer really about single-core CPU budget at all so much
+        // as "how many receivers is anyone plausibly going to want on
+        // one wideband capture" -- still NOT a hardware limit (unlike a
+        // real P1/P2 board's own reported count) -- see start_rx888_usb's
+        // own doc comment on the real_receivers sizing it drives.
+        supported_receivers: 8,
         supported_transmitters: 0, // receive-only hardware
         adcs: 1,
         frequency_min: 0,

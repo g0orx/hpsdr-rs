@@ -901,6 +901,18 @@ struct ExtraReceiver {
     /// this receiver's own sample-rate control when it can't actually
     /// be honored independently (see render_extra_receiver_settings).
     protocol: u8,
+    /// ADDED (2026-09-20, real report: an RX-888 extra receiver's own
+    /// Settings->RX showed the full generic P1 rate list (48-1536kHz),
+    /// most of which this board doesn't actually support -- see
+    /// rx888::ddc_params_for_output_rate's own doc comment for why only
+    /// 96/192/384 are real options). RX-888's `protocol` field is the
+    /// same dummy value 1 real P1 hardware uses (see Boards::Rx888's own
+    /// doc comment), so `protocol` alone can't tell the two apart --
+    /// this field can. Used only to pick the right rate BUTTON LIST in
+    /// render_extra_receiver_settings; the "follows the main receiver,
+    /// not independently adjustable" behavior itself is unchanged and
+    /// still driven by `protocol == 1` for both.
+    board: Boards,
     /// See discovery::Device::frequency_min/frequency_max's doc comment
     /// -- same radio, same limits, copied in once at spawn time (the
     /// connected device can't change mid-session). Used by this
@@ -2128,6 +2140,7 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                     &session,
                     device.adcs,
                     device.protocol,
+                    device.board,
                     device.frequency_min,
                     device.frequency_max,
                     Arc::clone(&settings_dirty),
@@ -3423,6 +3436,7 @@ impl eframe::App for HpsdrApp {
                                             &connected.session,
                                             connected.device.adcs,
                                             connected.device.protocol,
+                                            connected.device.board,
                                             connected.device.frequency_min,
                                             connected.device.frequency_max,
                                             Arc::clone(&connected.settings_dirty),
@@ -3619,16 +3633,33 @@ impl eframe::App for HpsdrApp {
                             // spectrum.rs's run()), so there's no correctness
                             // reason to cap it as low as 1.5 -- just headroom.
                             // Displayed/dragged in dB (see scroll_slider_f32_db's
-                            // doc comment) -- +18dB ceiling matches the old
-                            // 8.0 linear max; -100dB floor is effectively
+                            // doc comment); -100dB floor is effectively
                             // silent (0.00001 linear) while still being a
                             // finite, draggable slider position.
+                            //
+                            // RAISED AGAIN, 18dB -> 30dB (2026-09-20, real
+                            // RX-888 report: audio still too quiet with AGC
+                            // OFF even at the old 18dB ceiling AND
+                            // pavucontrol maxed). Deliberately NOT fixed by
+                            // raising rx888::Ddc's own HEADROOM_FACTOR
+                            // instead (which would affect every RX-888 user,
+                            // not just this AGC-off case) -- that constant's
+                            // own doc comment traces the ORIGINAL clipping
+                            // bug it fixed to WDSP's AM envelope detector/
+                            // limiter, which (unlike the separate RX AGC
+                            // toggle this report turned off) runs whenever
+                            // AM mode itself is active regardless of that
+                            // toggle -- raising it back up risks silently
+                            // reintroducing that same hard-clipping bug for
+                            // AM users who leave AGC on. Widening THIS
+                            // user-controlled slider instead only affects
+                            // whoever actually drags it up.
                             if scroll_slider_f32_db(
                                 ui,
                                 &mut connected.slider_scroll_accum,
                                 &mut gain,
                                 -100.0,
-                                18.0,
+                                30.0,
                                 1.0,
                             ) {
                                 connected.spectrum.set_gain(gain);
@@ -10377,9 +10408,12 @@ fn render_extra_receiver_ui(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceiver>>) {
     ui.horizontal(|ui| {
         ui.label("Audio gain:");
         let mut gain = current_gain;
-        // Same dB-displayed treatment as the main window's identical
-        // control -- see scroll_slider_f32_db's doc comment (main.rs).
-        if scroll_slider_f32_db(ui, &mut rx.slider_scroll_accum, &mut gain, -100.0, 18.0, 1.0) {
+        // Same dB-displayed treatment, and same 30dB ceiling, as the main
+        // window's identical control -- see scroll_slider_f32_db's doc
+        // comment (main.rs) and that control's own doc comment for why
+        // 30dB, not rx888::Ddc::HEADROOM_FACTOR, was raised for the real
+        // AGC-off-too-quiet RX-888 report this fixes.
+        if scroll_slider_f32_db(ui, &mut rx.slider_scroll_accum, &mut gain, -100.0, 30.0, 1.0) {
             rx.spectrum.set_gain(gain);
             rx.settings_dirty.store(true, Ordering::Relaxed);
         }
@@ -10978,9 +11012,23 @@ fn render_extra_receiver_settings(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceive
             // (see change_sample_rate's P1 branch) rather than exposed
             // as independently adjustable, which the hardware has no
             // way to actually honor.
+            // ROOT CAUSE FIX for a real report ("show all the sample
+            // rates but grayed out" -- an RX-888 extra receiver showed
+            // the full generic P1 list, most of which this board never
+            // actually supports, unlike real P1 hardware where every
+            // one of these genuinely is a valid shared-clock rate). Same
+            // rate list as the main receiver's own Sample Rate buttons
+            // (main.rs's SettingsTab::Agc block) -- see
+            // rx888::ddc_params_for_output_rate's own doc comment for
+            // why RX-888 is limited to just these three.
+            let rates: &[u32] = if rx.board == Boards::Rx888 {
+                &[96_000, 192_000, 384_000]
+            } else {
+                &[48_000, 96_000, 192_000, 384_000, 768_000, 1_536_000]
+            };
             ui.add_enabled_ui(rx.protocol != 1, |ui| {
                 ui.horizontal_wrapped(|ui| {
-                    for rate in [48_000u32, 96_000, 192_000, 384_000, 768_000, 1_536_000] {
+                    for &rate in rates {
                         let selected = rate == current_rate;
                         let label = format!("{}", rate / 1000);
                         if ui.add(egui::Button::selectable(selected, label)).clicked() && !selected {
@@ -11319,10 +11367,12 @@ fn resolve_tune(
 /// applying saved settings (used both by the "Add Receiver" button --
 /// saved=None, defaults -- and by auto-restoring from config on
 /// connect -- saved=Some(...)).
+#[allow(clippy::too_many_arguments)]
 fn spawn_extra_receiver(
     session: &RadioSession,
     num_adcs: u8,
     protocol: u8,
+    board: Boards,
     frequency_min: u64,
     frequency_max: u64,
     settings_dirty: Arc<std::sync::atomic::AtomicBool>,
@@ -11337,6 +11387,20 @@ fn spawn_extra_receiver(
         freq_arc.store(s.frequency_hz, Ordering::Relaxed);
         rate_arc.store(s.sample_rate_hz, Ordering::Relaxed);
         adc_arc.store(s.adc as u32, Ordering::Relaxed);
+    } else if protocol == 1 {
+        // ROOT CAUSE FIX for a real report (RX-888's own "Add Receiver"
+        // showing a rate that didn't match the main receiver): a fresh
+        // (non-restored) extra receiver's own extra_sample_rates_hz[idx-1]
+        // slot was pre-allocated at CONNECT time (see start_rx888_usb/
+        // start_protocol1's own identical sizing) and never touched
+        // again until this receiver was actually added -- if the user
+        // changed the main Sample Rate in between, this slot went stale,
+        // showing/using the OLD rate instead of what's actually running.
+        // Every shared-clock board (protocol == 1 -- real P1 hardware
+        // AND RX-888, whose own DDCs all share one decimation too, see
+        // ExtraReceiver::board's own doc comment) must start a fresh
+        // receiver already synced to the CURRENT session rate instead.
+        rate_arc.store(session.sample_rate.load(Ordering::Relaxed), Ordering::Relaxed);
     }
     let rate_val = rate_arc.load(Ordering::Relaxed);
 
@@ -11397,6 +11461,7 @@ fn spawn_extra_receiver(
         adc: adc_arc,
         num_adcs,
         protocol,
+        board,
         frequency_min,
         frequency_max,
         mox: Arc::clone(&session.mox),

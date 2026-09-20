@@ -485,7 +485,20 @@ impl Default for DemodParams {
             agc_attack_ms: 2,
             agc_decay_ms: 250,
             agc_hang_ms: 500,
-            agc_top_db: 100.0,
+            // ROOT CAUSE FIX for a real report: AGC ON produced heavily
+            // clipped audio (WAV analysis: 40-92% of samples pinned at
+            // full scale) -- confirmed via controlled recordings to be
+            // board-AGNOSTIC (reproduced identically on a real HL2 with
+            // the same FT8 signal, not just RX-888), so the bug wasn't
+            // in either board's own IQ scaling -- it was this default.
+            // 100.0 was NEVER actually matching the reference this
+            // control's own doc comment (main.rs's "AGC Gain" slider)
+            // claims to mirror: piHPSDR's receiver.c initializes
+            // `rx->agc_gain` to 80.0, not 100.0 -- 20dB (10x) less
+            // maximum AGC gain. Corrected to match that reference
+            // exactly rather than the untraceable 100.0 this project
+            // had been carrying.
+            agc_top_db: 80.0,
             agc_slope_db: 35,
             // NB/NR off by default, same reasoning as AGC above --
             // these reshape the signal in ways that can surprise a

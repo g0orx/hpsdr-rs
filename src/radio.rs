@@ -24,6 +24,7 @@ use std::collections::VecDeque;
 use std::io;
 use std::net::UdpSocket;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU8, Ordering};
+use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -1473,8 +1474,19 @@ impl RadioSession {
         let receiver_stop = Arc::clone(&stop_flag);
         let receiver_buffers = self.iq_buffers.clone();
         let receiver_frequency_hz = Arc::clone(&self.frequency_hz);
+        let receiver_extra_frequencies_hz = self.extra_frequencies_hz.clone();
+        let receiver_active_receiver_count = Arc::clone(&self.active_receiver_count);
         self.receiver_thread = Some(thread::spawn(move || {
-            rx888_receiver_loop(rx_endpoint, receiver_buffers, receiver_frequency_hz, receiver_stop, adc_rate_hz, decimation);
+            rx888_receiver_loop(
+                rx_endpoint,
+                receiver_buffers,
+                receiver_frequency_hz,
+                receiver_extra_frequencies_hz,
+                receiver_active_receiver_count,
+                receiver_stop,
+                adc_rate_hz,
+                decimation,
+            );
         }));
 
         let control_stop = Arc::clone(&stop_flag);
@@ -2360,10 +2372,43 @@ fn start_rx888_usb(
         rx888::initialise(&firmware_path, rx_attenuation.load(Ordering::Relaxed), adc_rate_hz)?;
 
     let stop_flag = Arc::new(AtomicBool::new(false));
-    // v1 scope: single receiver only -- see rx888.rs's module doc
-    // comment and discover_rx888_usb's synthetic Device entry.
+    // ADDED (2026-09-20, real request: "can we have more than 1 DDC for
+    // the RX888") -- up to `device.supported_receivers` (discover_rx888_usb's
+    // own synthetic Device reports 8, raised from an initial cap of 3 --
+    // see that field's own doc comment) independent NCO+CIC DDCs over
+    // the SAME raw ADC stream, exactly mirroring start_protocol1's own
+    // real_receivers/iq_buffers/extra_frequencies_hz sizing pattern
+    // (see that function's own comments for the general shape -- PS/
+    // diversity reservations don't apply here, this board has neither).
+    // Unlike a real P1/P2 radio, there's no hardware wire-capacity
+    // negotiation needed at all for this -- the RX-888 already delivers
+    // the entire wideband capture regardless of how many receivers are
+    // active; each additional one is purely a software cost (another
+    // NCO+CIC pipeline run over the same samples, on its own worker
+    // thread -- see rx888_receiver_loop's own doc comment for why this
+    // runs each DDC in parallel rather than sequentially on one thread,
+    // which is what makes a cap this high practical at all on a
+    // real-hardware report of ample per-core headroom with 3 active),
+    // not a new USB/protocol concern.
+    let real_receivers = settings.receivers.max(1);
     let iq_buffers: Vec<Arc<Mutex<VecDeque<IqSample>>>> =
-        vec![Arc::new(Mutex::new(VecDeque::with_capacity(IQ_BUFFER_CAPACITY)))];
+        (0..real_receivers).map(|_| Arc::new(Mutex::new(VecDeque::with_capacity(IQ_BUFFER_CAPACITY)))).collect();
+    let extra_count = real_receivers.saturating_sub(1) as usize;
+    // Sample rate is tracked per-extra-receiver for struct-shape parity
+    // with P2/start_protocol1, but every RX-888 DDC (main and extra)
+    // always shares the SAME ADC clock/decimation -- main.rs's
+    // change_sample_rate keeps every extra receiver's own WDSP channel
+    // in sync with the primary's rate via the exact same P1-shared-clock
+    // code path start_protocol1 already relies on (this board's
+    // `protocol` field is the same dummy value 1 -- see Boards::Rx888's
+    // doc comment), which is exactly correct here too: restart_rx888_at_rate
+    // rebuilds every active Ddc at the new decimation together, so there
+    // never IS an independent per-extra-receiver rate to expose.
+    let extra_frequencies_hz: Vec<Arc<AtomicU32>> =
+        (0..extra_count).map(|_| Arc::new(AtomicU32::new(settings.frequency_hz))).collect();
+    let extra_sample_rates_hz: Vec<Arc<AtomicU32>> =
+        (0..extra_count).map(|_| Arc::new(AtomicU32::new(settings.sample_rate))).collect();
+    let extra_adcs: Vec<Arc<AtomicU32>> = (0..extra_count).map(|_| Arc::new(AtomicU32::new(0))).collect();
     let active_receiver_count = Arc::new(AtomicU32::new(1));
     let disable_pa = Arc::new(AtomicBool::new(false));
     let tune_active = Arc::new(AtomicBool::new(false));
@@ -2377,8 +2422,19 @@ fn start_rx888_usb(
     let receiver_stop = Arc::clone(&stop_flag);
     let receiver_buffers = iq_buffers.clone();
     let receiver_frequency_hz = Arc::clone(&frequency_hz);
+    let receiver_extra_frequencies_hz = extra_frequencies_hz.clone();
+    let receiver_active_receiver_count = Arc::clone(&active_receiver_count);
     let receiver_thread = thread::spawn(move || {
-        rx888_receiver_loop(rx_endpoint, receiver_buffers, receiver_frequency_hz, receiver_stop, adc_rate_hz, decimation);
+        rx888_receiver_loop(
+            rx_endpoint,
+            receiver_buffers,
+            receiver_frequency_hz,
+            receiver_extra_frequencies_hz,
+            receiver_active_receiver_count,
+            receiver_stop,
+            adc_rate_hz,
+            decimation,
+        );
     });
 
     let control_stop = Arc::clone(&stop_flag);
@@ -2405,9 +2461,9 @@ fn start_rx888_usb(
         oc_tx,
         rx_attenuation,
         ps_tx_attenuation,
-        extra_frequencies_hz: Vec::new(),
-        extra_sample_rates_hz: Vec::new(),
-        extra_adcs: Vec::new(),
+        extra_frequencies_hz,
+        extra_sample_rates_hz,
+        extra_adcs,
         active_receiver_count,
         ps_rx_feedback_iq,
         ps_tx_feedback_iq,
@@ -2493,34 +2549,98 @@ fn start_rx888_usb(
 /// led to merging them) removes the artificial pause this loop would
 /// otherwise impose on itself.
 ///
-/// Reads raw real i16 ADC samples, runs each through the NCO+CIC DDC
-/// retuned to whatever `frequency_hz` currently holds (checked once per
-/// USB read, not once per sample -- retuning takes effect within one
-/// read's worth of latency, plenty responsive for a user turning a VFO
-/// knob), and pushes the result into `iq_buffers[0]` via the same
-/// drop-oldest `push_sample` every other board's receiver loop uses.
+/// Reads raw real i16 ADC samples and fans each block out to
+/// `1 + extra_frequencies_hz.len()` INDEPENDENT NCO+CIC DDC worker
+/// threads -- one per configured receiver slot (index 0 = the main
+/// `frequency_hz`, index i = `extra_frequencies_hz[i-1]`, matching
+/// iq_buffers' own indexing), each retuning itself to its own current
+/// frequency (checked once per block, same cadence as the original
+/// single-DDC design).
+///
+/// PARALLEL ACROSS THREADS, not just across receiver slots --
+/// ADDED/REVISED (2026-09-20, real request: "can we have more than 1
+/// DDC for the RX888" -> "lets try 3 and see what the CPU utilization
+/// is like" -> "What if we run them in parallel on separate threads.
+/// This computer is 8 core, 16 threads"). An earlier version of this
+/// function ran every active Ddc sequentially on THIS thread, so 3
+/// active receivers cost 3x one receiver's CPU time on a SINGLE core --
+/// fine on a few cores of headroom, but wasteful on a machine with
+/// plenty of otherwise-idle cores to spread that same work across.
+/// Worker threads are spawned ONCE here (not per USB read/block, which
+/// happens roughly 1000-2000 times/sec at this module's own
+/// STREAM_READ_SIZE -- real OS thread creation at that rate would
+/// plausibly cost more than the parallelism saves) and joined again
+/// before this function returns, each fed via its own small bounded
+/// `mpsc::sync_channel` of `Arc<[i16]>` blocks (cheap to hand off --
+/// just a refcount bump, no sample data copied per worker).
+///
+/// A worker's queue filling up (it's fallen behind) means `try_send`
+/// below drops that ONE block for that ONE receiver rather than
+/// blocking -- deliberately, for two reasons: blocking would let a
+/// single slow worker head-of-line-block the fan-out to every OTHER
+/// worker queued after it in the loop below, and (more importantly) it
+/// would prevent this function's own `while !stop_flag` check from
+/// ever being reached again, hanging the whole session's shutdown on
+/// one stuck receiver. A dropped block is a brief, self-contained glitch
+/// for that one receiver's own audio/spectrum, not a stall or a crash.
+///
+/// Only the first `active_receiver_count` workers are actually sent
+/// anything each read (checked once per read) -- an inactive slot's
+/// worker thread is still spawned and holds a live, correctly-tuned Ddc
+/// (simplest way to give it stable, persistent CIC state whenever it
+/// DOES get activated, rather than spawning/joining threads on every
+/// "Add Receiver" click), but sits blocked in `recv()` using no CPU at
+/// all until then. This is what makes the feature's own CPU/thread cost
+/// purely a function of how many receivers are actually turned on via
+/// "Add Receiver", not how many slots this board happens to be
+/// configured with.
 fn rx888_receiver_loop(
     mut rx_endpoint: rx888::RxEndpoint,
     iq_buffers: Vec<Arc<Mutex<VecDeque<IqSample>>>>,
     frequency_hz: Arc<AtomicU32>,
+    extra_frequencies_hz: Vec<Arc<AtomicU32>>,
+    active_receiver_count: Arc<AtomicU32>,
     stop_flag: Arc<AtomicBool>,
     adc_rate_hz: u32,
     decimation: u32,
 ) {
-    let mut ddc = rx888::Ddc::new(adc_rate_hz, decimation, rx888::CIC_STAGES);
-    let mut last_freq = frequency_hz.load(Ordering::Relaxed);
-    ddc.set_tune_freq(last_freq as f64);
+    let receiver_count = 1 + extra_frequencies_hz.len();
+
+    // Queue depth 2: a little elasticity against transient scheduling
+    // jitter across many hardware threads, without letting a
+    // persistently-behind worker queue up a meaningful amount of stale
+    // latency before try_send below starts shedding blocks for it.
+    const WORKER_QUEUE_DEPTH: usize = 2;
+
+    let mut senders: Vec<mpsc::SyncSender<Arc<[i16]>>> = Vec::with_capacity(receiver_count);
+    let mut workers: Vec<thread::JoinHandle<()>> = Vec::with_capacity(receiver_count);
+    for i in 0..receiver_count {
+        let (tx, rx) = mpsc::sync_channel::<Arc<[i16]>>(WORKER_QUEUE_DEPTH);
+        let iq_buffer = Arc::clone(&iq_buffers[i]);
+        let freq_source =
+            if i == 0 { Arc::clone(&frequency_hz) } else { Arc::clone(&extra_frequencies_hz[i - 1]) };
+        let mut last_freq = freq_source.load(Ordering::Relaxed);
+        let mut ddc = rx888::Ddc::new(adc_rate_hz, decimation, rx888::CIC_STAGES);
+        ddc.set_tune_freq(last_freq as f64);
+        workers.push(thread::spawn(move || {
+            // Ends when every Sender for this worker's channel is
+            // dropped -- see this function's own tail end, after the
+            // main read loop exits.
+            while let Ok(block) = rx.recv() {
+                let freq = freq_source.load(Ordering::Relaxed);
+                if freq != last_freq {
+                    ddc.set_tune_freq(freq as f64);
+                    last_freq = freq;
+                }
+                ddc.process_block(&block, |(iv, qv)| {
+                    push_sample(&iq_buffer, IqSample { i: iv, q: qv }, IQ_BUFFER_CAPACITY);
+                });
+            }
+        }));
+        senders.push(tx);
+    }
+
     let mut buf = vec![0u8; rx888::STREAM_READ_SIZE];
-    // Reused scratch buffer for the raw-bytes-to-i16 conversion below --
-    // avoids a per-read allocation. Processing a whole block at once via
-    // Ddc::process_block (rather than one sample at a time) is a real
-    // performance requirement, not just style -- see that function's own
-    // doc comment: an earlier one-sample-at-a-time design measured at
-    // 2.11s of CPU time per 1s of real audio (literally could not keep
-    // up with this board's real-time data rate), confirmed as the root
-    // cause of a real report (stale/backlogged spectrum display, missing
-    // discrete signals, corrupted audio).
-    let mut i16_samples: Vec<i16> = Vec::with_capacity(rx888::STREAM_READ_SIZE / 2);
 
     while !stop_flag.load(Ordering::Relaxed) {
         let n = match rx_endpoint.read(&mut buf) {
@@ -2529,26 +2649,32 @@ fn rx888_receiver_loop(
             Err(_) => break,
         };
 
-        let freq = frequency_hz.load(Ordering::Relaxed);
-        if freq != last_freq {
-            ddc.set_tune_freq(freq as f64);
-            last_freq = freq;
-        }
+        let active = (active_receiver_count.load(Ordering::Relaxed) as usize).clamp(1, receiver_count);
 
-        i16_samples.clear();
         // rx888::derandomize: REQUIRED because initialise() enables the
         // ADC's output randomizer (GPIO_RANDO) -- see that function's
         // own doc comment. Without this, roughly half of all samples
         // (every one with the LSB set) have their upper 15 bits
         // inverted -- not subtly wrong, full-scale noise on half the
-        // stream.
-        i16_samples.extend(
-            buf[..n].chunks_exact(2).map(|pair| rx888::derandomize(i16::from_le_bytes([pair[0], pair[1]]))),
-        );
+        // stream. A fresh Vec (not a reused scratch buffer, unlike the
+        // pre-parallel design) is unavoidable here: this block is about
+        // to be shared across multiple worker threads via Arc, so it
+        // can't be a buffer this loop goes on to mutate for the next
+        // read while a worker might still be reading it.
+        let block: Arc<[i16]> = buf[..n]
+            .chunks_exact(2)
+            .map(|pair| rx888::derandomize(i16::from_le_bytes([pair[0], pair[1]])))
+            .collect::<Vec<i16>>()
+            .into();
 
-        ddc.process_block(&i16_samples, |(i, q)| {
-            push_sample(&iq_buffers[0], IqSample { i, q }, IQ_BUFFER_CAPACITY);
-        });
+        for sender in senders.iter().take(active) {
+            let _ = sender.try_send(Arc::clone(&block));
+        }
+    }
+
+    drop(senders); // closes every worker's channel, ending its recv() loop above
+    for w in workers {
+        let _ = w.join();
     }
 }
 
