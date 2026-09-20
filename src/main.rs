@@ -87,6 +87,37 @@ fn band_for_frequency(freq_hz: u32) -> Option<&'static Band> {
     BANDS.iter().find(|b| freq_hz >= b.low_hz && freq_hz <= b.high_hz)
 }
 
+/// "General coverage" -- not a real ham band, but a real request: a
+/// band-button-like way to jump anywhere across the whole radio's own
+/// tunable range, for listening outside the ham allocations (broadcast,
+/// utility, WWV, etc.). Deliberately NOT a `BANDS` entry: that array is
+/// a fixed-size `const` indexed by literal position elsewhere (MIDI's
+/// Band160m..Band6m actions) and its entries participate in PA
+/// calibration/drive-linearization lookups (band_for_frequency, used
+/// for TX gain tables) where a catch-all spanning the ENTIRE range would
+/// incorrectly shadow every real band if it matched first, or need
+/// special-casing to avoid it. A `Band` value built fresh per call
+/// instead, using the CONNECTED device's own real frequency_min/max
+/// (which a `const` array entry couldn't hold anyway, since it's
+/// different per board) -- reuses the exact same Band/apply_band/
+/// band_memory machinery every real band already has (recall last
+/// frequency/mode on this "band", etc.) for free.
+fn gen_band(frequency_min: u64, frequency_max: u64) -> Band {
+    let lo = frequency_min as u32;
+    let hi = frequency_max as u32;
+    Band {
+        name: "Gen",
+        low_hz: lo,
+        high_hz: hi,
+        // 10.000.000 Hz -- WWV/WWVH, a globally-recognized reference
+        // signal and a reasonable first stop for general coverage
+        // listening; clamped into range for a board with a narrower
+        // tunable span than that.
+        default_hz: 10_000_000u32.clamp(lo, hi),
+        default_mode: spectrum::Mode::Am,
+    }
+}
+
 /// Looks up the current band's calibrated PA gain (dB), falling back to
 /// radio::DEFAULT_PA_GAIN_DB for a band with no calibration entry yet
 /// (or a frequency outside every defined band). See ConnectedState's
@@ -353,7 +384,7 @@ fn width_for_mode(width_memory: &std::collections::HashMap<String, f64>, mode: s
 /// extracted (unlike most of this file's inline UI-handler logic) because
 /// it touches enough fields (active_xvtr, band_memory, mode, width, the TX
 /// mirror) that duplicating it risks the two call sites drifting apart.
-fn apply_band(connected: &mut ConnectedState, band: &'static Band) {
+fn apply_band(connected: &mut ConnectedState, band: &Band) {
     connected.active_xvtr = None;
     let saved = connected.band_memory.get(band.name).copied();
     let target = saved.map(|s| s.frequency_hz).unwrap_or(band.default_hz);
@@ -382,6 +413,37 @@ fn apply_band(connected: &mut ConnectedState, band: &'static Band) {
         tx.set_mode(resolved_mode);
         tx.set_width_hz(resolved_width_hz);
     }
+}
+
+/// Same as `apply_band` above, but for an `ExtraReceiver` -- no XVTR/TX
+/// concept there, and its frequency is a plain atomic store rather than
+/// going through RadioSession::set_frequency. Factored out (2026-09-20)
+/// from what used to be inline-only logic in its own band-button row, so
+/// the "Gen" button (gen_band) can share it too instead of a second copy.
+fn apply_band_extra(rx: &mut ExtraReceiver, band: &Band) {
+    let saved = rx.band_memory.get(band.name).copied();
+    let target = saved.map(|s| s.frequency_hz).unwrap_or(band.default_hz);
+    rx.frequency_hz.store(target, Ordering::Relaxed);
+    rx.ctun_frequency_hz = target;
+    if let Some(s) = saved {
+        rx.db_low = s.db_low;
+        rx.db_high = s.db_high;
+        rx.waterfall_db_low = s.waterfall_db_low;
+        rx.waterfall_db_high = s.waterfall_db_high;
+    }
+    let resolved_mode = saved.and_then(|s| s.mode).unwrap_or(band.default_mode);
+    remember_band_settings(
+        &mut rx.band_memory,
+        target,
+        rx.db_low,
+        rx.db_high,
+        rx.waterfall_db_low,
+        rx.waterfall_db_high,
+        resolved_mode,
+    );
+    rx.spectrum.set_mode(resolved_mode);
+    rx.spectrum.set_width_hz(width_for_mode(&rx.width_memory, resolved_mode));
+    rx.settings_dirty.store(true, Ordering::Relaxed);
 }
 
 /// Switches to `mode` at the current dial frequency. Shared by the
@@ -1101,6 +1163,17 @@ impl Default for MidiLearnState {
     }
 }
 
+/// Right-click VFO -> keypad frequency-entry popup state -- real
+/// request. See ConnectedState::frequency_entry's own doc comment.
+struct FrequencyEntry {
+    vfo_b: bool,
+    /// ASCII '0'-'9' only, most-significant digit first, whole Hz --
+    /// e.g. "14074000" displays as "14.074.000" (format_frequency).
+    /// Empty until the user presses a digit key, same as a phone
+    /// dialer starting blank rather than pre-filled.
+    digits: String,
+}
+
 struct ConnectedState {
     device: Device,
     /// The local network interface (e.g. "eth0") `device.my_address`
@@ -1277,6 +1350,14 @@ struct ConnectedState {
     spectrum_pan: f32,
     slider_scroll_accum: f32,
     show_settings_window: bool,
+    /// Right-click VFO-A or VFO-B -> keypad frequency-entry popup, real
+    /// request. `None` = not open, same toggle idiom as
+    /// show_settings_window above. `vfo_b: true` targets VFO B instead
+    /// of VFO A/the dial; `digits` is what's been typed so far (ASCII
+    /// '0'-'9', most-significant first, interpreted as whole Hz) --
+    /// starts empty (not pre-filled with the current frequency) so
+    /// typing always starts a fresh number, same as a phone dialer.
+    frequency_entry: Option<FrequencyEntry>,
     settings_tab: SettingsTab,
     /// P2 in-application firmware update against THIS connected radio --
     /// see bootloader_ui::FirmwareUpdateWindow/bootloader.rs's own doc
@@ -2343,6 +2424,7 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                 spectrum_pan: cfg.spectrum_pan.unwrap_or(0.0),
                 slider_scroll_accum: 0.0,
                 show_settings_window: false,
+                frequency_entry: None,
                 settings_tab: SettingsTab::Agc,
                 firmware_update: None,
                 extra_receivers,
@@ -3242,19 +3324,35 @@ impl eframe::App for HpsdrApp {
                                 .group(|ui| {
                                     ui.vertical(|ui| {
                                         ui.label("VFO-A");
-                                        ui.add(
-                                            egui::Label::new(
-                                                egui::RichText::new(format_frequency(displayed_freq_hz))
-                                                    .monospace()
-                                                    .size(28.0)
-                                                    .strong()
-                                                    .color(freq_a_color),
+                                        let resp = ui
+                                            .add(
+                                                egui::Label::new(
+                                                    egui::RichText::new(format_frequency(displayed_freq_hz))
+                                                        .monospace()
+                                                        .size(28.0)
+                                                        .strong()
+                                                        .color(freq_a_color),
+                                                )
+                                                // CLICK (not just hover) --
+                                                // needed for
+                                                // secondary_clicked() below;
+                                                // still senses hover fine
+                                                // (Sense::click() includes
+                                                // it) so the existing
+                                                // scroll-to-tune hover check
+                                                // further down is unaffected.
+                                                .sense(egui::Sense::click()),
                                             )
-                                            .sense(egui::Sense::hover()),
-                                        )
-                                        .on_hover_text(
-                                            "Scroll to tune -- Shift: 100 Hz, Ctrl: 10 kHz, none: 1 kHz",
-                                        )
+                                            .on_hover_text(
+                                                "Scroll to tune -- Shift: 100 Hz, Ctrl: 10 kHz, none: 1 kHz -- right-click to type a frequency",
+                                            );
+                                        // Right-click -> keypad frequency
+                                        // entry popup, real request.
+                                        if resp.secondary_clicked() {
+                                            connected.frequency_entry =
+                                                Some(FrequencyEntry { vfo_b: false, digits: String::new() });
+                                        }
+                                        resp
                                     })
                                     .inner
                                 })
@@ -3387,21 +3485,27 @@ impl eframe::App for HpsdrApp {
                                 .group(|ui| {
                                     ui.vertical(|ui| {
                                         ui.label("VFO-B");
-                                        ui.add(
-                                            egui::Label::new(
-                                                egui::RichText::new(format_frequency(
-                                                    connected.vfo_b_frequency_hz,
-                                                ))
-                                                .monospace()
-                                                .size(28.0)
-                                                .strong()
-                                                .color(freq_b_color),
+                                        let resp = ui
+                                            .add(
+                                                egui::Label::new(
+                                                    egui::RichText::new(format_frequency(
+                                                        connected.vfo_b_frequency_hz,
+                                                    ))
+                                                    .monospace()
+                                                    .size(28.0)
+                                                    .strong()
+                                                    .color(freq_b_color),
+                                                )
+                                                .sense(egui::Sense::click()),
                                             )
-                                            .sense(egui::Sense::hover()),
-                                        )
-                                        .on_hover_text(
-                                            "Scroll to tune -- Shift: 100 Hz, none: 1 kHz",
-                                        )
+                                            .on_hover_text(
+                                                "Scroll to tune -- Shift: 100 Hz, none: 1 kHz -- right-click to type a frequency",
+                                            );
+                                        if resp.secondary_clicked() {
+                                            connected.frequency_entry =
+                                                Some(FrequencyEntry { vfo_b: true, digits: String::new() });
+                                        }
+                                        resp
                                     })
                                     .inner
                                 })
@@ -3470,8 +3574,13 @@ impl eframe::App for HpsdrApp {
                         // sits at 28MHz) would light up together, which
                         // reads as "I'm on two bands at once". Only one
                         // button should ever appear selected.
+                        // Falls back to "Gen" (see gen_band's own doc
+                        // comment) whenever the dial isn't in any real
+                        // ham band -- so the Gen button lights up as the
+                        // active "band" for general-coverage listening,
+                        // same as any other band would for its own range.
                         let current_band = if active_xvtr_name.is_none() {
-                            band_for_frequency(dial_freq_hz).map(|b| b.name)
+                            Some(band_for_frequency(dial_freq_hz).map(|b| b.name).unwrap_or("Gen"))
                         } else {
                             None
                         };
@@ -3496,6 +3605,18 @@ impl eframe::App for HpsdrApp {
                                 // job -- shared with MIDI's BandUp/
                                 // BandDown.
                                 apply_band(connected, band);
+                                settings_changed = true;
+                            }
+                        }
+                        // "Gen" (general coverage, the radio's full own
+                        // range) -- real request. See gen_band's own doc
+                        // comment for why this isn't just another BANDS
+                        // entry.
+                        {
+                            let gen = gen_band(connected.device.frequency_min, connected.device.frequency_max);
+                            let selected = current_band == Some("Gen");
+                            if ui.add(egui::Button::selectable(selected, "Gen")).clicked() && !selected {
+                                apply_band(connected, &gen);
                                 settings_changed = true;
                             }
                         }
@@ -3544,6 +3665,164 @@ impl eframe::App for HpsdrApp {
                             }
                         }
                     });
+
+                    // Right-click VFO -> keypad frequency-entry popup --
+                    // real request. Opened by freq_label/vfo_b_label's
+                    // own secondary_clicked() handling above.
+                    if connected.frequency_entry.is_some() {
+                        let mut close_now = false;
+                        ui.ctx().show_viewport_immediate(
+                            egui::ViewportId::from_hash_of("frequency_entry_window"),
+                            egui::ViewportBuilder::default()
+                                .with_title("Enter Frequency")
+                                .with_inner_size([260.0, 360.0])
+                                .with_resizable(false)
+                                .with_active(true),
+                            |ui, _class| {
+                                if ui.input(|i| i.viewport().close_requested()) {
+                                    close_now = true;
+                                    return;
+                                }
+                                egui::CentralPanel::default().show(ui, |ui| {
+                                    // Pulled out as plain locals rather
+                                    // than held as a live borrow of
+                                    // connected.frequency_entry for the
+                                    // rest of this closure -- Enter below
+                                    // also needs to mutate OTHER
+                                    // connected fields (session,
+                                    // vfo_b_frequency_hz) to actually
+                                    // apply the result, which a held
+                                    // borrow of this one field would
+                                    // otherwise conflict with.
+                                    let (vfo_b, mut digits) = match &connected.frequency_entry {
+                                        Some(e) => (e.vfo_b, e.digits.clone()),
+                                        None => return,
+                                    };
+                                    let mut apply = false;
+
+                                    // Keyboard input -- digits, Backspace,
+                                    // Enter, Escape -- same actions as the
+                                    // on-screen buttons below, for anyone
+                                    // who'd rather type than click.
+                                    ui.input(|i| {
+                                        for ev in &i.events {
+                                            match ev {
+                                                egui::Event::Key { key: egui::Key::Backspace, pressed: true, .. } => {
+                                                    digits.pop();
+                                                }
+                                                egui::Event::Key { key: egui::Key::Enter, pressed: true, .. } => {
+                                                    apply = true;
+                                                }
+                                                egui::Event::Key { key: egui::Key::Escape, pressed: true, .. } => {
+                                                    close_now = true;
+                                                }
+                                                egui::Event::Text(t) => {
+                                                    for c in t.chars() {
+                                                        if c.is_ascii_digit() && digits.len() < 9 {
+                                                            digits.push(c);
+                                                        }
+                                                    }
+                                                }
+                                                _ => {}
+                                            }
+                                        }
+                                    });
+
+                                    ui.add_space(8.0);
+                                    ui.vertical_centered(|ui| {
+                                        ui.label(egui::RichText::new(if vfo_b { "VFO-B" } else { "VFO-A" }).weak());
+                                        // 0 while empty (nothing typed
+                                        // yet) rather than blank -- makes
+                                        // it clear this is a live preview,
+                                        // not a label that's just missing.
+                                        let preview_hz: u32 = digits.parse().unwrap_or(0);
+                                        ui.label(
+                                            egui::RichText::new(format_frequency(preview_hz))
+                                                .monospace()
+                                                .size(26.0)
+                                                .strong(),
+                                        );
+                                    });
+                                    ui.add_space(8.0);
+
+                                    let button_size = [64.0, 42.0];
+                                    egui::Grid::new("frequency_entry_keypad").spacing([6.0, 6.0]).show(ui, |ui| {
+                                        for row in [['7', '8', '9'], ['4', '5', '6'], ['1', '2', '3']] {
+                                            for d in row {
+                                                if ui.add_sized(button_size, egui::Button::new(d.to_string())).clicked()
+                                                    && digits.len() < 9
+                                                {
+                                                    digits.push(d);
+                                                }
+                                            }
+                                            ui.end_row();
+                                        }
+                                        if ui.add_sized(button_size, egui::Button::new("C")).clicked() {
+                                            digits.clear();
+                                        }
+                                        if ui.add_sized(button_size, egui::Button::new("0")).clicked()
+                                            && digits.len() < 9
+                                        {
+                                            digits.push('0');
+                                        }
+                                        if ui.add_sized(button_size, egui::Button::new("\u{2190}")).clicked() {
+                                            digits.pop();
+                                        }
+                                        ui.end_row();
+                                    });
+
+                                    ui.add_space(10.0);
+                                    ui.horizontal(|ui| {
+                                        if ui.add_sized([123.0, 32.0], egui::Button::new("Cancel")).clicked() {
+                                            close_now = true;
+                                        }
+                                        if ui.add_sized([123.0, 32.0], egui::Button::new("Enter")).clicked() {
+                                            apply = true;
+                                        }
+                                    });
+
+                                    // Write the (possibly just-edited)
+                                    // digits back so they persist to the
+                                    // next frame -- the borrow this takes
+                                    // is brief and doesn't overlap with
+                                    // anything below.
+                                    if let Some(e) = connected.frequency_entry.as_mut() {
+                                        e.digits = digits.clone();
+                                    }
+
+                                    if apply {
+                                        if !digits.is_empty() {
+                                            if let Ok(freq) = digits.parse::<u32>() {
+                                                let clamped = freq.clamp(
+                                                    connected.device.frequency_min as u32,
+                                                    connected.device.frequency_max as u32,
+                                                );
+                                                if vfo_b {
+                                                    connected.vfo_b_frequency_hz = clamped;
+                                                } else {
+                                                    // Unconditional retune, CTUN
+                                                    // or not -- typing an exact
+                                                    // frequency is an explicit
+                                                    // "go here" request, same as
+                                                    // apply_band's own band-switch
+                                                    // handling, not a small nudge
+                                                    // resolve_tune's CTUN-window
+                                                    // clamping is meant for.
+                                                    connected.session.set_frequency(clamped);
+                                                    connected.ctun_frequency_hz = clamped;
+                                                }
+                                                settings_changed = true;
+                                            }
+                                        }
+                                        close_now = true;
+                                    }
+                                });
+                            },
+                        );
+                        if close_now {
+                            connected.frequency_entry = None;
+                        }
+                    }
 
                     ui.horizontal_wrapped(|ui| {
                         for mode in ALL_MODES {
@@ -10333,7 +10612,9 @@ fn render_extra_receiver_ui(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceiver>>) {
     });
 
     ui.horizontal_wrapped(|ui| {
-        let current_band = band_for_frequency(dial_freq_hz).map(|b| b.name);
+        // Falls back to "Gen" the same way the main receiver's own
+        // band row does -- see that block's doc comment.
+        let current_band = Some(band_for_frequency(dial_freq_hz).map(|b| b.name).unwrap_or("Gen"));
         for band in &BANDS {
             // Same reachable-band filter as the main receiver's own
             // band-button row -- see its doc comment for why.
@@ -10342,35 +10623,14 @@ fn render_extra_receiver_ui(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceiver>>) {
             }
             let selected = Some(band.name) == current_band;
             if ui.add(egui::Button::selectable(selected, band.name)).clicked() && !selected {
-                let saved = rx.band_memory.get(band.name).copied();
-                let target = saved.map(|s| s.frequency_hz).unwrap_or(band.default_hz);
-                rx.frequency_hz.store(target, Ordering::Relaxed);
-                rx.ctun_frequency_hz = target;
-                if let Some(s) = saved {
-                    rx.db_low = s.db_low;
-                    rx.db_high = s.db_high;
-                    rx.waterfall_db_low = s.waterfall_db_low;
-                    rx.waterfall_db_high = s.waterfall_db_high;
-                }
-                let (new_db_low, new_db_high, new_wf_low, new_wf_high) =
-                    (rx.db_low, rx.db_high, rx.waterfall_db_low, rx.waterfall_db_high);
-                // Restore whatever mode was last used on this band, if
-                // any -- see the main receiver's own band-click handler
-                // for the full reasoning.
-                let resolved_mode = saved.and_then(|s| s.mode).unwrap_or(band.default_mode);
-                remember_band_settings(
-                    &mut rx.band_memory,
-                    target,
-                    new_db_low,
-                    new_db_high,
-                    new_wf_low,
-                    new_wf_high,
-                    resolved_mode,
-                );
-                rx.spectrum.set_mode(resolved_mode);
-                rx.spectrum.set_width_hz(width_for_mode(&rx.width_memory, resolved_mode));
-                rx.settings_dirty.store(true, Ordering::Relaxed);
+                apply_band_extra(&mut rx, band);
             }
+        }
+        // "Gen" -- see gen_band's own doc comment.
+        let gen = gen_band(rx.frequency_min, rx.frequency_max);
+        let selected = current_band == Some("Gen");
+        if ui.add(egui::Button::selectable(selected, "Gen")).clicked() && !selected {
+            apply_band_extra(&mut rx, &gen);
         }
     });
 
