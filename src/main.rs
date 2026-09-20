@@ -1793,14 +1793,16 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
     if let Some(sr) = cfg.sample_rate {
         settings.sample_rate = sr;
     }
-    // RX-888: fixed, non-user-configurable DDC output rate (see
-    // rx888.rs's own doc comment) -- overrides any saved
-    // cfg.sample_rate rather than letting a stale value from some other
-    // board's config linger. Applied here (before RadioSession::start
-    // AND before this same settings.sample_rate is read again below for
-    // SpectrumHandle::start) so both stay consistent with what the DDC
-    // actually produces.
-    if device.board == Boards::Rx888 {
+    // RX-888: a saved rate only sticks if it's actually one of
+    // rx888::ddc_params_for_output_rate's supported presets -- otherwise
+    // (no prior RX-888 session, or a stale value carried over from some
+    // other board's config) falls back to this module's own default.
+    // Applied here (before RadioSession::start AND before this same
+    // settings.sample_rate is read again below for SpectrumHandle::start)
+    // so both stay consistent with what the DDC actually produces;
+    // start_rx888_usb resolves this exact same way and corrects
+    // settings.sample_rate's own atomic if it still somehow disagrees.
+    if device.board == Boards::Rx888 && rx888::ddc_params_for_output_rate(settings.sample_rate).is_none() {
         settings.sample_rate = rx888::OUTPUT_SAMPLE_RATE_HZ;
     }
     // Pre-size for multiple receivers, per whatever the
@@ -6696,33 +6698,27 @@ impl eframe::App for HpsdrApp {
 
                                 SettingsTab::Agc => {
                                     ui.label("Sample Rate:");
-                                    // RX-888: NOT a hardware-negotiable setting the way it is
-                                    // for a real P1/P2 radio -- this board's own DDC output
-                                    // rate (rx888::OUTPUT_SAMPLE_RATE_HZ) is fixed by its CIC
-                                    // decimation design, and there's no sender thread at all
-                                    // (see start_rx888_usb's doc comment) to tell real
-                                    // hardware to change it. Selecting one of the P1/P2 rate
-                                    // buttons below would only rebuild the WDSP channel to
-                                    // EXPECT a different input rate, while the actual data
-                                    // arriving from rx888_receiver_loop kept coming in at the
-                                    // real fixed rate regardless -- a real report: this
-                                    // mismatch crashed (WDSP's internal buffer/decimation
-                                    // state has no defense against the input rate it was
-                                    // opened with not matching what's actually arriving).
-                                    if connected.device.board == Boards::Rx888 {
-                                        ui.label(format!(
-                                            "{:.3} kHz (fixed -- RX-888's own DDC output rate)",
-                                            connected.sample_rate as f64 / 1000.0
-                                        ));
-                                    } else {
                                     ui.horizontal_wrapped(|ui| {
+                                        // RX-888: its own NCO+CIC software DDC (rx888.rs) can
+                                        // only land exactly on WDSP-recognized rates it has a
+                                        // real (ADC rate, decimation) pair for -- see
+                                        // rx888::ddc_params_for_output_rate's own doc comment
+                                        // for why that's just 96/192/384 (not the full P1/P2
+                                        // list) -- a real earlier report: offering a rate this
+                                        // DDC can't actually hit crashed WDSP outright (its
+                                        // decimation state has no defense against the input
+                                        // rate it was opened with not matching what's actually
+                                        // arriving).
+                                        //
                                         // Protocol 2 boards support 768/1536ksps too (encoded as
                                         // a raw ksps value in p2_ddc_specific_packet, not the
                                         // fixed 2-bit code P1 uses -- see sample_rate_code, which
                                         // only has entries up to 384000 and would silently fall
                                         // through to 48kHz for anything higher, so these extra
                                         // rates are P2-only).
-                                        let rates: &[u32] = if connected.device.protocol == 2 {
+                                        let rates: &[u32] = if connected.device.board == Boards::Rx888 {
+                                            &[96_000, 192_000, 384_000]
+                                        } else if connected.device.protocol == 2 {
                                             &[48_000, 96_000, 192_000, 384_000, 768_000, 1_536_000]
                                         } else {
                                             &[48_000, 96_000, 192_000, 384_000]
@@ -6741,9 +6737,16 @@ impl eframe::App for HpsdrApp {
                                         }
                                         ui.weak("kHz");
                                     });
-                                    ui.weak(
-                                        "Changing this briefly interrupts audio/spectrum while the demod chain restarts.",
-                                    );
+                                    if connected.device.board == Boards::Rx888 {
+                                        ui.weak(
+                                            "Changing this stops streaming, reprograms the RX-888's own ADC clock, \
+                                             and restarts it -- a bigger interruption than a real P1/P2 radio's \
+                                             live rate change, but still brief.",
+                                        );
+                                    } else {
+                                        ui.weak(
+                                            "Changing this briefly interrupts audio/spectrum while the demod chain restarts.",
+                                        );
                                     }
                                     ui.separator();
 
@@ -11449,6 +11452,16 @@ fn change_sample_rate(connected: &mut ConnectedState, new_rate: u32) {
     let agc = connected.spectrum.agc();
     let agc_params = connected.spectrum.agc_params();
 
+    // RX-888: stop the old producer BEFORE the new WDSP channel below is
+    // built, so nothing pushes old-rate samples into iq_buffers[0] while
+    // the new channel expects the new rate -- see
+    // RadioSession::stop_rx888_threads's own doc comment for why this is
+    // split into a stop call here and a restart call at the end of this
+    // function rather than one atomic call. No-op for every other board.
+    if connected.device.board == Boards::Rx888 {
+        connected.session.stop_rx888_threads();
+    }
+
     connected.session.set_sample_rate(new_rate);
 
     // Explicitly tear down everything that depends on the old WDSP
@@ -11588,6 +11601,29 @@ fn change_sample_rate(connected: &mut ConnectedState, new_rate: u32) {
                 }
                 connected.tx_handle = Some(tx_handle);
             }
+        }
+    }
+
+    // RX-888: restart the producer AFTER the new WDSP channel above
+    // already exists and is listening on iq_buffers[0] -- see this
+    // function's own opening stop_rx888_threads call for the other half
+    // of this ordering. Resolved rate may differ from `new_rate` if it
+    // somehow wasn't one of ddc_params_for_output_rate's supported
+    // presets (shouldn't happen -- the Sample Rate buttons only ever
+    // offer supported presets for this board -- but corrected here
+    // defensively regardless, same as start_rx888_usb's own fallback).
+    if connected.device.board == Boards::Rx888 {
+        let firmware_path =
+            connected.rx888_firmware_path.clone().map(std::path::PathBuf::from).or_else(rx888::default_firmware_path);
+        match firmware_path {
+            Some(path) => match connected.session.restart_rx888_at_rate(&path, new_rate) {
+                Ok(actual_rate) => {
+                    connected.sample_rate = actual_rate;
+                    connected.session.sample_rate.store(actual_rate, Ordering::Relaxed);
+                }
+                Err(e) => eprintln!("RX-888: failed to restart streaming at {new_rate}Hz: {e}"),
+            },
+            None => eprintln!("RX-888: no firmware path available, cannot restart streaming"),
         }
     }
 

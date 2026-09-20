@@ -183,12 +183,12 @@ direct-sampling HF mode only, fixed decimation** (no "Add Receiver", no
 tuner/VHF mode, no adjustable IF bandwidth yet) — proving the concept
 before expanding it.
 
-1. **Firmware file** — you need your own copy of the Cypress FX3 RAM
-   image (`SDDC_FX3.img`, from your device vendor or the SDDC firmware
-   project for this hardware). **Not bundled** with hpsdr-rs (unlike
-   Ozy's own firmware — this is a different, unverified third-party
-   upstream) — point the Discover window's **RX-888 USB setup** section
-   at your own copy via **Choose...**.
+1. **Firmware file** — the Cypress FX3 RAM image (`SDDC_FX3.img`) is
+   **bundled** with hpsdr-rs (MIT-licensed; see
+   [`assets/rx888/PROVENANCE.md`](assets/rx888/PROVENANCE.md) for its
+   real upstream), so no setup is needed here by default. Point the
+   Discover window's **RX-888 USB setup** section at a different copy
+   via **Choose...** only if you want to override it.
 2. **Linux only**: a udev rule for non-root USB access. Copy
    [`assets/90-rx888.rules`](assets/90-rx888.rules) to
    `/etc/udev/rules.d/`, then

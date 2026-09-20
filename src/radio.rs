@@ -1416,6 +1416,76 @@ impl RadioSession {
         self.puresignal_enabled.store(enabled, Ordering::SeqCst);
     }
 
+    /// RX-888 only: stops this session's receiver + control-transfer
+    /// threads (and clears any samples they already queued at the OLD
+    /// rate) WITHOUT touching anything else the session owns -- pairs
+    /// with `restart_rx888_at_rate` below. Split into two calls, not
+    /// one, because main.rs's change_sample_rate needs to stop the old
+    /// producer BEFORE rebuilding the WDSP channel at the new rate (so
+    /// nothing races it), then start the new producer AFTER (so it
+    /// pushes into an already-correctly-sized channel) -- see
+    /// change_sample_rate's own call sites for the exact ordering.
+    ///
+    /// Only ever called for `is_rx888` sessions; harmless no-op
+    /// otherwise (both threads are always `None` for every other board).
+    pub fn stop_rx888_threads(&mut self) {
+        self.stop_flag.store(true, Ordering::SeqCst);
+        if let Some(t) = self.receiver_thread.take() {
+            let _ = t.join();
+        }
+        if let Some(t) = self.rx888_control_thread.take() {
+            let _ = t.join();
+        }
+        self.iq_buffers[0].lock().unwrap().clear();
+    }
+
+    /// RX-888 only: (re)opens the USB device at `output_rate_hz` (one of
+    /// rx888::ddc_params_for_output_rate's supported presets, else this
+    /// module's own default) and spawns fresh receiver/control threads
+    /// -- always called AFTER `stop_rx888_threads` above, both at
+    /// initial connect (see start_rx888_usb) and on a live rate change
+    /// (see main.rs's change_sample_rate).
+    ///
+    /// Deliberately does a full close/reopen round-trip through
+    /// `rx888::initialise` rather than trying to poke the ADC rate
+    /// in-place on the already-open device: this project's own
+    /// discipline is to only ever reuse an already-proven real-hardware
+    /// bring-up sequence for anything touching this USB protocol
+    /// directly, not invent a new one specifically for a live-rate-
+    /// change code path that's had no hardware iteration of its own yet.
+    /// A brief interruption is expected (same as every other board's own
+    /// sample-rate change), not a bug.
+    ///
+    /// Returns the ACTUALLY resolved output rate (may differ from
+    /// `output_rate_hz` if it wasn't one of the supported presets, in
+    /// which case this silently falls back to the default rather than
+    /// erroring -- the UI only ever offers supported presets as buttons,
+    /// so this fallback is a defensive backstop, not an expected path).
+    pub fn restart_rx888_at_rate(&mut self, firmware_path: &std::path::Path, output_rate_hz: u32) -> io::Result<u32> {
+        let (adc_rate_hz, decimation) = rx888::ddc_params_for_output_rate(output_rate_hz)
+            .unwrap_or((rx888::DEFAULT_SAMPLE_RATE_HZ, rx888::CIC_DECIMATION));
+        let (rx888_device, rx_endpoint) =
+            rx888::initialise(firmware_path, self.rx_attenuation.load(Ordering::Relaxed), adc_rate_hz)?;
+
+        let stop_flag = Arc::new(AtomicBool::new(false));
+        self.stop_flag = Arc::clone(&stop_flag);
+
+        let receiver_stop = Arc::clone(&stop_flag);
+        let receiver_buffers = self.iq_buffers.clone();
+        let receiver_frequency_hz = Arc::clone(&self.frequency_hz);
+        self.receiver_thread = Some(thread::spawn(move || {
+            rx888_receiver_loop(rx_endpoint, receiver_buffers, receiver_frequency_hz, receiver_stop, adc_rate_hz, decimation);
+        }));
+
+        let control_stop = Arc::clone(&stop_flag);
+        let control_rx_attenuation = Arc::clone(&self.rx_attenuation);
+        self.rx888_control_thread = Some(thread::spawn(move || {
+            rx888_control_loop(rx888_device, control_rx_attenuation, control_stop);
+        }));
+
+        Ok(adc_rate_hz / decimation)
+    }
+
     pub fn stop(&mut self) {
         // Unkey first, before anything else -- a session ending (app
         // closing, "Stop" clicked, sample rate change tearing this
@@ -2267,13 +2337,27 @@ fn start_rx888_usb(
     let firmware_path = settings
         .rx888_firmware_path
         .map(std::path::PathBuf::from)
+        .or_else(rx888::default_firmware_path)
         .ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "RX-888 firmware (.img) not set -- go back to the Discover window's \"RX-888 USB setup\" section",
             )
         })?;
-    let (rx888_device, rx_endpoint) = rx888::initialise(&firmware_path, rx_attenuation.load(Ordering::Relaxed))?;
+    // Honors a saved/requested output rate if it's one of
+    // ddc_params_for_output_rate's supported presets, else falls back
+    // to this module's original, most-tested default (96000) -- e.g. a
+    // fresh connect with no prior RX-888 session, or a stale rate
+    // carried over from some other board's config. `sample_rate` is
+    // corrected to whatever was actually resolved below so the UI's own
+    // Sample Rate buttons (main.rs) show the real, achieved rate from
+    // the very first frame rather than momentarily showing a stale
+    // request.
+    let (adc_rate_hz, decimation) = rx888::ddc_params_for_output_rate(sample_rate.load(Ordering::Relaxed))
+        .unwrap_or((rx888::DEFAULT_SAMPLE_RATE_HZ, rx888::CIC_DECIMATION));
+    sample_rate.store(adc_rate_hz / decimation, Ordering::Relaxed);
+    let (rx888_device, rx_endpoint) =
+        rx888::initialise(&firmware_path, rx_attenuation.load(Ordering::Relaxed), adc_rate_hz)?;
 
     let stop_flag = Arc::new(AtomicBool::new(false));
     // v1 scope: single receiver only -- see rx888.rs's module doc
@@ -2294,7 +2378,7 @@ fn start_rx888_usb(
     let receiver_buffers = iq_buffers.clone();
     let receiver_frequency_hz = Arc::clone(&frequency_hz);
     let receiver_thread = thread::spawn(move || {
-        rx888_receiver_loop(rx_endpoint, receiver_buffers, receiver_frequency_hz, receiver_stop);
+        rx888_receiver_loop(rx_endpoint, receiver_buffers, receiver_frequency_hz, receiver_stop, adc_rate_hz, decimation);
     });
 
     let control_stop = Arc::clone(&stop_flag);
@@ -2420,8 +2504,10 @@ fn rx888_receiver_loop(
     iq_buffers: Vec<Arc<Mutex<VecDeque<IqSample>>>>,
     frequency_hz: Arc<AtomicU32>,
     stop_flag: Arc<AtomicBool>,
+    adc_rate_hz: u32,
+    decimation: u32,
 ) {
-    let mut ddc = rx888::Ddc::new(rx888::DEFAULT_SAMPLE_RATE_HZ, rx888::CIC_DECIMATION, rx888::CIC_STAGES);
+    let mut ddc = rx888::Ddc::new(adc_rate_hz, decimation, rx888::CIC_STAGES);
     let mut last_freq = frequency_hz.load(Ordering::Relaxed);
     ddc.set_tune_freq(last_freq as f64);
     let mut buf = vec![0u8; rx888::STREAM_READ_SIZE];

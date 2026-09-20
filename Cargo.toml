@@ -156,9 +156,8 @@ assets = [
     # reference copy alongside the docs, see README's Ozy USB section
     # for the install command.
     ["assets/90-ozy.rules", "usr/share/doc/hpsdr-rs/90-ozy.rules", "644"],
-    # RX-888's own firmware is NOT bundled (unverified third-party
-    # upstream, unlike Ozy's -- see rx888.rs's module doc comment), only
-    # the udev rule, same "not auto-installed" reasoning as Ozy's above.
+    # Not auto-installed to /etc/udev/rules.d/, same reasoning as Ozy's
+    # rule above.
     ["assets/90-rx888.rules", "usr/share/doc/hpsdr-rs/90-rx888.rules", "644"],
     # Ozy's FX2 firmware + FPGA bitstream -- sourced from the author's
     # own piHPSDR repo (github.com/g0orx/pihpsdr), same GPL-2.0 license
@@ -169,4 +168,12 @@ assets = [
     # needs no manual Ozy firmware/FPGA setup at all, only the udev rule.
     ["assets/ozy/ozyfw-sdr1k.hex", "usr/share/hpsdr-rs/ozy/ozyfw-sdr1k.hex", "644"],
     ["assets/ozy/Ozy_Janus.rbf", "usr/share/hpsdr-rs/ozy/Ozy_Janus.rbf", "644"],
+    # RX-888's own FX3 RAM firmware -- MIT-licensed (see
+    # assets/rx888/LICENSE.txt/PROVENANCE.md, and rx888.rs's module doc
+    # comment for how that was confirmed), same "installed .deb needs no
+    # manual firmware setup" reasoning as Ozy's above -- rx888.rs's own
+    # `bundled_path` derives usr/share/hpsdr-rs/rx888/ the same way.
+    ["assets/rx888/SDDC_FX3.img", "usr/share/hpsdr-rs/rx888/SDDC_FX3.img", "644"],
+    ["assets/rx888/LICENSE.txt", "usr/share/hpsdr-rs/rx888/LICENSE.txt", "644"],
+    ["assets/rx888/PROVENANCE.md", "usr/share/hpsdr-rs/rx888/PROVENANCE.md", "644"],
 ]

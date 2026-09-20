@@ -10,6 +10,7 @@
     (at your option) any later version.
 */
 
+use crate::config::Config;
 use crate::ozy;
 use crate::rx888;
 use network_interface::{Addr, NetworkInterface, NetworkInterfaceConfig};
@@ -85,6 +86,18 @@ pub struct Device {
     /// used anywhere until now.
     pub frequency_min: u64,
     pub frequency_max: u64,
+    /// A short, human-readable reason this device's own USB link looks
+    /// too slow to sustain its data rate -- `None` for every board
+    /// except a too-slow RX-888. Shown in the Discover window's Status
+    /// column AND gates that row's availability there (see
+    /// discovery_ui.rs's own device_available) -- safe to gate on since
+    /// discover_rx888_usb now brings the device up to its real streaming
+    /// firmware before rx888::link_speed_warning reads this (see that
+    /// function's own doc comment), the same firmware/PID
+    /// rx888::initialise itself connects to, not a guess off the
+    /// bootloader. Not meaningful for network-discovered boards, which
+    /// have no USB link of their own to warn about.
+    pub usb_link_speed_warning: Option<&'static str>,
 }
 
 impl Device {
@@ -115,6 +128,7 @@ impl Device {
             adcs,
             frequency_min,
             frequency_max,
+            usb_link_speed_warning: None,
         })
     }
 
@@ -145,6 +159,7 @@ impl Device {
             adcs,
             frequency_min,
             frequency_max,
+            usb_link_speed_warning: None,
         })
     }
 }
@@ -357,6 +372,7 @@ fn discover_ozy_usb(devices: &Arc<Mutex<Vec<Device>>>) {
         adcs: 2,
         frequency_min: 0,
         frequency_max: 61_440_000,
+        usb_link_speed_warning: None,
     });
 }
 
@@ -375,6 +391,16 @@ fn discover_rx888_usb(devices: &Arc<Mutex<Vec<Device>>>) {
     if !rx888::discover() {
         return;
     }
+    // Best-effort: brings the device up to the streaming PID (if a
+    // firmware path is already configured from a prior run) BEFORE the
+    // link-speed hint below reads it, so that hint reflects the real
+    // firmware's own negotiated speed rather than the bootloader's --
+    // see rx888::link_speed_warning's own doc comment for the real
+    // report (a warning that never fired) this fixes.
+    let firmware_path = Config::load(RX888_SENTINEL_MAC)
+        .rx888_firmware_path
+        .map(std::path::PathBuf::from)
+        .or_else(rx888::default_firmware_path);
     let sentinel = SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0);
     devices.lock().unwrap().push(Device {
         address: sentinel,
@@ -390,6 +416,12 @@ fn discover_rx888_usb(devices: &Arc<Mutex<Vec<Device>>>) {
         adcs: 1,
         frequency_min: 0,
         frequency_max: (rx888::DEFAULT_SAMPLE_RATE_HZ / 2) as u64,
+        // See rx888::link_speed_warning's own doc comment -- lets the
+        // Discover window's Status column warn about a too-slow USB
+        // link/cable before the user ever tries to connect, not just
+        // fail clearly once they do (radio.rs's start_rx888_usb hits
+        // the same check again at connect time, via rx888::initialise).
+        usb_link_speed_warning: rx888::link_speed_warning(firmware_path.as_deref()),
     });
 }
 

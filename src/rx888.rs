@@ -15,6 +15,21 @@
     decimation from there down to 48kHz, exactly as it already does for
     every other board -- see radio.rs's start_rx888_usb doc comment).
 
+    Firmware: `SDDC_FX3.img` is BUNDLED (assets/rx888/, see
+    default_firmware_path below) -- unlike this module's own earlier doc
+    comments/README text claimed, this turned out to be fine to
+    redistribute. Verified directly (not assumed) by finding that a
+    second, independent RX-888 Rust implementation
+    (~/github/sdroxide's sdroxide-rx888 crate) bundles the IDENTICAL
+    file (byte-for-byte, same SHA-256) under its own
+    crates/sdroxide-rx888/firmware/, with its own LICENSE.txt (MIT,
+    (c) 2017-2020 Oscar Steila IK1XPV and the rx888-firmware
+    contributors) and PROVENANCE.md citing the real upstream
+    (github.com/ringof/rx888-firmware v0.1.0) -- both copied verbatim
+    into assets/rx888/ alongside the image itself. An explicit path
+    chosen via the Discover window's "RX-888 USB setup" still always
+    overrides this default, same as Ozy's own bundled-firmware fallback.
+
     USB protocol constants and the firmware bring-up sequence below are
     ported from the user's own local reference checkout
     (~/github/ka9q-radio/rx888.c, rx888.h, ezusb.c -- a real, working
@@ -57,7 +72,7 @@
 */
 
 use nusb::transfer::{Bulk, ControlIn, ControlOut, ControlType, In, Recipient};
-use nusb::{Interface, MaybeFuture};
+use nusb::{Interface, MaybeFuture, Speed};
 use std::io::{self, Read};
 use std::path::Path;
 use std::time::Duration;
@@ -134,7 +149,13 @@ const GPIO_RANDO: u32 = 1 << 7;
 /// Default ADC sample rate (rx888.h's Default_samprate) -- the only
 /// rate this module supports for now (see this module's own doc
 /// comment on why Si5351 reprogramming for a different rate isn't
-/// ported yet).
+/// ported yet). Fixed at this one rate means `initialise` can check
+/// the negotiated USB link speed against a single known requirement
+/// (see REQUIRED_BYTES_PER_SEC) rather than a dynamic one -- a real
+/// USB2 cable/port produced exactly the confusing failure this guards
+/// against: firmware loads, the ADC clocks, samples simply go missing
+/// or corrupted, and it looks like a broken receiver rather than an
+/// insufficient link.
 pub const DEFAULT_SAMPLE_RATE_HZ: u32 = 64_800_000;
 
 /// CIC decimation ratio and stage count for the NCO+CIC DDC below.
@@ -199,6 +220,61 @@ pub const CIC_STAGES: usize = 5;
 /// just a nicety.
 pub const OUTPUT_SAMPLE_RATE_HZ: u32 = DEFAULT_SAMPLE_RATE_HZ / CIC_DECIMATION;
 
+/// (ADC sample rate, CIC decimation) for a WDSP-recognized DDC output
+/// rate -- `None` for anything else. ADDED (2026-09-20, real request:
+/// "are there any other sample rates we can run the DDC at" /
+/// "implement that") -- until now this module only ever ran at the one
+/// fixed 96,000 Hz output (DEFAULT_SAMPLE_RATE_HZ / CIC_DECIMATION).
+///
+/// Both the output rate AND the decimation must be exact: WDSP's own
+/// `calc_HBResampler` (vendor/wdsp/reshb.c) is a hardcoded switch over
+/// specific `(inrate,outrate)` pairs -- see CIC_DECIMATION's own doc
+/// comment for the real crash an unrecognized/mismatched rate caused
+/// earlier this session. Only 96000, 192000, and 384000 are offered
+/// here (out of WDSP's full recognized set, which also includes 48000,
+/// 768000, 1536000, 3072000, 6144000):
+/// - 48000 is deliberately EXCLUDED despite landing exactly (decimation
+///   1350 on the same 64.8MHz clock as the 96000 preset): CicStage's
+///   i64 wrapping arithmetic needs `decimation^CIC_STAGES * i16::MAX`
+///   to fit i64::MAX for the wraparound-cancellation trick in the comb
+///   stage to stay numerically exact (see CicStage's own doc comment).
+///   96000's own decimation (675) already uses about half of i64's
+///   range (675^5 * 32767 ~= 4.6e18 of ~9.2e18) -- 1350^5 is 2^5 = 32x
+///   that, comfortably OVER i64::MAX, which would silently corrupt
+///   output rather than just alias/attenuate it. 192000 and 384000 use
+///   SMALLER decimation than 675 (a wider output rate needs less
+///   decimation from the same ADC rate), so they're safer on this
+///   front, not riskier.
+/// - 768000 and above aren't offered in this v1 pass either: hitting
+///   them exactly needs a third ADC-clock family again (this module's
+///   two, 64.8MHz and 64.896MHz, don't divide evenly into either), and
+///   at that width the instantaneous bandwidth is already well beyond
+///   what a single receiver's own passband filter/audio chain is
+///   useful for -- a v2 addition if actually wanted, not attempted
+///   speculatively here.
+///
+/// TWO ADC clock "families" are used because no single ADC rate divides
+/// evenly into every WDSP-recognized rate (64,800,000 only divides
+/// evenly by 675, landing on 96000 -- see DEFAULT_SAMPLE_RATE_HZ's own
+/// doc comment): 64,800,000 Hz (this module's original, most-tested
+/// rate) covers 96000 via decimation 675 unchanged; 64,896,000 Hz (a
+/// +0.148% nudge, well within a real crystal's own tolerance, and only
+/// ever sent to the hardware if the user actually asks for one of these
+/// wider rates) covers both 192000 (decimation 338) and 384000
+/// (decimation 169) exactly. See `initialise`'s own doc comment for why
+/// reprogramming the ADC to 64,896,000 needs no new protocol work: the
+/// FX3 firmware's own internal Si5351 PLL math handles any requested
+/// rate for this module's always-default-reference case, the same
+/// STARTADC command already used for 64,800,000.
+pub fn ddc_params_for_output_rate(output_rate_hz: u32) -> Option<(u32, u32)> {
+    match output_rate_hz {
+        96_000 => Some((DEFAULT_SAMPLE_RATE_HZ, CIC_DECIMATION)),
+        192_000 => Some((64_896_000, 338)),
+        384_000 => Some((64_896_000, 169)),
+        _ => None,
+    }
+}
+
 fn io_err(e: impl std::fmt::Display) -> io::Error {
     io::Error::new(io::ErrorKind::Other, e.to_string())
 }
@@ -234,6 +310,34 @@ pub fn derandomize(sample: i16) -> i16 {
     sample ^ ((sample & 1).wrapping_neg() & !1i16)
 }
 
+/// Bundled `SDDC_FX3.img` location -- same "installed .deb / portable /
+/// `cargo run` from repo root / built-on-this-checkout" candidate list
+/// as ozy.rs's own (private, so duplicated rather than shared -- this
+/// project's existing per-module convention) `bundled_path`. Only used
+/// as a fallback when the user hasn't explicitly picked a file via the
+/// Discover window's "RX-888 USB setup" -- an explicit choice there
+/// always wins, so a custom/updated firmware build still works.
+fn bundled_path(filename: &str) -> Option<std::path::PathBuf> {
+    let mut candidates = Vec::new();
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(exe_dir) = exe.parent() {
+            // /usr/bin/hpsdr-rs -> /usr/share/hpsdr-rs/rx888/<file>
+            if let Some(prefix) = exe_dir.parent() {
+                candidates.push(prefix.join("share/hpsdr-rs/rx888").join(filename));
+            }
+            // Portable/non-packaged layout: files dropped next to the exe.
+            candidates.push(exe_dir.join("rx888").join(filename));
+        }
+    }
+    candidates.push(std::path::PathBuf::from("assets/rx888").join(filename));
+    candidates.push(std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets/rx888").join(filename));
+    candidates.into_iter().find(|p| p.is_file())
+}
+
+pub fn default_firmware_path() -> Option<std::path::PathBuf> {
+    bundled_path("SDDC_FX3.img")
+}
+
 /// Lightweight "is an RX-888 plugged in" probe for the discovery list --
 /// matches either PID (unloaded or already streaming from a prior
 /// session -- FX3 RAM firmware persists until power-cycle, so a
@@ -247,7 +351,61 @@ pub fn discover() -> bool {
     }
 }
 
-fn find_and_open(pid: u16) -> io::Result<Interface> {
+/// A short, human-readable warning if a currently-plugged-in RX-888's
+/// USB link SEEMS too slow to sustain this module's fixed data rate --
+/// `None` if no device is present, its link speed can't be determined,
+/// or it looks fast enough. Safe to call from the Discover window's own
+/// background discovery pass alongside every other board's probe --
+/// `discover()` only runs once per window-open/rescan click, not on a
+/// continuous timer, so the occasional extra second this can now cost
+/// (see below) is a one-off, not a repeated tax.
+///
+/// REVISED (2026-09-20, after a real report -- "now it always says it
+/// is available whether USB3 or USB2 connected", i.e. the warning
+/// stopped ever firing in the common case): earlier versions of this
+/// function only ever queried `DeviceInfo` passively, without opening
+/// or claiming anything, and had to guess which PID to trust -- the
+/// bootloader/unloaded PID's own negotiated speed is NOT reliably the
+/// same thing as the real firmware's (a genuine USB3 cable was once
+/// seen reported as "too slow" when only the unloaded PID was checked,
+/// then restricting the check to only the streaming PID fixed that but
+/// broke the overwhelmingly common case -- discovery normally runs
+/// BEFORE the device has ever been connected this session, i.e. while
+/// it's still sitting at the unloaded PID). Rather than keep guessing
+/// between two unreliable proxies, this now does what the user
+/// suggested: actually brings the device up to the streaming PID first
+/// (`load_firmware_if_needed`, best-effort -- silently does nothing if
+/// `firmware_path` is `None` or the load fails, e.g. no path configured
+/// yet), then reads the SAME real, reliably-negotiated speed
+/// `initialise`'s own check uses. `firmware_path` is `Option` rather
+/// than required precisely so a first-run user with no path configured
+/// yet still gets a (less certain) best-effort hint instead of nothing.
+///
+/// STILL DELIBERATELY A HINT, NOT AUTHORITATIVE, even now: a firmware
+/// load can fail for reasons that have nothing to do with link speed
+/// (wrong/missing file, a device that only ever answers at the unloaded
+/// PID for some other reason), in which case this falls back to the
+/// old, less certain "whatever PID happens to be present" read rather
+/// than returning `None` outright -- still better than silence, still
+/// not something to gate a row's availability on (see discovery_ui.rs's
+/// own device_available, which does NOT check this field, for why: a
+/// false positive here would otherwise BLOCK a working device from
+/// connecting at all via the UI). `initialise`'s own identical check at
+/// real connect time remains the true safety net regardless.
+pub fn link_speed_warning(firmware_path: Option<&Path>) -> Option<&'static str> {
+    if let Some(path) = firmware_path {
+        let _ = load_firmware_if_needed(path);
+    }
+    let speed = nusb::list_devices()
+        .wait()
+        .ok()?
+        .into_iter()
+        .find(|d| d.vendor_id() == VID && (d.product_id() == PID_UNLOADED || d.product_id() == PID_STREAMING))
+        .and_then(|d| d.speed())?;
+    (usable_bytes_per_sec(Some(speed)) < REQUIRED_BYTES_PER_SEC).then(|| speed_name(Some(speed)))
+}
+
+fn find_and_open(pid: u16) -> io::Result<(Interface, Option<Speed>)> {
     let device_info = nusb::list_devices()
         .wait()
         .map_err(io_err)?
@@ -256,10 +414,52 @@ fn find_and_open(pid: u16) -> io::Result<Interface> {
         .ok_or_else(|| {
             io::Error::new(io::ErrorKind::NotFound, format!("no RX-888 device (04b4:{pid:04x}) found on USB"))
         })?;
+    // Negotiated USB link speed -- captured here, from DeviceInfo,
+    // before opening (nusb's own natural place for it; the property
+    // belongs to the physical link/port/cable, not to anything the
+    // firmware does). See DEFAULT_SAMPLE_RATE_HZ's own doc comment for
+    // why `initialise` checks this against REQUIRED_BYTES_PER_SEC once
+    // the streaming device is open.
+    let speed = device_info.speed();
     let device = device_info.open().wait().map_err(io_err)?;
     let interface = device.claim_interface(0).wait().map_err(io_err)?;
-    Ok(interface)
+    Ok((interface, speed))
 }
+
+/// A human-readable USB link speed, for the error message below.
+fn speed_name(speed: Option<Speed>) -> &'static str {
+    match speed {
+        Some(Speed::Low) => "USB 1.1 low speed",
+        Some(Speed::Full) => "USB 1.1 full speed",
+        Some(Speed::High) => "USB 2.0 high speed",
+        Some(Speed::Super) => "USB 3.0 SuperSpeed",
+        Some(Speed::SuperPlus) => "USB 3.1 SuperSpeed+",
+        _ => "an unknown speed",
+    }
+}
+
+/// Sustained bulk throughput to plan for at a given negotiated link
+/// speed, in bytes/sec -- deliberately pessimistic relative to each
+/// speed's textbook peak (53MB/s for USB2 High Speed, 500MB/s+ for
+/// USB3 SuperSpeed): what a real host sustains, sharing a real bus with
+/// other traffic, is a good deal less, and over-promising here would
+/// only turn into dropped samples rather than an honest "this link is
+/// too slow" -- matching a second, independent RX-888 Rust
+/// implementation's own identical reasoning and constants
+/// (~/github/sdroxide's sdroxide-rx888::usb::usable_bytes_per_sec).
+fn usable_bytes_per_sec(speed: Option<Speed>) -> f64 {
+    match speed {
+        Some(Speed::SuperPlus) => 800e6,
+        Some(Speed::Super) => 380e6,
+        Some(Speed::High) => 38e6,
+        _ => 1e6,
+    }
+}
+
+/// What this module's own fixed-rate design (see DEFAULT_SAMPLE_RATE_HZ)
+/// needs the link to sustain: 64.8Msps of real i16 samples, 2 bytes
+/// each, continuously.
+const REQUIRED_BYTES_PER_SEC: f64 = DEFAULT_SAMPLE_RATE_HZ as f64 * 2.0;
 
 fn control_out(interface: &Interface, request: u8, value: u16, index: u16, data: &[u8]) -> io::Result<()> {
     interface
@@ -437,6 +637,25 @@ impl RxEndpoint {
     }
 }
 
+/// If an unloaded-PID RX-888 is present, loads firmware into it and
+/// waits for it to re-enumerate as the streaming PID; a no-op if no
+/// unloaded device is found (either already loaded from a prior session
+/// -- FX3 RAM firmware persists until power-cycle -- or not connected at
+/// all). Factored out of `initialise` so `link_speed_warning` can also
+/// use it, best-effort, to get an accurate real-firmware speed reading
+/// at discovery time instead of guessing off the bootloader's own
+/// enumeration -- see that function's own doc comment.
+fn load_firmware_if_needed(firmware_path: &Path) -> io::Result<()> {
+    if let Ok((interface, _)) = find_and_open(PID_UNLOADED) {
+        load_fx3_image(&interface, firmware_path)?;
+        drop(interface);
+        // rx888.c's own "how long should this be? sleep(1)" for
+        // re-enumeration -- ported as-is.
+        std::thread::sleep(Duration::from_secs(1));
+    }
+    Ok(())
+}
+
 /// Full cold-boot bring-up: find the unloaded device (if present) and
 /// load firmware into RAM, wait for it to re-enumerate as the streaming
 /// PID (or find it already there, from a prior session -- FX3 RAM
@@ -448,18 +667,60 @@ impl RxEndpoint {
 /// sleeps match rx888_set_*'s own `usleep(5000)` calls, ported as-is
 /// rather than removed, per this project's "match a working reference
 /// exactly for unverifiable low-level protocol code" discipline.
-pub fn initialise(firmware_path: &Path, initial_attenuator_db: u32) -> io::Result<(Rx888Device, RxEndpoint)> {
-    if let Ok(interface) = find_and_open(PID_UNLOADED) {
-        load_fx3_image(&interface, firmware_path)?;
-        drop(interface);
-        // rx888.c's own "how long should this be? sleep(1)" for
-        // re-enumeration -- ported as-is.
-        std::thread::sleep(Duration::from_secs(1));
+///
+/// `adc_rate_hz` -- ADDED (2026-09-20) as a real parameter rather than
+/// always sending the hardcoded `DEFAULT_SAMPLE_RATE_HZ`, so a caller
+/// can also (re)connect at one of `ddc_params_for_output_rate`'s other
+/// supported ADC rates. Still needs NO Si5351 register math ported here
+/// for any of them: this module only ever runs the RX-888 at its
+/// default 27MHz reference with no calibration offset, which is exactly
+/// ka9q-radio's own rx888_set_samprate fast path -- just send STARTADC
+/// with the desired value and let the FX3 firmware's own internal PLL
+/// math (see rx888.c's `actual_freq`, itself just a REPORTING/logging
+/// helper for the tiny fractional-N quantization error, not something
+/// this module needs to replicate) synthesize it. Called with
+/// `DEFAULT_SAMPLE_RATE_HZ` for this module's own original, most-tested
+/// preset; see ddc_params_for_output_rate for the others.
+pub fn initialise(firmware_path: &Path, initial_attenuator_db: u32, adc_rate_hz: u32) -> io::Result<(Rx888Device, RxEndpoint)> {
+    load_firmware_if_needed(firmware_path)?;
+
+    let (interface, speed) = find_and_open(PID_STREAMING)?;
+
+    // ROOT CAUSE FIX for a real report: connecting over a USB2 cable/
+    // port (or a USB3 port behind a USB2-only hub) let everything ELSE
+    // proceed normally -- firmware load, ADC clock, streaming all
+    // "succeeded" -- while the actual sample data was silently dropped/
+    // corrupted at the link layer, indistinguishable from a genuine
+    // signal-quality bug and the root cause of a very long real-hardware
+    // debugging session. Failing clearly here, before any of that can
+    // happen, is a direct port of a second, independent RX-888 Rust
+    // implementation's own identical check (~/github/sdroxide's
+    // sdroxide-rx888::device::clamp_rate_to_link) -- that implementation
+    // dynamically clamps its ADC rate to whatever the link can carry
+    // instead of refusing outright; this module fails with a clear,
+    // actionable message instead. Checked against the ACTUAL requested
+    // `adc_rate_hz`, not the fixed DEFAULT_SAMPLE_RATE_HZ constant, now
+    // that this can be one of ddc_params_for_output_rate's other rates
+    // too (all within a fraction of a percent of each other in practice,
+    // but this is the more correct check regardless).
+    let usable = usable_bytes_per_sec(speed);
+    let required = adc_rate_hz as f64 * 2.0;
+    if usable < required {
+        return Err(io::Error::new(
+            io::ErrorKind::Other,
+            format!(
+                "RX-888 is connected via {} (~{:.0}MB/s usable), which can't reliably carry this \
+                 receiver's {:.1}Msps stream (~{:.0}MB/s needed). Use a USB 3 cable plugged \
+                 directly into a USB 3 port (not a USB 2 hub) for the full rate.",
+                speed_name(speed),
+                usable / 1e6,
+                adc_rate_hz as f64 / 1e6,
+                required / 1e6,
+            ),
+        ));
     }
 
-    let interface = find_and_open(PID_STREAMING)?;
-
-    command_send(&interface, STARTADC, DEFAULT_SAMPLE_RATE_HZ)?;
+    command_send(&interface, STARTADC, adc_rate_hz)?;
     std::thread::sleep(Duration::from_millis(5));
 
     // REVISED (2026-09-19, after real hardware testing): dither AND the
@@ -838,6 +1099,57 @@ impl Ddc {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every rate `ddc_params_for_output_rate` claims to support must
+    /// ACTUALLY divide evenly (an approximate/rounded decimation would
+    /// silently disable WDSP's resampler instead of erroring -- see
+    /// that function's own doc comment) AND stay within the CIC's own
+    /// i64 arithmetic budget (see CicStage's doc comment) -- a real
+    /// regression this test would catch: a future edit picks a
+    /// decimation/ADC-rate pair that's off by rounding, or large enough
+    /// to silently overflow.
+    #[test]
+    fn ddc_params_for_every_supported_rate_divide_exactly_and_fit_i64() {
+        for &rate in &[96_000u32, 192_000, 384_000] {
+            let (adc_rate, decimation) = ddc_params_for_output_rate(rate).unwrap();
+            assert_eq!(adc_rate / decimation, rate, "rate {rate}");
+            assert_eq!(adc_rate % decimation, 0, "rate {rate} does not divide exactly");
+            let worst_case = (decimation as f64).powi(CIC_STAGES as i32) * i16::MAX as f64;
+            assert!(worst_case < i64::MAX as f64, "rate {rate}: worst-case CIC magnitude {worst_case} overflows i64");
+        }
+    }
+
+    /// 48000 is deliberately unsupported (see
+    /// ddc_params_for_output_rate's own doc comment on why) -- locks in
+    /// that this stays a conscious exclusion, not an accidental gap.
+    #[test]
+    fn ddc_params_for_output_rate_excludes_48khz() {
+        assert_eq!(ddc_params_for_output_rate(48_000), None);
+    }
+
+    /// Confirms the bundled firmware asset actually ships where
+    /// `default_firmware_path` expects it (via the CARGO_MANIFEST_DIR
+    /// candidate, which is independent of the test runner's own CWD) --
+    /// a real regression this test would catch: assets/rx888/ renamed,
+    /// or SDDC_FX3.img accidentally left out of a commit/release.
+    #[test]
+    fn default_firmware_path_finds_the_bundled_image() {
+        let path = default_firmware_path().expect("assets/rx888/SDDC_FX3.img should be bundled");
+        assert!(path.is_file(), "{path:?} does not exist");
+    }
+
+    /// Locks in the link-speed check `initialise` uses to fail clearly
+    /// on a USB2 cable/port instead of silently streaming corrupted
+    /// data -- see REQUIRED_BYTES_PER_SEC's own doc comment for the
+    /// real report this guards against. Mirrors a second, independent
+    /// RX-888 Rust implementation's own identical test
+    /// (~/github/sdroxide's sdroxide-rx888::usb::
+    /// a_usb2_link_cannot_carry_the_default_adc_rate).
+    #[test]
+    fn usb2_high_speed_cannot_carry_the_default_adc_rate_but_superspeed_can() {
+        assert!(usable_bytes_per_sec(Some(Speed::High)) < REQUIRED_BYTES_PER_SEC);
+        assert!(usable_bytes_per_sec(Some(Speed::Super)) > REQUIRED_BYTES_PER_SEC);
+    }
 
     /// ka9q-radio's own default (highgain mode, +1.5dB requested) --
     /// hand-verified against `gain2val`'s formula: voltage =

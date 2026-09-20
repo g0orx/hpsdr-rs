@@ -20,6 +20,24 @@ fn selectable_cell(
     ui.add_enabled(enabled, egui::Button::selectable(selected, text))
 }
 
+/// Whether a device is actually startable right now -- the protocol's
+/// own `status` byte, AND (RE-ADDED 2026-09-20, after
+/// discovery::discover_rx888_usb was changed to actually load firmware
+/// before reading the link speed -- see rx888::link_speed_warning's own
+/// doc comment) gated on `usb_link_speed_warning` too. This was
+/// previously reverted because the discovery-time speed check couldn't
+/// reliably tell a genuinely slow link apart from a device that simply
+/// hadn't loaded its real firmware yet this session -- a false positive
+/// there blocked a working device from connecting at all. Now that
+/// discovery brings the device up to the real streaming firmware first
+/// (same PID `initialise` itself connects to), the two checks read the
+/// SAME underlying speed, so gating here is no longer meaningfully less
+/// trustworthy than the connect-time failure it would otherwise just
+/// delay -- it just surfaces the same answer earlier.
+fn device_available(dev: &Device) -> bool {
+    dev.status == 2 && dev.usb_link_speed_warning.is_none()
+}
+
 /// Display text for one Ozy firmware/FPGA path row -- an explicit
 /// choice always wins; otherwise shows the bundled default's own path
 /// (with "(bundled)" so it's clear no action is needed) or "(not
@@ -240,7 +258,7 @@ impl DiscoveryWindow {
                 // re-applies to the next batch of results rather than
                 // fighting a deliberate user selection.
                 if self.selected.is_none() {
-                    if let Some(i) = devices_snapshot.iter().position(|d| d.status == 2) {
+                    if let Some(i) = devices_snapshot.iter().position(device_available) {
                         self.selected = Some(i);
                     }
                 }
@@ -259,7 +277,7 @@ impl DiscoveryWindow {
 
                         let interface_names = self.interface_names.lock().unwrap();
                         for (i, dev) in devices_snapshot.iter().enumerate() {
-                            let available = dev.status == 2;
+                            let available = device_available(dev);
                             let is_selected = self.selected == Some(i);
 
                             let mut row_clicked = false;
@@ -342,16 +360,22 @@ impl DiscoveryWindow {
                             );
                             row_clicked |= resp.clicked();
                             row_double_clicked |= resp.double_clicked();
-                            let resp = selectable_cell(
-                                ui,
-                                match dev.status {
-                                    2 => "Available",
-                                    3 => "In Use",
-                                    _ => "Unknown",
-                                },
-                                is_selected,
-                                available,
-                            );
+                            let status_text = match dev.status {
+                                2 => "Available",
+                                3 => "In Use",
+                                _ => "Unknown",
+                            };
+                            // See device_available's own doc comment --
+                            // discovery now brings the RX-888 up to its
+                            // real streaming firmware before reading this,
+                            // so a warning here means the row is actually
+                            // disabled (device_available returns false),
+                            // not just a soft hint -- worded to match.
+                            let status_text = match dev.usb_link_speed_warning {
+                                Some(warning) => format!("Too slow ({warning})"),
+                                None => status_text.to_string(),
+                            };
+                            let resp = selectable_cell(ui, status_text, is_selected, available);
                             row_clicked |= resp.clicked();
                             row_double_clicked |= resp.double_clicked();
 
@@ -417,7 +441,7 @@ impl DiscoveryWindow {
                     let can_start = self
                         .selected
                         .and_then(|i| devices_snapshot.get(i))
-                        .map(|d| d.status == 2)
+                        .map(device_available)
                         .unwrap_or(false);
 
                     if ui.add_enabled(can_start, egui::Button::new("Start")).clicked() {
@@ -486,16 +510,14 @@ impl DiscoveryWindow {
                 egui::CollapsingHeader::new("RX-888 USB setup").show(ui, |ui| {
                     ui.label(
                         "RX-888 Mk2 needs its own Cypress FX3 RAM image \
-                         (SDDC_FX3.img) to connect. Not bundled with hpsdr-rs \
-                         (different, unverified upstream from Ozy's own \
-                         firmware) -- point this at your own copy.",
+                         (SDDC_FX3.img) to connect -- bundled with hpsdr-rs \
+                         (MIT-licensed, see assets/rx888/PROVENANCE.md), so \
+                         no setup is needed unless you want to point it at \
+                         your own copy instead.",
                     );
                     ui.horizontal(|ui| {
                         ui.label("FX3 firmware (.img):");
-                        ui.label(match &self.rx888_firmware_path {
-                            Some(p) => p.clone(),
-                            None => "(not set -- use Choose... below)".to_string(),
-                        });
+                        ui.label(effective_path_label(&self.rx888_firmware_path, crate::rx888::default_firmware_path));
                         if ui.button("Choose...").clicked() {
                             if let Some(path) =
                                 rfd::FileDialog::new().add_filter("RX-888 FX3 firmware", &["img"]).pick_file()
