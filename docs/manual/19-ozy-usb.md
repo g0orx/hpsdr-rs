@@ -1,4 +1,4 @@
-[← XVTR](18-xvtr.md) | [Index](README.md)
+[← XVTR](18-xvtr.md) | [Index](README.md) | [RX-888 Mk2 →](20-rx888-mk2.md)
 
 # Ozy USB (legacy hardware)
 
@@ -72,4 +72,4 @@ actually begins.
 
 ---
 
-[← XVTR](18-xvtr.md) | [Index](README.md)
+[← XVTR](18-xvtr.md) | [Index](README.md) | [RX-888 Mk2 →](20-rx888-mk2.md)

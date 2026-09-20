@@ -10,8 +10,11 @@ Open **Settings...** from the main window, then the **RX** tab.
 
 Selectable buttons for the receiver's sample rate. Protocol 2 radios offer
 **48, 96, 192, 384, 768, 1536** kHz; Protocol 1 radios offer **48, 96, 192,
-384** kHz. Changing this briefly interrupts audio/spectrum while the demod
-chain restarts.
+384** kHz. An [RX-888 Mk2](20-rx888-mk2.md) offers only **96, 192, 384**
+kHz -- see that chapter for why. Changing this briefly interrupts audio/
+spectrum while the demod chain restarts (on an RX-888, this also stops
+and restarts USB streaming, so it's a bigger interruption than a real
+radio's own live rate change, but still brief).
 
 ## ADC and antenna (Protocol 2 only)
 
@@ -63,7 +66,7 @@ board -- there's nothing for it to do there.
 
 ## AGC tuning
 
-Six sliders fine-tune the AGC curve (the AGC mode itself -- Off/Long/Slow/
+Five sliders fine-tune the AGC curve (the AGC mode itself -- Off/Long/Slow/
 Medium/Fast -- is toggled from the main window, not here):
 
 | Slider | Range | Step |
@@ -73,10 +76,23 @@ Medium/Fast -- is toggled from the main window, not here):
 | Hang | 0-2000 ms | 25 |
 | Top | 0.0-140.0 dB | 2.0 |
 | Slope | 0-100 dB | 2 |
-| Thresh | -140.0-0.0 dB | 2.0 |
 
 **Top** is also available directly on the main window as **AGC Gain**
 (piHPSDR's name for the same value) -- both control the identical setting.
+Its default (80 dB) matches piHPSDR's own -- if AGC-on audio sounds
+clipped/distorted, lower this before assuming anything else is wrong.
+
+## S-Meter Cal
+
+**S-Meter Cal** (-20.0 to +20.0 dB, default 0.0) is a flat correction
+added to both the numeric S-meter reading (main window and every extra
+receiver) and the spectrum/waterfall trace's own dB scale -- two genuinely
+separate readouts internally, both corrected by this one control. Key a
+known reference signal (a calibrated signal generator at a documented
+dBm/S-unit level) and adjust until the displayed reading matches. There's
+no good universal default to ship instead -- even piHPSDR's own reference
+implementation never settled on one for this. Persists per radio, same as
+everything else on this tab.
 
 ## Noise blanker threshold
 

@@ -12,8 +12,9 @@ switching, bandpass filter selection, or amplifier keying. This tab lets you
 configure which outputs are active on each band, separately for receive and
 transmit.
 
-One row per band, plus a row per configured [XVTR](18-xvtr.md) slot with a
-non-empty name:
+One row per band, plus a **Gen** row (general coverage -- see [Main
+Window](02-main-window.md#bands-and-modes)) and a row per configured
+[XVTR](18-xvtr.md) slot with a non-empty name:
 
 - **Rx** -- which of OC1-OC7 are active while receiving on that band.
 - **Tx** -- which are active while transmitting on that band.
@@ -40,6 +41,17 @@ windows don't have their own Open Collector settings.
   relying on it for anything that could be damaged by the wrong filter path
   being selected, same as any other new hardware-control feature in this
   project.
+
+## Settings: Antenna
+
+The **Antenna** tab, next to Open Collector, works the same way for RF
+antenna port selection -- one row per band (plus **Gen** and any
+configured XVTR), an **RX** column (**ANT1**/**ANT2**/**ANT3**, plus
+**EXT1**/**EXT2**/**XVTR** where applicable) and a **TX** column
+(**ANT1**-**ANT3** only). Same "which band applies" rule as Open
+Collector above.
+
+![Screenshot needed: Antenna settings tab](images/12-antenna-tab.png)
 
 ---
 

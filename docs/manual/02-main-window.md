@@ -16,12 +16,24 @@ that VFO is the one actually transmitting (see
   steps. In CW mode (**CWL**/**CWU**), steps are finer -- 100 Hz per notch,
   10 Hz with Shift -- matching how tightly CW is normally zero-beaten.
   Clicking a signal on the spectrum/waterfall in CW mode also centers it in
-  the (narrow) CW filter passband rather than at the dial frequency itself
-  -- see [CW Decode](#cw-decode) below.
+  the (narrow) CW filter passband rather than at the dial frequency itself,
+  using the *exact* frequency under the cursor rather than rounding to the
+  nearest kHz the way every other mode's click does -- a CW signal is
+  essentially never sitting exactly on a kHz boundary -- see [CW
+  Decode](#cw-decode) below.
 - **Ctrl + scroll** (or a pinch/zoom gesture) over the spectrum: steps by
-  10 kHz per notch.
+  10 kHz per notch normally, or 1 Hz per notch in CW mode -- egui reports
+  this as a distinct "zoom" gesture rather than an ordinary scroll, which
+  is why it has its own, coarser-by-default step instead of just adding a
+  third tier to the plain-scroll steps above.
 - **Click** directly on the spectrum or waterfall: retunes straight to the
-  clicked frequency (rounded to the nearest kHz).
+  clicked frequency -- rounded to the nearest kHz in every mode except CW,
+  which uses the exact clicked frequency (see above).
+- **Right-click** the frequency display (VFO-A or VFO-B): opens a small
+  popup with an on-screen numeric keypad (plus normal keyboard digit/
+  Backspace/Enter/Escape input) to type an exact frequency directly,
+  rather than scrolling or clicking a spot on the spectrum. Retunes as
+  soon as you press **Enter**, clamped to the radio's own tunable range.
 - **Click and drag** across the spectrum or waterfall: retunes by however
   far you've dragged, in whichever direction, rather than jumping straight
   to wherever the cursor ends up. With [CTUN](#ctun-click-to-tune) off,
@@ -30,6 +42,8 @@ that VFO is the one actually transmitting (see
   itself doesn't move (the radio's real tuned frequency stays fixed) --
   instead this drags the CTUN listen point directly, the same direction as
   your cursor, the same way clicking a spot tunes straight to it.
+
+![Screenshot needed: the right-click frequency-entry keypad popup](images/02-frequency-entry.png)
 
 ### CTUN (Click to Tune)
 
@@ -101,6 +115,16 @@ all -- e.g. HermesLite/HermesLite2 cap out around 30.72MHz, so **6m**
 → PA Calibration's per-band list and to extra receiver windows' own band
 row.
 
+An extra **Gen** button (general coverage) always appears after the ham
+bands -- it covers the connected radio's *entire* tunable range, for
+listening outside the ham allocations (broadcast, utility, WWV, etc.). It
+works exactly like a real band otherwise: it remembers its own last
+frequency/mode (defaulting to 10.000.000 Hz/AM, WWV/WWVH, the first time
+you use it), and lights up as the selected "band" whenever the dial isn't
+actually inside one of the ham bands above. Settings → Open Collector and
+Settings → Antenna also treat **Gen** as a real, separately-configurable
+band row -- see [Settings: Open Collector](12-open-collector.md).
+
 A configured [transverter](18-xvtr.md) (Settings → **XVTR**) appears as an
 extra button alongside the band row, showing the real RF frequency (e.g.
 2m) while the radio's actual hardware stays tuned to its true IF
@@ -140,7 +164,7 @@ slider:
   stereo-listening effect), instead of the usual identical L/R. Needs
   headphones or stereo speakers to hear the effect.
 - **AGC** -- cycles Off → Long → Slow → Medium → Fast → Off. Attack/decay/
-  hang/top/slope/threshold for AGC are tuned in Settings → RX.
+  hang/top/slope for AGC are tuned in Settings → RX.
 - **AGC Gain** (0.0-140.0 dB) -- right after the AGC button. The same value
   as Settings → RX's **Top** slider, under the name piHPSDR uses for it --
   raises or lowers the AGC's target output level.
@@ -185,7 +209,16 @@ from different receivers never collide.
 ## Transmit controls
 
 This row only appears once TX is armed (Settings → TX → **Enable
-Transmit**):
+Transmit**).
+
+By default, TX refuses to key at all outside the defined ham bands (e.g.
+while parked on **Gen**) -- the **MOX** button greys out with an
+explanatory tooltip, and the same block applies to **TUNE**, **TWO
+TONE**, CW text send, and CAT/rigctl/TCI PTT commands. See [Settings:
+TX](17-settings-tx.md#allow-tx-outside-ham-bands) for the override, if
+you have your own authorization for out-of-band operation.
+
+The controls themselves:
 
 - **MOX** -- toggles transmit on/off. While active it turns red and reads
   **MOX ON**, and a red **TRANSMITTING** label appears.
@@ -271,7 +304,10 @@ under the cursor/zoomed view, not the underlying full span.
 Anchored in the top-right of the window:
 
 - **Receiving**: a classic analog S-meter, S0-S9 in 6 dB steps, with
-  +10..+60 over S9 shown in red.
+  +10..+60 over S9 shown in red. If it reads consistently high or low
+  against a known reference signal, see Settings → RX's [S-Meter
+  Cal](15-settings-rx.md#s-meter-cal) -- it also corrects the
+  spectrum/waterfall's own dB scale, not just this numeric reading.
 - **Transmitting**: forward/reverse power and SWR, scaled to your
   configured **Max TX Power** (Settings → TX). The needle is red whenever
   you're transmitting at all, and if SWR reaches or exceeds **Max SWR**

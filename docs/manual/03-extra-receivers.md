@@ -3,10 +3,12 @@
 # Extra Receivers
 
 hpsdr-rs supports multiple simultaneous, independent receivers on radios
-that report supporting more than one (Protocol 2 boards, generally). Each
-extra receiver gets its own window with its own VFO, mode, filter width,
-spectrum/waterfall, and settings -- entirely separate from the main
-receiver and from each other.
+that report supporting more than one (Protocol 2 boards, generally, plus
+an [RX-888 Mk2](20-rx888-mk2.md) -- up to 8, each an independent software
+DDC over the same wideband capture, running in parallel on its own CPU
+core). Each extra receiver gets its own window with its own VFO, mode,
+filter width, spectrum/waterfall, and settings -- entirely separate from
+the main receiver and from each other.
 
 ## Adding a receiver
 
@@ -56,13 +58,14 @@ three tabs -- **RX**, **Spectrum**, **EQ** -- a subset of the main window's
 tabs, since things like Network, Audio (main output only), TX, PA
 Calibration, PureSignal, and Diversity are session-wide, not per-receiver:
 
-- **RX** -- sample rate (Protocol 1 boards follow the main receiver's
-  rate, since P1 has one shared clock rather than per-receiver rates),
-  ADC/antenna selection, the same AGC attack/decay/hang/top/slope/thresh
-  and NB threshold controls as the main window's RX tab, and its own
-  independent **Output device** picker (same device list and fallback
-  behavior as the main window's [Audio tab](05-settings-audio.md)) -- so
-  this receiver can play to a different device than the main receiver.
+- **RX** -- sample rate (Protocol 1 boards, and an RX-888, follow the main
+  receiver's rate -- see [Settings: RX](15-settings-rx.md#sample-rate)),
+  ADC/antenna selection, the same AGC attack/decay/hang/top/slope and
+  [S-Meter Cal](15-settings-rx.md#s-meter-cal) and NB threshold controls
+  as the main window's RX tab, and its own independent **Output device**
+  picker (same device list and fallback behavior as the main window's
+  [Audio tab](05-settings-audio.md)) -- so this receiver can play to a
+  different device than the main receiver.
 - **Spectrum** -- display range and waterfall palette, same as the main
   window's Spectrum tab (no separate TX range here, since extra receivers
   never transmit).

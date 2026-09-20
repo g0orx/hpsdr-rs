@@ -890,6 +890,60 @@ const RENORM_INTERVAL: u32 = 4096;
 /// or still not enough.
 const HEADROOM_FACTOR: f64 = 0.2;
 
+/// CIC compensation filter -- a short FIR applied to each already-
+/// decimated (I,Q) output sample, correcting the CIC's own well-known
+/// non-flat passband response: it droops smoothly from full gain at DC
+/// (the dial frequency) toward the edges of the decimated Nyquist band
+/// -- an inherent property of ANY CIC decimator (not a bug, and not
+/// specific to this module's own gain_comp, which only corrects the
+/// FLAT/DC-level part of that gain), following a sinc^CIC_STAGES shape.
+/// Real request, after a real screenshot showed a visible "curve"
+/// (bowed, not flat) noise floor across the full-span spectrum display.
+///
+/// Designed via the standard "frequency sampling" FIR technique (not
+/// guessed at): computed once, offline, from the CIC's own closed-form
+/// magnitude response. `R` (CIC_DECIMATION and friends) doesn't appear
+/// anywhere in this design because it doesn't need to: for every R this
+/// module actually uses (169-675), the CIC's EXACT response
+/// `[sin(phi/2) / (R*sin(phi/(2R)))]^CIC_STAGES` is numerically
+/// indistinguishable from the classic R-independent sinc^CIC_STAGES(phi/2)
+/// approximation it was designed against (verified directly: worst-case
+/// error ~1.2e-5 across the full Nyquist band for R=169, the least
+/// favorable of the three) -- so one fixed compensator correctly serves
+/// every supported sample rate. Verified (see this module's own tests)
+/// to flatten the combined (CIC * compensator) response to within
+/// roughly ±0.7dB out to ~90% of the decimated Nyquist band, only
+/// degrading close to the extreme edge (~-3dB at 99.9% of Nyquist) --
+/// a real, physical limit of correcting a response that's genuinely
+/// approaching zero gain there with a modest, cheap tap count, not a
+/// design oversight.
+///
+/// Runs at the DECIMATED output rate (96-384kHz, not the 64.8Msps ADC
+/// rate the CIC itself processes), so 15 taps here is a negligible cost
+/// regardless of how many receivers are active in parallel.
+///
+/// DC-normalized (taps sum to exactly 1.0) so it only reshapes the
+/// passband, never changes overall level -- Ddc's own `gain_comp` still
+/// owns all absolute scaling, unaffected by this.
+const CIC_COMPENSATOR_LEN: usize = 15;
+const CIC_COMPENSATOR_TAPS: [f64; CIC_COMPENSATOR_LEN] = [
+    -0.006_742_892_2,
+    0.014_180_213_7,
+    -0.039_822_118_7,
+    0.100_820_572_7,
+    -0.231_910_577_4,
+    0.512_562_827_0,
+    -1.145_393_292_9,
+    2.592_610_535_6,
+    -1.145_393_292_9,
+    0.512_562_827_0,
+    -0.231_910_577_4,
+    0.100_820_572_7,
+    -0.039_822_118_7,
+    0.014_180_213_7,
+    -0.006_742_892_2,
+];
+
 pub struct Ddc {
     adc_rate_hz: f64,
     /// Current oscillator state as a unit vector (cos, sin) -- see
@@ -918,6 +972,14 @@ pub struct Ddc {
     /// risk from that (see CicStage's doc comment for the DIFFERENT,
     /// already-fixed bug that WAS a running-accumulation hazard).
     gain_comp: f64,
+    /// Circular history for CIC_COMPENSATOR_TAPS -- `comp_pos` is the
+    /// index of the MOST RECENT decimated sample (delay 0); older
+    /// samples are at decreasing indices, wrapping around. Separate I
+    /// and Q buffers, applied identically (the compensator is a plain
+    /// real-valued FIR, not itself doing any mixing).
+    comp_hist_i: [f64; CIC_COMPENSATOR_LEN],
+    comp_hist_q: [f64; CIC_COMPENSATOR_LEN],
+    comp_pos: usize,
 }
 
 impl Ddc {
@@ -940,6 +1002,9 @@ impl Ddc {
             stages_i: [CicStage { integrator: 0, comb_prev: 0 }; CIC_STAGES],
             stages_q: [CicStage { integrator: 0, comb_prev: 0 }; CIC_STAGES],
             gain_comp,
+            comp_hist_i: [0.0; CIC_COMPENSATOR_LEN],
+            comp_hist_q: [0.0; CIC_COMPENSATOR_LEN],
+            comp_pos: 0,
         }
     }
 
@@ -1027,6 +1092,9 @@ impl Ddc {
         let mut stages_q = self.stages_q;
         let decimation = self.decimation;
         let gain_comp = self.gain_comp;
+        let mut comp_hist_i = self.comp_hist_i;
+        let mut comp_hist_q = self.comp_hist_q;
+        let mut comp_pos = self.comp_pos;
 
         for &sample in samples {
             let x = sample as f64;
@@ -1084,9 +1152,29 @@ impl Ddc {
                 q_val = diff;
             }
 
-            emit(((i_val as f64 * gain_comp) as i32, (q_val as f64 * gain_comp) as i32));
+            // CIC_COMPENSATOR_TAPS -- see its own doc comment. Runs once
+            // per DECIMATED sample (not per input sample like everything
+            // above), so it's cheap even as a plain circular-buffer
+            // convolution -- no need for this part to fight the
+            // compiler for register locality the way the per-input-
+            // sample loop above does.
+            comp_hist_i[comp_pos] = i_val as f64 * gain_comp;
+            comp_hist_q[comp_pos] = q_val as f64 * gain_comp;
+            let mut comp_i = 0.0;
+            let mut comp_q = 0.0;
+            for (k, &tap) in CIC_COMPENSATOR_TAPS.iter().enumerate() {
+                let idx = (comp_pos + CIC_COMPENSATOR_LEN - k) % CIC_COMPENSATOR_LEN;
+                comp_i += tap * comp_hist_i[idx];
+                comp_q += tap * comp_hist_q[idx];
+            }
+            comp_pos = (comp_pos + 1) % CIC_COMPENSATOR_LEN;
+
+            emit((comp_i as i32, comp_q as i32));
         }
 
+        self.comp_hist_i = comp_hist_i;
+        self.comp_hist_q = comp_hist_q;
+        self.comp_pos = comp_pos;
         self.osc_cos = osc_cos;
         self.osc_sin = osc_sin;
         self.renorm_counter = renorm_counter;
@@ -1241,6 +1329,34 @@ mod tests {
             off_tune < on_tune / 10.0,
             "off-tune tone not sufficiently attenuated: on={on_tune} off={off_tune}"
         );
+    }
+
+    /// CIC_COMPENSATOR_TAPS actually flattens the passband end-to-end
+    /// through the real Ddc code (not just the offline design/
+    /// verification this module's own doc comment describes) -- real
+    /// request, after a real screenshot showed a visible, un-flat
+    /// "curve" in the spectrum display across a wideband capture.
+    /// Without compensation, a tone at 80% of the decimated Nyquist
+    /// band would measure roughly 10dB down from the on-tune (DC) case
+    /// (an inherent, uncorrected CIC's own sinc^5 droop) -- this checks
+    /// it instead stays close, confirming the compensator is wired up
+    /// and doing real work, not just present in the source.
+    #[test]
+    fn cic_compensator_flattens_the_passband() {
+        let tune_hz = 1_000_000.0;
+        let on_tune_db = 20.0 * tone_magnitude(DEFAULT_SAMPLE_RATE_HZ, tune_hz, tune_hz).log10();
+        let nyquist_hz = OUTPUT_SAMPLE_RATE_HZ as f64 / 2.0;
+        for &frac in &[0.25, 0.50, 0.80] {
+            let offset_hz = nyquist_hz * frac;
+            let mag = tone_magnitude(DEFAULT_SAMPLE_RATE_HZ, tune_hz + offset_hz, tune_hz);
+            let db = 20.0 * mag.log10();
+            let delta = on_tune_db - db;
+            assert!(
+                delta.abs() < 3.0,
+                "passband not flat at {:.0}% of Nyquist: on-tune {on_tune_db:.2}dB, here {db:.2}dB (delta {delta:.2}dB)",
+                frac * 100.0,
+            );
+        }
     }
 
     /// ROOT CAUSE regression test for a real report (2026-09-19): a

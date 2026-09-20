@@ -46,6 +46,30 @@ HermesLite2, which handle RX gain differently. Same underlying value as
 [PureSignal](14-puresignal.md)'s **Feedback Attenuation** slider --
 adjusting either one changes both.
 
+## Allow TX outside ham bands
+
+Off by default. While off, hpsdr-rs refuses to key transmit at all
+outside the defined ham band allocations -- e.g. while parked on
+[**Gen**](02-main-window.md#bands-and-modes), general coverage -- across
+every way to key TX: the main window's **MOX**/**TUNE**/**TWO TONE**
+buttons (which grey out with a tooltip explaining why), the Spacebar
+shortcut, a mapped MIDI Mox/Tune control, CW text send (including the
+Kenwood CAT `KY` and rigctl `send_morse` remote equivalents), and CAT
+`TX`/rigctl `\set_ptt`/TCI `trx` PTT commands from a client like WSJT-X.
+An already-running transmission can always be stopped regardless of this
+setting -- only *starting* one out of band is blocked.
+
+Turn this on only if you have your own explicit authorization for
+out-of-band operation (MARS/CAP, testing/development, etc.) -- it
+doesn't check any regulatory database, it only removes hpsdr-rs's own
+safety check. Takes effect immediately, no reconnect needed.
+
+> **Note:** this can't intercept CW sent by a physical key/paddle wired
+> directly into the radio's own hardware KEY jack (break-in keying) --
+> the radio's own firmware keys the transmitter on its own, with no
+> software PTT decision involved at all. This setting only covers
+> transmissions this application itself initiates.
+
 ## Enable Transmit
 
 Arms (or disarms) the whole TX signal path -- microphone input, the TX DSP
