@@ -422,6 +422,12 @@ impl TciServer {
         sample_rate: Arc<AtomicU32>,
         demod_params: Arc<Mutex<DemodParams>>,
         mox: Arc<AtomicBool>,
+        // See main.rs's tx_frequency_allowed doc comment -- real
+        // request, a safety default against accidentally transmitting
+        // outside the ham bands, checked before "trx" is honored to key
+        // ON.
+        tx_frequency_hz: Arc<AtomicU32>,
+        allow_out_of_band_tx: Arc<AtomicBool>,
         tci_audio_out: Arc<Mutex<VecDeque<(f32, f32)>>>,
         iq_out: Arc<Mutex<VecDeque<(f32, f32)>>>,
         tci_tx_audio: Arc<Mutex<VecDeque<f32>>>,
@@ -486,6 +492,8 @@ impl TciServer {
                         let tx_gain = Arc::clone(&accept_tci_tx_gain);
                         let wants_mic = Arc::clone(&accept_tci_wants_mic);
                         let conn_mox = Arc::clone(&mox);
+                        let conn_tx_frequency_hz = Arc::clone(&tx_frequency_hz);
+                        let conn_allow_out_of_band_tx = Arc::clone(&allow_out_of_band_tx);
                         let conn_rit_enabled = Arc::clone(&rit_enabled);
                         let conn_rit_offset_hz = Arc::clone(&rit_offset_hz);
                         let conn_xit_enabled = Arc::clone(&xit_enabled);
@@ -501,8 +509,9 @@ impl TciServer {
                             }
                             handle_client(
                                 stream, freq, rx_freq, hw_freq, rate, params, conn_audio_iq_registry, tx_audio,
-                                tx_gain, wants_mic, conn_mox, conn_rit_enabled, conn_rit_offset_hz, conn_xit_enabled,
-                                conn_xit_offset_hz, conn_stop, conn_board_name, conn_logging,
+                                tx_gain, wants_mic, conn_mox, conn_tx_frequency_hz, conn_allow_out_of_band_tx,
+                                conn_rit_enabled, conn_rit_offset_hz, conn_xit_enabled, conn_xit_offset_hz,
+                                conn_stop, conn_board_name, conn_logging,
                             );
                             conn_connected.fetch_sub(1, Ordering::Relaxed);
                             if let Some(addr) = local_addr {
@@ -658,6 +667,14 @@ fn handle_client(
     tci_tx_gain: Arc<Mutex<f32>>,
     tci_wants_mic: Arc<AtomicBool>,
     mox: Arc<AtomicBool>,
+    // See main.rs's tx_frequency_allowed doc comment -- real request, a
+    // safety default against accidentally transmitting outside the ham
+    // bands, checked before "trx" is honored to key ON. Distinct from
+    // hw_frequency_hz above (the real parked hardware LO) -- this is
+    // RadioSession::tx_frequency_hz, the CTUN/Split/XIT-aware value that
+    // actually reflects what frequency a transmission would go out on.
+    tx_frequency_hz: Arc<AtomicU32>,
+    allow_out_of_band_tx: Arc<AtomicBool>,
     rit_enabled: Arc<AtomicBool>,
     rit_offset_hz: Arc<AtomicI32>,
     xit_enabled: Arc<AtomicBool>,
@@ -1071,6 +1088,8 @@ fn handle_client(
                         &requested_frequency_hz,
                         &current_params,
                         &mox,
+                        &tx_frequency_hz,
+                        &allow_out_of_band_tx,
                         &rit_enabled,
                         &rit_offset_hz,
                         &xit_enabled,
@@ -1771,6 +1790,12 @@ fn handle_command(
     requested_frequency_hz: &Arc<AtomicU32>,
     demod_params: &Arc<Mutex<DemodParams>>,
     mox: &Arc<AtomicBool>,
+    // See main.rs's tx_frequency_allowed doc comment -- real request, a
+    // safety default against accidentally transmitting outside the ham
+    // bands. Checked before "trx" is honored to key ON, same as every
+    // other PTT path in this project.
+    tx_frequency_hz: &Arc<AtomicU32>,
+    allow_out_of_band_tx: &Arc<AtomicBool>,
     rit_enabled: &Arc<AtomicBool>,
     rit_offset_hz: &Arc<AtomicI32>,
     xit_enabled: &Arc<AtomicBool>,
@@ -2008,13 +2033,24 @@ fn handle_command(
         // suggest: TCI Remote, the one client this project's TX-audio
         // path is confirmed working against, never sends arg3 at all.
         "trx" => {
-            let on = matches!(args.get(1), Some(&"true") | Some(&"1"));
-            mox.store(on, Ordering::Relaxed);
+            let want_on = matches!(args.get(1), Some(&"true") | Some(&"1"));
+            let allowed = !want_on
+                || crate::tx_frequency_allowed(
+                    tx_frequency_hz.load(Ordering::Relaxed),
+                    allow_out_of_band_tx.load(Ordering::Relaxed),
+                );
+            if allowed {
+                mox.store(want_on, Ordering::Relaxed);
+            }
             if let Some(source) = args.get(2) {
                 tci_wants_mic.store(!source.eq_ignore_ascii_case("tci"), Ordering::Relaxed);
             } else {
                 tci_wants_mic.store(false, Ordering::Relaxed);
             }
+            // Echoes the ACTUAL resulting state, not blindly the
+            // request -- if refused, `on` stays false here so the
+            // client doesn't believe it successfully keyed.
+            let on = allowed && want_on;
             Some(format!("trx:{},{};", args.first().unwrap_or(&"0"), on))
         }
         // audio_start:receiver; / audio_stop:receiver; -- receiver index

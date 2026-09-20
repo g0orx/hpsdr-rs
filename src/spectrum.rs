@@ -468,6 +468,33 @@ pub struct DemodParams {
     /// stretching a fixed-resolution trace.
     pub zoom: i32,
     pub pan: f32,
+    /// S-meter/spectrum calibration offset (dB), added directly to
+    /// WDSP's own `GetRXAMeter` reading (see SpectrumHandle::start's own
+    /// run loop, where this is applied to meter_db) AND to every pixel
+    /// of the spectrum/waterfall trace (`GetPixels`, a separate WDSP
+    /// readout from the meter -- applied in that same run loop, right
+    /// where spectrum/waterfall are read) -- real request, one shared
+    /// value for both rather than two independent ones (piHPSDR itself
+    /// has a slightly different `display_calibration` alongside its
+    /// `meter_calibration`, suggesting the two paths CAN genuinely
+    /// differ by a small amount, but this project's own operator chose
+    /// the simpler single-control tradeoff).
+    ///
+    /// A controlled real-hardware test (Elecraft XG2 signal generator,
+    /// known 50uV/-73dBm/S9 reference) measured a consistent, real-world
+    /// offset on a genuine ANAN-8000DLE, not anything RX-888-specific.
+    /// Confirmed this isn't something to guess a default for -- piHPSDR
+    /// itself has an identical `meter_calibration` global (radio.c/
+    /// receiver.c: `rx->meter=GetRXAMeter(...)+meter_calibration`), with
+    /// only ABANDONED, commented-out per-device attempts at hardcoded
+    /// values (e.g. "ORION2: +3.0dB", all disabled in its own shipped
+    /// defaults) and no exposed UI control to set it at all -- even the
+    /// reference project never solved this with a good default. 0.0 (no
+    /// correction) here too; a real, live, persisted control (unlike
+    /// piHPSDR's) is the actual fix, letting each operator zero it
+    /// against their own known reference exactly once, same real-world
+    /// methodology as any other S-meter calibration.
+    pub meter_calibration_db: f64,
 }
 
 impl Default for DemodParams {
@@ -517,6 +544,7 @@ impl Default for DemodParams {
             eq: EqualizerParams::default(),
             zoom: 1,
             pan: 0.0,
+            meter_calibration_db: 0.0,
         }
     }
 }
@@ -1486,11 +1514,29 @@ fn run(
 
         let (spectrum, waterfall) = analyzer.feed(&chunk);
         if spectrum.is_some() || waterfall.is_some() {
+            // Same correction as the S-meter (real request -- one
+            // shared control rather than a second independent one, see
+            // DemodParams::meter_calibration_db's own doc comment) --
+            // GetPixels is WDSP's own SEPARATE spectrum/waterfall
+            // readout (distinct from GetRXAMeter), so it needs this
+            // applied here too, not just where meter_db is computed
+            // below.
+            let cal = params.meter_calibration_db as f32;
             let mut d = display.lock().unwrap();
-            if let Some(s) = spectrum {
+            if let Some(mut s) = spectrum {
+                if cal != 0.0 {
+                    for v in &mut s {
+                        *v += cal;
+                    }
+                }
                 d.spectrum = s;
             }
-            if let Some(w) = waterfall {
+            if let Some(mut w) = waterfall {
+                if cal != 0.0 {
+                    for v in &mut w {
+                        *v += cal;
+                    }
+                }
                 d.waterfall_rows.push_front(w);
                 if d.waterfall_rows.len() > WATERFALL_HISTORY {
                     d.waterfall_rows.pop_back();
@@ -1501,7 +1547,8 @@ fn run(
 
         let passband = passband_for(params.mode, params.width_hz);
         let audio = analyzer.demod(&chunk, params, passband);
-        let meter_db = analyzer.meter_db();
+        // See DemodParams::meter_calibration_db's own doc comment.
+        let meter_db = analyzer.meter_db() + params.meter_calibration_db;
         display.lock().unwrap().meter_db = meter_db;
         let cw_mode = matches!(params.mode, Mode::Cwl | Mode::Cwu);
         let cw_active = cw_mode && cw_decode_enabled.load(Ordering::Relaxed);
@@ -1890,6 +1937,9 @@ impl SpectrumHandle {
     }
     pub fn set_agc_slope_db(&self, v: i32) {
         self.demod_params.lock().unwrap().agc_slope_db = v.max(0);
+    }
+    pub fn set_meter_calibration_db(&self, v: f64) {
+        self.demod_params.lock().unwrap().meter_calibration_db = v;
     }
 
     pub fn noise_blanker(&self) -> NoiseBlanker {

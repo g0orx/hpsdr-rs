@@ -127,6 +127,12 @@ impl CatServer {
         demod_params: Arc<Mutex<DemodParams>>,
         display: Arc<Mutex<SpectrumDisplay>>,
         mox: Arc<AtomicBool>,
+        // See main.rs's tx_frequency_allowed doc comment -- real
+        // request, a safety default against accidentally transmitting
+        // outside the ham bands, checked before this server's own "TX"
+        // command is honored.
+        tx_frequency_hz: Arc<AtomicU32>,
+        allow_out_of_band_tx: Arc<AtomicBool>,
         // See RadioSession::rit_enabled/rit_offset_hz/xit_enabled's doc
         // comments -- backs RT/RC/RD/RU (RIT) and XT (XIT). No
         // xit_offset_hz here -- real Kenwood TS-2000 CAT has no command
@@ -172,6 +178,8 @@ impl CatServer {
                         let params = Arc::clone(&accept_demod_params);
                         let disp = Arc::clone(&accept_display);
                         let conn_mox = Arc::clone(&mox);
+                        let conn_tx_frequency_hz = Arc::clone(&tx_frequency_hz);
+                        let conn_allow_out_of_band_tx = Arc::clone(&allow_out_of_band_tx);
                         let conn_rit_enabled = Arc::clone(&rit_enabled);
                         let conn_rit_offset_hz = Arc::clone(&rit_offset_hz);
                         let conn_xit_enabled = Arc::clone(&xit_enabled);
@@ -183,9 +191,10 @@ impl CatServer {
                         let handle = thread::spawn(move || {
                             conn_connected.fetch_add(1, Ordering::Relaxed);
                             handle_client(
-                                stream, freq, rx_freq, params, disp, conn_mox, conn_rit_enabled,
-                                conn_rit_offset_hz, conn_xit_enabled, conn_cw_remote_pending,
-                                conn_cw_remote_busy, conn_stop, conn_logging,
+                                stream, freq, rx_freq, params, disp, conn_mox, conn_tx_frequency_hz,
+                                conn_allow_out_of_band_tx, conn_rit_enabled, conn_rit_offset_hz,
+                                conn_xit_enabled, conn_cw_remote_pending, conn_cw_remote_busy, conn_stop,
+                                conn_logging,
                             );
                             conn_connected.fetch_sub(1, Ordering::Relaxed);
                         });
@@ -253,6 +262,8 @@ fn handle_client(
     demod_params: DemodParamsCell,
     display: DisplayCell,
     mox: Arc<AtomicBool>,
+    tx_frequency_hz: Arc<AtomicU32>,
+    allow_out_of_band_tx: Arc<AtomicBool>,
     rit_enabled: Arc<AtomicBool>,
     rit_offset_hz: Arc<AtomicI32>,
     xit_enabled: Arc<AtomicBool>,
@@ -308,6 +319,8 @@ fn handle_client(
                         &current_params,
                         &current_display,
                         &mox,
+                        &tx_frequency_hz,
+                        &allow_out_of_band_tx,
                         &rit_enabled,
                         &rit_offset_hz,
                         &xit_enabled,
@@ -347,6 +360,12 @@ fn handle_command(
     demod_params: &Arc<Mutex<DemodParams>>,
     display: &Arc<Mutex<SpectrumDisplay>>,
     mox: &Arc<AtomicBool>,
+    // See main.rs's tx_frequency_allowed doc comment -- real request, a
+    // safety default against accidentally transmitting outside the ham
+    // bands. Checked before "TX" is honored, same as every other PTT
+    // path in this project.
+    tx_frequency_hz: &Arc<AtomicU32>,
+    allow_out_of_band_tx: &Arc<AtomicBool>,
     rit_enabled: &Arc<AtomicBool>,
     rit_offset_hz: &Arc<AtomicI32>,
     xit_enabled: &Arc<AtomicBool>,
@@ -538,7 +557,12 @@ fn handle_command(
             }
         }
         "TX" => {
-            if suffix.is_empty() {
+            if suffix.is_empty()
+                && crate::tx_frequency_allowed(
+                    tx_frequency_hz.load(Ordering::Relaxed),
+                    allow_out_of_band_tx.load(Ordering::Relaxed),
+                )
+            {
                 mox.store(true, Ordering::Relaxed);
             }
             None
@@ -691,21 +715,21 @@ mod tests {
     fn id_reports_ts2000() {
         let (f, p, d, m, rit, rit_hz, xit, cw_pending, cw_busy) = fixture();
         let mut ai = 0;
-        assert_eq!(handle_command("ID", &f, &f, &p, &d, &m, &rit, &rit_hz, &xit, &mut ai, &cw_pending, &cw_busy), Some("ID019;".to_string()));
+        assert_eq!(handle_command("ID", &f, &f, &p, &d, &m, &f, &Arc::new(AtomicBool::new(true)), &rit, &rit_hz, &xit, &mut ai, &cw_pending, &cw_busy), Some("ID019;".to_string()));
     }
 
     #[test]
     fn fa_read_reflects_current_frequency() {
         let (f, p, d, m, rit, rit_hz, xit, cw_pending, cw_busy) = fixture();
         let mut ai = 0;
-        assert_eq!(handle_command("FA", &f, &f, &p, &d, &m, &rit, &rit_hz, &xit, &mut ai, &cw_pending, &cw_busy), Some("FA00014074000;".to_string()));
+        assert_eq!(handle_command("FA", &f, &f, &p, &d, &m, &f, &Arc::new(AtomicBool::new(true)), &rit, &rit_hz, &xit, &mut ai, &cw_pending, &cw_busy), Some("FA00014074000;".to_string()));
     }
 
     #[test]
     fn fa_set_updates_frequency_and_sends_no_reply() {
         let (f, p, d, m, rit, rit_hz, xit, cw_pending, cw_busy) = fixture();
         let mut ai = 0;
-        assert_eq!(handle_command("FA00007074000", &f, &f, &p, &d, &m, &rit, &rit_hz, &xit, &mut ai, &cw_pending, &cw_busy), None);
+        assert_eq!(handle_command("FA00007074000", &f, &f, &p, &d, &m, &f, &Arc::new(AtomicBool::new(true)), &rit, &rit_hz, &xit, &mut ai, &cw_pending, &cw_busy), None);
         assert_eq!(f.load(Ordering::Relaxed), 7_074_000);
     }
 
@@ -713,7 +737,7 @@ mod tests {
     fn fb_read_mirrors_fa() {
         let (f, p, d, m, rit, rit_hz, xit, cw_pending, cw_busy) = fixture();
         let mut ai = 0;
-        assert_eq!(handle_command("FB", &f, &f, &p, &d, &m, &rit, &rit_hz, &xit, &mut ai, &cw_pending, &cw_busy), Some("FB00014074000;".to_string()));
+        assert_eq!(handle_command("FB", &f, &f, &p, &d, &m, &f, &Arc::new(AtomicBool::new(true)), &rit, &rit_hz, &xit, &mut ai, &cw_pending, &cw_busy), Some("FB00014074000;".to_string()));
     }
 
     #[test]
@@ -721,20 +745,20 @@ mod tests {
         let (f, p, d, m, rit, rit_hz, xit, cw_pending, cw_busy) = fixture();
         let mut ai = 0;
         // Default DemodParams starts at USB (code 2).
-        assert_eq!(handle_command("MD", &f, &f, &p, &d, &m, &rit, &rit_hz, &xit, &mut ai, &cw_pending, &cw_busy), Some("MD2;".to_string()));
-        assert_eq!(handle_command("MD3", &f, &f, &p, &d, &m, &rit, &rit_hz, &xit, &mut ai, &cw_pending, &cw_busy), None); // CWU
+        assert_eq!(handle_command("MD", &f, &f, &p, &d, &m, &f, &Arc::new(AtomicBool::new(true)), &rit, &rit_hz, &xit, &mut ai, &cw_pending, &cw_busy), Some("MD2;".to_string()));
+        assert_eq!(handle_command("MD3", &f, &f, &p, &d, &m, &f, &Arc::new(AtomicBool::new(true)), &rit, &rit_hz, &xit, &mut ai, &cw_pending, &cw_busy), None); // CWU
         assert_eq!(p.lock().unwrap().mode, Mode::Cwu);
-        assert_eq!(handle_command("MD", &f, &f, &p, &d, &m, &rit, &rit_hz, &xit, &mut ai, &cw_pending, &cw_busy), Some("MD3;".to_string()));
+        assert_eq!(handle_command("MD", &f, &f, &p, &d, &m, &f, &Arc::new(AtomicBool::new(true)), &rit, &rit_hz, &xit, &mut ai, &cw_pending, &cw_busy), Some("MD3;".to_string()));
     }
 
     #[test]
     fn rt_get_set_round_trip() {
         let (f, p, d, m, rit, rit_hz, xit, cw_pending, cw_busy) = fixture();
         let mut ai = 0;
-        assert_eq!(handle_command("RT", &f, &f, &p, &d, &m, &rit, &rit_hz, &xit, &mut ai, &cw_pending, &cw_busy), Some("RT0;".to_string()));
-        assert_eq!(handle_command("RT1", &f, &f, &p, &d, &m, &rit, &rit_hz, &xit, &mut ai, &cw_pending, &cw_busy), None);
+        assert_eq!(handle_command("RT", &f, &f, &p, &d, &m, &f, &Arc::new(AtomicBool::new(true)), &rit, &rit_hz, &xit, &mut ai, &cw_pending, &cw_busy), Some("RT0;".to_string()));
+        assert_eq!(handle_command("RT1", &f, &f, &p, &d, &m, &f, &Arc::new(AtomicBool::new(true)), &rit, &rit_hz, &xit, &mut ai, &cw_pending, &cw_busy), None);
         assert!(rit.load(Ordering::Relaxed));
-        assert_eq!(handle_command("RT", &f, &f, &p, &d, &m, &rit, &rit_hz, &xit, &mut ai, &cw_pending, &cw_busy), Some("RT1;".to_string()));
+        assert_eq!(handle_command("RT", &f, &f, &p, &d, &m, &f, &Arc::new(AtomicBool::new(true)), &rit, &rit_hz, &xit, &mut ai, &cw_pending, &cw_busy), Some("RT1;".to_string()));
     }
 
     #[test]
@@ -742,7 +766,7 @@ mod tests {
         let (f, p, d, m, rit, rit_hz, xit, cw_pending, cw_busy) = fixture();
         let mut ai = 0;
         rit_hz.store(250, Ordering::Relaxed);
-        assert_eq!(handle_command("RC", &f, &f, &p, &d, &m, &rit, &rit_hz, &xit, &mut ai, &cw_pending, &cw_busy), None);
+        assert_eq!(handle_command("RC", &f, &f, &p, &d, &m, &f, &Arc::new(AtomicBool::new(true)), &rit, &rit_hz, &xit, &mut ai, &cw_pending, &cw_busy), None);
         assert_eq!(rit_hz.load(Ordering::Relaxed), 0);
     }
 
@@ -751,23 +775,23 @@ mod tests {
         let (f, p, d, m, rit, rit_hz, xit, cw_pending, cw_busy) = fixture();
         let mut ai = 0;
         // Default mode (USB) steps by 50Hz.
-        assert_eq!(handle_command("RU", &f, &f, &p, &d, &m, &rit, &rit_hz, &xit, &mut ai, &cw_pending, &cw_busy), None);
+        assert_eq!(handle_command("RU", &f, &f, &p, &d, &m, &f, &Arc::new(AtomicBool::new(true)), &rit, &rit_hz, &xit, &mut ai, &cw_pending, &cw_busy), None);
         assert_eq!(rit_hz.load(Ordering::Relaxed), 50);
-        assert_eq!(handle_command("RD", &f, &f, &p, &d, &m, &rit, &rit_hz, &xit, &mut ai, &cw_pending, &cw_busy), None);
+        assert_eq!(handle_command("RD", &f, &f, &p, &d, &m, &f, &Arc::new(AtomicBool::new(true)), &rit, &rit_hz, &xit, &mut ai, &cw_pending, &cw_busy), None);
         assert_eq!(rit_hz.load(Ordering::Relaxed), 0);
         // CW modes step by 10Hz instead of 50Hz.
         p.lock().unwrap().mode = Mode::Cwl;
-        assert_eq!(handle_command("RU", &f, &f, &p, &d, &m, &rit, &rit_hz, &xit, &mut ai, &cw_pending, &cw_busy), None);
+        assert_eq!(handle_command("RU", &f, &f, &p, &d, &m, &f, &Arc::new(AtomicBool::new(true)), &rit, &rit_hz, &xit, &mut ai, &cw_pending, &cw_busy), None);
         assert_eq!(rit_hz.load(Ordering::Relaxed), 10);
         // An explicit value is an ABSOLUTE set, negated for RD -- matches
         // piHPSDR's rigctl.c exactly (see handle_command's own comment).
         assert_eq!(
-            handle_command("RU00500", &f, &f, &p, &d, &m, &rit, &rit_hz, &xit, &mut ai, &cw_pending, &cw_busy),
+            handle_command("RU00500", &f, &f, &p, &d, &m, &f, &Arc::new(AtomicBool::new(true)), &rit, &rit_hz, &xit, &mut ai, &cw_pending, &cw_busy),
             None
         );
         assert_eq!(rit_hz.load(Ordering::Relaxed), 500);
         assert_eq!(
-            handle_command("RD00500", &f, &f, &p, &d, &m, &rit, &rit_hz, &xit, &mut ai, &cw_pending, &cw_busy),
+            handle_command("RD00500", &f, &f, &p, &d, &m, &f, &Arc::new(AtomicBool::new(true)), &rit, &rit_hz, &xit, &mut ai, &cw_pending, &cw_busy),
             None
         );
         assert_eq!(rit_hz.load(Ordering::Relaxed), -500);
@@ -777,20 +801,52 @@ mod tests {
     fn xt_get_set_round_trip() {
         let (f, p, d, m, rit, rit_hz, xit, cw_pending, cw_busy) = fixture();
         let mut ai = 0;
-        assert_eq!(handle_command("XT", &f, &f, &p, &d, &m, &rit, &rit_hz, &xit, &mut ai, &cw_pending, &cw_busy), Some("XT0;".to_string()));
-        assert_eq!(handle_command("XT1", &f, &f, &p, &d, &m, &rit, &rit_hz, &xit, &mut ai, &cw_pending, &cw_busy), None);
+        assert_eq!(handle_command("XT", &f, &f, &p, &d, &m, &f, &Arc::new(AtomicBool::new(true)), &rit, &rit_hz, &xit, &mut ai, &cw_pending, &cw_busy), Some("XT0;".to_string()));
+        assert_eq!(handle_command("XT1", &f, &f, &p, &d, &m, &f, &Arc::new(AtomicBool::new(true)), &rit, &rit_hz, &xit, &mut ai, &cw_pending, &cw_busy), None);
         assert!(xit.load(Ordering::Relaxed));
-        assert_eq!(handle_command("XT", &f, &f, &p, &d, &m, &rit, &rit_hz, &xit, &mut ai, &cw_pending, &cw_busy), Some("XT1;".to_string()));
+        assert_eq!(handle_command("XT", &f, &f, &p, &d, &m, &f, &Arc::new(AtomicBool::new(true)), &rit, &rit_hz, &xit, &mut ai, &cw_pending, &cw_busy), Some("XT1;".to_string()));
     }
 
     #[test]
     fn tx_rx_drive_mox() {
         let (f, p, d, m, rit, rit_hz, xit, cw_pending, cw_busy) = fixture();
         let mut ai = 0;
-        assert_eq!(handle_command("TX", &f, &f, &p, &d, &m, &rit, &rit_hz, &xit, &mut ai, &cw_pending, &cw_busy), None);
+        assert_eq!(handle_command("TX", &f, &f, &p, &d, &m, &f, &Arc::new(AtomicBool::new(true)), &rit, &rit_hz, &xit, &mut ai, &cw_pending, &cw_busy), None);
         assert!(m.load(Ordering::Relaxed));
-        assert_eq!(handle_command("RX", &f, &f, &p, &d, &m, &rit, &rit_hz, &xit, &mut ai, &cw_pending, &cw_busy), None);
+        assert_eq!(handle_command("RX", &f, &f, &p, &d, &m, &f, &Arc::new(AtomicBool::new(true)), &rit, &rit_hz, &xit, &mut ai, &cw_pending, &cw_busy), None);
         assert!(!m.load(Ordering::Relaxed));
+    }
+
+    /// Real request: TX must be refused outside every ham band unless
+    /// explicitly allowed -- see main.rs's tx_frequency_allowed doc
+    /// comment. 6,000,000 Hz is a real gap between 60m (tops out at
+    /// 5,406,000) and 40m (starts at 7,000,000), so it isn't just an
+    /// untested edge of some band's own range.
+    #[test]
+    fn tx_blocked_outside_ham_bands_unless_allowed() {
+        let (_f, p, d, m, rit, rit_hz, xit, cw_pending, cw_busy) = fixture();
+        let out_of_band = Arc::new(AtomicU32::new(6_000_000));
+        let mut ai = 0;
+
+        let blocked = Arc::new(AtomicBool::new(false));
+        assert_eq!(
+            handle_command(
+                "TX", &out_of_band, &out_of_band, &p, &d, &m, &out_of_band, &blocked, &rit, &rit_hz, &xit,
+                &mut ai, &cw_pending, &cw_busy
+            ),
+            None
+        );
+        assert!(!m.load(Ordering::Relaxed), "TX should have been refused outside every ham band");
+
+        let allowed = Arc::new(AtomicBool::new(true));
+        assert_eq!(
+            handle_command(
+                "TX", &out_of_band, &out_of_band, &p, &d, &m, &out_of_band, &allowed, &rit, &rit_hz, &xit,
+                &mut ai, &cw_pending, &cw_busy
+            ),
+            None
+        );
+        assert!(m.load(Ordering::Relaxed), "TX should be allowed once the operator opts in");
     }
 
     #[test]
@@ -798,12 +854,12 @@ mod tests {
         let (f, p, d, m, rit, rit_hz, xit, cw_pending, cw_busy) = fixture();
         let mut ai = 0;
         assert_eq!(
-            handle_command("KY", &f, &f, &p, &d, &m, &rit, &rit_hz, &xit, &mut ai, &cw_pending, &cw_busy),
+            handle_command("KY", &f, &f, &p, &d, &m, &f, &Arc::new(AtomicBool::new(true)), &rit, &rit_hz, &xit, &mut ai, &cw_pending, &cw_busy),
             Some("KY0;".to_string())
         );
         cw_busy.store(true, Ordering::Relaxed);
         assert_eq!(
-            handle_command("KY", &f, &f, &p, &d, &m, &rit, &rit_hz, &xit, &mut ai, &cw_pending, &cw_busy),
+            handle_command("KY", &f, &f, &p, &d, &m, &f, &Arc::new(AtomicBool::new(true)), &rit, &rit_hz, &xit, &mut ai, &cw_pending, &cw_busy),
             Some("KY1;".to_string())
         );
     }
@@ -813,7 +869,7 @@ mod tests {
         let (f, p, d, m, rit, rit_hz, xit, cw_pending, cw_busy) = fixture();
         let mut ai = 0;
         assert_eq!(
-            handle_command("KY1CQ CQ DE G0ORX  ", &f, &f, &p, &d, &m, &rit, &rit_hz, &xit, &mut ai, &cw_pending, &cw_busy),
+            handle_command("KY1CQ CQ DE G0ORX  ", &f, &f, &p, &d, &m, &f, &Arc::new(AtomicBool::new(true)), &rit, &rit_hz, &xit, &mut ai, &cw_pending, &cw_busy),
             None
         );
         assert_eq!(cw_pending.lock().unwrap().pop_front(), Some("CQ CQ DE G0ORX".to_string()));
@@ -824,7 +880,7 @@ mod tests {
         let (f, p, d, m, rit, rit_hz, xit, cw_pending, cw_busy) = fixture();
         let mut ai = 0;
         assert_eq!(
-            handle_command("KYTEST", &f, &f, &p, &d, &m, &rit, &rit_hz, &xit, &mut ai, &cw_pending, &cw_busy),
+            handle_command("KYTEST", &f, &f, &p, &d, &m, &f, &Arc::new(AtomicBool::new(true)), &rit, &rit_hz, &xit, &mut ai, &cw_pending, &cw_busy),
             None
         );
         assert_eq!(cw_pending.lock().unwrap().pop_front(), Some("TEST".to_string()));
@@ -847,7 +903,7 @@ mod tests {
         let mut ai = 0;
         // fixture() sets meter_db to -73 (S9); piHPSDR's formula maps
         // that to roughly the middle of the 0-30 scale.
-        let resp = handle_command("SM0", &f, &f, &p, &d, &m, &rit, &rit_hz, &xit, &mut ai, &cw_pending, &cw_busy).unwrap();
+        let resp = handle_command("SM0", &f, &f, &p, &d, &m, &f, &Arc::new(AtomicBool::new(true)), &rit, &rit_hz, &xit, &mut ai, &cw_pending, &cw_busy).unwrap();
         assert!(resp.starts_with("SM0"), "{resp}");
         assert!(resp.ends_with(';'));
     }
@@ -856,26 +912,26 @@ mod tests {
     fn ai_get_set_round_trip() {
         let (f, p, d, m, rit, rit_hz, xit, cw_pending, cw_busy) = fixture();
         let mut ai = 0;
-        assert_eq!(handle_command("AI", &f, &f, &p, &d, &m, &rit, &rit_hz, &xit, &mut ai, &cw_pending, &cw_busy), Some("AI0;".to_string()));
-        assert_eq!(handle_command("AI2", &f, &f, &p, &d, &m, &rit, &rit_hz, &xit, &mut ai, &cw_pending, &cw_busy), None);
+        assert_eq!(handle_command("AI", &f, &f, &p, &d, &m, &f, &Arc::new(AtomicBool::new(true)), &rit, &rit_hz, &xit, &mut ai, &cw_pending, &cw_busy), Some("AI0;".to_string()));
+        assert_eq!(handle_command("AI2", &f, &f, &p, &d, &m, &f, &Arc::new(AtomicBool::new(true)), &rit, &rit_hz, &xit, &mut ai, &cw_pending, &cw_busy), None);
         assert_eq!(ai, 2);
-        assert_eq!(handle_command("AI", &f, &f, &p, &d, &m, &rit, &rit_hz, &xit, &mut ai, &cw_pending, &cw_busy), Some("AI2;".to_string()));
+        assert_eq!(handle_command("AI", &f, &f, &p, &d, &m, &f, &Arc::new(AtomicBool::new(true)), &rit, &rit_hz, &xit, &mut ai, &cw_pending, &cw_busy), Some("AI2;".to_string()));
     }
 
     #[test]
     fn ps_read_always_reports_on_and_set_is_ignored() {
         let (f, p, d, m, rit, rit_hz, xit, cw_pending, cw_busy) = fixture();
         let mut ai = 0;
-        assert_eq!(handle_command("PS", &f, &f, &p, &d, &m, &rit, &rit_hz, &xit, &mut ai, &cw_pending, &cw_busy), Some("PS1;".to_string()));
+        assert_eq!(handle_command("PS", &f, &f, &p, &d, &m, &f, &Arc::new(AtomicBool::new(true)), &rit, &rit_hz, &xit, &mut ai, &cw_pending, &cw_busy), Some("PS1;".to_string()));
         // "PS0;" (power off) is deliberately a no-op, not a shutdown --
         // see this module's doc comment.
-        assert_eq!(handle_command("PS0", &f, &f, &p, &d, &m, &rit, &rit_hz, &xit, &mut ai, &cw_pending, &cw_busy), None);
+        assert_eq!(handle_command("PS0", &f, &f, &p, &d, &m, &f, &Arc::new(AtomicBool::new(true)), &rit, &rit_hz, &xit, &mut ai, &cw_pending, &cw_busy), None);
     }
 
     #[test]
     fn unknown_command_gets_question_mark() {
         let (f, p, d, m, rit, rit_hz, xit, cw_pending, cw_busy) = fixture();
         let mut ai = 0;
-        assert_eq!(handle_command("ZZ", &f, &f, &p, &d, &m, &rit, &rit_hz, &xit, &mut ai, &cw_pending, &cw_busy), Some("?;".to_string()));
+        assert_eq!(handle_command("ZZ", &f, &f, &p, &d, &m, &f, &Arc::new(AtomicBool::new(true)), &rit, &rit_hz, &xit, &mut ai, &cw_pending, &cw_busy), Some("?;".to_string()));
     }
 }

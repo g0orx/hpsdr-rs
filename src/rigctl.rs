@@ -120,6 +120,12 @@ impl RigctlServer {
         demod_params: Arc<Mutex<DemodParams>>,
         display: Arc<Mutex<SpectrumDisplay>>,
         mox: Arc<AtomicBool>,
+        // See main.rs's tx_frequency_allowed doc comment -- real
+        // request, a safety default against accidentally transmitting
+        // outside the ham bands, checked before this server's own
+        // `\set_ptt` is honored.
+        tx_frequency_hz: Arc<AtomicU32>,
+        allow_out_of_band_tx: Arc<AtomicBool>,
         // See RadioSession::rit_enabled/rit_offset_hz/xit_enabled/
         // xit_offset_hz's doc comments -- backs j/J (get/set_rit), z/Z
         // (get/set_xit), and u/U (get/set_func RIT/XIT).
@@ -170,6 +176,8 @@ impl RigctlServer {
                         let params = Arc::clone(&accept_demod_params);
                         let disp = Arc::clone(&accept_display);
                         let conn_mox = Arc::clone(&mox);
+                        let conn_tx_frequency_hz = Arc::clone(&tx_frequency_hz);
+                        let conn_allow_out_of_band_tx = Arc::clone(&allow_out_of_band_tx);
                         let conn_rit_enabled = Arc::clone(&rit_enabled);
                         let conn_rit_offset_hz = Arc::clone(&rit_offset_hz);
                         let conn_xit_enabled = Arc::clone(&xit_enabled);
@@ -182,9 +190,10 @@ impl RigctlServer {
                         let handle = thread::spawn(move || {
                             conn_connected.fetch_add(1, Ordering::Relaxed);
                             handle_client(
-                                stream, freq, rx_freq, params, disp, conn_mox, conn_rit_enabled,
-                                conn_rit_offset_hz, conn_xit_enabled, conn_xit_offset_hz,
-                                conn_cw_remote_pending, conn_cw_remote_stop, conn_stop, conn_logging,
+                                stream, freq, rx_freq, params, disp, conn_mox, conn_tx_frequency_hz,
+                                conn_allow_out_of_band_tx, conn_rit_enabled, conn_rit_offset_hz,
+                                conn_xit_enabled, conn_xit_offset_hz, conn_cw_remote_pending,
+                                conn_cw_remote_stop, conn_stop, conn_logging,
                             );
                             conn_connected.fetch_sub(1, Ordering::Relaxed);
                         });
@@ -273,6 +282,8 @@ fn handle_client(
     demod_params: DemodParamsCell,
     display: DisplayCell,
     mox: Arc<AtomicBool>,
+    tx_frequency_hz: Arc<AtomicU32>,
+    allow_out_of_band_tx: Arc<AtomicBool>,
     rit_enabled: Arc<AtomicBool>,
     rit_offset_hz: Arc<AtomicI32>,
     xit_enabled: Arc<AtomicBool>,
@@ -316,6 +327,8 @@ fn handle_client(
                     &current_params,
                     &current_display,
                     &mox,
+                    &tx_frequency_hz,
+                    &allow_out_of_band_tx,
                     &rit_enabled,
                     &rit_offset_hz,
                     &xit_enabled,
@@ -368,6 +381,12 @@ fn handle_command(
     demod_params: &Arc<Mutex<DemodParams>>,
     display: &Arc<Mutex<SpectrumDisplay>>,
     mox: &Arc<AtomicBool>,
+    // See main.rs's tx_frequency_allowed doc comment -- real request, a
+    // safety default against accidentally transmitting outside the ham
+    // bands. Checked before `\set_ptt`'s "on" is honored, same as every
+    // other PTT path in this project.
+    tx_frequency_hz: &Arc<AtomicU32>,
+    allow_out_of_band_tx: &Arc<AtomicBool>,
     rit_enabled: &Arc<AtomicBool>,
     rit_offset_hz: &Arc<AtomicI32>,
     xit_enabled: &Arc<AtomicBool>,
@@ -489,7 +508,21 @@ fn handle_command(
         }
         "T" | "\\set_ptt" => match parts.next().and_then(|s| s.parse::<i32>().ok()) {
             Some(v) => {
-                mox.store(v != 0, Ordering::Relaxed);
+                let want_on = v != 0;
+                if !want_on
+                    || crate::tx_frequency_allowed(
+                        tx_frequency_hz.load(Ordering::Relaxed),
+                        allow_out_of_band_tx.load(Ordering::Relaxed),
+                    )
+                {
+                    mox.store(want_on, Ordering::Relaxed);
+                }
+                // Always RPRT 0 even if refused -- matches this file's
+                // own "PS0/PS" precedent (cat.rs) of acking the command
+                // rather than risking an error code confusing a
+                // client's own retry/handshake logic; the real signal
+                // is that mox never actually goes true, same as a real
+                // radio's own TX-inhibit firmware.
                 "RPRT 0\n".to_string()
             }
             None => "RPRT -1\n".to_string(),

@@ -50,6 +50,12 @@ pub struct Config {
     pub agc_hang_ms: Option<i32>,
     pub agc_top_db: Option<f64>,
     pub agc_slope_db: Option<i32>,
+    /// See spectrum::DemodParams::meter_calibration_db's own doc
+    /// comment. `#[serde(default)]` since older saved configs predate
+    /// this field -- missing = 0.0/uncalibrated, the pre-existing
+    /// behavior, not a guessed correction.
+    #[serde(default)]
+    pub meter_calibration_db: Option<f64>,
     pub db_low: Option<f32>,
     pub db_high: Option<f32>,
     /// "Auto" mode for db_low -- see ConnectedState::db_low_auto's doc
@@ -296,6 +302,17 @@ pub struct Config {
     /// matching field doc comment for why this can't be a live toggle.
     #[serde(default)]
     pub puresignal_enabled: Option<bool>,
+    /// TX Settings' "Allow TX outside ham bands" checkbox -- real
+    /// request, a safety default against accidentally transmitting
+    /// outside the ham bands (e.g. while parked on "Gen"/general
+    /// coverage). `None`/`false` = the default, ham-band-only safety
+    /// check is enforced (main.rs's tx_frequency_allowed); `Some(true)`
+    /// = the operator has explicitly opted into out-of-band TX (e.g.
+    /// MARS/CAP or other authorized use). Live -- takes effect
+    /// immediately, no reconnect needed, since it's read fresh from
+    /// ConnectedState::allow_out_of_band_tx by every PTT path each time.
+    #[serde(default)]
+    pub allow_out_of_band_tx: Option<bool>,
     /// Diversity reception (2-ADC boards only, Settings -> Diversity) --
     /// see radio::RadioSettings's matching field doc comment. Only takes
     /// effect on the next connect, same as puresignal_enabled (and
@@ -506,6 +523,11 @@ pub struct ExtraReceiverConfig {
     pub agc_hang_ms: i32,
     pub agc_top_db: f64,
     pub agc_slope_db: i32,
+    /// See spectrum::DemodParams::meter_calibration_db's own doc
+    /// comment. `#[serde(default)]` -- same reasoning as every other
+    /// field added to this struct after the ones above it.
+    #[serde(default)]
+    pub meter_calibration_db: f64,
     pub db_low: f32,
     pub db_high: f32,
     pub waterfall_db_low: f32,
