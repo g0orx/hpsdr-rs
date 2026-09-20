@@ -592,7 +592,28 @@ fn load_fx3_image(interface: &Interface, path: &Path) -> io::Result<()> {
     if checksum != expected {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "RX-888 firmware image: checksum mismatch"));
     }
-    fx3_jump(interface, entry_addr)
+    // Real report (2026-09-20): a device that had connected successfully
+    // many times in the same session started silently failing to
+    // re-enumerate after this point, with NO new kernel USB event at
+    // all (confirmed via `dmesg -w` across a failed attempt) -- meaning
+    // it's not obvious from the outside whether this RAM-write/verify/
+    // checksum sequence (everything above) genuinely completed and the
+    // jump command itself was sent cleanly, or something failed
+    // silently before ever reaching it. Logged unconditionally (not
+    // gated behind a debug flag) since this whole sequence only runs
+    // once per connect attempt, not in any hot loop -- negligible
+    // console noise for real diagnostic value.
+    eprintln!(
+        "rx888: firmware RAM-loaded and verified ({} bytes, checksum 0x{checksum:08x} matches), \
+         jumping to entry point 0x{entry_addr:08x}",
+        bytes.len(),
+    );
+    let result = fx3_jump(interface, entry_addr);
+    match &result {
+        Ok(()) => eprintln!("rx888: jump command sent successfully -- waiting for the device to re-enumerate"),
+        Err(e) => eprintln!("rx888: jump command itself failed: {e}"),
+    }
+    result
 }
 
 /// Control-transfer handle -- owns the claimed `Interface`. Kept
@@ -637,6 +658,13 @@ impl RxEndpoint {
     }
 }
 
+/// Cheap "is a device at this PID present" check -- `list_devices` only,
+/// no open/claim, so this is safe to call repeatedly in a poll loop
+/// (unlike `find_and_open`, which claims the interface).
+fn device_present(pid: u16) -> bool {
+    nusb::list_devices().wait().is_ok_and(|it| it.into_iter().any(|d| d.vendor_id() == VID && d.product_id() == pid))
+}
+
 /// If an unloaded-PID RX-888 is present, loads firmware into it and
 /// waits for it to re-enumerate as the streaming PID; a no-op if no
 /// unloaded device is found (either already loaded from a prior session
@@ -645,13 +673,66 @@ impl RxEndpoint {
 /// use it, best-effort, to get an accurate real-firmware speed reading
 /// at discovery time instead of guessing off the bootloader's own
 /// enumeration -- see that function's own doc comment.
+///
+/// REVISED (2026-09-20, real report: a device that had connected
+/// successfully many times in the same session suddenly stopped
+/// re-enumerating, "Failed to start radio: no RX-888 device (04b4:00f1)
+/// found on USB") -- rx888.c's own reference just does a single fixed
+/// `usleep(1000000)` (1s) then moves on, trusting the caller's own next
+/// step (opening PID_STREAMING) to fail if that wasn't long enough. This
+/// polls instead, checking every 100ms for up to 5s -- returning as soon
+/// as the device reappears (the common case stays close to the old ~1s),
+/// but giving real margin on a system/USB controller that's simply
+/// slower to re-enumerate than whatever machine the reference's own
+/// 1-second constant was tuned against, before concluding something is
+/// actually wrong rather than just running late.
 fn load_firmware_if_needed(firmware_path: &Path) -> io::Result<()> {
     if let Ok((interface, _)) = find_and_open(PID_UNLOADED) {
         load_fx3_image(&interface, firmware_path)?;
         drop(interface);
-        // rx888.c's own "how long should this be? sleep(1)" for
-        // re-enumeration -- ported as-is.
-        std::thread::sleep(Duration::from_secs(1));
+
+        const POLL_INTERVAL: Duration = Duration::from_millis(100);
+        const POLL_TIMEOUT: Duration = Duration::from_secs(5);
+        let start = std::time::Instant::now();
+        while start.elapsed() < POLL_TIMEOUT {
+            if device_present(PID_STREAMING) {
+                return Ok(());
+            }
+            std::thread::sleep(POLL_INTERVAL);
+        }
+
+        // Didn't reappear within the poll window -- distinguish the two
+        // real possibilities rather than a flat "not found" (which
+        // `initialise`'s own subsequent find_and_open(PID_STREAMING)
+        // would otherwise report identically either way): still/again
+        // at the unloaded PID means the RAM firmware was written and
+        // verified byte-for-byte (load_fx3_image's own checksum/verify
+        // steps would already have failed loudly otherwise) but never
+        // actually booted into real streaming firmware -- a firmware
+        // jump that didn't take, or the FX3 crashing/resetting on boot;
+        // gone entirely points more at the USB link itself (cable,
+        // port, power) dropping the device mid-re-enumeration.
+        if device_present(PID_UNLOADED) {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!(
+                    "RX-888 firmware was written and verified, but the device is still showing up as \
+                     unloaded (04b4:{PID_UNLOADED:04x}) {POLL_TIMEOUT:?} after being told to start it -- \
+                     it isn't booting into the real streaming firmware. Try a different USB cable/port \
+                     (directly into a USB 3 port, not a hub) and a full power cycle (unplug 30+ seconds, \
+                     not just replug) before assuming this is a firmware/hardware fault."
+                ),
+            ));
+        }
+        return Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!(
+                "RX-888 firmware was written and verified, but the device disappeared from USB entirely \
+                 (not found at either 04b4:{PID_UNLOADED:04x} or 04b4:{PID_STREAMING:04x}) {POLL_TIMEOUT:?} \
+                 after being told to start it -- check the USB cable/port/power (try a different port, \
+                 directly into USB 3, not a hub) rather than assuming this is a firmware/hardware fault."
+            ),
+        ));
     }
     Ok(())
 }
