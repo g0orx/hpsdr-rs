@@ -375,19 +375,27 @@ fn remember_band_settings(
     waterfall_db_high: f32,
     mode: spectrum::Mode,
 ) {
-    if let Some(band) = band_for_frequency(freq_hz) {
-        band_memory.insert(
-            band.name.to_string(),
-            BandSettings {
-                frequency_hz: freq_hz,
-                db_low,
-                db_high,
-                waterfall_db_low,
-                waterfall_db_high,
-                mode: Some(mode),
-            },
-        );
-    }
+    // ROOT CAUSE FIX for a real report ("the Gen band does not remember
+    // its last settings"): this used to silently no-op (`if let Some`)
+    // for any frequency outside every real ham band -- i.e. every
+    // single time this ran while tuned to "Gen", including the very
+    // first save right after switching TO it (apply_band's own initial
+    // remember_band_settings call, immediately after computing Gen's
+    // own default_hz, which also isn't in a real band). Same "Gen"
+    // fallback as gen_band/current_band elsewhere (main.rs) -- see
+    // gen_band's own doc comment.
+    let name = band_for_frequency(freq_hz).map(|b| b.name).unwrap_or("Gen");
+    band_memory.insert(
+        name.to_string(),
+        BandSettings {
+            frequency_hz: freq_hz,
+            db_low,
+            db_high,
+            waterfall_db_low,
+            waterfall_db_high,
+            mode: Some(mode),
+        },
+    );
 }
 
 /// Last filter width the user set while in `mode`, if any -- falls back
