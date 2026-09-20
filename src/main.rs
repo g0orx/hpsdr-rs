@@ -758,7 +758,7 @@ fn dispatch_midi_event(connected: &mut ConnectedState, ev: RawMidiEvent, freq_hz
             connected.width_memory.insert(current_mode.label().to_string(), width);
         }
         MidiAction::VfoStepUp | MidiAction::VfoStepDown => {
-            let step = scroll_tune_step_hz(cw_mode, false);
+            let step = scroll_tune_step_hz(cw_mode, false, false);
             let signed_step = if binding.action == MidiAction::VfoStepUp { step } else { -step };
             let new_freq = (dial_freq_hz as i64 + signed_step).max(0) as u32;
             let (effective_freq, retune) = resolve_tune(connected.ctun, freq_hz, sample_rate, passband, new_freq);
@@ -3432,9 +3432,30 @@ impl eframe::App for HpsdrApp {
                                                 // further down is unaffected.
                                                 .sense(egui::Sense::click()),
                                             )
-                                            .on_hover_text(
-                                                "Scroll to tune -- Shift: 100 Hz, Ctrl: 10 kHz, none: 1 kHz -- right-click to type a frequency",
-                                            );
+                                            .on_hover_text(if matches!(current_mode, spectrum::Mode::Cwl | spectrum::Mode::Cwu) {
+                                                // ROOT CAUSE FIX for a real
+                                                // report: this hovering
+                                                // over VFO-A shares the
+                                                // SAME scroll handler as
+                                                // the spectrum/waterfall
+                                                // (see the "if
+                                                // freq_label.hovered() ||
+                                                // spectrum_resp.hovered()"
+                                                // check further down) --
+                                                // its real step sizes were
+                                                // already CW-aware
+                                                // (scroll_tune_step_hz/
+                                                // ctrl_scroll_tune_step_hz),
+                                                // but this tooltip text
+                                                // was a plain static
+                                                // string that never
+                                                // reflected that, always
+                                                // showing the non-CW
+                                                // values even in CW mode.
+                                                "Scroll to tune -- Shift: 10 Hz, Ctrl: 1 Hz, none: 100 Hz -- right-click to type a frequency"
+                                            } else {
+                                                "Scroll to tune -- Shift: 100 Hz, Ctrl: 10 kHz, none: 1 kHz -- right-click to type a frequency"
+                                            });
                                         // Right-click -> keypad frequency
                                         // entry popup, real request.
                                         if resp.secondary_clicked() {
@@ -5070,7 +5091,8 @@ impl eframe::App for HpsdrApp {
                             const NOTCH: f32 = 100.0;
 
                             let shift = ui.input(|i| i.modifiers.shift);
-                            let step: i64 = scroll_tune_step_hz(cw_mode, shift);
+                            let ctrl = ui.input(|i| i.modifiers.ctrl);
+                            let step: i64 = scroll_tune_step_hz(cw_mode, shift, ctrl);
 
                             let mut new_freq = dial_freq_hz as i64;
                             while connected.scroll_accum.abs() >= NOTCH {
@@ -5097,6 +5119,9 @@ impl eframe::App for HpsdrApp {
                         // and reports it via zoom_delta() (1.0 = no
                         // change) rather than smooth_scroll_delta, so it
                         // needs its own accumulate-and-threshold path.
+                        // See ctrl_scroll_tune_step_hz's own doc comment
+                        // for why the step size is computed there, not
+                        // hardcoded here.
                         let zoom = ui.input(|i| i.zoom_delta());
                         if zoom != 1.0 {
                             connected.zoom_accum += zoom - 1.0;
@@ -5104,12 +5129,13 @@ impl eframe::App for HpsdrApp {
                             // Unverified threshold, same caveat as NOTCH
                             // above -- tune if 10kHz steps feel off.
                             const ZOOM_NOTCH: f32 = 0.05;
+                            let ctrl_step = ctrl_scroll_tune_step_hz(cw_mode);
 
                             let mut new_freq = dial_freq_hz as i64;
                             while connected.zoom_accum.abs() >= ZOOM_NOTCH {
                                 let sign = connected.zoom_accum.signum();
                                 connected.zoom_accum -= sign * ZOOM_NOTCH;
-                                new_freq += 10_000 * sign as i64;
+                                new_freq += ctrl_step * sign as i64;
                             }
                             new_freq = new_freq.max(0);
 
@@ -5369,7 +5395,7 @@ impl eframe::App for HpsdrApp {
                     }
 
                     if let Some(pos) = spectrum_resp.hover_pos() {
-                        let hover_freq = round_to_1khz(freq_at_x(pos.x, rect, freq_hz, sample_rate, connected.spectrum_zoom, pan_offset_hz));
+                        let hover_freq = round_to_step_hz(freq_at_x(pos.x, rect, freq_hz, sample_rate, connected.spectrum_zoom, pan_offset_hz), main_hover_scroll_step_hz(cw_mode, ui.input(|i| i.modifiers.shift), ui.input(|i| i.modifiers.ctrl)));
                         // Shown in RF space when a transverter is active --
                         // see xvtr_rf_offset_hz's doc comment -- matching
                         // the frequency-axis tick labels, which get the
@@ -5463,7 +5489,8 @@ impl eframe::App for HpsdrApp {
                                 connected.scroll_accum += delta;
                                 const NOTCH: f32 = 100.0;
                                 let shift = ui.input(|i| i.modifiers.shift);
-                                let step: i64 = scroll_tune_step_hz(cw_mode, shift);
+                                let ctrl = ui.input(|i| i.modifiers.ctrl);
+                                let step: i64 = scroll_tune_step_hz(cw_mode, shift, ctrl);
 
                                 let mut new_freq = dial_freq_hz as i64;
                                 while connected.scroll_accum.abs() >= NOTCH {
@@ -5486,16 +5513,20 @@ impl eframe::App for HpsdrApp {
                                 }
                             }
 
+                            // See ctrl_scroll_tune_step_hz's own doc
+                            // comment for why the step size is computed
+                            // there, not hardcoded here.
                             let zoom = ui.input(|i| i.zoom_delta());
                             if zoom != 1.0 {
                                 connected.zoom_accum += zoom - 1.0;
                                 const ZOOM_NOTCH: f32 = 0.05;
+                                let ctrl_step = ctrl_scroll_tune_step_hz(cw_mode);
 
                                 let mut new_freq = dial_freq_hz as i64;
                                 while connected.zoom_accum.abs() >= ZOOM_NOTCH {
                                     let sign = connected.zoom_accum.signum();
                                     connected.zoom_accum -= sign * ZOOM_NOTCH;
-                                    new_freq += 10_000 * sign as i64;
+                                    new_freq += ctrl_step * sign as i64;
                                 }
                                 new_freq = new_freq.max(0);
 
@@ -5546,7 +5577,7 @@ impl eframe::App for HpsdrApp {
                             );
                         }
                         if let Some(pos) = waterfall_click_resp.hover_pos() {
-                            let hover_freq = round_to_1khz(freq_at_x(pos.x, rect, freq_hz, sample_rate, connected.spectrum_zoom, pan_offset_hz));
+                            let hover_freq = round_to_step_hz(freq_at_x(pos.x, rect, freq_hz, sample_rate, connected.spectrum_zoom, pan_offset_hz), main_hover_scroll_step_hz(cw_mode, ui.input(|i| i.modifiers.shift), ui.input(|i| i.modifiers.ctrl)));
                             // See the spectrum pane's identical treatment above.
                             let hover_freq_shown = (hover_freq as i64 + xvtr_rf_offset_hz).clamp(0, u32::MAX as i64) as u32;
                             draw_freq_hover_tooltip(ui.painter(), pos, hover_freq_shown);
@@ -10699,7 +10730,16 @@ fn render_extra_receiver_ui(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceiver>>) {
                     )
                     .sense(egui::Sense::hover()),
                 )
-                .on_hover_text("Scroll to tune -- Shift: 100 Hz, none: 1 kHz. Click spectrum/waterfall to jump.")
+                .on_hover_text(if cw_mode {
+                    // Same real report/fix as the main window's
+                    // identical tooltip (main.rs) -- this label shares
+                    // its own spectrum/waterfall scroll handler
+                    // (scroll_tune_step_hz), already CW-aware, but this
+                    // text never reflected that.
+                    "Scroll to tune -- Shift: 10 Hz, none: 100 Hz. Click spectrum/waterfall to jump."
+                } else {
+                    "Scroll to tune -- Shift: 100 Hz, none: 1 kHz. Click spectrum/waterfall to jump."
+                })
             });
         });
 
@@ -11110,7 +11150,8 @@ fn render_extra_receiver_ui(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceiver>>) {
             // See the main receiver's own scroll-to-tune NOTCH comment.
             const NOTCH: f32 = 100.0;
             let shift = ui.input(|i| i.modifiers.shift);
-            let step: i64 = scroll_tune_step_hz(cw_mode, shift);
+            let ctrl = ui.input(|i| i.modifiers.ctrl);
+            let step: i64 = scroll_tune_step_hz(cw_mode, shift, ctrl);
             let mut new_freq = dial_freq_hz as i64;
             while rx.scroll_accum.abs() >= NOTCH {
                 let sign = rx.scroll_accum.signum();
@@ -11229,7 +11270,7 @@ fn render_extra_receiver_ui(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceiver>>) {
     draw_audio_waveform(ui.painter(), rect, &waveform_samples);
 
     if let Some(pos) = spectrum_resp.hover_pos() {
-        let hover_freq = round_to_1khz(freq_at_x(pos.x, rect, freq_hz, sample_rate, rx.spectrum_zoom, pan_offset_hz));
+        let hover_freq = round_to_step_hz(freq_at_x(pos.x, rect, freq_hz, sample_rate, rx.spectrum_zoom, pan_offset_hz), scroll_tune_step_hz(cw_mode, ui.input(|i| i.modifiers.shift), ui.input(|i| i.modifiers.ctrl)));
         draw_freq_hover_tooltip(ui.painter(), pos, hover_freq);
     }
 
@@ -11301,7 +11342,8 @@ fn render_extra_receiver_ui(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceiver>>) {
                 rx.scroll_accum += delta;
                 const NOTCH: f32 = 100.0;
                 let shift = ui.input(|i| i.modifiers.shift);
-                let step: i64 = scroll_tune_step_hz(cw_mode, shift);
+                let ctrl = ui.input(|i| i.modifiers.ctrl);
+                let step: i64 = scroll_tune_step_hz(cw_mode, shift, ctrl);
                 let mut new_freq = dial_freq_hz as i64;
                 while rx.scroll_accum.abs() >= NOTCH {
                     let sign = rx.scroll_accum.signum();
@@ -11369,7 +11411,7 @@ fn render_extra_receiver_ui(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceiver>>) {
             );
         }
         if let Some(pos) = wf_resp.hover_pos() {
-            let hover_freq = round_to_1khz(freq_at_x(pos.x, wf_rect, freq_hz, sample_rate, rx.spectrum_zoom, pan_offset_hz));
+            let hover_freq = round_to_step_hz(freq_at_x(pos.x, wf_rect, freq_hz, sample_rate, rx.spectrum_zoom, pan_offset_hz), scroll_tune_step_hz(cw_mode, ui.input(|i| i.modifiers.shift), ui.input(|i| i.modifiers.ctrl)));
             draw_freq_hover_tooltip(ui.painter(), pos, hover_freq);
         }
 
@@ -11772,16 +11814,68 @@ fn render_extra_receiver_settings(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceive
 }
 
 /// Scroll-to-tune step size over the spectrum/waterfall panes -- finer
-/// in CW mode (100Hz normally, 10Hz with Shift) than every other mode
-/// (1kHz normally, 100Hz with Shift), since zero-beating a CW signal
-/// is commonly done within tens of Hz, far tighter than SSB/AM/FM
-/// listening ever needs.
-fn scroll_tune_step_hz(cw_mode: bool, shift: bool) -> i64 {
-    match (cw_mode, shift) {
-        (true, true) => 10,
-        (true, false) => 100,
-        (false, true) => 100,
-        (false, false) => 1_000,
+/// in CW mode (100Hz normally, 10Hz with Shift, 1Hz with Ctrl -- real
+/// request) than every other mode (1kHz normally, 100Hz with Shift;
+/// Ctrl not given a CW-only meaning outside CW, so it's ignored there,
+/// same as before this was added), since zero-beating a CW signal is
+/// commonly done within single-digit Hz, far tighter than SSB/AM/FM
+/// listening ever needs. Ctrl takes priority over Shift if somehow both
+/// are held at once, simplest well-defined choice for an unspecified
+/// combination.
+fn scroll_tune_step_hz(cw_mode: bool, shift: bool, ctrl: bool) -> i64 {
+    match (cw_mode, ctrl, shift) {
+        (true, true, _) => 1,
+        (true, false, true) => 10,
+        (true, false, false) => 100,
+        (false, _, true) => 100,
+        (false, _, false) => 1_000,
+    }
+}
+
+/// The REAL step a Ctrl+scroll gesture over the spectrum/waterfall uses
+/// right now -- ROOT CAUSE FIX for a real report ("Ctrl + scroll should
+/// be 1Hz not 10kHz" in CW mode): egui intercepts Ctrl+scroll BEFORE it
+/// ever reaches smooth_scroll_delta, reporting it instead as a "zoom"
+/// gesture via zoom_delta() -- a genuinely separate code path (see the
+/// spectrum click-and-drag handler's own "Ctrl+scroll: egui treats this
+/// as a zoom gesture" comment) with its own historical hardcoded 10kHz
+/// step that predates CW-aware stepping entirely. scroll_tune_step_hz's
+/// own `ctrl` parameter, passed at the PLAIN-scroll call sites, can
+/// therefore never actually see ctrl=true in practice -- delta is
+/// always 0.0 there whenever Ctrl is held, since egui already diverted
+/// it. This is the function that actually needs to know about Ctrl:
+/// used both where the zoom-gesture path itself decides its step, and
+/// by the hover tooltip (so its preview matches what scrolling would
+/// really do). CW drops all the way to 1Hz on this gesture too, since
+/// zero-beating needs that precision regardless of which gesture got
+/// you there; every other mode keeps this path's own original 10kHz
+/// jump unchanged (not tied to scroll_tune_step_hz's own non-CW
+/// values, which were never what this "big jump" gesture used).
+fn ctrl_scroll_tune_step_hz(cw_mode: bool) -> i64 {
+    if cw_mode {
+        1
+    } else {
+        10_000
+    }
+}
+
+/// Accurate hover-tooltip preview for the MAIN receiver's spectrum/
+/// waterfall -- accounts for ctrl_scroll_tune_step_hz's own doc
+/// comment: Ctrl+scroll is a genuinely separate gesture/code path from
+/// a plain scroll, with its own distinct step, so the preview needs to
+/// branch the same way the real handlers do rather than just calling
+/// scroll_tune_step_hz (which can never actually see ctrl=true from a
+/// real scroll, only from this tooltip's own direct modifier check).
+/// NOT used for extra receivers, which have no Ctrl+scroll zoom-gesture
+/// handler of their own at all yet -- their hover tooltip keeps its
+/// existing (less precise, but harmless) scroll_tune_step_hz-only
+/// preview rather than implying a gesture that doesn't actually do
+/// anything there.
+fn main_hover_scroll_step_hz(cw_mode: bool, shift: bool, ctrl: bool) -> i64 {
+    if ctrl {
+        ctrl_scroll_tune_step_hz(cw_mode)
+    } else {
+        scroll_tune_step_hz(cw_mode, shift, false)
     }
 }
 
@@ -11798,7 +11892,7 @@ fn scroll_tune_step_hz(cw_mode: bool, shift: bool) -> i64 {
 /// adjustments rather than "select this exact signal").
 ///
 /// Also where rounding is decided (real request): every OTHER mode's
-/// click-to-tune snaps to the nearest 1kHz (round_to_1khz, matching
+/// click-to-tune snaps to the nearest 1kHz (round_to_step_hz, matching
 /// freq_at_x's own former behavior, still applied here for them) --
 /// fine for voice modes, but CW operators need to land exactly on a
 /// signal's real frequency (often not anywhere near a 1kHz boundary),
@@ -11810,17 +11904,29 @@ fn cw_center_click_freq(mode: spectrum::Mode, clicked_freq_hz: u32) -> u32 {
     match mode {
         spectrum::Mode::Cwl => (clicked_freq_hz as i64 + pitch).max(0) as u32,
         spectrum::Mode::Cwu => (clicked_freq_hz as i64 - pitch).max(0) as u32,
-        _ => round_to_1khz(clicked_freq_hz),
+        _ => round_to_step_hz(clicked_freq_hz, 1_000),
     }
 }
 
-/// Nearest-1kHz rounding -- factored out of freq_at_x (real request:
-/// CW click-to-tune needed the EXACT frequency instead, see
-/// cw_center_click_freq's own doc comment) so hover-tooltip display
-/// call sites can still round for a clean readout without forcing
-/// every caller of freq_at_x to.
-fn round_to_1khz(freq_hz: u32) -> u32 {
-    ((freq_hz as f64 / 1000.0).round() * 1000.0).max(0.0) as u32
+/// Rounds to the nearest multiple of `step_hz` -- factored out of
+/// freq_at_x (real request: CW click-to-tune needed the EXACT
+/// frequency instead, see cw_center_click_freq's own doc comment) so
+/// hover-tooltip display call sites can still round for a clean
+/// readout without forcing every caller of freq_at_x to.
+///
+/// `step_hz` is a real parameter, not hardcoded to 1kHz (REVISED, real
+/// report): the hover tooltip rounding to a fixed 1kHz didn't match CW
+/// mode's own actual scroll-to-tune step (100Hz, 10Hz with Shift, 1Hz
+/// with Ctrl -- see scroll_tune_step_hz), so the preview shown while
+/// hovering disagreed with where a scroll would actually land.
+/// Hover-tooltip call sites now pass `scroll_tune_step_hz(cw_mode,
+/// <live Shift state>, <live Ctrl state>)`, the exact same step the
+/// scroll handler itself would use at that instant; cw_center_click_freq's
+/// own non-CW arm above still hardcodes 1000, since click-to-tune
+/// (unlike hover/scroll) never varies by modifier keys.
+fn round_to_step_hz(freq_hz: u32, step_hz: i64) -> u32 {
+    let step = step_hz.max(1) as f64;
+    ((freq_hz as f64 / step).round() * step).max(0.0) as u32
 }
 
 /// `zoom`/`pan_offset_hz` describe the currently visible window the same
@@ -11831,11 +11937,9 @@ fn round_to_1khz(freq_hz: u32) -> u32 {
 /// request) from an earlier version that rounded to the nearest 1kHz
 /// internally, which defeated precise CW click-to-tune (a CW signal is
 /// essentially never sitting exactly on a 1kHz boundary). Callers that
-/// still want a rounded value for display (the hover tooltip, still
-/// wants a clean 1kHz readout for voice-mode use) apply round_to_1khz
-/// themselves; cw_center_click_freq (the actual click-to-tune path)
-/// does the same for every non-CW mode, but uses the exact value
-/// directly for CW.
+/// want a rounded value instead (the hover tooltip; cw_center_click_freq,
+/// the actual click-to-tune path, for every non-CW mode) apply
+/// round_to_step_hz themselves.
 fn freq_at_x(
     x: f32,
     rect: egui::Rect,
