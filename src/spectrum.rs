@@ -594,6 +594,58 @@ impl RxAudioLowpass {
     }
 }
 
+/// ROOT CAUSE FIX (2026-09-21): WDSP's plain AM detector (`amd.c` mode 0)
+/// is a literal envelope, `sqrt(I^2+Q^2)` -- inherently unipolar (never
+/// negative) and never DC-corrected anywhere in RXA's own chain (traced
+/// through WDSP's `xrxa` -- no DC-removal stage exists between `xamd`
+/// and the final output). A real recording proved this isn't just a
+/// gain-scaling problem: even after fixing AGC-Off's hidden fixed gain
+/// (see SetRXAAGCFixed's own doc comment above) so the level LOOKED
+/// reasonable on paper (~-13 to -15dBFS RMS, no clipping), the user
+/// still heard it as "very quiet" on real headphones. FFT on that exact
+/// "clean" segment showed why: ~84M of RMS-squared energy sat in the
+/// 0-20Hz band alone, vs. ~1.8M total across the entire 300-3000Hz voice
+/// band -- the segment's overall RMS (~6000-7200) was almost entirely
+/// the constant carrier-level DC pedestal (segment mean ~5763, nearly
+/// identical to its RMS), not audible content. Headphones/speakers can't
+/// reproduce true DC at all, so a human listener only ever heard the
+/// small leftover AC sliver riding on top of a very loud-on-paper, but
+/// silent-in-reality, DC level -- meanwhile that same DC pedestal was
+/// eating most of the headroom budget before the app's own
+/// `.clamp(-1.0, 1.0)`, making the signal look far closer to clipping
+/// than the real audio content ever justified.
+///
+/// A gentle one-pole DC blocker (`y[n] = x[n] - x[n-1] + R*y[n-1]`)
+/// removes exactly that pedestal (cutoff ~(1-R)*fs/2*pi, a few Hz at
+/// R=0.9995) while leaving normal audio content untouched -- standard
+/// practice in any audio chain that might carry a DC offset. Applied
+/// generically to every mode (not just AM) since it's a no-op on modes
+/// that are already zero-mean (SSB/CW/digital), and applied to the RAW
+/// l/r samples right out of WDSP -- upstream of Audio Gain, the clamp,
+/// and every consumer tap (waveform/CW decoder/local speaker/TCI/
+/// radio-audio) -- so none of them keep seeing this non-audio DC
+/// component eating their own headroom or amplitude budget.
+struct DcBlocker {
+    r: f32,
+    x1: f32,
+    y1: f32,
+}
+
+impl DcBlocker {
+    const R: f32 = 0.9995;
+
+    fn new() -> Self {
+        Self { r: Self::R, x1: 0.0, y1: 0.0 }
+    }
+
+    fn feed(&mut self, x: f32) -> f32 {
+        let y = x - self.x1 + self.r * self.y1;
+        self.x1 = x;
+        self.y1 = y;
+        y
+    }
+}
+
 // Same "small, bounded, drop-oldest" reasoning as AUDIO_BUFFER_CAPACITY
 // above -- a TCI client that isn't draining fast enough (or isn't
 // streaming at all) shouldn't cause unbounded growth here. Sized more
@@ -763,6 +815,73 @@ impl SpectrumAnalyzer {
             // covers the actually-useful levels, instead of everything
             // being 4x hotter than the slider implies.
             wdsp::SetRXAPanelGain1(channel, 1.0);
+
+            // Same category of bug as SetRXAPanelGain1 above, for AGC's
+            // "Off" mode specifically: create_wcpagc's own default
+            // fixed_gain is 1000.0 (+60dB!), applied by WDSP's AGC stage
+            // whenever this app's AGC is set to Off/None (WDSP's mode 0
+            // is a fixed manual gain, not zero gain -- see wcpAGC.c's
+            // mode==0 branch, a plain `out = fixed_gain * in`, no
+            // limiting at all). That's applied AFTER the demodulator
+            // (xamd runs before xwcpagc in RXA's chain) and BEFORE this
+            // app's own Audio Gain slider, so a strong signal with AGC
+            // Off got hit with a hidden 60dB boost no UI control here
+            // exposes -- confirmed via a real recording on an S9+20
+            // broadcast AM station with AGC None: clean audio at Audio
+            // Gain -20dB, but the plain AM detector's output (WDSP's
+            // amd.c literal `sqrt(I^2+Q^2)`, unipolar/DC-biased with no
+            // DC removal in that path) rammed into this app's downstream
+            // `.clamp(-1.0, 1.0)` and pinned at positive full-scale for
+            // 97-99% of samples at Audio Gain 0dB, not a symmetric
+            // clipped waveform -- exactly the "turning gain up gives
+            // hardly any audio" symptom, since almost the entire
+            // waveform became a flat DC ceiling with only a sliver of
+            // real modulation surviving below it.
+            //
+            // FIRST ATTEMPT reset this to 0dB (unity) -- eliminated the
+            // clipping, but a follow-up real recording on the SAME S9+20
+            // station at Audio Gain's own maximum (+30dB) measured only
+            // ~1100-1200 RMS out of a 32767 full scale (~-28dBFS) --
+            // "audio out through the speaker is very low", confirmed by
+            // the user. Unity throws out too much: WDSP's own default
+            // was oversized for this one exceptionally strong signal,
+            // but raw (unity-gain) demod amplitude is genuinely quiet in
+            // this app's own I/Q scaling, and Audio Gain's own ceiling
+            // (+30dB, see its scroll_slider_f32_db call site) can't make
+            // up a full 60dB shortfall -- weaker, more ordinary signals
+            // would be far less audible still.
+            //
+            // +40dB (100x) looked like a reasonable data-driven middle
+            // ground at the time (comfortable RMS, no clipping, on the
+            // same S9+20 station) -- but a THIRD real report shot that
+            // down too: even at that "clean-looking" level, the user
+            // still heard it as very quiet on real headphones. That
+            // pointed straight back at the DC-biased-envelope root cause
+            // itself, not the gain: see DcBlocker's own doc comment for
+            // the FFT that proved almost all of that "clean" segment's
+            // RMS was actually the inaudible DC pedestal, not real audio
+            // -- ~84M of energy in 0-20Hz vs. ~1.8M across the entire
+            // 300-3000Hz voice band. Once DcBlocker strips that pedestal
+            // (now wired in below, upstream of everything), the true
+            // AC-only content in that exact recording (same channel,
+            // same 100x total gain) simulates out to only ~1260 RMS /
+            // ~7800 peak -- i.e. the REAL signal was always ~14dB
+            // quieter than the old DC-inclusive measurements implied,
+            // and needs real additional gain to compensate, not less.
+            //
+            // +50dB (316x) is the recalibration: applied to that same
+            // simulated DC-blocked data, it projects to ~-18dBFS RMS /
+            // ~2.5dB of peak headroom at Audio Gain 0dB on this same
+            // S9+20 station -- comfortably audible without clipping,
+            // using the DC-blocked signal's own measured crest factor
+            // (~6.2x, much peakier than the old DC-polluted ~2.4x, which
+            // makes sense once a flat DC pedestal no longer masks real
+            // dynamic range). Simulated from real recorded data, not yet
+            // confirmed against the actual DC-blocked+regained pipeline
+            // on real hardware -- revisit with a fresh recording (Audio
+            // Gain swept low-to-high on the same or another station) if
+            // it's still off in either direction.
+            wdsp::SetRXAAGCFixed(channel, 50.0);
 
             // Creates the noise blanker DSP objects themselves -- must
             // happen before the Set*Samplerate calls below, since those
@@ -1473,6 +1592,12 @@ fn run(
     // against the actual captured samples to fully remove the ~22-23kHz
     // component while leaving a real ~1.3kHz tone untouched.
     let mut radio_audio_lpf = RxAudioLowpass::new(OUTPUT_RATE as f32);
+    // See DcBlocker's own doc comment -- strips WDSP's plain-AM-detector
+    // DC pedestal (and any other mode's residual DC) before ANY consumer
+    // (waveform/CW decoder/gain/clamp/speaker/TCI/radio-audio) sees it.
+    // One instance per channel so L/R stay independent for binaural.
+    let mut dc_block_l = DcBlocker::new();
+    let mut dc_block_r = DcBlocker::new();
 
     while !stop.load(Ordering::Relaxed) {
         chunk.clear();
@@ -1611,6 +1736,11 @@ fn run(
                 if mox_active {
                     continue;
                 }
+                // See DcBlocker's own doc comment -- strips the raw
+                // demod output's DC/near-DC pedestal before anything
+                // else (mono downmix, waveform tap, CW decoder, Audio
+                // Gain, the clamp below, every output tap) sees it.
+                let (l, r) = (dc_block_l.feed(l), dc_block_r.feed(r));
                 // Waveform tap and radio-audio-to-radio both stay a
                 // plain mono downmix regardless of DemodParams::binaural
                 // -- see that field's own doc comment: neither is a
