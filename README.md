@@ -38,7 +38,7 @@ Any board the standard openHPSDR discovery protocol reports as one of: Metis, He
 
 Also, separately: the original Ozy/Mercury/Penny hardware (Protocol 1 over USB rather than Ethernet) — see [Ozy USB](#ozy-usb-legacy-hardware) below. **New, partially confirmed against real hardware.**
 
-And separately again: the receive-only [RX-888 Mk2](#rx-888-mk2-receive-only-direct-sampling-sdr) direct-sampling SDR — see that section below. **v1, unconfirmed against real hardware.**
+And separately again: the receive-only [RX-888 Mk2](#rx-888-mk2-receive-only-direct-sampling-sdr) direct-sampling SDR — see that section below. **Confirmed working against real hardware.**
 
 ## Building
 
@@ -168,11 +168,7 @@ ADC in this hardware generation).
 
 ## RX-888 Mk2 (receive-only direct-sampling SDR)
 
-> **v1, unconfirmed against real hardware.** This development
-> environment has no USB access at all — every USB/firmware/streaming
-> detail is ported directly from a real, working reference driver
-> (ka9q-radio), but none of it has actually been run against a real
-> RX-888 yet. If you try it, reports (good or bad) are very welcome.
+> **Confirmed working** against a real RX-888 Mk2.
 
 An RX-888 Mk2 is a receive-only, direct-sampling HF SDR (Cypress FX3 +
 LTC2208-class ADC) that streams its *entire* captured bandwidth as raw
