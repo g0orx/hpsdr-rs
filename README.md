@@ -174,10 +174,12 @@ An RX-888 Mk2 is a receive-only, direct-sampling HF SDR (Cypress FX3 +
 LTC2208-class ADC) that streams its *entire* captured bandwidth as raw
 ADC samples over USB, with no on-board tuner/DDC — hpsdr-rs does the
 digital down-conversion (NCO mixer + CIC decimator) itself in software.
-This first version is deliberately narrow in scope: **one receiver,
-direct-sampling HF mode only, fixed decimation** (no "Add Receiver", no
-tuner/VHF mode, no adjustable IF bandwidth yet) — proving the concept
-before expanding it.
+It supports up to **8 simultaneous, independent receivers** (see [Extra
+Receivers](docs/manual/03-extra-receivers.md), each on its own CPU core)
+and **96/192/384kHz** selectable sample rates — see
+[the full RX-888 Mk2 chapter](docs/manual/20-rx888-mk2.md) for details.
+It remains direct-sampling HF mode only: no on-board tuner, so no
+VHF/UHF.
 
 1. **Firmware file** — the Cypress FX3 RAM image (`SDDC_FX3.img`) is
    **bundled** with hpsdr-rs (MIT-licensed; see
