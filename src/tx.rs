@@ -408,6 +408,20 @@ pub struct TxParams {
     pub two_tone: bool,
     /// See spectrum::EqualizerParams's doc comment -- same type, TXA side.
     pub eq: EqualizerParams,
+    /// WDSP's Speech Processor (a baseband RF-clipper equivalent --
+    /// see TxProcessor's own compressor/CESSB update in process() for
+    /// the full story, including why `cessb_enabled` alone isn't
+    /// enough to actually engage CESSB).
+    pub compressor_enabled: bool,
+    /// Compression level in dB, fed straight to WDSP's
+    /// SetTXACompressorGain (which takes dB directly, unlike mic_gain's
+    /// linear convention above) -- [default = 3.0 dB] per the WDSP
+    /// Guide, kept as this project's own default too.
+    pub compressor_gain_db: f32,
+    /// CESSB (Controlled Envelope SSB) Overshoot Control -- see
+    /// process()'s update for why this only actually runs in WDSP
+    /// while compressor_enabled is also true.
+    pub cessb_enabled: bool,
 }
 
 impl Default for TxParams {
@@ -433,6 +447,9 @@ impl Default for TxParams {
             tune: false,
             two_tone: false,
             eq: EqualizerParams::default(),
+            compressor_enabled: false,
+            compressor_gain_db: 3.0,
+            cessb_enabled: false,
         }
     }
 }
@@ -449,6 +466,14 @@ struct TxProcessor {
     last_gain: Option<f32>,
     last_passband: Option<(f64, f64)>,
     last_eq: Option<EqualizerParams>,
+    /// (compressor_enabled, compressor_gain_db, cessb_enabled) as last
+    /// applied -- bundled as one tuple (not three separate last_*
+    /// fields) because the actually-applied osctrl Run state depends on
+    /// BOTH compressor_enabled and cessb_enabled together (see
+    /// process()'s update for why), so a compressor_enabled-only change
+    /// still has to re-evaluate/re-send osctrl even though cessb_enabled
+    /// itself didn't change -- same reasoning as last_post_gen below.
+    last_compressor: Option<(bool, f32, bool)>,
     /// (tune, two_tone) as last applied to WDSP's PostGen -- see
     /// process()'s PostGen update for why these are tracked together.
     last_post_gen: Option<(bool, bool)>,
@@ -763,6 +788,11 @@ impl TxProcessor {
             wdsp::SetTXAFMDeviation(channel, 2500.0);
             wdsp::SetTXAAMCarrierLevel(channel, 0.5);
 
+            // Inert startup state, matching every other TXA stage's
+            // pattern in this function -- process()'s compressor/CESSB
+            // update (see last_compressor's own doc comment) takes over
+            // and applies the real TxParams-driven values from the
+            // first chunk onward.
             wdsp::SetTXACompressorGain(channel, 0.0);
             wdsp::SetTXACompressorRun(channel, 0);
 
@@ -833,6 +863,7 @@ impl TxProcessor {
             last_gain: None,
             last_passband: Some(default_passband),
             last_eq: None,
+            last_compressor: None,
             last_post_gen: None,
             last_ps_mox: None,
             ps_ratio_baseline: None,
@@ -878,6 +909,9 @@ impl TxProcessor {
         tune: bool,
         two_tone: bool,
         eq: EqualizerParams,
+        compressor_enabled: bool,
+        compressor_gain_db: f32,
+        cessb_enabled: bool,
     ) -> (Vec<f32>, c_int) {
         debug_assert_eq!(mic_samples.len(), TX_BUFFER_SIZE);
 
@@ -1042,6 +1076,60 @@ impl TxProcessor {
                 wdsp::SetTXAEQRun(self.channel, eq.enabled as c_int);
             }
             self.last_eq = Some(eq);
+        }
+
+        // Speech Processor (compressor) + CESSB Overshoot Control.
+        // WDSP's own xtxa() processing order (TXA.c) runs the
+        // compressor, then osctrl right after it, on the SAME signal --
+        // and the WDSP Guide is explicit that "it is the responsibility
+        // of the console application to ensure that the Speech
+        // Processor is turned ON as a prerequisite for this block! This
+        // block will NOT operate properly in the absence of the Speech
+        // Processor also being active!" (CESSB Overshoot Control
+        // section). Matches the reference console's own behavior
+        // exactly (Thetis's chkCPDR_CheckedChanged/TXOsctrlOn): CESSB
+        // only actually reaches WDSP's Run call while the compressor is
+        // ALSO enabled, regardless of the CESSB checkbox's own state --
+        // so unchecking the compressor silently drops CESSB too rather
+        // than leaving it running against an inert compressor stage,
+        // and re-checking the compressor later does NOT silently
+        // resurrect CESSB on its own (effective_cessb is recomputed
+        // from both inputs every call, never latched).
+        //
+        // Gain is fed straight through in dB -- unlike mic_gain's linear
+        // SetTXAPanelGain1 convention above, SetTXACompressorGain's own
+        // parameter IS dB (confirmed in both the WDSP Guide and the
+        // reference console, which passes its dB slider value directly
+        // with no linear/dB conversion of its own).
+        //
+        // Linear Phase TX bandpass filters (recommended by the Guide
+        // "for optimum performance" with CESSB) are already this
+        // project's default -- see open()'s TXASetMP(channel, 0) call.
+        //
+        // Real request: force both off on DIGU/DIGL (see Mode::
+        // is_digital's own doc comment) regardless of the saved
+        // checkbox state -- compressing or CESSB-shaping a digital
+        // mode's precisely-encoded tone signal would corrupt exactly
+        // the amplitude/timing relationships those modes decode.
+        // Deliberately does NOT clear compressor_enabled/cessb_enabled
+        // themselves (those stay exactly as the user set them, still
+        // saved to config) -- only the WDSP-facing effective_* values
+        // are gated here, same "don't latch/clear, recompute every
+        // call" reasoning as effective_cessb's own dependency on the
+        // compressor above. Switching back to a voice mode later
+        // restores whatever was checked before, with no extra action
+        // needed.
+        let digital_mode = mode.is_digital();
+        let effective_compressor = compressor_enabled && !digital_mode;
+        let effective_cessb = cessb_enabled && effective_compressor;
+        let desired_compressor = (effective_compressor, compressor_gain_db, effective_cessb);
+        if self.last_compressor != Some(desired_compressor) {
+            unsafe {
+                wdsp::SetTXACompressorGain(self.channel, compressor_gain_db as f64);
+                wdsp::SetTXACompressorRun(self.channel, effective_compressor as c_int);
+                wdsp::SetTXAosctrlRun(self.channel, effective_cessb as c_int);
+            }
+            self.last_compressor = Some(desired_compressor);
         }
 
         // Confirmed against the reference: real mono mic sample in the
@@ -2105,7 +2193,18 @@ fn run(
 
         let p = *params.lock().unwrap();
         let (iq, exch_error) =
-            processor.process(&chunk, p.mode, p.mic_gain, p.width_hz, p.tune, p.two_tone, p.eq);
+            processor.process(
+                &chunk,
+                p.mode,
+                p.mic_gain,
+                p.width_hz,
+                p.tune,
+                p.two_tone,
+                p.eq,
+                p.compressor_enabled,
+                p.compressor_gain_db,
+                p.cessb_enabled,
+            );
 
         if exch_error != 0 {
             exch_errors_this_window += 1;
@@ -2440,6 +2539,32 @@ impl TxHandle {
     }
     pub fn set_eq(&self, eq: EqualizerParams) {
         self.params.lock().unwrap().eq = eq;
+    }
+
+    /// See TxParams::compressor_enabled's doc comment.
+    pub fn compressor_enabled(&self) -> bool {
+        self.params.lock().unwrap().compressor_enabled
+    }
+    pub fn set_compressor_enabled(&self, enabled: bool) {
+        self.params.lock().unwrap().compressor_enabled = enabled;
+    }
+
+    /// See TxParams::compressor_gain_db's doc comment.
+    pub fn compressor_gain_db(&self) -> f32 {
+        self.params.lock().unwrap().compressor_gain_db
+    }
+    pub fn set_compressor_gain_db(&self, gain_db: f32) {
+        self.params.lock().unwrap().compressor_gain_db = gain_db.clamp(0.0, 20.0);
+    }
+
+    /// See TxParams::cessb_enabled's doc comment -- note that setting
+    /// this alone doesn't guarantee CESSB actually runs in WDSP; see
+    /// TxProcessor::process's compressor/CESSB update for why.
+    pub fn cessb_enabled(&self) -> bool {
+        self.params.lock().unwrap().cessb_enabled
+    }
+    pub fn set_cessb_enabled(&self, enabled: bool) {
+        self.params.lock().unwrap().cessb_enabled = enabled;
     }
 
     pub fn set_ps_enabled(&self, enabled: bool) {

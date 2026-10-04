@@ -43,7 +43,8 @@ use midi::{
 };
 use radio::{
     IqSample, RadioSession, RadioSettings, CW_KEYER_MODE_IAMBIC_A, CW_KEYER_MODE_IAMBIC_B,
-    CW_KEYER_MODE_STRAIGHT, TX_AUDIO_SOURCE_AUTO, TX_AUDIO_SOURCE_LOCAL_MIC, TX_AUDIO_SOURCE_RADIO_MIC,
+    CW_KEYER_MODE_STRAIGHT, FILTER_BOARD_ALEX, FILTER_BOARD_APOLLO, FILTER_BOARD_CHARLY25, FILTER_BOARD_N2ADR,
+    FILTER_BOARD_NONE, TX_AUDIO_SOURCE_AUTO, TX_AUDIO_SOURCE_LOCAL_MIC, TX_AUDIO_SOURCE_RADIO_MIC,
 };
 use rigctl::RigctlServer;
 use spectrum::{SpectrumHandle, ALL_MODES};
@@ -317,6 +318,31 @@ pub struct OcMask {
     pub rx: u8,
     pub tx: u8,
 }
+
+/// Preset OC1-OC7 values for the N2ADR filter board, a 6-relay LPF board
+/// commonly paired with the Hermes-Lite 2 -- same (band name, mask)
+/// pairs as piHPSDR's own reference implementation (radio_menu.c's
+/// load_filters(), filter_board==N2ADR), confirmed bit-for-bit
+/// transferable since OcMask uses the identical "bits 0-6 = OC1-OC7"
+/// encoding (see OcMask's own doc comment). Bit 6 (value 64) is a
+/// shared "LPF board active" line ORed into every band except 160m,
+/// which uses OC1 alone; bits 1-5 then each select one of the board's
+/// remaining 5 relays, shared across adjacent band pairs (60m/40m,
+/// 30m/20m, 17m/15m, 12m/10m) that use the same physical filter
+/// section. Rx and Tx use the same mask per band on the real board (no
+/// separate Rx/Tx relay sets), matching the reference exactly.
+const N2ADR_OC_PRESET: [(&str, u8); 10] = [
+    ("160m", 1),
+    ("80m", 66),
+    ("60m", 68),
+    ("40m", 68),
+    ("30m", 72),
+    ("20m", 72),
+    ("17m", 80),
+    ("15m", 80),
+    ("12m", 96),
+    ("10m", 96),
+];
 
 /// Per-band Alex antenna port selection (0=ANT1, 1=ANT2, 2=ANT3), RX and
 /// TX independently -- same HashMap-by-name pattern as OcMask above,
@@ -1970,6 +1996,15 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
     if let Some(atten) = cfg.ps_tx_attenuation {
         settings.ps_tx_attenuation = atten;
     }
+    if let Some(fb) = cfg.filter_board {
+        settings.filter_board = fb;
+    }
+    if let Some(v) = cfg.charly25_preamp1 {
+        settings.charly25_preamp1 = v;
+    }
+    if let Some(v) = cfg.charly25_preamp2 {
+        settings.charly25_preamp2 = v;
+    }
     // See RadioSettings::rit_enabled's doc comment -- computed here
     // (rather than after RadioSession::start, where these were
     // previously read) so the shared atomics it seeds already match this
@@ -2236,6 +2271,20 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
             if let Some(v) = cfg.meter_calibration_db {
                 spectrum.set_meter_calibration_db(v);
             }
+            // Guarded on filter_board itself (not just whether these
+            // happen to be Some(true) in a saved config) -- see this
+            // click handler's own doc comment in the Open Collector tab
+            // for why a stale `true` here must never reach the meter/
+            // spectrum offset unless Charly25 is the board actually
+            // restored.
+            if cfg.filter_board == Some(FILTER_BOARD_CHARLY25) {
+                if let Some(v) = cfg.charly25_preamp1 {
+                    spectrum.set_charly25_preamp1(v);
+                }
+                if let Some(v) = cfg.charly25_preamp2 {
+                    spectrum.set_charly25_preamp2(v);
+                }
+            }
             if let Some(v) = cfg.noise_blanker {
                 spectrum.set_noise_blanker(v);
             }
@@ -2363,6 +2412,15 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                     tx_handle.set_ps_tx_delay_ns(ps_tx_delay_ns);
                     if let Some(v) = cfg.tx_eq {
                         tx_handle.set_eq(v);
+                    }
+                    if let Some(v) = cfg.tx_compressor_enabled {
+                        tx_handle.set_compressor_enabled(v);
+                    }
+                    if let Some(v) = cfg.tx_compressor_gain_db {
+                        tx_handle.set_compressor_gain_db(v);
+                    }
+                    if let Some(v) = cfg.tx_cessb_enabled {
+                        tx_handle.set_cessb_enabled(v);
                     }
                     // Apply a previously-saved correction table
                     // immediately, if PS is enabled and one exists for
@@ -7908,6 +7966,82 @@ impl eframe::App for HpsdrApp {
                                     }
                                     ui.add_space(8.0);
 
+                                    // Speech Processor (WDSP's baseband compressor) + CESSB
+                                    // Overshoot Control -- see tx::TxProcessor::process's own
+                                    // compressor/CESSB update comment for the full WDSP-Guide-
+                                    // sourced story on why CESSB is a sub-option of the
+                                    // compressor, not an independent toggle.
+                                    if let Some(tx) = connected.tx_handle.as_ref() {
+                                        // Real request: grey out (and force off in WDSP, see
+                                        // Mode::is_digital's doc comment) on DIGU/DIGL -- the
+                                        // checkboxes below still show/save whatever the user
+                                        // last set for voice modes, they just can't be
+                                        // interacted with (or take effect) while a digital
+                                        // mode is active.
+                                        let digital_mode = connected.spectrum.mode().is_digital();
+                                        let mut compressor_enabled = tx.compressor_enabled();
+                                        let compressor_resp = ui.add_enabled(
+                                            !digital_mode,
+                                            egui::Checkbox::new(&mut compressor_enabled, "Speech Processor"),
+                                        );
+                                        if digital_mode {
+                                            compressor_resp.on_hover_text(
+                                                "Disabled on DIGU/DIGL -- compressing a digital mode's \
+                                                 precisely-encoded tone signal would corrupt it, not \
+                                                 just change how it sounds. Switch to a voice mode to \
+                                                 use this.",
+                                            );
+                                        } else if compressor_resp
+                                            .on_hover_text(
+                                                "WDSP's baseband speech compressor -- the equivalent \
+                                                 of an RF speech clipper, raising average transmitted \
+                                                 power. Off by default.",
+                                            )
+                                            .changed()
+                                        {
+                                            tx.set_compressor_enabled(compressor_enabled);
+                                            settings_changed = true;
+                                        }
+                                        ui.add_enabled_ui(!digital_mode, |ui| {
+                                            ui.horizontal(|ui| {
+                                                ui.label("Compression:");
+                                                let mut gain_db = tx.compressor_gain_db();
+                                                if scroll_slider_f32(
+                                                    ui,
+                                                    &mut connected.slider_scroll_accum,
+                                                    &mut gain_db,
+                                                    0.0..=20.0,
+                                                    1.0,
+                                                ) {
+                                                    tx.set_compressor_gain_db(gain_db);
+                                                    settings_changed = true;
+                                                }
+                                                ui.label("dB");
+                                            });
+                                        });
+                                        let mut cessb_enabled = tx.cessb_enabled();
+                                        if ui
+                                            .add_enabled(
+                                                compressor_enabled && !digital_mode,
+                                                egui::Checkbox::new(&mut cessb_enabled, "CESSB Overshoot Control"),
+                                            )
+                                            .on_hover_text(if digital_mode {
+                                                "Disabled on DIGU/DIGL -- see Speech Processor above."
+                                            } else {
+                                                "Controlled Envelope SSB -- reduces the overshoot the \
+                                                 compressor above introduces, for extra average power \
+                                                 with minimal added distortion. Requires Speech \
+                                                 Processor to be on (per the WDSP Guide); has no effect \
+                                                 while it's off, even if checked here."
+                                            })
+                                            .changed()
+                                        {
+                                            tx.set_cessb_enabled(cessb_enabled);
+                                            settings_changed = true;
+                                        }
+                                    }
+                                    ui.add_space(8.0);
+
                                     // Standard (non-HermesLite) boards only -- see
                                     // radio::RadioSession::ps_tx_attenuation's doc comment. Despite
                                     // the internal name, this protects ADC0's front end from the
@@ -8414,6 +8548,151 @@ impl eframe::App for HpsdrApp {
                                          is OR'd into the current band's Tx outputs while the Tune \
                                          button is engaged.",
                                     );
+                                    ui.add_space(6.0);
+                                    // Filter Board selector -- see
+                                    // RadioSession::filter_board's doc
+                                    // comment. HermesLite/HermesLite2
+                                    // have their own separate "HL2+
+                                    // Audio Codec" addon concept
+                                    // (Settings -> Audio) and no Alex
+                                    // front end at all, so this whole
+                                    // selector (and everything it
+                                    // gates) is hidden there, same
+                                    // "standard boards only" gating as
+                                    // TX ADC0 Attenuation in the TX tab.
+                                    if !matches!(connected.device.board, Boards::HermesLite | Boards::HermesLite2) {
+                                        let current_fb = connected.session.filter_board.load(Ordering::Relaxed);
+                                        ui.label("Filter Board:");
+                                        ui.horizontal(|ui| {
+                                            for (value, label) in [
+                                                (FILTER_BOARD_NONE, "None"),
+                                                (FILTER_BOARD_ALEX, "Alex"),
+                                                (FILTER_BOARD_APOLLO, "Apollo"),
+                                                (FILTER_BOARD_CHARLY25, "Charly25"),
+                                                (FILTER_BOARD_N2ADR, "N2ADR"),
+                                            ] {
+                                                if ui.selectable_label(current_fb == value, label).clicked()
+                                                    && current_fb != value
+                                                {
+                                                    connected.session.filter_board.store(value, Ordering::Relaxed);
+                                                    // Matches piHPSDR's own n2adr_cb -> load_filters()
+                                                    // behavior exactly: selecting N2ADR immediately
+                                                    // fills in the preset, it isn't a separate manual
+                                                    // step there either.
+                                                    if value == FILTER_BOARD_N2ADR {
+                                                        for (name, mask) in N2ADR_OC_PRESET {
+                                                            connected
+                                                                .oc_settings
+                                                                .insert(name.to_string(), OcMask { rx: mask, tx: mask });
+                                                        }
+                                                    }
+                                                    // Leaving Charly25: force both preamp stages off
+                                                    // everywhere (wire bits AND the spectrum/meter
+                                                    // offset) rather than just hiding their checkboxes
+                                                    // -- otherwise a stage left checked would keep
+                                                    // silently applying its -18dB S-meter/spectrum
+                                                    // compensation (DemodParams::charly25_preamp1/2
+                                                    // don't know about filter_board at all, see that
+                                                    // field's own doc comment) even after switching to
+                                                    // a board where it no longer makes sense.
+                                                    if current_fb == FILTER_BOARD_CHARLY25 && value != FILTER_BOARD_CHARLY25 {
+                                                        connected.session.charly25_preamp1.store(false, Ordering::Relaxed);
+                                                        connected.session.charly25_preamp2.store(false, Ordering::Relaxed);
+                                                        connected.spectrum.set_charly25_preamp1(false);
+                                                        connected.spectrum.set_charly25_preamp2(false);
+                                                    }
+                                                    settings_changed = true;
+                                                }
+                                            }
+                                        });
+                                        ui.weak(match current_fb {
+                                            FILTER_BOARD_ALEX => {
+                                                "Standard Hermes/Angelia/Orion/Orion2 front end -- \
+                                                 enables Alex's antenna/attenuation/bandpass register \
+                                                 (byte 59 on P2; P1 has no separate enable concept, \
+                                                 Alex's bits are always sent there regardless of this \
+                                                 setting). The default, matching this app's prior \
+                                                 behavior before this selector existed."
+                                            }
+                                            FILTER_BOARD_APOLLO => {
+                                                "Apollo PA/ATU combo -- enables its tuner-control bits \
+                                                 (P1 and P2). Note: matching piHPSDR exactly, this does \
+                                                 NOT also enable Alex's own register (P2 byte 59 stays \
+                                                 0) -- select Alex instead if you need Alex's antenna/\
+                                                 attenuation features and don't have an Apollo fitted."
+                                            }
+                                            FILTER_BOARD_CHARLY25 => {
+                                                "RedPitaya-based Charly25 front end (P1 only -- no P2 \
+                                                 support exists for this board in the reference either). \
+                                                 Repurposes two normally-unused ADC control bits as a \
+                                                 pair of +18dB preamp stages -- see the checkboxes below."
+                                            }
+                                            FILTER_BOARD_N2ADR => {
+                                                "N2ADR 6-relay LPF board, a common Hermes-Lite 2 add-on -- \
+                                                 just filled in (or re-fill below) the 10 ham-band OC rows \
+                                                 above with its relay values. No protocol-level enable \
+                                                 bit of its own (same as the reference)."
+                                            }
+                                            _ => {
+                                                "No filter/front-end addon board -- Alex's own register \
+                                                 (P2 byte 59) is NOT sent, for a plain Hermes/Metis board \
+                                                 with nothing fitted. P1 is unaffected either way (see \
+                                                 Alex's own note above)."
+                                            }
+                                        });
+                                        if current_fb == FILTER_BOARD_N2ADR {
+                                            if ui
+                                                .button("Re-apply N2ADR Filter Board preset")
+                                                .on_hover_text(
+                                                    "Fills in the 10 ham-band rows below with the N2ADR \
+                                                     LPF board's own OC1-OC7 relay values again -- \
+                                                     useful if you've since changed one by hand and want \
+                                                     to restore the defaults. Overwrites those 10 rows; \
+                                                     Gen, any XVTRs, and Tune are left untouched.",
+                                                )
+                                                .clicked()
+                                            {
+                                                for (name, mask) in N2ADR_OC_PRESET {
+                                                    connected.oc_settings.insert(name.to_string(), OcMask { rx: mask, tx: mask });
+                                                }
+                                                settings_changed = true;
+                                            }
+                                        }
+                                        if current_fb == FILTER_BOARD_CHARLY25 {
+                                            ui.add_space(4.0);
+                                            let mut p1 = connected.session.charly25_preamp1.load(Ordering::Relaxed);
+                                            if ui
+                                                .checkbox(&mut p1, "Preamp Stage 1 (+18dB)")
+                                                .on_hover_text(
+                                                    "Charly25's first repurposed gain stage (confirmed \
+                                                     against piHPSDR: LT2208_GAIN_ON, P1 command 4's C3 \
+                                                     byte). Automatically compensates the S-meter/\
+                                                     spectrum/waterfall by -18dB while on, so displayed \
+                                                     levels stay antenna-referenced.",
+                                                )
+                                                .changed()
+                                            {
+                                                connected.session.charly25_preamp1.store(p1, Ordering::Relaxed);
+                                                connected.spectrum.set_charly25_preamp1(p1);
+                                                settings_changed = true;
+                                            }
+                                            let mut p2 = connected.session.charly25_preamp2.load(Ordering::Relaxed);
+                                            if ui
+                                                .checkbox(&mut p2, "Preamp Stage 2 (+18dB)")
+                                                .on_hover_text(
+                                                    "Charly25's second repurposed gain stage (repurposes \
+                                                     the LT2208_DITHER_ON bit -- real ADC dithering isn't \
+                                                     implemented here, same as every other board). Same \
+                                                     automatic -18dB display compensation as Stage 1.",
+                                                )
+                                                .changed()
+                                            {
+                                                connected.session.charly25_preamp2.store(p2, Ordering::Relaxed);
+                                                connected.spectrum.set_charly25_preamp2(p2);
+                                                settings_changed = true;
+                                            }
+                                        }
+                                    }
                                     ui.add_space(6.0);
                                     // Every row emits exactly the same 15
                                     // cells (Band + 7 Rx + 7 Tx) so the
@@ -9349,6 +9628,9 @@ impl eframe::App for HpsdrApp {
                         rx_eq: Some(agc_params_now.eq),
                         mic_gain: Some(connected.mic_gain),
                         tx_eq: connected.tx_handle.as_ref().map(|t| t.eq()),
+                        tx_compressor_enabled: connected.tx_handle.as_ref().map(|t| t.compressor_enabled()),
+                        tx_compressor_gain_db: connected.tx_handle.as_ref().map(|t| t.compressor_gain_db()),
+                        tx_cessb_enabled: connected.tx_handle.as_ref().map(|t| t.cessb_enabled()),
                         tci_tx_gain: Some(connected.tci_tx_gain),
                         tx_power_watts: Some(connected.session.tx_power_watts.load(Ordering::Relaxed)),
                         cw_keyer_mode: Some(connected.session.cw_keyer.mode.load(Ordering::Relaxed)),
@@ -9465,6 +9747,9 @@ impl eframe::App for HpsdrApp {
                         active_xvtr: connected.active_xvtr.clone(),
                         oc_settings: connected.oc_settings.clone(),
                         oc_tune: connected.oc_tune,
+                        filter_board: Some(connected.session.filter_board.load(Ordering::Relaxed)),
+                        charly25_preamp1: Some(connected.session.charly25_preamp1.load(Ordering::Relaxed)),
+                        charly25_preamp2: Some(connected.session.charly25_preamp2.load(Ordering::Relaxed)),
                         antenna_settings: connected.antenna_settings.clone(),
                         midi_enabled: Some(connected.midi.enabled.load(Ordering::Relaxed)),
                         midi_device_name: connected.midi.device_name.lock().unwrap().clone(),

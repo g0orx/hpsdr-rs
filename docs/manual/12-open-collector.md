@@ -26,6 +26,46 @@ Unchecked means that output is off. There's no "leave alone" state -- every
 packet sent to the radio declares the full set of outputs that should be
 active right now.
 
+## Filter Board
+
+Above the OC table, on every board except HermesLite/HermesLite2 (which
+have their own separate "HL2+ Audio Codec" addon concept instead -- see
+Settings: Audio), a **Filter Board** selector declares which analog
+front-end/filter addon board is physically fitted: **None**, **Alex**,
+**Apollo**, **Charly25**, or **N2ADR** -- matching piHPSDR's own
+`filter_board` setting.
+
+- **Alex** (the default, matching this app's behavior before this selector
+  existed) -- the standard Hermes/Angelia/Orion/Orion2 front end. Enables
+  Alex's antenna/attenuation/bandpass register.
+- **Apollo** -- the Apollo PA/ATU combo. Enables its tuner-control bits.
+  Matching piHPSDR exactly, this does *not* also enable Alex's own
+  register -- select Alex instead if you don't have an Apollo fitted.
+- **Charly25** -- a RedPitaya-based front end (P1 only). Selecting it
+  reveals two extra checkboxes:
+  - **Preamp Stage 1 (+18dB)** and **Preamp Stage 2 (+18dB)** -- Charly25
+    repurposes two normally-unused ADC control bits as a pair of +18dB
+    gain stages. The S-meter, spectrum, and waterfall are automatically
+    compensated by -18dB per active stage, so displayed levels stay
+    antenna-referenced regardless of which stages are switched in.
+- **N2ADR** -- see below.
+- **None** -- no addon board at all. Alex's own register is not sent, for
+  a plain Hermes/Metis board with nothing fitted.
+
+Changing this takes effect live, no reconnect needed.
+
+### N2ADR filter board preset
+
+Selecting **N2ADR** immediately fills in the 10 ham-band rows below with
+the N2ADR LPF board's own OC1-OC7 relay values -- a common Hermes-Lite 2
+add-on, matching piHPSDR's own N2ADR filter-board preset exactly (including
+applying it the moment you select it, not as a separate step). A
+**Re-apply N2ADR Filter Board preset** button appears while N2ADR is
+selected, in case you've since changed one of those rows by hand and want
+to restore the defaults. Either way, this overwrites those 10 rows only --
+Gen, any XVTRs, and Tune are left untouched, and you can still adjust
+individual checkboxes afterward if your wiring differs.
+
 ## Which band applies
 
 Whichever band the primary receiver's real hardware frequency (or, if a
@@ -36,11 +76,18 @@ windows don't have their own Open Collector settings.
 
 ## Limitations
 
-- This feature has not been verified against real Open-Collector-driven
-  relays/filters -- check with a meter or by ear (relay click) before
-  relying on it for anything that could be damaged by the wrong filter path
-  being selected, same as any other new hardware-control feature in this
-  project.
+- **N2ADR confirmed working** on a real Hermes-Lite 2 with an N2ADR filter
+  board fitted. **Alex confirmed working** on a real plain Alex-equipped
+  board too.
+- The rest of this feature has not been verified against real Open-
+  Collector-driven relays/filters generally -- check with a meter or by ear
+  (relay click) before relying on it for anything that could be damaged by
+  the wrong filter path being selected.
+- The Filter Board selector's Apollo and Charly25 handling is ported
+  directly from piHPSDR's source (exact protocol bytes/bits), but not yet
+  confirmed against real Apollo or Charly25 hardware -- if you have either,
+  a real-world report (does the PA/tuner actually respond, do the preamp
+  stages and their S-meter compensation look right) would help confirm it.
 
 ## Settings: Antenna
 

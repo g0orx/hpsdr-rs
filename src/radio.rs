@@ -122,6 +122,24 @@ pub const TX_AUDIO_SOURCE_AUTO: u8 = 0;
 pub const TX_AUDIO_SOURCE_RADIO_MIC: u8 = 1;
 pub const TX_AUDIO_SOURCE_LOCAL_MIC: u8 = 2;
 
+/// Which analog front-end/filter addon board is physically fitted --
+/// same 5-way choice as piHPSDR's own `filter_board` (radio.h), values
+/// kept in the same order for easy cross-reference against that
+/// reference implementation, though nothing here depends on the actual
+/// numbers matching (this is never sent to the radio as-is, only used
+/// to decide which bits/bytes p1_build_packet/p2_general_packet set).
+/// Default (see RadioSession::filter_board's own doc comment) is ALEX,
+/// not NONE -- this project unconditionally enabled Alex's front-end
+/// register bits before this setting existed at all, so ALEX is the
+/// behavior-preserving default for every existing config; NONE is an
+/// explicit opt-out for a plain Hermes/Metis board with no Alex
+/// daughterboard fitted at all.
+pub const FILTER_BOARD_NONE: u8 = 0;
+pub const FILTER_BOARD_ALEX: u8 = 1;
+pub const FILTER_BOARD_APOLLO: u8 = 2;
+pub const FILTER_BOARD_CHARLY25: u8 = 3;
+pub const FILTER_BOARD_N2ADR: u8 = 4;
+
 /// Just an initial-capacity hint for the queue below (like the other
 /// constants here) -- the actual enforced drop-oldest bound is
 /// spectrum.rs's own AUDIO_BUFFER_CAPACITY (also 14,400, same value),
@@ -217,6 +235,13 @@ pub struct RadioSettings {
     /// Discover window's "RX-888 USB setup" and loaded from Config the
     /// same way ozy_firmware_path is.
     pub rx888_firmware_path: Option<String>,
+    /// Initial value for RadioSession::filter_board -- see that
+    /// field's doc comment.
+    pub filter_board: u8,
+    /// Initial values for RadioSession::charly25_preamp1/2 -- see
+    /// those fields' doc comments.
+    pub charly25_preamp1: bool,
+    pub charly25_preamp2: bool,
 }
 
 impl Default for RadioSettings {
@@ -252,6 +277,11 @@ impl Default for RadioSettings {
             ozy_firmware_path: None,
             ozy_fpga_path: None,
             rx888_firmware_path: None,
+            // See RadioSession::filter_board's doc comment -- ALEX is
+            // the behavior-preserving default.
+            filter_board: FILTER_BOARD_ALEX,
+            charly25_preamp1: false,
+            charly25_preamp2: false,
         }
     }
 }
@@ -966,6 +996,23 @@ pub struct RadioSession {
     /// different, unambiguous bit layout regardless of this setting --
     /// see is_orion2's doc comment at each of those call sites.
     pub new_pa_board: Arc<AtomicBool>,
+    /// Live selector (Settings -> Open Collector) for which analog
+    /// front-end/filter addon board is physically fitted -- one of the
+    /// FILTER_BOARD_* constants above, matching piHPSDR's own
+    /// `filter_board` setting (radio_menu.c) in spirit. Currently only
+    /// ALEX's/APOLLO's front-end register-enable bits (p1_build_packet/
+    /// p2_general_packet) are gated on this; N2ADR is a one-shot OC-mask
+    /// preset applied from the UI, not something read per-packet at all
+    /// (see main.rs's N2ADR_OC_PRESET).
+    pub filter_board: Arc<AtomicU8>,
+    /// Charly25's first repurposed +18dB gain stage (LT2208_GAIN_ON) --
+    /// see p1_build_packet's own doc comment on its identically-named
+    /// param. Only meaningful when filter_board ==
+    /// FILTER_BOARD_CHARLY25, and only on P1 (no P2 equivalent exists).
+    pub charly25_preamp1: Arc<AtomicBool>,
+    /// Charly25's second repurposed +18dB gain stage (repurposes
+    /// LT2208_DITHER_ON) -- see p1_build_packet's own doc comment.
+    pub charly25_preamp2: Arc<AtomicBool>,
     /// Desired TX output power in watts, converted to each protocol's
     /// actual drive byte via drive_byte_for_watts -- see that
     /// function's doc comment. Confirmed by the user to belong at byte
@@ -1212,6 +1259,12 @@ impl RadioSession {
         // See RadioSession::hl2_ak4951_codec's doc comment.
         let hl2_ak4951_codec = Arc::new(AtomicBool::new(false));
         let new_pa_board = Arc::new(AtomicBool::new(false));
+        // See RadioSession::filter_board/charly25_preamp1/2's doc
+        // comments -- seeded from Config via RadioSettings, same
+        // pattern as rx_attenuation just above this whole block.
+        let filter_board = Arc::new(AtomicU8::new(settings.filter_board));
+        let charly25_preamp1 = Arc::new(AtomicBool::new(settings.charly25_preamp1));
+        let charly25_preamp2 = Arc::new(AtomicBool::new(settings.charly25_preamp2));
         let radio_mic_audio = Arc::new(Mutex::new(VecDeque::with_capacity(RADIO_MIC_AUDIO_CAPACITY)));
         let tx_audio_source = Arc::new(AtomicU8::new(TX_AUDIO_SOURCE_AUTO));
         let tci_wants_mic = Arc::new(AtomicBool::new(false));
@@ -1247,7 +1300,7 @@ impl RadioSession {
                 ps_tx_attenuation, mox, tx_iq, tci_tx_audio, tci_tx_gain, tx_power_watts, cw_keyer, cw_mode_active, pa_gain_db,
                 tx_forward_power, tx_reverse_power, adc0_overload, cw_ptt_active, cw_paddle_contacts, adc1_overload,
                 tx_fifo_underrun, tx_fifo_overrun, ps_rx_feedback_iq, ps_tx_feedback_iq,
-                rx_audio_to_radio, send_rx_audio_to_radio, hl2_ak4951_codec, new_pa_board, radio_mic_audio, tx_audio_source,
+                rx_audio_to_radio, send_rx_audio_to_radio, hl2_ak4951_codec, new_pa_board, filter_board, charly25_preamp1, charly25_preamp2, radio_mic_audio, tx_audio_source,
                 tci_wants_mic, mic_ptt_enabled, mic_bias_enabled, mic_ptt_on_tip,
                 diversity_enabled, diversity_gain_db, diversity_phase_deg, diversity_main_raw_iq,
                 puresignal_enabled,
@@ -1258,7 +1311,7 @@ impl RadioSession {
                 ps_tx_attenuation, mox, tx_iq, tci_tx_audio, tci_tx_gain, tx_power_watts, cw_keyer, cw_mode_active, pa_gain_db,
                 tx_forward_power, tx_reverse_power, adc0_overload, cw_ptt_active, cw_paddle_contacts, adc1_overload,
                 tx_fifo_underrun, tx_fifo_overrun, ps_rx_feedback_iq, ps_tx_feedback_iq,
-                rx_audio_to_radio, send_rx_audio_to_radio, hl2_ak4951_codec, new_pa_board, radio_mic_audio, tx_audio_source,
+                rx_audio_to_radio, send_rx_audio_to_radio, hl2_ak4951_codec, new_pa_board, filter_board, charly25_preamp1, charly25_preamp2, radio_mic_audio, tx_audio_source,
                 tci_wants_mic, mic_ptt_enabled, mic_bias_enabled, mic_ptt_on_tip,
                 diversity_enabled, diversity_gain_db, diversity_phase_deg, diversity_main_raw_iq,
                 puresignal_enabled,
@@ -1270,7 +1323,7 @@ impl RadioSession {
                 ps_tx_attenuation, mox, tx_iq, tci_tx_audio, tci_tx_gain, tx_power_watts, cw_keyer, cw_mode_active, pa_gain_db,
                 tx_forward_power, tx_reverse_power, adc0_overload, cw_ptt_active, cw_paddle_contacts, adc1_overload,
                 tx_fifo_underrun, tx_fifo_overrun, ps_rx_feedback_iq, ps_tx_feedback_iq,
-                rx_audio_to_radio, send_rx_audio_to_radio, hl2_ak4951_codec, new_pa_board, radio_mic_audio, tx_audio_source,
+                rx_audio_to_radio, send_rx_audio_to_radio, hl2_ak4951_codec, new_pa_board, filter_board, charly25_preamp1, charly25_preamp2, radio_mic_audio, tx_audio_source,
                 tci_wants_mic, mic_ptt_enabled, mic_bias_enabled, mic_ptt_on_tip,
                 diversity_enabled, diversity_gain_db, diversity_phase_deg, diversity_main_raw_iq,
                 puresignal_enabled,
@@ -1280,7 +1333,7 @@ impl RadioSession {
                 ps_tx_attenuation, mox, tx_iq, tci_tx_audio, tci_tx_gain, tx_power_watts, cw_keyer, cw_mode_active, pa_gain_db,
                 tx_forward_power, tx_reverse_power, adc0_overload, cw_ptt_active, cw_paddle_contacts, adc1_overload,
                 tx_fifo_underrun, tx_fifo_overrun, ps_rx_feedback_iq, ps_tx_feedback_iq,
-                rx_audio_to_radio, send_rx_audio_to_radio, hl2_ak4951_codec, new_pa_board, radio_mic_audio, tx_audio_source,
+                rx_audio_to_radio, send_rx_audio_to_radio, hl2_ak4951_codec, new_pa_board, filter_board, charly25_preamp1, charly25_preamp2, radio_mic_audio, tx_audio_source,
                 tci_wants_mic, mic_ptt_enabled, mic_bias_enabled, mic_ptt_on_tip,
                 diversity_enabled, diversity_gain_db, diversity_phase_deg, diversity_main_raw_iq,
                 puresignal_enabled,
@@ -1607,6 +1660,14 @@ fn start_protocol1(
     hl2_ak4951_codec: Arc<AtomicBool>,
     // See RadioSession::new_pa_board's doc comment.
     new_pa_board: Arc<AtomicBool>,
+    // See RadioSession::filter_board's doc comment.
+    filter_board: Arc<AtomicU8>,
+    // See p1_build_packet's identically-named params' doc comments --
+    // only meaningful on P1 (start_protocol1), stored/threaded through
+    // unused elsewhere so RadioSession's own field is always populated
+    // regardless of board/protocol.
+    charly25_preamp1: Arc<AtomicBool>,
+    charly25_preamp2: Arc<AtomicBool>,
     radio_mic_audio: Arc<Mutex<VecDeque<f32>>>,
     tx_audio_source: Arc<AtomicU8>,
     tci_wants_mic: Arc<AtomicBool>,
@@ -1800,6 +1861,9 @@ fn start_protocol1(
     let sender_mic_ptt_enabled = Arc::clone(&mic_ptt_enabled);
     let sender_mic_bias_enabled = Arc::clone(&mic_bias_enabled);
     let sender_mic_ptt_on_tip = Arc::clone(&mic_ptt_on_tip);
+    let sender_filter_board = Arc::clone(&filter_board);
+    let sender_charly25_preamp1 = Arc::clone(&charly25_preamp1);
+    let sender_charly25_preamp2 = Arc::clone(&charly25_preamp2);
     let sender_adc = Arc::clone(&adc);
     let sender_extra_adcs = extra_adcs.clone();
     // Live -- see RadioSession::diversity_enabled's doc comment.
@@ -1845,6 +1909,9 @@ fn start_protocol1(
             sender_mic_ptt_enabled,
             sender_mic_bias_enabled,
             sender_mic_ptt_on_tip,
+            sender_filter_board,
+            sender_charly25_preamp1,
+            sender_charly25_preamp2,
             sender_stop,
         );
     });
@@ -1929,6 +1996,9 @@ fn start_protocol1(
         send_rx_audio_to_radio,
         hl2_ak4951_codec,
         new_pa_board,
+        filter_board,
+        charly25_preamp1,
+        charly25_preamp2,
         radio_mic_audio,
         tx_audio_source,
         tci_wants_mic,
@@ -2033,6 +2103,14 @@ fn start_protocol1_ozy_usb(
     hl2_ak4951_codec: Arc<AtomicBool>,
     // See RadioSession::new_pa_board's doc comment.
     new_pa_board: Arc<AtomicBool>,
+    // See RadioSession::filter_board's doc comment.
+    filter_board: Arc<AtomicU8>,
+    // See p1_build_packet's identically-named params' doc comments --
+    // only meaningful on P1 (start_protocol1), stored/threaded through
+    // unused elsewhere so RadioSession's own field is always populated
+    // regardless of board/protocol.
+    charly25_preamp1: Arc<AtomicBool>,
+    charly25_preamp2: Arc<AtomicBool>,
     radio_mic_audio: Arc<Mutex<VecDeque<f32>>>,
     tx_audio_source: Arc<AtomicU8>,
     tci_wants_mic: Arc<AtomicBool>,
@@ -2236,6 +2314,9 @@ fn start_protocol1_ozy_usb(
         send_rx_audio_to_radio,
         hl2_ak4951_codec,
         new_pa_board,
+        filter_board,
+        charly25_preamp1,
+        charly25_preamp2,
         radio_mic_audio,
         tx_audio_source,
         tci_wants_mic,
@@ -2334,6 +2415,14 @@ fn start_rx888_usb(
     send_rx_audio_to_radio: Arc<AtomicBool>,
     hl2_ak4951_codec: Arc<AtomicBool>,
     new_pa_board: Arc<AtomicBool>,
+    // See RadioSession::filter_board's doc comment.
+    filter_board: Arc<AtomicU8>,
+    // See p1_build_packet's identically-named params' doc comments --
+    // only meaningful on P1 (start_protocol1), stored/threaded through
+    // unused elsewhere so RadioSession's own field is always populated
+    // regardless of board/protocol.
+    charly25_preamp1: Arc<AtomicBool>,
+    charly25_preamp2: Arc<AtomicBool>,
     radio_mic_audio: Arc<Mutex<VecDeque<f32>>>,
     tx_audio_source: Arc<AtomicU8>,
     tci_wants_mic: Arc<AtomicBool>,
@@ -2480,6 +2569,9 @@ fn start_rx888_usb(
         send_rx_audio_to_radio,
         hl2_ak4951_codec,
         new_pa_board,
+        filter_board,
+        charly25_preamp1,
+        charly25_preamp2,
         radio_mic_audio,
         tx_audio_source,
         tci_wants_mic,
@@ -3175,6 +3267,9 @@ fn p1_send_preconfig_and_start(
             is_hermes_lite,
             false, // hl2_ak4951_codec: irrelevant this early -- no RX audio flows until sender_loop takes over, whose live value applies to every subsequent packet
             false, // disable_pa: nothing to key yet this early -- sender_loop's live value takes over immediately after
+            FILTER_BOARD_NONE, // filter_board: irrelevant this early, no Apollo/Charly25 bits possible before mox/preamp exist
+            false, // charly25_preamp1: irrelevant this early, same reasoning
+            false, // charly25_preamp2: irrelevant this early, same reasoning
             false, // tune_active: never during startup config, nothing keyed yet
             CwKeyerValues { mode: 0, speed_wpm: 0, weight: 0, sidetone_volume: 0, sidetone_freq_hz: 0, hang_time_ms: 0 }, // cw_keyer: irrelevant while cw_mode_active is false below
             false, // cw_mode_active: never during startup config, nothing keyed yet
@@ -3285,6 +3380,25 @@ fn p1_build_packet(
     // here.
     hl2_ak4951_codec: bool,
     disable_pa: bool,
+    // See RadioSession::filter_board's doc comment. Only consulted for
+    // command 3's C2 byte below (Apollo's tuner-enable bits) and
+    // command 4's C3 byte (Charly25's repurposed LT2208_GAIN_ON bit,
+    // gated additionally on charly25_preamp1) -- confirmed against
+    // piHPSDR's old_protocol.c (filter_board==APOLLO/CHARLY25 branches
+    // at those exact two commands; P1 has no "Alex enable" concept at
+    // all, Alex's own antenna/attenuation bits elsewhere in this
+    // function are sent unconditionally regardless of this value).
+    filter_board: u8,
+    // See ConnectedState's own Charly25 doc comment in main.rs --
+    // Charly25 repurposes the normal preamp/dither wire bits as two
+    // cascaded +18dB gain stages; this is the first of those two
+    // (LT2208_GAIN_ON, command 4's C3 byte). Ignored unless
+    // filter_board == FILTER_BOARD_CHARLY25.
+    charly25_preamp1: bool,
+    // Second Charly25 stage -- see this function's own C3-byte doc
+    // comment (command 4) for why this repurposes LT2208_DITHER_ON
+    // (0x08) rather than a generic dither setting.
+    charly25_preamp2: bool,
     // See RadioSession::tune_active's doc comment. HermesLite2-only
     // (see this function's own HermesLite2 branch below) -- ignored
     // entirely for every other board.
@@ -3585,6 +3699,20 @@ fn p1_build_packet(
                     c2 |= 0x10;
                 }
                 (c2, 0x00, 0x00)
+            } else if filter_board == FILTER_BOARD_APOLLO {
+                // Confirmed against piHPSDR's old_protocol.c (command
+                // 0x12's C2 byte): 0x2C is sent unconditionally once
+                // Apollo is selected (bits 2/3/5 -- enables the Apollo
+                // PA/ATU combo's own control logic), with bit 4 (0x10)
+                // additionally ORed in only while Tune is active. Not
+                // gated on mox_on -- matches the reference exactly,
+                // same "persistent enable, not per-transmission" shape
+                // as HL2's PA-enable bit just above.
+                let mut c2 = 0x2C;
+                if tune_active {
+                    c2 |= 0x10;
+                }
+                (c2, 0x00, 0x00)
             } else {
                 (0x00, 0x00, 0x00)
             };
@@ -3668,7 +3796,37 @@ fn p1_build_packet(
             // 0x08 -- otherwise a real ADC dither-generator control this
             // project doesn't implement) as its own "codec present"
             // flag, ported directly from deskhpsdr's old_protocol.c.
-            let c3: u8 = if is_hermes_lite && hl2_ak4951_codec { 0x08 } else { 0x00 };
+            let mut c3: u8 = if is_hermes_lite && hl2_ak4951_codec { 0x08 } else { 0x00 };
+            // Charly25 (a RedPitaya-based board, unrelated to
+            // HermesLite): confirmed against piHPSDR's old_protocol.c
+            // -- `LT2208_GAIN_ON` (0x04) is ORed into this same C3 byte
+            // whenever Charly25 is selected AND its first preamp stage
+            // is on, gated there on `active_receiver->preamp`. This
+            // project has no generic per-receiver preamp concept, so
+            // charly25_preamp1 (Settings -> Open Collector, only shown
+            // for this board) stands in for that same check -- see
+            // ConnectedState's own Charly25 doc comment in main.rs for
+            // why this project repurposes it as a dedicated Charly25
+            // control rather than inventing a generic preamp toggle no
+            // other board here currently uses.
+            if filter_board == FILTER_BOARD_CHARLY25 && charly25_preamp1 {
+                c3 |= 0x04;
+            }
+            // Second Charly25 stage: piHPSDR drives this off the SAME
+            // `active_receiver->dither` flag/LT2208_DITHER_ON bit every
+            // board sends unconditionally when dither is on (no
+            // filter_board gate on their side at all) -- on real
+            // Charly25 hardware that GPIO line is simply wired to a
+            // second +18dB preamp stage instead of real ADC dithering.
+            // Since this project has no generic dither bit to repurpose
+            // (0x08 above is reserved for hl2_ak4951_codec's unrelated
+            // "codec present" flag, and the two boards can't be
+            // selected simultaneously), gate this directly on
+            // charly25_preamp2 instead of a nonexistent generic dither
+            // setting.
+            if filter_board == FILTER_BOARD_CHARLY25 && charly25_preamp2 {
+                c3 |= 0x08;
+            }
             (0x14, c1, 0x00, c3, c4)
         }
         5 => {
@@ -4038,6 +4196,11 @@ fn sender_loop(
     mic_ptt_enabled: Arc<AtomicBool>,
     mic_bias_enabled: Arc<AtomicBool>,
     mic_ptt_on_tip: Arc<AtomicBool>,
+    // See RadioSession::filter_board's doc comment.
+    filter_board: Arc<AtomicU8>,
+    // See p1_build_packet's identically-named param's doc comment.
+    charly25_preamp1: Arc<AtomicBool>,
+    charly25_preamp2: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
 ) {
     let mut seq: u32 = 0;
@@ -4255,6 +4418,9 @@ fn sender_loop(
             is_hermes_lite,
             hl2_ak4951_codec_on,
             disable_pa.load(Ordering::Relaxed),
+            filter_board.load(Ordering::Relaxed),
+            charly25_preamp1.load(Ordering::Relaxed),
+            charly25_preamp2.load(Ordering::Relaxed),
             tune_active.load(Ordering::Relaxed),
             CwKeyerValues::load(&cw_keyer),
             cw_mode_active.load(Ordering::Relaxed),
@@ -4655,6 +4821,9 @@ fn ozy_sender_loop(
             false, // is_hermes_lite -- Ozy is never a HermesLite-family board
             false, // hl2_ak4951_codec -- irrelevant when is_hermes_lite is false above
             disable_pa.load(Ordering::Relaxed),
+            FILTER_BOARD_NONE, // filter_board -- Ozy predates Alex/Apollo/Charly25 entirely, same reasoning as new_pa_board above
+            false, // charly25_preamp1 -- irrelevant when filter_board is forced to NONE above
+            false, // charly25_preamp2 -- same reasoning
             false, // tune_active -- irrelevant when is_hermes_lite is false above
             CwKeyerValues::load(&cw_keyer),
             // cw_mode_active: classic Ozy/Mercury/Penny hardware is a
@@ -5261,6 +5430,14 @@ fn start_protocol2(
     hl2_ak4951_codec: Arc<AtomicBool>,
     // See RadioSession::new_pa_board's doc comment.
     new_pa_board: Arc<AtomicBool>,
+    // See RadioSession::filter_board's doc comment.
+    filter_board: Arc<AtomicU8>,
+    // See p1_build_packet's identically-named params' doc comments --
+    // only meaningful on P1 (start_protocol1), stored/threaded through
+    // unused elsewhere so RadioSession's own field is always populated
+    // regardless of board/protocol.
+    charly25_preamp1: Arc<AtomicBool>,
+    charly25_preamp2: Arc<AtomicBool>,
     radio_mic_audio: Arc<Mutex<VecDeque<f32>>>,
     tx_audio_source: Arc<AtomicU8>,
     tci_wants_mic: Arc<AtomicBool>,
@@ -5411,6 +5588,7 @@ fn start_protocol2(
     let sender_mic_ptt_enabled = Arc::clone(&mic_ptt_enabled);
     let sender_mic_bias_enabled = Arc::clone(&mic_bias_enabled);
     let sender_mic_ptt_on_tip = Arc::clone(&mic_ptt_on_tip);
+    let sender_filter_board = Arc::clone(&filter_board);
     let num_adcs = device.adcs;
     let is_orion2 = device.board == Boards::Orion2;
     // Live -- see RadioSession::diversity_enabled's doc comment.
@@ -5449,6 +5627,7 @@ fn start_protocol2(
             sender_mic_ptt_enabled,
             sender_mic_bias_enabled,
             sender_mic_ptt_on_tip,
+            sender_filter_board,
             sender_diversity_enabled,
             sender_stop,
         );
@@ -5565,6 +5744,9 @@ fn start_protocol2(
         send_rx_audio_to_radio,
         hl2_ak4951_codec,
         new_pa_board,
+        filter_board,
+        charly25_preamp1,
+        charly25_preamp2,
         radio_mic_audio,
         tx_audio_source,
         tci_wants_mic,
@@ -5621,7 +5803,7 @@ fn start_protocol2(
 // byte-for-byte, yet the radio never transitions" perfectly.
 const P2_GENERAL_PACKET_SIZE: usize = 60;
 
-fn p2_general_packet(seq: u32, num_adcs: u8, disable_pa: bool) -> [u8; P2_GENERAL_PACKET_SIZE] {
+fn p2_general_packet(seq: u32, num_adcs: u8, disable_pa: bool, filter_board: u8) -> [u8; P2_GENERAL_PACKET_SIZE] {
     let mut p = [0u8; P2_GENERAL_PACKET_SIZE];
     p[0..4].copy_from_slice(&seq.to_be_bytes());
     p[4] = 0x00; // General packet command
@@ -5640,7 +5822,26 @@ fn p2_general_packet(seq: u32, num_adcs: u8, disable_pa: bool) -> [u8; P2_GENERA
     // (new_protocol.c), so a transverter's low-level IF input never sees
     // the internal PA turned on.
     p[58] = if disable_pa { 0x00 } else { 0x01 };
-    p[59] = if num_adcs == 2 { 0x03 } else { 0x01 }; // enable Alex0 (+ Alex1 if this board has 2 ADCs)
+    // ROOT CAUSE FIX (2026-10-02): this was unconditional -- byte 59
+    // (Alex0/Alex1 enable) was sent as if filter_board was ALWAYS ALEX,
+    // regardless of what's actually fitted. Confirmed against piHPSDR's
+    // new_protocol.c: this byte is explicitly 0 (the buffer's own
+    // memset default) for every filter_board value except ALEX -- not
+    // even APOLLO sets it, so this project's default (see
+    // RadioSession::filter_board's doc comment) keeps every existing
+    // Alex-equipped setup's exact prior wire behavior, while a plain
+    // Hermes/Metis board with nothing fitted can now genuinely select
+    // None and stop sending it.
+    if filter_board == FILTER_BOARD_ALEX {
+        p[59] = if num_adcs == 2 { 0x03 } else { 0x01 }; // enable Alex0 (+ Alex1 if this board has 2 ADCs)
+    }
+    // Apollo's PA/tuner-enable bit -- ORed onto the SAME byte as the PA-
+    // enable bit above (0x01), confirmed against piHPSDR's
+    // new_protocol.c (`general_buffer[58]|=0x02`), unconditional once
+    // selected (not gated on mox/tune, unlike P1's equivalent bits).
+    if filter_board == FILTER_BOARD_APOLLO {
+        p[58] |= 0x02;
+    }
     p
 }
 
@@ -6341,6 +6542,15 @@ fn p2_sender_loop(
     mic_ptt_enabled: Arc<AtomicBool>,
     mic_bias_enabled: Arc<AtomicBool>,
     mic_ptt_on_tip: Arc<AtomicBool>,
+    // See RadioSession::filter_board's doc comment -- consulted by
+    // p2_general_packet for Alex0/Alex1's own enable bit (byte 59,
+    // ONLY sent when this is ALEX -- see that function's doc comment:
+    // confirmed via direct source inspection that piHPSDR leaves this
+    // byte at 0 for every other filter_board value, including APOLLO)
+    // and Apollo's tuner-enable bit (byte 58). No Charly25 case here --
+    // confirmed no P2-specific Charly25 behavior exists in the
+    // reference at all.
+    filter_board: Arc<AtomicU8>,
     // Diversity -- see RadioSession::diversity_enabled's doc comment.
     // Mutually exclusive with puresignal_enabled (enforced in main.rs's
     // Settings UI), so no interaction with that reserved-DDC scheme
@@ -6539,7 +6749,12 @@ fn p2_sender_loop(
         let rx_atten = (rx_attenuation.load(Ordering::Relaxed) as u8) & 0x1F;
 
         if due_for_keepalive {
-            let general = p2_general_packet(general_seq, num_adcs, disable_pa.load(Ordering::Relaxed));
+            let general = p2_general_packet(
+                general_seq,
+                num_adcs,
+                disable_pa.load(Ordering::Relaxed),
+                filter_board.load(Ordering::Relaxed),
+            );
             let ddc = p2_ddc_specific_packet(ddc_seq, &rates, &adcs, num_adcs, ps_mox_gate);
             let tx = p2_tx_specific_packet(
                 tx_seq,

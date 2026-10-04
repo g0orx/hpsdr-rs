@@ -73,6 +73,19 @@ pub enum Mode {
     Drm = 11,
 }
 
+impl Mode {
+    /// DIGU/DIGL -- used to force the Speech Processor/CESSB off (see
+    /// tx::TxProcessor::process's own compressor/CESSB update): a real
+    /// request, since compressing or CESSB-shaping an already-precisely-
+    /// tone-encoded digital-mode signal (FT8 and similar) would distort
+    /// exactly the amplitude/timing relationships those modes decode,
+    /// not just make TX audio "sound different" the way it does on
+    /// voice modes.
+    pub fn is_digital(self) -> bool {
+        matches!(self, Mode::Digu | Mode::Digl)
+    }
+}
+
 pub const ALL_MODES: [Mode; 12] = [
     Mode::Lsb,
     Mode::Usb,
@@ -495,6 +508,25 @@ pub struct DemodParams {
     /// against their own known reference exactly once, same real-world
     /// methodology as any other S-meter calibration.
     pub meter_calibration_db: f64,
+    /// Charly25's own two +18dB gain stages (see RadioSession::
+    /// charly25_preamp1/2's doc comments) -- confirmed against
+    /// piHPSDR's meter.c/rx_panadapter.c: both subtract a further 18dB
+    /// from the displayed level per active stage, ON TOP OF the normal
+    /// attenuation-based correction every board already gets, so the
+    /// S-meter/spectrum/waterfall read the true antenna-referenced
+    /// level regardless of which stage is switched in. Kept as its own
+    /// additive field rather than folded into meter_calibration_db
+    /// above so toggling a Charly25 stage never alters that slider's
+    /// own persisted, user-set value -- same "live-computed, never
+    /// written back into any saved calibration number" approach as the
+    /// reference itself (recomputed from the live checkboxes every
+    /// draw, never persisted as a combined number). Only ever set true
+    /// on the MAIN receiver (RadioSession::filter_board/charly25_*'s
+    /// own doc comments -- a board-wide ADC0 property, not a per-extra-
+    /// receiver one); every extra receiver's own DemodParams keeps
+    /// these false.
+    pub charly25_preamp1: bool,
+    pub charly25_preamp2: bool,
 }
 
 impl Default for DemodParams {
@@ -545,6 +577,8 @@ impl Default for DemodParams {
             zoom: 1,
             pan: 0.0,
             meter_calibration_db: 0.0,
+            charly25_preamp1: false,
+            charly25_preamp2: false,
         }
     }
 }
@@ -1637,6 +1671,13 @@ fn run(
         let params = *demod_params.lock().unwrap();
         analyzer.set_zoom_pan(params.zoom, params.pan, sample_rate);
 
+        // See DemodParams::charly25_preamp1/2's own doc comment --
+        // additive, independent of meter_calibration_db below. Computed
+        // once here since both the spectrum/waterfall correction below
+        // and the S-meter correction further down need the same value.
+        let charly25_offset_db =
+            -18.0 * (params.charly25_preamp1 as i32 + params.charly25_preamp2 as i32) as f64;
+
         let (spectrum, waterfall) = analyzer.feed(&chunk);
         if spectrum.is_some() || waterfall.is_some() {
             // Same correction as the S-meter (real request -- one
@@ -1646,7 +1687,7 @@ fn run(
             // readout (distinct from GetRXAMeter), so it needs this
             // applied here too, not just where meter_db is computed
             // below.
-            let cal = params.meter_calibration_db as f32;
+            let cal = (params.meter_calibration_db + charly25_offset_db) as f32;
             let mut d = display.lock().unwrap();
             if let Some(mut s) = spectrum {
                 if cal != 0.0 {
@@ -1673,7 +1714,7 @@ fn run(
         let passband = passband_for(params.mode, params.width_hz);
         let audio = analyzer.demod(&chunk, params, passband);
         // See DemodParams::meter_calibration_db's own doc comment.
-        let meter_db = analyzer.meter_db() + params.meter_calibration_db;
+        let meter_db = analyzer.meter_db() + params.meter_calibration_db + charly25_offset_db;
         display.lock().unwrap().meter_db = meter_db;
         let cw_mode = matches!(params.mode, Mode::Cwl | Mode::Cwu);
         let cw_active = cw_mode && cw_decode_enabled.load(Ordering::Relaxed);
@@ -2070,6 +2111,14 @@ impl SpectrumHandle {
     }
     pub fn set_meter_calibration_db(&self, v: f64) {
         self.demod_params.lock().unwrap().meter_calibration_db = v;
+    }
+
+    /// See DemodParams::charly25_preamp1/2's own doc comments.
+    pub fn set_charly25_preamp1(&self, v: bool) {
+        self.demod_params.lock().unwrap().charly25_preamp1 = v;
+    }
+    pub fn set_charly25_preamp2(&self, v: bool) {
+        self.demod_params.lock().unwrap().charly25_preamp2 = v;
     }
 
     pub fn noise_blanker(&self) -> NoiseBlanker {

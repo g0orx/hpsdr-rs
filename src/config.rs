@@ -162,6 +162,18 @@ pub struct Config {
     pub mic_gain: Option<f32>,
     /// TX graphic EQ -- see spectrum::EqualizerParams's doc comment.
     pub tx_eq: Option<EqualizerParams>,
+    /// Speech Processor (WDSP compressor) on/off -- see
+    /// tx::TxParams::compressor_enabled's doc comment.
+    #[serde(default)]
+    pub tx_compressor_enabled: Option<bool>,
+    /// Speech Processor compression level in dB -- see
+    /// tx::TxParams::compressor_gain_db's doc comment.
+    #[serde(default)]
+    pub tx_compressor_gain_db: Option<f32>,
+    /// CESSB Overshoot Control on/off -- see
+    /// tx::TxParams::cessb_enabled's doc comment.
+    #[serde(default)]
+    pub tx_cessb_enabled: Option<bool>,
     /// Gain applied specifically to TX audio received from a TCI
     /// client (WSJT-X, TCI Remote, etc.), independent of mic_gain
     /// above -- see radio::RadioSession::tci_tx_gain's doc comment for
@@ -461,6 +473,17 @@ pub struct Config {
     /// before this existed just load with no OC outputs configured.
     #[serde(default)]
     pub oc_settings: std::collections::HashMap<String, crate::OcMask>,
+    /// See radio::RadioSession::filter_board's doc comment. `None`
+    /// (a config saved before this existed) falls back to ALEX there,
+    /// not FILTER_BOARD_NONE's literal 0 -- see that default's own doc
+    /// comment for why.
+    #[serde(default)]
+    pub filter_board: Option<u8>,
+    /// See radio::RadioSession::charly25_preamp1/2's doc comments.
+    #[serde(default)]
+    pub charly25_preamp1: Option<bool>,
+    #[serde(default)]
+    pub charly25_preamp2: Option<bool>,
     /// Global Open Collector mask ORed into the active band's Tx mask
     /// while TUNE is active -- see main.rs's ConnectedState::oc_tune
     /// doc comment.

@@ -70,6 +70,23 @@ safety check. Takes effect immediately, no reconnect needed.
 > software PTT decision involved at all. This setting only covers
 > transmissions this application itself initiates.
 
+## Speech Processor
+
+WDSP's baseband speech compressor -- the equivalent of an RF speech
+clipper, raising average transmitted power. Off by default.
+
+**Compression** (0-20dB, default 3dB) sets the compression level in dB
+directly, applied live while the checkbox is on.
+
+## CESSB Overshoot Control
+
+Controlled Envelope SSB (CESSB): reduces the overshoot the Speech
+Processor's compression introduces, recovering extra average power with
+minimal added distortion. Requires **Speech Processor** to be on --
+this checkbox stays visible even while Speech Processor is off, but has
+no effect until it's turned on too, and greys out to make that
+dependency visible.
+
 ## Enable Transmit
 
 Arms (or disarms) the whole TX signal path -- microphone input, the TX DSP
