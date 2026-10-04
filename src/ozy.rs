@@ -187,11 +187,30 @@ fn open_interface() -> io::Result<Interface> {
         .into_iter()
         .find(|d| d.vendor_id() == VID && d.product_id() == PID)
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no Ozy device (fffe:0007) found on USB"))?;
-    let device = device_info.open().wait().map_err(io_err)?;
-    let interface = device.claim_interface(0).wait().map_err(io_err)?;
+    let device = device_info.open().wait().map_err(|e| {
+        eprintln!("ozy: device.open() failed: {e}");
+        io_err(e)
+    })?;
+    let interface = device.claim_interface(0).wait().map_err(|e| {
+        eprintln!("ozy: claim_interface(0) failed: {e}");
+        io_err(e)
+    })?;
     Ok(interface)
 }
 
+// Real report (2026-10-02, issue #8: "Ozy + Mercury: endpoint stalled
+// after FPGA load"): the only error that ever reached the user was the
+// generic "Failed to start radio: endpoint stalled", with no indication
+// of WHICH of this module's many control transfers (FX2 RAM load, FPGA
+// load, LED, firmware-version read, I2C read/write) actually failed --
+// and a release build printed nothing at all before that point (no
+// console output showing progress, confirmed by the reporter). Every
+// control transfer now logs its own request/value/index/length
+// unconditionally on failure (not gated behind a debug flag -- this
+// only runs once per connect attempt, never in a hot loop, so the
+// console cost is negligible), so the NEXT report from someone with
+// real Ozy+Mercury+Penny hardware pins down the exact failing step
+// instead of requiring another guess-and-rebuild round trip.
 fn control_out(interface: &Interface, request: u8, value: u16, index: u16, data: &[u8]) -> io::Result<()> {
     interface
         .control_out(
@@ -199,7 +218,14 @@ fn control_out(interface: &Interface, request: u8, value: u16, index: u16, data:
             IO_TIMEOUT,
         )
         .wait()
-        .map_err(io_err)?;
+        .map_err(|e| {
+            eprintln!(
+                "ozy: control OUT failed (request=0x{request:02x} value=0x{value:04x} \
+                 index=0x{index:04x} {} bytes): {e}",
+                data.len(),
+            );
+            io_err(e)
+        })?;
     Ok(())
 }
 
@@ -210,7 +236,13 @@ fn control_in(interface: &Interface, request: u8, value: u16, index: u16, length
             IO_TIMEOUT,
         )
         .wait()
-        .map_err(io_err)
+        .map_err(|e| {
+            eprintln!(
+                "ozy: control IN failed (request=0x{request:02x} value=0x{value:04x} \
+                 index=0x{index:04x} length={length}): {e}",
+            );
+            io_err(e)
+        })
 }
 
 /// Cypress FX2 "anchor download" RAM write, chunked at 64 bytes per
@@ -271,25 +303,38 @@ fn parse_hex_record(line: &str) -> io::Result<Option<(u16, Vec<u8>)>> {
 
 fn load_firmware(interface: &Interface, hex_path: &Path) -> io::Result<()> {
     let text = std::fs::read_to_string(hex_path)?;
+    eprintln!("ozy: loaded FX2 firmware file {} ({} lines)", hex_path.display(), text.lines().count());
+    let mut records = 0u32;
     for line in text.lines() {
         if line.is_empty() {
             continue;
         }
         match parse_hex_record(line)? {
-            Some((addr, data)) => write_ram(interface, addr, &data)?,
+            Some((addr, data)) => {
+                write_ram(interface, addr, &data)?;
+                records += 1;
+            }
             None => break, // EOF record
         }
     }
+    eprintln!("ozy: FX2 firmware RAM-loaded ({records} hex records written)");
     Ok(())
 }
 
 fn load_fpga(interface: &Interface, rbf_path: &Path) -> io::Result<()> {
     let bytes = std::fs::read(rbf_path)?;
+    eprintln!("ozy: loading FPGA bitstream {} ({} bytes)", rbf_path.display(), bytes.len());
     control_out(interface, VENDOR_REQ_FPGA_LOAD, 0, FL_BEGIN, &[])?;
-    for chunk in bytes.chunks(MAX_ANCHOR_CHUNK) {
-        control_out(interface, VENDOR_REQ_FPGA_LOAD, 0, FL_XFER, chunk)?;
+    let total_chunks = bytes.chunks(MAX_ANCHOR_CHUNK).count();
+    for (i, chunk) in bytes.chunks(MAX_ANCHOR_CHUNK).enumerate() {
+        control_out(interface, VENDOR_REQ_FPGA_LOAD, 0, FL_XFER, chunk).map_err(|e| {
+            eprintln!("ozy: FPGA load failed at chunk {}/{total_chunks}: {e}", i + 1);
+            e
+        })?;
     }
-    control_out(interface, VENDOR_REQ_FPGA_LOAD, 0, FL_END, &[])
+    control_out(interface, VENDOR_REQ_FPGA_LOAD, 0, FL_END, &[])?;
+    eprintln!("ozy: FPGA bitstream load complete ({total_chunks} chunks)");
+    Ok(())
 }
 
 fn set_led(interface: &Interface, which: u16, on: bool) -> io::Result<()> {
@@ -331,23 +376,43 @@ fn init_penny_codec(interface: &Interface) -> io::Result<()> {
     const TLV320_DATA: [u8; 16] =
         [0x1e, 0x00, 0x12, 0x01, 0x08, 0x15, 0x0c, 0x00, 0x0e, 0x02, 0x10, 0x00, 0x0a, 0x00, 0x00, 0x00];
     for i in (0..16).step_by(2) {
-        i2c_write(interface, I2C_PENNY_TLV320, &[TLV320_DATA[i], TLV320_DATA[i + 1]])?;
+        i2c_write(interface, I2C_PENNY_TLV320, &[TLV320_DATA[i], TLV320_DATA[i + 1]]).map_err(|e| {
+            eprintln!("ozy: Penny TLV320 codec write #{} failed: {e}", i / 2 + 1);
+            e
+        })?;
     }
+    eprintln!("ozy: Penny TLV320 codec initialised");
     Ok(())
 }
 
 fn read_firmware_versions(interface: &Interface, ozy_fx2: &str) -> io::Result<OzyVersions> {
     let mut versions = OzyVersions { ozy_fx2: ozy_fx2.to_string(), ..Default::default() };
+    eprintln!("ozy: FX2 firmware version string: {ozy_fx2:?}");
     // Mercury1's I2C read failing is fatal to the rest of this sequence
     // in the reference (it bails out entirely, on the assumption the
     // I2C SCL/SDA jumpers aren't fitted) -- matched here: propagate the
     // error rather than silently reporting "no boards found".
-    let merc1 = i2c_read(interface, I2C_MERC1_FW, 2)?;
+    let merc1 = i2c_read(interface, I2C_MERC1_FW, 2).map_err(|e| {
+        eprintln!(
+            "ozy: Mercury1 I2C firmware-version read failed (fatal -- assuming I2C SCL/SDA \
+             jumpers aren't fitted, same as the reference): {e}"
+        );
+        e
+    })?;
+    eprintln!("ozy: Mercury1 firmware version: {}", merc1[1]);
     versions.mercury[0] = Some(merc1[1]);
-    if let Ok(merc2) = i2c_read(interface, I2C_MERC2_FW, 2) {
-        versions.mercury[1] = Some(merc2[1]);
+    match i2c_read(interface, I2C_MERC2_FW, 2) {
+        Ok(merc2) => {
+            eprintln!("ozy: Mercury2 firmware version: {}", merc2[1]);
+            versions.mercury[1] = Some(merc2[1]);
+        }
+        Err(e) => eprintln!("ozy: Mercury2 I2C read failed (non-fatal, single-Mercury systems are expected to hit this): {e}"),
     }
-    let penny = i2c_read(interface, I2C_PENNY_FW, 2)?;
+    let penny = i2c_read(interface, I2C_PENNY_FW, 2).map_err(|e| {
+        eprintln!("ozy: Penny I2C firmware-version read failed: {e}");
+        e
+    })?;
+    eprintln!("ozy: Penny firmware version: {}", penny[1]);
     versions.penny = Some(penny[1]);
     init_penny_codec(interface)?;
     Ok(versions)
@@ -435,33 +500,71 @@ impl TxEndpoint {
 /// thread (which never touches the bulk endpoints) needs the
 /// `Interface` itself, for control transfers.
 pub fn initialise(hex_path: &Path, rbf_path: &Path) -> io::Result<(OzyDevice, RxEndpoint, TxEndpoint, OzyVersions)> {
+    eprintln!("ozy: initialise() starting -- opening device (fffe:0007) for FX2 firmware load");
     let interface = open_interface()?;
     reset_cpu(&interface, true)?;
+    eprintln!("ozy: FX2 CPU held in reset");
     load_firmware(&interface, hex_path)?;
     reset_cpu(&interface, false)?;
+    eprintln!("ozy: FX2 CPU reset released -- dropping interface, waiting 4s for USB re-enumeration");
     drop(interface);
     std::thread::sleep(Duration::from_secs(4));
 
+    eprintln!("ozy: re-opening device after FX2 re-enumeration, for FPGA load");
     let interface = open_interface()?;
     set_led(&interface, 1, true)?;
     load_fpga(&interface, rbf_path)?;
     set_led(&interface, 1, false)?;
+    eprintln!("ozy: dropping interface after FPGA load");
     drop(interface);
 
+    // Real report (issue #8): "endpoint stalled" happens right around
+    // here ("Immediately after" the FPGA load's LEDs start blinking) --
+    // this is the first point after the FPGA itself starts running that
+    // ANY further USB communication (this reopen, or the version-read/
+    // I2C calls just below) is attempted, so it's the prime suspect.
+    // Unlike the FX2 firmware load above, there is deliberately NO sleep
+    // here before reopening -- matches the reference (ozy_initialise()
+    // has no delay at this specific point either) but is explicitly
+    // called out here in case that turns out to be wrong for some real
+    // Ozy/Mercury/Penny combinations (the FPGA itself may need a moment
+    // to finish configuring before it'll respond to USB again, unlike
+    // the FX2 firmware reload, which has a documented re-enumeration
+    // delay).
+    eprintln!("ozy: re-opening device after FPGA load, for firmware-version/I2C reads");
     let interface = open_interface()?;
-    let ozy_fx2 = get_firmware_string(&interface).unwrap_or_default();
+    let ozy_fx2 = match get_firmware_string(&interface) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("ozy: FX2 firmware-version string read failed (non-fatal, continuing with empty string): {e}");
+            String::new()
+        }
+    };
     let versions = read_firmware_versions(&interface, &ozy_fx2)?;
+    eprintln!("ozy: firmware-version/I2C reads complete -- waiting 1s before claiming bulk endpoints");
     std::thread::sleep(Duration::from_secs(1));
 
+    eprintln!("ozy: claiming RX bulk endpoint 0x{EP6_IN:02x} and TX bulk endpoint 0x{EP2_OUT:02x}");
     let rx = RxEndpoint {
         reader: interface
             .endpoint::<Bulk, In>(EP6_IN)
-            .map_err(io_err)?
+            .map_err(|e| {
+                eprintln!("ozy: claiming RX bulk endpoint 0x{EP6_IN:02x} failed: {e}");
+                io_err(e)
+            })?
             .reader(EP6_READ_SIZE)
             .with_read_timeout(IO_TIMEOUT),
     };
-    let tx =
-        TxEndpoint { writer: interface.endpoint::<Bulk, Out>(EP2_OUT).map_err(io_err)?.writer(EP2_WRITE_SIZE) };
+    let tx = TxEndpoint {
+        writer: interface
+            .endpoint::<Bulk, Out>(EP2_OUT)
+            .map_err(|e| {
+                eprintln!("ozy: claiming TX bulk endpoint 0x{EP2_OUT:02x} failed: {e}");
+                io_err(e)
+            })?
+            .writer(EP2_WRITE_SIZE),
+    };
 
+    eprintln!("ozy: initialise() complete -- FX2 {ozy_fx2:?}, Mercury {:?}, Penny {:?}", versions.mercury, versions.penny);
     Ok((OzyDevice { interface }, rx, tx, versions))
 }
