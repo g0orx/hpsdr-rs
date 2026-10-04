@@ -101,6 +101,45 @@ pub struct DiscoveryWindow {
     /// `discovery::RX888_SENTINEL_MAC`'s doc comment for why this uses a
     /// different sentinel MAC than Ozy's.
     rx888_firmware_path: Option<String>,
+    /// Real report (issue #5): manually-entered IPs (for radios on a
+    /// different subnet/VLAN that broadcast discovery can't reach --
+    /// see discovery::manual_discovery's own doc comment) had to be
+    /// retyped every single program start, with no way to see or manage
+    /// a saved list. Persisted here (see `manual_ips_path`) -- NOT a
+    /// per-MAC Config like ozy_firmware_path/rx888_firmware_path above,
+    /// since the whole point of manual entry is reaching a radio BEFORE
+    /// its MAC (or anything else about it) is known. `Arc<Mutex<...>>`
+    /// rather than a plain `Vec` because a successful background
+    /// `manual_discovery` (see `spawn_manual`) needs to append to it
+    /// and save from its own thread, not just the UI thread.
+    manual_ips: Arc<Mutex<Vec<String>>>,
+}
+
+/// See DiscoveryWindow::manual_ips's own doc comment -- a flat JSON
+/// file in the same settings directory as everything else this app
+/// persists, same "separate file, own format, same directory" precedent
+/// as config::ps_corr_path, since this isn't tied to any one device's
+/// MAC the way Config is.
+fn manual_ips_path() -> Option<std::path::PathBuf> {
+    let mut path = crate::config::settings_dir()?;
+    path.push("manual_ips.json");
+    Some(path)
+}
+
+fn load_manual_ips() -> Vec<String> {
+    manual_ips_path()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+fn save_manual_ips(ips: &[String]) {
+    let Some(path) = manual_ips_path() else { return };
+    if let Ok(json) = serde_json::to_string_pretty(ips) {
+        if let Err(e) = std::fs::write(&path, json) {
+            eprintln!("failed to save manual discovery IPs to {}: {e}", path.display());
+        }
+    }
 }
 
 /// Sentinel MAC discover_ozy_usb's synthetic `Device` uses (Ozy has no
@@ -127,8 +166,23 @@ impl DiscoveryWindow {
             ozy_firmware_path: ozy_cfg.ozy_firmware_path,
             ozy_fpga_path: ozy_cfg.ozy_fpga_path,
             rx888_firmware_path: rx888_cfg.rx888_firmware_path,
+            manual_ips: Arc::new(Mutex::new(load_manual_ips())),
         };
         window.spawn_discovery(ctx.clone());
+        // Real request (issue #5): re-try every saved manual address in
+        // the background on open, same as the normal broadcast
+        // discovery just above -- so a radio on a different subnet/VLAN
+        // just shows up in the grid like any other, with no re-typing
+        // or extra click needed. Deliberately does NOT touch
+        // `discovering`/show a spinner for these (see spawn_manual_silent's
+        // own doc comment) -- unlike a user's own just-typed "Add"
+        // click, a silent background retry of a POSSIBLY-stale saved
+        // address shouldn't block the UI on it.
+        for ip_str in window.manual_ips.lock().unwrap().clone() {
+            if let Ok(ip) = ip_str.parse::<IpAddr>() {
+                window.spawn_manual_silent(ctx.clone(), ip);
+            }
+        }
         window
     }
 
@@ -160,12 +214,39 @@ impl DiscoveryWindow {
     fn spawn_manual(&self, ctx: egui::Context, ip: IpAddr) {
         let devices = Arc::clone(&self.devices);
         let discovering = Arc::clone(&self.discovering);
+        let manual_ips = Arc::clone(&self.manual_ips);
         *discovering.lock().unwrap() = true;
         thread::spawn(move || {
             let found = manual_discovery(Arc::clone(&devices), ip);
             *discovering.lock().unwrap() = false;
-            if !found {
+            if found {
+                // Only saved on an actual response, not just a
+                // well-formed address -- see manual_ips's own doc
+                // comment. Dedup (same address re-added) rather than
+                // growing the list with repeats.
+                let mut ips = manual_ips.lock().unwrap();
+                let ip_str = ip.to_string();
+                if !ips.contains(&ip_str) {
+                    ips.push(ip_str);
+                    save_manual_ips(&ips);
+                }
+            } else {
                 eprintln!("manual_discovery: no radio responded at {ip}");
+            }
+            ctx.request_repaint();
+        });
+    }
+
+    /// Same as `spawn_manual` above, but for the background re-try of a
+    /// SAVED address on window open (see `new`'s own call site) --
+    /// doesn't touch `discovering` (no spinner for a silent retry the
+    /// user didn't just ask for) and doesn't re-save on success (it's
+    /// already in the saved list, that's why it's being retried).
+    fn spawn_manual_silent(&self, ctx: egui::Context, ip: IpAddr) {
+        let devices = Arc::clone(&self.devices);
+        thread::spawn(move || {
+            if !manual_discovery(Arc::clone(&devices), ip) {
+                eprintln!("manual_discovery (saved address): no radio responded at {ip}");
             }
             ctx.request_repaint();
         });
@@ -433,6 +514,37 @@ impl DiscoveryWindow {
 
                 if let Some(err) = &self.manual_error {
                     ui.colored_label(egui::Color32::from_rgb(200, 60, 60), err);
+                }
+
+                // Saved manual addresses (issue #5) -- already silently
+                // re-tried on window open (see `new`'s own call site),
+                // this just shows what's saved and lets the user manage
+                // the list: "Retry" re-runs the full (spinner-visible)
+                // lookup for one entry on demand (e.g. a radio that was
+                // powered off at startup), "Forget" removes it.
+                let saved_ips = self.manual_ips.lock().unwrap().clone();
+                if !saved_ips.is_empty() {
+                    ui.add_space(4.0);
+                    ui.label(egui::RichText::new("Saved manual addresses:").weak());
+                    let mut forget: Option<String> = None;
+                    for ip_str in &saved_ips {
+                        ui.horizontal(|ui| {
+                            ui.label(ip_str);
+                            if ui.add_enabled(!discovering, egui::Button::new("Retry")).clicked() {
+                                if let Ok(ip) = ip_str.parse::<IpAddr>() {
+                                    self.spawn_manual(ui.ctx().clone(), ip);
+                                }
+                            }
+                            if ui.button("Forget").clicked() {
+                                forget = Some(ip_str.clone());
+                            }
+                        });
+                    }
+                    if let Some(ip_str) = forget {
+                        let mut ips = self.manual_ips.lock().unwrap();
+                        ips.retain(|s| s != &ip_str);
+                        save_manual_ips(&ips);
+                    }
                 }
 
                 ui.add_space(12.0);

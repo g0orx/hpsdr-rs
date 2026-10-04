@@ -52,6 +52,13 @@ that doesn't forward broadcasts). Type the address into the field and click
 **Add**; if a radio responds there, it's added to the list the same as a
 broadcast-discovered one.
 
+A successfully-reached address is remembered under **Saved manual
+addresses**, so you don't have to retype it next time -- every saved address
+is automatically retried in the background each time this window opens, and
+shows up in the list on its own if the radio responds. Each saved entry also
+has its own **Retry** (re-check it right now) and **Forget** (remove it)
+buttons.
+
 **Firmware Update...** opens a separate window for updating a radio's FPGA
 firmware or changing its IP address while it's in bootloader mode -- see
 [Firmware Update](09-firmware-update.md).
