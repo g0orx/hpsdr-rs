@@ -151,6 +151,7 @@ assets = [
     ["docs/manual/images/*", "usr/share/doc/hpsdr-rs/manual/images/", "644"],
     ["assets/hpsdr-rs.desktop", "usr/share/applications/hpsdr-rs.desktop", "644"],
     ["assets/icons/hpsdr-rs.png", "usr/share/icons/hicolor/256x256/apps/hpsdr-rs.png", "644"],
+    ["assets/io.github.g0orx.hpsdr-rs.metainfo.xml", "usr/share/metainfo/io.github.g0orx.hpsdr-rs.metainfo.xml", "644"],
     # Not auto-installed to /etc/udev/rules.d/ (a .deb shouldn't silently
     # install udev rules without the user's say-so) -- shipped as a
     # reference copy alongside the docs, see README's Ozy USB section
