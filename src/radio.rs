@@ -242,6 +242,9 @@ pub struct RadioSettings {
     /// those fields' doc comments.
     pub charly25_preamp1: bool,
     pub charly25_preamp2: bool,
+    /// Initial value for RadioSession::tx_tail_delay_ms -- see that
+    /// field's doc comment.
+    pub tx_tail_delay_ms: u32,
 }
 
 impl Default for RadioSettings {
@@ -282,6 +285,9 @@ impl Default for RadioSettings {
             filter_board: FILTER_BOARD_ALEX,
             charly25_preamp1: false,
             charly25_preamp2: false,
+            // 0 = off, matching every existing config's prior (no
+            // tail delay at all) behavior exactly.
+            tx_tail_delay_ms: 0,
         }
     }
 }
@@ -798,6 +804,31 @@ pub struct RadioSession {
     /// actually run mic audio through TXA or idle). Written from the
     /// UI's PTT control and from rigctl/TCI's set_ptt/trx commands.
     pub mox: Arc<AtomicBool>,
+    /// Real request (issue #6): "a TX tail delay is needed... to keep
+    /// the TX closed until the signal finishes the transmit" -- a
+    /// residual beep from Tune's own tone was audible in RX audio right
+    /// after releasing it, because `mox` (and therefore RX audio
+    /// muting -- see spectrum.rs's own mox-gating) dropped the instant
+    /// the button was released, before whatever was still in flight
+    /// through WDSP's own TX processing latency (e.g. the TX bandpass
+    /// filter's own group delay) and the actual over-the-wire/RF
+    /// transmission had genuinely finished.
+    ///
+    /// In milliseconds, 0 = off (no behavior change, matches every
+    /// existing config). Applied inside `set_mox` itself -- see that
+    /// method's own doc comment for the actual delay mechanism -- so
+    /// every one of its many callers (UI PTT, Tune/Two-Tone, CW keyer,
+    /// CAT/rigctl/TCI PTT, the out-of-band safety interlock) gets this
+    /// for free with no change needed at any call site. Applies ONLY
+    /// to the true->false (key-up) transition; key-down is always
+    /// immediate.
+    pub tx_tail_delay_ms: Arc<AtomicU32>,
+    /// See `set_mox`'s own doc comment -- bumped on every call
+    /// (key-down AND key-up) so a delayed key-up's background timer
+    /// can tell, when it eventually fires, whether anything newer
+    /// (a re-key, or another release) has superseded it in the
+    /// meantime, and skip clobbering `mox` if so.
+    mox_tail_generation: Arc<AtomicU32>,
     /// Mutes the MAIN receiver's local audio_out tap (spectrum.rs's
     /// SpectrumHandle::run, same mechanism as its own `mox`-gating
     /// param) while true. Computed fresh each UI frame from
@@ -1239,6 +1270,9 @@ impl RadioSession {
         // See RadioSession::ps_tx_attenuation's doc comment.
         let ps_tx_attenuation = Arc::new(AtomicU32::new(settings.ps_tx_attenuation));
         let mox = Arc::new(AtomicBool::new(false));
+        // See RadioSession::tx_tail_delay_ms's doc comment.
+        let tx_tail_delay_ms = Arc::new(AtomicU32::new(settings.tx_tail_delay_ms));
+        let mox_tail_generation = Arc::new(AtomicU32::new(0));
         let tx_iq = Arc::new(Mutex::new(VecDeque::with_capacity(TX_IQ_BUFFER_CAPACITY)));
         let tci_tx_audio = Arc::new(Mutex::new(VecDeque::with_capacity(TCI_TX_AUDIO_CAPACITY)));
         let tci_tx_gain = Arc::new(Mutex::new(1.0f32));
@@ -1300,7 +1334,7 @@ impl RadioSession {
                 ps_tx_attenuation, mox, tx_iq, tci_tx_audio, tci_tx_gain, tx_power_watts, cw_keyer, cw_mode_active, pa_gain_db,
                 tx_forward_power, tx_reverse_power, adc0_overload, cw_ptt_active, cw_paddle_contacts, adc1_overload,
                 tx_fifo_underrun, tx_fifo_overrun, ps_rx_feedback_iq, ps_tx_feedback_iq,
-                rx_audio_to_radio, send_rx_audio_to_radio, hl2_ak4951_codec, new_pa_board, filter_board, charly25_preamp1, charly25_preamp2, radio_mic_audio, tx_audio_source,
+                rx_audio_to_radio, send_rx_audio_to_radio, hl2_ak4951_codec, new_pa_board, filter_board, charly25_preamp1, charly25_preamp2, tx_tail_delay_ms, mox_tail_generation, radio_mic_audio, tx_audio_source,
                 tci_wants_mic, mic_ptt_enabled, mic_bias_enabled, mic_ptt_on_tip,
                 diversity_enabled, diversity_gain_db, diversity_phase_deg, diversity_main_raw_iq,
                 puresignal_enabled,
@@ -1311,7 +1345,7 @@ impl RadioSession {
                 ps_tx_attenuation, mox, tx_iq, tci_tx_audio, tci_tx_gain, tx_power_watts, cw_keyer, cw_mode_active, pa_gain_db,
                 tx_forward_power, tx_reverse_power, adc0_overload, cw_ptt_active, cw_paddle_contacts, adc1_overload,
                 tx_fifo_underrun, tx_fifo_overrun, ps_rx_feedback_iq, ps_tx_feedback_iq,
-                rx_audio_to_radio, send_rx_audio_to_radio, hl2_ak4951_codec, new_pa_board, filter_board, charly25_preamp1, charly25_preamp2, radio_mic_audio, tx_audio_source,
+                rx_audio_to_radio, send_rx_audio_to_radio, hl2_ak4951_codec, new_pa_board, filter_board, charly25_preamp1, charly25_preamp2, tx_tail_delay_ms, mox_tail_generation, radio_mic_audio, tx_audio_source,
                 tci_wants_mic, mic_ptt_enabled, mic_bias_enabled, mic_ptt_on_tip,
                 diversity_enabled, diversity_gain_db, diversity_phase_deg, diversity_main_raw_iq,
                 puresignal_enabled,
@@ -1323,7 +1357,7 @@ impl RadioSession {
                 ps_tx_attenuation, mox, tx_iq, tci_tx_audio, tci_tx_gain, tx_power_watts, cw_keyer, cw_mode_active, pa_gain_db,
                 tx_forward_power, tx_reverse_power, adc0_overload, cw_ptt_active, cw_paddle_contacts, adc1_overload,
                 tx_fifo_underrun, tx_fifo_overrun, ps_rx_feedback_iq, ps_tx_feedback_iq,
-                rx_audio_to_radio, send_rx_audio_to_radio, hl2_ak4951_codec, new_pa_board, filter_board, charly25_preamp1, charly25_preamp2, radio_mic_audio, tx_audio_source,
+                rx_audio_to_radio, send_rx_audio_to_radio, hl2_ak4951_codec, new_pa_board, filter_board, charly25_preamp1, charly25_preamp2, tx_tail_delay_ms, mox_tail_generation, radio_mic_audio, tx_audio_source,
                 tci_wants_mic, mic_ptt_enabled, mic_bias_enabled, mic_ptt_on_tip,
                 diversity_enabled, diversity_gain_db, diversity_phase_deg, diversity_main_raw_iq,
                 puresignal_enabled,
@@ -1333,7 +1367,7 @@ impl RadioSession {
                 ps_tx_attenuation, mox, tx_iq, tci_tx_audio, tci_tx_gain, tx_power_watts, cw_keyer, cw_mode_active, pa_gain_db,
                 tx_forward_power, tx_reverse_power, adc0_overload, cw_ptt_active, cw_paddle_contacts, adc1_overload,
                 tx_fifo_underrun, tx_fifo_overrun, ps_rx_feedback_iq, ps_tx_feedback_iq,
-                rx_audio_to_radio, send_rx_audio_to_radio, hl2_ak4951_codec, new_pa_board, filter_board, charly25_preamp1, charly25_preamp2, radio_mic_audio, tx_audio_source,
+                rx_audio_to_radio, send_rx_audio_to_radio, hl2_ak4951_codec, new_pa_board, filter_board, charly25_preamp1, charly25_preamp2, tx_tail_delay_ms, mox_tail_generation, radio_mic_audio, tx_audio_source,
                 tci_wants_mic, mic_ptt_enabled, mic_bias_enabled, mic_ptt_on_tip,
                 diversity_enabled, diversity_gain_db, diversity_phase_deg, diversity_main_raw_iq,
                 puresignal_enabled,
@@ -1368,12 +1402,68 @@ impl RadioSession {
     /// with `true` when the operator actually intends to transmit --
     /// this method itself does no license/band/power-limit checking
     /// whatsoever.
+    ///
+    /// See `tx_tail_delay_ms`'s own doc comment for why key-up isn't
+    /// always immediate. Key-down (`on == true`) always is -- a tail
+    /// delay only ever makes sense on release, holding the transmitter
+    /// open a little LONGER than requested, never shorter/later to
+    /// actually key.
+    ///
+    /// Mechanism: `mox_tail_generation` is bumped on every call
+    /// (key-down or key-up). A key-up with a non-zero delay spawns a
+    /// short-lived thread that sleeps for the delay, then only writes
+    /// `mox = false` if the generation it captured is STILL the latest
+    /// one -- i.e. nothing else (a fresh key-down resuming
+    /// transmission, or another release) happened in the meantime. A
+    /// generation bump on every call, not just key-down, means a
+    /// rapid double-release (e.g. two quick Tune taps) can't leave two
+    /// stale timers both thinking they're still current -- each
+    /// release invalidates whatever delayed-drop the previous one
+    /// scheduled, so only the LAST key-up's timer ever actually fires.
     pub fn set_mox(&self, on: bool) {
-        self.mox.store(on, Ordering::Relaxed);
+        let generation = self.mox_tail_generation.fetch_add(1, Ordering::Relaxed) + 1;
+        if on {
+            self.mox.store(true, Ordering::Relaxed);
+            return;
+        }
+        let delay_ms = self.tx_tail_delay_ms.load(Ordering::Relaxed);
+        if delay_ms == 0 {
+            self.mox.store(false, Ordering::Relaxed);
+            return;
+        }
+        let mox = Arc::clone(&self.mox);
+        let mox_tail_generation = Arc::clone(&self.mox_tail_generation);
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(delay_ms as u64));
+            if mox_tail_generation.load(Ordering::Relaxed) == generation {
+                mox.store(false, Ordering::Relaxed);
+            }
+        });
     }
 
     pub fn mox_active(&self) -> bool {
         self.mox.load(Ordering::Relaxed)
+    }
+
+    /// Immediately drops MOX, bypassing `tx_tail_delay_ms` entirely
+    /// (and invalidating/cancelling any already-pending delayed drop a
+    /// previous `set_mox(false)` call may have scheduled, via the same
+    /// generation bump). For unkey paths where ANY extra delay would be
+    /// wrong, not just unnecessary:
+    /// - Session teardown (`stop`, just below) -- "must never leave the
+    ///   transmitter keyed" can't wait on a timer.
+    /// - The TX-disarm safety path (main.rs's "Enable Transmit" off) --
+    ///   same reasoning, already documented there as "disarming must be
+    ///   at least as safe as never having armed at all."
+    /// - CW keying (break-in's own per-element hang time, and CW text
+    ///   send's own timing) -- both are already correctly tuned
+    ///   elsewhere for CW's own timing needs; a generic PTT tail delay
+    ///   layered on top wouldn't just be redundant, it would actively
+    ///   break CW at any real WPM (holding MOX through the start of the
+    ///   next element instead of dropping between them).
+    pub fn force_mox_off(&self) {
+        self.mox_tail_generation.fetch_add(1, Ordering::Relaxed);
+        self.mox.store(false, Ordering::Relaxed);
     }
 
     /// Retunes the running receiver. Takes effect on the next packet the
@@ -1555,7 +1645,9 @@ impl RadioSession {
         // Unkey first, before anything else -- a session ending (app
         // closing, "Stop" clicked, sample rate change tearing this
         // down for a rebuild) must never leave the transmitter keyed.
-        self.set_mox(false);
+        // force_mox_off, not set_mox(false) -- see that method's own
+        // doc comment for why this path can't wait on tx_tail_delay_ms.
+        self.force_mox_off();
         self.stop_flag.store(true, Ordering::SeqCst);
         // Join the sender first so it's no longer sending "keep running"
         // traffic, then tell the radio to actually stop. P1 has no
@@ -1668,6 +1760,11 @@ fn start_protocol1(
     // regardless of board/protocol.
     charly25_preamp1: Arc<AtomicBool>,
     charly25_preamp2: Arc<AtomicBool>,
+    // See RadioSession::tx_tail_delay_ms/mox_tail_generation's doc
+    // comments -- consumed entirely by RadioSession::set_mox, nothing
+    // here needs to read them, just store them into the session.
+    tx_tail_delay_ms: Arc<AtomicU32>,
+    mox_tail_generation: Arc<AtomicU32>,
     radio_mic_audio: Arc<Mutex<VecDeque<f32>>>,
     tx_audio_source: Arc<AtomicU8>,
     tci_wants_mic: Arc<AtomicBool>,
@@ -1984,6 +2081,8 @@ fn start_protocol1(
         ps_rx_feedback_iq,
         ps_tx_feedback_iq,
         mox,
+        tx_tail_delay_ms,
+        mox_tail_generation,
         mute_local_audio_for_tci,
         rit_enabled,
         rit_offset_hz,
@@ -2111,6 +2210,11 @@ fn start_protocol1_ozy_usb(
     // regardless of board/protocol.
     charly25_preamp1: Arc<AtomicBool>,
     charly25_preamp2: Arc<AtomicBool>,
+    // See RadioSession::tx_tail_delay_ms/mox_tail_generation's doc
+    // comments -- consumed entirely by RadioSession::set_mox, nothing
+    // here needs to read them, just store them into the session.
+    tx_tail_delay_ms: Arc<AtomicU32>,
+    mox_tail_generation: Arc<AtomicU32>,
     radio_mic_audio: Arc<Mutex<VecDeque<f32>>>,
     tx_audio_source: Arc<AtomicU8>,
     tci_wants_mic: Arc<AtomicBool>,
@@ -2302,6 +2406,8 @@ fn start_protocol1_ozy_usb(
         ps_rx_feedback_iq,
         ps_tx_feedback_iq,
         mox,
+        tx_tail_delay_ms,
+        mox_tail_generation,
         mute_local_audio_for_tci,
         rit_enabled,
         rit_offset_hz,
@@ -2423,6 +2529,11 @@ fn start_rx888_usb(
     // regardless of board/protocol.
     charly25_preamp1: Arc<AtomicBool>,
     charly25_preamp2: Arc<AtomicBool>,
+    // See RadioSession::tx_tail_delay_ms/mox_tail_generation's doc
+    // comments -- consumed entirely by RadioSession::set_mox, nothing
+    // here needs to read them, just store them into the session.
+    tx_tail_delay_ms: Arc<AtomicU32>,
+    mox_tail_generation: Arc<AtomicU32>,
     radio_mic_audio: Arc<Mutex<VecDeque<f32>>>,
     tx_audio_source: Arc<AtomicU8>,
     tci_wants_mic: Arc<AtomicBool>,
@@ -2557,6 +2668,8 @@ fn start_rx888_usb(
         ps_rx_feedback_iq,
         ps_tx_feedback_iq,
         mox,
+        tx_tail_delay_ms,
+        mox_tail_generation,
         mute_local_audio_for_tci,
         rit_enabled,
         rit_offset_hz,
@@ -5438,6 +5551,11 @@ fn start_protocol2(
     // regardless of board/protocol.
     charly25_preamp1: Arc<AtomicBool>,
     charly25_preamp2: Arc<AtomicBool>,
+    // See RadioSession::tx_tail_delay_ms/mox_tail_generation's doc
+    // comments -- consumed entirely by RadioSession::set_mox, nothing
+    // here needs to read them, just store them into the session.
+    tx_tail_delay_ms: Arc<AtomicU32>,
+    mox_tail_generation: Arc<AtomicU32>,
     radio_mic_audio: Arc<Mutex<VecDeque<f32>>>,
     tx_audio_source: Arc<AtomicU8>,
     tci_wants_mic: Arc<AtomicBool>,
@@ -5732,6 +5850,8 @@ fn start_protocol2(
         ps_rx_feedback_iq,
         ps_tx_feedback_iq,
         mox,
+        tx_tail_delay_ms,
+        mox_tail_generation,
         mute_local_audio_for_tci,
         rit_enabled,
         rit_offset_hz,

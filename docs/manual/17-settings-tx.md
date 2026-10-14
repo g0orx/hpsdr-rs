@@ -37,6 +37,22 @@ If SWR reaches or exceeds this while actually running more than 35W,
 raise itself back up on its own once the match improves, so raise it
 back manually when it's safe to.
 
+## TX Tail Delay
+
+Holds MOX/PTT open this many milliseconds (0-1000, default 0 = off) after
+releasing it -- Tune, Two-Tone, the main PTT/MOX control, or a remote
+CAT/rigctl/TCI client. Useful if you hear a residual beep/click in RX
+audio right after releasing (the receiver was re-enabling before whatever
+was still in flight through the TX processing chain had actually
+finished), or if an external amplifier/relay needs a moment to settle
+before the receiver re-opens.
+
+Only delays releasing -- keying up is always immediate. Does **not**
+apply to CW keying (break-in and CW text send both have their own
+already-tuned timing -- a generic tail here would hold MOX into the start
+of the next element at any real WPM) or to disarming **Enable Transmit**
+(which always drops MOX immediately, same as it always has).
+
 ## TX ADC0 Attenuation (standard boards only)
 
 Protects ADC0's front end from this radio's own TX leakage while

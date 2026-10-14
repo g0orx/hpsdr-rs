@@ -484,6 +484,10 @@ pub struct Config {
     pub charly25_preamp1: Option<bool>,
     #[serde(default)]
     pub charly25_preamp2: Option<bool>,
+    /// See radio::RadioSession::tx_tail_delay_ms's doc comment. `None`
+    /// (a config saved before this existed) falls back to 0 (off).
+    #[serde(default)]
+    pub tx_tail_delay_ms: Option<u32>,
     /// Global Open Collector mask ORed into the active band's Tx mask
     /// while TUNE is active -- see main.rs's ConnectedState::oc_tune
     /// doc comment.

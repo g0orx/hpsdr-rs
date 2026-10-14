@@ -2005,6 +2005,9 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
     if let Some(v) = cfg.charly25_preamp2 {
         settings.charly25_preamp2 = v;
     }
+    if let Some(v) = cfg.tx_tail_delay_ms {
+        settings.tx_tail_delay_ms = v;
+    }
     // See RadioSettings::rit_enabled's doc comment -- computed here
     // (rather than after RadioSession::start, where these were
     // previously read) so the shared atomics it seeds already match this
@@ -2936,14 +2939,21 @@ impl eframe::App for HpsdrApp {
                             connected.cw_break_in_active = true;
                         }
                     } else if connected.cw_break_in_active {
-                        connected.session.set_mox(false);
+                        // force_mox_off, not set_mox(false) -- CW
+                        // break-in has its own per-element hang time
+                        // already tuned for this; see that method's
+                        // own doc comment for why a generic PTT tail
+                        // delay would actively break CW here, not
+                        // just be redundant.
+                        connected.session.force_mox_off();
                         connected.cw_break_in_active = false;
                     }
                 } else if connected.cw_break_in_active {
                     // Left CW mode (or a stuck-key lockout just
                     // engaged) while break-in still held mox up --
-                    // nothing left to hang onto, drop it immediately.
-                    connected.session.set_mox(false);
+                    // nothing left to hang onto, drop it immediately
+                    // (force_mox_off -- see its own doc comment).
+                    connected.session.force_mox_off();
                     connected.cw_break_in_active = false;
                 }
                 // A stale true must never survive mox dropping for some
@@ -4768,7 +4778,12 @@ impl eframe::App for HpsdrApp {
                                     if let Some(tx) = &connected.tx_handle {
                                         tx.stop_cw_text();
                                     }
-                                    connected.session.set_mox(false);
+                                    // force_mox_off -- CW text send has
+                                    // its own already-tuned timing, same
+                                    // reasoning as CW break-in above
+                                    // (see that method's own doc
+                                    // comment).
+                                    connected.session.force_mox_off();
                                     connected.cw_text_sending = false;
                                 }
                             }
@@ -7938,6 +7953,40 @@ impl eframe::App for HpsdrApp {
                                     });
                                     ui.add_space(8.0);
 
+                                    ui.horizontal(|ui| {
+                                        ui.label("TX Tail Delay:");
+                                        let mut delay_ms =
+                                            connected.session.tx_tail_delay_ms.load(Ordering::Relaxed) as i32;
+                                        if scroll_slider_i32(
+                                            ui,
+                                            &mut connected.slider_scroll_accum,
+                                            &mut delay_ms,
+                                            0..=1000,
+                                            10,
+                                            " ms",
+                                        ) {
+                                            connected
+                                                .session
+                                                .tx_tail_delay_ms
+                                                .store(delay_ms as u32, Ordering::Relaxed);
+                                            settings_changed = true;
+                                        }
+                                    })
+                                    .response
+                                    .on_hover_text(
+                                        "Real request (0ms default, no change in behavior): holds \
+                                         MOX/PTT open this much longer after releasing it (Tune, \
+                                         Two-Tone, the main PTT/MOX control, or a remote \
+                                         CAT/rigctl/TCI client) -- useful if you hear a residual \
+                                         beep/click in RX audio right after releasing, or if an \
+                                         external amplifier/relay needs a moment to finish before \
+                                         the receiver re-opens. Only delays releasing -- keying up \
+                                         is always immediate. Not applied to CW keying (break-in \
+                                         and CW text send have their own timing) or to disarming \
+                                         Enable Transmit.",
+                                    );
+                                    ui.add_space(8.0);
+
                                     // Real request: a safety default
                                     // against accidentally transmitting
                                     // outside the ham bands (e.g. while
@@ -8183,8 +8232,10 @@ impl eframe::App for HpsdrApp {
                                         } else {
                                             // Disarming must be at least as safe as never having
                                             // armed at all -- force MOX off regardless of whether
-                                            // PTT happened to be held at this exact moment.
-                                            connected.session.set_mox(false);
+                                            // PTT happened to be held at this exact moment, and
+                                            // bypass tx_tail_delay_ms entirely (force_mox_off, not
+                                            // set_mox(false) -- see that method's own doc comment).
+                                            connected.session.force_mox_off();
                                             connected.ptt_held = false;
                                             connected.tx_handle = None;
                                             connected.tx_audio_monitor_output = None;
@@ -8373,7 +8424,19 @@ impl eframe::App for HpsdrApp {
                                                 ui,
                                                 &mut connected.slider_scroll_accum,
                                                 &mut gain_db,
-                                                20.0..=50.0,
+                                                // Real report (issue #6): a high-gain external amp
+                                                // needs the PA actually driven down to a LOWER
+                                                // output than this cap previously allowed room for
+                                                // (higher gain_db here means a SMALLER computed
+                                                // drive byte for the same target watts, see
+                                                // drive_byte_for_watts's own doc comment -- the
+                                                // dB value and the resulting output power move in
+                                                // opposite directions). 50.0 wasn't enough headroom
+                                                // (reporter needed ~53.8); drive_byte_for_watts's
+                                                // own clamp(0.0, 1.0) on the computed volts has no
+                                                // upper gain_db assumption baked in, so there's
+                                                // nothing else to widen for this to be safe.
+                                                20.0..=60.0,
                                                 0.1,
                                             ) {
                                                 connected
@@ -9750,6 +9813,7 @@ impl eframe::App for HpsdrApp {
                         filter_board: Some(connected.session.filter_board.load(Ordering::Relaxed)),
                         charly25_preamp1: Some(connected.session.charly25_preamp1.load(Ordering::Relaxed)),
                         charly25_preamp2: Some(connected.session.charly25_preamp2.load(Ordering::Relaxed)),
+                        tx_tail_delay_ms: Some(connected.session.tx_tail_delay_ms.load(Ordering::Relaxed)),
                         antenna_settings: connected.antenna_settings.clone(),
                         midi_enabled: Some(connected.midi.enabled.load(Ordering::Relaxed)),
                         midi_device_name: connected.midi.device_name.lock().unwrap().clone(),
