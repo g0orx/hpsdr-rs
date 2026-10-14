@@ -221,9 +221,49 @@ fn open_socket(bind_addr: SocketAddr, broadcast: bool) -> std::io::Result<UdpSoc
     Ok(setup_socket.into())
 }
 
+/// Adds `device` unless the same radio (same address, same protocol) was
+/// already found via the same local interface. Needed because each
+/// discovery round now sends BOTH the global 255.255.255.255 broadcast
+/// and the interface's own directed broadcast (see protocol1_discovery's
+/// doc comment) -- a radio reachable by both answers both, which
+/// otherwise showed up as two identical rows in the Discover window.
+/// Keyed on my_address too so a radio genuinely reachable via two
+/// different interfaces still lists once per interface, as before.
+fn push_unique(devices: &Arc<Mutex<Vec<Device>>>, device: Device) {
+    let mut devices = devices.lock().unwrap();
+    if !devices.iter().any(|d| {
+        d.address == device.address && d.my_address.ip() == device.my_address.ip() && d.protocol == device.protocol
+    }) {
+        devices.push(device);
+    }
+}
+
 /// Broadcast a Protocol 1 discovery packet and collect replies until the
 /// read timeout fires with nothing pending.
-pub fn protocol1_discovery(devices: Arc<Mutex<Vec<Device>>>, socket_addr: SocketAddr) {
+///
+/// `directed_broadcast`: this interface's own subnet-directed broadcast
+/// address (e.g. 169.254.255.255 for a 169.254.160.149/255.255.0.0
+/// interface), if the OS/`network-interface` crate reported one -- see
+/// `discover`'s own call site. Real report: a 169.254.0.0/16 (APIPA/
+/// direct-connect, no DHCP) setup with the interface and radio in
+/// different /24s but the same /16 (e.g. 169.254.160.149 talking to
+/// 169.254.34.92) couldn't discover at all. The global 255.255.255.255
+/// broadcast below is still attempted first (unchanged, keeps working
+/// for everyone else), but on a multi-homed host (a real NIC with its
+/// own default route, PLUS a direct-connect link-local interface),
+/// Windows in particular is known to not reliably route a global
+/// broadcast out whichever interface a socket happens to be bound to --
+/// it's resolved against the routing table same as any other
+/// destination, which may not pick the link-local interface at all.
+/// The interface's own DIRECTED broadcast doesn't have that ambiguity
+/// (there's a real routing-table entry for that specific subnet via
+/// that specific interface), so send to both rather than relying on
+/// the global address alone.
+pub fn protocol1_discovery(
+    devices: Arc<Mutex<Vec<Device>>>,
+    socket_addr: SocketAddr,
+    directed_broadcast: Option<std::net::Ipv4Addr>,
+) {
     let socket = match open_socket(socket_addr, true) {
         Ok(s) => s,
         Err(e) => {
@@ -236,8 +276,20 @@ pub fn protocol1_discovery(devices: Arc<Mutex<Vec<Device>>>, socket_addr: Socket
     request[0] = 0xEF;
     request[1] = 0xFE;
     request[2] = 0x02;
-    if let Err(e) = socket.send_to(&request, ("255.255.255.255", DISCOVERY_PORT)) {
-        eprintln!("protocol1_discovery: send failed: {e}");
+    let mut sent = false;
+    match socket.send_to(&request, ("255.255.255.255", DISCOVERY_PORT)) {
+        Ok(_) => sent = true,
+        Err(e) => eprintln!("protocol1_discovery: global broadcast send failed: {e}"),
+    }
+    if let Some(bcast) = directed_broadcast {
+        if bcast != std::net::Ipv4Addr::BROADCAST {
+            match socket.send_to(&request, (bcast, DISCOVERY_PORT)) {
+                Ok(_) => sent = true,
+                Err(e) => eprintln!("protocol1_discovery: directed broadcast ({bcast}) send failed: {e}"),
+            }
+        }
+    }
+    if !sent {
         return;
     }
 
@@ -247,7 +299,7 @@ pub fn protocol1_discovery(devices: Arc<Mutex<Vec<Device>>>, socket_addr: Socket
         match socket.recv_from(&mut buf) {
             Ok((amt, src)) if amt == 60 && src.port() == DISCOVERY_PORT => {
                 if let Some(device) = Device::from_p1_reply(&buf[..amt], src, local_addr) {
-                    devices.lock().unwrap().push(device);
+                    push_unique(&devices, device);
                 }
             }
             Ok(_) => continue,
@@ -256,8 +308,13 @@ pub fn protocol1_discovery(devices: Arc<Mutex<Vec<Device>>>, socket_addr: Socket
     }
 }
 
-/// Broadcast a Protocol 2 discovery packet and collect replies.
-pub fn protocol2_discovery(devices: Arc<Mutex<Vec<Device>>>, socket_addr: SocketAddr) {
+/// Broadcast a Protocol 2 discovery packet and collect replies. See
+/// protocol1_discovery's own doc comment for `directed_broadcast`.
+pub fn protocol2_discovery(
+    devices: Arc<Mutex<Vec<Device>>>,
+    socket_addr: SocketAddr,
+    directed_broadcast: Option<std::net::Ipv4Addr>,
+) {
     let socket = match open_socket(socket_addr, true) {
         Ok(s) => s,
         Err(e) => {
@@ -268,8 +325,20 @@ pub fn protocol2_discovery(devices: Arc<Mutex<Vec<Device>>>, socket_addr: Socket
 
     let mut request = [0u8; 60];
     request[4] = 0x02;
-    if let Err(e) = socket.send_to(&request, ("255.255.255.255", DISCOVERY_PORT)) {
-        eprintln!("protocol2_discovery: send failed: {e}");
+    let mut sent = false;
+    match socket.send_to(&request, ("255.255.255.255", DISCOVERY_PORT)) {
+        Ok(_) => sent = true,
+        Err(e) => eprintln!("protocol2_discovery: global broadcast send failed: {e}"),
+    }
+    if let Some(bcast) = directed_broadcast {
+        if bcast != std::net::Ipv4Addr::BROADCAST {
+            match socket.send_to(&request, (bcast, DISCOVERY_PORT)) {
+                Ok(_) => sent = true,
+                Err(e) => eprintln!("protocol2_discovery: directed broadcast ({bcast}) send failed: {e}"),
+            }
+        }
+    }
+    if !sent {
         return;
     }
 
@@ -279,7 +348,7 @@ pub fn protocol2_discovery(devices: Arc<Mutex<Vec<Device>>>, socket_addr: Socket
         match socket.recv_from(&mut buf) {
             Ok((amt, src)) if amt == 60 && src.port() == DISCOVERY_PORT => {
                 if let Some(device) = Device::from_p2_reply(&buf[..amt], src, local_addr) {
-                    devices.lock().unwrap().push(device);
+                    push_unique(&devices, device);
                 }
             }
             Ok(_) => continue,
@@ -329,8 +398,12 @@ pub fn discover(devices: Arc<Mutex<Vec<Device>>>, interface_names: Arc<Mutex<Has
                 if std::net::UdpSocket::bind((ip, 5000)).is_ok() {
                     interface_names.lock().unwrap().insert(IpAddr::V4(ip), itf.name.clone());
                     let socket_address = SocketAddr::new(IpAddr::V4(ip), 50000);
-                    protocol1_discovery(Arc::clone(&devices), socket_address);
-                    protocol2_discovery(Arc::clone(&devices), socket_address);
+                    // See protocol1_discovery's own doc comment --
+                    // this interface's own subnet-directed broadcast,
+                    // straight from the OS (via the network-interface
+                    // crate), not computed/assumed here.
+                    protocol1_discovery(Arc::clone(&devices), socket_address, v4_info.broadcast);
+                    protocol2_discovery(Arc::clone(&devices), socket_address, v4_info.broadcast);
                 } else {
                     eprintln!("discover: interface {} not bindable, skipping", itf.name);
                 }
