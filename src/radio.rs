@@ -19,6 +19,7 @@
 
 use crate::discovery::{Boards, Device};
 use crate::ozy;
+use crate::rtlsdr;
 use crate::rx888;
 use std::collections::VecDeque;
 use std::io;
@@ -235,6 +236,10 @@ pub struct RadioSettings {
     /// Discover window's "RX-888 USB setup" and loaded from Config the
     /// same way ozy_firmware_path is.
     pub rx888_firmware_path: Option<String>,
+    /// RTL-SDR only -- initial values for rtlsdr::Controls (see its
+    /// doc comment).
+    pub rtlsdr_direct_sampling: u8,
+    pub rtlsdr_tuner_agc: bool,
     /// Initial value for RadioSession::filter_board -- see that
     /// field's doc comment.
     pub filter_board: u8,
@@ -280,6 +285,10 @@ impl Default for RadioSettings {
             ozy_firmware_path: None,
             ozy_fpga_path: None,
             rx888_firmware_path: None,
+            // Q-branch: the input the common HF mods (and the RTL-SDR
+            // Blog V3's built-in HF path) use.
+            rtlsdr_direct_sampling: 2,
+            rtlsdr_tuner_agc: false,
             // See RadioSession::filter_board's doc comment -- ALEX is
             // the behavior-preserving default.
             filter_board: FILTER_BOARD_ALEX,
@@ -347,7 +356,7 @@ fn ps_feedback_config(protocol: u8, board: Boards) -> Option<(u8, u8, Option<u8>
             // start_protocol1_ozy_usb's doc comment) -- no reservation.
             // RX-888: receive-only hardware, no TX/feedback path at all
             // (see start_rx888_usb's doc comment).
-            Boards::Saturn | Boards::Ozy | Boards::Rx888 | Boards::Unknown => None,
+            Boards::Saturn | Boards::Ozy | Boards::Rx888 | Boards::RtlSdr | Boards::Unknown => None,
         },
         // P2: DDC0/DDC1 reservation is universal, not board-dependent --
         // confirmed via new_protocol.c, no per-board variation in that
@@ -1234,14 +1243,22 @@ pub struct RadioSession {
     /// True only for an RX-888 session -- same "no UDP peer to send a
     /// stop packet to" reasoning as `is_ozy`, see send_stop_command.
     is_rx888: bool,
-    /// rx888_control_loop's handle (attenuator polling, on its own
-    /// thread separate from the bulk-streaming receiver_thread -- see
-    /// that function's own doc comment for why: a real report that
-    /// issuing the attenuator's USB control transfer from the SAME
-    /// thread as the hot bulk-read loop corrupted the ADC sample
-    /// stream). Joined in `stop()` alongside the other threads. Always
-    /// None on every other transport.
-    rx888_control_thread: Option<JoinHandle<()>>,
+    /// rx888_control_loop's / rtlsdr_control_loop's handle (attenuator
+    /// or tuner polling, on its own thread separate from the
+    /// bulk-streaming receiver_thread -- see rx888_control_loop's own
+    /// doc comment for why: a real report that issuing the attenuator's
+    /// USB control transfer from the SAME thread as the hot bulk-read
+    /// loop corrupted the ADC sample stream). Joined in `stop()`
+    /// alongside the other threads. Always None on every other
+    /// transport.
+    usb_control_thread: Option<JoinHandle<()>>,
+    /// True only for an RTL-SDR session -- same "no UDP peer" reasoning
+    /// as `is_rx888`.
+    is_rtlsdr: bool,
+    /// RTL-SDR only: direct-sampling / tuner-AGC settings polled by
+    /// rtlsdr_control_loop (RF gain itself is `rx_attenuation`, see
+    /// rtlsdr::Controls' doc comment). `pub` for main.rs's Settings -> RX.
+    pub rtlsdr_controls: Option<Arc<rtlsdr::Controls>>,
 }
 
 impl RadioSession {
@@ -1341,6 +1358,17 @@ impl RadioSession {
             )
         } else if device.board == Boards::Rx888 {
             start_rx888_usb(
+                device, settings, frequency_hz, tx_frequency_hz, rx_frequency_hz, requested_frequency_hz, sample_rate, adc, rx_antenna, tx_antenna, rx_attenuation,
+                ps_tx_attenuation, mox, tx_iq, tci_tx_audio, tci_tx_gain, tx_power_watts, cw_keyer, cw_mode_active, pa_gain_db,
+                tx_forward_power, tx_reverse_power, adc0_overload, cw_ptt_active, cw_paddle_contacts, adc1_overload,
+                tx_fifo_underrun, tx_fifo_overrun, ps_rx_feedback_iq, ps_tx_feedback_iq,
+                rx_audio_to_radio, send_rx_audio_to_radio, hl2_ak4951_codec, new_pa_board, filter_board, charly25_preamp1, charly25_preamp2, tx_tail_delay_ms, mox_tail_generation, radio_mic_audio, tx_audio_source,
+                tci_wants_mic, mic_ptt_enabled, mic_bias_enabled, mic_ptt_on_tip,
+                diversity_enabled, diversity_gain_db, diversity_phase_deg, diversity_main_raw_iq,
+                puresignal_enabled,
+            )
+        } else if device.board == Boards::RtlSdr {
+            start_rtlsdr_usb(
                 device, settings, frequency_hz, tx_frequency_hz, rx_frequency_hz, requested_frequency_hz, sample_rate, adc, rx_antenna, tx_antenna, rx_attenuation,
                 ps_tx_attenuation, mox, tx_iq, tci_tx_audio, tci_tx_gain, tx_power_watts, cw_keyer, cw_mode_active, pa_gain_db,
                 tx_forward_power, tx_reverse_power, adc0_overload, cw_ptt_active, cw_paddle_contacts, adc1_overload,
@@ -1560,24 +1588,26 @@ impl RadioSession {
         self.puresignal_enabled.store(enabled, Ordering::SeqCst);
     }
 
-    /// RX-888 only: stops this session's receiver + control-transfer
-    /// threads (and clears any samples they already queued at the OLD
-    /// rate) WITHOUT touching anything else the session owns -- pairs
-    /// with `restart_rx888_at_rate` below. Split into two calls, not
+    /// RX-888 / RTL-SDR only: stops this session's receiver +
+    /// control-transfer threads (and clears any samples they already
+    /// queued at the OLD rate) WITHOUT touching anything else the
+    /// session owns -- pairs with `restart_rx888_at_rate` /
+    /// `restart_rtlsdr_at_rate` below. Split into two calls, not
     /// one, because main.rs's change_sample_rate needs to stop the old
     /// producer BEFORE rebuilding the WDSP channel at the new rate (so
     /// nothing races it), then start the new producer AFTER (so it
     /// pushes into an already-correctly-sized channel) -- see
     /// change_sample_rate's own call sites for the exact ordering.
     ///
-    /// Only ever called for `is_rx888` sessions; harmless no-op
-    /// otherwise (both threads are always `None` for every other board).
-    pub fn stop_rx888_threads(&mut self) {
+    /// Only ever called for `is_rx888`/`is_rtlsdr` sessions; harmless
+    /// no-op otherwise (both threads are always `None` for every other
+    /// board).
+    pub fn stop_usb_sdr_threads(&mut self) {
         self.stop_flag.store(true, Ordering::SeqCst);
         if let Some(t) = self.receiver_thread.take() {
             let _ = t.join();
         }
-        if let Some(t) = self.rx888_control_thread.take() {
+        if let Some(t) = self.usb_control_thread.take() {
             let _ = t.join();
         }
         self.iq_buffers[0].lock().unwrap().clear();
@@ -1586,7 +1616,7 @@ impl RadioSession {
     /// RX-888 only: (re)opens the USB device at `output_rate_hz` (one of
     /// rx888::ddc_params_for_output_rate's supported presets, else this
     /// module's own default) and spawns fresh receiver/control threads
-    /// -- always called AFTER `stop_rx888_threads` above, both at
+    /// -- always called AFTER `stop_usb_sdr_threads` above, both at
     /// initial connect (see start_rx888_usb) and on a live rate change
     /// (see main.rs's change_sample_rate).
     ///
@@ -1634,11 +1664,42 @@ impl RadioSession {
 
         let control_stop = Arc::clone(&stop_flag);
         let control_rx_attenuation = Arc::clone(&self.rx_attenuation);
-        self.rx888_control_thread = Some(thread::spawn(move || {
+        self.usb_control_thread = Some(thread::spawn(move || {
             rx888_control_loop(rx888_device, control_rx_attenuation, control_stop);
         }));
 
         Ok(adc_rate_hz / decimation)
+    }
+
+    /// RTL-SDR counterpart of `restart_rx888_at_rate`, same ordering
+    /// contract with stop_usb_sdr_threads (see its doc comment). The
+    /// dongle itself always runs at rtlsdr::DONGLE_RATE_HZ -- only the
+    /// software decimation changes -- but the device is still fully
+    /// reopened, same "only reuse the proven bring-up path" reasoning as
+    /// the RX-888's. Returns the rate actually in use.
+    pub fn restart_rtlsdr_at_rate(&mut self, output_rate_hz: u32) -> io::Result<u32> {
+        let output_rate_hz = if rtlsdr::decimation_for_output_rate(output_rate_hz).is_some() {
+            output_rate_hz
+        } else {
+            rtlsdr::DEFAULT_OUTPUT_RATE_HZ
+        };
+        let controls = self
+            .rtlsdr_controls
+            .clone()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "not an RTL-SDR session"))?;
+        let stop_flag = Arc::new(AtomicBool::new(false));
+        self.stop_flag = Arc::clone(&stop_flag);
+        let (receiver_thread, control_thread) = spawn_rtlsdr_threads(
+            &self.iq_buffers[0],
+            &self.frequency_hz,
+            &self.rx_attenuation,
+            &controls,
+            &stop_flag,
+            output_rate_hz,
+        )?;
+        self.receiver_thread = Some(receiver_thread);
+        self.usb_control_thread = Some(control_thread);
+        Ok(output_rate_hz)
     }
 
     pub fn stop(&mut self) {
@@ -1670,7 +1731,7 @@ impl RadioSession {
         if let Some(t) = self.ozy_i2c_thread.take() {
             let _ = t.join();
         }
-        if let Some(t) = self.rx888_control_thread.take() {
+        if let Some(t) = self.usb_control_thread.take() {
             let _ = t.join();
         }
         self.stop_diversity_combiner_now();
@@ -1682,7 +1743,7 @@ impl RadioSession {
         // the time this is called) + dropping the USB device handle.
         // Matches piHPSDR's own old_protocol.c, which short-circuits
         // equivalent stop-packet logic for DEVICE_OZY the same way.
-        if self.is_ozy || self.is_rx888 {
+        if self.is_ozy || self.is_rx888 || self.is_rtlsdr {
             return;
         }
         // See stop_socket's own doc comment -- sent from the SAME local
@@ -2135,7 +2196,9 @@ fn start_protocol1(
         ozy_versions: None,
         ozy_i2c_thread: None,
         is_rx888: false,
-        rx888_control_thread: None,
+        usb_control_thread: None,
+        is_rtlsdr: false,
+        rtlsdr_controls: None,
     })
 }
 
@@ -2460,7 +2523,9 @@ fn start_protocol1_ozy_usb(
         ozy_versions: Some(ozy_versions),
         ozy_i2c_thread: Some(i2c_thread),
         is_rx888: false,
-        rx888_control_thread: None,
+        usb_control_thread: None,
+        is_rtlsdr: false,
+        rtlsdr_controls: None,
     })
 }
 
@@ -2722,8 +2787,331 @@ fn start_rx888_usb(
         ozy_versions: None,
         ozy_i2c_thread: None,
         is_rx888: true,
-        rx888_control_thread: Some(control_thread),
+        usb_control_thread: Some(control_thread),
+        is_rtlsdr: false,
+        rtlsdr_controls: None,
     })
+}
+
+/// RTL-SDR counterpart of start_rx888_usb -- same receive-only,
+/// no-sender-thread shape. See rtlsdr.rs's module doc comment.
+#[allow(clippy::too_many_arguments)]
+fn start_rtlsdr_usb(
+    device: &Device,
+    settings: RadioSettings,
+    frequency_hz: Arc<AtomicU32>,
+    tx_frequency_hz: Arc<AtomicU32>,
+    rx_frequency_hz: Arc<AtomicU32>,
+    requested_frequency_hz: Arc<AtomicU32>,
+    sample_rate: Arc<AtomicU32>,
+    adc: Arc<AtomicU32>,
+    rx_antenna: Arc<AtomicU32>,
+    tx_antenna: Arc<AtomicU32>,
+    rx_attenuation: Arc<AtomicU32>,
+    ps_tx_attenuation: Arc<AtomicU32>,
+    mox: Arc<AtomicBool>,
+    tx_iq: Arc<Mutex<VecDeque<f32>>>,
+    tci_tx_audio: Arc<Mutex<VecDeque<f32>>>,
+    tci_tx_gain: Arc<Mutex<f32>>,
+    tx_power_watts: Arc<AtomicU32>,
+    cw_keyer: Arc<CwKeyerAtomics>,
+    cw_mode_active: Arc<AtomicBool>,
+    pa_gain_db: Arc<AtomicU32>,
+    tx_forward_power: Arc<AtomicU32>,
+    tx_reverse_power: Arc<AtomicU32>,
+    adc0_overload: Arc<AtomicBool>,
+    cw_ptt_active: Arc<AtomicBool>,
+    cw_paddle_contacts: Arc<AtomicU8>,
+    adc1_overload: Arc<AtomicBool>,
+    tx_fifo_underrun: Arc<AtomicBool>,
+    tx_fifo_overrun: Arc<AtomicBool>,
+    ps_rx_feedback_iq: Arc<Mutex<VecDeque<IqSample>>>,
+    ps_tx_feedback_iq: Arc<Mutex<VecDeque<IqSample>>>,
+    rx_audio_to_radio: Arc<Mutex<VecDeque<f32>>>,
+    send_rx_audio_to_radio: Arc<AtomicBool>,
+    hl2_ak4951_codec: Arc<AtomicBool>,
+    new_pa_board: Arc<AtomicBool>,
+    // See RadioSession::filter_board's doc comment.
+    filter_board: Arc<AtomicU8>,
+    // See p1_build_packet's identically-named params' doc comments --
+    // only meaningful on P1 (start_protocol1), stored/threaded through
+    // unused elsewhere so RadioSession's own field is always populated
+    // regardless of board/protocol.
+    charly25_preamp1: Arc<AtomicBool>,
+    charly25_preamp2: Arc<AtomicBool>,
+    // See RadioSession::tx_tail_delay_ms/mox_tail_generation's doc
+    // comments -- consumed entirely by RadioSession::set_mox, nothing
+    // here needs to read them, just store them into the session.
+    tx_tail_delay_ms: Arc<AtomicU32>,
+    mox_tail_generation: Arc<AtomicU32>,
+    radio_mic_audio: Arc<Mutex<VecDeque<f32>>>,
+    tx_audio_source: Arc<AtomicU8>,
+    tci_wants_mic: Arc<AtomicBool>,
+    mic_ptt_enabled: Arc<AtomicBool>,
+    mic_bias_enabled: Arc<AtomicBool>,
+    mic_ptt_on_tip: Arc<AtomicBool>,
+    diversity_enabled: Arc<AtomicBool>,
+    diversity_gain_db: Arc<AtomicU32>,
+    diversity_phase_deg: Arc<AtomicU32>,
+    diversity_main_raw_iq: Arc<Mutex<VecDeque<IqSample>>>,
+    puresignal_enabled: Arc<AtomicBool>,
+) -> io::Result<RadioSession> {
+    // A saved rate only sticks if it's one rtlsdr.rs can decimate to
+    // exactly (see rtlsdr::decimation_for_output_rate); main.rs's
+    // connect_to_device already does the same check, this is the backstop.
+    let output_rate = sample_rate.load(Ordering::Relaxed);
+    let output_rate =
+        if rtlsdr::decimation_for_output_rate(output_rate).is_some() { output_rate } else { rtlsdr::DEFAULT_OUTPUT_RATE_HZ };
+    sample_rate.store(output_rate, Ordering::Relaxed);
+
+    let controls = Arc::new(rtlsdr::Controls {
+        direct_sampling: AtomicU8::new(settings.rtlsdr_direct_sampling),
+        tuner_agc: AtomicBool::new(settings.rtlsdr_tuner_agc),
+    });
+
+    // Receive-only, single receiver -- see discover_rtlsdr_usb's
+    // supported_receivers. The extra_* vectors stay empty; they exist
+    // only for RadioSession's struct shape.
+    let iq_buffers: Vec<Arc<Mutex<VecDeque<IqSample>>>> =
+        vec![Arc::new(Mutex::new(VecDeque::with_capacity(IQ_BUFFER_CAPACITY)))];
+    let extra_frequencies_hz: Vec<Arc<AtomicU32>> = Vec::new();
+    let extra_sample_rates_hz: Vec<Arc<AtomicU32>> = Vec::new();
+    let extra_adcs: Vec<Arc<AtomicU32>> = Vec::new();
+    let active_receiver_count = Arc::new(AtomicU32::new(1));
+    let disable_pa = Arc::new(AtomicBool::new(false));
+    let tune_active = Arc::new(AtomicBool::new(false));
+    let oc_rx = Arc::new(AtomicU8::new(0));
+    let oc_tx = Arc::new(AtomicU8::new(0));
+    let rit_enabled = Arc::new(AtomicBool::new(settings.rit_enabled));
+    let rit_offset_hz = Arc::new(AtomicI32::new(settings.rit_offset_hz));
+    let xit_enabled = Arc::new(AtomicBool::new(settings.xit_enabled));
+    let xit_offset_hz = Arc::new(AtomicI32::new(settings.xit_offset_hz));
+
+    let stop_flag = Arc::new(AtomicBool::new(false));
+    let (receiver_thread, control_thread) = spawn_rtlsdr_threads(
+        &iq_buffers[0],
+        &frequency_hz,
+        &rx_attenuation,
+        &controls,
+        &stop_flag,
+        output_rate,
+    )?;
+
+    let mute_local_audio_for_tci = Arc::new(AtomicBool::new(false));
+
+    Ok(RadioSession {
+        iq_buffers,
+        frequency_hz,
+        tx_frequency_hz,
+        rx_frequency_hz,
+        requested_frequency_hz,
+        sample_rate,
+        adc,
+        rx_antenna,
+        tx_antenna,
+        disable_pa,
+        tune_active,
+        oc_rx,
+        oc_tx,
+        rx_attenuation,
+        ps_tx_attenuation,
+        extra_frequencies_hz,
+        extra_sample_rates_hz,
+        extra_adcs,
+        active_receiver_count,
+        ps_rx_feedback_iq,
+        ps_tx_feedback_iq,
+        mox,
+        tx_tail_delay_ms,
+        mox_tail_generation,
+        mute_local_audio_for_tci,
+        rit_enabled,
+        rit_offset_hz,
+        xit_enabled,
+        xit_offset_hz,
+        tx_iq,
+        tci_tx_audio,
+        tci_tx_gain,
+        rx_audio_to_radio,
+        send_rx_audio_to_radio,
+        hl2_ak4951_codec,
+        new_pa_board,
+        filter_board,
+        charly25_preamp1,
+        charly25_preamp2,
+        radio_mic_audio,
+        tx_audio_source,
+        tci_wants_mic,
+        mic_ptt_enabled,
+        mic_bias_enabled,
+        mic_ptt_on_tip,
+        diversity_enabled,
+        diversity_gain_db,
+        diversity_phase_deg,
+        diversity_main_raw_iq,
+        puresignal_enabled,
+        tx_power_watts,
+        cw_keyer,
+        cw_mode_active,
+        pa_gain_db,
+        tx_forward_power,
+        tx_reverse_power,
+        adc0_overload,
+        adc1_overload,
+        cw_ptt_active,
+        cw_paddle_contacts,
+        tx_fifo_underrun,
+        tx_fifo_overrun,
+        stop_flag,
+        sender_thread: None,
+        receiver_thread: Some(receiver_thread),
+        tx_iq_thread: None,
+        rx_audio_thread: None,
+        diversity_combiner_thread: None,
+        diversity_combiner_stop: None,
+        protocol: 1,
+        radio_ip: device.address.ip(),
+        stop_socket: UdpSocket::bind(("0.0.0.0", 0))?,
+        is_ozy: false,
+        ozy_versions: None,
+        ozy_i2c_thread: None,
+        is_rx888: false,
+        usb_control_thread: Some(control_thread),
+        is_rtlsdr: true,
+        rtlsdr_controls: Some(controls),
+    })
+}
+
+/// Opens the dongle and starts its receiver + control threads. Shared
+/// by start_rtlsdr_usb and RadioSession::restart_rtlsdr_at_rate.
+fn spawn_rtlsdr_threads(
+    iq_buffer: &Arc<Mutex<VecDeque<IqSample>>>,
+    frequency_hz: &Arc<AtomicU32>,
+    rx_attenuation: &Arc<AtomicU32>,
+    controls: &Arc<rtlsdr::Controls>,
+    stop_flag: &Arc<AtomicBool>,
+    output_rate_hz: u32,
+) -> io::Result<(JoinHandle<()>, JoinHandle<()>)> {
+    let decimation = rtlsdr::decimation_for_output_rate(output_rate_hz)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, format!("RTL-SDR: unsupported rate {output_rate_hz}")))?;
+    // See rtlsdr::Decimator's doc comment -- the dongle sits this far
+    // above the dial so its own centre spike stays out of the way.
+    let offset_hz = rtlsdr::tuning_offset_hz(decimation);
+    let (device, rx_endpoint, name) = rtlsdr::initialise(
+        frequency_hz.load(Ordering::Relaxed) + offset_hz,
+        rx_attenuation.load(Ordering::Relaxed),
+        controls.tuner_agc.load(Ordering::Relaxed),
+        controls.direct_sampling.load(Ordering::Relaxed),
+    )?;
+    println!("RTL-SDR: {name} streaming at {} Hz, decimating by {decimation}", rtlsdr::DONGLE_RATE_HZ);
+
+    let receiver_buffer = Arc::clone(iq_buffer);
+    let receiver_stop = Arc::clone(stop_flag);
+    let receiver_thread = thread::spawn(move || {
+        rtlsdr_receiver_loop(rx_endpoint, receiver_buffer, receiver_stop, decimation);
+    });
+
+    let control_frequency_hz = Arc::clone(frequency_hz);
+    let control_rx_attenuation = Arc::clone(rx_attenuation);
+    let control_controls = Arc::clone(controls);
+    let control_stop = Arc::clone(stop_flag);
+    let control_thread = thread::spawn(move || {
+        rtlsdr_control_loop(device, control_frequency_hz, offset_hz, control_rx_attenuation, control_controls, control_stop);
+    });
+    Ok((receiver_thread, control_thread))
+}
+
+/// RTL-SDR receiver thread -- owns the bulk endpoint exclusively (see
+/// rx888_receiver_loop's doc comment for why control transfers live on
+/// a different thread) and decimates straight into iq_buffers[0]. No
+/// worker fan-out: one receiver, and a 1.536MS/s CIC is a trivial load.
+fn rtlsdr_receiver_loop(
+    mut rx_endpoint: rtlsdr::RxEndpoint,
+    iq_buffer: Arc<Mutex<VecDeque<IqSample>>>,
+    stop_flag: Arc<AtomicBool>,
+    decimation: u32,
+) {
+    let mut decimator = rtlsdr::Decimator::new(decimation);
+    let mut buf = vec![0u8; rtlsdr::STREAM_READ_SIZE];
+    while !stop_flag.load(Ordering::Relaxed) {
+        let n = match rx_endpoint.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) if e.kind() == io::ErrorKind::TimedOut => continue,
+            Err(e) => {
+                eprintln!("RTL-SDR: stream read failed: {e}");
+                break;
+            }
+        };
+        decimator.process_block(&buf[..n], |(iv, qv)| {
+            push_sample(&iq_buffer, IqSample { i: iv, q: qv }, IQ_BUFFER_CAPACITY);
+        });
+    }
+}
+
+/// How often rtlsdr_control_loop checks for changes. Short, because
+/// this is also how tuning reaches the hardware -- unlike the RX-888's
+/// software NCO, every VFO move is a real R82xx PLL retune.
+const RTLSDR_CONTROL_POLL: Duration = Duration::from_millis(20);
+
+/// Owns the dongle's control side: pushes VFO frequency, RF gain
+/// (`rx_attenuation`, whole dB), tuner AGC and direct-sampling changes
+/// to the hardware. Only the latest value of each is ever sent, so
+/// spinning the VFO quickly coalesces into one retune per poll rather
+/// than queuing a backlog of them.
+///
+/// The dongle is tuned `offset_hz` above the dial (see
+/// rtlsdr::Decimator's doc comment); the direct-sampling switch below
+/// still goes by the dial frequency itself.
+///
+/// Direct sampling switches automatically: tuned below
+/// rtlsdr::DIRECT_SAMPLING_BELOW_HZ with it enabled -> that ADC branch,
+/// otherwise the tuner. Switching back to the tuner re-runs its init
+/// (librtlsdr does the same), which resets its gain registers, so gain
+/// is re-applied after every mode change.
+fn rtlsdr_control_loop(
+    mut device: rtlsdr::RtlSdrDevice,
+    frequency_hz: Arc<AtomicU32>,
+    offset_hz: u32,
+    rx_attenuation: Arc<AtomicU32>,
+    controls: Arc<rtlsdr::Controls>,
+    stop_flag: Arc<AtomicBool>,
+) {
+    // initialise() already applied these.
+    let mut last_freq = frequency_hz.load(Ordering::Relaxed);
+    let mut last_gain = (rx_attenuation.load(Ordering::Relaxed), controls.tuner_agc.load(Ordering::Relaxed));
+    while !stop_flag.load(Ordering::Relaxed) {
+        let freq = frequency_hz.load(Ordering::Relaxed);
+        let ds_setting = controls.direct_sampling.load(Ordering::Relaxed);
+        let wanted_ds = if freq < rtlsdr::DIRECT_SAMPLING_BELOW_HZ { ds_setting } else { 0 };
+        let gain = (rx_attenuation.load(Ordering::Relaxed), controls.tuner_agc.load(Ordering::Relaxed));
+
+        let mut force_gain = false;
+        if wanted_ds != device.direct_sampling() {
+            if let Err(e) = device.set_direct_sampling(wanted_ds) {
+                eprintln!("RTL-SDR: direct sampling switch to {wanted_ds} failed: {e}");
+            }
+            force_gain = wanted_ds == 0;
+            last_freq = u32::MAX; // retune in the new mode
+        }
+        if freq != last_freq {
+            // Hardware sits offset_hz above the dial -- see
+            // rtlsdr::Decimator's doc comment.
+            if let Err(e) = device.set_center_freq(freq + offset_hz) {
+                eprintln!("RTL-SDR: tune to {} Hz failed: {e}", freq + offset_hz);
+            }
+            last_freq = freq;
+        }
+        // Gain only means anything with the tuner in use.
+        if device.direct_sampling() == 0 && (gain != last_gain || force_gain) {
+            if let Err(e) = device.set_gain(gain.1, gain.0.min(50) as i32 * 10) {
+                eprintln!("RTL-SDR: gain change failed: {e}");
+            }
+            last_gain = gain;
+        }
+        thread::sleep(RTLSDR_CONTROL_POLL);
+    }
+    device.close();
 }
 
 /// RX-888 receiver thread -- owns the bulk streaming `RxEndpoint`
@@ -5904,7 +6292,9 @@ fn start_protocol2(
         ozy_versions: None,
         ozy_i2c_thread: None,
         is_rx888: false,
-        rx888_control_thread: None,
+        usb_control_thread: None,
+        is_rtlsdr: false,
+        rtlsdr_controls: None,
     })
 }
 

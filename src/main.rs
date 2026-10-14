@@ -25,6 +25,7 @@ mod midi_import;
 mod ozy;
 mod radio;
 mod rigctl;
+mod rtlsdr;
 mod rx888;
 mod spectrum;
 mod tci;
@@ -70,7 +71,7 @@ struct Band {
     default_mode: spectrum::Mode,
 }
 
-const BANDS: [Band; 11] = [
+const BANDS: [Band; 14] = [
     Band { name: "160m", low_hz: 1_800_000, high_hz: 2_000_000, default_hz: 1_900_000, default_mode: spectrum::Mode::Lsb },
     Band { name: "80m", low_hz: 3_500_000, high_hz: 4_000_000, default_hz: 3_573_000, default_mode: spectrum::Mode::Lsb },
     Band { name: "60m", low_hz: 5_330_000, high_hz: 5_406_000, default_hz: 5_357_000, default_mode: spectrum::Mode::Usb }, // USB by regulatory convention despite being below 10MHz
@@ -82,6 +83,15 @@ const BANDS: [Band; 11] = [
     Band { name: "12m", low_hz: 24_890_000, high_hz: 24_990_000, default_hz: 24_915_000, default_mode: spectrum::Mode::Usb },
     Band { name: "10m", low_hz: 28_000_000, high_hz: 29_700_000, default_hz: 28_074_000, default_mode: spectrum::Mode::Usb },
     Band { name: "6m", low_hz: 50_000_000, high_hz: 54_000_000, default_hz: 50_313_000, default_mode: spectrum::Mode::Usb },
+    // VHF/UHF -- only reachable by the RTL-SDR so far (every band
+    // consumer filters by the device's own frequency_min/max, so no
+    // HPSDR board shows these). Ranges are the widest ITU-region
+    // allocation; defaults are the FT8 frequencies, matching HF's.
+    // Appended, never inserted: MidiAction::Band160m..Band6m index this
+    // array by position.
+    Band { name: "2m", low_hz: 144_000_000, high_hz: 148_000_000, default_hz: 144_174_000, default_mode: spectrum::Mode::Usb },
+    Band { name: "70cm", low_hz: 420_000_000, high_hz: 450_000_000, default_hz: 432_174_000, default_mode: spectrum::Mode::Usb },
+    Band { name: "23cm", low_hz: 1_240_000_000, high_hz: 1_300_000_000, default_hz: 1_296_174_000, default_mode: spectrum::Mode::Usb },
 ];
 
 fn band_for_frequency(freq_hz: u32) -> Option<&'static Band> {
@@ -878,8 +888,8 @@ fn dispatch_midi_event(connected: &mut ConnectedState, ev: RawMidiEvent, freq_hz
         | MidiAction::Band12m
         | MidiAction::Band10m
         | MidiAction::Band6m => {
-            // BANDS is [160m, 80m, 60m, 40m, 30m, 20m, 17m, 15m, 12m,
-            // 10m, 6m] -- 60m has no direct-select MIDI action (none of
+            // BANDS starts [160m, 80m, 60m, 40m, 30m, 20m, 17m, 15m, 12m,
+            // 10m, 6m] (VHF/UHF entries follow) -- 60m has no direct-select MIDI action (none of
             // this project's Thetis-import table entries asked for one;
             // BandUp/BandDown already reach it).
             let band = match binding.action {
@@ -957,6 +967,10 @@ fn dispatch_midi_event(connected: &mut ConnectedState, ev: RawMidiEvent, freq_hz
             {
                 let gain_db = midi_knob_range(ev.value, -12.0, 48.0);
                 connected.session.rx_attenuation.store((gain_db + 12.0).clamp(0.0, 60.0) as u32, Ordering::Relaxed);
+            } else if connected.device.board == Boards::RtlSdr {
+                // RTL-SDR: rx_attenuation is RF gain, 0-50 dB.
+                let gain_db = midi_knob_range(ev.value, 0.0, 50.0);
+                connected.session.rx_attenuation.store(gain_db.clamp(0.0, 50.0) as u32, Ordering::Relaxed);
             } else {
                 let atten = (ev.value as u32 * 31) / 127;
                 connected.session.rx_attenuation.store(atten, Ordering::Relaxed);
@@ -1976,6 +1990,10 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
     if device.board == Boards::Rx888 && rx888::ddc_params_for_output_rate(settings.sample_rate).is_none() {
         settings.sample_rate = rx888::OUTPUT_SAMPLE_RATE_HZ;
     }
+    // RTL-SDR: same idea -- only rates rtlsdr.rs can decimate to exactly.
+    if device.board == Boards::RtlSdr && rtlsdr::decimation_for_output_rate(settings.sample_rate).is_none() {
+        settings.sample_rate = rtlsdr::DEFAULT_OUTPUT_RATE_HZ;
+    }
     // Pre-size for multiple receivers, per whatever the
     // radio's own discovery reply reported supporting --
     // both protocols now genuinely support independent
@@ -1992,6 +2010,11 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
     settings.diversity_phase_deg = cfg.diversity_phase_deg.unwrap_or(0.0);
     if let Some(atten) = cfg.rx_attenuation {
         settings.rx_attenuation = atten;
+    } else if device.board == Boards::RtlSdr {
+        // rx_attenuation is the RTL-SDR's RF gain in dB (see
+        // rtlsdr::Controls' doc comment) -- the generic default would
+        // leave a never-configured dongle nearly deaf.
+        settings.rx_attenuation = 30;
     }
     if let Some(atten) = cfg.ps_tx_attenuation {
         settings.ps_tx_attenuation = atten;
@@ -2024,6 +2047,12 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
     settings.ozy_firmware_path = cfg.ozy_firmware_path.clone();
     settings.ozy_fpga_path = cfg.ozy_fpga_path.clone();
     settings.rx888_firmware_path = cfg.rx888_firmware_path.clone();
+    if let Some(v) = cfg.rtlsdr_direct_sampling {
+        settings.rtlsdr_direct_sampling = v.min(2);
+    }
+    if let Some(v) = cfg.rtlsdr_tuner_agc {
+        settings.rtlsdr_tuner_agc = v;
+    }
     match RadioSession::start(&device, settings.clone()) {
         Ok(session) => {
             // Override RadioSession::start's hardcoded
@@ -2452,7 +2481,7 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
             // (harmless -- there's no sender thread for this board to
             // act on any of it, see start_rx888_usb's doc comment -- but
             // confusing UI for hardware that can never transmit).
-            let tx_enabled = tx_enabled && device.board != Boards::Rx888;
+            let tx_enabled = tx_enabled && !matches!(device.board, Boards::Rx888 | Boards::RtlSdr);
 
             println!(
                 "Started {:?} at {} (protocol {}, {} ADC(s), reports supporting {} receiver(s))",
@@ -6896,7 +6925,8 @@ impl eframe::App for HpsdrApp {
                                         ));
                                         ui.end_row();
 
-                                        let is_usb_board = matches!(connected.device.board, Boards::Ozy | Boards::Rx888);
+                                        let is_usb_board =
+                                            matches!(connected.device.board, Boards::Ozy | Boards::Rx888 | Boards::RtlSdr);
                                         ui.label("IP Address:");
                                         ui.label(if is_usb_board {
                                             "USB".to_string()
@@ -7296,6 +7326,9 @@ impl eframe::App for HpsdrApp {
                                         // rates are P2-only).
                                         let rates: &[u32] = if connected.device.board == Boards::Rx888 {
                                             &[96_000, 192_000, 384_000]
+                                        } else if connected.device.board == Boards::RtlSdr {
+                                            // See rtlsdr::SUPPORTED_OUTPUT_RATES.
+                                            &rtlsdr::SUPPORTED_OUTPUT_RATES
                                         } else if connected.device.protocol == 2 {
                                             &[48_000, 96_000, 192_000, 384_000, 768_000, 1_536_000]
                                         } else {
@@ -7320,6 +7353,11 @@ impl eframe::App for HpsdrApp {
                                             "Changing this stops streaming, reprograms the RX-888's own ADC clock, \
                                              and restarts it -- a bigger interruption than a real P1/P2 radio's \
                                              live rate change, but still brief.",
+                                        );
+                                    } else if connected.device.board == Boards::RtlSdr {
+                                        ui.weak(
+                                            "The dongle always samples at 1536 kHz; this picks how far that is \
+                                             decimated. Changing it briefly stops and restarts streaming.",
                                         );
                                     } else {
                                         ui.weak(
@@ -7383,7 +7421,58 @@ impl eframe::App for HpsdrApp {
                                     // plain "RX Attenuation" slider too, same as any other
                                     // board there.
                                     {
-                                        if connected.device.protocol == 1
+                                        if let Some(controls) = connected.session.rtlsdr_controls.clone() {
+                                            // RTL-SDR: rx_attenuation holds the R82xx's RF gain
+                                            // in whole dB (see rtlsdr::Controls' doc comment).
+                                            let mut agc = controls.tuner_agc.load(Ordering::Relaxed);
+                                            let mut gain_db =
+                                                connected.session.rx_attenuation.load(Ordering::Relaxed).min(50) as i32;
+                                            ui.horizontal(|ui| {
+                                                ui.label("RF Gain:");
+                                                ui.add_enabled_ui(!agc, |ui| {
+                                                    if scroll_slider_i32(
+                                                        ui,
+                                                        &mut connected.slider_scroll_accum,
+                                                        &mut gain_db,
+                                                        0..=50,
+                                                        1,
+                                                        " dB",
+                                                    ) {
+                                                        connected
+                                                            .session
+                                                            .rx_attenuation
+                                                            .store(gain_db as u32, Ordering::Relaxed);
+                                                        settings_changed = true;
+                                                    }
+                                                });
+                                                if ui.checkbox(&mut agc, "Tuner AGC").changed() {
+                                                    controls.tuner_agc.store(agc, Ordering::Relaxed);
+                                                    settings_changed = true;
+                                                }
+                                            });
+                                            ui.weak(
+                                                "R820T2 LNA + mixer gain, snapped to the tuner's own steps (0-49.6 dB). \
+                                                 Lower it if strong signals produce spurs or a raised noise floor.",
+                                            );
+                                            ui.add_space(4.0);
+                                            let mut ds = controls.direct_sampling.load(Ordering::Relaxed);
+                                            ui.horizontal(|ui| {
+                                                ui.label("Below 24 MHz:");
+                                                for (value, label) in [(0u8, "Off"), (1, "Direct sampling (I)"), (2, "Direct sampling (Q)")] {
+                                                    if ui.add(egui::Button::selectable(ds == value, label)).clicked() && ds != value {
+                                                        ds = value;
+                                                        controls.direct_sampling.store(ds, Ordering::Relaxed);
+                                                        settings_changed = true;
+                                                    }
+                                                }
+                                            });
+                                            ui.weak(
+                                                "The tuner stops at ~24 MHz. Below that, direct sampling feeds the antenna \
+                                                 straight into one of the RTL2832U's ADC inputs -- only useful on a dongle \
+                                                 modified (or built) for HF; an unmodified NESDR Smart just shows noise. \
+                                                 RF Gain has no effect in direct sampling mode.",
+                                            );
+                                        } else if connected.device.protocol == 1
                                             && matches!(connected.device.board, Boards::HermesLite | Boards::HermesLite2)
                                         {
                                             // ROOT CAUSE FIX: this was hardcoded to wire value 0
@@ -8140,7 +8229,7 @@ impl eframe::App for HpsdrApp {
                                     // RX-888: receive-only hardware, no TX capability at
                                     // all -- don't let this checkbox re-enable the MOX/
                                     // TUNE/etc. row the connect-time override above hides.
-                                    if connected.device.board == Boards::Rx888 {
+                                    if matches!(connected.device.board, Boards::Rx888 | Boards::RtlSdr) {
                                         ui.weak("Enable Transmit (receive-only hardware)");
                                     } else {
                                     let mut tx_enabled = connected.tx_enabled;
@@ -9740,6 +9829,16 @@ impl eframe::App for HpsdrApp {
                         ozy_firmware_path: connected.ozy_firmware_path.clone(),
                         ozy_fpga_path: connected.ozy_fpga_path.clone(),
                         rx888_firmware_path: connected.rx888_firmware_path.clone(),
+                        rtlsdr_direct_sampling: connected
+                            .session
+                            .rtlsdr_controls
+                            .as_ref()
+                            .map(|c| c.direct_sampling.load(Ordering::Relaxed)),
+                        rtlsdr_tuner_agc: connected
+                            .session
+                            .rtlsdr_controls
+                            .as_ref()
+                            .map(|c| c.tuner_agc.load(Ordering::Relaxed)),
                         rigctl_addr: Some(connected.rigctl_addr.clone()),
                         tci_addr: Some(connected.tci_addr.clone()),
                         cat_addr: Some(connected.cat_addr.clone()),
@@ -10666,7 +10765,7 @@ fn default_max_tx_power_watts(board: Boards) -> u32 {
         // Receive-only hardware -- 0W makes the TX Power slider/control
         // meaningless rather than picking an arbitrary non-zero default
         // it can never actually reach. See radio.rs's start_rx888_usb.
-        Boards::Rx888 => 0,
+        Boards::Rx888 | Boards::RtlSdr => 0,
         Boards::Unknown => 100,
     }
 }
@@ -10729,7 +10828,7 @@ fn power_watts_and_swr(raw_forward: u32, raw_reverse: u32, board: Boards) -> (f3
         // all -- never actually displayed (max_tx_power_watts is 0, see
         // default_max_tx_power_watts), placeholder purely so this match
         // stays exhaustive.
-        Boards::Rx888 => (3.3, 0.09),
+        Boards::Rx888 | Boards::RtlSdr => (3.3, 0.09),
         Boards::Unknown => (3.3, 0.09),
     };
 
@@ -12516,11 +12615,11 @@ fn change_sample_rate(connected: &mut ConnectedState, new_rate: u32) {
     // RX-888: stop the old producer BEFORE the new WDSP channel below is
     // built, so nothing pushes old-rate samples into iq_buffers[0] while
     // the new channel expects the new rate -- see
-    // RadioSession::stop_rx888_threads's own doc comment for why this is
+    // RadioSession::stop_usb_sdr_threads's own doc comment for why this is
     // split into a stop call here and a restart call at the end of this
     // function rather than one atomic call. No-op for every other board.
-    if connected.device.board == Boards::Rx888 {
-        connected.session.stop_rx888_threads();
+    if matches!(connected.device.board, Boards::Rx888 | Boards::RtlSdr) {
+        connected.session.stop_usb_sdr_threads();
     }
 
     connected.session.set_sample_rate(new_rate);
@@ -12668,7 +12767,7 @@ fn change_sample_rate(connected: &mut ConnectedState, new_rate: u32) {
 
     // RX-888: restart the producer AFTER the new WDSP channel above
     // already exists and is listening on iq_buffers[0] -- see this
-    // function's own opening stop_rx888_threads call for the other half
+    // function's own opening stop_usb_sdr_threads call for the other half
     // of this ordering. Resolved rate may differ from `new_rate` if it
     // somehow wasn't one of ddc_params_for_output_rate's supported
     // presets (shouldn't happen -- the Sample Rate buttons only ever
@@ -12686,6 +12785,15 @@ fn change_sample_rate(connected: &mut ConnectedState, new_rate: u32) {
                 Err(e) => eprintln!("RX-888: failed to restart streaming at {new_rate}Hz: {e}"),
             },
             None => eprintln!("RX-888: no firmware path available, cannot restart streaming"),
+        }
+    }
+    if connected.device.board == Boards::RtlSdr {
+        match connected.session.restart_rtlsdr_at_rate(new_rate) {
+            Ok(actual_rate) => {
+                connected.sample_rate = actual_rate;
+                connected.session.sample_rate.store(actual_rate, Ordering::Relaxed);
+            }
+            Err(e) => eprintln!("RTL-SDR: failed to restart streaming at {new_rate}Hz: {e}"),
         }
     }
 

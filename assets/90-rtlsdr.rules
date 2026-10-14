@@ -1,0 +1,94 @@
+# udev rule for non-root USB access to RTL2832U "RTL-SDR" dongles (e.g.
+# NooElec NESDR Smart, 0bda:2838) -- one line per VID:PID in rtlsdr.rs's
+# KNOWN_DEVICES (itself librtlsdr's known_devices[] table), same
+# "standard permission rule" reasoning as 90-ozy.rules.
+#
+# No need to blacklist the dvb_usb_rtl28xxu kernel module: hpsdr-rs
+# detaches it when it opens the dongle.
+#
+# Install: copy to /etc/udev/rules.d/, then either replug the device or
+# run: sudo udevadm control --reload-rules && sudo udevadm trigger
+# Generic RTL2832U
+SUBSYSTEMS=="usb",ATTRS{idVendor}=="0bda",ATTRS{idProduct}=="2832",MODE="666"
+# Generic RTL2832U OEM
+SUBSYSTEMS=="usb",ATTRS{idVendor}=="0bda",ATTRS{idProduct}=="2838",MODE="666"
+# DigitalNow Quad DVB-T PCI-E card
+SUBSYSTEMS=="usb",ATTRS{idVendor}=="0413",ATTRS{idProduct}=="6680",MODE="666"
+# Leadtek WinFast DTV Dongle mini D
+SUBSYSTEMS=="usb",ATTRS{idVendor}=="0413",ATTRS{idProduct}=="6f0f",MODE="666"
+# Genius TVGo DVB-T03 USB dongle (Ver. B)
+SUBSYSTEMS=="usb",ATTRS{idVendor}=="0458",ATTRS{idProduct}=="707f",MODE="666"
+# Terratec Cinergy T Stick Black (rev 1)
+SUBSYSTEMS=="usb",ATTRS{idVendor}=="0ccd",ATTRS{idProduct}=="00a9",MODE="666"
+# Terratec NOXON DAB/DAB+ USB dongle (rev 1)
+SUBSYSTEMS=="usb",ATTRS{idVendor}=="0ccd",ATTRS{idProduct}=="00b3",MODE="666"
+# Terratec Deutschlandradio DAB Stick
+SUBSYSTEMS=="usb",ATTRS{idVendor}=="0ccd",ATTRS{idProduct}=="00b4",MODE="666"
+# Terratec NOXON DAB Stick - Radio Energy
+SUBSYSTEMS=="usb",ATTRS{idVendor}=="0ccd",ATTRS{idProduct}=="00b5",MODE="666"
+# Terratec Media Broadcast DAB Stick
+SUBSYSTEMS=="usb",ATTRS{idVendor}=="0ccd",ATTRS{idProduct}=="00b7",MODE="666"
+# Terratec BR DAB Stick
+SUBSYSTEMS=="usb",ATTRS{idVendor}=="0ccd",ATTRS{idProduct}=="00b8",MODE="666"
+# Terratec WDR DAB Stick
+SUBSYSTEMS=="usb",ATTRS{idVendor}=="0ccd",ATTRS{idProduct}=="00b9",MODE="666"
+# Terratec MuellerVerlag DAB Stick
+SUBSYSTEMS=="usb",ATTRS{idVendor}=="0ccd",ATTRS{idProduct}=="00c0",MODE="666"
+# Terratec Fraunhofer DAB Stick
+SUBSYSTEMS=="usb",ATTRS{idVendor}=="0ccd",ATTRS{idProduct}=="00c6",MODE="666"
+# Terratec Cinergy T Stick RC (Rev.3)
+SUBSYSTEMS=="usb",ATTRS{idVendor}=="0ccd",ATTRS{idProduct}=="00d3",MODE="666"
+# Terratec T Stick PLUS
+SUBSYSTEMS=="usb",ATTRS{idVendor}=="0ccd",ATTRS{idProduct}=="00d7",MODE="666"
+# Terratec NOXON DAB/DAB+ USB dongle (rev 2)
+SUBSYSTEMS=="usb",ATTRS{idVendor}=="0ccd",ATTRS{idProduct}=="00e0",MODE="666"
+# PixelView PV-DT235U(RN)
+SUBSYSTEMS=="usb",ATTRS{idVendor}=="1554",ATTRS{idProduct}=="5020",MODE="666"
+# Astrometa DVB-T/DVB-T2
+SUBSYSTEMS=="usb",ATTRS{idVendor}=="15f4",ATTRS{idProduct}=="0131",MODE="666"
+# HanfTek DAB+FM+DVB-T
+SUBSYSTEMS=="usb",ATTRS{idVendor}=="15f4",ATTRS{idProduct}=="0133",MODE="666"
+# Compro Videomate U620F
+SUBSYSTEMS=="usb",ATTRS{idVendor}=="185b",ATTRS{idProduct}=="0620",MODE="666"
+# Compro Videomate U650F
+SUBSYSTEMS=="usb",ATTRS{idVendor}=="185b",ATTRS{idProduct}=="0650",MODE="666"
+# Compro Videomate U680F
+SUBSYSTEMS=="usb",ATTRS{idVendor}=="185b",ATTRS{idProduct}=="0680",MODE="666"
+# GIGABYTE GT-U7300
+SUBSYSTEMS=="usb",ATTRS{idVendor}=="1b80",ATTRS{idProduct}=="d393",MODE="666"
+# DIKOM USB-DVBT HD
+SUBSYSTEMS=="usb",ATTRS{idVendor}=="1b80",ATTRS{idProduct}=="d394",MODE="666"
+# Peak 102569AGPK
+SUBSYSTEMS=="usb",ATTRS{idVendor}=="1b80",ATTRS{idProduct}=="d395",MODE="666"
+# KWorld KW-UB450-T USB DVB-T Pico TV
+SUBSYSTEMS=="usb",ATTRS{idVendor}=="1b80",ATTRS{idProduct}=="d397",MODE="666"
+# Zaapa ZT-MINDVBZP
+SUBSYSTEMS=="usb",ATTRS{idVendor}=="1b80",ATTRS{idProduct}=="d398",MODE="666"
+# SVEON STV20 DVB-T USB & FM
+SUBSYSTEMS=="usb",ATTRS{idVendor}=="1b80",ATTRS{idProduct}=="d39d",MODE="666"
+# Twintech UT-40
+SUBSYSTEMS=="usb",ATTRS{idVendor}=="1b80",ATTRS{idProduct}=="d3a4",MODE="666"
+# ASUS U3100MINI_PLUS_V2
+SUBSYSTEMS=="usb",ATTRS{idVendor}=="1b80",ATTRS{idProduct}=="d3a8",MODE="666"
+# SVEON STV27 DVB-T USB & FM
+SUBSYSTEMS=="usb",ATTRS{idVendor}=="1b80",ATTRS{idProduct}=="d3af",MODE="666"
+# SVEON STV21 DVB-T USB & FM
+SUBSYSTEMS=="usb",ATTRS{idVendor}=="1b80",ATTRS{idProduct}=="d3b0",MODE="666"
+# Dexatek DK DVB-T Dongle (Logilink VG0002A)
+SUBSYSTEMS=="usb",ATTRS{idVendor}=="1d19",ATTRS{idProduct}=="1101",MODE="666"
+# Dexatek DK DVB-T Dongle (MSI DigiVox mini II V3.0)
+SUBSYSTEMS=="usb",ATTRS{idVendor}=="1d19",ATTRS{idProduct}=="1102",MODE="666"
+# Dexatek Technology Ltd. DK 5217 DVB-T Dongle
+SUBSYSTEMS=="usb",ATTRS{idVendor}=="1d19",ATTRS{idProduct}=="1103",MODE="666"
+# MSI DigiVox Micro HD
+SUBSYSTEMS=="usb",ATTRS{idVendor}=="1d19",ATTRS{idProduct}=="1104",MODE="666"
+# Sweex DVB-T USB
+SUBSYSTEMS=="usb",ATTRS{idVendor}=="1f4d",ATTRS{idProduct}=="a803",MODE="666"
+# GTek T803
+SUBSYSTEMS=="usb",ATTRS{idVendor}=="1f4d",ATTRS{idProduct}=="b803",MODE="666"
+# Lifeview LV5TDeluxe
+SUBSYSTEMS=="usb",ATTRS{idVendor}=="1f4d",ATTRS{idProduct}=="c803",MODE="666"
+# MyGica TD312
+SUBSYSTEMS=="usb",ATTRS{idVendor}=="1f4d",ATTRS{idProduct}=="d286",MODE="666"
+# PROlectrix DV107669
+SUBSYSTEMS=="usb",ATTRS{idVendor}=="1f4d",ATTRS{idProduct}=="d803",MODE="666"

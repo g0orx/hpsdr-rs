@@ -40,6 +40,8 @@ Also, separately: the original Ozy/Mercury/Penny hardware (Protocol 1 over USB r
 
 And separately again: the receive-only [RX-888 Mk2](#rx-888-mk2-receive-only-direct-sampling-sdr) direct-sampling SDR — see that section below. **Confirmed working against real hardware.**
 
+And: receive-only [RTL-SDR dongles](#rtl-sdr-dongles-receive-only) (RTL2832U + R820T/R820T2/R828D tuner, e.g. the NooElec NESDR Smart) — see that section below. **Confirmed working on a real NESDR Smart v5.**
+
 ## Building
 
 Developed and tested primarily on Linux. A Windows build (via MSVC + vcpkg)
@@ -203,6 +205,39 @@ Once set up, the RX-888 shows up in the normal Discover window like any
 other radio (as "USB" instead of an IP address) — select it and click
 Start. The receiver's step attenuator (0-31dB) reuses the existing
 Settings → RX Attenuation control rather than adding a new one.
+
+## RTL-SDR dongles (receive-only)
+
+> **Confirmed working** on a real NooElec NESDR Smart v5 (HF direct
+> sampling, 2m and 70cm).
+
+RTL2832U-based dongles with a Rafael Micro R820T, R820T2 or R828D tuner
+— the NooElec NESDR Smart, RTL-SDR Blog V3/V4 and most generic DVB-T
+sticks. (Older E4000/FC0012/FC0013/FC2580-tuner sticks aren't supported.)
+The driver is a pure-Rust port of osmocom librtlsdr over nusb, so there's
+no librtlsdr or libusb to install.
+
+- Tunes **~24 MHz – 1.766 GHz** with the tuner; **2m, 70cm and 23cm**
+  band buttons appear for it alongside 10m/6m.
+- Below 24 MHz, **direct sampling** (Settings → RX, I or Q branch) is used
+  automatically — this needs a dongle modified or built for HF; an
+  unmodified NESDR Smart just shows noise there.
+- **RF Gain** (0–50 dB, or **Tuner AGC**) is in Settings → RX.
+- Sample rates **48–1536 kHz**; one receiver.
+
+Setup:
+
+1. **Linux only**: copy [`assets/90-rtlsdr.rules`](assets/90-rtlsdr.rules)
+   to `/etc/udev/rules.d/`, then
+   `sudo udevadm control --reload-rules && sudo udevadm trigger` (or
+   replug). The kernel's DVB-T driver doesn't need blacklisting —
+   hpsdr-rs detaches it when it opens the dongle.
+2. **Windows only**: bind WinUSB to the dongle (usually `0bda:2838`)
+   with [Zadig](https://zadig.akeo.ie/), the same as for any other
+   RTL-SDR software.
+3. **macOS**: no extra driver needed — untested.
+
+See [the full RTL-SDR chapter](docs/manual/21-rtl-sdr.md).
 
 ## Packaging (Debian/Ubuntu)
 

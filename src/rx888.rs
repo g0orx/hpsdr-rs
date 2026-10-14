@@ -1006,8 +1006,8 @@ const HEADROOM_FACTOR: f64 = 0.2;
 /// DC-normalized (taps sum to exactly 1.0) so it only reshapes the
 /// passband, never changes overall level -- Ddc's own `gain_comp` still
 /// owns all absolute scaling, unaffected by this.
-const CIC_COMPENSATOR_LEN: usize = 15;
-const CIC_COMPENSATOR_TAPS: [f64; CIC_COMPENSATOR_LEN] = [
+pub(crate) const CIC_COMPENSATOR_LEN: usize = 15;
+pub(crate) const CIC_COMPENSATOR_TAPS: [f64; CIC_COMPENSATOR_LEN] = [
     -0.006_742_892_2,
     0.014_180_213_7,
     -0.039_822_118_7,

@@ -283,6 +283,12 @@ pub struct Config {
     /// third-party upstream, see rx888.rs's module doc comment.
     #[serde(default)]
     pub rx888_firmware_path: Option<String>,
+    /// RTL-SDR only -- see rtlsdr::Controls' doc comment. `None` falls
+    /// back to radio::RadioSettings' defaults (Q-branch, tuner AGC off).
+    #[serde(default)]
+    pub rtlsdr_direct_sampling: Option<u8>,
+    #[serde(default)]
+    pub rtlsdr_tuner_agc: Option<bool>,
     /// Spectrum/waterfall display range while transmitting -- separate
     /// from db_low/db_high/waterfall_db_low/waterfall_db_high (which
     /// are for receiving) because a locally-picked-up TX signal is

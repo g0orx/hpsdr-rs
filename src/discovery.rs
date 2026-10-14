@@ -13,6 +13,7 @@
 use crate::config::Config;
 use crate::ozy;
 use crate::rx888;
+use crate::rtlsdr;
 use network_interface::{Addr, NetworkInterface, NetworkInterfaceConfig};
 use serde::{Deserialize, Serialize};
 use socket2::{Domain, Socket, Type};
@@ -49,6 +50,12 @@ pub enum Boards {
     /// this board (set to 1 only as a harmless placeholder; nothing
     /// reads it for an Rx888 device).
     Rx888,
+    /// RTL2832U + R820T/R820T2/R828D "RTL-SDR" dongle (e.g. NooElec
+    /// NESDR Smart) -- receive-only, raw USB like Rx888, and like it has
+    /// no P1/P2 framing at all; see rtlsdr.rs and radio.rs's
+    /// start_rtlsdr_usb. `Device::protocol` is the same meaningless
+    /// placeholder 1 as Rx888's.
+    RtlSdr,
     Unknown,
 }
 
@@ -381,6 +388,7 @@ pub fn discover(devices: Arc<Mutex<Vec<Device>>>, interface_names: Arc<Mutex<Has
     // real cost to doing it inline first.
     discover_ozy_usb(&devices);
     discover_rx888_usb(&devices);
+    discover_rtlsdr_usb(&devices);
 
     let interfaces = match NetworkInterface::show() {
         Ok(v) => v,
@@ -507,6 +515,43 @@ fn discover_rx888_usb(devices: &Arc<Mutex<Vec<Device>>>) {
         // fail clearly once they do (radio.rs's start_rx888_usb hits
         // the same check again at connect time, via rx888::initialise).
         usb_link_speed_warning: rx888::link_speed_warning(firmware_path.as_deref()),
+    });
+}
+
+/// Sentinel MAC for the synthetic RTL-SDR `Device` entry below -- see
+/// RX888_SENTINEL_MAC for why each USB board needs its own.
+pub const RTLSDR_SENTINEL_MAC: [u8; 6] = [0, 0, 0, 0, 0, 2];
+
+/// Same idea as discover_rx888_usb: a synthetic row for a plugged-in
+/// RTL-SDR dongle. Nothing is opened here -- the dongle is only claimed
+/// (and the Linux DVB-T driver detached) at connect time, in
+/// rtlsdr::initialise.
+fn discover_rtlsdr_usb(devices: &Arc<Mutex<Vec<Device>>>) {
+    if rtlsdr::discover().is_none() {
+        return;
+    }
+    let sentinel = SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0);
+    devices.lock().unwrap().push(Device {
+        address: sentinel,
+        my_address: sentinel,
+        device: 0,
+        board: Boards::RtlSdr,
+        protocol: 1, // meaningless for this board -- see Boards::RtlSdr's doc comment
+        version: 0,
+        status: 2, // available
+        mac: RTLSDR_SENTINEL_MAC,
+        // One receiver: unlike the RX-888's whole-HF capture, extra
+        // receivers here could only live inside the dongle's own
+        // ~1.5MHz window, which isn't wired up (yet).
+        supported_receivers: 1,
+        supported_transmitters: 0, // receive-only hardware
+        adcs: 1,
+        // 0, not the tuner's ~24MHz floor: below that, direct sampling
+        // (Settings -> RX) covers HF on a modified dongle. Leaving the
+        // HF band buttons available is what makes that reachable.
+        frequency_min: 0,
+        frequency_max: rtlsdr::FREQUENCY_MAX_HZ,
+        usb_link_speed_warning: None,
     });
 }
 
