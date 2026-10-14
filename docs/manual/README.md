@@ -27,6 +27,7 @@ from source and project status, see the [top-level README](../../README.md).
 19. [Ozy USB](19-ozy-usb.md) -- connecting the original Ozy/Mercury/Penny hardware over USB (new, unconfirmed)
 20. [RX-888 Mk2](20-rx888-mk2.md) -- receive-only direct-sampling SDR, software DDC, multiple receivers
 21. [RTL-SDR](21-rtl-sdr.md) -- receive-only RTL2832U + R820T2 dongles (e.g. NooElec NESDR Smart), VHF/UHF and direct-sampling HF
+22. [MSI.SDR](22-msi-sdr.md) -- receive-only Mirics MSi2500 + MSi001 sticks (MSI.SDR, SDRplay RSP1), HF to 2 GHz
 
 **PDF**: this whole manual is also available as a single PDF, useful for
 offline/printed reading. It's built automatically by the "Manual PDF"

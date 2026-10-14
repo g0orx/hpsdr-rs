@@ -1,4 +1,4 @@
-[← RX-888 Mk2](20-rx888-mk2.md) | [Index](README.md)
+[← RX-888 Mk2](20-rx888-mk2.md) | [Index](README.md) | [MSI.SDR →](22-msi-sdr.md)
 
 # RTL-SDR dongles (receive-only)
 
@@ -96,4 +96,4 @@ any rate.
 
 ---
 
-[← RX-888 Mk2](20-rx888-mk2.md) | [Index](README.md)
+[← RX-888 Mk2](20-rx888-mk2.md) | [Index](README.md) | [MSI.SDR →](22-msi-sdr.md)

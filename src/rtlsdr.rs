@@ -9,9 +9,11 @@
     8-bit I/Q at the configured rate over a bulk endpoint. Unlike the
     RX-888, that stream is ALREADY complex baseband centred on the tuned
     frequency (the R82xx mixes RF down to a low IF, the RTL2832U's own
-    DDC brings it to zero), so there's no NCO here -- just a CIC
+    DDC brings it to zero), so tuning needs no NCO here -- just a CIC
     decimator from the dongle's fixed DONGLE_RATE_HZ down to whichever
-    WDSP-recognised rate the user picked (see `decimation_for_output_rate`).
+    WDSP-recognised rate the user picked (see `decimation_for_output_rate`),
+    plus a fixed offset-tuning shift (see `Decimator`). mirisdr.rs reuses
+    that same Decimator.
 
     PORTED, not invented: every register sequence below is a
     transcription of osmocom librtlsdr v2.0.2 (~/github/rtl-sdr,
@@ -1392,6 +1394,14 @@ pub struct Decimator {
 
 impl Decimator {
     pub fn new(decimation: u32) -> Self {
+        Self::with_full_scale(decimation, 255.0)
+    }
+
+    /// For a source other than this dongle's centred 8-bit samples
+    /// (mirisdr.rs's 14-bit ones): `full_scale` is the input magnitude
+    /// that should map to IqSample's own full scale, before
+    /// HEADROOM_FACTOR.
+    pub fn with_full_scale(decimation: u32, full_scale: f64) -> Self {
         let decimation = decimation.max(1);
         let cic_gain = if decimation > 1 { (decimation as f64).powi(CIC_STAGES as i32) } else { 1.0 };
         let phase_inc =
@@ -1401,7 +1411,7 @@ impl Decimator {
             count: 0,
             stages_i: [CicStage::default(); CIC_STAGES],
             stages_q: [CicStage::default(); CIC_STAGES],
-            gain_comp: (8_388_608.0 / 255.0) * HEADROOM_FACTOR / (cic_gain * CIC_INPUT_SCALE),
+            gain_comp: (8_388_608.0 / full_scale) * HEADROOM_FACTOR / (cic_gain * CIC_INPUT_SCALE),
             use_compensator: decimation >= 4,
             comp_hist_i: [0.0; rx888::CIC_COMPENSATOR_LEN],
             comp_hist_q: [0.0; rx888::CIC_COMPENSATOR_LEN],
@@ -1437,6 +1447,14 @@ impl Decimator {
     }
 
     fn process_pairs(&mut self, bytes: &[u8], emit: &mut impl FnMut((i32, i32))) {
+        // 1: centre.
+        let samples = bytes.chunks_exact(2).map(|p| ((2 * p[0] as i32 - 255) as f64, (2 * p[1] as i32 - 255) as f64));
+        self.process_samples(samples, emit);
+    }
+
+    /// Steps 2-4 of the doc comment above, on already-centred samples
+    /// (scaled so `full_scale` -- see `with_full_scale` -- is full scale).
+    pub fn process_samples(&mut self, samples: impl Iterator<Item = (f64, f64)>, emit: &mut impl FnMut((i32, i32))) {
         let decimation = self.decimation;
         let gain_comp = self.gain_comp;
         let (mut prev_in_i, mut prev_in_q) = self.dc_prev_in;
@@ -1448,10 +1466,8 @@ impl Decimator {
         let mut stages_i = self.stages_i;
         let mut stages_q = self.stages_q;
 
-        for pair in bytes.chunks_exact(2) {
-            // 1 + 2: centre, then DC-block.
-            let x_i = (2 * pair[0] as i32 - 255) as f64;
-            let x_q = (2 * pair[1] as i32 - 255) as f64;
+        for (x_i, x_q) in samples {
+            // 2: DC-block.
             let y_i = x_i - prev_in_i + DC_BLOCK_POLE * prev_out_i;
             let y_q = x_q - prev_in_q + DC_BLOCK_POLE * prev_out_q;
             prev_in_i = x_i;

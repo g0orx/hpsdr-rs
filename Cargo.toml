@@ -160,6 +160,7 @@ assets = [
     # rule above.
     ["assets/90-rx888.rules", "usr/share/doc/hpsdr-rs/90-rx888.rules", "644"],
     ["assets/90-rtlsdr.rules", "usr/share/doc/hpsdr-rs/90-rtlsdr.rules", "644"],
+    ["assets/90-mirisdr.rules", "usr/share/doc/hpsdr-rs/90-mirisdr.rules", "644"],
     # Ozy's FX2 firmware + FPGA bitstream -- sourced from the author's
     # own piHPSDR repo (github.com/g0orx/pihpsdr), same GPL-2.0 license
     # as this project, not a third-party blob. Installed to

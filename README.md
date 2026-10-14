@@ -42,6 +42,8 @@ And separately again: the receive-only [RX-888 Mk2](#rx-888-mk2-receive-only-dir
 
 And: receive-only [RTL-SDR dongles](#rtl-sdr-dongles-receive-only) (RTL2832U + R820T/R820T2/R828D tuner, e.g. the NooElec NESDR Smart) — see that section below. **Confirmed working on a real NESDR Smart v5.**
 
+And: receive-only [MSI.SDR / MSi2500 sticks](#msisdr--msi2500-sticks-receive-only) (Mirics MSi2500 + MSi001, also the SDRplay RSP1) — see that section below. **Confirmed working on a real MSI.SDR stick.**
+
 ## Building
 
 Developed and tested primarily on Linux. A Windows build (via MSVC + vcpkg)
@@ -238,6 +240,33 @@ Setup:
 3. **macOS**: no extra driver needed — untested.
 
 See [the full RTL-SDR chapter](docs/manual/21-rtl-sdr.md).
+
+## MSI.SDR / MSi2500 sticks (receive-only)
+
+> **Confirmed working** on a real MSI.SDR stick.
+
+Mirics MSi2500 + MSi001 receivers (USB `1df7:2500`): the cheap
+"MSI.SDR" sticks and the original SDRplay RSP1. The driver is a pure-Rust
+port of libmirisdr-4 over nusb, so there's no libmirisdr, SDRplay API or
+libusb to install.
+
+- Tunes **HF to ~2 GHz** natively (no direct-sampling mod needed); every
+  HF band plus **2m, 70cm and 23cm** band buttons.
+- **RF Gain** (0–102 dB) is in Settings → RX.
+- Sample rates **48–1536 kHz**; one receiver.
+
+Setup:
+
+1. **Linux only**: copy [`assets/90-mirisdr.rules`](assets/90-mirisdr.rules)
+   to `/etc/udev/rules.d/`, then
+   `sudo udevadm control --reload-rules && sudo udevadm trigger` (or
+   replug). The kernel's `msi2500` driver doesn't need blacklisting:
+   hpsdr-rs detaches it when it opens the stick.
+2. **Windows only**: bind WinUSB to `1df7:2500` with
+   [Zadig](https://zadig.akeo.ie/). Untested.
+3. **macOS**: no extra driver needed. Untested.
+
+See [the full MSI.SDR chapter](docs/manual/22-msi-sdr.md).
 
 ## Packaging (Debian/Ubuntu)
 

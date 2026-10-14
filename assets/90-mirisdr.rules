@@ -1,0 +1,24 @@
+# udev rule for non-root USB access to Mirics MSi2500 receivers (e.g. the
+# "MSI.SDR" sticks and SDRplay RSP1, 1df7:2500) -- one line per VID:PID in
+# mirisdr.rs's KNOWN_DEVICES (itself libmirisdr-4's mirisdr_devices[]
+# table), same "standard permission rule" reasoning as 90-ozy.rules.
+#
+# No need to blacklist the msi2500/msi001 kernel modules: hpsdr-rs
+# detaches them when it opens the stick.
+#
+# Install: copy to /etc/udev/rules.d/, then either replug the device or
+# run: sudo udevadm control --reload-rules && sudo udevadm trigger
+# Mirics MSi2500 default (e.g. VTX3D card)
+SUBSYSTEMS=="usb",ATTRS{idVendor}=="1df7",ATTRS{idProduct}=="2500",MODE="666"
+# SDRplay RSP1A
+SUBSYSTEMS=="usb",ATTRS{idVendor}=="1df7",ATTRS{idProduct}=="3000",MODE="666"
+# SDRplay RSP2
+SUBSYSTEMS=="usb",ATTRS{idVendor}=="1df7",ATTRS{idProduct}=="3010",MODE="666"
+# Hauppauge WinTV 133559 LF
+SUBSYSTEMS=="usb",ATTRS{idVendor}=="2040",ATTRS{idProduct}=="d300",MODE="666"
+# AverMedia A859 Pure DVBT
+SUBSYSTEMS=="usb",ATTRS{idVendor}=="07ca",ATTRS{idProduct}=="8591",MODE="666"
+# IO-DATA GV-TV100 stick
+SUBSYSTEMS=="usb",ATTRS{idVendor}=="04bb",ATTRS{idProduct}=="0537",MODE="666"
+# Logitec LDT-1S310U/J
+SUBSYSTEMS=="usb",ATTRS{idVendor}=="0511",ATTRS{idProduct}=="0037",MODE="666"

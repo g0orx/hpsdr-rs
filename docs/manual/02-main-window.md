@@ -107,7 +107,7 @@ stored value directly, or use the buttons between the two boxes:
 
 One row of band buttons -- **160m, 80m, 60m, 40m, 30m, 20m, 17m, 15m, 12m,
 10m, 6m**, plus **2m, 70cm, 23cm** on a VHF/UHF-capable board such as an
-[RTL-SDR](21-rtl-sdr.md) -- jumps to that band's remembered frequency, mode, and filter
+[RTL-SDR](21-rtl-sdr.md) or [MSI.SDR](22-msi-sdr.md) -- jumps to that band's remembered frequency, mode, and filter
 width (or sensible defaults the first time you visit a band). Each band
 remembers its own settings independently as you use the app. A band whose
 range the connected radio can't actually tune to doesn't get a button at

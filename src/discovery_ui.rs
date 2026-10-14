@@ -388,7 +388,7 @@ impl DiscoveryWindow {
                             // sentinels for it (see discover_ozy_usb's doc
                             // comment), so show "USB" instead of formatting
                             // them like a real IP/interface.
-                            let interface_cell = if matches!(dev.board, Boards::Ozy | Boards::Rx888 | Boards::RtlSdr) {
+                            let interface_cell = if matches!(dev.board, Boards::Ozy | Boards::Rx888 | Boards::RtlSdr | Boards::MsiSdr) {
                                 "USB".to_string()
                             } else {
                                 match interface_names.get(&dev.my_address.ip()) {
@@ -404,7 +404,7 @@ impl DiscoveryWindow {
                             );
                             row_clicked |= resp.clicked();
                             row_double_clicked |= resp.double_clicked();
-                            let ip_cell = if matches!(dev.board, Boards::Ozy | Boards::Rx888 | Boards::RtlSdr) {
+                            let ip_cell = if matches!(dev.board, Boards::Ozy | Boards::Rx888 | Boards::RtlSdr | Boards::MsiSdr) {
                                 "USB".to_string()
                             } else {
                                 dev.address.ip().to_string()

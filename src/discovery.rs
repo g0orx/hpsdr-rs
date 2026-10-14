@@ -13,6 +13,7 @@
 use crate::config::Config;
 use crate::ozy;
 use crate::rx888;
+use crate::mirisdr;
 use crate::rtlsdr;
 use network_interface::{Addr, NetworkInterface, NetworkInterfaceConfig};
 use serde::{Deserialize, Serialize};
@@ -53,9 +54,14 @@ pub enum Boards {
     /// RTL2832U + R820T/R820T2/R828D "RTL-SDR" dongle (e.g. NooElec
     /// NESDR Smart) -- receive-only, raw USB like Rx888, and like it has
     /// no P1/P2 framing at all; see rtlsdr.rs and radio.rs's
-    /// start_rtlsdr_usb. `Device::protocol` is the same meaningless
+    /// start_usb_dongle. `Device::protocol` is the same meaningless
     /// placeholder 1 as Rx888's.
     RtlSdr,
+    /// Mirics MSi2500 + MSi001 ("MSI.SDR" stick, SDRplay RSP1) --
+    /// receive-only raw USB, same shape as RtlSdr; see mirisdr.rs and
+    /// radio.rs's start_usb_dongle. `Device::protocol` is the same
+    /// meaningless placeholder 1.
+    MsiSdr,
     Unknown,
 }
 
@@ -389,6 +395,7 @@ pub fn discover(devices: Arc<Mutex<Vec<Device>>>, interface_names: Arc<Mutex<Has
     discover_ozy_usb(&devices);
     discover_rx888_usb(&devices);
     discover_rtlsdr_usb(&devices);
+    discover_mirisdr_usb(&devices);
 
     let interfaces = match NetworkInterface::show() {
         Ok(v) => v,
@@ -551,6 +558,36 @@ fn discover_rtlsdr_usb(devices: &Arc<Mutex<Vec<Device>>>) {
         // HF band buttons available is what makes that reachable.
         frequency_min: 0,
         frequency_max: rtlsdr::FREQUENCY_MAX_HZ,
+        usb_link_speed_warning: None,
+    });
+}
+
+/// Sentinel MAC for the synthetic MSi2500 `Device` entry below.
+pub const MIRISDR_SENTINEL_MAC: [u8; 6] = [0, 0, 0, 0, 0, 3];
+
+/// Same idea as discover_rtlsdr_usb, for an MSi2500 stick. Nothing is
+/// opened here -- see mirisdr::initialise.
+fn discover_mirisdr_usb(devices: &Arc<Mutex<Vec<Device>>>) {
+    if mirisdr::discover().is_none() {
+        return;
+    }
+    let sentinel = SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0);
+    devices.lock().unwrap().push(Device {
+        address: sentinel,
+        my_address: sentinel,
+        device: 0,
+        board: Boards::MsiSdr,
+        protocol: 1, // meaningless for this board -- see Boards::MsiSdr's doc comment
+        version: 0,
+        status: 2, // available
+        mac: MIRISDR_SENTINEL_MAC,
+        // One receiver, same reasoning as discover_rtlsdr_usb.
+        supported_receivers: 1,
+        supported_transmitters: 0, // receive-only hardware
+        adcs: 1,
+        // The MSi001's AM path covers HF natively (see mirisdr.rs).
+        frequency_min: 0,
+        frequency_max: mirisdr::FREQUENCY_MAX_HZ,
         usb_link_speed_warning: None,
     });
 }
