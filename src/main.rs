@@ -1261,7 +1261,7 @@ impl Default for MidiLearnState {
 struct FrequencyEntry {
     vfo_b: bool,
     /// ASCII '0'-'9' only, most-significant digit first, whole Hz --
-    /// e.g. "14074000" displays as "14.074.000" (format_frequency).
+    /// e.g. "14074000" displays as "14.074000" (format_frequency).
     /// Empty until the user presses a digit key, same as a phone
     /// dialer starting blank rather than pre-filled.
     digits: String,
@@ -10537,20 +10537,13 @@ fn tci_status_hover(status: Option<bool>, addr: &str, server: Option<&TciServer>
     format!("{base}\nvia {ip_list}")
 }
 
+/// MHz, a single ".", then the remaining six digits (kHz+Hz) -- e.g.
+/// "14.074000", "10489.748300". No "Hz" suffix. Real request
+/// (2026-10-15): the earlier piHPSDR-style "."-every-three-digits form
+/// read badly once QO-100's 10GHz frequencies grew an extra group
+/// ("10.489.748.300").
 fn format_frequency(hz: u64) -> String {
-    // "." as the thousands separator, no "Hz" suffix -- matches piHPSDR's
-    // own VFO display convention (real request), rather than this
-    // project's earlier ","-separated "... Hz" format.
-    let digits = hz.to_string();
-    let bytes = digits.as_bytes();
-    let mut out = String::new();
-    for (i, b) in bytes.iter().enumerate() {
-        if i > 0 && (bytes.len() - i) % 3 == 0 {
-            out.push('.');
-        }
-        out.push(*b as char);
-    }
-    out
+    format!("{}.{:06}", hz / 1_000_000, hz % 1_000_000)
 }
 
 /// Same accumulate-and-threshold pattern as frequency scroll-to-tune:
