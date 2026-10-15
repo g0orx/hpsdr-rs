@@ -236,6 +236,11 @@ const MAX_XVTRS: usize = 8;
 /// value is wanted.
 const CW_STUCK_KEY_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Longest frequency the keypad entry popup accepts, in digits -- 11
+/// reaches 99.99GHz so a microwave transverter's RF (e.g. QO-100's
+/// 10.4895GHz) can be typed directly.
+const MAX_FREQUENCY_ENTRY_DIGITS: usize = 11;
+
 /// A user-configured transverter: converts the radio's real tunable range
 /// (its IF -- e.g. 28-29.7MHz on 10m) to some other displayed/operating
 /// frequency (RF -- e.g. 144-144.5MHz on 2m) via an external analog box.
@@ -256,13 +261,12 @@ const CW_STUCK_KEY_TIMEOUT: Duration = Duration::from_secs(10);
 /// XVTR menu uses) -- `frequency_min_hz`/`frequency_max_hz` etc are
 /// meaningless until a name is set.
 ///
-/// Deliberately u32 (not u64) for frequency_min_hz/frequency_max_hz,
-/// matching every other frequency field in this project -- covers
-/// roughly 2m through 9cm transverters (the overwhelming majority of
-/// real-world use), but NOT microwave/QO-100-class transverters
-/// (10.489GHz), which would overflow u32. A full u64 migration would
-/// touch a very large number of already-carefully-tuned call sites
-/// throughout this project for a use case most users won't hit.
+/// frequency_min_hz/frequency_max_hz are u64 (and lo_offset_hz i64)
+/// so microwave setups fit -- e.g. QO-100 via an LNB: RF 10489.5MHz,
+/// LO offset 9750MHz, IF 739.5MHz. Only the RF/displayed side is u64
+/// (this, the VFO display, rx_frequency_hz/requested_frequency_hz for
+/// CAT/rigctl/TCI); the radio's own IF stays u32 like every other
+/// hardware frequency in this project.
 ///
 /// No PA-calibration-table entry and no S-meter/panadapter gain-
 /// calibration field (piHPSDR's `gaincalib`) -- transverter drive is set
@@ -278,8 +282,8 @@ const CW_STUCK_KEY_TIMEOUT: Duration = Duration::from_secs(10);
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct Xvtr {
     pub name: String,
-    pub frequency_min_hz: u32,
-    pub frequency_max_hz: u32,
+    pub frequency_min_hz: u64,
+    pub frequency_max_hz: u64,
     pub lo_offset_hz: i64,
     pub lo_error_hz: i64,
     pub disable_pa: bool,
@@ -310,7 +314,7 @@ fn xvtr_rf_offset(xvtr: &Xvtr) -> i64 {
 /// `rf_freq_hz` -- used at the "set" boundary (CAT/rigctl/TCI set-
 /// frequency, XVTR band-button clicks), where the incoming value is
 /// already in RF/displayed space.
-fn xvtr_for_rf_freq(xvtrs: &[Xvtr], rf_freq_hz: u32) -> Option<&Xvtr> {
+fn xvtr_for_rf_freq(xvtrs: &[Xvtr], rf_freq_hz: u64) -> Option<&Xvtr> {
     xvtrs
         .iter()
         .find(|x| !x.name.is_empty() && rf_freq_hz >= x.frequency_min_hz && rf_freq_hz <= x.frequency_max_hz)
@@ -1486,7 +1490,7 @@ struct ConnectedState {
     /// reconciled through the same CTUN-aware resolve_tune path any
     /// other frequency change goes through, then this is updated to
     /// match so the same request isn't reapplied every frame.
-    last_requested_frequency_hz: u32,
+    last_requested_frequency_hz: u64,
     /// VFO B -- a second, independently-remembered frequency. Set via
     /// the Copy A->B/Copy B->A/Swap A<->B buttons, or by scrolling
     /// directly on its own box (see vfo_b_scroll_accum below) -- unlike
@@ -2601,7 +2605,7 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                 width_memory: cfg.width_memory.clone(),
                 ctun,
                 ctun_frequency_hz,
-                last_requested_frequency_hz: initial_frequency_hz,
+                last_requested_frequency_hz: initial_frequency_hz as u64,
                 vfo_b_frequency_hz,
                 vfo_b_scroll_accum: 0.0,
                 split,
@@ -3186,7 +3190,7 @@ impl eframe::App for HpsdrApp {
                         Some(x) => (xvtr_rf_offset(x), x.disable_pa, Some(x.name.clone())),
                         None => (0, false, None),
                     };
-                let displayed_freq_hz = (dial_freq_hz as i64 + xvtr_rf_offset_hz).clamp(0, u32::MAX as i64) as u32;
+                let displayed_freq_hz = (dial_freq_hz as i64 + xvtr_rf_offset_hz).max(0) as u64;
                 connected
                     .session
                     .disable_pa
@@ -3713,7 +3717,7 @@ impl eframe::App for HpsdrApp {
                                             .add(
                                                 egui::Label::new(
                                                     egui::RichText::new(format_frequency(
-                                                        connected.vfo_b_frequency_hz,
+                                                        connected.vfo_b_frequency_hz.into(),
                                                     ))
                                                     .monospace()
                                                     .size(28.0)
@@ -3942,7 +3946,7 @@ impl eframe::App for HpsdrApp {
                                                 }
                                                 egui::Event::Text(t) => {
                                                     for c in t.chars() {
-                                                        if c.is_ascii_digit() && digits.len() < 9 {
+                                                        if c.is_ascii_digit() && digits.len() < MAX_FREQUENCY_ENTRY_DIGITS {
                                                             digits.push(c);
                                                         }
                                                     }
@@ -3959,7 +3963,7 @@ impl eframe::App for HpsdrApp {
                                         // yet) rather than blank -- makes
                                         // it clear this is a live preview,
                                         // not a label that's just missing.
-                                        let preview_hz: u32 = digits.parse().unwrap_or(0);
+                                        let preview_hz: u64 = digits.parse().unwrap_or(0);
                                         ui.label(
                                             egui::RichText::new(format_frequency(preview_hz))
                                                 .monospace()
@@ -3974,7 +3978,7 @@ impl eframe::App for HpsdrApp {
                                         for row in [['7', '8', '9'], ['4', '5', '6'], ['1', '2', '3']] {
                                             for d in row {
                                                 if ui.add_sized(button_size, egui::Button::new(d.to_string())).clicked()
-                                                    && digits.len() < 9
+                                                    && digits.len() < MAX_FREQUENCY_ENTRY_DIGITS
                                                 {
                                                     digits.push(d);
                                                 }
@@ -3985,7 +3989,7 @@ impl eframe::App for HpsdrApp {
                                             digits.clear();
                                         }
                                         if ui.add_sized(button_size, egui::Button::new("0")).clicked()
-                                            && digits.len() < 9
+                                            && digits.len() < MAX_FREQUENCY_ENTRY_DIGITS
                                         {
                                             digits.push('0');
                                         }
@@ -4016,11 +4020,24 @@ impl eframe::App for HpsdrApp {
 
                                     if apply {
                                         if !digits.is_empty() {
-                                            if let Ok(freq) = digits.parse::<u32>() {
-                                                let clamped = freq.clamp(
-                                                    connected.device.frequency_min as u32,
-                                                    connected.device.frequency_max as u32,
-                                                );
+                                            if let Ok(freq) = digits.parse::<u64>() {
+                                                // VFO-A entry is in RF/displayed
+                                                // space, like a CAT/rigctl/TCI
+                                                // set: a frequency inside a
+                                                // configured transverter's RF
+                                                // range selects it and tunes its
+                                                // IF (see active_xvtr's doc
+                                                // comment). VFO-B stays plain IF.
+                                                let xvtr = if vfo_b { None } else { xvtr_for_rf_freq(&connected.xvtrs, freq) };
+                                                let offset = xvtr.map(xvtr_rf_offset).unwrap_or(0);
+                                                let xvtr_name = xvtr.map(|x| x.name.clone());
+                                                let clamped = (freq as i64 - offset).clamp(
+                                                    connected.device.frequency_min as i64,
+                                                    connected.device.frequency_max as i64,
+                                                ) as u32;
+                                                if !vfo_b {
+                                                    connected.active_xvtr = xvtr_name;
+                                                }
                                                 if vfo_b {
                                                     connected.vfo_b_frequency_hz = clamped;
                                                 } else {
@@ -5519,7 +5536,7 @@ impl eframe::App for HpsdrApp {
                         // see xvtr_rf_offset_hz's doc comment -- matching
                         // the frequency-axis tick labels, which get the
                         // same treatment.
-                        let hover_freq_shown = (hover_freq as i64 + xvtr_rf_offset_hz).clamp(0, u32::MAX as i64) as u32;
+                        let hover_freq_shown = (hover_freq as i64 + xvtr_rf_offset_hz).max(0) as u64;
                         draw_freq_hover_tooltip(ui.painter(), pos, hover_freq_shown);
                     }
 
@@ -5698,7 +5715,7 @@ impl eframe::App for HpsdrApp {
                         if let Some(pos) = waterfall_click_resp.hover_pos() {
                             let hover_freq = round_to_step_hz(freq_at_x(pos.x, rect, freq_hz, sample_rate, connected.spectrum_zoom, pan_offset_hz), main_hover_scroll_step_hz(cw_mode, ui.input(|i| i.modifiers.shift), ui.input(|i| i.modifiers.ctrl)));
                             // See the spectrum pane's identical treatment above.
-                            let hover_freq_shown = (hover_freq as i64 + xvtr_rf_offset_hz).clamp(0, u32::MAX as i64) as u32;
+                            let hover_freq_shown = (hover_freq as i64 + xvtr_rf_offset_hz).max(0) as u64;
                             draw_freq_hover_tooltip(ui.painter(), pos, hover_freq_shown);
                         }
 
@@ -8673,8 +8690,8 @@ impl eframe::App for HpsdrApp {
                                          IF) to some other operating frequency (RF) via an external \
                                          analog box -- e.g. a 10m IF of 28-29.7MHz driving a 2m \
                                          transverter to cover 144-145.7MHz. RF = IF + LO Offset + LO \
-                                         Error. Only supports up to ~4.3GHz RF (not QO-100-class \
-                                         microwave transverters). Main receiver only -- extra \
+                                         Error, e.g. a QO-100 LNB: RF 10489500000-10490000000, LO \
+                                         Offset 9750000000 (IF 739.5MHz). All values are in Hz. Main receiver only -- extra \
                                          receiver windows are unaffected.",
                                     );
                                     ui.add_space(6.0);
@@ -8698,13 +8715,13 @@ impl eframe::App for HpsdrApp {
                                                 settings_changed = true;
                                             }
                                             if ui
-                                                .add(egui::DragValue::new(&mut xvtr.frequency_min_hz).range(0..=u32::MAX))
+                                                .add(egui::DragValue::new(&mut xvtr.frequency_min_hz))
                                                 .changed()
                                             {
                                                 settings_changed = true;
                                             }
                                             if ui
-                                                .add(egui::DragValue::new(&mut xvtr.frequency_max_hz).range(0..=u32::MAX))
+                                                .add(egui::DragValue::new(&mut xvtr.frequency_max_hz))
                                                 .changed()
                                             {
                                                 settings_changed = true;
@@ -10238,7 +10255,7 @@ fn spectrum_waterfall_divider(
 /// Small frequency readout drawn next to the mouse cursor while
 /// hovering the spectrum trace or waterfall, so you can read off the
 /// frequency under the pointer without having to tune there first.
-fn draw_freq_hover_tooltip(painter: &egui::Painter, pos: egui::Pos2, freq_hz: u32) {
+fn draw_freq_hover_tooltip(painter: &egui::Painter, pos: egui::Pos2, freq_hz: u64) {
     let text = format_khz(freq_hz as f64);
     let text_pos = pos + egui::vec2(12.0, -18.0);
     let bg_rect = egui::Rect::from_min_size(text_pos - egui::vec2(4.0, 3.0), egui::vec2(74.0, 18.0));
@@ -10520,7 +10537,7 @@ fn tci_status_hover(status: Option<bool>, addr: &str, server: Option<&TciServer>
     format!("{base}\nvia {ip_list}")
 }
 
-fn format_frequency(hz: u32) -> String {
+fn format_frequency(hz: u64) -> String {
     // "." as the thousands separator, no "Hz" suffix -- matches piHPSDR's
     // own VFO display convention (real request), rather than this
     // project's earlier ","-separated "... Hz" format.
@@ -11224,7 +11241,7 @@ fn render_extra_receiver_ui(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceiver>>) {
                 ui.label("VFO-A");
                 ui.add(
                     egui::Label::new(
-                        egui::RichText::new(format_frequency(dial_freq_hz))
+                        egui::RichText::new(format_frequency(dial_freq_hz.into()))
                             .monospace()
                             .size(28.0)
                             .strong()
@@ -11364,7 +11381,7 @@ fn render_extra_receiver_ui(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceiver>>) {
                 ui.label("VFO-B");
                 ui.add(
                     egui::Label::new(
-                        egui::RichText::new(format_frequency(rx.vfo_b_frequency_hz))
+                        egui::RichText::new(format_frequency(rx.vfo_b_frequency_hz.into()))
                             .monospace()
                             .size(28.0)
                             .strong()
@@ -11773,7 +11790,7 @@ fn render_extra_receiver_ui(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceiver>>) {
 
     if let Some(pos) = spectrum_resp.hover_pos() {
         let hover_freq = round_to_step_hz(freq_at_x(pos.x, rect, freq_hz, sample_rate, rx.spectrum_zoom, pan_offset_hz), scroll_tune_step_hz(cw_mode, ui.input(|i| i.modifiers.shift), ui.input(|i| i.modifiers.ctrl)));
-        draw_freq_hover_tooltip(ui.painter(), pos, hover_freq);
+        draw_freq_hover_tooltip(ui.painter(), pos, hover_freq.into());
     }
 
     // Waterfall disabled (Settings -> Spectrum): skip the divider, the
@@ -11914,7 +11931,7 @@ fn render_extra_receiver_ui(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceiver>>) {
         }
         if let Some(pos) = wf_resp.hover_pos() {
             let hover_freq = round_to_step_hz(freq_at_x(pos.x, wf_rect, freq_hz, sample_rate, rx.spectrum_zoom, pan_offset_hz), scroll_tune_step_hz(cw_mode, ui.input(|i| i.modifiers.shift), ui.input(|i| i.modifiers.ctrl)));
-            draw_freq_hover_tooltip(ui.painter(), pos, hover_freq);
+            draw_freq_hover_tooltip(ui.painter(), pos, hover_freq.into());
         }
 
         wf_rect.bottom()

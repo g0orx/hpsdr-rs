@@ -135,7 +135,7 @@ use crate::debug_log::DebugLog;
 use crate::spectrum::{Agc, DemodParams, Mode, NoiseBlanker, NoiseReduction, passband_for};
 use std::collections::VecDeque;
 use std::net::{TcpListener, TcpStream};
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -397,11 +397,11 @@ impl TciServer {
         // retuning the real hardware otherwise), since CTUN state lives
         // in the UI layer, not anywhere reachable from this server
         // thread.
-        requested_frequency_hz: Arc<AtomicU32>,
+        requested_frequency_hz: Arc<AtomicU64>,
         // See RadioSession::rx_frequency_hz's doc comment -- used for the
         // vfo/heartbeat frequency reports so a CTUN'd listen frequency is
         // reported correctly, not the parked hardware LO.
-        rx_frequency_hz: Arc<AtomicU32>,
+        rx_frequency_hz: Arc<AtomicU64>,
         // RadioSession::frequency_hz -- the real, parked hardware LO that
         // this project's raw wideband IQ tap (spectrum.rs's iq_out, what
         // dds/if below describe) is actually centered on. BUG FIX: dds/
@@ -654,8 +654,8 @@ fn send_logged(ws: &mut tungstenite::WebSocket<TcpStream>, logging: &DebugLog, m
 
 fn handle_client(
     stream: TcpStream,
-    requested_frequency_hz: Arc<AtomicU32>,
-    rx_frequency_hz: Arc<AtomicU32>,
+    requested_frequency_hz: Arc<AtomicU64>,
+    rx_frequency_hz: Arc<AtomicU64>,
     hw_frequency_hz: Arc<AtomicU32>,
     sample_rate: Arc<AtomicU32>,
     demod_params: DemodParamsCell,
@@ -1787,7 +1787,7 @@ fn decode_binary_message(data: &[u8]) -> Option<(u32, Vec<f32>)> {
 /// protocol itself says invalid commands should just be ignored.
 fn handle_command(
     cmd: &str,
-    requested_frequency_hz: &Arc<AtomicU32>,
+    requested_frequency_hz: &Arc<AtomicU64>,
     demod_params: &Arc<Mutex<DemodParams>>,
     mox: &Arc<AtomicBool>,
     // See main.rs's tx_frequency_allowed doc comment -- real request, a
@@ -1813,7 +1813,7 @@ fn handle_command(
         // vfo:receiver,vfo,frequency;
         "vfo" => {
             let f = args.get(2)?.parse::<f64>().ok()?;
-            let f = f.round().max(0.0) as u32;
+            let f = f.round().max(0.0) as u64;
             requested_frequency_hz.store(f, Ordering::Relaxed);
             Some(format!(
                 "vfo:{},{},{};",

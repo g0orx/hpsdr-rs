@@ -28,6 +28,20 @@ One row per slot, each with:
   input. This does **not** limit drive level by itself -- keep TX Power low
   regardless; it only stops the internal PA/relay from engaging.
 
+All frequencies are entered in **Hz**.
+
+### Example: QO-100 with an LNB
+
+A QO-100 narrowband downlink (10489.5-10490 MHz) received through a
+standard 9750 MHz LNB lands at an IF of 739.5-740 MHz, which an
+[RTL-SDR](21-rtl-sdr.md) or [MSI.SDR](22-msi-sdr.md) can tune directly:
+
+| Name | RF Min | RF Max | LO Offset | LO Error |
+|---|---|---|---|---|
+| QO-100 | 10489500000 | 10490000000 | 9750000000 | 0 |
+
+Use LO Error to correct for your LNB's actual LO drift.
+
 ## Using a configured transverter
 
 A configured, in-range slot appears as an extra button alongside the
@@ -39,13 +53,14 @@ Clicking it retunes to the slot's RF minimum. While active:
   [CAT/rigctl/TCI](11-settings-network.md) frequency reporting all show the
   real RF frequency, even though the radio's actual hardware LO stays at
   the true IF underneath.
+- Typing a frequency into VFO-A's keypad entry (right-click VFO-A) works in
+  RF too: a frequency inside a configured transverter's RF range selects
+  that transverter and tunes its IF. Up to 11 digits are accepted.
 - Clicking back to an ordinary band leaves the transverter and returns to
   plain IF display.
 
 ## Limitations
 
-- Supports up to ~4.3GHz of RF range (covers roughly 2m through 9cm) -- not
-  microwave/QO-100-class transverters.
 - Main receiver only -- extra receiver windows and
   [PA Calibration](13-pa-calibration.md) don't know about configured
   transverters.

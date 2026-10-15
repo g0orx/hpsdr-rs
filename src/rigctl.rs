@@ -53,7 +53,7 @@ use crate::spectrum::{DemodParams, Mode, SpectrumDisplay};
 use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -112,11 +112,11 @@ impl RigctlServer {
         // (moving the CTUN target if CTUN is on, retuning the real
         // hardware otherwise), since CTUN state lives in the UI layer,
         // not anywhere reachable from this server thread.
-        requested_frequency_hz: Arc<AtomicU32>,
+        requested_frequency_hz: Arc<AtomicU64>,
         // See RadioSession::rx_frequency_hz's doc comment -- used for
         // `f`/`\get_freq` so a CTUN'd listen frequency is reported
         // correctly, not the parked hardware LO.
-        rx_frequency_hz: Arc<AtomicU32>,
+        rx_frequency_hz: Arc<AtomicU64>,
         demod_params: Arc<Mutex<DemodParams>>,
         display: Arc<Mutex<SpectrumDisplay>>,
         mox: Arc<AtomicBool>,
@@ -277,8 +277,8 @@ impl Drop for RigctlServer {
 
 fn handle_client(
     stream: TcpStream,
-    requested_frequency_hz: Arc<AtomicU32>,
-    rx_frequency_hz: Arc<AtomicU32>,
+    requested_frequency_hz: Arc<AtomicU64>,
+    rx_frequency_hz: Arc<AtomicU64>,
     demod_params: DemodParamsCell,
     display: DisplayCell,
     mox: Arc<AtomicBool>,
@@ -376,8 +376,8 @@ fn handle_client(
 
 fn handle_command(
     cmd: &str,
-    requested_frequency_hz: &Arc<AtomicU32>,
-    rx_frequency_hz: &Arc<AtomicU32>,
+    requested_frequency_hz: &Arc<AtomicU64>,
+    rx_frequency_hz: &Arc<AtomicU64>,
     demod_params: &Arc<Mutex<DemodParams>>,
     display: &Arc<Mutex<SpectrumDisplay>>,
     mox: &Arc<AtomicBool>,
@@ -407,7 +407,7 @@ fn handle_command(
         }
         "F" | "\\set_freq" => match parts.next().and_then(|s| s.parse::<f64>().ok()) {
             Some(f) => {
-                requested_frequency_hz.store(f.round().max(0.0) as u32, Ordering::Relaxed);
+                requested_frequency_hz.store(f.round().max(0.0) as u64, Ordering::Relaxed);
                 "RPRT 0\n".to_string()
             }
             None => "RPRT -1\n".to_string(),

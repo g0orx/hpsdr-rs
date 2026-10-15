@@ -25,7 +25,7 @@ use crate::rx888;
 use std::collections::VecDeque;
 use std::io;
 use std::net::UdpSocket;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -507,7 +507,7 @@ pub struct RadioSession {
     /// so they report the CTUN'd listen frequency (what's actually being
     /// heard) rather than the parked hardware LO. See
     /// `requested_frequency_hz` below for the "set" side of this.
-    pub rx_frequency_hz: Arc<AtomicU32>,
+    pub rx_frequency_hz: Arc<AtomicU64>,
     /// Where rigctl/CAT/TCI's "set frequency" commands write their
     /// request, instead of `frequency_hz` directly -- CTUN state
     /// (`ConnectedState::ctun`/`ctun_frequency_hz`) lives in the UI layer,
@@ -523,7 +523,7 @@ pub struct RadioSession {
     /// tracking (the RXA shift is computed from `ctun_frequency_hz -
     /// frequency_hz`, so moving `frequency_hz` alone desyncs it) as well
     /// as ignoring the user's CTUN intent entirely.
-    pub requested_frequency_hz: Arc<AtomicU32>,
+    pub requested_frequency_hz: Arc<AtomicU64>,
     pub sample_rate: Arc<AtomicU32>,
     /// Which ADC (0-indexed) the primary receiver's DDC pulls from.
     pub adc: Arc<AtomicU32>,
@@ -1274,11 +1274,11 @@ impl RadioSession {
         let tx_frequency_hz = Arc::new(AtomicU32::new(settings.frequency_hz));
         // See RadioSession::rx_frequency_hz's doc comment. Same starting
         // value/reasoning as tx_frequency_hz above.
-        let rx_frequency_hz = Arc::new(AtomicU32::new(settings.frequency_hz));
+        let rx_frequency_hz = Arc::new(AtomicU64::new(settings.frequency_hz as u64));
         // See RadioSession::requested_frequency_hz's doc comment. Starts
         // equal to frequency_hz so the very first per-frame reconcile
         // sees no pending request.
-        let requested_frequency_hz = Arc::new(AtomicU32::new(settings.frequency_hz));
+        let requested_frequency_hz = Arc::new(AtomicU64::new(settings.frequency_hz as u64));
         let sample_rate = Arc::new(AtomicU32::new(settings.sample_rate));
         let adc = Arc::new(AtomicU32::new(0));
         let rx_antenna = Arc::new(AtomicU32::new(0));
@@ -1790,8 +1790,8 @@ fn start_protocol1(
     settings: RadioSettings,
     frequency_hz: Arc<AtomicU32>,
     tx_frequency_hz: Arc<AtomicU32>,
-    rx_frequency_hz: Arc<AtomicU32>,
-    requested_frequency_hz: Arc<AtomicU32>,
+    rx_frequency_hz: Arc<AtomicU64>,
+    requested_frequency_hz: Arc<AtomicU64>,
     sample_rate: Arc<AtomicU32>,
     adc: Arc<AtomicU32>,
     rx_antenna: Arc<AtomicU32>,
@@ -2243,8 +2243,8 @@ fn start_protocol1_ozy_usb(
     settings: RadioSettings,
     frequency_hz: Arc<AtomicU32>,
     tx_frequency_hz: Arc<AtomicU32>,
-    rx_frequency_hz: Arc<AtomicU32>,
-    requested_frequency_hz: Arc<AtomicU32>,
+    rx_frequency_hz: Arc<AtomicU64>,
+    requested_frequency_hz: Arc<AtomicU64>,
     sample_rate: Arc<AtomicU32>,
     adc: Arc<AtomicU32>,
     rx_antenna: Arc<AtomicU32>,
@@ -2567,8 +2567,8 @@ fn start_rx888_usb(
     settings: RadioSettings,
     frequency_hz: Arc<AtomicU32>,
     tx_frequency_hz: Arc<AtomicU32>,
-    rx_frequency_hz: Arc<AtomicU32>,
-    requested_frequency_hz: Arc<AtomicU32>,
+    rx_frequency_hz: Arc<AtomicU64>,
+    requested_frequency_hz: Arc<AtomicU64>,
     sample_rate: Arc<AtomicU32>,
     adc: Arc<AtomicU32>,
     rx_antenna: Arc<AtomicU32>,
@@ -2816,8 +2816,8 @@ fn start_usb_dongle(
     settings: RadioSettings,
     frequency_hz: Arc<AtomicU32>,
     tx_frequency_hz: Arc<AtomicU32>,
-    rx_frequency_hz: Arc<AtomicU32>,
-    requested_frequency_hz: Arc<AtomicU32>,
+    rx_frequency_hz: Arc<AtomicU64>,
+    requested_frequency_hz: Arc<AtomicU64>,
     sample_rate: Arc<AtomicU32>,
     adc: Arc<AtomicU32>,
     rx_antenna: Arc<AtomicU32>,
@@ -6010,8 +6010,8 @@ fn start_protocol2(
     settings: RadioSettings,
     frequency_hz: Arc<AtomicU32>,
     tx_frequency_hz: Arc<AtomicU32>,
-    rx_frequency_hz: Arc<AtomicU32>,
-    requested_frequency_hz: Arc<AtomicU32>,
+    rx_frequency_hz: Arc<AtomicU64>,
+    requested_frequency_hz: Arc<AtomicU64>,
     sample_rate: Arc<AtomicU32>,
     adc: Arc<AtomicU32>,
     rx_antenna: Arc<AtomicU32>,
