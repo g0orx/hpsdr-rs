@@ -41,7 +41,6 @@
 
 use nusb::transfer::{Bulk, ControlIn, ControlOut, ControlType, In, Recipient};
 use nusb::{Interface, MaybeFuture};
-use crate::rx888;
 use std::io::{self, Read};
 use std::sync::atomic::{AtomicBool, AtomicU8};
 use std::time::Duration;
@@ -1352,16 +1351,18 @@ const RENORM_INTERVAL: u32 = 4096;
 ///    zero. Not relying on the DC blocker alone matters: on its own it
 ///    would also notch out anything sitting exactly on the dial -- an AM
 ///    carrier, say.
-/// 4. N-stage CIC per rail (same wrapping i64 arithmetic as rx888::Ddc,
-///    see its CicStage doc comment for why wrapping integers rather
-///    than floats), then rx888's CIC compensator.
+/// 4. N-stage CIC per rail decimating by `decimation / 2` (same
+///    wrapping i64 arithmetic as rx888::Ddc, see its CicStage doc
+///    comment for why wrapping integers rather than floats) -- skipped
+///    entirely at decimation 2.
+/// 5. A final decimate-by-2 FIR (see `design_final_fir`) that both
+///    cancels the CIC's droop exactly and does the alias rejection the
+///    CIC is poor at. REAL REPORT (2026-10-14): the previous design (the
+///    whole decimation in the CIC, rx888's large-R compensator only from
+///    R=4) left a clearly curved spectrum at 768k -- a 5-stage CIC
+///    decimating by 2 is ~15dB down at the band edge.
 ///
-/// The compensator is skipped below a decimation of 4: it was designed
-/// against the large-R sinc^N approximation of the CIC response (see
-/// rx888::CIC_COMPENSATOR_TAPS), which is ~1dB off at the band edge for
-/// R=4 but ~4.6dB off at R=2 -- enough to visibly over-boost the edges,
-/// worse than the CIC's own droop it would be correcting. R=1 has no
-/// CIC (and no offset) at all.
+/// R=1 has no CIC, FIR or offset at all.
 ///
 /// Emits (i, -q): this codebase's I/Q convention is the conjugate of
 /// the standard one the RTL2832U produces (see rx888::Ddc::process_block's
@@ -1371,14 +1372,21 @@ const RENORM_INTERVAL: u32 = 4096;
 /// above, the centre spike gone and tuning accurate.
 pub struct Decimator {
     decimation: u32,
+    /// CIC decimation: decimation / 2 (the final FIR does the last 2x).
+    cic_decimation: u32,
     count: u32,
     stages_i: [CicStage; CIC_STAGES],
     stages_q: [CicStage; CIC_STAGES],
     gain_comp: f64,
-    use_compensator: bool,
-    comp_hist_i: [f64; rx888::CIC_COMPENSATOR_LEN],
-    comp_hist_q: [f64; rx888::CIC_COMPENSATOR_LEN],
-    comp_pos: usize,
+    fir_taps: Vec<f64>,
+    /// FIR history, each sample stored twice (at `fir_pos` and
+    /// `fir_pos + FIR_LEN`) so the latest FIR_LEN are always one
+    /// contiguous slice.
+    fir_hist_i: Vec<f64>,
+    fir_hist_q: Vec<f64>,
+    fir_pos: usize,
+    /// Whether the next FIR input produces an output (every other one).
+    fir_emit: bool,
     /// DC blocker state: previous input and output, per rail.
     dc_prev_in: (f64, f64),
     dc_prev_out: (f64, f64),
@@ -1403,19 +1411,22 @@ impl Decimator {
     /// HEADROOM_FACTOR.
     pub fn with_full_scale(decimation: u32, full_scale: f64) -> Self {
         let decimation = decimation.max(1);
-        let cic_gain = if decimation > 1 { (decimation as f64).powi(CIC_STAGES as i32) } else { 1.0 };
+        let cic_decimation = (decimation / 2).max(1);
+        let cic_gain = (cic_decimation as f64).powi(CIC_STAGES as i32);
         let phase_inc =
             2.0 * std::f64::consts::PI * tuning_offset_hz(decimation) as f64 / DONGLE_RATE_HZ as f64;
         Self {
             decimation,
+            cic_decimation,
             count: 0,
             stages_i: [CicStage::default(); CIC_STAGES],
             stages_q: [CicStage::default(); CIC_STAGES],
             gain_comp: (8_388_608.0 / full_scale) * HEADROOM_FACTOR / (cic_gain * CIC_INPUT_SCALE),
-            use_compensator: decimation >= 4,
-            comp_hist_i: [0.0; rx888::CIC_COMPENSATOR_LEN],
-            comp_hist_q: [0.0; rx888::CIC_COMPENSATOR_LEN],
-            comp_pos: 0,
+            fir_taps: if decimation > 1 { design_final_fir(cic_decimation) } else { Vec::new() },
+            fir_hist_i: vec![0.0; 2 * FIR_LEN],
+            fir_hist_q: vec![0.0; 2 * FIR_LEN],
+            fir_pos: 0,
+            fir_emit: false,
             dc_prev_in: (0.0, 0.0),
             dc_prev_out: (0.0, 0.0),
             osc: (1.0, 0.0),
@@ -1452,10 +1463,11 @@ impl Decimator {
         self.process_samples(samples, emit);
     }
 
-    /// Steps 2-4 of the doc comment above, on already-centred samples
+    /// Steps 2-5 of the doc comment above, on already-centred samples
     /// (scaled so `full_scale` -- see `with_full_scale` -- is full scale).
     pub fn process_samples(&mut self, samples: impl Iterator<Item = (f64, f64)>, emit: &mut impl FnMut((i32, i32))) {
         let decimation = self.decimation;
+        let cic_decimation = self.cic_decimation;
         let gain_comp = self.gain_comp;
         let (mut prev_in_i, mut prev_in_q) = self.dc_prev_in;
         let (mut prev_out_i, mut prev_out_q) = self.dc_prev_out;
@@ -1496,37 +1508,41 @@ impl Decimator {
             }
 
             // 4: CIC.
-            let mut i_val = (m_i * CIC_INPUT_SCALE) as i64;
-            let mut q_val = (m_q * CIC_INPUT_SCALE) as i64;
-            for stage in &mut stages_i {
-                stage.integrator = stage.integrator.wrapping_add(i_val);
-                i_val = stage.integrator;
-            }
-            for stage in &mut stages_q {
-                stage.integrator = stage.integrator.wrapping_add(q_val);
-                q_val = stage.integrator;
-            }
-            count += 1;
-            if count < decimation {
-                continue;
-            }
-            count = 0;
-            for stage in &mut stages_i {
-                let diff = i_val.wrapping_sub(stage.comb_prev);
-                stage.comb_prev = i_val;
-                i_val = diff;
-            }
-            for stage in &mut stages_q {
-                let diff = q_val.wrapping_sub(stage.comb_prev);
-                stage.comb_prev = q_val;
-                q_val = diff;
-            }
-            let (out_i, out_q) = if self.use_compensator {
-                self.compensate(i_val as f64 * gain_comp, q_val as f64 * gain_comp)
+            let (c_i, c_q) = if cic_decimation == 1 {
+                (m_i * CIC_INPUT_SCALE, m_q * CIC_INPUT_SCALE)
             } else {
-                (i_val as f64 * gain_comp, q_val as f64 * gain_comp)
+                let mut i_val = (m_i * CIC_INPUT_SCALE) as i64;
+                let mut q_val = (m_q * CIC_INPUT_SCALE) as i64;
+                for stage in &mut stages_i {
+                    stage.integrator = stage.integrator.wrapping_add(i_val);
+                    i_val = stage.integrator;
+                }
+                for stage in &mut stages_q {
+                    stage.integrator = stage.integrator.wrapping_add(q_val);
+                    q_val = stage.integrator;
+                }
+                count += 1;
+                if count < cic_decimation {
+                    continue;
+                }
+                count = 0;
+                for stage in &mut stages_i {
+                    let diff = i_val.wrapping_sub(stage.comb_prev);
+                    stage.comb_prev = i_val;
+                    i_val = diff;
+                }
+                for stage in &mut stages_q {
+                    let diff = q_val.wrapping_sub(stage.comb_prev);
+                    stage.comb_prev = q_val;
+                    q_val = diff;
+                }
+                (i_val as f64, q_val as f64)
             };
-            emit((out_i as i32, -(out_q as i32)));
+
+            // 5: final FIR, decimating by 2.
+            if let Some((out_i, out_q)) = self.fir_push(c_i * gain_comp, c_q * gain_comp) {
+                emit((out_i as i32, -(out_q as i32)));
+            }
         }
 
         self.dc_prev_in = (prev_in_i, prev_in_q);
@@ -1538,20 +1554,129 @@ impl Decimator {
         self.stages_q = stages_q;
     }
 
-    fn compensate(&mut self, i: f64, q: f64) -> (f64, f64) {
-        let len = rx888::CIC_COMPENSATOR_LEN;
-        self.comp_hist_i[self.comp_pos] = i;
-        self.comp_hist_q[self.comp_pos] = q;
-        let mut ci = 0.0;
-        let mut cq = 0.0;
-        for (k, &tap) in rx888::CIC_COMPENSATOR_TAPS.iter().enumerate() {
-            let idx = (self.comp_pos + len - k) % len;
-            ci += tap * self.comp_hist_i[idx];
-            cq += tap * self.comp_hist_q[idx];
+    /// Step 5: pushes one sample into the final FIR; every other call
+    /// returns a filtered output (polyphase -- the discarded outputs are
+    /// never computed).
+    fn fir_push(&mut self, i: f64, q: f64) -> Option<(f64, f64)> {
+        let pos = self.fir_pos;
+        self.fir_hist_i[pos] = i;
+        self.fir_hist_i[pos + FIR_LEN] = i;
+        self.fir_hist_q[pos] = q;
+        self.fir_hist_q[pos + FIR_LEN] = q;
+        self.fir_pos = (pos + 1) % FIR_LEN;
+        self.fir_emit = !self.fir_emit;
+        if !self.fir_emit {
+            return None;
         }
-        self.comp_pos = (self.comp_pos + 1) % len;
-        (ci, cq)
+        // The taps are symmetric, so the window's order doesn't matter.
+        let win_i = &self.fir_hist_i[pos + 1..pos + 1 + FIR_LEN];
+        let win_q = &self.fir_hist_q[pos + 1..pos + 1 + FIR_LEN];
+        let mut acc_i = 0.0;
+        let mut acc_q = 0.0;
+        for ((&t, &xi), &xq) in self.fir_taps.iter().zip(win_i).zip(win_q) {
+            acc_i += t * xi;
+            acc_q += t * xq;
+        }
+        Some((acc_i, acc_q))
     }
+}
+
+/// Final FIR: 2*FIR_HALF_LEN+1 taps, linear phase. Prototyped in numpy
+/// against the exact CIC response: 81 taps gives <0.04dB passband ripple
+/// and >66dB alias rejection at every decimation -- comfortably past an
+/// 8-bit RTL2832U and fine for the MSi2500's 14 bits.
+const FIR_HALF_LEN: usize = 40;
+const FIR_LEN: usize = 2 * FIR_HALF_LEN + 1;
+/// Band edges as fractions of the FIR's INPUT rate. After decimating by
+/// 2 these are 0.45/0.55 of the output rate: flat (and alias-free) over
+/// the middle 90% of the displayed span; the outer 5% each side rolls
+/// off and may carry the other edge's alias, as on any real decimator.
+const FIR_PASSBAND_EDGE: f64 = 0.225;
+const FIR_STOPBAND_EDGE: f64 = 0.275;
+/// Least-squares weight of the stopband error relative to the passband's.
+const FIR_STOPBAND_WEIGHT: f64 = 30.0;
+/// Frequency grid points (0..0.5) the least-squares fit is taken over.
+const FIR_DESIGN_GRID: usize = 4000;
+
+/// Magnitude of an N-stage, decimate-by-`r` CIC (normalised to unity at
+/// DC) at `f` cycles per sample of its OUTPUT rate.
+fn cic_response(f: f64, r: u32) -> f64 {
+    if r <= 1 {
+        return 1.0;
+    }
+    let x = std::f64::consts::PI * f / r as f64;
+    if x.abs() < 1e-12 {
+        return 1.0;
+    }
+    ((r as f64 * x).sin() / (r as f64 * x.sin())).abs().powi(CIC_STAGES as i32)
+}
+
+/// Weighted least-squares linear-phase lowpass whose passband is the
+/// inverse of the preceding CIC's droop (`cic_decimation`, 1 = no CIC),
+/// normalised to exactly unity gain at DC. Solved once per Decimator,
+/// so a rate change costs a fraction of a millisecond.
+fn design_final_fir(cic_decimation: u32) -> Vec<f64> {
+    let m = FIR_HALF_LEN;
+    // Normal equations A*a = b for the cosine coefficients a[0..=m] of
+    // H(f) = a0 + 2*sum(a_k cos(2*pi*k*f)).
+    let mut a = vec![vec![0.0; m + 1]; m + 1];
+    let mut b = vec![0.0; m + 1];
+    let mut basis = vec![0.0; m + 1];
+    for g in 0..FIR_DESIGN_GRID {
+        let f = 0.5 * g as f64 / (FIR_DESIGN_GRID - 1) as f64;
+        let (weight, desired) = if f <= FIR_PASSBAND_EDGE {
+            (1.0, 1.0 / cic_response(f, cic_decimation))
+        } else if f >= FIR_STOPBAND_EDGE {
+            (FIR_STOPBAND_WEIGHT, 0.0)
+        } else {
+            continue; // transition band: don't care
+        };
+        for (k, v) in basis.iter_mut().enumerate() {
+            let c = (2.0 * std::f64::consts::PI * k as f64 * f).cos();
+            *v = if k == 0 { c } else { 2.0 * c };
+        }
+        for r in 0..=m {
+            b[r] += weight * basis[r] * desired;
+            for c in 0..=m {
+                a[r][c] += weight * basis[r] * basis[c];
+            }
+        }
+    }
+    let coeffs = solve_linear(a, b);
+    let mut taps: Vec<f64> = (0..FIR_LEN).map(|n| coeffs[n.abs_diff(m)]).collect();
+    let dc: f64 = taps.iter().sum();
+    for t in &mut taps {
+        *t /= dc;
+    }
+    taps
+}
+
+/// Gaussian elimination with partial pivoting. Only used on
+/// design_final_fir's small, symmetric positive-definite system
+/// (condition number ~1e5), well within f64.
+fn solve_linear(mut a: Vec<Vec<f64>>, mut b: Vec<f64>) -> Vec<f64> {
+    let n = b.len();
+    for col in 0..n {
+        let pivot = (col..n).max_by(|&x, &y| a[x][col].abs().total_cmp(&a[y][col].abs())).unwrap();
+        a.swap(col, pivot);
+        b.swap(col, pivot);
+        let pivot_row = a[col].clone();
+        for row in col + 1..n {
+            let factor = a[row][col] / pivot_row[col];
+            if factor != 0.0 {
+                for (dst, &src) in a[row][col..].iter_mut().zip(&pivot_row[col..]) {
+                    *dst -= factor * src;
+                }
+                b[row] -= factor * b[col];
+            }
+        }
+    }
+    let mut x = vec![0.0; n];
+    for row in (0..n).rev() {
+        let s: f64 = (row + 1..n).map(|k| a[row][k] * x[k]).sum();
+        x[row] = (b[row] - s) / a[row][row];
+    }
+    x
 }
 
 #[cfg(test)]
@@ -1633,6 +1758,65 @@ mod tests {
             .sqrt();
         // Nearly all the power is in the steady (DC) component.
         assert!(mean_mag > 0.95 * rms, "mean {mean_mag} rms {rms}");
+    }
+
+    /// Output RMS of a unit complex tone at `f_out_hz` relative to the
+    /// dial (standard convention, before the offset shift), through a
+    /// float-input Decimator -- no 8-bit quantisation.
+    fn tone_rms(decimation: u32, f_out_hz: f64) -> f64 {
+        let off = tuning_offset_hz(decimation) as f64;
+        let f_in = f_out_hz - off;
+        let n = 120_000 * decimation as usize / 8 + 40_000;
+        let samples = (0..n).map(|k| {
+            let ph = 2.0 * std::f64::consts::PI * f_in * k as f64 / DONGLE_RATE_HZ as f64;
+            (1000.0 * ph.cos(), 1000.0 * ph.sin())
+        });
+        let mut d = Decimator::with_full_scale(decimation, 1000.0);
+        let mut out = Vec::new();
+        d.process_samples(samples, &mut |s| out.push(s));
+        let tail = &out[out.len() / 2..];
+        (tail.iter().map(|&(i, q)| (i as f64).powi(2) + (q as f64).powi(2)).sum::<f64>() / tail.len() as f64)
+            .sqrt()
+    }
+
+    #[test]
+    fn final_fir_is_symmetric_with_unity_dc_gain() {
+        for r in [1, 2, 4, 8, 16] {
+            let taps = design_final_fir(r);
+            assert_eq!(taps.len(), FIR_LEN);
+            assert!((taps.iter().sum::<f64>() - 1.0).abs() < 1e-12);
+            for k in 0..FIR_LEN {
+                assert_eq!(taps[k], taps[FIR_LEN - 1 - k]);
+            }
+        }
+    }
+
+    #[test]
+    fn passband_is_flat_at_every_decimation() {
+        // REAL REPORT: 768k (decimation 2) showed a clearly curved
+        // spectrum. Tones across the middle 90% of the output span,
+        // either side of the dial, must all come out within 0.1dB.
+        for decimation in [2, 4, 8, 32] {
+            let out_rate = (DONGLE_RATE_HZ / decimation) as f64;
+            let reference = tone_rms(decimation, 0.02 * out_rate);
+            for frac in [-0.44, -0.3, -0.15, 0.15, 0.3, 0.44] {
+                let db = 20.0 * (tone_rms(decimation, frac * out_rate) / reference).log10();
+                assert!(db.abs() < 0.1, "decimation {decimation}, {frac} of output rate: {db:.3}dB");
+            }
+        }
+    }
+
+    #[test]
+    fn aliases_are_rejected() {
+        // A tone one output-rate away from the passband aliases onto it
+        // after decimating; it must come out >60dB down.
+        for decimation in [2, 4, 8, 32] {
+            let out_rate = (DONGLE_RATE_HZ / decimation) as f64;
+            let wanted = tone_rms(decimation, 0.3 * out_rate);
+            let alias = tone_rms(decimation, (0.3 - 1.0) * out_rate);
+            let db = 20.0 * (alias / wanted).log10();
+            assert!(db < -60.0, "decimation {decimation}: alias only {db:.1}dB down");
+        }
     }
 
     #[test]
