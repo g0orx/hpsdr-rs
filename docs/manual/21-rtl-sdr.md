@@ -66,7 +66,8 @@ click **Start**.
   cause spurs or a raised noise floor. The **RF Attenuation** MIDI
   control drives this too.
 - **Tuner AGC** hands gain control to the tuner's own AGC instead.
-- Neither has any effect in direct sampling mode.
+- Neither has any effect in direct sampling mode, so both are greyed
+  out while you're tuned below 24 MHz with direct sampling on.
 
 ## Sample rate
 

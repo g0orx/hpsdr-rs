@@ -7436,9 +7436,14 @@ impl eframe::App for HpsdrApp {
                                             let mut agc = controls.tuner_agc.load(Ordering::Relaxed);
                                             let mut gain_db =
                                                 connected.session.rx_attenuation.load(Ordering::Relaxed).min(50) as i32;
+                                            // Same test rtlsdr_control_loop uses to pick the
+                                            // ADC branch: the tuner (and its gain) is bypassed.
+                                            let direct_sampling_active = controls.direct_sampling.load(Ordering::Relaxed) != 0
+                                                && connected.session.frequency_hz.load(Ordering::Relaxed)
+                                                    < rtlsdr::DIRECT_SAMPLING_BELOW_HZ;
                                             ui.horizontal(|ui| {
-                                                ui.label("RF Gain:");
-                                                ui.add_enabled_ui(!agc, |ui| {
+                                                ui.add_enabled(!direct_sampling_active, egui::Label::new("RF Gain:"));
+                                                ui.add_enabled_ui(!agc && !direct_sampling_active, |ui| {
                                                     if scroll_slider_i32(
                                                         ui,
                                                         &mut connected.slider_scroll_accum,
@@ -7454,9 +7459,15 @@ impl eframe::App for HpsdrApp {
                                                         settings_changed = true;
                                                     }
                                                 });
-                                                if ui.checkbox(&mut agc, "Tuner AGC").changed() {
+                                                if ui
+                                                    .add_enabled(!direct_sampling_active, egui::Checkbox::new(&mut agc, "Tuner AGC"))
+                                                    .changed()
+                                                {
                                                     controls.tuner_agc.store(agc, Ordering::Relaxed);
                                                     settings_changed = true;
+                                                }
+                                                if direct_sampling_active {
+                                                    ui.weak("(not used in direct sampling)");
                                                 }
                                             });
                                             ui.weak(
