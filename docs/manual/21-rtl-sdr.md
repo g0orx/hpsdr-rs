@@ -39,8 +39,14 @@ SoapySDR to install.
 ## Connecting
 
 Plug in the dongle and click **Rediscover** -- it appears in the list as
-board **RtlSdr**, with "USB" in place of an IP address. Select it and
-click **Start**.
+board **RtlSdr**, with "USB" and the USB port it's plugged into (e.g.
+`USB 1-3.2`) in place of an IP address. Select it and click **Start**.
+
+With more than one dongle plugged in, each gets its own row. Many
+dongles share the same serial number (often `00000001`), so hpsdr-rs
+tells them apart by USB port: each port keeps its own saved settings
+(frequency, gain, transverters and so on). Moving a dongle to a
+different port makes it look like a new dongle.
 
 ## Frequency coverage
 

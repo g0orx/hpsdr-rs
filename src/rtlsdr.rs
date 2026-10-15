@@ -41,6 +41,7 @@
 
 use nusb::transfer::{Bulk, ControlIn, ControlOut, ControlType, In, Recipient};
 use nusb::{Interface, MaybeFuture};
+use crate::usb_port;
 use std::io::{self, Read};
 use std::sync::atomic::{AtomicBool, AtomicU8};
 use std::time::Duration;
@@ -189,18 +190,23 @@ fn io_err(e: impl std::fmt::Display) -> io::Error {
     io::Error::other(e.to_string())
 }
 
-/// First plugged-in dongle matching KNOWN_DEVICES, if any -- for
-/// discovery.rs's synthetic Device row. No open/claim, safe to poll.
-pub fn discover() -> Option<&'static str> {
-    let devices = nusb::list_devices().wait().ok()?;
-    for d in devices {
-        if let Some(&(_, _, name)) =
-            KNOWN_DEVICES.iter().find(|&&(vid, pid, _)| vid == d.vendor_id() && pid == d.product_id())
-        {
-            return Some(name);
-        }
-    }
-    None
+fn is_known(info: &nusb::DeviceInfo) -> bool {
+    KNOWN_DEVICES.iter().any(|&(vid, pid, _)| vid == info.vendor_id() && pid == info.product_id())
+}
+
+/// Last byte of every RTL-SDR sentinel MAC -- see usb_port::port_mac.
+pub const MAC_TAG: u8 = 2;
+
+/// Every plugged-in dongle matching KNOWN_DEVICES, as usb_port::port_mac
+/// values in port order -- for discovery.rs's synthetic Device rows. No
+/// open/claim, safe to poll.
+pub fn discover() -> Vec<[u8; 6]> {
+    let Ok(devices) = nusb::list_devices().wait() else {
+        return Vec::new();
+    };
+    let mut found: Vec<_> = devices.filter(is_known).map(|d| usb_port::port_mac(&d, MAC_TAG)).collect();
+    found.sort();
+    found
 }
 
 // ---------------------------------------------------------------------
@@ -1150,13 +1156,18 @@ impl RtlSdrDevice {
     }
 }
 
-fn find_and_open() -> io::Result<(nusb::Device, Interface, String, bool)> {
+/// Opens the dongle in the USB port `mac` names (see usb_port::port_mac).
+fn find_and_open(mac: [u8; 6]) -> io::Result<(nusb::Device, Interface, String, bool)> {
     let info = nusb::list_devices()
         .wait()
         .map_err(io_err)?
-        .into_iter()
-        .find(|d| KNOWN_DEVICES.iter().any(|&(vid, pid, _)| vid == d.vendor_id() && pid == d.product_id()))
-        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no RTL-SDR dongle found on USB"))?;
+        .find(|d| is_known(d) && usb_port::port_mac(d, MAC_TAG) == mac)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("no RTL-SDR dongle found in USB port {}", usb_port::port_label(mac)),
+            )
+        })?;
     // rtlsdr_check_dongle_model(dev, "RTLSDRBlog", "Blog V4") -- exact
     // string match, as upstream. Windows doesn't cache these strings
     // (see nusb's DeviceInfo docs), so a Blog V4 there is treated as a
@@ -1177,15 +1188,17 @@ fn find_and_open() -> io::Result<(nusb::Device, Interface, String, bool)> {
 }
 
 /// rtlsdr_open, followed by the standard bring-up a client like rtl_sdr
-/// does (sample rate, gain, centre frequency, reset buffer). Returns the
-/// control half, the streaming half, and the dongle's product name.
+/// does (sample rate, gain, centre frequency, reset buffer), for the
+/// dongle `mac` (a discover() port MAC) names. Returns the control
+/// half, the streaming half, and the dongle's product name.
 pub fn initialise(
+    mac: [u8; 6],
     initial_freq_hz: u32,
     gain_db: u32,
     tuner_agc: bool,
     direct_sampling: u8,
 ) -> io::Result<(RtlSdrDevice, RxEndpoint, String)> {
-    let (device, mut interface, name, is_blog_v4) = find_and_open()?;
+    let (device, mut interface, name, is_blog_v4) = find_and_open(mac)?;
     let mut usb = Usb { interface: interface.clone() };
 
     // perform a dummy write, if it fails, reset the device
@@ -1196,7 +1209,7 @@ pub fn initialise(
         let _ = device.reset().wait();
         drop(device);
         std::thread::sleep(Duration::from_millis(500));
-        let (_, i, _, _) = find_and_open()?;
+        let (_, i, _, _) = find_and_open(mac)?;
         interface = i;
         usb = Usb { interface: interface.clone() };
     }

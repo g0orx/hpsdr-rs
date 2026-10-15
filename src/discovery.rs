@@ -14,6 +14,7 @@ use crate::config::Config;
 use crate::ozy;
 use crate::rx888;
 use crate::mirisdr;
+use crate::usb_port;
 use crate::rtlsdr;
 use network_interface::{Addr, NetworkInterface, NetworkInterfaceConfig};
 use serde::{Deserialize, Serialize};
@@ -525,71 +526,76 @@ fn discover_rx888_usb(devices: &Arc<Mutex<Vec<Device>>>) {
     });
 }
 
-/// Sentinel MAC for the synthetic RTL-SDR `Device` entry below -- see
-/// RX888_SENTINEL_MAC for why each USB board needs its own.
-pub const RTLSDR_SENTINEL_MAC: [u8; 6] = [0, 0, 0, 0, 0, 2];
-
-/// Same idea as discover_rx888_usb: a synthetic row for a plugged-in
-/// RTL-SDR dongle. Nothing is opened here -- the dongle is only claimed
-/// (and the Linux DVB-T driver detached) at connect time, in
-/// rtlsdr::initialise.
-fn discover_rtlsdr_usb(devices: &Arc<Mutex<Vec<Device>>>) {
-    if rtlsdr::discover().is_none() {
-        return;
+/// A device identified by its USB port (usb_port::port_mac) with no
+/// config of its own yet starts from the single shared config every
+/// device of its type used before, so upgrading doesn't lose settings.
+fn adopt_legacy_config(mac: [u8; 6]) {
+    let legacy = usb_port::legacy_mac(mac[5]);
+    if !Config::exists(mac) && Config::exists(legacy) {
+        Config::load(legacy).save(mac);
     }
-    let sentinel = SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0);
-    devices.lock().unwrap().push(Device {
-        address: sentinel,
-        my_address: sentinel,
-        device: 0,
-        board: Boards::RtlSdr,
-        protocol: 1, // meaningless for this board -- see Boards::RtlSdr's doc comment
-        version: 0,
-        status: 2, // available
-        mac: RTLSDR_SENTINEL_MAC,
-        // One receiver: unlike the RX-888's whole-HF capture, extra
-        // receivers here could only live inside the dongle's own
-        // ~1.5MHz window, which isn't wired up (yet).
-        supported_receivers: 1,
-        supported_transmitters: 0, // receive-only hardware
-        adcs: 1,
-        // 0, not the tuner's ~24MHz floor: below that, direct sampling
-        // (Settings -> RX) covers HF on a modified dongle. Leaving the
-        // HF band buttons available is what makes that reachable.
-        frequency_min: 0,
-        frequency_max: rtlsdr::FREQUENCY_MAX_HZ,
-        usb_link_speed_warning: None,
-    });
 }
 
-/// Sentinel MAC for the synthetic MSi2500 `Device` entry below.
-pub const MIRISDR_SENTINEL_MAC: [u8; 6] = [0, 0, 0, 0, 0, 3];
-
-/// Same idea as discover_rtlsdr_usb, for an MSi2500 stick. Nothing is
-/// opened here -- see mirisdr::initialise.
-fn discover_mirisdr_usb(devices: &Arc<Mutex<Vec<Device>>>) {
-    if mirisdr::discover().is_none() {
-        return;
-    }
+/// Same idea as discover_rx888_usb: a synthetic row per plugged-in
+/// RTL-SDR dongle, each keyed by the USB port it's in (see usb_port.rs
+/// for why not its serial). Nothing is opened here -- a dongle is only
+/// claimed (and the Linux DVB-T driver detached) at connect time, in
+/// rtlsdr::initialise.
+fn discover_rtlsdr_usb(devices: &Arc<Mutex<Vec<Device>>>) {
     let sentinel = SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0);
-    devices.lock().unwrap().push(Device {
-        address: sentinel,
-        my_address: sentinel,
-        device: 0,
-        board: Boards::MsiSdr,
-        protocol: 1, // meaningless for this board -- see Boards::MsiSdr's doc comment
-        version: 0,
-        status: 2, // available
-        mac: MIRISDR_SENTINEL_MAC,
-        // One receiver, same reasoning as discover_rtlsdr_usb.
-        supported_receivers: 1,
-        supported_transmitters: 0, // receive-only hardware
-        adcs: 1,
-        // The MSi001's AM path covers HF natively (see mirisdr.rs).
-        frequency_min: 0,
-        frequency_max: mirisdr::FREQUENCY_MAX_HZ,
-        usb_link_speed_warning: None,
-    });
+    for mac in rtlsdr::discover() {
+        adopt_legacy_config(mac);
+        devices.lock().unwrap().push(Device {
+            address: sentinel,
+            my_address: sentinel,
+            device: 0,
+            board: Boards::RtlSdr,
+            protocol: 1, // meaningless for this board -- see Boards::RtlSdr's doc comment
+            version: 0,
+            status: 2, // available
+            mac,
+            // One receiver: unlike the RX-888's whole-HF capture, extra
+            // receivers here could only live inside the dongle's own
+            // ~1.5MHz window, which isn't wired up (yet).
+            supported_receivers: 1,
+            supported_transmitters: 0, // receive-only hardware
+            adcs: 1,
+            // 0, not the tuner's ~24MHz floor: below that, direct sampling
+            // (Settings -> RX) covers HF on a modified dongle. Leaving the
+            // HF band buttons available is what makes that reachable.
+            frequency_min: 0,
+            frequency_max: rtlsdr::FREQUENCY_MAX_HZ,
+            usb_link_speed_warning: None,
+        });
+    }
+}
+
+/// Same idea as discover_rtlsdr_usb, for MSi2500 sticks -- one row per
+/// stick, each keyed by the USB port it's in. Nothing is opened here --
+/// see mirisdr::initialise.
+fn discover_mirisdr_usb(devices: &Arc<Mutex<Vec<Device>>>) {
+    let sentinel = SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0);
+    for (_, mac) in mirisdr::discover() {
+        adopt_legacy_config(mac);
+        devices.lock().unwrap().push(Device {
+            address: sentinel,
+            my_address: sentinel,
+            device: 0,
+            board: Boards::MsiSdr,
+            protocol: 1, // meaningless for this board -- see Boards::MsiSdr's doc comment
+            version: 0,
+            status: 2, // available
+            mac,
+            // One receiver, same reasoning as discover_rtlsdr_usb.
+            supported_receivers: 1,
+            supported_transmitters: 0, // receive-only hardware
+            adcs: 1,
+            // The MSi001's AM path covers HF natively (see mirisdr.rs).
+            frequency_min: 0,
+            frequency_max: mirisdr::FREQUENCY_MAX_HZ,
+            usb_link_speed_warning: None,
+        });
+    }
 }
 
 /// Looks up which local network interface (e.g. "eth0"/"enp3s0")

@@ -28,6 +28,7 @@
 */
 
 use crate::rtlsdr;
+use crate::usb_port;
 use nusb::transfer::{Bulk, ControlOut, ControlType, In, Recipient};
 use nusb::{Interface, MaybeFuture};
 use std::io::{self, Read};
@@ -88,18 +89,26 @@ fn io_err(e: impl std::fmt::Display) -> io::Error {
     io::Error::other(e.to_string())
 }
 
-/// First plugged-in device matching KNOWN_DEVICES, if any -- for
-/// discovery.rs's synthetic Device row. No open/claim, safe to poll.
-pub fn discover() -> Option<&'static str> {
-    let devices = nusb::list_devices().wait().ok()?;
-    for d in devices {
-        if let Some(&(_, _, name)) =
-            KNOWN_DEVICES.iter().find(|&&(vid, pid, _)| vid == d.vendor_id() && pid == d.product_id())
-        {
-            return Some(name);
-        }
-    }
-    None
+fn known_name(info: &nusb::DeviceInfo) -> Option<&'static str> {
+    KNOWN_DEVICES
+        .iter()
+        .find(|&&(vid, pid, _)| vid == info.vendor_id() && pid == info.product_id())
+        .map(|&(_, _, name)| name)
+}
+
+/// Last byte of every MSi2500 sentinel MAC -- see usb_port::port_mac.
+pub const MAC_TAG: u8 = 3;
+
+/// Every plugged-in device matching KNOWN_DEVICES, as (name, usb_port::port_mac),
+/// in port order -- for discovery.rs's synthetic Device rows. No
+/// open/claim, safe to poll.
+pub fn discover() -> Vec<(&'static str, [u8; 6])> {
+    let Ok(devices) = nusb::list_devices().wait() else {
+        return Vec::new();
+    };
+    let mut found: Vec<_> = devices.filter_map(|d| known_name(&d).map(|name| (name, usb_port::port_mac(&d, MAC_TAG)))).collect();
+    found.sort_by_key(|&(_, mac)| mac);
+    found
 }
 
 // ---------------------------------------------------------------------
@@ -431,39 +440,40 @@ impl MiriSdrDevice {
     }
 }
 
-fn find_and_open() -> io::Result<(nusb::Device, String)> {
-    let info = nusb::list_devices()
+/// Opens the stick in the USB port `mac` names (see usb_port::port_mac).
+fn find_and_open(mac: [u8; 6]) -> io::Result<(nusb::Device, String)> {
+    let (info, name) = nusb::list_devices()
         .wait()
         .map_err(io_err)?
-        .into_iter()
-        .find(|d| KNOWN_DEVICES.iter().any(|&(vid, pid, _)| vid == d.vendor_id() && pid == d.product_id()))
-        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no MSi2500 (MSI.SDR) device found on USB"))?;
-    let name = KNOWN_DEVICES
-        .iter()
-        .find(|&&(vid, pid, _)| vid == info.vendor_id() && pid == info.product_id())
-        .map_or("MSi2500", |&(_, _, n)| n)
-        .to_string();
+        .find_map(|d| known_name(&d).filter(|_| usb_port::port_mac(&d, MAC_TAG) == mac).map(|name| (d, name)))
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("no MSi2500 (MSI.SDR) device found in USB port {}", usb_port::port_label(mac)),
+            )
+        })?;
     let device = info.open().wait().map_err(io_err)?;
-    Ok((device, name))
+    Ok((device, name.to_string()))
 }
 
 /// mirisdr_open followed by the bring-up rtl_sdr-style clients do (rate,
 /// frequency, gain), then mirisdr_read_async's start: bulk alternate
-/// setting, stream on. Returns the control half, the streaming half,
-/// and the device's name.
-pub fn initialise(initial_freq_hz: u32, gain_db: u32) -> io::Result<(MiriSdrDevice, RxEndpoint, String)> {
+/// setting, stream on, for the stick `mac` (a discover() port MAC)
+/// names. Returns the control half, the streaming half, and the
+/// device's name.
+pub fn initialise(mac: [u8; 6], initial_freq_hz: u32, gain_db: u32) -> io::Result<(MiriSdrDevice, RxEndpoint, String)> {
     // "reset je potřeba, jinak občas zařízení odmítá komunikovat" --
     // libmirisdr always resets on open (otherwise the device sometimes
     // refuses to talk). A reset can re-enumerate it, so look it up again
     // afterwards rather than reusing the handle.
     {
-        let (device, _) = find_and_open()?;
+        let (device, _) = find_and_open(mac)?;
         if let Err(e) = device.reset().wait() {
             eprintln!("MSi2500: USB reset failed ({e}), continuing");
         }
     }
     std::thread::sleep(Duration::from_millis(500));
-    let (device, name) = find_and_open()?;
+    let (device, name) = find_and_open(mac)?;
     // Linux's msi2500 V4L2 driver binds these sticks by default; detach
     // it (libmirisdr's DETACH_KERNEL_DRIVER build option) rather than
     // making the user blacklist msi2500/msi001.
@@ -573,6 +583,7 @@ impl Unpacker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
 
     #[test]
     fn soft_regs_match_upstream_c() {

@@ -36,8 +36,14 @@ or SoapySDR to install.
 ## Connecting
 
 Plug in the stick and click **Rediscover**. It appears in the list as
-board **MsiSdr**, with "USB" in place of an IP address. Select it and
-click **Start**.
+board **MsiSdr**, with "USB" and the USB port it's plugged into (e.g.
+`USB 1-3.3`) in place of an IP address. Select it and click **Start**.
+
+With more than one stick plugged in, each gets its own row. These
+sticks have no serial number, so hpsdr-rs tells them apart by USB port:
+each port keeps its own saved settings (frequency, gain, transverters
+and so on). Moving a stick to a different port makes it look like a new
+stick.
 
 ## Frequency coverage
 

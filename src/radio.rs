@@ -1253,17 +1253,18 @@ pub struct RadioSession {
     /// alongside the other threads. Always None on every other
     /// transport.
     usb_control_thread: Option<JoinHandle<()>>,
-    /// True only for an RTL-SDR session -- same "no UDP peer" reasoning
-    /// as `is_rx888`.
-    is_rtlsdr: bool,
+    /// Some(the dongle's usb_port::port_mac) only for an RTL-SDR session
+    /// -- same "no UDP peer" reasoning as `is_rx888`; the MAC is how
+    /// restart_dongle_at_rate reopens the same dongle.
+    rtlsdr_mac: Option<[u8; 6]>,
     /// RTL-SDR only: direct-sampling / tuner-AGC settings polled by
     /// rtlsdr_control_loop (RF gain itself is `rx_attenuation`, see
     /// rtlsdr::Controls' doc comment). `pub` for main.rs's Settings -> RX.
     pub rtlsdr_controls: Option<Arc<rtlsdr::Controls>>,
-    /// True only for an MSi2500 (MSI.SDR) session -- same "no UDP peer"
-    /// reasoning as `is_rtlsdr`, and shares its start/restart path (see
-    /// start_usb_dongle).
-    is_mirisdr: bool,
+    /// Some(the stick's usb_port::port_mac) only for an MSi2500
+    /// (MSI.SDR) session -- same reasoning as `rtlsdr_mac`, and shares
+    /// its start/restart path (see start_usb_dongle).
+    mirisdr_mac: Option<[u8; 6]>,
 }
 
 impl RadioSession {
@@ -1690,14 +1691,16 @@ impl RadioSession {
         };
         let stop_flag = Arc::new(AtomicBool::new(false));
         self.stop_flag = Arc::clone(&stop_flag);
-        let (receiver_thread, control_thread) = if self.is_mirisdr {
-            spawn_mirisdr_threads(&self.iq_buffers[0], &self.frequency_hz, &self.rx_attenuation, &stop_flag, output_rate_hz)?
+        let (receiver_thread, control_thread) = if let Some(mac) = self.mirisdr_mac {
+            spawn_mirisdr_threads(mac, &self.iq_buffers[0], &self.frequency_hz, &self.rx_attenuation, &stop_flag, output_rate_hz)?
         } else {
             let controls = self
                 .rtlsdr_controls
                 .clone()
                 .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "not an RTL-SDR session"))?;
+            let mac = self.rtlsdr_mac.ok_or_else(|| io::Error::other("not an RTL-SDR session"))?;
             spawn_rtlsdr_threads(
+                mac,
                 &self.iq_buffers[0],
                 &self.frequency_hz,
                 &self.rx_attenuation,
@@ -1752,7 +1755,7 @@ impl RadioSession {
         // the time this is called) + dropping the USB device handle.
         // Matches piHPSDR's own old_protocol.c, which short-circuits
         // equivalent stop-packet logic for DEVICE_OZY the same way.
-        if self.is_ozy || self.is_rx888 || self.is_rtlsdr || self.is_mirisdr {
+        if self.is_ozy || self.is_rx888 || self.rtlsdr_mac.is_some() || self.mirisdr_mac.is_some() {
             return;
         }
         // See stop_socket's own doc comment -- sent from the SAME local
@@ -2206,9 +2209,9 @@ fn start_protocol1(
         ozy_i2c_thread: None,
         is_rx888: false,
         usb_control_thread: None,
-        is_rtlsdr: false,
+        rtlsdr_mac: None,
         rtlsdr_controls: None,
-        is_mirisdr: false,
+        mirisdr_mac: None,
     })
 }
 
@@ -2534,9 +2537,9 @@ fn start_protocol1_ozy_usb(
         ozy_i2c_thread: Some(i2c_thread),
         is_rx888: false,
         usb_control_thread: None,
-        is_rtlsdr: false,
+        rtlsdr_mac: None,
         rtlsdr_controls: None,
-        is_mirisdr: false,
+        mirisdr_mac: None,
     })
 }
 
@@ -2799,9 +2802,9 @@ fn start_rx888_usb(
         ozy_i2c_thread: None,
         is_rx888: true,
         usb_control_thread: Some(control_thread),
-        is_rtlsdr: false,
+        rtlsdr_mac: None,
         rtlsdr_controls: None,
-        is_mirisdr: false,
+        mirisdr_mac: None,
     })
 }
 
@@ -2908,9 +2911,9 @@ fn start_usb_dongle(
     let stop_flag = Arc::new(AtomicBool::new(false));
     let (receiver_thread, control_thread) = match &controls {
         Some(controls) => {
-            spawn_rtlsdr_threads(&iq_buffers[0], &frequency_hz, &rx_attenuation, controls, &stop_flag, output_rate)?
+            spawn_rtlsdr_threads(device.mac, &iq_buffers[0], &frequency_hz, &rx_attenuation, controls, &stop_flag, output_rate)?
         }
-        None => spawn_mirisdr_threads(&iq_buffers[0], &frequency_hz, &rx_attenuation, &stop_flag, output_rate)?,
+        None => spawn_mirisdr_threads(device.mac, &iq_buffers[0], &frequency_hz, &rx_attenuation, &stop_flag, output_rate)?,
     };
 
     let mute_local_audio_for_tci = Arc::new(AtomicBool::new(false));
@@ -2993,15 +2996,16 @@ fn start_usb_dongle(
         ozy_i2c_thread: None,
         is_rx888: false,
         usb_control_thread: Some(control_thread),
-        is_rtlsdr: !is_mirisdr,
+        rtlsdr_mac: (!is_mirisdr).then_some(device.mac),
         rtlsdr_controls: controls,
-        is_mirisdr,
+        mirisdr_mac: is_mirisdr.then_some(device.mac),
     })
 }
 
 /// Opens the dongle and starts its receiver + control threads. Shared
 /// by start_usb_dongle and RadioSession::restart_dongle_at_rate.
 fn spawn_rtlsdr_threads(
+    mac: [u8; 6],
     iq_buffer: &Arc<Mutex<VecDeque<IqSample>>>,
     frequency_hz: &Arc<AtomicU32>,
     rx_attenuation: &Arc<AtomicU32>,
@@ -3015,6 +3019,7 @@ fn spawn_rtlsdr_threads(
     // above the dial so its own centre spike stays out of the way.
     let offset_hz = rtlsdr::tuning_offset_hz(decimation);
     let (device, rx_endpoint, name) = rtlsdr::initialise(
+        mac,
         frequency_hz.load(Ordering::Relaxed) + offset_hz,
         rx_attenuation.load(Ordering::Relaxed),
         controls.tuner_agc.load(Ordering::Relaxed),
@@ -3134,6 +3139,7 @@ fn rtlsdr_control_loop(
 /// MSi2500 counterpart of spawn_rtlsdr_threads. Same fixed
 /// rtlsdr::DONGLE_RATE_HZ, same Decimator and tuning offset.
 fn spawn_mirisdr_threads(
+    mac: [u8; 6],
     iq_buffer: &Arc<Mutex<VecDeque<IqSample>>>,
     frequency_hz: &Arc<AtomicU32>,
     rx_attenuation: &Arc<AtomicU32>,
@@ -3144,7 +3150,7 @@ fn spawn_mirisdr_threads(
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, format!("MSi2500: unsupported rate {output_rate_hz}")))?;
     let offset_hz = rtlsdr::tuning_offset_hz(decimation);
     let (device, rx_endpoint, name) =
-        mirisdr::initialise(frequency_hz.load(Ordering::Relaxed) + offset_hz, rx_attenuation.load(Ordering::Relaxed))?;
+        mirisdr::initialise(mac, frequency_hz.load(Ordering::Relaxed) + offset_hz, rx_attenuation.load(Ordering::Relaxed))?;
     println!("MSi2500: {name} streaming at {} Hz, decimating by {decimation}", mirisdr::SAMPLE_RATE_HZ);
 
     let receiver_buffer = Arc::clone(iq_buffer);
@@ -6404,9 +6410,9 @@ fn start_protocol2(
         ozy_i2c_thread: None,
         is_rx888: false,
         usb_control_thread: None,
-        is_rtlsdr: false,
+        rtlsdr_mac: None,
         rtlsdr_controls: None,
-        is_mirisdr: false,
+        mirisdr_mac: None,
     })
 }
 

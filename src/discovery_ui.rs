@@ -388,7 +388,10 @@ impl DiscoveryWindow {
                             // sentinels for it (see discover_ozy_usb's doc
                             // comment), so show "USB" instead of formatting
                             // them like a real IP/interface.
-                            let interface_cell = if matches!(dev.board, Boards::Ozy | Boards::Rx888 | Boards::RtlSdr | Boards::MsiSdr) {
+                            let interface_cell = if matches!(dev.board, Boards::RtlSdr | Boards::MsiSdr) {
+                                // One row per dongle -- see usb_port.rs.
+                                format!("USB {}", crate::usb_port::port_label(dev.mac))
+                            } else if matches!(dev.board, Boards::Ozy | Boards::Rx888) {
                                 "USB".to_string()
                             } else {
                                 match interface_names.get(&dev.my_address.ip()) {

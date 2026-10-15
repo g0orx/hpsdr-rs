@@ -31,6 +31,7 @@ mod rx888;
 mod spectrum;
 mod tci;
 mod tx;
+mod usb_port;
 mod wdsp_sys;
 
 use audio::{AudioOutput, MicInput};
@@ -6972,7 +6973,9 @@ impl eframe::App for HpsdrApp {
                                         }
 
                                         ui.label("Interface:");
-                                        ui.label(if is_usb_board {
+                                        ui.label(if matches!(connected.device.board, Boards::RtlSdr | Boards::MsiSdr) {
+                                            format!("USB {}", usb_port::port_label(connected.device.mac))
+                                        } else if is_usb_board {
                                             "USB".to_string()
                                         } else {
                                             connected.interface_name.clone().unwrap_or_else(|| "unknown".to_string())

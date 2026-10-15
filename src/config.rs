@@ -730,6 +730,11 @@ impl Config {
             .unwrap_or_default()
     }
 
+    /// Whether a config file has been saved for `mac` yet.
+    pub fn exists(mac: [u8; 6]) -> bool {
+        config_path(mac).is_some_and(|p| p.exists())
+    }
+
     pub fn save(&self, mac: [u8; 6]) {
         let Some(path) = config_path(mac) else {
             return;
