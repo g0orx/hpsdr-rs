@@ -18,7 +18,7 @@ You should have received a copy of the GNU General Public License
 along with this program; if not, write to the Free Software
 Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
 
-The author can be reached by email at
+The author can be reached by email at  
 
 warren@pratt.one
 
@@ -29,8 +29,8 @@ warren@pratt.one
 
 typedef struct _cfir *CFIR;
 
-extern CFIR create_cfir (int run, int size, int nc, int mp, double *in, double *out, int runrate, int cicrate,
-                         int DD, int R, int Pairs, double cutoff, int xtype, double xbw, int wintype);
+extern CFIR create_cfir (int run, int size, int nc, int mp, double* in, double* out, int runrate, int cicrate, 
+	int DD, int R, int Pairs, double cutoff, int xtype, double xbw, int wintype);
 
 extern void destroy_cfir (CFIR a);
 
@@ -38,7 +38,7 @@ extern void flush_cfir (CFIR a);
 
 extern void xcfir (CFIR a);
 
-extern void setBuffers_cfir (CFIR a, double *in, double *out);
+extern void setBuffers_cfir (CFIR a, double* in, double* out);
 
 extern void setSamplerate_cfir (CFIR a, int rate);
 
@@ -51,6 +51,6 @@ extern __declspec (dllexport) void SetTXACFIRRun(int channel, int run);
 extern __declspec (dllexport) void SetTXACFIRNC(int channel, int nc);
 
 extern __declspec (dllexport) void SetTXACFIRCurve(int channel, int DD, int R, int Pairs,
-    int runrate, int cicrate, double cutoff, int xtype, double xbw);
+	int runrate, int cicrate, double cutoff, int xtype, double xbw);
 
 #endif

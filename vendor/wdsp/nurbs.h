@@ -27,36 +27,37 @@ warren@pratt.one
 #ifndef _nurbs_h
 #define _nurbs_h
 
-typedef struct _nurbs {
-  int n;
-  int p;
-  int r;
-  int umethod;
-  double *U;
-  double *CP;
-  double *W;
-  int upts;
-  double *Xs;
-  double *Ys;
-  double *Uout;
-  int fpts;
-  double *Xf;
-  double *Yf;
-  int max_cp;
-  int max_p;
-  int max_upts;
-  int max_fpts;
-  int max_knots;
-} nurbs, *NURBS;
+typedef struct _nurbs
+{
+	int n;
+	int p;
+	int r;
+	int umethod;
+	double* U;
+	double* CP;
+	double* W;
+	int upts;
+	double* Xs;
+	double* Ys;
+	double* Uout;
+	int fpts;
+	double* Xf;
+	double* Yf;
+	int max_cp;
+	int max_p;
+	int max_upts;
+	int max_fpts;
+	int max_knots;
+} nurbs, * NURBS;
 
 extern NURBS create_nurbs(int n, int p, int r, int umethod, int upts,
-                          int max_cp, int max_deg, int max_upts, int max_fpts);
+	int max_cp, int max_deg, int max_upts, int max_fpts);
 
-extern void destroy_nurbs(NURBS a);
+extern void destroy_nurbs (NURBS a);
 
-extern void BuildSpline(int n, int p, int r, int umethod, double *U, double *CP, double *W,
-                        int upts, double *Xs, double *Ys, double *Uout, int fpts, double *Xf, double *Yf);
+extern void BuildSpline (int n, int p, int r, int umethod, double* U, double* CP, double* W,
+	int upts, double* Xs, double* Ys, double* Uout, int fpts, double* Xf, double* Yf);
 
-extern int checkSplineInputs(int ncp, int p, int r, int umethod, double *W);
+extern int checkSplineInputs (int ncp, int p, int r, int umethod, double* W);
 
 #endif

@@ -29,20 +29,20 @@ warren@pratt.one
 
 #include <stddef.h>
 
-typedef struct _nnio *NNIO;
+typedef struct _nnio* NNIO;
 
-extern NNIO nnio_open (const char *path);
+extern NNIO nnio_open (const char* path);
 
-extern NNIO nnio_open_mem (const unsigned char *buf, size_t nbytes,
-                           const char *what);
+extern NNIO nnio_open_mem (const unsigned char* buf, size_t nbytes,
+	const char* what);
 
 extern void nnio_close (NNIO f);
 
 extern int nnio_count (NNIO f);
 
-extern const char *nnio_name (NNIO f, int idx);
+extern const char* nnio_name (NNIO f, int idx);
 
-extern int nnio_find (NNIO f, const char *name);
+extern int nnio_find (NNIO f, const char* name);
 
 extern int nnio_ndim (NNIO f, int idx);
 
@@ -50,8 +50,8 @@ extern int nnio_dim (NNIO f, int idx, int d);
 
 extern int nnio_numel (NNIO f, int idx);
 
-extern const double *nnio_data (NNIO f, int idx);
+extern const double* nnio_data (NNIO f, int idx);
 
-extern const double *nnio_get (NNIO f, const char *name, int d0, int d1, int d2, int d3);
+extern const double* nnio_get (NNIO f, const char* name, int d0, int d1, int d2, int d3);
 
 #endif

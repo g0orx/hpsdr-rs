@@ -4,17 +4,14 @@
     from rustyHPSDR's own build.rs, which built the same source tree on
     both Linux and Windows (MSYS2/MinGW-w64).
 
-    vendor/libspecbleach and vendor/rnnoise (which backed WDSP's NR4
-    "SBNR" and NR3 "RNNR" noise-reduction stages) are NOT built --
-    removed entirely (2026-09-08), along with the real DSP work inside
-    vendor/wdsp/rnnr.c/sbnr.c that called into them (now inert stubs,
-    see those files' own header comments). Neither stage was ever
-    enabled by any Rust code in this project -- WDSP's own built-in
-    neural-net stage ("NNR", vendor/wdsp/nnr.c + nnet.c/nnio.c + two
-    compiled-in trained models) is what's actually wired up to the UI
-    (labeled "NNR", not "NR3", to avoid confusion with the removed
-    RNNoise-backed stage -- see spectrum.rs's NoiseReduction doc
-    comment) -- see memory/wdsp_210_port.md for the full history.
+    vendor/wdsp is upstream WDSP 2.11 (OpenHPSDR-wdsp, Warren Pratt
+    NR0V) plus the Linux/macOS port: comm.h's platform branch,
+    linux_port.c/.h, _WIN32 guards around Windows-only calls, and
+    SetPSDeadlockMinFrac carried over from deskHPSDR. The RNNoise-
+    and libspecbleach-backed NR3/NR4 stages (rnnr.c/sbnr.c, never
+    part of upstream) are gone; WDSP's own neural-net stage ("NNR")
+    is what the UI uses -- see spectrum.rs's NoiseReduction doc
+    comment.
 
     Confirmed viable cross-platform by reading the vendored source
     directly: wdsp/comm.h and wdsp/linux_port.h branch on
@@ -225,24 +222,17 @@ fn main() {
         "vendor/wdsp/matchedCW.c",
         "vendor/wdsp/sender.c",
         "vendor/wdsp/zetaHat.c",
-        // Still built -- RXA.c creates an instance of each unconditionally
-        // -- but stubbed out (2026-09-08) to an inert passthrough with no
-        // external library dependency, since neither stage is ever
-        // enabled by any Rust code here. See these two files' own header
-        // comments and memory/wdsp_210_port.md for the full history
-        // (they briefly backed real RNNoise/libspecbleach-based NR3/NR4
-        // noise reduction after the WDSP 2.10 re-port, alongside the new
-        // NNR stage below -- since removed as genuinely unused).
-        "vendor/wdsp/rnnr.c",
-        "vendor/wdsp/sbnr.c",
-        // Added by the WDSP 2.10 port (2026-09-07): a new built-in
-        // neural-net NR stage, alongside (not instead of) rnnr.c/
-        // sbnr.c above -- see spectrum.rs's NoiseReduction doc comment.
+        // WDSP's built-in neural-net NR stage ("NNR"), added in 2.10.
+        // 2.11 added two CW models (nnr_model_2/3, Standard/Premium)
+        // alongside the original voice models (0/1), plus nnrbypass.c.
         "vendor/wdsp/nnet.c",
         "vendor/wdsp/nnio.c",
         "vendor/wdsp/nnr.c",
+        "vendor/wdsp/nnrbypass.c",
         "vendor/wdsp/nnr_model_0.c",
         "vendor/wdsp/nnr_model_1.c",
+        "vendor/wdsp/nnr_model_2.c",
+        "vendor/wdsp/nnr_model_3.c",
         // Internal helpers/new subsystems added upstream in the same
         // version bump -- extrapolate/nurbs/snoop have no direct Rust
         // FFI callers yet (needed only so the library links as a whole);

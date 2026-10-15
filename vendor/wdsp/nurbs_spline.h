@@ -30,38 +30,38 @@ warren@pratt.one
 #define NURBS_SPLINE_H
 
 #ifndef M_PI
-  #define M_PI 3.14159265358979323846
+#  define M_PI 3.14159265358979323846
 #endif
 
 #include "nurbs_fit.h"
 
 typedef struct {
-  double x0;
-  double a, b, c, d;
+    double x0;
+    double a, b, c, d;
 } NS_Seg;
 
 typedef struct {
-  int      n_pts;
-  double  *xs;
-  double  *ys;
-  NS_Seg  *segs;
-  double   t_mid;
+    int      n_pts;
+    double  *xs;
+    double  *ys;
+    NS_Seg  *segs;
+    double   t_mid;
 } NS_Branch;
 
 typedef struct {
-  int        n_branches;
-  NS_Branch *branches;
+    int        n_branches;
+    NS_Branch *branches;
 } NS_Spline;
 
 #ifndef NS_DEFAULT_PTS
-  #define NS_DEFAULT_PTS 256
+#  define NS_DEFAULT_PTS 256
 #endif
 
 #ifndef NS_SAMPLES_PER_CTRL
-  #define NS_SAMPLES_PER_CTRL 8
+#  define NS_SAMPLES_PER_CTRL 8
 #endif
 
-typedef struct _ns_ws *NS_WS;
+typedef struct _ns_ws* NS_WS;
 
 NS_WS build_ns_ws(int n_ctrl_max);
 void  teardown_ns_ws(NS_WS ws);
@@ -93,8 +93,8 @@ int ns_eval_all(const NS_Spline *s, double x,
 void ns_x_range(const NS_Spline *s, double *x_min, double *x_max);
 
 double ns_accuracy_check(const NS_Spline *s, const NF_Curve *curve,
-                         int n_check,
-                         double *max_err, double *rms_err);
+                          int n_check,
+                          double *max_err, double *rms_err);
 
 void ns_free(NS_Spline *s);
 
@@ -104,15 +104,15 @@ NS_Spline *ns_copy(const NS_Spline *src);
 #define CURVE_EMA_PTS  256
 
 typedef struct _CurveEMA {
-  double xs[CURVE_EMA_PTS];
-  double ys[CURVE_EMA_PTS];
-  double alpha;
-  double alpha_lo;
-  double x_alpha_boundary;
-  double y_clip_lo;
-  double y_clip_hi;
-  int    count;
-  int    warmup_cycles;
+    double xs[CURVE_EMA_PTS];
+    double ys[CURVE_EMA_PTS];
+    double alpha;
+    double alpha_lo;
+    double x_alpha_boundary;
+    double y_clip_lo;
+    double y_clip_hi;
+    int    count;
+    int    warmup_cycles;
 } CurveEMA;
 
 void curve_ema_init(CurveEMA *e, double alpha);

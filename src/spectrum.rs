@@ -423,9 +423,10 @@ pub struct DemodParams {
     /// being set even when AGC is Off.
     pub nnr_mask_floor_db: f64,
     /// NR3 (NNR)'s model selector: false = Standard (default, ~10% of
-    /// one core), true = Premium (~32%, measurably better) -- both
+    /// one core), true = Premium (~32%, measurably better) -- all
     /// compiled in and already loaded, switching is immediate (WDSP
-    /// Guide 5.3.20).
+    /// Guide 5.3.20). In CWL/CWU this picks the CW Standard/Premium
+    /// model instead of the voice one (WDSP 2.11).
     pub nnr_premium: bool,
     /// SNB ("Spectral Noise Blanker", WDSP's SNBA stage) -- unlike
     /// NoiseReduction's NR/NR2/NR3, this is an independent toggle
@@ -707,7 +708,7 @@ struct SpectrumAnalyzer {
     last_nb_enabled: Option<NoiseBlanker>,
     last_nb_threshold: Option<f64>,
     last_nr_enabled: Option<NoiseReduction>,
-    last_nnr_params: Option<(f64, bool)>,
+    last_nnr_params: Option<(f64, c_int)>,
     last_snb_enabled: Option<bool>,
     last_anf_enabled: Option<bool>,
     last_binaural: Option<bool>,
@@ -758,8 +759,10 @@ impl SpectrumAnalyzer {
             if let Some(dir) = crate::config::settings_dir().map(|d| d.join("wdsp_wisdom")) {
                 if std::fs::create_dir_all(&dir).is_ok() {
                     if let Ok(cstring) = std::ffi::CString::new(dir.to_string_lossy().as_bytes()) {
-                        unsafe {
-                            wdsp::WDSPwisdom(cstring.as_ptr());
+                        // WDSP 2.11: -1 means the path was rejected and no
+                        // wisdom was loaded or built.
+                        if unsafe { wdsp::WDSPwisdom(cstring.as_ptr()) } < 0 {
+                            eprintln!("WDSPwisdom: path rejected, no FFTW wisdom loaded");
                         }
                     }
                 }
@@ -1352,11 +1355,17 @@ impl SpectrumAnalyzer {
             self.last_nr_enabled = Some(params.noise_reduction);
         }
 
-        let nnr_params = (params.nnr_mask_floor_db, params.nnr_premium);
+        // WDSP 2.11 slots: 0/1 = Standard/Premium voice, 2/3 =
+        // Standard/Premium CW. The guide (5.3.20) has the console pick
+        // voice or CW by mode -- the voice models were trained to remove
+        // CW -- so the operator only chooses Standard or Premium.
+        let cw = matches!(params.mode, Mode::Cwl | Mode::Cwu);
+        let nnr_slot = params.nnr_premium as c_int + if cw { 2 } else { 0 };
+        let nnr_params = (params.nnr_mask_floor_db, nnr_slot);
         if self.last_nnr_params != Some(nnr_params) {
             unsafe {
                 wdsp::SetRXANNRMaskFloor(self.channel, params.nnr_mask_floor_db);
-                wdsp::SetRXANNRModel(self.channel, params.nnr_premium as c_int);
+                wdsp::SetRXANNRModel(self.channel, nnr_slot);
             }
             self.last_nnr_params = Some(nnr_params);
         }
@@ -1556,6 +1565,13 @@ impl Drop for SpectrumAnalyzer {
         // reported sample rate onto an exact 48kHz multiple) NOT
         // resolving it -- ruling both out and pointing back at this
         // exact gap.
+        // WDSP 2.11: turn the channel off and wait for its flush
+        // (dmode 1) before CloseChannel, as the release notes require.
+        // Outside the lock, so a flush wait never stalls another
+        // channel's setup.
+        unsafe {
+            wdsp::SetChannelState(self.channel, 0, 1);
+        }
         let _guard = wdsp::SETUP_LOCK.lock().unwrap();
         unsafe {
             wdsp::DestroyAnalyzer(self.channel);

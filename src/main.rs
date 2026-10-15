@@ -7021,6 +7021,15 @@ impl eframe::App for HpsdrApp {
                                         "john.d.melton@googlemail.com",
                                         "mailto:john.d.melton@googlemail.com",
                                     );
+                                    ui.add_space(8.0);
+                                    // GetWDSPVersion returns version * 100 (e.g. 211 for 2.11),
+                                    // read from the linked library itself.
+                                    let wdsp_version = unsafe { wdsp_sys::GetWDSPVersion() };
+                                    ui.label(format!(
+                                        "WDSP {}.{:02} by Warren Pratt NR0V",
+                                        wdsp_version / 100,
+                                        wdsp_version % 100
+                                    ));
                                 }
 
                                 SettingsTab::Audio => {
@@ -7829,8 +7838,9 @@ impl eframe::App for HpsdrApp {
                                             .add(egui::Button::selectable(premium, "Premium"))
                                             .on_hover_text(
                                                 "NNR's Standard model (~10% of one core) vs Premium \
-                                                 (~32%, measurably better) -- both built in, switching \
-                                                 is instant.",
+                                                 (~32%, measurably better) -- all built in, switching \
+                                                 is instant. In CWL/CWU, NNR uses the CW versions of \
+                                                 these models automatically.",
                                             )
                                             .clicked()
                                         {

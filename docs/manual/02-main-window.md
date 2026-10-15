@@ -154,7 +154,9 @@ slider:
   blanker stages; the threshold both share is in Settings → RX).
 - **NR** -- cycles Off → NR → NR2 → NNR → Off (three mutually-exclusive
   noise reduction algorithms; NNR is WDSP's built-in neural-net noise
-  reduction).
+  reduction). NNR has Standard and Premium models (Settings → RX); in
+  CWL/CWU it switches to WDSP's CW-trained models automatically, since
+  the voice models treat CW as noise.
 - **SNB** -- toggles the Spectral Noise Blanker on/off, independently of NB
   and NR (it can run alongside either).
 - **ANF** -- toggles the Automatic Notch Filter on/off, independently of

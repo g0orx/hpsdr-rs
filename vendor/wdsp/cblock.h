@@ -18,7 +18,7 @@ You should have received a copy of the GNU General Public License
 along with this program; if not, write to the Free Software
 Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
 
-The author can be reached by email at
+The author can be reached by email at  
 
 warren@wpratt.com
 
@@ -27,18 +27,18 @@ warren@wpratt.com
 #ifndef _cblock_h
 #define _cblock_h
 
-typedef struct _cbl *CBL;
+typedef struct _cbl* CBL;
 
 extern CBL create_cbl
-(
-        int run,
-        int buff_size,
-        double *in_buff,
-        double *out_buff,
-        int mode,
-        int sample_rate,
-        double tau
-);
+	(
+	int run,
+	int buff_size,
+	double *in_buff,
+	double *out_buff,
+	int mode,
+	int sample_rate,
+	double tau
+	);
 
 extern void destroy_cbl (CBL a);
 
@@ -46,7 +46,7 @@ extern void flush_cbl (CBL a);
 
 extern void xcbl (CBL a);
 
-extern void setBuffers_cbl (CBL a, double *in, double *out);
+extern void setBuffers_cbl (CBL a, double* in, double* out);
 
 extern void setSamplerate_cbl (CBL a, int rate);
 

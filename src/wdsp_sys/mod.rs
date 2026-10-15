@@ -1061,5 +1061,5 @@ unsafe extern "C" {
     pub fn wisdom_get_status() -> *mut ::std::os::raw::c_char;
 }
 unsafe extern "C" {
-    pub fn WDSPwisdom(directory: *const ::std::os::raw::c_char);
+    pub fn WDSPwisdom(directory: *const ::std::os::raw::c_char) -> ::std::os::raw::c_int;
 }

@@ -33,28 +33,28 @@ warren@pratt.one
 #include <stdio.h>
 
 #ifndef NNP_WARMUP_FRAMES
-  #define NNP_WARMUP_FRAMES   312
+#define NNP_WARMUP_FRAMES   312
 #endif
 #ifndef NNP_MEASURE_FRAMES
-  #define NNP_MEASURE_FRAMES  3750
+#define NNP_MEASURE_FRAMES  3750
 #endif
 
 #ifndef NNP_OUTFILE
-  #define NNP_OUTFILE  "nnr_profile.txt"
+#define NNP_OUTFILE  "nnr_profile.txt"
 #endif
 
 enum {
-  NNP_ENC0 = 0, NNP_ENC1, NNP_ENC2, NNP_ENC3,
-  NNP_DP0, NNP_DP1,
-  NNP_DEC0, NNP_DEC1, NNP_DEC2, NNP_DEC3,
-  NNP_COND, NNP_DFHEAD, NNP_TOTAL,
-  NNP_NSTAGE
+    NNP_ENC0 = 0, NNP_ENC1, NNP_ENC2, NNP_ENC3,
+    NNP_DP0, NNP_DP1,
+    NNP_DEC0, NNP_DEC1, NNP_DEC2, NNP_DEC3,
+    NNP_COND, NNP_DFHEAD, NNP_TOTAL,
+    NNP_NSTAGE
 };
 
 extern double  nnp_sec[NNP_NSTAGE];
 extern long long nnp_cnt[NNP_NSTAGE];
 
-extern double nnp_now(void);
+extern double nnp_now (void);
 
 #define NNP_START(id)   double _nnp_t##id = nnp_now()
 #define NNP_STOP(id)    do {                                             \
@@ -62,8 +62,8 @@ extern double nnp_now(void);
                             nnp_cnt[id] += 1;                            \
                         } while (0)
 
-extern void report_profile_nnet(void);
-extern void reset_profile_nnet(void);
+extern void report_profile_nnet (void);
+extern void reset_profile_nnet (void);
 
 #else
 

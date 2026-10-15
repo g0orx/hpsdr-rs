@@ -1,7 +1,5 @@
 /*  nnr.h
 
-Neural Noise Reduction (NNR) - streaming framework
-
 This file is part of a program that implements a Software-Defined Radio.
 
 Copyright (C) 2026 Warren Pratt, NR0V
@@ -22,30 +20,26 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
 
 The author can be reached by email at
 
-warren@wpratt.com
+warren@pratt.one
 
 */
 
 #ifndef _nnr_h
 #define _nnr_h
 
-typedef struct _nnr *NNR;
+typedef struct _nnr* NNR;
 
 extern NNR create_nnr
-(
-        int run,            // 0 => bypass, 1 => enable
-        int position,         // position in the processing chain
-        int size,           // input/output buffer size, complex samples
-        double *in_buff,        // pointer to input buffer
-        double *out_buff,       // pointer to output buffer
-        int rate,           // dsp sample rate, Hz
-        int nrate,            // network sample rate, Hz (e.g. 16000)
-        int fftsize,          // STFT size at nrate (e.g. 512)
-        int overlap,          // 2 => 50% overlap, 4 => 75% overlap
-        int lookahead,          // network lookahead, in frames (0, 1, 2 ...)
-        double mask_floor,        // minimum mask magnitude, dB (e.g. -20.0)
-        int cmode           // I/Q handling; see notes in nnr.c
-);
+	(
+	int run,						// 0 => bypass, 1 => enable
+	int position,					// position in the processing chain
+	int size,						// input/output buffer size, complex samples
+	double* in_buff,				// pointer to input buffer
+	double* out_buff,				// pointer to output buffer
+	int rate,						// dsp sample rate, Hz
+	double mask_floor,				// minimum mask magnitude, dB (e.g. -20.0)
+	int cmode						// I/Q handling; see notes in nnr.c
+	);
 
 extern void destroy_nnr (NNR a);
 
@@ -57,16 +51,21 @@ extern void flush_nnr (NNR a);
 
 extern void xnnr (NNR a, int pos);
 
-extern void setBuffers_nnr (NNR a, double *in, double *out);
+extern void setBuffers_nnr (NNR a, double* in, double* out);
 
 extern void setSamplerate_nnr (NNR a, int rate);
 
 extern void setSize_nnr (NNR a, int size);
 
-// diagnostics - returns algorithmic delay through the block, in dsp_rate samples
 extern int getDelay_nnr (NNR a);
 
-extern int getRun_nnr(NNR a);
+extern int getRun_nnr (NNR a);
+
+extern int getPosition_nnr(NNR a);
+
+extern int getNNRTrainingBand (NNR a, double* band_low, double* band_high);
+
+extern void setNNRbypassRun(int channel);
 
 
 // RXA Properties

@@ -37,70 +37,71 @@ The author can be reached by email at  warren@pratt.one
 #ifndef _phrot_h
 #define _phrot_h
 
-typedef struct _phrot {
-  int     reverse;
-  int     run;
-  int     size;
-  double *in;
-  double *out;
-  int     rate;
-  double  fc;
-  int     nstages;
-  double  b0, b1, a1;
-  double *x0, *x1;
-  double *y0, *y1;
-  CRITICAL_SECTION cs_update;
-  int     optim_interval;
-  int     optim_samp_count;
-  double  coeff_attack;
-  double  coeff_decay;
-  double  coeff_asym;
-  double  coeff_asym_fast;
-  double  env_pos;
-  double  env_neg;
-  double  asym_metric;
-  double  asym_fast;
-  double  in_env_pos;
-  double  in_env_neg;
-  double  in_asym_metric;
-  int     autoMode;
-  double  auto_fc;
-  double  auto_asym_best;
-  double  auto_step;
-  int     auto_direction;
-  int     auto_reject_count;
-  int     auto_converged;
-  int     ab_phase;
-  double  fc_A;
-  double  fc_B;
-  double  asym_A;
+typedef struct _phrot
+{
+    int     reverse;
+    int     run;
+    int     size;
+    double *in;
+    double *out;
+    int     rate;
+    double  fc;
+    int     nstages;
+    double  b0, b1, a1;
+    double *x0, *x1;
+    double *y0, *y1;
+    CRITICAL_SECTION cs_update;
+    int     optim_interval;
+    int     optim_samp_count;
+    double  coeff_attack;
+    double  coeff_decay;
+    double  coeff_asym;
+    double  coeff_asym_fast;
+    double  env_pos;
+    double  env_neg;
+    double  asym_metric;
+    double  asym_fast;
+    double  in_env_pos;
+    double  in_env_neg;
+    double  in_asym_metric;
+    int     autoMode;
+    double  auto_fc;
+    double  auto_asym_best;
+    double  auto_step;
+    int     auto_direction;
+    int     auto_reject_count;
+    int     auto_converged;
+    int     ab_phase;
+    double  fc_A;
+    double  fc_B;
+    double  asym_A;
 } phrot, *PHROT;
 
-extern void calc_phrot(PHROT a);
-extern void decalc_phrot(PHROT a);
-extern void flush_phrot(PHROT a);
-extern PHROT create_phrot(int run, int size, double *in, double *out,
-                          int rate, double fc, int nstages);
-extern void  destroy_phrot(PHROT a);
-extern void xphrot(PHROT a);
-extern void setBuffers_phrot(PHROT a, double *in, double *out);
+extern void calc_phrot   (PHROT a);
+extern void decalc_phrot (PHROT a);
+extern void flush_phrot  (PHROT a);
+extern PHROT create_phrot  (int run, int size, double* in, double* out,
+                             int rate, double fc, int nstages);
+extern void  destroy_phrot (PHROT a);
+extern void xphrot (PHROT a);
+extern void setBuffers_phrot   (PHROT a, double* in, double* out);
 extern void setSamplerate_phrot(PHROT a, int rate);
-extern void setSize_phrot(PHROT a, int size);
+extern void setSize_phrot      (PHROT a, int size);
 
-__declspec(dllexport) void SetTXAPHROTRun(int channel, int run);
-__declspec(dllexport) void SetTXAPHROTCorner(int channel, double frequency);
-__declspec(dllexport) void SetTXAPHROTNstages(int channel, int nstages);
-__declspec(dllexport) void SetTXAPHROTReverse(int channel, int reverse);
+__declspec(dllexport) void SetTXAPHROTRun     (int channel, int run);
+__declspec(dllexport) void SetTXAPHROTCorner  (int channel, double frequency);
+__declspec(dllexport) void SetTXAPHROTNstages (int channel, int nstages);
+__declspec(dllexport) void SetTXAPHROTReverse (int channel, int reverse);
 __declspec(dllexport) void SetTXAPHROTAutoMode(int channel, int autoMode);
 __declspec(dllexport) void SetTXAPHROTAutoReset(int channel);
 __declspec(dllexport) void GetTXAPHROTAsymmetry(int channel,
-    double *in_pos,
-    double *in_neg,
-    double *in_ratio,
-    double *out_pos,
-    double *out_neg,
-    double *out_ratio,
-    double *current_fc,
-    double *auto_step);
+                                                 double* in_pos,
+                                                 double* in_neg,
+                                                 double* in_ratio,
+                                                 double* out_pos,
+                                                 double* out_neg,
+                                                 double* out_ratio,
+                                                 double* current_fc,
+                                                 double* auto_step);
 
 #endif  // _phrot_h

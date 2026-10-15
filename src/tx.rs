@@ -1622,6 +1622,11 @@ impl Drop for TxProcessor {
         // SpectrumAnalyzer::drop (identical fix, same root cause: a
         // real "double free or corruption" from CloseChannel never
         // being covered by this lock, only setup was).
+        // WDSP 2.11: off-and-wait before CloseChannel -- see
+        // SpectrumAnalyzer::drop.
+        unsafe {
+            wdsp::SetChannelState(self.channel, 0, 1);
+        }
         let _guard = wdsp::SETUP_LOCK.lock().unwrap();
         unsafe {
             wdsp::CloseChannel(self.channel);

@@ -38,85 +38,86 @@ typedef struct _dmph   *DMPH;
 typedef struct _sdelay *SDELAY;
 
 
-typedef struct _wbfm {
-  // the basics
-  int run;
-  int size;
-  double *in;
-  double *out;
-  double rate;
+typedef struct _wbfm
+{
+	// the basics
+	int run;
+	int size;
+	double* in;
+	double* out;
+	double rate;
 
-  // internal buffers
-  double *disc_out;
-  double *fil19_out;
-  double *fil53_out;
-  double *LmR;
-  double *LpR;
-  double *L;
-  double *R;
+	// internal buffers
+	double* disc_out;
+	double* fil19_out;
+	double* fil53_out;
+	double* LmR;
+	double* LpR;
+	double* L;
+	double* R;
 
-  // discriminator & dcb
-  double discSave_I;
-  double discSave_Q;
-  double dcbSave_x;
-  double dcbSave_y;
-  double disc_gain_comp;
+	// discriminator & dcb
+	double discSave_I;
+	double discSave_Q;
+	double dcbSave_x;
+	double dcbSave_y;
+	double disc_gain_comp;
+	
+	// filter:  0-15 kHz
+	FIRCORE pfil0_15;
+	double flow_fil0_15;
+	double fhigh_fil0_15;
+	int nc_fil0_15;
 
-  // filter:  0-15 kHz
-  FIRCORE pfil0_15;
-  double flow_fil0_15;
-  double fhigh_fil0_15;
-  int nc_fil0_15;
+	// filter:  19 kHz
+	FIRCORE pfil19;
+	double flow_fil19;
+	double fhigh_fil19;
+	double magComp_fil19;
+	int nc_fil19;
 
-  // filter:  19 kHz
-  FIRCORE pfil19;
-  double flow_fil19;
-  double fhigh_fil19;
-  double magComp_fil19;
-  int nc_fil19;
+	// filter:  23-53 kHz
+	FIRCORE pfil23_53;
+	double flow_fil23_53;
+	double fhigh_fil23_53;
+	int nc_fil23_53;
 
-  // filter:  23-53 kHz
-  FIRCORE pfil23_53;
-  double flow_fil23_53;
-  double fhigh_fil23_53;
-  int nc_fil23_53;
+	// Pilot AGC
+	double tau_attack;
+	double n_tau;
+	double targ_mult;
+	double out_targ;
+	int agc_delay;
+	WCPAGC pAGC_Pilot;
 
-  // Pilot AGC
-  double tau_attack;
-  double n_tau;
-  double targ_mult;
-  double out_targ;
-  int agc_delay;
-  WCPAGC pAGC_Pilot;
+	// Deemphasis Filters
+	DMPH dmphL;
+	DMPH dmphR;
 
-  // Deemphasis Filters
-  DMPH dmphL;
-  DMPH dmphR;
+	// Indicator
+	INDY pIndy;
 
-  // Indicator
-  INDY pIndy;
+	// Squelch
+	WBSQL psql;
 
-  // Squelch
-  WBSQL psql;
+	// Miscellaneous
+	int stereo;
+	double sqgain;
+	double mag19;
+	int dmph;
+	int dmph_type;
 
-  // Miscellaneous
-  int stereo;
-  double sqgain;
-  double mag19;
-  int dmph;
-  int dmph_type;
-
-  // Matching Delays
-  SDELAY del15;
-  SDELAY del53;
+	// Matching Delays
+	SDELAY del15;
+	SDELAY del53;
 
 } wbfm, *WBFM;
 
-extern WBFM create_wbfm(int run, int size, double *in, double *out, double rate);
+extern WBFM create_wbfm(int run, int size, double* in, double* out, double rate);
 extern void destroy_wbfm(WBFM a);
 extern void xwbfm(WBFM a);
 extern void flush_wbfm(WBFM a);
-extern void setBuffers_wbfm(WBFM a, double *in, double *out);
+extern void setBuffers_wbfm(WBFM a, double* in, double* out);
 extern void setSamplerate_wbfm(WBFM a, int rate);
 extern void setSize_wbfm(WBFM a, int size);
 

@@ -18,7 +18,7 @@ You should have received a copy of the GNU General Public License
 along with this program; if not, write to the Free Software
 Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
 
-The author can be reached by email at
+The author can be reached by email at  
 
 warren@pratt.one
 
@@ -27,11 +27,11 @@ warren@pratt.one
 #ifndef _fmd_h
 #define _fmd_h
 
-typedef struct _fmd *FMD;
+typedef struct _fmd* FMD;
 
-extern FMD create_fmd (int run, int size, double *in, double *out, int rate, double deviation,
-                       double f_low, double f_high, double fmin, double fmax, double zeta, double omegaN, double tau,
-                       double afgain, int sntch_run, double ctcss_freq, int nc_de, int mp_de, int nc_aud, int mp_aud);
+extern FMD create_fmd ( int run, int size, double* in, double* out, int rate, double deviation, 
+	double f_low, double f_high, double fmin, double fmax, double zeta, double omegaN, double tau, 
+	double afgain, int sntch_run, double ctcss_freq, int nc_de, int mp_de, int nc_aud, int mp_aud);
 
 extern void destroy_fmd (FMD a);
 
@@ -39,15 +39,15 @@ extern void flush_fmd (FMD a);
 
 extern void xfmd (FMD a);
 
-extern void setBuffers_fmd (FMD a, double *in, double *out);
+extern void setBuffers_fmd (FMD a, double* in, double* out);
 
 extern void setSamplerate_fmd (FMD a, int rate);
 
 extern void setSize_fmd (FMD a, int size);
 
-extern double *getFMDpAudio (int channel);
+extern double* getFMDpAudio (int channel);
 
-extern double *getFMDpPllpole (int channel);
+extern double* getFMDpPllpole (int channel);
 
 extern void setFMDRun (int channel, int run);
 

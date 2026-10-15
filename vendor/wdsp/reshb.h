@@ -28,40 +28,43 @@ warren@pratt.one
 #ifndef _reshb_h
 #define _reshb_h
 
-typedef struct {
-  double i;
-  double q;
+typedef struct
+{
+    double i;
+    double q;
 } complex_t;
 
-typedef struct _hbres {
-  int N;
-  double *h;
-  complex_t *ring;
-  int ring_ptr;
-  complex_t *in;
-  complex_t *out;
-  int size;
-} hbres, *HBRES;
+typedef struct _hbres
+{
+    int N;
+    double* h;
+    complex_t* ring;
+    int ring_ptr;
+    complex_t* in;
+    complex_t* out;
+    int size;
+} hbres, * HBRES;
 
-struct HBRESdata {
-  uint32_t run;
-  complex_t *in;
-  complex_t *out;
-  uint32_t insize;
-  uint32_t inrate;
-  uint32_t outrate;
-  uint32_t nStages;
-  uint32_t taps[10];
-  uint32_t nBuffs;
-  uint32_t bsize[10];
-  complex_t *buff[10];
-  hbres rsmps[10];
+struct HBRESdata 
+{
+    uint32_t run;
+    complex_t* in;
+    complex_t* out;
+    uint32_t insize;
+    uint32_t inrate;
+    uint32_t outrate;
+    uint32_t nStages;
+    uint32_t taps[10];
+    uint32_t nBuffs;
+    uint32_t bsize[10];
+    complex_t* buff[10];
+    hbres rsmps[10];
 };
 
-typedef struct HBRESdata *HBResampler;
+typedef struct HBRESdata* HBResampler;
 
-extern HBResampler create_HBResampler(uint32_t inrate, uint32_t outrate, uint32_t insize,
-                                      complex_t *in, complex_t *out);
+extern HBResampler create_HBResampler(uint32_t inrate, uint32_t outrate, uint32_t insize, 
+    complex_t* in, complex_t* out);
 
 extern void xHBResampler(HBResampler h);
 
@@ -69,7 +72,7 @@ extern void destroy_HBResampler(HBResampler h);
 
 extern void flush_HBResampler(HBResampler tData);
 
-extern void setBuffers_HBResampler(HBResampler tData, complex_t *in, complex_t *out);
+extern void setBuffers_HBResampler(HBResampler tData, complex_t* in, complex_t* out);
 
 extern void setSize_HBResampler(HBResampler tData, uint32_t insize);
 
