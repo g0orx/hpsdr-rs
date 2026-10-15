@@ -30,7 +30,9 @@ or SoapySDR to install.
    blacklisting, because hpsdr-rs detaches them itself when it opens the
    stick.
 2. **Windows only**: use [Zadig](https://zadig.akeo.ie/) to bind the WinUSB
-   driver to the stick (`1df7:2500`). This is untested.
+   driver to the stick (`1df7:2500`). With several sticks, do this for
+   **each** one -- a stick with no driver won't appear in Discover. This
+   is untested.
 3. **macOS**: no extra driver needed (untested).
 
 ## Connecting

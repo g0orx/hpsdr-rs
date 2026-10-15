@@ -33,7 +33,9 @@ SoapySDR to install.
 2. **Windows only**: bind the WinUSB driver to the dongle (usually shown
    as "Bulk-In, Interface (Interface 0)", `0bda:2838`) with
    [Zadig](https://zadig.akeo.ie/) -- the same step every RTL-SDR program
-   on Windows needs.
+   on Windows needs. With several dongles, do this for **each** one: a
+   dongle with no driver shows a "!" in Device Manager and Windows
+   doesn't list it to hpsdr-rs at all, so it won't appear in Discover.
 3. **macOS**: no extra driver needed (untested).
 
 ## Connecting
