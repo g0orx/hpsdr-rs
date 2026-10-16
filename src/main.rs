@@ -5427,17 +5427,17 @@ impl eframe::App for HpsdrApp {
                     // numbers shift.
                     draw_freq_axis_ticks(ui.painter(), rect, view_center_hz, visible_half_span_hz, xvtr_rf_offset_hz);
 
+                    let range = (db_high - db_low).max(1.0);
+
+                    // Reserve space at the bottom for the frequency
+                    // axis labels drawn there, so the trace/gridlines
+                    // never overdraw them. Sized for the 13.0 font
+                    // above, not just the older/smaller 10.0.
+                    const FREQ_AXIS_MARGIN: f32 = 20.0;
+                    let plot_bottom = rect.bottom() - FREQ_AXIS_MARGIN;
+                    let plot_height = plot_bottom - rect.top();
+
                     if spectrum_row.len() > 1 {
-                        let range = (db_high - db_low).max(1.0);
-
-                        // Reserve space at the bottom for the frequency
-                        // axis labels drawn there, so the trace/gridlines
-                        // never overdraw them. Sized for the 13.0 font
-                        // above, not just the older/smaller 10.0.
-                        const FREQ_AXIS_MARGIN: f32 = 20.0;
-                        let plot_bottom = rect.bottom() - FREQ_AXIS_MARGIN;
-                        let plot_height = plot_bottom - rect.top();
-
                         // Power-level gridlines. Values are whatever units
                         // WDSP's log-average detector outputs -- real dB,
                         // but not calibrated to absolute dBm since the
@@ -5470,7 +5470,23 @@ impl eframe::App for HpsdrApp {
                             );
                             db += 10.0;
                         }
+                    }
 
+                    // Band edges and the dial line go on top of the
+                    // gridlines but UNDER the trace, so the signal is
+                    // never hidden behind them -- see
+                    // draw_band_edge_markers's own doc comment. Band
+                    // edges first, so the dial line wins if they overlap.
+                    draw_band_edge_markers(ui.painter(), rect, view_center_hz, visible_half_span_hz, &connected.xvtrs);
+                    // Thicker than a plain 1px stroke so it's still
+                    // unambiguous where the trace crosses it, regardless
+                    // of the display's DPI scaling.
+                    ui.painter().line_segment(
+                        [egui::pos2(x_dial, rect.top()), egui::pos2(x_dial, rect.bottom())],
+                        egui::Stroke::new(2.0, egui::Color32::RED),
+                    );
+
+                    if spectrum_row.len() > 1 {
                         // Plain full-width bin mapping -- unlike an
                         // earlier version of this, no zoom-aware
                         // filtering/cropping is needed here: WDSP's own
@@ -5497,21 +5513,6 @@ impl eframe::App for HpsdrApp {
                             egui::Stroke::new(1.5, egui::Color32::LIGHT_GREEN),
                         ));
                     }
-
-                    // See draw_band_edge_markers's own doc comment for
-                    // why this moved here (on top of the trace/gridlines,
-                    // not underneath) -- drawn before the dial line below
-                    // so the dial line still wins if they ever overlap.
-                    draw_band_edge_markers(ui.painter(), rect, view_center_hz, visible_half_span_hz, &connected.xvtrs);
-
-                    // Drawn last (on top of the trace/gridlines above)
-                    // and thicker than a plain 1px stroke so it's
-                    // unambiguous regardless of what's under it or the
-                    // display's DPI scaling.
-                    ui.painter().line_segment(
-                        [egui::pos2(x_dial, rect.top()), egui::pos2(x_dial, rect.bottom())],
-                        egui::Stroke::new(2.0, egui::Color32::RED),
-                    );
 
                     // Small audio-waveform overlay -- output audio while
                     // receiving, whatever's actually feeding TX while
@@ -10430,17 +10431,14 @@ fn draw_audio_waveform(painter: &egui::Painter, rect: egui::Rect, samples: &[f32
 /// (BANDS' low_hz/high_hz) that falls within the currently visible span
 /// -- e.g. tuned near the top of 40m shows a line at 7.300MHz, or near a
 /// WARC band shows both its edges. Deliberately spectrum-only (not the
-/// waterfall). REGRESSION FIX: this used to be drawn right after the
-/// black background, before the trace/gridlines -- at a plain 1px
-/// stroke width, a real report confirmed this made the markers
-/// effectively invisible (not just occasionally crossed-over) once the
-/// trace was drawn on top, unlike the dial line, which had already been
-/// through this exact problem and fixed it (see its own "thicker than a
-/// plain 1px stroke so it's unambiguous regardless of what's under it or
-/// the display's DPI scaling" comment at its call site). Now drawn AFTER
-/// the trace/gridlines (still before the dial line, so the dial line --
-/// the single most important indicator -- always wins if they overlap)
-/// and at the same 2px width. Recomputes the same offset-from-dial-
+/// waterfall). Drawn after the gridlines but BEFORE the trace (and
+/// before the dial line, so the dial line wins if they overlap), so a
+/// signal on or near a band edge or the dial frequency is never hidden
+/// behind them. History: these were once drawn under the trace at 1px
+/// and a real report found them effectively invisible, so they moved on
+/// top of the trace; they're now back underneath but kept at 2px, the
+/// same width as the dial line, so they stay visible where the trace
+/// crosses them. Recomputes the same offset-from-dial-
 /// frequency-to-x mapping the caller builds separately (as `x_for_offset`)
 /// for its own passband overlay/axis ticks, rather than threading that
 /// closure through.
@@ -11726,16 +11724,16 @@ fn render_extra_receiver_ui(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceiver>>) {
     );
     let x_dial = x_for_offset(ctun_offset_hz);
 
+    let range = (db_high - db_low).max(1.0);
+
+    // Reserve space at the bottom for the frequency axis labels
+    // drawn there, so the trace/gridlines never overdraw them.
+    // Sized for the 13.0 font above, not just the older/smaller 10.0.
+    const FREQ_AXIS_MARGIN: f32 = 20.0;
+    let plot_bottom = rect.bottom() - FREQ_AXIS_MARGIN;
+    let plot_height = plot_bottom - rect.top();
+
     if spectrum_row.len() > 1 {
-        let range = (db_high - db_low).max(1.0);
-
-        // Reserve space at the bottom for the frequency axis labels
-        // drawn there, so the trace/gridlines never overdraw them.
-        // Sized for the 13.0 font above, not just the older/smaller 10.0.
-        const FREQ_AXIS_MARGIN: f32 = 20.0;
-        let plot_bottom = rect.bottom() - FREQ_AXIS_MARGIN;
-        let plot_height = plot_bottom - rect.top();
-
         // Power-level gridlines, same treatment as the main window --
         // snapped to multiples of 10 dB rather than equal fractions of
         // db_low/db_high (see that copy's own doc comment for why).
@@ -11756,7 +11754,17 @@ fn render_extra_receiver_ui(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceiver>>) {
             );
             db += 10.0;
         }
+    }
 
+    // Band edges then the dial line, over the gridlines but under the
+    // trace -- same order as the main window.
+    draw_band_edge_markers(ui.painter(), rect, view_center_hz, visible_half_span_hz, &[]);
+    ui.painter().line_segment(
+        [egui::pos2(x_dial, rect.top()), egui::pos2(x_dial, rect.bottom())],
+        egui::Stroke::new(2.0, egui::Color32::RED),
+    );
+
+    if spectrum_row.len() > 1 {
         // Plain full-width bin mapping -- see the main receiver's
         // identical treatment for why no zoom-aware cropping is needed
         // here (WDSP's own analyzer already returns just the visible
@@ -11775,18 +11783,6 @@ fn render_extra_receiver_ui(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceiver>>) {
         ui.painter()
             .add(egui::Shape::line(points, egui::Stroke::new(1.5, egui::Color32::LIGHT_GREEN)));
     }
-
-    // See draw_band_edge_markers's own doc comment for why this moved
-    // here (on top of the trace/gridlines) -- drawn before the dial line
-    // below so the dial line still wins if they ever overlap.
-    draw_band_edge_markers(ui.painter(), rect, view_center_hz, visible_half_span_hz, &[]);
-
-    // Drawn last (on top of the trace/gridlines above) and thicker
-    // than a plain 1px stroke, same as the main window.
-    ui.painter().line_segment(
-        [egui::pos2(x_dial, rect.top()), egui::pos2(x_dial, rect.bottom())],
-        egui::Stroke::new(2.0, egui::Color32::RED),
-    );
 
     // Small audio-waveform overlay -- output audio, same as the main
     // receiver's RX case (extra receivers never transmit, so there's no
