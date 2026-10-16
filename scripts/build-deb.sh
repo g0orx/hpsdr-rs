@@ -22,4 +22,6 @@ next=$((last + 1))
 echo "$next" > "$COUNTER_FILE"
 
 echo "Building .deb with revision $next..."
-cargo deb --deb-revision "$next" "$@"
+# Portable build: no -march=native (see build.rs), so the package runs
+# on other machines' CPUs, not just this one's.
+HPSDR_PORTABLE=1 cargo deb --deb-revision "$next" "$@"
