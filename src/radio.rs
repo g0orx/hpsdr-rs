@@ -2450,8 +2450,18 @@ fn start_protocol1_ozy_usb(
     let i2c_tx_forward_power = Arc::clone(&tx_forward_power);
     let i2c_tx_reverse_power = Arc::clone(&tx_reverse_power);
     let i2c_adc1_overload = Arc::clone(&adc1_overload);
+    let i2c_has_penny = ozy_versions.penny.is_some();
+    let i2c_has_mercury2 = ozy_versions.mercury[1].is_some();
     let i2c_thread = thread::spawn(move || {
-        ozy_i2c_loop(ozy_device, i2c_tx_forward_power, i2c_tx_reverse_power, i2c_adc1_overload, i2c_stop);
+        ozy_i2c_loop(
+            ozy_device,
+            i2c_has_penny,
+            i2c_has_mercury2,
+            i2c_tx_forward_power,
+            i2c_tx_reverse_power,
+            i2c_adc1_overload,
+            i2c_stop,
+        );
     });
 
     // See RadioSession::mute_local_audio_for_tci's doc comment -- only
@@ -5596,8 +5606,15 @@ fn ozy_receiver_loop(
 /// "channel 0" 2-byte reply format wasn't confirmed against a real
 /// single-Mercury reference at the time this was written -- flag if
 /// ADC0 overload never lights up on real hardware).
+///
+/// Only boards that answered at connect time (ozy::OzyVersions) are
+/// polled, as piHPSDR's own ozy_i2c_thread does for Mercury2: polling
+/// a missing board stalls the control endpoint on every cycle and
+/// floods the log (issue #8, a single-Mercury system).
 fn ozy_i2c_loop(
     device: ozy::OzyDevice,
+    has_penny: bool,
+    has_mercury2: bool,
     tx_forward_power: Arc<AtomicU32>,
     tx_reverse_power: Arc<AtomicU32>,
     adc1_overload: Arc<AtomicBool>,
@@ -5609,12 +5626,16 @@ fn ozy_i2c_loop(
     // saturating the I2C bus with back-to-back control transfers.
     const POLL_INTERVAL: Duration = Duration::from_millis(250);
     while !stop.load(Ordering::Relaxed) {
-        if let Ok((fwd, rev, _alc)) = device.read_penny_power() {
-            tx_forward_power.store(fwd as u32, Ordering::Relaxed);
-            tx_reverse_power.store(rev as u32, Ordering::Relaxed);
+        if has_penny {
+            if let Ok((fwd, rev, _alc)) = device.read_penny_power() {
+                tx_forward_power.store(fwd as u32, Ordering::Relaxed);
+                tx_reverse_power.store(rev as u32, Ordering::Relaxed);
+            }
         }
-        if let Ok(overload) = device.read_mercury_overload(1) {
-            adc1_overload.store(overload, Ordering::Relaxed);
+        if has_mercury2 {
+            if let Ok(overload) = device.read_mercury_overload(1) {
+                adc1_overload.store(overload, Ordering::Relaxed);
+            }
         }
         thread::sleep(POLL_INTERVAL);
     }

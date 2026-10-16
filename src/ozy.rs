@@ -408,13 +408,18 @@ fn read_firmware_versions(interface: &Interface, ozy_fx2: &str) -> io::Result<Oz
         }
         Err(e) => eprintln!("ozy: Mercury2 I2C read failed (non-fatal, single-Mercury systems are expected to hit this): {e}"),
     }
-    let penny = i2c_read(interface, I2C_PENNY_FW, 2).map_err(|e| {
-        eprintln!("ozy: Penny I2C firmware-version read failed: {e}");
-        e
-    })?;
-    eprintln!("ozy: Penny firmware version: {}", penny[1]);
-    versions.penny = Some(penny[1]);
-    init_penny_codec(interface)?;
+    // No Penny fitted (an RX-only Ozy + Mercury system) is not an
+    // error: like the reference's ozy_i2c_readvars, skip the TLV320
+    // codec init and carry on. versions.penny stays None, which also
+    // stops radio.rs's ozy_i2c_loop polling Penny's power readings.
+    match i2c_read(interface, I2C_PENNY_FW, 2) {
+        Ok(penny) => {
+            eprintln!("ozy: Penny firmware version: {}", penny[1]);
+            versions.penny = Some(penny[1]);
+            init_penny_codec(interface)?;
+        }
+        Err(e) => eprintln!("ozy: Penny I2C read failed (non-fatal, assuming no Penny fitted): {e}"),
+    }
     Ok(versions)
 }
 
