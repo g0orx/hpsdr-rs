@@ -440,6 +440,14 @@ pub struct Config {
     /// as a fresh connect.
     #[serde(default)]
     pub cw_decode_enabled: Option<bool>,
+    /// See ConnectedState::psk_beacon_enabled's doc comment. `None`
+    /// falls back to off.
+    #[serde(default)]
+    pub psk_beacon_enabled: Option<bool>,
+    /// See ConnectedState::lnb_lock_enabled's doc comment. `None` falls
+    /// back to off.
+    #[serde(default)]
+    pub lnb_lock_enabled: Option<bool>,
     /// RIT / XIT -- see ConnectedState::rit_enabled/xit_enabled's doc
     /// comments (main.rs). `None`/missing falls back to off with a
     /// zero offset, same "a config saved before this existed shouldn't

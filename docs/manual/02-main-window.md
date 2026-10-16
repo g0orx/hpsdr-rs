@@ -82,6 +82,56 @@ want to hear/zero-beat CW at", not a per-receiver hardware setting. That
 same tab also configures the radio's internal CW keyer (speed, weight,
 sidetone, break-in) and up to 5 saved CW text messages.
 
+### PSK Beacon (QO-100)
+
+The **PSK Beacon** button (next to **CTUN**, shown once a
+[transverter](18-xvtr.md#example-qo-100-with-an-lnb) covers 10489.750
+MHz) monitors the QO-100 middle beacon -- the 400 bit/s PSK beacon
+AMSAT-DL sends from the DK0SB ground station. It decodes the beacon's
+text pages and measures exactly where the beacon is, which **Lock LNB**
+uses to cancel your LNB's drift.
+
+It works on the whole received span, not on what you're listening to,
+so the main receiver stays free for normal use. The intended setup:
+
+1. Select the QO-100 transverter and tune to about 10489.750 MHz, so the
+   beacon is near the middle of the span.
+2. Choose a wide sample rate -- e.g. **768 kHz** on an RTL-SDR or
+   MSI.SDR, which covers the whole narrowband transponder.
+3. Turn **CTUN** on and tune around the transponder with it. The radio
+   stays put, so the beacon stays in the span.
+
+The beacon just has to be in the span (not within 12 kHz of its edge);
+the mode and filter don't matter. It's searched for within 10 kHz of
+where the transverter's **LO Offset** and **LO Error** say it should be,
+so if your LNB is further off than that, set LO Error closer by hand
+first. Only a signal with the beacon's PSK shape is accepted, so a
+stronger CW carrier nearby won't be mistaken for it. While it's
+searching, the panel shows the best candidate it has seen and how it
+measured up, which helps if it's never found.
+
+The panel beside the spectrum/waterfall shows:
+
+- How far the beacon is from where it's expected, and how fast it's
+  drifting -- i.e. your LNB's error. It's measured four times a second.
+- **Lock LNB**: corrects that error continuously. Frequencies shown (and
+  reported over CAT/rigctl/TCI) stay right as the LNB drifts, and the
+  station you're listening to stays put -- the listening point moves
+  with the drift, not the radio. **Correction** shows how much is being
+  applied. If the beacon is lost, the last correction is held. Turning
+  the lock (or PSK Beacon) off takes the correction back out. With CTUN
+  off, the radio itself has to be retuned instead, so it's only
+  corrected in 10 Hz steps; use CTUN.
+- **Frames**: pages received with a good checksum. A page arrives about
+  every 25 seconds; each page letter (K, L, M, N, ...) shows its latest
+  version, newest first. **Clear** empties the list.
+
+Only the beacon's plain (uncoded) frames are decoded. The beacon also
+sends FEC-coded frames between them, which aren't decoded yet. It runs
+on the main receiver only. If the CW decoder's panel is showing, it
+takes the place of this panel, but the beacon monitor and Lock LNB keep
+working.
+
 ## VFO A / VFO B / Split
 
 ![VFO A and VFO B boxes with buttons between them](images/02-vfo-ab.png)

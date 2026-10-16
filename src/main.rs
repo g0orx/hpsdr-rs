@@ -24,6 +24,7 @@ mod midi;
 mod midi_import;
 mod mirisdr;
 mod ozy;
+mod psk_beacon;
 mod radio;
 mod rigctl;
 mod rtlsdr;
@@ -289,6 +290,11 @@ pub struct Xvtr {
     pub lo_error_hz: i64,
     pub disable_pa: bool,
     pub default_mode: spectrum::Mode,
+    /// Live LNB drift correction from the QO-100 beacon monitor ("Lock
+    /// LNB", see apply_lnb_correction) -- added to the offset like
+    /// lo_error_hz, but measured rather than set, so never saved.
+    #[serde(skip)]
+    pub lnb_correction_hz: i64,
 }
 
 impl Default for Xvtr {
@@ -301,6 +307,7 @@ impl Default for Xvtr {
             lo_error_hz: 0,
             disable_pa: true,
             default_mode: spectrum::Mode::Usb,
+            lnb_correction_hz: 0,
         }
     }
 }
@@ -308,7 +315,85 @@ impl Default for Xvtr {
 /// The RF-space offset a transverter applies: `RF = IF + this`. Trivial,
 /// but named so every call site reads the same way.
 fn xvtr_rf_offset(xvtr: &Xvtr) -> i64 {
-    xvtr.lo_offset_hz + xvtr.lo_error_hz
+    xvtr.lo_offset_hz + xvtr.lo_error_hz + xvtr.lnb_correction_hz
+}
+
+/// Whether a configured transverter's RF range covers the QO-100 PSK
+/// beacon, i.e. the beacon monitor has something to look at.
+fn xvtr_covers_beacon(xvtr: &Xvtr) -> bool {
+    !xvtr.name.is_empty()
+        && (xvtr.frequency_min_hz..=xvtr.frequency_max_hz).contains(&psk_beacon::BEACON_RF_HZ)
+}
+
+/// Where the QO-100 beacon should be relative to the main receiver's IQ
+/// centre (Hz), for the beacon monitor (spectrum.rs/psk_beacon.rs), or
+/// None if the monitor should idle: PSK Beacon off, the active
+/// transverter doesn't cover the beacon, or it's too near the edge of
+/// the received span. Worked out from the transverter's set LO (offset
+/// + error) WITHOUT the live LNB correction, so the monitor measures
+/// the whole drift from that, not what's left after correcting it.
+fn beacon_iq_offset_hz(connected: &ConnectedState) -> Option<f64> {
+    if !connected.psk_beacon_enabled {
+        return None;
+    }
+    let name = connected.active_xvtr.as_deref()?;
+    let x = connected.xvtrs.iter().find(|x| x.name == name && xvtr_covers_beacon(x))?;
+    let beacon_if_hz = psk_beacon::BEACON_RF_HZ as i64 - (x.lo_offset_hz + x.lo_error_hz);
+    let hardware_hz = connected.session.frequency_hz.load(Ordering::Relaxed) as i64;
+    let offset = (beacon_if_hz - hardware_hz) as f64;
+    (offset.abs() <= connected.sample_rate as f64 / 2.0 - psk_beacon::EDGE_MARGIN_HZ).then_some(offset)
+}
+
+/// "Lock LNB": sets the beacon-covering active transverter's
+/// lnb_correction_hz from the beacon monitor's measured offset, so the
+/// displayed RF (and CAT/rigctl/TCI) stay right as the LNB drifts. The
+/// listening frequency moves with it -- by the same amount the other
+/// way in IF -- so the station being listened to stays put. The
+/// radio's own tuning isn't touched while CTUN is on (the intended
+/// setup: e.g. 768 kHz with the beacon in the middle, CTUN to tune
+/// around); with CTUN off the hardware has to follow instead, so that
+/// only happens in steps of LNB_RETUNE_STEP_HZ.
+///
+/// While the beacon is lost the last correction is held. With the lock
+/// (or PSK Beacon) off, or on any other transverter, the correction is
+/// taken back out, again keeping the listening frequency's RF.
+fn apply_lnb_correction(connected: &mut ConnectedState) {
+    const LNB_RETUNE_STEP_HZ: i64 = 10;
+    let locking = connected.psk_beacon_enabled && connected.lnb_lock_enabled;
+    let measured = connected.spectrum.psk_status().predicted_offset_hz;
+    let active = connected.active_xvtr.clone();
+    let mut listen_shift_hz = 0i64;
+    for x in connected.xvtrs.iter_mut() {
+        let is_active = active.as_deref() == Some(x.name.as_str()) && !x.name.is_empty();
+        let target = if locking && is_active && xvtr_covers_beacon(x) {
+            // The beacon appears `measured` Hz above where the set LO
+            // puts it, i.e. the LNB's LO is that much LOW: RF = IF + LO.
+            match measured {
+                Some(m) => -(m.round() as i64),
+                None => x.lnb_correction_hz,
+            }
+        } else {
+            0
+        };
+        let delta = target - x.lnb_correction_hz;
+        if delta == 0 || (is_active && !connected.ctun && delta.abs() < LNB_RETUNE_STEP_HZ && target != 0) {
+            continue;
+        }
+        x.lnb_correction_hz = target;
+        if is_active {
+            // RF = IF + offset: the offset grew by delta, so the same RF
+            // is now delta lower in IF.
+            listen_shift_hz -= delta;
+        }
+    }
+    if listen_shift_hz != 0 {
+        if connected.ctun {
+            connected.ctun_frequency_hz = (connected.ctun_frequency_hz as i64 + listen_shift_hz).clamp(0, u32::MAX as i64) as u32;
+        } else {
+            let hw = connected.session.frequency_hz.load(Ordering::Relaxed) as i64;
+            connected.session.set_frequency((hw + listen_shift_hz).clamp(0, u32::MAX as i64) as u32);
+        }
+    }
 }
 
 /// Finds the configured transverter (if any) whose *RF* range contains
@@ -1610,6 +1695,16 @@ struct ConnectedState {
     /// panel always shown/active in CW mode) is unchanged for anyone
     /// who's never touched this button.
     cw_decode_enabled: bool,
+    /// "PSK Beacon" toggle (button next to CTUN, shown when a
+    /// transverter covers 10489.750 MHz -- see xvtr_covers_beacon): runs
+    /// the QO-100 beacon monitor (psk_beacon.rs) on the main receiver's
+    /// IQ while that transverter is active, and shows its panel beside
+    /// the spectrum. Off by default.
+    psk_beacon_enabled: bool,
+    /// "Lock LNB" checkbox in the PSK Beacon panel -- corrects LNB drift
+    /// from the beacon monitor's measurement, see apply_lnb_correction.
+    /// Off by default.
+    lnb_lock_enabled: bool,
     /// RIT ("Receiver Incremental Tuning"): when on, rit_offset_hz is
     /// added to the RXA demod shift (see spectrum::SpectrumHandle::
     /// set_ctun -- RIT and CTUN share WDSP's one RXA shift register, so
@@ -2607,6 +2702,8 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
             let vfo_b_frequency_hz = cfg.vfo_b_frequency_hz.unwrap_or(initial_frequency_hz);
             let split = cfg.split.unwrap_or(false);
             let cw_decode_enabled = cfg.cw_decode_enabled.unwrap_or(true);
+            let psk_beacon_enabled = cfg.psk_beacon_enabled.unwrap_or(false);
+            let lnb_lock_enabled = cfg.lnb_lock_enabled.unwrap_or(false);
             // RIT / XIT -- see ConnectedState's own doc comments. Values
             // themselves already computed above (before RadioSession::
             // start), reused here.
@@ -2697,6 +2794,8 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                 vfo_b_scroll_accum: 0.0,
                 split,
                 cw_decode_enabled,
+                psk_beacon_enabled,
+                lnb_lock_enabled,
                 rit_enabled,
                 rit_offset_hz,
                 rit_scroll_accum: 0.0,
@@ -3195,6 +3294,12 @@ impl eframe::App for HpsdrApp {
                 let current_gain = connected.spectrum.gain();
                 let current_agc = connected.spectrum.agc();
                 let agc_params = connected.spectrum.agc_params();
+
+                // QO-100 beacon monitor and LNB lock -- before the CTUN
+                // offset below, since the lock can move the CTUN
+                // listening frequency.
+                connected.spectrum.set_psk_beacon_offset(beacon_iq_offset_hz(connected));
+                apply_lnb_correction(connected);
 
                 // CTUN: keep the analyzer thread's copy of the LO
                 // frequency and shift offset in sync every frame,
@@ -3791,6 +3896,22 @@ impl eframe::App for HpsdrApp {
                                             .clicked()
                                     {
                                         connected.cw_decode_enabled = !connected.cw_decode_enabled;
+                                        settings_changed = true;
+                                    }
+                                    if connected.xvtrs.iter().any(xvtr_covers_beacon)
+                                        && ui
+                                            .add(egui::Button::selectable(
+                                                connected.psk_beacon_enabled,
+                                                "PSK Beacon",
+                                            ))
+                                            .on_hover_text(
+                                                "Monitor the QO-100 middle beacon (10489.750 MHz, 400 bit/s \
+                                                 PSK) on the received span: decode its text pages and \
+                                                 measure LNB drift",
+                                            )
+                                            .clicked()
+                                    {
+                                        connected.psk_beacon_enabled = !connected.psk_beacon_enabled;
                                         settings_changed = true;
                                     }
                                 });
@@ -5198,7 +5319,20 @@ impl eframe::App for HpsdrApp {
                     // the "CW Decode" button next to CTUN (see its own
                     // doc comment above).
                     let cw_panel_visible = cw_mode && connected.cw_decode_enabled;
-                    let cw_panel_reserved_width = if cw_panel_visible { CW_PANEL_WIDTH + CW_PANEL_GAP } else { 0.0 };
+                    // PSK beacon panel: same place and mechanism as the
+                    // CW one, wider for its 64-character lines. The CW
+                    // panel wins if both are on (the beacon monitor and
+                    // LNB lock keep running either way).
+                    let psk_panel_visible = !cw_panel_visible
+                        && connected.psk_beacon_enabled
+                        && connected.xvtrs.iter().any(xvtr_covers_beacon);
+                    let cw_panel_reserved_width = if cw_panel_visible {
+                        CW_PANEL_WIDTH + CW_PANEL_GAP
+                    } else if psk_panel_visible {
+                        PSK_PANEL_WIDTH + CW_PANEL_GAP
+                    } else {
+                        0.0
+                    };
                     let (rect, spectrum_resp) = ui.allocate_exact_size(
                         egui::vec2(ui.available_width() - cw_panel_reserved_width, spectrum_height),
                         egui::Sense::click_and_drag(),
@@ -5217,7 +5351,7 @@ impl eframe::App for HpsdrApp {
                         // window must NOT also do.
                         if spectrum_resp.clicked() && !suppress_refocus_click {
                             let new_freq = freq_at_x(pos.x, rect, freq_hz, sample_rate, connected.spectrum_zoom, pan_offset_hz);
-                            let new_freq = cw_center_click_freq(current_mode, new_freq);
+                            let new_freq = cw_center_click_freq(current_mode, new_freq, xvtr_rf_offset_hz);
                             let (effective_freq, retune) =
                                 resolve_tune(connected.ctun, freq_hz, sample_rate, passband, new_freq);
                             if let Some(lo) = retune {
@@ -5627,12 +5761,15 @@ impl eframe::App for HpsdrApp {
                     }
 
                     if let Some(pos) = spectrum_resp.hover_pos() {
-                        let hover_freq = round_to_step_hz(freq_at_x(pos.x, rect, freq_hz, sample_rate, connected.spectrum_zoom, pan_offset_hz), main_hover_scroll_step_hz(cw_mode, ui.input(|i| i.modifiers.shift), ui.input(|i| i.modifiers.ctrl)));
                         // Shown in RF space when a transverter is active --
                         // see xvtr_rf_offset_hz's doc comment -- matching
                         // the frequency-axis tick labels, which get the
-                        // same treatment.
-                        let hover_freq_shown = (hover_freq as i64 + xvtr_rf_offset_hz).max(0) as u64;
+                        // same treatment. Rounded AFTER adding the offset,
+                        // so it's a round number even when the offset
+                        // isn't (see cw_center_click_freq).
+                        let hover_freq = freq_at_x(pos.x, rect, freq_hz, sample_rate, connected.spectrum_zoom, pan_offset_hz);
+                        let step = main_hover_scroll_step_hz(cw_mode, ui.input(|i| i.modifiers.shift), ui.input(|i| i.modifiers.ctrl));
+                        let hover_freq_shown = round_shown_hz(hover_freq as i64 + xvtr_rf_offset_hz, step).max(0) as u64;
                         draw_freq_hover_tooltip(ui.painter(), pos, hover_freq_shown);
                     }
 
@@ -5660,7 +5797,7 @@ impl eframe::App for HpsdrApp {
                             // See suppress_refocus_click's own doc comment.
                             if waterfall_click_resp.clicked() && !suppress_refocus_click {
                                 let new_freq = freq_at_x(pos.x, rect, freq_hz, sample_rate, connected.spectrum_zoom, pan_offset_hz);
-                                let new_freq = cw_center_click_freq(current_mode, new_freq);
+                                let new_freq = cw_center_click_freq(current_mode, new_freq, xvtr_rf_offset_hz);
                                 let (effective_freq, retune) =
                                     resolve_tune(connected.ctun, freq_hz, sample_rate, passband, new_freq);
                                 if let Some(lo) = retune {
@@ -5809,9 +5946,10 @@ impl eframe::App for HpsdrApp {
                             );
                         }
                         if let Some(pos) = waterfall_click_resp.hover_pos() {
-                            let hover_freq = round_to_step_hz(freq_at_x(pos.x, rect, freq_hz, sample_rate, connected.spectrum_zoom, pan_offset_hz), main_hover_scroll_step_hz(cw_mode, ui.input(|i| i.modifiers.shift), ui.input(|i| i.modifiers.ctrl)));
                             // See the spectrum pane's identical treatment above.
-                            let hover_freq_shown = (hover_freq as i64 + xvtr_rf_offset_hz).max(0) as u64;
+                            let hover_freq = freq_at_x(pos.x, rect, freq_hz, sample_rate, connected.spectrum_zoom, pan_offset_hz);
+                            let step = main_hover_scroll_step_hz(cw_mode, ui.input(|i| i.modifiers.shift), ui.input(|i| i.modifiers.ctrl));
+                            let hover_freq_shown = round_shown_hz(hover_freq as i64 + xvtr_rf_offset_hz, step).max(0) as u64;
                             draw_freq_hover_tooltip(ui.painter(), pos, hover_freq_shown);
                         }
 
@@ -5829,6 +5967,18 @@ impl eframe::App for HpsdrApp {
                                 egui::pos2(spectrum_right + CW_PANEL_GAP + CW_PANEL_WIDTH, waterfall_bottom),
                             ),
                         );
+                    }
+                    if psk_panel_visible
+                        && render_psk_beacon_panel_beside(
+                            ui,
+                            connected,
+                            egui::Rect::from_min_max(
+                                egui::pos2(spectrum_right + CW_PANEL_GAP, spectrum_top),
+                                egui::pos2(spectrum_right + CW_PANEL_GAP + PSK_PANEL_WIDTH, waterfall_bottom),
+                            ),
+                        )
+                    {
+                        settings_changed = true;
                     }
 
                     ui.horizontal(|ui| {
@@ -9943,6 +10093,8 @@ impl eframe::App for HpsdrApp {
                         vfo_b_frequency_hz: Some(connected.vfo_b_frequency_hz),
                         split: Some(connected.split),
                         cw_decode_enabled: Some(connected.cw_decode_enabled),
+                        psk_beacon_enabled: Some(connected.psk_beacon_enabled),
+                        lnb_lock_enabled: Some(connected.lnb_lock_enabled),
                         rit_enabled: Some(connected.rit_enabled),
                         rit_offset_hz: Some(connected.rit_offset_hz),
                         xit_enabled: Some(connected.xit_enabled),
@@ -10162,6 +10314,9 @@ const SPECTRUM_WATERFALL_DIVIDER_HEIGHT: f32 = 8.0;
 /// does.
 const CW_PANEL_WIDTH: f32 = 220.0;
 const CW_PANEL_GAP: f32 = 8.0;
+/// PSK beacon panel width -- fits the beacon's 64-character page lines
+/// in the 11pt monospace font render_psk_beacon_panel uses.
+const PSK_PANEL_WIDTH: f32 = 460.0;
 
 /// "Auto" Low tuning -- see ConnectedState::db_low_auto's doc comment.
 /// Bins within the excluded edge (max of 1/20th of the trace width and
@@ -10309,6 +10464,120 @@ fn render_cw_decoder_panel_beside(ui: &mut egui::Ui, spectrum: &SpectrumHandle, 
             render_cw_decoder_panel(ui, spectrum);
         });
     });
+}
+
+/// Content of the QO-100 PSK beacon panel (see psk_beacon.rs): the
+/// beacon monitor's measurement, the "Lock LNB" checkbox, frame counts
+/// and the decoded text pages, newest first. Returns true if the lock
+/// checkbox changed (caller marks settings dirty).
+fn render_psk_beacon_panel(ui: &mut egui::Ui, connected: &mut ConnectedState) -> bool {
+    let status = connected.spectrum.psk_status();
+    let mut changed = false;
+    ui.horizontal(|ui| {
+        ui.heading("PSK Beacon");
+        if ui.button("Clear").clicked() {
+            connected.spectrum.clear_psk_status();
+        }
+    });
+    let green = egui::Color32::from_rgb(80, 200, 80);
+    if !status.in_span {
+        ui.colored_label(
+            egui::Color32::GRAY,
+            "Beacon (10489.750 MHz) isn't in the received span -- select the QO-100 \
+             transverter and tune near it (e.g. 768 kHz with CTUN on).",
+        );
+    } else {
+        match (status.offset_hz, status.predicted_offset_hz) {
+            (Some(_), Some(predicted)) => {
+                ui.colored_label(
+                    green,
+                    format!("Beacon {predicted:+.0} Hz from expected, drifting {:+.1} Hz/s", status.drift_hz_per_s),
+                )
+                .on_hover_text(
+                    "How far the beacon is from where the transverter's LO Offset + LO Error \
+                     put it -- i.e. the LNB's drift.",
+                );
+            }
+            _ => {
+                ui.colored_label(egui::Color32::GRAY, "Searching for the beacon (within +/-10 kHz)").on_hover_text(
+                    "Takes a few seconds. If it's never found, your LNB may be more than 10 kHz \
+                     off: set the transverter's LO Error closer first.",
+                );
+                // What the search is seeing -- for working out why it
+                // isn't finding the beacon.
+                if let Some(c) = status.candidate {
+                    ui.weak(format!(
+                        "Best candidate {:+.0} Hz: level {:.1} (needs {:.1}), line {:.1} (needs {:.0}), \
+                         shape {:.2} / {:.2} (both need below {:.1})",
+                        c.offset_hz,
+                        c.level,
+                        psk_beacon::WIDE_MIN_LEVEL,
+                        c.line,
+                        psk_beacon::WIDE_MIN_LINE,
+                        c.shape,
+                        c.outer,
+                        psk_beacon::SHAPE_MAX_RATIO,
+                    ));
+                }
+            }
+        }
+    }
+    ui.horizontal(|ui| {
+        if ui
+            .checkbox(&mut connected.lnb_lock_enabled, "Lock LNB")
+            .on_hover_text(
+                "Correct LNB drift from the beacon: frequencies shown (and sent to CAT/rigctl/TCI) \
+                 stay right, and the station you're listening to stays put. Holds the last \
+                 correction if the beacon is lost.",
+            )
+            .changed()
+        {
+            changed = true;
+        }
+        let correction = connected
+            .active_xvtr
+            .as_deref()
+            .and_then(|name| connected.xvtrs.iter().find(|x| x.name == name))
+            .map_or(0, |x| x.lnb_correction_hz);
+        if connected.lnb_lock_enabled {
+            ui.label(format!("Correction {correction:+} Hz"));
+        }
+    });
+    ui.horizontal(|ui| {
+        ui.label(format!("Frames {}", status.frames_ok));
+        if status.frames_bad > 0 {
+            ui.colored_label(egui::Color32::from_rgb(220, 140, 60), format!("CRC errors {}", status.frames_bad));
+        }
+    });
+    ui.separator();
+    egui::ScrollArea::vertical().show(ui, |ui| {
+        if status.pages.is_empty() {
+            ui.weak("No pages decoded yet -- a page is sent about every 25 s.");
+        }
+        for page in &status.pages {
+            let text = page.lines.join("\n");
+            ui.label(egui::RichText::new(text.trim_end()).monospace().size(11.0));
+            ui.separator();
+        }
+    });
+    changed
+}
+
+/// Places the PSK beacon panel beside the spectrum/waterfall, the same
+/// way as render_cw_decoder_panel_beside (see its doc comment).
+fn render_psk_beacon_panel_beside(ui: &mut egui::Ui, connected: &mut ConnectedState, rect: egui::Rect) -> bool {
+    egui::Area::new(egui::Id::new("psk_beacon_panel_main"))
+        .fixed_pos(rect.min)
+        .show(ui, |ui| {
+            egui::Frame::group(ui.style())
+                .show(ui, |ui| {
+                    ui.set_width(rect.width());
+                    ui.set_height(rect.height());
+                    render_psk_beacon_panel(ui, connected)
+                })
+                .inner
+        })
+        .inner
 }
 
 /// Small audio-waveform display drawn in the top-right corner of the
@@ -11589,7 +11858,7 @@ fn render_extra_receiver_ui(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceiver>>) {
     if let Some(pos) = spectrum_resp.interact_pointer_pos() {
         if spectrum_resp.clicked() {
             let new_freq = freq_at_x(pos.x, rect, freq_hz, sample_rate, rx.spectrum_zoom, pan_offset_hz);
-            let new_freq = cw_center_click_freq(current_mode, new_freq);
+            let new_freq = cw_center_click_freq(current_mode, new_freq, 0);
             let (effective_freq, retune) = resolve_tune(rx.ctun, freq_hz, sample_rate, passband, new_freq);
             if let Some(lo) = retune {
                 rx.frequency_hz.store(lo, Ordering::Relaxed);
@@ -11775,7 +12044,7 @@ fn render_extra_receiver_ui(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceiver>>) {
         if let Some(pos) = wf_resp.interact_pointer_pos() {
             if wf_resp.clicked() {
                 let new_freq = freq_at_x(pos.x, wf_rect, freq_hz, sample_rate, rx.spectrum_zoom, pan_offset_hz);
-                let new_freq = cw_center_click_freq(current_mode, new_freq);
+                let new_freq = cw_center_click_freq(current_mode, new_freq, 0);
                 let (effective_freq, retune) = resolve_tune(rx.ctun, freq_hz, sample_rate, passband, new_freq);
                 if let Some(lo) = retune {
                     rx.frequency_hz.store(lo, Ordering::Relaxed);
@@ -12385,13 +12654,33 @@ fn main_hover_scroll_step_hz(cw_mode: bool, shift: bool, ctrl: bool) -> i64 {
 /// so CW's own two arms use `clicked_freq_hz` (now the EXACT frequency
 /// under the cursor -- see freq_at_x's own doc comment) directly,
 /// un-rounded, before applying the pitch offset.
-fn cw_center_click_freq(mode: spectrum::Mode, clicked_freq_hz: u32) -> u32 {
+///
+/// `display_offset_hz` is what's added to this (IF) frequency for
+/// display -- the active transverter's xvtr_rf_offset, 0 otherwise. The
+/// 1kHz rounding happens in DISPLAYED frequency, so the readout lands
+/// on a round number even when that offset isn't one (LO Error, or Lock
+/// LNB's live correction -- real report: click-to-tune stopped landing
+/// on whole kHz with a transverter active).
+fn cw_center_click_freq(mode: spectrum::Mode, clicked_freq_hz: u32, display_offset_hz: i64) -> u32 {
     let pitch = spectrum::cw_pitch_hz() as i64;
     match mode {
         spectrum::Mode::Cwl => (clicked_freq_hz as i64 + pitch).max(0) as u32,
         spectrum::Mode::Cwu => (clicked_freq_hz as i64 - pitch).max(0) as u32,
-        _ => round_to_step_hz(clicked_freq_hz, 1_000),
+        _ => round_displayed_hz(clicked_freq_hz, display_offset_hz, 1_000),
     }
+}
+
+/// Rounds `if_hz` so that its DISPLAYED frequency (`if_hz +
+/// display_offset_hz`) is a multiple of `step_hz`, returning the IF.
+fn round_displayed_hz(if_hz: u32, display_offset_hz: i64, step_hz: i64) -> u32 {
+    let shown = round_shown_hz(if_hz as i64 + display_offset_hz, step_hz);
+    (shown - display_offset_hz).clamp(0, u32::MAX as i64) as u32
+}
+
+/// Rounds a displayed frequency to the nearest multiple of `step_hz`.
+fn round_shown_hz(shown_hz: i64, step_hz: i64) -> i64 {
+    let step = step_hz.max(1);
+    (shown_hz as f64 / step as f64).round() as i64 * step
 }
 
 /// Rounds to the nearest multiple of `step_hz` -- factored out of
@@ -13239,4 +13528,24 @@ fn main() -> eframe::Result<()> {
         options,
         Box::new(|cc| Ok(Box::new(HpsdrApp::new(&cc.egui_ctx)))),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn click_rounds_displayed_frequency_not_if() {
+        // QO-100 via a 9750 MHz LNB with a non-round LO error plus a live
+        // Lock LNB correction: offset 9750.001234 MHz - 193 Hz.
+        let offset: i64 = 9_750_001_234 - 193;
+        let clicked_if: u32 = 739_704_300; // shown as 10489.705341 MHz
+        let tuned_if = cw_center_click_freq(spectrum::Mode::Usb, clicked_if, offset);
+        assert_eq!(tuned_if as i64 + offset, 10_489_705_000);
+        // No transverter: plain 1 kHz rounding, as before.
+        assert_eq!(cw_center_click_freq(spectrum::Mode::Usb, 7_074_600, 0), 7_075_000);
+        // CW still lands exactly, un-rounded.
+        let pitch = spectrum::cw_pitch_hz() as u32;
+        assert_eq!(cw_center_click_freq(spectrum::Mode::Cwu, 7_030_123, offset), 7_030_123 - pitch);
+    }
 }

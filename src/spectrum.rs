@@ -7,6 +7,7 @@
 
 use crate::audio_recorder::AudioRecorder;
 use crate::cw_decoder::CwDecoder;
+use crate::psk_beacon::{BeaconMonitor, BeaconStatus};
 use crate::radio::IqSample;
 use crate::wdsp_sys as wdsp;
 use std::collections::VecDeque;
@@ -1605,6 +1606,12 @@ fn run(
     // the panel in main.rs) fixes that: no new text while disabled, so
     // there's nothing to dump when it's turned back on.
     cw_decode_enabled: Arc<AtomicBool>,
+    // QO-100 beacon monitor (see psk_beacon.rs) -- fed this receiver's
+    // wideband IQ, independent of its own mode and CTUN tuning, while
+    // psk_beacon_offset (where the beacon is expected relative to the
+    // IQ's centre, set by main.rs every frame) is Some.
+    psk_status: Arc<Mutex<BeaconStatus>>,
+    psk_beacon_offset: Arc<Mutex<Option<f64>>>,
     // WAV-recording tap for main.rs's "Record" toolbar toggle -- see
     // audio_recorder.rs. Written from the SAME post-Audio-Gain (l, r)
     // frame as the local speaker's own audio_out push below (matching
@@ -1625,6 +1632,7 @@ fn run(
     let mut analyzer = SpectrumAnalyzer::open(channel, sample_rate);
     let mut chunk = Vec::with_capacity(BUFFER_SIZE);
     let mut cw_decoder = CwDecoder::new(Arc::clone(&cw_text));
+    let mut beacon_monitor = BeaconMonitor::new(Arc::clone(&psk_status));
     // Anti-aliasing lowpass for rx_audio_to_radio only -- confirmed via a
     // real packet capture (radio.rs's RX-audio-to-radio feature) that
     // WDSP's raw 48kHz RXA output carries a large, persistent near-
@@ -1679,6 +1687,9 @@ fn run(
                 out.push_back((s.i as f32 / IQ_NORM as f32, s.q as f32 / IQ_NORM as f32));
             }
         }
+
+        let beacon_offset = *psk_beacon_offset.lock().unwrap();
+        beacon_monitor.process(&chunk, sample_rate as f64, beacon_offset);
 
         // Loaded before feed() (not just before demod() further down,
         // where this used to be read) so set_zoom_pan can reconfigure
@@ -1888,6 +1899,11 @@ pub struct SpectrumHandle {
     /// (matches this project's other "existing behavior unchanged"
     /// toggles) via set_cw_decode_enabled's own call site.
     cw_decode_enabled: Arc<AtomicBool>,
+    /// QO-100 beacon monitor output, and where it should look -- see
+    /// psk_beacon.rs and run()'s doc comment on these same fields. Idle
+    /// (None) by default (set_psk_beacon_offset).
+    psk_status: Arc<Mutex<BeaconStatus>>,
+    psk_beacon_offset: Arc<Mutex<Option<f64>>>,
     /// WAV-recording control for main.rs's "Record" toolbar toggle --
     /// see audio_recorder.rs. `AudioRecorder` is itself already a
     /// cheap `Clone`-able handle (like this whole struct's other
@@ -1959,6 +1975,8 @@ impl SpectrumHandle {
         let iq_out = Arc::new(Mutex::new(VecDeque::with_capacity(IQ_OUT_CAPACITY)));
         let cw_text = Arc::new(Mutex::new(String::new()));
         let cw_decode_enabled = Arc::new(AtomicBool::new(true));
+        let psk_status = Arc::new(Mutex::new(BeaconStatus::default()));
+        let psk_beacon_offset = Arc::new(Mutex::new(None));
         let recorder = AudioRecorder::new();
         let stop = Arc::new(AtomicBool::new(false));
         let iq_buffer_for_clear = Arc::clone(&iq_buffer);
@@ -1971,6 +1989,8 @@ impl SpectrumHandle {
             let iq_out = Arc::clone(&iq_out);
             let cw_text = Arc::clone(&cw_text);
             let cw_decode_enabled = Arc::clone(&cw_decode_enabled);
+            let psk_status = Arc::clone(&psk_status);
+            let psk_beacon_offset = Arc::clone(&psk_beacon_offset);
             let recorder = recorder.clone();
             let stop = Arc::clone(&stop);
             thread::spawn(move || {
@@ -1986,6 +2006,8 @@ impl SpectrumHandle {
                     iq_out,
                     cw_text,
                     cw_decode_enabled,
+                    psk_status,
+                    psk_beacon_offset,
                     recorder,
                     rx_audio_to_radio,
                     mox,
@@ -2002,6 +2024,8 @@ impl SpectrumHandle {
             iq_out,
             cw_text,
             cw_decode_enabled,
+            psk_status,
+            psk_beacon_offset,
             recorder,
             demod_params,
             iq_buffer: iq_buffer_for_clear,
@@ -2072,6 +2096,26 @@ impl SpectrumHandle {
     /// panel is being drawn.
     pub fn set_cw_decode_enabled(&self, enabled: bool) {
         self.cw_decode_enabled.store(enabled, Ordering::Relaxed);
+    }
+
+    /// Snapshot of the beacon monitor's measurement, frame counts and
+    /// decoded pages (see psk_beacon.rs).
+    pub fn psk_status(&self) -> BeaconStatus {
+        self.psk_status.lock().unwrap().clone()
+    }
+
+    /// Clears the decoded pages and frame counts (not the measurement).
+    pub fn clear_psk_status(&self) {
+        let mut st = self.psk_status.lock().unwrap();
+        st.pages.clear();
+        st.frames_ok = 0;
+        st.frames_bad = 0;
+    }
+
+    /// Where the beacon is expected relative to this receiver's IQ
+    /// centre (Hz), or None to idle the monitor.
+    pub fn set_psk_beacon_offset(&self, offset_hz: Option<f64>) {
+        *self.psk_beacon_offset.lock().unwrap() = offset_hz;
     }
 
     pub fn width_hz(&self) -> f64 {

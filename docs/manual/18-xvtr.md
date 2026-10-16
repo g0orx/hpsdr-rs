@@ -40,7 +40,9 @@ standard 9750 MHz LNB lands at an IF of 739.5-740 MHz, which an
 |---|---|---|---|---|
 | QO-100 | 10489500000 | 10490000000 | 9750000000 | 0 |
 
-Use LO Error to correct for your LNB's actual LO drift.
+Use LO Error to correct for your LNB's actual LO error. To follow its
+drift automatically, use [PSK Beacon](02-main-window.md#psk-beacon-qo-100)'s
+**Lock LNB**, which measures it from the middle beacon at 10489.750 MHz.
 
 ## Using a configured transverter
 
