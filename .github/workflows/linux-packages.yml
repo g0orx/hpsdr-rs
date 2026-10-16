@@ -1,10 +1,12 @@
 name: Linux packages
 
-# Builds the Linux AppImages (scripts/build-appimage.sh) and RPMs
-# (scripts/build-rpm.sh) for x86_64 and aarch64. Every run keeps them as
-# workflow artifacts; a pushed v* tag also attaches them to that GitHub
-# release. The RPM is then installed and its libraries checked on real
-# Fedora and openSUSE Tumbleweed containers.
+# Builds the Linux AppImages (scripts/build-appimage.sh), RPMs
+# (scripts/build-rpm.sh) and .debs (cargo deb) for x86_64 and aarch64.
+# Every run keeps them as workflow artifacts; a pushed v* tag also
+# attaches them to that GitHub release. The RPM is then installed and
+# its libraries checked on real Fedora and openSUSE Tumbleweed
+# containers, and the .deb on Debian 12 (also Raspberry Pi OS
+# Bookworm's base) and Ubuntu 24.04.
 #
 # Built on Ubuntu 22.04 on purpose: both formats need a glibc at least
 # as new as the build machine's, so the oldest supported runner gives
@@ -35,6 +37,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y pkg-config libfftw3-dev libasound2-dev curl file
           cargo install cargo-generate-rpm --locked
+          cargo install cargo-deb --locked
 
       - name: Build AppImage
         run: scripts/build-appimage.sh
@@ -42,10 +45,16 @@ jobs:
       - name: Build RPM
         run: scripts/build-rpm.sh
 
+      # Revision 1 for a release; scripts/build-deb.sh's auto-increment
+      # is for local rebuilds. Same portable build as the RPM above, so
+      # nothing is recompiled.
+      - name: Build .deb
+        run: HPSDR_PORTABLE=1 cargo deb --deb-revision 1
+
       - name: Collect packages
         run: |
           mkdir dist
-          mv hpsdr-rs-*.AppImage target/generate-rpm/*.rpm dist/
+          mv hpsdr-rs-*.AppImage target/generate-rpm/*.rpm target/debian/*.deb dist/
           ls -l dist
 
       - name: Upload build artifact
@@ -84,6 +93,41 @@ jobs:
         run: |
           rpm -qi hpsdr-rs
           rpm -qR hpsdr-rs
+          test -x /usr/bin/hpsdr-rs
+          test -f /usr/share/hpsdr-rs/rx888/SDDC_FX3.img
+          test -f /usr/share/hpsdr-rs/ozy/Ozy_Janus.rbf
+          if ldd /usr/bin/hpsdr-rs | grep 'not found'; then exit 1; fi
+
+  deb-install-test:
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: debian:12
+            runner: ubuntu-latest
+            artifact: linux-packages-X64
+          - image: ubuntu:24.04
+            runner: ubuntu-latest
+            artifact: linux-packages-X64
+          - image: debian:12
+            runner: ubuntu-24.04-arm
+            artifact: linux-packages-ARM64
+    runs-on: ${{ matrix.runner }}
+    container: ${{ matrix.image }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+
+      - name: Install .deb
+        run: |
+          apt-get update
+          apt-get install -y ./*.deb
+
+      - name: Check installed files and libraries
+        run: |
+          dpkg -s hpsdr-rs
           test -x /usr/bin/hpsdr-rs
           test -f /usr/share/hpsdr-rs/rx888/SDDC_FX3.img
           test -f /usr/share/hpsdr-rs/ozy/Ozy_Janus.rbf
