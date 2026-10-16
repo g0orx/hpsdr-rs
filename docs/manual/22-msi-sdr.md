@@ -54,9 +54,10 @@ built-in upconverter is used, so there's no direct-sampling mode to set
 up. Every HF band button appears, plus **2m, 70cm and 23cm**, and
 [**Gen**](02-main-window.md#bands-and-modes) reaches anywhere else.
 
-## Settings → RX
+## RF Gain
 
-- **RF Gain** (0-102 dB) sets the MSi001's total gain. It's split across
+- **RF Gain** (0-102 dB), on the main window next to AGC Gain, sets the
+  MSi001's total gain. It's split across
   the LNA (24 dB), mixer (19 dB) and baseband (0-59 dB) stages
   the same way libmirisdr does it. The default is 43 dB. Near the top of the range,
   the ADC clips on any real antenna, so turn it down if strong signals

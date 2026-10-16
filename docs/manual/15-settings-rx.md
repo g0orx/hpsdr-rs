@@ -26,18 +26,10 @@ across every receiver using it.
 
 ## RX attenuation / RX Gain
 
-On any board other than a HermesLite/HermesLite2 connected over Protocol
-1, an **RX Attenuation** slider (0-31 dB) reduces the receiver's input
-level -- turn this up if you're overloading the front end on a strong
-signal, and back down if signals seem unusually weak. This also covers
-Protocol 2 connections (including a HermesLite2 over Protocol 2 -- its
-RX Gain control, below, only exists over Protocol 1).
-
-A HermesLite/HermesLite2 connected over Protocol 1 has no step
-attenuator at all; instead it shows an **RX Gain** slider (-12 to +48
-dB) that adds front-end gain (positive values) or attenuation (negative
-values) directly. Lower it if the spectrum looks garbled/overloaded on
-a strong band, raise it if signals seem unusually weak.
+The **RX Attenuation** / **RX Gain** / **RF Gain** slider is on the
+[main window](02-main-window.md#noiseagc-toggles), next to **AGC
+Gain**. On an [RTL-SDR](21-rtl-sdr.md), its **Tuner AGC** and direct
+sampling options stay here in Settings → RX.
 
 ## Send RX audio to radio
 

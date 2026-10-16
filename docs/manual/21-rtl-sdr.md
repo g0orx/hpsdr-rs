@@ -66,14 +66,15 @@ different port makes it look like a new dongle.
   - **Off**: below 24 MHz the tuner simply can't lock, and you get
     silence.
 
-## Settings → RX
+## RF Gain
 
-- **RF Gain** (0-50 dB) sets the R820T2's LNA and mixer gain. The tuner
-  only has fixed steps (0 to 49.6 dB), so the value snaps to the nearest
-  step at or above what you ask for. Turn it down if strong signals
-  cause spurs or a raised noise floor. The **RF Attenuation** MIDI
-  control drives this too.
-- **Tuner AGC** hands gain control to the tuner's own AGC instead.
+- **RF Gain** (0-50 dB), on the main window next to AGC Gain, sets the
+  R820T2's LNA and mixer gain. The tuner only has fixed steps (0 to
+  49.6 dB), so the value snaps to the nearest step at or above what you
+  ask for. Turn it down if strong signals cause spurs or a raised noise
+  floor. The **RF Attenuation** MIDI control drives this too.
+- **Tuner AGC** (Settings → RX) hands gain control to the tuner's own
+  AGC instead, and greys out the RF Gain slider.
 - Neither has any effect in direct sampling mode, so both are greyed
   out while you're tuned below 24 MHz with direct sampling on.
 

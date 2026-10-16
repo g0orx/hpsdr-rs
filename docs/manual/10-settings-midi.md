@@ -140,7 +140,7 @@ to check.
 | AF Gain | Local speaker/headphone volume |
 | AGC Gain | AGC gain -- the same control as the main window's **AGC Gain** slider (called **Top** in [Settings: RX](15-settings-rx.md#agc-tuning)) |
 | Mic Gain | Microphone input level |
-| RF Attenuation | RX step attenuator (0-31 dB) -- shown as **RF Gain** (-12 to +48 dB) instead when bound while connected to a HermesLite/HermesLite2 over Protocol 1, which has no step attenuator; see [Settings: RX](15-settings-rx.md#rx-attenuation--rx-gain) |
+| RF Attenuation | RX step attenuator (0-31 dB) -- shown as **RF Gain** (-12 to +48 dB) instead when bound while connected to a HermesLite/HermesLite2 over Protocol 1, which has no step attenuator; the same control as the main window's slider next to **AGC Gain** |
 | TX Drive | Transmit power |
 | CW Speed | The radio's internal keyer speed (WPM) |
 | Filter Width | Set the filter width directly |

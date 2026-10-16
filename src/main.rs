@@ -547,6 +547,92 @@ fn midi_knob_range(value: u8, lo: f64, hi: f64) -> f64 {
     lo + (value as f64 / 127.0) * (hi - lo)
 }
 
+/// The main window's RX front-end gain slider, next to AGC Gain (moved
+/// from Settings -> RX). One control, four meanings, all stored in
+/// RadioSession::rx_attenuation (see its doc comment for each one's wire
+/// encoding):
+/// - RTL-SDR: "RF Gain" 0-50 dB (R820T2 LNA + mixer). Greyed out while
+///   Tuner AGC is on (Settings -> RX) or direct sampling bypasses the
+///   tuner.
+/// - MSI.SDR: "RF Gain" 0-mirisdr::MAX_GAIN_DB (MSi001 total gain).
+/// - HermesLite/HermesLite2 on Protocol 1: "RX Gain" -12..+48 dB,
+///   stored as gain_db + 12 (0-60). Previously hardcoded to wire value 0
+///   with no UI; piHPSDR's "RX GAIN - ADC-%d (dB)" slider confirmed it's
+///   meant to be live. P2 has no equivalent, so a HermesLite2 over P2
+///   gets the plain attenuator below.
+/// - Everything else: "RX Attenuation" 0-31 dB. Was once hardcoded to
+///   0 dB, which real hardware (ANAN-100D on an HF antenna) showed
+///   overloads the front end.
+/// Returns true if the value changed (caller marks settings dirty).
+fn rx_gain_slider(ui: &mut egui::Ui, connected: &mut ConnectedState) -> bool {
+    let mut changed = false;
+    if let Some(controls) = connected.session.rtlsdr_controls.clone() {
+        let agc = controls.tuner_agc.load(Ordering::Relaxed);
+        let mut gain_db = connected.session.rx_attenuation.load(Ordering::Relaxed).min(50) as i32;
+        // Same test rtlsdr_control_loop uses to pick the ADC branch.
+        let direct_sampling_active = controls.direct_sampling.load(Ordering::Relaxed) != 0
+            && connected.session.frequency_hz.load(Ordering::Relaxed) < rtlsdr::DIRECT_SAMPLING_BELOW_HZ;
+        let enabled = !agc && !direct_sampling_active;
+        let hover = if direct_sampling_active {
+            "Not used in direct sampling mode (below 24 MHz) -- the tuner is bypassed."
+        } else if agc {
+            "Tuner AGC is on (Settings -> RX), so the tuner sets its own gain."
+        } else {
+            "R820T2 LNA + mixer gain, snapped to the tuner's own steps (0-49.6 dB). \
+             Lower it if strong signals produce spurs or a raised noise floor."
+        };
+        ui.add_enabled(enabled, egui::Label::new("RF Gain:")).on_hover_text(hover).on_disabled_hover_text(hover);
+        ui.add_enabled_ui(enabled, |ui| {
+            if scroll_slider_i32(ui, &mut connected.slider_scroll_accum, &mut gain_db, 0..=50, 1, " dB") {
+                connected.session.rx_attenuation.store(gain_db as u32, Ordering::Relaxed);
+                changed = true;
+            }
+        });
+    } else if connected.device.board == Boards::MsiSdr {
+        let mut gain_db =
+            connected.session.rx_attenuation.load(Ordering::Relaxed).min(mirisdr::MAX_GAIN_DB) as i32;
+        ui.label("RF Gain:").on_hover_text(
+            "MSi001 LNA + mixer + baseband gain. Lower it if strong signals \
+             produce spurs or a raised noise floor.",
+        );
+        if scroll_slider_i32(
+            ui,
+            &mut connected.slider_scroll_accum,
+            &mut gain_db,
+            0..=mirisdr::MAX_GAIN_DB as i32,
+            1,
+            " dB",
+        ) {
+            connected.session.rx_attenuation.store(gain_db as u32, Ordering::Relaxed);
+            changed = true;
+        }
+    } else if connected.device.protocol == 1
+        && matches!(connected.device.board, Boards::HermesLite | Boards::HermesLite2)
+    {
+        let mut gain_db = connected.session.rx_attenuation.load(Ordering::Relaxed) as i32 - 12;
+        ui.label("RX Gain:").on_hover_text(
+            "Extra front-end gain (positive) or attenuation (negative) -- lower this \
+             if the spectrum looks garbled/overloaded on a strong band, raise it if \
+             signals seem unusually weak.",
+        );
+        if scroll_slider_i32(ui, &mut connected.slider_scroll_accum, &mut gain_db, -12..=48, 1, " dB") {
+            connected.session.rx_attenuation.store((gain_db + 12).clamp(0, 60) as u32, Ordering::Relaxed);
+            changed = true;
+        }
+    } else {
+        let mut atten = connected.session.rx_attenuation.load(Ordering::Relaxed) as i32;
+        ui.label("RX Attenuation:").on_hover_text(
+            "Raise this if the spectrum looks garbled/overloaded on a strong band -- \
+             0dB is maximum sensitivity, not a safe default.",
+        );
+        if scroll_slider_i32(ui, &mut connected.slider_scroll_accum, &mut atten, 0..=31, 1, " dB") {
+            connected.session.rx_attenuation.store(atten as u32, Ordering::Relaxed);
+            changed = true;
+        }
+    }
+    changed
+}
+
 /// Display label for a MIDI action, given the currently connected radio
 /// -- same board/protocol-dependent naming as Settings -> RX's own
 /// slider (see dispatch_midi_event's RfAttenuation arm and
@@ -4404,6 +4490,14 @@ impl eframe::App for HpsdrApp {
                             connected.spectrum.set_agc_top_db(agc_top_db);
                             settings_changed = true;
                         }
+
+                        // Front-end gain/attenuation, next to AGC Gain
+                        // since the two are adjusted together -- see
+                        // rx_gain_slider.
+                        ui.add_space(12.0);
+                        if rx_gain_slider(ui, connected) {
+                            settings_changed = true;
+                        }
                     });
 
                     ui.add_space(4.0);
@@ -7446,180 +7540,51 @@ impl eframe::App for HpsdrApp {
                                     // Settings -> Antenna and AntennaMask's doc comment.
                                     ui.separator();
 
-                                    // Shown on both protocols now -- P2's High Priority
-                                    // packet carries this too (bytes 1442/1443, see
-                                    // p2_high_priority_packet), a real gap fixed alongside
-                                    // P1's. HermesLite/HermesLite2 and standard boards share
-                                    // the SAME underlying RadioSession::rx_attenuation
-                                    // storage (see that field's own doc comment for the real
-                                    // dB range/semantics of each) but are genuinely different
-                                    // controls -- and the HermesLite-specific "RX Gain"
-                                    // control only actually exists on Protocol 1 (P2 has no
-                                    // equivalent of P1's wire-sharing quirk, see that same
-                                    // doc comment), so a HermesLite2 on Protocol 2 gets the
-                                    // plain "RX Attenuation" slider too, same as any other
-                                    // board there.
-                                    {
-                                        if let Some(controls) = connected.session.rtlsdr_controls.clone() {
-                                            // RTL-SDR: rx_attenuation holds the R82xx's RF gain
-                                            // in whole dB (see rtlsdr::Controls' doc comment).
-                                            let mut agc = controls.tuner_agc.load(Ordering::Relaxed);
-                                            let mut gain_db =
-                                                connected.session.rx_attenuation.load(Ordering::Relaxed).min(50) as i32;
-                                            // Same test rtlsdr_control_loop uses to pick the
-                                            // ADC branch: the tuner (and its gain) is bypassed.
-                                            let direct_sampling_active = controls.direct_sampling.load(Ordering::Relaxed) != 0
-                                                && connected.session.frequency_hz.load(Ordering::Relaxed)
-                                                    < rtlsdr::DIRECT_SAMPLING_BELOW_HZ;
-                                            ui.horizontal(|ui| {
-                                                ui.add_enabled(!direct_sampling_active, egui::Label::new("RF Gain:"));
-                                                ui.add_enabled_ui(!agc && !direct_sampling_active, |ui| {
-                                                    if scroll_slider_i32(
-                                                        ui,
-                                                        &mut connected.slider_scroll_accum,
-                                                        &mut gain_db,
-                                                        0..=50,
-                                                        1,
-                                                        " dB",
-                                                    ) {
-                                                        connected
-                                                            .session
-                                                            .rx_attenuation
-                                                            .store(gain_db as u32, Ordering::Relaxed);
-                                                        settings_changed = true;
-                                                    }
-                                                });
-                                                if ui
-                                                    .add_enabled(!direct_sampling_active, egui::Checkbox::new(&mut agc, "Tuner AGC"))
-                                                    .changed()
-                                                {
-                                                    controls.tuner_agc.store(agc, Ordering::Relaxed);
+                                    // RX Attenuation / RX Gain / RF Gain moved to the
+                                    // main window, next to AGC Gain -- see
+                                    // rx_gain_slider. Only the RTL-SDR's own tuner
+                                    // options stay here.
+                                    if let Some(controls) = connected.session.rtlsdr_controls.clone() {
+                                        let mut agc = controls.tuner_agc.load(Ordering::Relaxed);
+                                        // Same test rtlsdr_control_loop uses to pick the
+                                        // ADC branch: the tuner (and its gain) is bypassed.
+                                        let direct_sampling_active = controls.direct_sampling.load(Ordering::Relaxed) != 0
+                                            && connected.session.frequency_hz.load(Ordering::Relaxed)
+                                                < rtlsdr::DIRECT_SAMPLING_BELOW_HZ;
+                                        ui.horizontal(|ui| {
+                                            if ui
+                                                .add_enabled(!direct_sampling_active, egui::Checkbox::new(&mut agc, "Tuner AGC"))
+                                                .changed()
+                                            {
+                                                controls.tuner_agc.store(agc, Ordering::Relaxed);
+                                                settings_changed = true;
+                                            }
+                                            if direct_sampling_active {
+                                                ui.weak("(not used in direct sampling)");
+                                            }
+                                        });
+                                        ui.weak(
+                                            "Hands the R820T2's gain to its own AGC; the main window's \
+                                             RF Gain slider is greyed out while this is on.",
+                                        );
+                                        ui.add_space(4.0);
+                                        let mut ds = controls.direct_sampling.load(Ordering::Relaxed);
+                                        ui.horizontal(|ui| {
+                                            ui.label("Below 24 MHz:");
+                                            for (value, label) in [(0u8, "Off"), (1, "Direct sampling (I)"), (2, "Direct sampling (Q)")] {
+                                                if ui.add(egui::Button::selectable(ds == value, label)).clicked() && ds != value {
+                                                    ds = value;
+                                                    controls.direct_sampling.store(ds, Ordering::Relaxed);
                                                     settings_changed = true;
                                                 }
-                                                if direct_sampling_active {
-                                                    ui.weak("(not used in direct sampling)");
-                                                }
-                                            });
-                                            ui.weak(
-                                                "R820T2 LNA + mixer gain, snapped to the tuner's own steps (0-49.6 dB). \
-                                                 Lower it if strong signals produce spurs or a raised noise floor.",
-                                            );
-                                            ui.add_space(4.0);
-                                            let mut ds = controls.direct_sampling.load(Ordering::Relaxed);
-                                            ui.horizontal(|ui| {
-                                                ui.label("Below 24 MHz:");
-                                                for (value, label) in [(0u8, "Off"), (1, "Direct sampling (I)"), (2, "Direct sampling (Q)")] {
-                                                    if ui.add(egui::Button::selectable(ds == value, label)).clicked() && ds != value {
-                                                        ds = value;
-                                                        controls.direct_sampling.store(ds, Ordering::Relaxed);
-                                                        settings_changed = true;
-                                                    }
-                                                }
-                                            });
-                                            ui.weak(
-                                                "The tuner stops at ~24 MHz. Below that, direct sampling feeds the antenna \
-                                                 straight into one of the RTL2832U's ADC inputs -- only useful on a dongle \
-                                                 modified (or built) for HF; an unmodified NESDR Smart just shows noise. \
-                                                 RF Gain has no effect in direct sampling mode.",
-                                            );
-                                        } else if connected.device.board == Boards::MsiSdr {
-                                            // MSi2500: rx_attenuation holds the MSi001's total RF
-                                            // gain in whole dB (see mirisdr::gain_reductions).
-                                            let mut gain_db = connected
-                                                .session
-                                                .rx_attenuation
-                                                .load(Ordering::Relaxed)
-                                                .min(mirisdr::MAX_GAIN_DB) as i32;
-                                            ui.horizontal(|ui| {
-                                                ui.label("RF Gain:");
-                                                if scroll_slider_i32(
-                                                    ui,
-                                                    &mut connected.slider_scroll_accum,
-                                                    &mut gain_db,
-                                                    0..=mirisdr::MAX_GAIN_DB as i32,
-                                                    1,
-                                                    " dB",
-                                                ) {
-                                                    connected.session.rx_attenuation.store(gain_db as u32, Ordering::Relaxed);
-                                                    settings_changed = true;
-                                                }
-                                            });
-                                            ui.weak(
-                                                "MSi001 LNA + mixer + baseband gain. Lower it if strong signals \
-                                                 produce spurs or a raised noise floor.",
-                                            );
-                                        } else if connected.device.protocol == 1
-                                            && matches!(connected.device.board, Boards::HermesLite | Boards::HermesLite2)
-                                        {
-                                            // ROOT CAUSE FIX: this was hardcoded to wire value 0
-                                            // (-12dB, maximum attenuation) with no UI at all -- a
-                                            // real report (RX Gain control expected, same as
-                                            // other HPSDR radios' RX Attenuation) plus direct
-                                            // inspection of piHPSDR's old_protocol.c/sliders.c
-                                            // confirmed this is meant to be a live, user-
-                                            // adjustable -12..+48 dB value (piHPSDR's own "RX
-                                            // GAIN - ADC-%d (dB)" slider), not a constant. The
-                                            // stored wire value is gain_db+12 (0-60) -- see
-                                            // RadioSession::rx_attenuation's doc comment -- so
-                                            // the conversion happens at this UI boundary only.
-                                            let mut gain_db =
-                                                connected.session.rx_attenuation.load(Ordering::Relaxed) as i32 - 12;
-                                            ui.horizontal(|ui| {
-                                                ui.label("RX Gain:");
-                                                if scroll_slider_i32(
-                                                    ui,
-                                                    &mut connected.slider_scroll_accum,
-                                                    &mut gain_db,
-                                                    -12..=48,
-                                                    1,
-                                                    " dB",
-                                                ) {
-                                                    connected
-                                                        .session
-                                                        .rx_attenuation
-                                                        .store((gain_db + 12).clamp(0, 60) as u32, Ordering::Relaxed);
-                                                    settings_changed = true;
-                                                }
-                                            });
-                                            ui.weak(
-                                                "Extra front-end gain (positive) or attenuation \
-                                                 (negative) -- lower this if the spectrum looks \
-                                                 garbled/overloaded on a strong band, raise it if \
-                                                 signals seem unusually weak.",
-                                            );
-                                        } else {
-                                            // ROOT CAUSE FIX: this was previously hardcoded to
-                                            // 0dB (no attenuation), which real hardware testing
-                                            // (ANAN-100D/Angelia on an HF antenna) confirmed
-                                            // causes front-end overload from ordinary band
-                                            // signals -- visible as an intermod comb pattern or
-                                            // sustained broadband noise depending on band
-                                            // conditions at the moment, which is why it looked
-                                            // random between connects.
-                                            let mut atten =
-                                                connected.session.rx_attenuation.load(Ordering::Relaxed) as i32;
-                                            ui.horizontal(|ui| {
-                                                ui.label("RX Attenuation:");
-                                                if scroll_slider_i32(
-                                                    ui,
-                                                    &mut connected.slider_scroll_accum,
-                                                    &mut atten,
-                                                    0..=31,
-                                                    1,
-                                                    " dB",
-                                                ) {
-                                                    connected
-                                                        .session
-                                                        .rx_attenuation
-                                                        .store(atten as u32, Ordering::Relaxed);
-                                                    settings_changed = true;
-                                                }
-                                            });
-                                            ui.weak(
-                                                "Raise this if the spectrum looks garbled/overloaded on a \
-                                                 strong band -- 0dB is maximum sensitivity, not a safe default.",
-                                            );
-                                        }
+                                            }
+                                        });
+                                        ui.weak(
+                                            "The tuner stops at ~24 MHz. Below that, direct sampling feeds the antenna \
+                                             straight into one of the RTL2832U's ADC inputs -- only useful on a dongle \
+                                             modified (or built) for HF; an unmodified NESDR Smart just shows noise. \
+                                             RF Gain and Tuner AGC have no effect in direct sampling mode.",
+                                        );
                                         ui.separator();
                                     }
 

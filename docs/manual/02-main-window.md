@@ -171,6 +171,20 @@ slider:
 - **AGC Gain** (0.0-140.0 dB) -- right after the AGC button. The same value
   as Settings → RX's **Top** slider, under the name piHPSDR uses for it --
   raises or lowers the AGC's target output level.
+- **RX Attenuation / RX Gain / RF Gain** -- right after AGC Gain. The
+  radio's front-end level; which one appears depends on the radio:
+  - **RX Attenuation** (0-31 dB) on most boards: turn it up if strong
+    signals overload the front end, back down if signals seem unusually
+    weak.
+  - **RX Gain** (-12 to +48 dB) on a HermesLite/HermesLite2 over Protocol
+    1, which has no step attenuator: positive values add gain, negative
+    values attenuate. Lower it if the spectrum looks garbled/overloaded
+    on a strong band. Over Protocol 2 a HermesLite2 shows RX Attenuation
+    instead.
+  - **RF Gain** on an [RTL-SDR](21-rtl-sdr.md#rf-gain) (0-50 dB) or
+    [MSI.SDR](22-msi-sdr.md#rf-gain) (0-102 dB).
+
+  Hover over the label for a reminder of what it does.
 
 ![Noise and AGC toggle row](images/02-toggle-row.png)
 

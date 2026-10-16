@@ -206,7 +206,7 @@ with **96/192/384kHz** selectable sample rates — see
 Once set up, the RX-888 shows up in the normal Discover window like any
 other radio (as "USB" instead of an IP address) — select it and click
 Start. The receiver's step attenuator (0-31dB) reuses the existing
-Settings → RX Attenuation control rather than adding a new one.
+RX Attenuation control (main window, next to AGC Gain) rather than adding a new one.
 
 ## RTL-SDR dongles (receive-only)
 
@@ -224,7 +224,7 @@ no librtlsdr or libusb to install.
 - Below 24 MHz, **direct sampling** (Settings → RX, I or Q branch) is used
   automatically — this needs a dongle modified or built for HF; an
   unmodified NESDR Smart just shows noise there.
-- **RF Gain** (0–50 dB, or **Tuner AGC**) is in Settings → RX.
+- **RF Gain** (0–50 dB) is on the main window next to AGC Gain; **Tuner AGC** is in Settings → RX.
 - Sample rates **48–1536 kHz**; one receiver.
 
 Setup:
@@ -252,7 +252,7 @@ libusb to install.
 
 - Tunes **HF to ~2 GHz** natively (no direct-sampling mod needed); every
   HF band plus **2m, 70cm and 23cm** band buttons.
-- **RF Gain** (0–102 dB) is in Settings → RX.
+- **RF Gain** (0–102 dB) is on the main window next to AGC Gain.
 - Sample rates **48–1536 kHz**; one receiver.
 
 Setup:
