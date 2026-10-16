@@ -111,8 +111,8 @@ One row of band buttons -- **160m, 80m, 60m, 40m, 30m, 20m, 17m, 15m, 12m,
 width (or sensible defaults the first time you visit a band). Each band
 remembers its own settings independently as you use the app. A band whose
 range the connected radio can't actually tune to doesn't get a button at
-all -- e.g. HermesLite/HermesLite2 cap out around 30.72MHz, so **6m**
-(50-54MHz) is missing on those boards. Same filtering applies to Settings
+all -- e.g. HermesLite2 receives up to 38.4MHz, so **6m**
+(50-54MHz) is missing on that board. Same filtering applies to Settings
 → PA Calibration's per-band list and to extra receiver windows' own band
 row.
 

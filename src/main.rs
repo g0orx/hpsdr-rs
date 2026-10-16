@@ -3816,7 +3816,7 @@ impl eframe::App for HpsdrApp {
                         for band in &BANDS {
                             // Skip bands the radio can't actually reach --
                             // e.g. HermesLite/HermesLite2 cap out at
-                            // 30.72MHz, well short of 6m's 50MHz start.
+                            // 30.72/38.4MHz, well short of 6m's 50MHz start.
                             // Same check piHPSDR's own band_menu.c makes
                             // against radio->frequency_min/frequency_max.
                             if (band.low_hz as u64) < connected.device.frequency_min

@@ -188,10 +188,15 @@ fn board_info_p1(board_id: u8, version: u8, buf19: u8) -> (Boards, u8, u8, u8, u
         4 => (Boards::Angelia, 2, 7, 1, 0, 61_440_000),
         5 => (Boards::Orion, 2, 7, 1, 0, 61_440_000),
         6 => {
+            // HL2 receives up to 38.4MHz (half its 76.8MHz ADC clock),
+            // beyond its 30MHz TX spec -- same as deskHPSDR's
+            // old_discovery.c. Matters for a transverter whose IF runs
+            // above 30MHz (e.g. 2m on a 28-32MHz IF), whose button was
+            // hidden at the old 30.72MHz cap.
             if version < 42 {
                 (Boards::HermesLite, 1, 2, 1, 0, 30_720_000)
             } else {
-                (Boards::HermesLite2, 1, buf19, 1, 0, 30_720_000)
+                (Boards::HermesLite2, 1, buf19, 1, 0, 38_400_000)
             }
         }
         10 => (Boards::Orion2, 2, 7, 1, 0, 61_440_000),
@@ -216,7 +221,7 @@ fn board_info_p2(board_id: u8) -> (Boards, u8, u8, u8, u64, u64) {
         // 1 (see board_info_p1's buf19-based dynamic lookup, the path a
         // real HL2 unit's discovery reply takes), but corrected for
         // accuracy rather than left silently wrong.
-        6 => (Boards::HermesLite2, 1, 4, 1, 0, 30_720_000),
+        6 => (Boards::HermesLite2, 1, 4, 1, 0, 38_400_000),
         10 => (Boards::Saturn, 2, 7, 1, 0, 61_440_000),
         _ => (Boards::Unknown, 1, 1, 1, 0, 61_440_000),
     }
