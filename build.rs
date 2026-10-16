@@ -276,7 +276,13 @@ fn main() {
     build.flag_if_supported("-pthread");
     build.flag_if_supported("-D_GNU_SOURCE");
     build.flag_if_supported("-Wno-parentheses");
-    build.flag_if_supported("-march=native");
+    // HPSDR_PORTABLE=1 (set by scripts/build-appimage.sh)
+    // drops -march=native: a binary handed to other machines must
+    // not use instructions only the build machine's CPU has.
+    println!("cargo:rerun-if-env-changed=HPSDR_PORTABLE");
+    if std::env::var_os("HPSDR_PORTABLE").is_none() {
+        build.flag_if_supported("-march=native");
+    }
     // BUG FIX: MSVC's cl.exe, with no explicit /std: flag, defaults to a
     // pre-C11 dialect and doesn't recognize `_Static_assert` -- confirmed
     // by a real build failure on (now-removed) libspecbleach's

@@ -2,3 +2,6 @@
 /log
 /dist
 /.deb-revision
+
+# AppImage builds (packaging/appimage/build-appimage.sh)
+/*.AppImage

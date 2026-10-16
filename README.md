@@ -287,6 +287,45 @@ If the project directory is under your home directory (the normal case), `apt` w
 
 Rebuilding and reinstalling repeatedly (e.g. while testing local changes) with the crate's own `version` unchanged produces the exact same package version every time — `dpkg`/`apt` treat that as nothing to do, requiring `sudo dpkg -r hpsdr-rs` before the new one will install. `./scripts/build-deb.sh` avoids this: it's a thin wrapper around `cargo deb --deb-revision <n>` that auto-increments a local counter (`.deb-revision`, gitignored) on every run, so each build gets a genuinely newer Debian revision and installs over the previous one cleanly. Use it exactly like `cargo deb` — extra arguments are passed through, e.g. `./scripts/build-deb.sh --no-build`.
 
+## Packaging (AppImage, any Linux distribution)
+
+An AppImage is a single file that runs on most Linux distributions without installing anything:
+
+```sh
+chmod +x hpsdr-rs-<version>-x86_64.AppImage
+./hpsdr-rs-<version>-x86_64.AppImage
+```
+
+x86_64 and aarch64 (e.g. Raspberry Pi 5) AppImages are attached to each GitHub release. To build one yourself, with the same prerequisites as a normal build plus `curl`:
+
+```sh
+./scripts/build-appimage.sh
+```
+
+This produces `hpsdr-rs-<version>-<arch>.AppImage` in the project root, including the Ozy and RX-888 firmware. It downloads the pinned `linuxdeploy` tools into `target/appimage-tools` on first use, and builds without `-march=native` so the result runs on other CPUs. An AppImage only runs on systems with a glibc at least as new as the one it was built on, so build on the oldest distribution you want to support (the release AppImages are built on Ubuntu 22.04). FFTW3 is bundled; ALSA and the graphics libraries come from the host system.
+
+USB radios (Ozy, RX-888, RTL-SDR, MSI.SDR) still need their udev rules installed by hand, as described in each radio's section above. The rules files are inside the AppImage under `usr/share/doc/hpsdr-rs/`; `./hpsdr-rs-<version>-x86_64.AppImage --appimage-extract` unpacks them.
+
+## Packaging (RPM: Fedora, RHEL, openSUSE)
+
+x86_64 and aarch64 `.rpm` packages are attached to each GitHub release. Install with your distribution's package manager, which also pulls in FFTW3 and ALSA:
+
+```sh
+sudo dnf install ./hpsdr-rs-<version>-1.x86_64.rpm                          # Fedora, RHEL
+sudo zypper install --allow-unsigned-rpm ./hpsdr-rs-<version>-1.x86_64.rpm  # openSUSE
+```
+
+The package installs the same files as the `.deb` (binary, desktop entry and icon, AppStream metadata, manual, Ozy and RX-888 firmware), and like the `.deb` it ships the udev rules for USB radios under `/usr/share/doc/hpsdr-rs/` for you to install by hand. The package isn't signed, which is why openSUSE needs `--allow-unsigned-rpm`.
+
+To build one yourself, using [`cargo-generate-rpm`](https://crates.io/crates/cargo-generate-rpm) (no `rpmbuild` needed, so this works on any distribution):
+
+```sh
+cargo install cargo-generate-rpm   # one-time
+./scripts/build-rpm.sh
+```
+
+This produces `target/generate-rpm/hpsdr-rs-<version>-1.<arch>.rpm`. Library dependencies are worked out from the built binary, so the one package suits every RPM distribution. It does need a glibc at least as new as the build machine's, so build on the oldest system you want to install on (the release RPMs are built on Ubuntu 22.04 and tested on Fedora and openSUSE Tumbleweed).
+
 ## Packaging (Windows)
 
 An `.msi` installer can be built with [`cargo-wix`](https://crates.io/crates/cargo-wix), from a normal PowerShell prompt on a Windows machine already set up for the [MSVC build](#windows-via-msvc) above — this only packages an existing working build, it doesn't set one up:

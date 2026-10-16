@@ -180,3 +180,31 @@ assets = [
     ["assets/rx888/LICENSE.txt", "usr/share/hpsdr-rs/rx888/LICENSE.txt", "644"],
     ["assets/rx888/PROVENANCE.md", "usr/share/hpsdr-rs/rx888/PROVENANCE.md", "644"],
 ]
+
+# RPM packaging (Fedora, RHEL, openSUSE, ...) via cargo-generate-rpm --
+# see README's "Packaging (RPM)". Same files and locations as the .deb
+# above (ozy.rs/rx888.rs find their firmware under /usr/share/hpsdr-rs).
+# Requires are worked out from the built binary's shared libraries
+# (auto-req), as sonames like libfftw3.so.3()(64bit) rather than
+# package names, so one .rpm works whatever each distro calls its
+# FFTW/ALSA packages.
+[package.metadata.generate-rpm]
+release = "1"
+summary = "Desktop client for openHPSDR software-defined radios"
+url = "https://github.com/g0orx/hpsdr-rs"
+auto-req = "auto"
+assets = [
+    { source = "target/release/hpsdr-rs", dest = "/usr/bin/hpsdr-rs", mode = "755" },
+    { source = "README.md", dest = "/usr/share/doc/hpsdr-rs/README.md", mode = "644", doc = true },
+    { source = "LICENSE", dest = "/usr/share/licenses/hpsdr-rs/LICENSE", mode = "644" },
+    { source = "docs/manual/*.md", dest = "/usr/share/doc/hpsdr-rs/manual/", mode = "644", doc = true },
+    { source = "docs/manual/images/*", dest = "/usr/share/doc/hpsdr-rs/manual/images/", mode = "644", doc = true },
+    { source = "assets/hpsdr-rs.desktop", dest = "/usr/share/applications/hpsdr-rs.desktop", mode = "644" },
+    { source = "assets/icons/hpsdr-rs.png", dest = "/usr/share/icons/hicolor/256x256/apps/hpsdr-rs.png", mode = "644" },
+    { source = "assets/io.github.g0orx.hpsdr-rs.metainfo.xml", dest = "/usr/share/metainfo/io.github.g0orx.hpsdr-rs.metainfo.xml", mode = "644" },
+    # Reference copies, not installed to /etc/udev/rules.d/ -- same
+    # reasoning as the .deb.
+    { source = "assets/*.rules", dest = "/usr/share/doc/hpsdr-rs/", mode = "644", doc = true },
+    { source = "assets/ozy/*", dest = "/usr/share/hpsdr-rs/ozy/", mode = "644" },
+    { source = "assets/rx888/*", dest = "/usr/share/hpsdr-rs/rx888/", mode = "644" },
+]
