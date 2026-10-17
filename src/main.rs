@@ -3486,6 +3486,12 @@ impl eframe::App for HpsdrApp {
                     _ => tx_dial_freq_hz,
                 };
                 connected.session.tx_frequency_hz.store(tx_dial_freq_hz, std::sync::atomic::Ordering::Relaxed);
+                // The HL2 IO board switches amplifiers/transverters on the
+                // real RF TX frequency, not the radio's IF.
+                connected.session.hl2_io_board.tx_rf_frequency_hz.store(
+                    (tx_dial_freq_hz as i64 + xvtr_rf_offset_hz).max(0) as u64,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
 
                 // While transmitting, show tx_spectrum (fed with the
                 // actual generated TX IQ -- see ConnectedState::tx_spectrum's
@@ -9193,6 +9199,22 @@ impl eframe::App for HpsdrApp {
                                         {
                                             connected.session.new_pa_board.store(new_pa_board, Ordering::Relaxed);
                                             settings_changed = true;
+                                        }
+                                    }
+                                    // See radio::Hl2IoBoardShared -- detected
+                                    // automatically over Protocol 1.
+                                    if connected.device.protocol == 1
+                                        && matches!(connected.device.board, Boards::HermesLite2)
+                                    {
+                                        ui.add_space(4.0);
+                                        if connected.session.hl2_io_board.detected.load(Ordering::Relaxed) {
+                                            ui.label(
+                                                "N2ADR HL2 IO board detected: it is sent the TX frequency \
+                                                 (transverter RF included), and any RX antenna other than \
+                                                 ANT1 selects its J9 receive input.",
+                                            );
+                                        } else {
+                                            ui.weak("No N2ADR HL2 IO board detected.");
                                         }
                                     }
                                     ui.add_space(6.0);

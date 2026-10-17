@@ -60,6 +60,23 @@ Clicking it retunes to the slot's RF minimum. While active:
   that transverter and tunes its IF. Up to 11 digits are accepted.
 - Clicking back to an ordinary band leaves the transverter and returns to
   plain IF display.
+- VFO-B is shown and typed in the same RF terms while a transverter is
+  active.
+
+## Hermes-Lite 2 with the N2ADR IO board
+
+Over Protocol 1, hpsdr-rs looks for the N2ADR HL2 IO board automatically
+and, once found (Settings → Antenna says so), keeps it told:
+
+- the **TX frequency** in RF terms (transverter offset included), which
+  the board's firmware uses to switch amplifier and transverter bands;
+- the **RX1 frequency code**, for its receive antenna/preselector choice;
+- the **RF input mode**: any band whose RX antenna (Settings → Antenna) is
+  not ANT1 uses the board's J9 receive input, and with PureSignal on, J10
+  is passed through for PureSignal on TX.
+
+The board's registers are reset once on connect. What the board does with
+these values is up to its own Pico firmware.
 
 ## Limitations
 

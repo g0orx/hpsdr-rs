@@ -508,6 +508,9 @@ pub struct RadioSession {
     /// heard) rather than the parked hardware LO. See
     /// `requested_frequency_hz` below for the "set" side of this.
     pub rx_frequency_hz: Arc<AtomicU64>,
+    /// N2ADR HL2 IO board state -- see Hl2IoBoardShared. Only P1
+    /// (HermesLite2) sessions ever probe for or write to one.
+    pub hl2_io_board: Arc<Hl2IoBoardShared>,
     /// Where rigctl/CAT/TCI's "set frequency" commands write their
     /// request, instead of `frequency_hz` directly -- CTUN state
     /// (`ConnectedState::ctun`/`ctun_frequency_hz`) lives in the UI layer,
@@ -2042,6 +2045,9 @@ fn start_protocol1(
     // Live -- see RadioSession::puresignal_enabled's doc comment.
     // sender_loop watches this itself for changes, same as diversity.
     let sender_puresignal_enabled = Arc::clone(&puresignal_enabled);
+    let hl2_io_board = Arc::new(Hl2IoBoardShared::default());
+    let sender_hl2_io_board = Arc::clone(&hl2_io_board);
+    let sender_rx_frequency = Arc::clone(&rx_frequency_hz);
     let sender_thread = thread::spawn(move || {
         sender_loop(
             sender_socket,
@@ -2082,6 +2088,8 @@ fn start_protocol1(
             sender_filter_board,
             sender_charly25_preamp1,
             sender_charly25_preamp2,
+            sender_hl2_io_board,
+            sender_rx_frequency,
             sender_stop,
         );
     });
@@ -2103,6 +2111,7 @@ fn start_protocol1(
     // Live -- see RadioSession::diversity_enabled's doc comment.
     let receiver_diversity_enabled = Arc::clone(&diversity_enabled);
     let receiver_diversity_main_raw_iq = Arc::clone(&diversity_main_raw_iq);
+    let receiver_hl2_io_board = Arc::clone(&hl2_io_board);
     let receiver_thread = thread::spawn(move || {
         receiver_loop(
             receiver_socket,
@@ -2122,6 +2131,7 @@ fn start_protocol1(
             receiver_radio_mic_audio,
             receiver_diversity_enabled,
             receiver_diversity_main_raw_iq,
+            receiver_hl2_io_board,
             receiver_stop,
         );
     });
@@ -2136,6 +2146,7 @@ fn start_protocol1(
         frequency_hz,
         tx_frequency_hz,
         rx_frequency_hz,
+        hl2_io_board,
         requested_frequency_hz,
         sample_rate,
         adc,
@@ -2474,6 +2485,7 @@ fn start_protocol1_ozy_usb(
         frequency_hz,
         tx_frequency_hz,
         rx_frequency_hz,
+        hl2_io_board: Arc::default(),
         requested_frequency_hz,
         sample_rate,
         adc,
@@ -2739,6 +2751,7 @@ fn start_rx888_usb(
         frequency_hz,
         tx_frequency_hz,
         rx_frequency_hz,
+        hl2_io_board: Arc::default(),
         requested_frequency_hz,
         sample_rate,
         adc,
@@ -2933,6 +2946,7 @@ fn start_usb_dongle(
         frequency_hz,
         tx_frequency_hz,
         rx_frequency_hz,
+        hl2_io_board: Arc::default(),
         requested_frequency_hz,
         sample_rate,
         adc,
@@ -3920,6 +3934,7 @@ fn p1_send_preconfig_and_start(
             mic_ptt_enabled,
             mic_bias_enabled,
             mic_ptt_on_tip,
+            None, // hl2_iob_cc: sender_loop takes over the IO board once running
         );
         socket.send(&packet)?;
         pre_seq = pre_seq.wrapping_add(1);
@@ -3954,6 +3969,108 @@ fn p1_send_preconfig_and_start(
     start_pkt[3] = 0x03;
     socket.send(&start_pkt)?;
     Ok(())
+}
+
+/// N2ADR HL2 IO board (github.com/jimahlstrom/HL2IOBoard): a Pico on the
+/// HermesLite2's I2C bus 2 that switches amplifiers, transverters and
+/// receive inputs. It can't see the radio's frequencies, so the host must
+/// write them: the TX frequency (the one thing its docs call required),
+/// the RX1 frequency code, and REG_RF_INPUTS (J9 as the receive input).
+/// Shared between main.rs (which knows the RF frequency, transverter
+/// included), sender_loop (which writes the registers) and receiver_loop
+/// (which sees the presence probe's answer).
+#[derive(Default)]
+pub struct Hl2IoBoardShared {
+    /// Set once the board answers the presence probe.
+    pub detected: AtomicBool,
+    /// TX frequency as the operator sees it (transverter RF, not IF).
+    pub tx_rf_frequency_hz: AtomicU64,
+}
+
+/// HL2 I2C tunnel: C&C address 0x3D (I2C bus 2) in C0, plus C0 bit 7
+/// ("RQST") to make the gateware answer. C1 0x06 writes, 0x07 reads; C2
+/// is 0x80 | the 7-bit I2C address. Byte layout matches deskHPSDR's
+/// old_protocol.c and the HL2 protocol wiki.
+const HL2_I2C2_C0: u8 = 0x3D << 1;
+const HL2_I2C_RQST: u8 = 0x80;
+const HL2_I2C_WRITE: u8 = 0x06;
+const HL2_I2C_READ: u8 = 0x07;
+/// The board's Pico.
+const HL2_IOB_ADDR: u8 = 0x1D;
+/// The board's hardware-version chip, answered even if the Pico isn't
+/// running: reads back 0xF1 (0xF in the top nibble, version below).
+const HL2_IOB_VERSION_ADDR: u8 = 0x41;
+const HL2_IOB_REG_TX_FREQ_BYTE4: u8 = 0; // MSB; registers 1-3 follow, 4 is the LSB
+const HL2_IOB_REG_CONTROL: u8 = 5;
+const HL2_IOB_REG_RF_INPUTS: u8 = 11;
+const HL2_IOB_REG_FCODE_RX1: u8 = 13;
+/// Presence probe cadence while undetected, in HL2 slots (~30 ms each).
+const HL2_IOB_PROBE_EVERY: u8 = 32;
+
+/// The IO board's one-byte frequency code (its n2adr_lib hertz2fcode):
+/// a log scale coarse enough to pick a band, 0 meaning "not set".
+fn hl2_iob_fcode(hz: u64) -> u8 {
+    if hz == 0 {
+        0
+    } else if hz < 20_000 {
+        1
+    } else if hz > 270_000_000_000 {
+        255
+    } else {
+        (0.5 + 15.47 * (hz as f64 / 18748.1).ln()) as u8
+    }
+}
+
+/// Whether a P1 reply frame's C0-C4 is the IO board's version chip
+/// answering the presence probe: an I2C ACK frame (C0 bit 7) for address
+/// 0x3D carrying the 0xF? version byte (deskHPSDR checks all four for 0xF1).
+fn hl2_iob_probe_answered(c: &[u8]) -> bool {
+    c[0] & 0x80 != 0 && (c[0] & 0x7E) >> 1 == 0x3D && c[1..5].iter().all(|&b| b & 0xF0 == 0xF0 && b == c[1])
+}
+
+/// Walks the IO board's register writes through P1's HermesLite slot
+/// (rotation command 11, normally the 0x2E PTT-hang/TX-latency write).
+/// Until the board is detected, every HL2_IOB_PROBE_EVERY-th slot probes
+/// for it. Once detected: one REG_CONTROL reset (its registers outlive
+/// whatever program set them last), then a repeating cycle of 0x2E, the
+/// five TX frequency bytes (LSB last -- that write latches the rest),
+/// REG_RF_INPUTS and REG_FCODE_RX1. Writes are re-sent every cycle
+/// (~250 ms) rather than on change, so a lost UDP packet heals itself.
+#[derive(Default)]
+struct Hl2IoBoard {
+    step: u8,
+    probe_countdown: u8,
+    reset_sent: bool,
+}
+
+impl Hl2IoBoard {
+    /// C0-C4 for this HermesLite slot, or None for the normal 0x2E write.
+    fn next_cc(&mut self, detected: bool, tx_hz: u64, rx_hz: u64, rf_inputs: u8) -> Option<(u8, u8, u8, u8, u8)> {
+        let write = |reg: u8, val: u8| Some((HL2_I2C2_C0, HL2_I2C_WRITE, 0x80 | HL2_IOB_ADDR, reg, val));
+        if !detected {
+            if self.probe_countdown == 0 {
+                self.probe_countdown = HL2_IOB_PROBE_EVERY;
+                return Some((HL2_I2C2_C0 | HL2_I2C_RQST, HL2_I2C_READ, 0x80 | HL2_IOB_VERSION_ADDR, 0, 0));
+            }
+            self.probe_countdown -= 1;
+            return None;
+        }
+        if !self.reset_sent {
+            self.reset_sent = true;
+            return write(HL2_IOB_REG_CONTROL, 1);
+        }
+        let step = self.step;
+        self.step = if step >= 7 { 0 } else { step + 1 };
+        match step {
+            1..=5 => {
+                let byte = 5 - step; // 4 (MSB) down to 0 (LSB)
+                write(HL2_IOB_REG_TX_FREQ_BYTE4 + step - 1, (tx_hz >> (8 * byte as u32)) as u8)
+            }
+            6 => write(HL2_IOB_REG_RF_INPUTS, rf_inputs),
+            7 => write(HL2_IOB_REG_FCODE_RX1, hl2_iob_fcode(rx_hz)),
+            _ => None,
+        }
+    }
 }
 
 /// Builds one full P1 packet (general-control frame + whichever C&C
@@ -4080,6 +4197,9 @@ fn p1_build_packet(
     mic_ptt_enabled: bool,
     mic_bias_enabled: bool,
     mic_ptt_on_tip: bool,
+    // HermesLite2 IO board writes for this packet's HermesLite slot, if
+    // it carries one -- see Hl2IoBoard. None everywhere but sender_loop.
+    hl2_iob_cc: Option<(u8, u8, u8, u8, u8)>,
 ) -> [u8; PACKET_SIZE] {
     // MOX/PTT bit: inferred to be C0's bit 0 on both frames, based
     // on every register value used elsewhere in this file (0x00,
@@ -4722,7 +4842,7 @@ fn p1_build_packet(
             }
             (0x24, c1, c2, 0x00, 0x00)
         }
-        _ => (0x2E, 0x00, 0x00, 0x04, 0x15),
+        _ => hl2_iob_cc.unwrap_or((0x2E, 0x00, 0x00, 0x04, 0x15)),
     };
     if *current_receiver == 0 {
         *ozy_command = if *ozy_command >= 11 { 1 } else { *ozy_command + 1 };
@@ -4829,6 +4949,10 @@ fn sender_loop(
     // See p1_build_packet's identically-named param's doc comment.
     charly25_preamp1: Arc<AtomicBool>,
     charly25_preamp2: Arc<AtomicBool>,
+    // See Hl2IoBoardShared. rx_frequency_hz is RadioSession's (RF, CTUN
+    // and transverter included).
+    hl2_io_board: Arc<Hl2IoBoardShared>,
+    rx_frequency_hz: Arc<AtomicU64>,
     stop: Arc<AtomicBool>,
 ) {
     let mut seq: u32 = 0;
@@ -4836,6 +4960,7 @@ fn sender_loop(
     let mut current_receiver: u8 = 0;
     let mut rx_audio_pacer = RxAudioPacer::new();
     let mut tx_iq_pacer = TxIqPacer::new();
+    let mut hl2_iob = Hl2IoBoard::default();
 
     // Absolute-deadline pacing, not `thread::sleep(interval)` computed
     // fresh each iteration (which this loop used until now) -- same
@@ -5028,6 +5153,27 @@ fn sender_loop(
         // time directly instead).
         let tx_iq_slots_per_sample = 1.0;
 
+        // See Hl2IoBoard -- only advanced when this packet actually
+        // carries the HermesLite slot (command 11), so no write is
+        // skipped. RF inputs: J9 replaces the HL2's receive input when
+        // the band's RX antenna is anything but ANT1, with J10 (the
+        // PureSignal input) passed through on TX when PureSignal is on.
+        let hl2_iob_cc = if is_hermes_lite && ozy_command == 11 {
+            let rf_inputs = match (rx_antenna.load(Ordering::Relaxed), now_puresignal_enabled) {
+                (0, _) => 0,
+                (_, false) => 1,
+                (_, true) => 2,
+            };
+            hl2_iob.next_cc(
+                hl2_io_board.detected.load(Ordering::Relaxed),
+                hl2_io_board.tx_rf_frequency_hz.load(Ordering::Relaxed),
+                rx_frequency_hz.load(Ordering::Relaxed),
+                rf_inputs,
+            )
+        } else {
+            None
+        };
+
         let packet = p1_build_packet(
             seq,
             &mut ozy_command,
@@ -5071,6 +5217,7 @@ fn sender_loop(
             mic_ptt_enabled.load(Ordering::Relaxed),
             mic_bias_enabled.load(Ordering::Relaxed),
             mic_ptt_on_tip.load(Ordering::Relaxed),
+            hl2_iob_cc,
         );
 
         if socket.send(&packet).is_err() {
@@ -5297,6 +5444,7 @@ fn receiver_loop(
     // read fresh each packet, same as active_receiver_count just above.
     diversity_enabled: Arc<AtomicBool>,
     diversity_main_raw_iq: Arc<Mutex<VecDeque<IqSample>>>,
+    hl2_io_board: Arc<Hl2IoBoardShared>,
     stop: Arc<AtomicBool>,
 ) {
     let mut buf = [0u8; PACKET_SIZE + 64]; // a little slack in case of larger packets
@@ -5356,6 +5504,7 @@ fn receiver_loop(
                         &mut rev_acc,
                         &mut carry,
                         &mut frame_synced,
+                        &hl2_io_board.detected,
                     );
                 }
                 // EP_WIDEBAND (0x04) and anything else: ignored for now.
@@ -5483,6 +5632,7 @@ fn ozy_sender_loop(
             mic_ptt_enabled.load(Ordering::Relaxed),
             mic_bias_enabled.load(Ordering::Relaxed),
             mic_ptt_on_tip.load(Ordering::Relaxed),
+            None, // hl2_iob_cc -- Ozy is never a HermesLite
         );
 
         // `packet` is [8-byte Metis header][512-byte frame][512-byte
@@ -5574,6 +5724,7 @@ fn ozy_receiver_loop(
                     &mut rev_acc,
                     &mut carry,
                     &mut frame_synced,
+                    &AtomicBool::new(false), // no HL2 IO board on Ozy
                 );
             }
             Ok(_) => continue, // 0 bytes -- transient, keep polling
@@ -5743,6 +5894,9 @@ fn parse_iq_stream(
     // diagnostic is no longer needed.
     carry: &mut Vec<u8>,
     frame_synced: &mut bool,
+    // See Hl2IoBoardShared::detected -- set when a reply frame is the
+    // IO board answering sender_loop's presence probe.
+    hl2_iob_detected: &AtomicBool,
 ) -> (u32, u32) {
     let mut rx_fb_pushed: u32 = 0;
     let mut tx_fb_pushed: u32 = 0;
@@ -5795,6 +5949,13 @@ fn parse_iq_stream(
         // Alex reverse power (C1-C2).
         let frame = &carry[0..USB_FRAME_SIZE];
         let c0 = frame[3];
+        // An HL2 I2C acknowledgement (sender_loop's IO board probe) puts
+        // its own address in C0 bits 6:1, where dot/dash normally live;
+        // only PTT (bit 0) still means what it usually does.
+        let i2c_ack = c0 & 0x80 != 0 && matches!((c0 & 0x7E) >> 1, 0x3D | 0x3F);
+        if hl2_iob_probe_answered(&frame[3..8]) && !hl2_iob_detected.swap(true, Ordering::Relaxed) {
+            eprintln!("radio: HL2 IO board detected (version 0x{:02X})", frame[4]);
+        }
         let address = (c0 >> 3) & 0x1F;
         // See RadioSession::cw_ptt_active's doc comment -- bit 0
         // ("local_ptt" in piHPSDR), NOT the dot/dash contact bits.
@@ -5803,9 +5964,11 @@ fn parse_iq_stream(
         // raw bit positions are SWAPPED relative to P2's (confirmed
         // against piHPSDR's old_protocol.c: bit 2 = dot, bit 1 = dash),
         // normalized here to bit 0 = dot, bit 1 = dash either way.
-        let dot = (c0 >> 2) & 0x01;
-        let dash = (c0 >> 1) & 0x01;
-        cw_paddle_contacts.store(dot | (dash << 1), Ordering::Relaxed);
+        if !i2c_ack {
+            let dot = (c0 >> 2) & 0x01;
+            let dash = (c0 >> 1) & 0x01;
+            cw_paddle_contacts.store(dot | (dash << 1), Ordering::Relaxed);
+        }
         if address == 1 {
             let forward = u16::from_be_bytes([frame[6], frame[7]]) as u32;
             // ROOT CAUSE FIX for a real HL2 report (meter settling at a
@@ -6358,6 +6521,7 @@ fn start_protocol2(
         frequency_hz,
         tx_frequency_hz,
         rx_frequency_hz,
+        hl2_io_board: Arc::default(),
         requested_frequency_hz,
         sample_rate,
         adc,
@@ -7979,6 +8143,48 @@ fn p2_tx_iq_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Values from the IO board's own frequency-code table
+    /// (james.ahlstrom.name/frequencycodes.html, hertz2fcode).
+    #[test]
+    fn hl2_iob_fcode_matches_board() {
+        assert_eq!(hl2_iob_fcode(0), 0);
+        assert_eq!(hl2_iob_fcode(7_100_000), 92);
+        assert_eq!(hl2_iob_fcode(144_200_000), 138);
+    }
+
+    #[test]
+    fn hl2_iob_probes_until_detected_then_writes_registers() {
+        let mut iob = Hl2IoBoard::default();
+        // Probe first, then quiet for HL2_IOB_PROBE_EVERY slots.
+        assert_eq!(iob.next_cc(false, 0, 0, 0), Some((0xFA, 0x07, 0x80 | 0x41, 0, 0)));
+        for _ in 0..HL2_IOB_PROBE_EVERY {
+            assert_eq!(iob.next_cc(false, 0, 0, 0), None);
+        }
+        assert!(iob.next_cc(false, 0, 0, 0).is_some());
+
+        let tx: u64 = 144_200_000;
+        let w = |reg, val| Some((0x7A, 0x06, 0x80 | 0x1D, reg, val));
+        assert_eq!(iob.next_cc(true, tx, tx, 1), w(5, 1)); // reset once
+        assert_eq!(iob.next_cc(true, tx, tx, 1), None); // the normal 0x2E slot
+        for reg in 0..5u8 {
+            let byte = (tx >> (8 * (4 - reg as u32))) as u8;
+            assert_eq!(iob.next_cc(true, tx, tx, 1), w(reg, byte));
+        }
+        assert_eq!(iob.next_cc(true, tx, tx, 1), w(11, 1));
+        assert_eq!(iob.next_cc(true, tx, tx, 1), w(13, 138));
+        assert_eq!(iob.next_cc(true, tx, tx, 1), None); // cycle repeats, no second reset
+        assert_eq!(iob.next_cc(true, tx, tx, 1), w(0, 0));
+    }
+
+    #[test]
+    fn hl2_iob_probe_answer_recognised() {
+        assert!(hl2_iob_probe_answered(&[0xFA, 0xF1, 0xF1, 0xF1, 0xF1]));
+        assert!(hl2_iob_probe_answered(&[0xFB, 0xF1, 0xF1, 0xF1, 0xF1])); // PTT bit set
+        assert!(!hl2_iob_probe_answered(&[0x7A, 0xF1, 0xF1, 0xF1, 0xF1])); // not an ACK
+        assert!(!hl2_iob_probe_answered(&[0xFE, 0xF1, 0xF1, 0xF1, 0xF1])); // address 0x3F: I2C failed
+        assert!(!hl2_iob_probe_answered(&[0xFA, 0x00, 0x00, 0x00, 0x00]));
+    }
 
     /// See RxAudioPacer's own doc comment for the full history this
     /// asserts against. Core property: with `last_tick` set to barely
