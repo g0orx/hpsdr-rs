@@ -10001,6 +10001,8 @@ impl eframe::App for HpsdrApp {
                                 nnr_premium: agc_params.nnr_premium,
                                 snb: agc_params.snb,
                                 anf: agc_params.anf,
+                                squelch_enabled: agc_params.squelch_enabled,
+                                squelch_level: agc_params.squelch_level,
                                 binaural: agc_params.binaural,
                                 db_low: rx.db_low,
                                 db_high: rx.db_high,
@@ -11792,6 +11794,30 @@ fn render_extra_receiver_ui(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceiver>>) {
             rx.spectrum.set_gain(gain);
             rx.settings_dirty.store(true, Ordering::Relaxed);
         }
+
+        // Squelch -- same control as the main window's, next to Audio
+        // gain; see spectrum::Squelch.
+        ui.add_space(12.0);
+        let squelch_available = spectrum::Squelch::available(rx.spectrum.mode());
+        ui.add_enabled_ui(squelch_available, |ui| {
+            let squelch_on = rx.spectrum.squelch_enabled();
+            if ui
+                .add(egui::Button::selectable(squelch_on && squelch_available, "SQL"))
+                .on_hover_text(
+                    "Squelch: FM noise squelch, SSB voice squelch, AM carrier-level \
+                     squelch -- the slider sets how tight (0 = open)",
+                )
+                .clicked()
+            {
+                rx.spectrum.set_squelch_enabled(!squelch_on);
+                rx.settings_dirty.store(true, Ordering::Relaxed);
+            }
+            let mut level = rx.spectrum.squelch_level() as f64;
+            if scroll_slider_f64(ui, &mut rx.slider_scroll_accum, &mut level, 0.0..=100.0, 1.0, "") {
+                rx.spectrum.set_squelch_level(level as f32);
+                rx.settings_dirty.store(true, Ordering::Relaxed);
+            }
+        });
     });
 
     ui.horizontal_wrapped(|ui| {
@@ -12953,6 +12979,8 @@ fn spawn_extra_receiver(
         spectrum.set_nnr_premium(s.nnr_premium);
         spectrum.set_snb(s.snb);
         spectrum.set_anf(s.anf);
+        spectrum.set_squelch_enabled(s.squelch_enabled);
+        spectrum.set_squelch_level(s.squelch_level);
         spectrum.set_binaural(s.binaural);
         spectrum.set_eq(s.eq);
     }
@@ -13093,6 +13121,8 @@ fn change_sample_rate(connected: &mut ConnectedState, new_rate: u32) {
     spectrum.set_nnr_premium(agc_params.nnr_premium);
     spectrum.set_snb(agc_params.snb);
     spectrum.set_anf(agc_params.anf);
+    spectrum.set_squelch_enabled(agc_params.squelch_enabled);
+    spectrum.set_squelch_level(agc_params.squelch_level);
     spectrum.set_binaural(agc_params.binaural);
 
     connected.audio_output = match AudioOutput::start(
@@ -13285,6 +13315,8 @@ fn change_extra_receiver_sample_rate(rx: &mut ExtraReceiver, new_rate: u32) {
     spectrum.set_nnr_premium(agc_params.nnr_premium);
     spectrum.set_snb(agc_params.snb);
     spectrum.set_anf(agc_params.anf);
+    spectrum.set_squelch_enabled(agc_params.squelch_enabled);
+    spectrum.set_squelch_level(agc_params.squelch_level);
     spectrum.set_binaural(agc_params.binaural);
 
     rx.audio_output = match AudioOutput::start(Arc::clone(&spectrum.audio_out), rx.audio_output_device.as_deref()) {

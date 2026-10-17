@@ -599,6 +599,11 @@ pub struct ExtraReceiverConfig {
     /// See Config::anf's doc comment.
     #[serde(default)]
     pub anf: bool,
+    /// See Config::squelch_enabled's doc comment.
+    #[serde(default)]
+    pub squelch_enabled: bool,
+    #[serde(default = "default_squelch_level")]
+    pub squelch_level: f32,
     /// See Config::binaural's doc comment.
     #[serde(default)]
     pub binaural: bool,
@@ -757,4 +762,8 @@ impl Config {
             }
         }
     }
+}
+
+fn default_squelch_level() -> f32 {
+    30.0
 }

@@ -32,7 +32,8 @@ boxes with **A>B**/**B>A**/**A<>B** buttons (same as the main window's own
 -- but no **Split** button, since extra receivers never transmit), with
 **CTUN** and, while in CW mode, **CW Decode** (see
 [CW decoder](02-main-window.md#cw-decode)) in the row underneath, band
-and mode rows, **Filter width** and **Audio gain** sliders, the
+and mode rows, **Filter width** and **Audio gain** sliders (with
+[squelch](02-main-window.md#noiseagc-toggles) next to Audio gain), the
 **Record**/NB/NR/SNB/ANF/BIN/AGC/AGC Gain/RIT toggle row -- RIT here
 works the same as the
 main window's own (see [Transmit controls](02-main-window.md#transmit-controls)),
