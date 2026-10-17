@@ -5198,16 +5198,11 @@ impl eframe::App for HpsdrApp {
                                 settings_changed = true;
                             }
                             if rit_resp.hovered() {
-                                let scroll_delta = ui.input(|i| i.smooth_scroll_delta);
-                                let delta = if scroll_delta.y.abs() >= scroll_delta.x.abs() {
-                                    scroll_delta.y
-                                } else {
-                                    scroll_delta.x
-                                };
+                                let (delta, scroll_shift) = scroll_tune_input(ui);
                                 if delta != 0.0 {
                                     connected.rit_scroll_accum += delta;
                                     const NOTCH: f32 = 100.0;
-                                    let shift = ui.input(|i| i.modifiers.shift);
+                                    let shift = scroll_shift;
                                     let step: i64 = if shift { 10 } else { 100 };
                                     let mut new_offset = connected.rit_offset_hz as i64;
                                     while connected.rit_scroll_accum.abs() >= NOTCH {
@@ -5258,16 +5253,11 @@ impl eframe::App for HpsdrApp {
                                 settings_changed = true;
                             }
                             if xit_resp.hovered() {
-                                let scroll_delta = ui.input(|i| i.smooth_scroll_delta);
-                                let delta = if scroll_delta.y.abs() >= scroll_delta.x.abs() {
-                                    scroll_delta.y
-                                } else {
-                                    scroll_delta.x
-                                };
+                                let (delta, scroll_shift) = scroll_tune_input(ui);
                                 if delta != 0.0 {
                                     connected.xit_scroll_accum += delta;
                                     const NOTCH: f32 = 100.0;
-                                    let shift = ui.input(|i| i.modifiers.shift);
+                                    let shift = scroll_shift;
                                     let step: i64 = if shift { 10 } else { 100 };
                                     let mut new_offset = connected.xit_offset_hz as i64;
                                     while connected.xit_scroll_accum.abs() >= NOTCH {
@@ -5442,19 +5432,7 @@ impl eframe::App for HpsdrApp {
                     // Scroll-to-tune: active while hovering the frequency
                     // label or the spectrum itself.
                     if freq_label.hovered() || spectrum_resp.hovered() {
-                        let scroll_delta = ui.input(|i| i.smooth_scroll_delta);
-                        // egui redirects vertical scroll into the x-axis
-                        // while Shift is held (its convention for
-                        // horizontal-scroll support elsewhere) -- so
-                        // check whichever axis actually has motion
-                        // rather than only .y. Ctrl+scroll doesn't reach
-                        // here at all -- egui diverts it into a zoom
-                        // gesture instead, handled separately below.
-                        let delta = if scroll_delta.y.abs() >= scroll_delta.x.abs() {
-                            scroll_delta.y
-                        } else {
-                            scroll_delta.x
-                        };
+                        let (delta, scroll_shift) = scroll_tune_input(ui);
 
                         if delta != 0.0 {
                             connected.scroll_accum += delta;
@@ -5475,7 +5453,7 @@ impl eframe::App for HpsdrApp {
                             // feel across all of them.
                             const NOTCH: f32 = 100.0;
 
-                            let shift = ui.input(|i| i.modifiers.shift);
+                            let shift = scroll_shift;
                             let ctrl = ui.input(|i| i.modifiers.ctrl);
                             let step: i64 = scroll_tune_step_hz(cw_mode, shift, ctrl);
 
@@ -5545,19 +5523,14 @@ impl eframe::App for HpsdrApp {
                     // CTUN/passband/retune handling needed here -- just a
                     // plain accumulate-then-step onto the stored value.
                     if vfo_b_label.hovered() {
-                        let scroll_delta = ui.input(|i| i.smooth_scroll_delta);
-                        let delta = if scroll_delta.y.abs() >= scroll_delta.x.abs() {
-                            scroll_delta.y
-                        } else {
-                            scroll_delta.x
-                        };
+                        let (delta, scroll_shift) = scroll_tune_input(ui);
 
                         if delta != 0.0 {
                             connected.vfo_b_scroll_accum += delta;
                             // Same NOTCH/step convention as VFO A's block
                             // above.
                             const NOTCH: f32 = 100.0;
-                            let shift = ui.input(|i| i.modifiers.shift);
+                            let shift = scroll_shift;
                             let step: i64 = if shift { 100 } else { 1_000 };
 
                             let mut new_freq = connected.vfo_b_frequency_hz as i64;
@@ -5867,17 +5840,12 @@ impl eframe::App for HpsdrApp {
                         // spectrum pane -- only one pane can be hovered at
                         // once, so there's no cross-talk.
                         if waterfall_click_resp.hovered() {
-                            let scroll_delta = ui.input(|i| i.smooth_scroll_delta);
-                            let delta = if scroll_delta.y.abs() >= scroll_delta.x.abs() {
-                                scroll_delta.y
-                            } else {
-                                scroll_delta.x
-                            };
+                            let (delta, scroll_shift) = scroll_tune_input(ui);
 
                             if delta != 0.0 {
                                 connected.scroll_accum += delta;
                                 const NOTCH: f32 = 100.0;
-                                let shift = ui.input(|i| i.modifiers.shift);
+                                let shift = scroll_shift;
                                 let ctrl = ui.input(|i| i.modifiers.ctrl);
                                 let step: i64 = scroll_tune_step_hz(cw_mode, shift, ctrl);
 
@@ -11835,13 +11803,11 @@ fn render_extra_receiver_ui(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceiver>>) {
             rx.settings_dirty.store(true, Ordering::Relaxed);
         }
         if rit_resp.hovered() {
-            let scroll_delta = ui.input(|i| i.smooth_scroll_delta);
-            let delta =
-                if scroll_delta.y.abs() >= scroll_delta.x.abs() { scroll_delta.y } else { scroll_delta.x };
+            let (delta, scroll_shift) = scroll_tune_input(ui);
             if delta != 0.0 {
                 rx.rit_scroll_accum += delta;
                 const NOTCH: f32 = 100.0;
-                let shift = ui.input(|i| i.modifiers.shift);
+                let shift = scroll_shift;
                 let step: i64 = if shift { 10 } else { 100 };
                 let mut new_offset = rx.rit_offset_hz as i64;
                 while rx.rit_scroll_accum.abs() >= NOTCH {
@@ -11932,17 +11898,12 @@ fn render_extra_receiver_ui(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceiver>>) {
         }
     }
     if spectrum_resp.hovered() {
-        let scroll_delta = ui.input(|i| i.smooth_scroll_delta);
-        let delta = if scroll_delta.y.abs() >= scroll_delta.x.abs() {
-            scroll_delta.y
-        } else {
-            scroll_delta.x
-        };
+        let (delta, scroll_shift) = scroll_tune_input(ui);
         if delta != 0.0 {
             rx.scroll_accum += delta;
             // See the main receiver's own scroll-to-tune NOTCH comment.
             const NOTCH: f32 = 100.0;
-            let shift = ui.input(|i| i.modifiers.shift);
+            let shift = scroll_shift;
             let ctrl = ui.input(|i| i.modifiers.ctrl);
             let step: i64 = scroll_tune_step_hz(cw_mode, shift, ctrl);
             let mut new_freq = dial_freq_hz as i64;
@@ -12123,16 +12084,11 @@ fn render_extra_receiver_ui(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceiver>>) {
         // drag were wired up), same gap confirmed and fixed on the main
         // receiver window.
         if wf_resp.hovered() {
-            let scroll_delta = ui.input(|i| i.smooth_scroll_delta);
-            let delta = if scroll_delta.y.abs() >= scroll_delta.x.abs() {
-                scroll_delta.y
-            } else {
-                scroll_delta.x
-            };
+            let (delta, scroll_shift) = scroll_tune_input(ui);
             if delta != 0.0 {
                 rx.scroll_accum += delta;
                 const NOTCH: f32 = 100.0;
-                let shift = ui.input(|i| i.modifiers.shift);
+                let shift = scroll_shift;
                 let ctrl = ui.input(|i| i.modifiers.ctrl);
                 let step: i64 = scroll_tune_step_hz(cw_mode, shift, ctrl);
                 let mut new_freq = dial_freq_hz as i64;
@@ -12602,6 +12558,40 @@ fn render_extra_receiver_settings(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceive
             }
         }
     }
+}
+
+/// Scroll-to-tune input for this frame: wheel motion (in points, the
+/// same scale as `smooth_scroll_delta`, so NOTCH keeps its feel) and
+/// whether Shift was held *when that motion happened*. Read from the raw
+/// wheel events rather than `smooth_scroll_delta`: egui spreads each
+/// notch over several frames, and pairing that tail with the live Shift
+/// state stepped at the unshifted size whenever Shift was released (or
+/// pressed) mid-tail -- real report, "sometimes Shift does not change the
+/// scroll amount to 100 Hz". Ctrl+wheel stays egui's zoom gesture, handled
+/// separately, as before. Either axis tunes: egui (and macOS) turn
+/// Shift+wheel into horizontal scrolling.
+fn scroll_tune_input(ui: &egui::Ui) -> (f32, bool) {
+    let (zoom_modifier, line_scroll_speed) =
+        ui.ctx().options(|o| (o.input_options.zoom_modifier, o.input_options.line_scroll_speed));
+    ui.input(|i| {
+        let mut delta = 0.0;
+        let mut shift = false;
+        for event in &i.events {
+            if let egui::Event::MouseWheel { unit, delta: d, modifiers, .. } = event {
+                if modifiers.matches_any(zoom_modifier) {
+                    continue;
+                }
+                let d = match unit {
+                    egui::MouseWheelUnit::Point => *d,
+                    egui::MouseWheelUnit::Line => line_scroll_speed * *d,
+                    egui::MouseWheelUnit::Page => i.viewport_rect().height() * *d,
+                };
+                delta += if d.y.abs() >= d.x.abs() { d.y } else { d.x };
+                shift |= modifiers.shift;
+            }
+        }
+        (delta, shift)
+    })
 }
 
 /// Scroll-to-tune step size over the spectrum/waterfall panes -- finer
