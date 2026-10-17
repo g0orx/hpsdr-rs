@@ -2557,6 +2557,12 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
             if let Some(v) = cfg.anf {
                 spectrum.set_anf(v);
             }
+            if let Some(v) = cfg.squelch_enabled {
+                spectrum.set_squelch_enabled(v);
+            }
+            if let Some(v) = cfg.squelch_level {
+                spectrum.set_squelch_level(v);
+            }
             if let Some(v) = cfg.binaural {
                 spectrum.set_binaural(v);
             }
@@ -4448,6 +4454,35 @@ impl eframe::App for HpsdrApp {
                                 connected.spectrum.set_gain(gain);
                                 settings_changed = true;
                             }
+                        });
+
+                        // Squelch -- see spectrum::Squelch. Next to Audio
+                        // gain; its own horizontal group so the button and
+                        // slider wrap together. FM, SSB/DSB and AM/SAM
+                        // only; greyed out in CW/digital modes.
+                        ui.add_space(12.0);
+                        ui.horizontal(|ui| {
+                            let squelch_available = spectrum::Squelch::available(current_mode);
+                            ui.add_enabled_ui(squelch_available, |ui| {
+                                let squelch_on = connected.spectrum.squelch_enabled();
+                                if ui
+                                    .add(egui::Button::selectable(squelch_on && squelch_available, "SQL"))
+                                    .on_hover_text(
+                                        "Squelch: FM noise squelch, SSB voice squelch, AM carrier-level \
+                                         squelch -- the slider sets how tight (0 = open)",
+                                    )
+                                    .clicked()
+                                {
+                                    connected.spectrum.set_squelch_enabled(!squelch_on);
+                                    settings_changed = true;
+                                }
+                                let mut level = connected.spectrum.squelch_level() as f64;
+                                if scroll_slider_f64(ui, &mut connected.slider_scroll_accum, &mut level, 0.0..=100.0, 1.0, "")
+                                {
+                                    connected.spectrum.set_squelch_level(level as f32);
+                                    settings_changed = true;
+                                }
+                            });
                         });
 
                         if connected.tx_enabled {
@@ -10016,6 +10051,8 @@ impl eframe::App for HpsdrApp {
                         nnr_premium: Some(agc_params_now.nnr_premium),
                         snb: Some(agc_params_now.snb),
                         anf: Some(agc_params_now.anf),
+                        squelch_enabled: Some(agc_params_now.squelch_enabled),
+                        squelch_level: Some(agc_params_now.squelch_level),
                         binaural: Some(agc_params_now.binaural),
                         rx_eq: Some(agc_params_now.eq),
                         mic_gain: Some(connected.mic_gain),

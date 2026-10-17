@@ -149,6 +149,10 @@ pub struct Config {
     /// ANF ("Automatic Notch Filter") -- see spectrum::DemodParams::anf's
     /// doc comment.
     pub anf: Option<bool>,
+    /// Main receiver squelch on/off and 0-100 level -- see
+    /// spectrum::Squelch.
+    pub squelch_enabled: Option<bool>,
+    pub squelch_level: Option<f32>,
     /// Binaural ("phasing") RX audio -- see spectrum::DemodParams::
     /// binaural's doc comment.
     pub binaural: Option<bool>,

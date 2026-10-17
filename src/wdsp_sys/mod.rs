@@ -311,6 +311,18 @@ unsafe extern "C" {
     pub fn SetRXAAMSQThreshold(channel: ::std::os::raw::c_int, threshold: f64);
 }
 unsafe extern "C" {
+    pub fn SetRXASSQLRun(channel: ::std::os::raw::c_int, run: ::std::os::raw::c_int);
+}
+unsafe extern "C" {
+    pub fn SetRXASSQLThreshold(channel: ::std::os::raw::c_int, threshold: f64);
+}
+unsafe extern "C" {
+    pub fn SetRXASSQLTauMute(channel: ::std::os::raw::c_int, tau_mute: f64);
+}
+unsafe extern "C" {
+    pub fn SetRXASSQLTauUnMute(channel: ::std::os::raw::c_int, tau_unmute: f64);
+}
+unsafe extern "C" {
     pub fn SetRXAEMNRRun(channel: ::std::os::raw::c_int, run: ::std::os::raw::c_int);
 }
 unsafe extern "C" {

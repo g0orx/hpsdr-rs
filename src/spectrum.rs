@@ -385,6 +385,58 @@ impl Default for EqualizerParams {
     }
 }
 
+/// Which WDSP squelch runs for a mode, and its threshold -- piHPSDR's
+/// mapping (receiver.c) of one 0-100 level onto WDSP's three squelches:
+/// FM noise squelch (FMSQ, threshold 1.0 -> 0.01, exponential), SSB
+/// "voice" squelch (SSQL, 0 -> 0.75, linear) and AM carrier-level
+/// squelch (AMSQ, -160 -> 0 dB, linear). CW and the digital modes get
+/// none: a squelch there chops weak signals a decoder could still use.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Squelch {
+    Off,
+    Fm(f64),
+    Voice(f64),
+    Am(f64),
+}
+
+impl Squelch {
+    pub fn for_mode(mode: Mode, enabled: bool, level: f32) -> Self {
+        if !enabled {
+            return Squelch::Off;
+        }
+        let level = level.clamp(0.0, 100.0) as f64;
+        match mode {
+            Mode::Fmn => Squelch::Fm(10f64.powf(-2.0 * level / 100.0)),
+            Mode::Lsb | Mode::Usb | Mode::Dsb => Squelch::Voice(0.0075 * level),
+            Mode::Am | Mode::Sam => Squelch::Am(level / 100.0 * 160.0 - 160.0),
+            _ => Squelch::Off,
+        }
+    }
+
+    /// Whether this mode has a squelch at all (for the UI).
+    pub fn available(mode: Mode) -> bool {
+        Self::for_mode(mode, true, 0.0) != Squelch::Off
+    }
+
+    fn apply(self, channel: c_int) {
+        unsafe {
+            match self {
+                Squelch::Fm(t) => wdsp::SetRXAFMSQThreshold(channel, t),
+                Squelch::Voice(t) => {
+                    wdsp::SetRXASSQLThreshold(channel, t);
+                    wdsp::SetRXASSQLTauMute(channel, 0.1);
+                    wdsp::SetRXASSQLTauUnMute(channel, 0.1);
+                }
+                Squelch::Am(t) => wdsp::SetRXAAMSQThreshold(channel, t),
+                Squelch::Off => {}
+            }
+            wdsp::SetRXAFMSQRun(channel, matches!(self, Squelch::Fm(_)) as c_int);
+            wdsp::SetRXASSQLRun(channel, matches!(self, Squelch::Voice(_)) as c_int);
+            wdsp::SetRXAAMSQRun(channel, matches!(self, Squelch::Am(_)) as c_int);
+        }
+    }
+}
+
 #[derive(Copy, Clone)]
 pub struct DemodParams {
     pub mode: Mode,
@@ -442,6 +494,10 @@ pub struct DemodParams {
     /// no mutually-exclusive cycle to fold into). Targets a steady
     /// heterodyne/carrier within the passband, not broadband noise.
     pub anf: bool,
+    /// Squelch: on/off and a 0-100 level (0 = open, 100 = tightest),
+    /// mapped per mode onto WDSP's three squelches -- see Squelch.
+    pub squelch_enabled: bool,
+    pub squelch_level: f32,
     /// Binaural ("phasing") RX audio -- when true, RXA's PatchPanel
     /// output stage is left in WDSP's own default mode, producing
     /// genuinely different L/R audio (an intentional SDR stereo-
@@ -571,6 +627,8 @@ impl Default for DemodParams {
             nnr_premium: false,
             snb: false,
             anf: false,
+            squelch_enabled: false,
+            squelch_level: 30.0,
             binaural: false,
             ctun: false,
             ctun_offset_hz: 0.0,
@@ -712,6 +770,7 @@ struct SpectrumAnalyzer {
     last_nnr_params: Option<(f64, c_int)>,
     last_snb_enabled: Option<bool>,
     last_anf_enabled: Option<bool>,
+    last_squelch: Option<Squelch>,
     last_binaural: Option<bool>,
     last_ctun: Option<bool>,
     last_ctun_offset: Option<f64>,
@@ -1077,6 +1136,7 @@ impl SpectrumAnalyzer {
                 last_nnr_params: None,
                 last_snb_enabled: None,
                 last_anf_enabled: None,
+                last_squelch: None,
                 last_binaural: None,
                 last_ctun: None,
                 last_ctun_offset: None,
@@ -1389,6 +1449,14 @@ impl SpectrumAnalyzer {
                 wdsp::SetRXAANFRun(self.channel, params.anf as c_int);
             }
             self.last_anf_enabled = Some(params.anf);
+        }
+
+        // Squelch -- see Squelch. Exactly one of WDSP's three runs (or
+        // none), re-sent whenever the mode, level or on/off changes.
+        let squelch = Squelch::for_mode(params.mode, params.squelch_enabled, params.squelch_level);
+        if self.last_squelch != Some(squelch) {
+            squelch.apply(self.channel);
+            self.last_squelch = Some(squelch);
         }
 
         // Binaural ("phasing") RX audio -- see DemodParams::binaural's
@@ -2222,6 +2290,19 @@ impl SpectrumHandle {
         self.demod_params.lock().unwrap().anf = v;
     }
 
+    pub fn squelch_enabled(&self) -> bool {
+        self.demod_params.lock().unwrap().squelch_enabled
+    }
+    pub fn set_squelch_enabled(&self, v: bool) {
+        self.demod_params.lock().unwrap().squelch_enabled = v;
+    }
+    pub fn squelch_level(&self) -> f32 {
+        self.demod_params.lock().unwrap().squelch_level
+    }
+    pub fn set_squelch_level(&self, v: f32) {
+        self.demod_params.lock().unwrap().squelch_level = v.clamp(0.0, 100.0);
+    }
+
     pub fn binaural(&self) -> bool {
         self.demod_params.lock().unwrap().binaural
     }
@@ -2282,5 +2363,22 @@ impl SpectrumHandle {
 impl Drop for SpectrumHandle {
     fn drop(&mut self) {
         self.stop();
+    }
+}
+
+#[cfg(test)]
+mod squelch_tests {
+    use super::*;
+
+    #[test]
+    fn squelch_maps_level_per_mode() {
+        assert_eq!(Squelch::for_mode(Mode::Fmn, false, 50.0), Squelch::Off);
+        assert_eq!(Squelch::for_mode(Mode::Fmn, true, 0.0), Squelch::Fm(1.0));
+        assert_eq!(Squelch::for_mode(Mode::Fmn, true, 100.0), Squelch::Fm(0.01));
+        assert_eq!(Squelch::for_mode(Mode::Usb, true, 100.0), Squelch::Voice(0.75));
+        assert_eq!(Squelch::for_mode(Mode::Am, true, 0.0), Squelch::Am(-160.0));
+        assert_eq!(Squelch::for_mode(Mode::Cwu, true, 50.0), Squelch::Off);
+        assert!(!Squelch::available(Mode::Digu));
+        assert!(Squelch::available(Mode::Lsb));
     }
 }

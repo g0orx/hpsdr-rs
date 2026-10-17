@@ -235,6 +235,19 @@ slider:
     [MSI.SDR](22-msi-sdr.md#rf-gain) (0-102 dB).
 
   Hover over the label for a reminder of what it does.
+- **SQL** and its slider (0-100) -- squelch, next to Audio gain (above
+  this row). The button turns it on and off; the slider sets how tight it
+  is (0 = fully open).
+  Which squelch runs depends on the mode:
+  - **FM** -- noise squelch: opens when a carrier quiets the receiver
+    noise.
+  - **LSB/USB/DSB** -- voice squelch: opens on speech, stays closed on
+    noise and steady carriers.
+  - **AM/SAM** -- carrier-level squelch.
+
+  CW and the digital modes have no squelch (the button is greyed out),
+  since it would chop weak signals a decoder could still use. Settings are
+  saved and apply to the main receiver.
 
 ![Noise and AGC toggle row](images/02-toggle-row.png)
 
