@@ -13,8 +13,9 @@ across all bands, rather than just one.
 
 One row per band, each with:
 
-- A gain slider, **20.0-60.0 dB**, in 0.1 dB steps (default 38.8 dB until
-  you calibrate a band). Higher gain here corresponds to a LOWER actual
+- A gain slider, **20.0-60.0 dB**, in 0.1 dB steps (until you calibrate a
+  band it defaults to 38.8 dB, or 25.8 dB on a Hermes-Lite, where that
+  makes 5 W full drive). Higher gain here corresponds to a LOWER actual
   drive level for the same target watts -- a higher-gain external
   amplifier needs a higher number here to get the PA driven down far
   enough for a low target output.

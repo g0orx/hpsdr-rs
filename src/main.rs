@@ -157,15 +157,15 @@ pub(crate) fn tx_frequency_allowed(freq_hz: u32, allow_out_of_band: bool) -> boo
 }
 
 /// Looks up the current band's calibrated PA gain (dB), falling back to
-/// radio::DEFAULT_PA_GAIN_DB for a band with no calibration entry yet
+/// radio::default_pa_gain_db for a band with no calibration entry yet
 /// (or a frequency outside every defined band). See ConnectedState's
 /// pa_calibration field doc for how this gets pushed into the running
 /// session.
-fn resolved_pa_gain_db(pa_calibration: &std::collections::HashMap<String, f32>, freq_hz: u32) -> f32 {
+fn resolved_pa_gain_db(pa_calibration: &std::collections::HashMap<String, f32>, freq_hz: u32, board: Boards) -> f32 {
     band_for_frequency(freq_hz)
         .and_then(|b| pa_calibration.get(b.name))
         .copied()
-        .unwrap_or(radio::DEFAULT_PA_GAIN_DB)
+        .unwrap_or_else(|| radio::default_pa_gain_db(board))
 }
 
 /// Piecewise-linear interpolation between 9 stored dB-adjustment
@@ -3107,7 +3107,7 @@ impl eframe::App for HpsdrApp {
                 // user actually populates a curve) -- see
                 // resolved_pa_drive_adjust_db's own doc comment for the
                 // real-hardware report this corrects.
-                let gain_db = resolved_pa_gain_db(&connected.pa_calibration, freq_hz)
+                let gain_db = resolved_pa_gain_db(&connected.pa_calibration, freq_hz, connected.device.board)
                     - resolved_pa_drive_adjust_db(
                         &connected.pa_drive_adjust,
                         freq_hz,
@@ -8765,7 +8765,7 @@ impl eframe::App for HpsdrApp {
                                             .pa_calibration
                                             .get(band.name)
                                             .copied()
-                                            .unwrap_or(radio::DEFAULT_PA_GAIN_DB);
+                                            .unwrap_or_else(|| radio::default_pa_gain_db(connected.device.board));
                                         ui.horizontal(|ui| {
                                             ui.label(format!("{:>4}:", band.name));
                                             if scroll_slider_f32(

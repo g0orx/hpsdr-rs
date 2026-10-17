@@ -3742,6 +3742,21 @@ fn fill_rx_audio_payload(
 /// this uncalibrated reference starting point.
 pub const DEFAULT_PA_GAIN_DB: f32 = 38.8;
 
+/// Uncalibrated PA gain for a board. 38.8 dB is the reference's figure
+/// for a 100 W radio; on a Hermes-Lite's 5 W PA it left even the top of
+/// the TX Power slider at drive level ~59/255 -- the HL2's bottom
+/// attenuator step scaled down, around a quarter of a watt (issue #13:
+/// "no RF power out" until PA Calibration was done). 25.8 dB makes 5 W
+/// full drive, which is what deskHPSDR's 100% drive gives. Only the
+/// Hermes-Lite boards change: a Hermes-class board may sit inside a
+/// 100 W ANAN, where a lower default would overdrive it.
+pub fn default_pa_gain_db(board: Boards) -> f32 {
+    match board {
+        Boards::HermesLite | Boards::HermesLite2 => 25.8,
+        _ => DEFAULT_PA_GAIN_DB,
+    }
+}
+
 /// Converts a desired TX output power (watts) into a protocol drive
 /// byte (0-255), via a dBm/DAC-voltage calibration curve using the
 /// given per-band PA gain. Originally P1-only: confirmed against a
@@ -8145,6 +8160,16 @@ fn p2_tx_iq_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Issue #13: an uncalibrated Hermes-Lite must reach full drive at
+    /// its 5 W maximum, not the ~59/255 the 100 W default gave.
+    #[test]
+    fn uncalibrated_hermes_lite_reaches_full_drive() {
+        let level = drive_byte_for_watts(5.0, default_pa_gain_db(Boards::HermesLite2));
+        assert!(level >= 250, "level {level}");
+        assert_eq!(hl2_drive_level_and_scale(level).0, 240);
+        assert_eq!(default_pa_gain_db(Boards::Orion2), DEFAULT_PA_GAIN_DB);
+    }
 
     /// Values from the IO board's own frequency-code table
     /// (james.ahlstrom.name/frequencycodes.html, hertz2fcode).
