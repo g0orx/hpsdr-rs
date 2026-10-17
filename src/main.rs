@@ -499,6 +499,11 @@ pub struct BandSettings {
 /// unrelated change within the same band.
 fn remember_band_settings(
     band_memory: &mut std::collections::HashMap<String, BandSettings>,
+    // The active transverter, if any: its tuning is remembered under its
+    // own key (xvtr_memory_key), not whichever HF band its IF falls in --
+    // otherwise using a 28 MHz-IF transverter overwrote 10m's memory and
+    // the transverter itself never remembered anything (issue #4).
+    active_xvtr: Option<&str>,
     freq_hz: u32,
     db_low: f32,
     db_high: f32,
@@ -515,9 +520,12 @@ fn remember_band_settings(
     // own default_hz, which also isn't in a real band). Same "Gen"
     // fallback as gen_band/current_band elsewhere (main.rs) -- see
     // gen_band's own doc comment.
-    let name = band_for_frequency(freq_hz).map(|b| b.name).unwrap_or("Gen");
+    let name = match active_xvtr {
+        Some(xvtr) => xvtr_memory_key(xvtr),
+        None => band_for_frequency(freq_hz).map(|b| b.name).unwrap_or("Gen").to_string(),
+    };
     band_memory.insert(
-        name.to_string(),
+        name,
         BandSettings {
             frequency_hz: freq_hz,
             db_low,
@@ -527,6 +535,12 @@ fn remember_band_settings(
             mode: Some(mode),
         },
     );
+}
+
+/// band_memory key for a transverter -- prefixed so a transverter named
+/// like a built-in band ("2m", "70cm") keeps its own entry.
+fn xvtr_memory_key(xvtr_name: &str) -> String {
+    format!("xvtr:{xvtr_name}")
 }
 
 /// Last filter width the user set while in `mode`, if any -- falls back
@@ -562,6 +576,7 @@ fn apply_band(connected: &mut ConnectedState, band: &Band) {
     let resolved_mode = saved.and_then(|s| s.mode).unwrap_or(band.default_mode);
     remember_band_settings(
         &mut connected.band_memory,
+        connected.active_xvtr.as_deref(),
         target,
         connected.db_low,
         connected.db_high,
@@ -597,6 +612,7 @@ fn apply_band_extra(rx: &mut ExtraReceiver, band: &Band) {
     let resolved_mode = saved.and_then(|s| s.mode).unwrap_or(band.default_mode);
     remember_band_settings(
         &mut rx.band_memory,
+        None,
         target,
         rx.db_low,
         rx.db_high,
@@ -622,6 +638,7 @@ fn apply_mode(connected: &mut ConnectedState, mode: spectrum::Mode, dial_freq_hz
     }
     remember_band_settings(
         &mut connected.band_memory,
+        connected.active_xvtr.as_deref(),
         dial_freq_hz,
         connected.db_low,
         connected.db_high,
@@ -994,6 +1011,7 @@ fn dispatch_midi_event(connected: &mut ConnectedState, ev: RawMidiEvent, freq_hz
             }
             remember_band_settings(
                 &mut connected.band_memory,
+                connected.active_xvtr.as_deref(),
                 effective_freq,
                 connected.db_low,
                 connected.db_high,
@@ -1013,6 +1031,7 @@ fn dispatch_midi_event(connected: &mut ConnectedState, ev: RawMidiEvent, freq_hz
             }
             remember_band_settings(
                 &mut connected.band_memory,
+                connected.active_xvtr.as_deref(),
                 effective_freq,
                 connected.db_low,
                 connected.db_high,
@@ -4079,10 +4098,11 @@ impl eframe::App for HpsdrApp {
                         // range (same skip-the-button convention as the
                         // HermesLite/6m filtering just above, just
                         // computed from the shifted range instead of the
-                        // raw one). Unlike ordinary bands, XVTR
-                        // selections don't participate in band_memory --
-                        // clicking always applies the slot's own
-                        // configured default frequency/mode.
+                        // raw one). Like ordinary bands, a click recalls
+                        // the transverter's last frequency/mode/levels
+                        // (band_memory under xvtr_memory_key), falling
+                        // back to the bottom of its range and its
+                        // default mode the first time (issue #4).
                         for xvtr in &connected.xvtrs {
                             if xvtr.name.is_empty() {
                                 continue;
@@ -4101,15 +4121,29 @@ impl eframe::App for HpsdrApp {
                                 // ConnectedState::active_xvtr's doc
                                 // comment.
                                 connected.active_xvtr = Some(xvtr.name.clone());
-                                let target = if_low.clamp(0, u32::MAX as i64) as u32;
+                                let saved = connected.band_memory.get(&xvtr_memory_key(&xvtr.name)).copied();
+                                // A remembered IF outside the current range
+                                // (the transverter was reconfigured since) is
+                                // ignored.
+                                let target = saved
+                                    .map(|s| s.frequency_hz as i64)
+                                    .filter(|f| (if_low..=if_high).contains(f))
+                                    .unwrap_or(if_low)
+                                    .clamp(0, u32::MAX as i64) as u32;
                                 connected.session.set_frequency(target);
                                 connected.ctun_frequency_hz = target;
-                                connected.spectrum.set_mode(xvtr.default_mode);
-                                let resolved_width_hz =
-                                    width_for_mode(&connected.width_memory, xvtr.default_mode);
+                                if let Some(s) = saved {
+                                    connected.db_low = s.db_low;
+                                    connected.db_high = s.db_high;
+                                    connected.waterfall_db_low = s.waterfall_db_low;
+                                    connected.waterfall_db_high = s.waterfall_db_high;
+                                }
+                                let resolved_mode = saved.and_then(|s| s.mode).unwrap_or(xvtr.default_mode);
+                                connected.spectrum.set_mode(resolved_mode);
+                                let resolved_width_hz = width_for_mode(&connected.width_memory, resolved_mode);
                                 connected.spectrum.set_width_hz(resolved_width_hz);
                                 if let Some(tx) = &connected.tx_handle {
-                                    tx.set_mode(xvtr.default_mode);
+                                    tx.set_mode(resolved_mode);
                                     tx.set_width_hz(resolved_width_hz);
                                 }
                                 settings_changed = true;
@@ -5370,7 +5404,7 @@ impl eframe::App for HpsdrApp {
                             } else {
                                 connected.ctun_frequency_hz = effective_freq;
                             }
-                            remember_band_settings(&mut connected.band_memory, effective_freq, connected.db_low, connected.db_high, connected.waterfall_db_low, connected.waterfall_db_high, current_mode);
+                            remember_band_settings(&mut connected.band_memory, connected.active_xvtr.as_deref(), effective_freq, connected.db_low, connected.db_high, connected.waterfall_db_low, connected.waterfall_db_high, current_mode);
                             settings_changed = true;
                         }
                     }
@@ -5425,7 +5459,7 @@ impl eframe::App for HpsdrApp {
                             } else {
                                 connected.ctun_frequency_hz = effective_freq;
                             }
-                            remember_band_settings(&mut connected.band_memory, effective_freq, connected.db_low, connected.db_high, connected.waterfall_db_low, connected.waterfall_db_high, current_mode);
+                            remember_band_settings(&mut connected.band_memory, connected.active_xvtr.as_deref(), effective_freq, connected.db_low, connected.db_high, connected.waterfall_db_low, connected.waterfall_db_high, current_mode);
                             settings_changed = true;
                         }
                     }
@@ -5474,7 +5508,7 @@ impl eframe::App for HpsdrApp {
                                 } else {
                                     connected.ctun_frequency_hz = effective_freq;
                                 }
-                                remember_band_settings(&mut connected.band_memory, effective_freq, connected.db_low, connected.db_high, connected.waterfall_db_low, connected.waterfall_db_high, current_mode);
+                                remember_band_settings(&mut connected.band_memory, connected.active_xvtr.as_deref(), effective_freq, connected.db_low, connected.db_high, connected.waterfall_db_low, connected.waterfall_db_high, current_mode);
                                 settings_changed = true;
                             }
                         }
@@ -5511,7 +5545,7 @@ impl eframe::App for HpsdrApp {
                                 } else {
                                     connected.ctun_frequency_hz = effective_freq;
                                 }
-                                remember_band_settings(&mut connected.band_memory, effective_freq, connected.db_low, connected.db_high, connected.waterfall_db_low, connected.waterfall_db_high, current_mode);
+                                remember_band_settings(&mut connected.band_memory, connected.active_xvtr.as_deref(), effective_freq, connected.db_low, connected.db_high, connected.waterfall_db_low, connected.waterfall_db_high, current_mode);
                                 settings_changed = true;
                             }
                         }
@@ -5799,7 +5833,7 @@ impl eframe::App for HpsdrApp {
                                 } else {
                                     connected.ctun_frequency_hz = effective_freq;
                                 }
-                                remember_band_settings(&mut connected.band_memory, effective_freq, connected.db_low, connected.db_high, connected.waterfall_db_low, connected.waterfall_db_high, current_mode);
+                                remember_band_settings(&mut connected.band_memory, connected.active_xvtr.as_deref(), effective_freq, connected.db_low, connected.db_high, connected.waterfall_db_low, connected.waterfall_db_high, current_mode);
                                 settings_changed = true;
                             }
                         }
@@ -5827,7 +5861,7 @@ impl eframe::App for HpsdrApp {
                                 } else {
                                     connected.ctun_frequency_hz = effective_freq;
                                 }
-                                remember_band_settings(&mut connected.band_memory, effective_freq, connected.db_low, connected.db_high, connected.waterfall_db_low, connected.waterfall_db_high, current_mode);
+                                remember_band_settings(&mut connected.band_memory, connected.active_xvtr.as_deref(), effective_freq, connected.db_low, connected.db_high, connected.waterfall_db_low, connected.waterfall_db_high, current_mode);
                                 settings_changed = true;
                             }
                         }
@@ -5866,7 +5900,7 @@ impl eframe::App for HpsdrApp {
                                     } else {
                                         connected.ctun_frequency_hz = effective_freq;
                                     }
-                                    remember_band_settings(&mut connected.band_memory, effective_freq, connected.db_low, connected.db_high, connected.waterfall_db_low, connected.waterfall_db_high, current_mode);
+                                    remember_band_settings(&mut connected.band_memory, connected.active_xvtr.as_deref(), effective_freq, connected.db_low, connected.db_high, connected.waterfall_db_low, connected.waterfall_db_high, current_mode);
                                     settings_changed = true;
                                 }
                             }
@@ -5896,7 +5930,7 @@ impl eframe::App for HpsdrApp {
                                     } else {
                                         connected.ctun_frequency_hz = effective_freq;
                                     }
-                                    remember_band_settings(&mut connected.band_memory, effective_freq, connected.db_low, connected.db_high, connected.waterfall_db_low, connected.waterfall_db_high, current_mode);
+                                    remember_band_settings(&mut connected.band_memory, connected.active_xvtr.as_deref(), effective_freq, connected.db_low, connected.db_high, connected.waterfall_db_low, connected.waterfall_db_high, current_mode);
                                     settings_changed = true;
                                 }
                             }
@@ -7980,6 +8014,7 @@ impl eframe::App for HpsdrApp {
                                                 connected.db_low = low;
                                                 remember_band_settings(
                                                     &mut connected.band_memory,
+                                                    connected.active_xvtr.as_deref(),
                                                     freq_hz,
                                                     connected.db_low,
                                                     connected.db_high,
@@ -8014,6 +8049,7 @@ impl eframe::App for HpsdrApp {
                                             connected.db_high = high;
                                             remember_band_settings(
                                                 &mut connected.band_memory,
+                                                connected.active_xvtr.as_deref(),
                                                 freq_hz,
                                                 connected.db_low,
                                                 connected.db_high,
@@ -8062,6 +8098,7 @@ impl eframe::App for HpsdrApp {
                                             connected.waterfall_db_low = wlow;
                                             remember_band_settings(
                                                 &mut connected.band_memory,
+                                                connected.active_xvtr.as_deref(),
                                                 freq_hz,
                                                 connected.db_low,
                                                 connected.db_high,
@@ -8083,6 +8120,7 @@ impl eframe::App for HpsdrApp {
                                             connected.waterfall_db_high = whigh;
                                             remember_band_settings(
                                                 &mut connected.band_memory,
+                                                connected.active_xvtr.as_deref(),
                                                 freq_hz,
                                                 connected.db_low,
                                                 connected.db_high,
@@ -11681,6 +11719,7 @@ fn render_extra_receiver_ui(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceiver>>) {
                 rx.spectrum.set_width_hz(width_for_mode(&rx.width_memory, mode));
                 remember_band_settings(
                     &mut rx.band_memory,
+                    None,
                     dial_freq_hz,
                     db_low,
                     db_high,
@@ -11873,7 +11912,7 @@ fn render_extra_receiver_ui(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceiver>>) {
             } else {
                 rx.ctun_frequency_hz = effective_freq;
             }
-            remember_band_settings(&mut rx.band_memory, effective_freq, db_low, db_high, wf_db_low, wf_db_high, current_mode);
+            remember_band_settings(&mut rx.band_memory, None, effective_freq, db_low, db_high, wf_db_low, wf_db_high, current_mode);
             rx.settings_dirty.store(true, Ordering::Relaxed);
         }
     }
@@ -11899,7 +11938,7 @@ fn render_extra_receiver_ui(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceiver>>) {
             } else {
                 rx.ctun_frequency_hz = effective_freq;
             }
-            remember_band_settings(&mut rx.band_memory, effective_freq, db_low, db_high, wf_db_low, wf_db_high, current_mode);
+            remember_band_settings(&mut rx.band_memory, None, effective_freq, db_low, db_high, wf_db_low, wf_db_high, current_mode);
             rx.settings_dirty.store(true, Ordering::Relaxed);
         }
     }
@@ -11927,7 +11966,7 @@ fn render_extra_receiver_ui(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceiver>>) {
                 } else {
                     rx.ctun_frequency_hz = effective_freq;
                 }
-                remember_band_settings(&mut rx.band_memory, effective_freq, db_low, db_high, wf_db_low, wf_db_high, current_mode);
+                remember_band_settings(&mut rx.band_memory, None, effective_freq, db_low, db_high, wf_db_low, wf_db_high, current_mode);
                 rx.settings_dirty.store(true, Ordering::Relaxed);
             }
         }
@@ -12054,7 +12093,7 @@ fn render_extra_receiver_ui(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceiver>>) {
                 } else {
                     rx.ctun_frequency_hz = effective_freq;
                 }
-                remember_band_settings(&mut rx.band_memory, effective_freq, db_low, db_high, wf_db_low, wf_db_high, current_mode);
+                remember_band_settings(&mut rx.band_memory, None, effective_freq, db_low, db_high, wf_db_low, wf_db_high, current_mode);
                 rx.settings_dirty.store(true, Ordering::Relaxed);
             }
         }
@@ -12080,7 +12119,7 @@ fn render_extra_receiver_ui(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceiver>>) {
                 } else {
                     rx.ctun_frequency_hz = effective_freq;
                 }
-                remember_band_settings(&mut rx.band_memory, effective_freq, db_low, db_high, wf_db_low, wf_db_high, current_mode);
+                remember_band_settings(&mut rx.band_memory, None, effective_freq, db_low, db_high, wf_db_low, wf_db_high, current_mode);
                 rx.settings_dirty.store(true, Ordering::Relaxed);
             }
         }
@@ -12112,7 +12151,7 @@ fn render_extra_receiver_ui(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceiver>>) {
                     } else {
                         rx.ctun_frequency_hz = effective_freq;
                     }
-                    remember_band_settings(&mut rx.band_memory, effective_freq, db_low, db_high, wf_db_low, wf_db_high, current_mode);
+                    remember_band_settings(&mut rx.band_memory, None, effective_freq, db_low, db_high, wf_db_low, wf_db_high, current_mode);
                     rx.settings_dirty.store(true, Ordering::Relaxed);
                 }
             }
@@ -12488,7 +12527,7 @@ fn render_extra_receiver_settings(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceive
                     if scroll_slider_f32(ui, &mut rx.slider_scroll_accum, &mut low, -180.0..=0.0, 2.0) {
                         rx.db_low = low;
                         let (a, b, c, d) = (rx.db_low, rx.db_high, rx.waterfall_db_low, rx.waterfall_db_high);
-                        remember_band_settings(&mut rx.band_memory, freq_hz, a, b, c, d, agc_params.mode);
+                        remember_band_settings(&mut rx.band_memory, None, freq_hz, a, b, c, d, agc_params.mode);
                         rx.settings_dirty.store(true, Ordering::Relaxed);
                     }
                 });
@@ -12508,7 +12547,7 @@ fn render_extra_receiver_settings(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceive
                 if scroll_slider_f32(ui, &mut rx.slider_scroll_accum, &mut high, -180.0..=0.0, 2.0) {
                     rx.db_high = high;
                     let (a, b, c, d) = (rx.db_low, rx.db_high, rx.waterfall_db_low, rx.waterfall_db_high);
-                    remember_band_settings(&mut rx.band_memory, freq_hz, a, b, c, d, agc_params.mode);
+                    remember_band_settings(&mut rx.band_memory, None, freq_hz, a, b, c, d, agc_params.mode);
                     rx.settings_dirty.store(true, Ordering::Relaxed);
                 }
             });
@@ -12540,7 +12579,7 @@ fn render_extra_receiver_settings(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceive
                 if scroll_slider_f32(ui, &mut rx.slider_scroll_accum, &mut wlow, -180.0..=0.0, 2.0) {
                     rx.waterfall_db_low = wlow;
                     let (a, b, c, d) = (rx.db_low, rx.db_high, rx.waterfall_db_low, rx.waterfall_db_high);
-                    remember_band_settings(&mut rx.band_memory, freq_hz, a, b, c, d, agc_params.mode);
+                    remember_band_settings(&mut rx.band_memory, None, freq_hz, a, b, c, d, agc_params.mode);
                     rx.settings_dirty.store(true, Ordering::Relaxed);
                 }
                 let mut whigh = rx.waterfall_db_high;
@@ -12548,7 +12587,7 @@ fn render_extra_receiver_settings(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceive
                 if scroll_slider_f32(ui, &mut rx.slider_scroll_accum, &mut whigh, -180.0..=0.0, 2.0) {
                     rx.waterfall_db_high = whigh;
                     let (a, b, c, d) = (rx.db_low, rx.db_high, rx.waterfall_db_low, rx.waterfall_db_high);
-                    remember_band_settings(&mut rx.band_memory, freq_hz, a, b, c, d, agc_params.mode);
+                    remember_band_settings(&mut rx.band_memory, None, freq_hz, a, b, c, d, agc_params.mode);
                     rx.settings_dirty.store(true, Ordering::Relaxed);
                 }
             });
@@ -13565,6 +13604,18 @@ fn main() -> eframe::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn transverter_tuning_has_its_own_band_memory() {
+        let mut mem = std::collections::HashMap::new();
+        let usb = spectrum::Mode::Usb;
+        remember_band_settings(&mut mem, None, 28_400_000, 0.0, 0.0, 0.0, 0.0, usb);
+        // 2m transverter with a 28 MHz IF: must not overwrite 10m.
+        remember_band_settings(&mut mem, Some("2m"), 28_200_000, 0.0, 0.0, 0.0, 0.0, usb);
+        assert_eq!(mem["10m"].frequency_hz, 28_400_000);
+        assert_eq!(mem[&xvtr_memory_key("2m")].frequency_hz, 28_200_000);
+        assert!(!mem.contains_key("2m"));
+    }
 
     #[test]
     fn click_rounds_displayed_frequency_not_if() {

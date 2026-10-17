@@ -49,7 +49,9 @@ drift automatically, use [PSK Beacon](02-main-window.md#psk-beacon-qo-100)'s
 A configured, in-range slot appears as an extra button alongside the
 ordinary [band row](02-main-window.md#bands-and-modes) -- only if its
 corresponding IF range actually fits this radio's native tunable range.
-Clicking it retunes to the slot's RF minimum. While active:
+Clicking it returns to where you last were on that transverter --
+frequency, mode and spectrum levels, remembered like an ordinary band --
+or to the slot's RF minimum the first time. While active:
 
 - VFO-A, the spectrum/waterfall frequency axis, and
   [CAT/rigctl/TCI](11-settings-network.md) frequency reporting all show the
