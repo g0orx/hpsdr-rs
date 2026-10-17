@@ -387,6 +387,10 @@ fn apply_lnb_correction(connected: &mut ConnectedState) {
         }
     }
     if listen_shift_hz != 0 {
+        // VFO B is IF too and displayed through the same offset: move it
+        // with A so its RF frequency stays put.
+        connected.vfo_b_frequency_hz =
+            (connected.vfo_b_frequency_hz as i64 + listen_shift_hz).clamp(0, u32::MAX as i64) as u32;
         if connected.ctun {
             connected.ctun_frequency_hz = (connected.ctun_frequency_hz as i64 + listen_shift_hz).clamp(0, u32::MAX as i64) as u32;
         } else {
@@ -3924,8 +3928,12 @@ impl eframe::App for HpsdrApp {
                                         let resp = ui
                                             .add(
                                                 egui::Label::new(
+                                                    // VFO B is stored as IF like VFO A's
+                                                    // dial; show it in the same RF space
+                                                    // (active transverter's offset added).
                                                     egui::RichText::new(format_frequency(
-                                                        connected.vfo_b_frequency_hz.into(),
+                                                        (connected.vfo_b_frequency_hz as i64 + xvtr_rf_offset_hz).max(0)
+                                                            as u64,
                                                     ))
                                                     .monospace()
                                                     .size(28.0)
@@ -4235,9 +4243,15 @@ impl eframe::App for HpsdrApp {
                                                 // configured transverter's RF
                                                 // range selects it and tunes its
                                                 // IF (see active_xvtr's doc
-                                                // comment). VFO-B stays plain IF.
+                                                // comment). VFO-B is entered in the
+                                                // active transverter's RF space, as
+                                                // it is displayed.
                                                 let xvtr = if vfo_b { None } else { xvtr_for_rf_freq(&connected.xvtrs, freq) };
-                                                let offset = xvtr.map(xvtr_rf_offset).unwrap_or(0);
+                                                let offset = if vfo_b {
+                                                    xvtr_rf_offset_hz
+                                                } else {
+                                                    xvtr.map(xvtr_rf_offset).unwrap_or(0)
+                                                };
                                                 let xvtr_name = xvtr.map(|x| x.name.clone());
                                                 let clamped = (freq as i64 - offset).clamp(
                                                     connected.device.frequency_min as i64,
