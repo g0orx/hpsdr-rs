@@ -346,10 +346,20 @@ impl Default for RadioSettings {
 /// other channels are used for PURESIGNAL and get the TX freq") and
 /// new_protocol.c's high-priority packet builder ("Set DDC0 and DDC1
 /// (synchronized) to the transmit frequency").
+/// Whether this board/protocol can run PureSignal here at all.
+pub fn puresignal_supported(protocol: u8, board: Boards) -> bool {
+    ps_feedback_config(protocol, board).is_some()
+}
+
 fn ps_feedback_config(protocol: u8, board: Boards) -> Option<(u8, u8, Option<u8>)> {
     match protocol {
         1 => match board {
-            Boards::Metis | Boards::HermesLite => Some((0, 1, Some(0))),
+            // piHPSDR feeds PureSignal through RX1 on these 2-receiver
+            // boards, but this project reserves feedback slots for the
+            // whole session, which left them NO normal receiver: an
+            // empty iq_buffers and a crash on connect (issue #12, Metis).
+            // A Metis with Mercury/Penny has no feedback path anyway.
+            Boards::Metis | Boards::HermesLite => None,
             Boards::Hermes | Boards::Hermes2 | Boards::HermesLite2 => Some((2, 3, Some(2))),
             Boards::Angelia | Boards::Orion | Boards::Orion2 => Some((3, 4, Some(3))),
             // Classic Ozy+Mercury+Penny hardware has no PureSignal
@@ -1898,17 +1908,9 @@ fn start_protocol1(
     // reconnect -- see RadioSession::puresignal_enabled's doc comment for
     // the "Add Receiver" capacity cost this trades for that.
     //
-    // NOT forced to a minimum of 1 real receiver -- on Metis/HermesLite
-    // (max_real=0), real receiver indices would otherwise collide with
-    // the feedback indices themselves (rx_feedback_idx=0 there), a
-    // genuine wire-level correctness bug, not just a UI nicety. This
-    // does mean `iq_buffers` can legitimately end up empty on those
-    // smallest boards now (regardless of whether PS starts on) -- main.rs's
-    // connect flow (which assumes iq_buffers[0] always exists for the main
-    // SpectrumHandle) doesn't handle that yet; not a concern for the
-    // 2-ADC Angelia/Orion/Orion2-class hardware this was built against,
-    // but flagged rather than silently papered over for anyone with
-    // one of the smaller boards.
+    // Every board with a reservation keeps at least one real receiver
+    // (max_real >= 2 below); Metis/HermesLite, where it would have been
+    // zero, have no PureSignal at all -- see ps_feedback_config.
     let ps_config = ps_feedback_config(1, device.board);
     let mut real_receivers = match ps_config {
         Some((_, _, Some(max_real))) => settings.receivers.max(1).min(max_real),

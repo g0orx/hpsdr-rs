@@ -2200,7 +2200,8 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
     // stuck at 1 for every P1 radio regardless of what it
     // actually supports).
     settings.receivers = device.supported_receivers.max(1);
-    settings.puresignal_enabled = cfg.puresignal_enabled.unwrap_or(false);
+    settings.puresignal_enabled = cfg.puresignal_enabled.unwrap_or(false)
+        && radio::puresignal_supported(device.protocol, device.board);
     settings.diversity_enabled = cfg.diversity_enabled.unwrap_or(false);
     settings.diversity_gain_db = cfg.diversity_gain_db.unwrap_or(0.0);
     settings.diversity_phase_deg = cfg.diversity_phase_deg.unwrap_or(0.0);
@@ -6491,6 +6492,11 @@ impl eframe::App for HpsdrApp {
                                     // it, same gating style already used for
                                     // the per-receiver ADC dropdown below.
                                     if tab == SettingsTab::Diversity && connected.device.adcs != 2 {
+                                        continue;
+                                    }
+                                    if tab == SettingsTab::PureSignal
+                                        && !radio::puresignal_supported(connected.device.protocol, connected.device.board)
+                                    {
                                         continue;
                                     }
                                     if ui
