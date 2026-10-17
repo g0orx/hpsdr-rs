@@ -363,6 +363,12 @@ A real recording of 40m background noise, captured with the main window's own Re
 | 9-13s | `NR: NR2` |
 | 13s-end | `NR: NNR` |
 
+## QO-100 demo
+
+[![hpsdr-rs receiving QO-100 with the PSK Beacon panel decoding and Lock LNB correcting drift](docs/video/qo100-poster.png)](https://g0orx.github.io/hpsdr-rs/qo100-demo.html)
+
+A screen recording of the QO-100 narrowband transponder received with an MSI.SDR stick and a 10 GHz LNB, set up as a [transverter](docs/manual/18-xvtr.md). The PSK Beacon panel is decoding the middle beacon, and Lock LNB is correcting the LNB's drift. **[Watch it here](https://g0orx.github.io/hpsdr-rs/qo100-demo.html)** (GitHub Pages — GitHub doesn't play video from a README), or [download the MP4](docs/video/qo100.mp4).
+
 ## Roadmap
 
 Current focus is on stabilizing and testing Protocol 1 and Protocol 2 operation, including PureSignal, across more radios.
