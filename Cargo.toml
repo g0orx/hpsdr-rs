@@ -18,16 +18,23 @@ repository = "https://github.com/g0orx/hpsdr-rs"
 # technology active, especially under GNOME's always-running AT-SPI
 # registry daemon. This app has no accessibility/screen-reader use
 # case, so there's no downside to dropping it. The rest of this list
-# is eframe 0.35's own default feature set, copied verbatim minus
-# "accesskit" -- keep in sync if eframe's defaults ever change.
-eframe = { version = "0.35", default-features = false, features = [
+# is eframe 0.37's own default feature set minus "accesskit",
+# "system_fonts" (keeps egui's bundled fonts, so the UI looks the same)
+# and "winit/default" (never enabled here, even on 0.35)
+# -- keep in sync if eframe's defaults ever change. 0.37 (from 0.35)
+# for its Wayland fix: 0.35 set ControlFlow::Poll while waiting for the
+# compositor's frame callback, spinning the UI thread at 100% under
+# native Wayland (egui issue #8326, confirmed here with perf).
+eframe = { version = "0.37", default-features = false, features = [
+    "clipboard",
     "default_fonts",
+    "links",
     "wayland",
     "web_screen_reader",
     "wgpu",
     "x11",
 ] }
-egui = "0.35"
+egui = "0.37"
 network-interface = "1"
 socket2 = { version = "0.5", features = ["all"] }
 serde = { version = "1", features = ["derive"] }

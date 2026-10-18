@@ -6019,7 +6019,7 @@ impl eframe::App for HpsdrApp {
                         render_cw_decoder_panel_beside(
                             ui,
                             &connected.spectrum,
-                            egui::Id::new("cw_decoder_panel_main"),
+                            egui::Id::unique("cw_decoder_panel_main"),
                             egui::Rect::from_min_max(
                                 egui::pos2(spectrum_right + CW_PANEL_GAP, spectrum_top),
                                 egui::pos2(spectrum_right + CW_PANEL_GAP + CW_PANEL_WIDTH, waterfall_bottom),
@@ -6097,7 +6097,7 @@ impl eframe::App for HpsdrApp {
                     });
                 });
 
-                egui::Area::new(egui::Id::new("s_meter_area"))
+                egui::Area::new(egui::Id::unique("s_meter_area"))
                     .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-10.0, 10.0))
                     .show(ui, |ui| {
                         // Height lowered from 110 -- once draw_s_meter's
@@ -6386,7 +6386,7 @@ impl eframe::App for HpsdrApp {
                             }
 
                             let meter_db = rx_for_closure.lock().unwrap().spectrum.display.lock().unwrap().meter_db;
-                            egui::Area::new(egui::Id::new(("extra_s_meter", ddc_index)))
+                            egui::Area::new(egui::Id::unique(("extra_s_meter", ddc_index)))
                                 .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-10.0, 10.0))
                                 .show(ui, |ui| {
                                     let (meter_rect, _resp) =
@@ -10653,7 +10653,7 @@ fn render_psk_beacon_panel(ui: &mut egui::Ui, connected: &mut ConnectedState) ->
 /// Places the PSK beacon panel beside the spectrum/waterfall, the same
 /// way as render_cw_decoder_panel_beside (see its doc comment).
 fn render_psk_beacon_panel_beside(ui: &mut egui::Ui, connected: &mut ConnectedState, rect: egui::Rect) -> bool {
-    egui::Area::new(egui::Id::new("psk_beacon_panel_main"))
+    egui::Area::new(egui::Id::unique("psk_beacon_panel_main"))
         .fixed_pos(rect.min)
         .show(ui, |ui| {
             egui::Frame::group(ui.style())
@@ -12278,7 +12278,7 @@ fn render_extra_receiver_ui(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceiver>>) {
         render_cw_decoder_panel_beside(
             ui,
             &rx.spectrum,
-            egui::Id::new(("cw_decoder_panel_extra", rx.ddc_index)),
+            egui::Id::unique(("cw_decoder_panel_extra", rx.ddc_index)),
             egui::Rect::from_min_max(
                 egui::pos2(spectrum_right + CW_PANEL_GAP, spectrum_top),
                 egui::pos2(spectrum_right + CW_PANEL_GAP + CW_PANEL_WIDTH, waterfall_bottom),
