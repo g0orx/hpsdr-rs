@@ -85,6 +85,13 @@ nusb = "0.2"
 # new system dependency on any platform.
 midir = "0.11"
 
+# Native Wayland (the default on Linux) needs the app to draw its own
+# window title bar; winit only draws a GNOME/Adwaita-style one (title
+# text, proper buttons) with this feature -- without it windows got a
+# plain fallback frame with no title. Same winit as eframe pulls in.
+[target.'cfg(target_os = "linux")'.dependencies]
+winit = { version = "0.30", default-features = false, features = ["wayland-csd-adwaita"] }
+
 [target.'cfg(windows)'.dependencies]
 # SetStdHandle, used by main.rs's redirect_stdio_to_log_file() to send
 # the app's existing println!/eprintln! debug output to a log file

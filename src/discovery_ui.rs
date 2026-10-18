@@ -283,19 +283,11 @@ impl DiscoveryWindow {
         // concern (focus vs. stacking order) that happens to have
         // shared this same window_level gate before.
         let window_level = egui::WindowLevel::AlwaysOnTop;
-        ui.ctx().show_viewport_immediate(
-            egui::ViewportId::from_hash_of("discovery_window"),
-            egui::ViewportBuilder::default()
-                .with_title("Discover HPSDR Radios")
-                // Widened from 700 -- the Interface column now shows the
-                // interface name alongside its address (e.g. "eth0
-                // (192.168.1.50)"), which combined with the MAC column's
-                // own width was pushing the trailing Status column past
-                // the fixed window edge and clipping it.
-                .with_inner_size([900.0, 500.0])
-                .with_active(true)
-                .with_window_level(window_level),
-            |ui, _class| {
+        // Under native Wayland a client can neither keep a window on top
+        // nor take focus, so this separate window could open hidden behind
+        // the (empty, black) main window. There it's drawn inside the main
+        // window instead.
+        let mut viewport_ui = |ui: &mut egui::Ui, _class: egui::ViewportClass| {
                 if let Some(deadline) = self.focus_deadline {
                     let focused = ui.input(|i| i.viewport().focused).unwrap_or(false);
                     if focused || Instant::now() >= deadline {
@@ -644,8 +636,25 @@ impl DiscoveryWindow {
                     });
                 });
                 });
-            },
-        );
+        };
+        if crate::running_on_wayland() {
+            viewport_ui(ui, egui::ViewportClass::Root);
+        } else {
+            ui.ctx().show_viewport_immediate(
+                egui::ViewportId::from_hash_of("discovery_window"),
+                egui::ViewportBuilder::default()
+                    .with_title("Discover HPSDR Radios")
+                    // Widened from 700 -- the Interface column now shows the
+                    // interface name alongside its address (e.g. "eth0
+                    // (192.168.1.50)"), which combined with the MAC column's
+                    // own width was pushing the trailing Status column past
+                    // the fixed window edge and clipping it.
+                    .with_inner_size([900.0, 500.0])
+                    .with_active(true)
+                    .with_window_level(window_level),
+                viewport_ui,
+            );
+        }
         self.open = still_open;
 
         if !still_open {

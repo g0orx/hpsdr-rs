@@ -13515,6 +13515,13 @@ fn redirect_stdio_to_log_file() {
     }
 }
 
+/// Whether winit is using native Wayland (main() clears WAYLAND_DISPLAY
+/// before winit starts when X11 is forced, so this reflects the backend
+/// actually chosen).
+pub(crate) fn running_on_wayland() -> bool {
+    cfg!(target_os = "linux") && std::env::var_os("WAYLAND_DISPLAY").is_some()
+}
+
 fn main() -> eframe::Result<()> {
     // See the crate-level `windows_subsystem` attribute above for why
     // this matters: with no console auto-allocated on Windows release
@@ -13522,57 +13529,24 @@ fn main() -> eframe::Result<()> {
     #[cfg(all(windows, not(debug_assertions)))]
     redirect_stdio_to_log_file();
 
-    // Force winit's X11 backend (via XWayland) rather than native Wayland.
-    // Confirmed via `perf record`/`strace -p` on a running session: winit's
-    // Wayland backend pegged one CPU core continuously on this system --
-    // tens of thousands of epoll_ctl/timerfd_settime/epoll_pwait cycles per
-    // second on the main UI thread alone (~150us/cycle), not a normal
-    // blocking wait -- while switching to X11 (WAYLAND_DISPLAY cleared)
-    // eliminated it entirely on the same session, same hardware. Root cause
-    // not pinned down further (deep in winit/calloop's Wayland event-loop
-    // internals; egui-winit/accesskit's AT-SPI/D-Bus stack was ruled out
-    // and removed separately -- see Cargo.toml). winit 0.30 selects its
-    // Linux backend purely by checking WAYLAND_DISPLAY/WAYLAND_SOCKET at
-    // startup (see winit::platform_impl::linux::mod.rs), so clearing it
-    // here -- before eframe/winit ever read it, and before any other
-    // threads exist -- is enough to force X11 without needing the user to
-    // remember an env var on every launch. Revisit if a real Wayland fix
-    // ever lands upstream and this workaround is no longer needed.
+    // Native Wayland is the default; HPSDR_FORCE_X11=1 (any value but
+    // "0") forces winit's X11 backend via XWayland instead, by clearing
+    // WAYLAND_DISPLAY before winit reads it (winit 0.30 picks its Linux
+    // backend from WAYLAND_DISPLAY/WAYLAND_SOCKET at startup).
     //
-    // Escape hatch: set HPSDR_FORCE_X11=0 to skip this and run native
-    // Wayland instead -- added after a Raspberry Pi 5 report of UI
-    // flicker (VFO-A/S-meter/spectrum/waterfall/waveform) that
-    // persisted even after forcing PresentMode::Fifo, to test whether
-    // XWayland's extra compositing hop (rather than the present mode)
-    // is the actual cause on that GPU/driver.
+    // X11 used to be forced by default because native Wayland pinned the
+    // UI thread at 100% CPU -- root-caused with perf (2026-10-18) to
+    // eframe 0.35 setting ControlFlow::Poll while waiting for the
+    // compositor's frame callback, and fixed by eframe 0.37 (UI thread
+    // ~9%, also confirmed on a Raspberry Pi 5). XWayland, meanwhile, had
+    // real costs of its own: GNOME throttles XWayland windows it thinks
+    // are hidden to ~1 redraw/s -- the whole app while the Settings
+    // window was minimized, and the upper of two stacked hpsdr-rs windows
+    // once the lower one reached the bottom of the screen.
     //
-    // SECOND confirmed reason to use this escape hatch (2026-09-14): a
-    // real report that minimizing the Settings window (a second OS-level
-    // window this app opens, see show_viewport_immediate's own call site
-    // comment) throttled the WHOLE app's updates to ~1/sec until it was
-    // restored -- confirmed via a real winit/eframe trace capture (see
-    // project memory: settings_viewport_minimize_stall) to be the window
-    // manager/XWayland layer throttling redraw delivery for every window
-    // of this process while any one of them is iconified, not something
-    // this app's own rendering code does. Confirmed via the same A/B
-    // test this comment already recommends: HPSDR_FORCE_X11=0 (native
-    // Wayland) does NOT have this problem. Left forcing X11 as the
-    // DEFAULT anyway -- native Wayland's own known CPU-pegging bug (see
-    // below) is a continuous cost for the whole session, worse than an
-    // occasional, self-clearing stall from minimizing one window.
-    // BUG FIX (2026-09-18, real report): unconditionally clearing
-    // WAYLAND_DISPLAY assumed X11/XWayland was always there as a working
-    // fallback -- a real report on Debian (a pure-Wayland session with no
-    // XWayland running/available, DISPLAY unset too) showed winit failing
-    // outright at startup instead ("neither WAYLAND_DISPLAY nor
-    // WAYLAND_SOCKET nor DISPLAY is set"), taking away the only display
-    // connection that would have worked with nothing to fall back to.
-    // Only force X11 when DISPLAY is actually set -- i.e. XWayland (or a
-    // native X11 session) is genuinely available to switch to; otherwise
-    // leave WAYLAND_DISPLAY alone and let winit use native Wayland, which
-    // at least runs (with the known CPU-pegging cost documented above)
-    // instead of not starting at all.
-    let force_x11 = std::env::var("HPSDR_FORCE_X11").map(|v| v != "0").unwrap_or(true);
+    // Only forced when DISPLAY is set, i.e. X11/XWayland actually exists
+    // (a pure-Wayland session with no XWayland otherwise fails to start).
+    let force_x11 = std::env::var("HPSDR_FORCE_X11").map(|v| v != "0").unwrap_or(false);
     if force_x11 && std::env::var_os("DISPLAY").is_some() {
         unsafe {
             std::env::remove_var("WAYLAND_DISPLAY");
