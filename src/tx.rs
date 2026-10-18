@@ -140,8 +140,9 @@ const TX_AUDIO_MONITOR_CAPACITY: usize = 14_400;
 /// display-only, never-drained peek tap (see main.rs's
 /// draw_audio_waveform) where a longer window is purely cosmetic -- see
 /// spectrum.rs's identical WAVEFORM_TAP_CAPACITY for the RX side of the
-/// same display. ~500ms at 48kHz.
-const WAVEFORM_TAP_CAPACITY: usize = 24_000;
+/// same display. ~750ms at 48kHz -- must be at least main.rs's
+/// WAVEFORM_WINDOW_SAMPLES.
+const WAVEFORM_TAP_CAPACITY: usize = 36_000;
 
 /// Reference ALC decay (ms) -- piHPSDR's own confirmed value.
 ///

@@ -659,8 +659,9 @@ const AUDIO_BUFFER_CAPACITY: usize = 14_400;
 /// peek tap where a longer window is purely cosmetic (a real report:
 /// the default ~200ms window felt too fast/frantic; longer shows more
 /// history per frame so it reads as calmer without changing anything
-/// about actual audio latency). ~500ms at 48kHz.
-const WAVEFORM_TAP_CAPACITY: usize = 24_000;
+/// about actual audio latency). ~750ms at 48kHz -- must be at least
+/// main.rs's WAVEFORM_WINDOW_SAMPLES.
+const WAVEFORM_TAP_CAPACITY: usize = 36_000;
 
 /// Two cascaded single-pole lowpass stages (~12dB/octave) -- see run()'s
 /// doc comment on radio_audio_lpf for why this exists at all and how the

@@ -10491,16 +10491,16 @@ fn draw_freq_hover_tooltip(painter: &egui::Painter, pos: egui::Pos2, freq_hz: u6
 }
 
 /// How many trailing samples draw_audio_waveform reads each frame --
-/// ~500ms at 48kHz. A real report: an earlier, shorter ~200ms window
-/// felt too fast/frantic (nearly all of it fresh content every frame);
-/// this shows more history per frame so it reads as calmer. Comfortably
-/// inside both source taps' own ~500ms capacity (spectrum.rs's
+/// ~750ms at 48kHz. Real reports: ~200ms felt too fast/frantic (nearly
+/// all of it fresh content every frame), and 500ms was still a bit
+/// fast; a longer window scrolls more slowly and reads as calmer. Comfortably
+/// inside both source taps' own ~750ms capacity (spectrum.rs's
 /// WAVEFORM_TAP_CAPACITY / tx.rs's WAVEFORM_TAP_CAPACITY -- each
 /// dedicated to this display alone, not shared with the smaller
 /// latency-sensitive playback/monitor buffers), so there's always a
 /// full window's worth available rather than reading right up against
 /// the producer.
-const WAVEFORM_WINDOW_SAMPLES: usize = 24_000;
+const WAVEFORM_WINDOW_SAMPLES: usize = 36_000;
 
 /// Read-only snapshot of the most recent `max_samples` values in `buf`,
 /// oldest first. Never pops -- `buf` is a tap fed independently of
