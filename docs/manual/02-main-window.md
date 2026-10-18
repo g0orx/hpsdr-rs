@@ -152,6 +152,17 @@ stored value directly, or use the buttons between the two boxes:
   actually red while transmitting follows whichever VFO is really in use
   -- VFO A normally, VFO B when Split is on -- so the highlight always
   points at what's really going out over the air.
+- **SAT** -- satellite mode, for working through a transponder. Click to
+  cycle Off → **SAT** → **SATR** → Off; switching it on also turns Split
+  on. In **SAT**, tuning VFO A moves VFO B by the same amount in the same
+  direction, so your transmit frequency follows your receive frequency.
+  **SATR** (reverse) moves VFO B the opposite way, for inverting
+  transponders where a higher uplink gives a lower downlink. It works
+  both ways: scrolling VFO B (or a MIDI VFO B Tune control) moves VFO A
+  the same way in SAT, the opposite way in SATR. Only tuning counts:
+  B>A, A<>B, typing a VFO A or VFO B frequency, changing band or
+  transverter, and Lock LNB corrections leave the other VFO alone. Set up
+  VFO B first (e.g. with A>B and then adjust it), then tune with VFO A.
 
 ## Bands and modes
 

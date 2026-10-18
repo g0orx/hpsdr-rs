@@ -439,6 +439,9 @@ pub struct Config {
     pub vfo_b_frequency_hz: Option<u32>,
     #[serde(default)]
     pub split: Option<bool>,
+    /// See ConnectedState::sat_mode: 0 off, 1 SAT, 2 SATR.
+    #[serde(default)]
+    pub sat_mode: Option<u8>,
     /// See ConnectedState::cw_decode_enabled's doc comment. `None`
     /// (a config saved before this existed) falls back to true, same
     /// as a fresh connect.

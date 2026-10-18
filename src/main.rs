@@ -357,6 +357,90 @@ fn beacon_iq_offset_hz(connected: &ConnectedState) -> Option<f64> {
 /// While the beacon is lost the last correction is held. With the lock
 /// (or PSK Beacon) off, or on any other transverter, the correction is
 /// taken back out, again keeping the listening frequency's RF.
+/// Satellite VFO tracking mode -- see ConnectedState::sat_mode.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+enum SatMode {
+    #[default]
+    Off,
+    Sat,
+    SatR,
+}
+
+impl SatMode {
+    fn next(self) -> Self {
+        match self {
+            SatMode::Off => SatMode::Sat,
+            SatMode::Sat => SatMode::SatR,
+            SatMode::SatR => SatMode::Off,
+        }
+    }
+    fn label(self) -> &'static str {
+        match self {
+            SatMode::Off | SatMode::Sat => "SAT",
+            SatMode::SatR => "SATR",
+        }
+    }
+    fn to_config(self) -> u8 {
+        self as u8
+    }
+    fn from_config(v: u8) -> Self {
+        match v {
+            1 => SatMode::Sat,
+            2 => SatMode::SatR,
+            _ => SatMode::Off,
+        }
+    }
+}
+
+/// SAT/SATR: moves VFO B by however far VFO A's displayed frequency moved
+/// since last frame (SAT) or the opposite way (SATR). Uses the displayed
+/// (RF) frequency so a Lock LNB correction, which shifts the IF but not
+/// what's shown, doesn't count as tuning; skips band/transverter changes.
+/// Returns true if VFO B moved.
+fn track_sat_vfo_b(connected: &mut ConnectedState, displayed_hz: u64, band_key: &str) -> bool {
+    let last = connected.sat_last.replace((displayed_hz, band_key.to_string()));
+    let Some((last_hz, last_key)) = last else {
+        return false;
+    };
+    if connected.sat_mode == SatMode::Off || last_key != band_key || last_hz == displayed_hz {
+        return false;
+    }
+    let delta = displayed_hz as i64 - last_hz as i64;
+    let delta = if connected.sat_mode == SatMode::SatR { -delta } else { delta };
+    connected.vfo_b_frequency_hz = (connected.vfo_b_frequency_hz as i64 + delta).clamp(0, u32::MAX as i64) as u32;
+    true
+}
+
+/// SAT/SATR, the other direction: tuning VFO B by `delta_b` moves VFO A
+/// by the same amount (SAT) or the opposite (SATR), CTUN-aware like any
+/// other VFO A tune. sat_last is cleared so track_sat_vfo_b doesn't feed
+/// that move back into VFO B next frame.
+fn sat_follow_vfo_b(
+    connected: &mut ConnectedState,
+    delta_b: i64,
+    dial_freq_hz: u32,
+    freq_hz: u32,
+    sample_rate: u32,
+    passband: (f64, f64),
+) {
+    let delta_a = match connected.sat_mode {
+        SatMode::Off => return,
+        SatMode::Sat => delta_b,
+        SatMode::SatR => -delta_b,
+    };
+    if delta_a == 0 {
+        return;
+    }
+    let new_a = (dial_freq_hz as i64 + delta_a).clamp(0, u32::MAX as i64) as u32;
+    let (effective_freq, retune) = resolve_tune(connected.ctun, freq_hz, sample_rate, passband, new_a);
+    if let Some(lo) = retune {
+        connected.session.set_frequency(lo);
+    } else {
+        connected.ctun_frequency_hz = effective_freq;
+    }
+    connected.sat_last = None;
+}
+
 fn apply_lnb_correction(connected: &mut ConnectedState) {
     const LNB_RETUNE_STEP_HZ: i64 = 10;
     let locking = connected.psk_beacon_enabled && connected.lnb_lock_enabled;
@@ -907,6 +991,13 @@ fn dispatch_midi_event(connected: &mut ConnectedState, ev: RawMidiEvent, freq_hz
             }
         }
         MidiAction::Split => connected.split = !connected.split,
+        // Same as the SAT button: cycle, and turn Split on with it.
+        MidiAction::SatMode => {
+            connected.sat_mode = connected.sat_mode.next();
+            if connected.sat_mode != SatMode::Off {
+                connected.split = true;
+            }
+        }
         MidiAction::RitToggle => {
             connected.rit_enabled = !connected.rit_enabled;
             connected.session.rit_enabled.store(connected.rit_enabled, Ordering::Relaxed);
@@ -925,6 +1016,7 @@ fn dispatch_midi_event(connected: &mut ConnectedState, ev: RawMidiEvent, freq_hz
         }
         MidiAction::VfoAtoB => connected.vfo_b_frequency_hz = dial_freq_hz,
         MidiAction::VfoBtoA => {
+            connected.sat_last = None;
             let (effective_freq, retune) =
                 resolve_tune(connected.ctun, freq_hz, sample_rate, passband, connected.vfo_b_frequency_hz);
             if let Some(lo) = retune {
@@ -934,6 +1026,7 @@ fn dispatch_midi_event(connected: &mut ConnectedState, ev: RawMidiEvent, freq_hz
             }
         }
         MidiAction::VfoSwap => {
+            connected.sat_last = None;
             let new_b = dial_freq_hz;
             let (effective_freq, retune) =
                 resolve_tune(connected.ctun, freq_hz, sample_rate, passband, connected.vfo_b_frequency_hz);
@@ -1048,6 +1141,7 @@ fn dispatch_midi_event(connected: &mut ConnectedState, ev: RawMidiEvent, freq_hz
             // field fresh every frame, so nothing else needs to react.
             let Some(step) = midi_wheel_step_hz(ev, &binding) else { return };
             connected.vfo_b_frequency_hz = (connected.vfo_b_frequency_hz as i64 + step).max(0) as u32;
+            sat_follow_vfo_b(connected, step, dial_freq_hz, freq_hz, sample_rate, passband);
         }
         MidiAction::CtunToggle => {
             // Mirrors the on-screen CTUN button's click handler exactly
@@ -1707,6 +1801,14 @@ struct ConnectedState {
     /// unaffected -- this app has no dual-watch/second-RX-chain
     /// concept, so VFO A keeps receiving regardless of Split.
     split: bool,
+    /// Satellite tracking: SAT moves VFO B with VFO A (same direction),
+    /// SATR (reverse, for inverting transponders) moves it the opposite
+    /// way -- see track_sat_vfo_b. Switching it on turns Split on too.
+    sat_mode: SatMode,
+    /// VFO A's displayed frequency and band/transverter last frame, for
+    /// track_sat_vfo_b. None after an explicit VFO A set (B>A, A<>B,
+    /// typed entry), so that jump doesn't drag VFO B along.
+    sat_last: Option<(u64, String)>,
     /// "CW Decode" toggle (button next to CTUN) -- controls both
     /// whether main.rs draws the decoder panel AND (pushed to
     /// spectrum.rs every frame via set_cw_decode_enabled) whether the
@@ -2823,6 +2925,8 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                 vfo_b_frequency_hz,
                 vfo_b_scroll_accum: 0.0,
                 split,
+                sat_mode: SatMode::from_config(cfg.sat_mode.unwrap_or(0)),
+                sat_last: None,
                 cw_decode_enabled,
                 psk_beacon_enabled,
                 lnb_lock_enabled,
@@ -3449,6 +3553,9 @@ impl eframe::App for HpsdrApp {
                     Some(name) => name,
                     None => band_for_frequency(freq_hz).map(|b| b.name).unwrap_or("Gen"),
                 };
+                if track_sat_vfo_b(connected, displayed_freq_hz, current_band_name) {
+                    connected.settings_dirty.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
                 let oc = connected.oc_settings.get(current_band_name).copied().unwrap_or_default();
                 let oc_tx_resolved = if connected.tune_active { oc.tx | connected.oc_tune } else { oc.tx };
                 connected.session.oc_rx.store(oc.rx, std::sync::atomic::Ordering::Relaxed);
@@ -3829,6 +3936,7 @@ impl eframe::App for HpsdrApp {
                                         .on_hover_text("Retune VFO A to VFO B's frequency")
                                         .clicked()
                                     {
+                                        connected.sat_last = None;
                                         // While CTUN is on, "A" is the
                                         // CTUN'd listen frequency, not the
                                         // parked hardware LO -- move that
@@ -3858,6 +3966,7 @@ impl eframe::App for HpsdrApp {
                                         .on_hover_text("Swap VFO A and VFO B")
                                         .clicked()
                                     {
+                                        connected.sat_last = None;
                                         // Same CTUN-aware handling as B>A
                                         // above.
                                         let new_b = dial_freq_hz;
@@ -3884,6 +3993,24 @@ impl eframe::App for HpsdrApp {
                                         .clicked()
                                     {
                                         connected.split = !connected.split;
+                                        settings_changed = true;
+                                    }
+                                    if ui
+                                        .add(egui::Button::selectable(
+                                            connected.sat_mode != SatMode::Off,
+                                            connected.sat_mode.label(),
+                                        ))
+                                        .on_hover_text(
+                                            "Satellite: click to cycle Off -> SAT -> SATR. SAT moves VFO B \
+                                             with VFO A; SATR moves it the opposite way (inverting \
+                                             transponders). Turns Split on.",
+                                        )
+                                        .clicked()
+                                    {
+                                        connected.sat_mode = connected.sat_mode.next();
+                                        if connected.sat_mode != SatMode::Off {
+                                            connected.split = true;
+                                        }
                                         settings_changed = true;
                                     }
                                 });
@@ -4320,6 +4447,7 @@ impl eframe::App for HpsdrApp {
                                                     // clamping is meant for.
                                                     connected.session.set_frequency(clamped);
                                                     connected.ctun_frequency_hz = clamped;
+                                                    connected.sat_last = None;
                                                 }
                                                 settings_changed = true;
                                             }
@@ -5612,7 +5740,9 @@ impl eframe::App for HpsdrApp {
                             new_freq = new_freq.max(0);
 
                             if new_freq as u32 != connected.vfo_b_frequency_hz {
+                                let delta_b = new_freq - connected.vfo_b_frequency_hz as i64;
                                 connected.vfo_b_frequency_hz = new_freq as u32;
+                                sat_follow_vfo_b(connected, delta_b, dial_freq_hz, freq_hz, sample_rate, passband);
                                 settings_changed = true;
                             }
                         }
@@ -10178,6 +10308,7 @@ impl eframe::App for HpsdrApp {
                         ctun_frequency_hz: Some(connected.ctun_frequency_hz),
                         vfo_b_frequency_hz: Some(connected.vfo_b_frequency_hz),
                         split: Some(connected.split),
+                        sat_mode: Some(connected.sat_mode.to_config()),
                         cw_decode_enabled: Some(connected.cw_decode_enabled),
                         psk_beacon_enabled: Some(connected.psk_beacon_enabled),
                         lnb_lock_enabled: Some(connected.lnb_lock_enabled),

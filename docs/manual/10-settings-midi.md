@@ -116,6 +116,7 @@ to check.
 | MOX (PTT) | Toggle transmit on/off (or momentary, see above) |
 | Tune | Toggle the Tune tone on/off |
 | Split | Toggle Split on/off |
+| SAT / SATR (cycle) | Cycle satellite mode Off → SAT → SATR, same as the SAT button (turns Split on) |
 | RIT On/Off, RIT Clear | Toggle RIT, or zero its offset |
 | XIT On/Off, XIT Clear | Toggle XIT, or zero its offset |
 | VFO A -> B, VFO B -> A, VFO A/B Swap | Copy or swap VFO frequencies |
