@@ -6040,14 +6040,12 @@ impl eframe::App for HpsdrApp {
                     }
 
                     ui.horizontal(|ui| {
-                        // Fill the available width -- reserve space for
-                        // the two labels, Reset button, and inter-widget
-                        // spacing, split the rest evenly between the two
-                        // sliders. Scoped to this row's own child Ui, so
-                        // it doesn't affect any other slider elsewhere
-                        // in the window.
-                        let reserved = 230.0;
-                        ui.spacing_mut().slider_width = ((ui.available_width() - reserved) / 2.0).max(80.0);
+                        // Fill the available width: the two sliders split
+                        // what the labels, value boxes and Reset leave --
+                        // see size_slider_pair. Scoped to this row's own
+                        // child Ui, so no other slider is affected.
+                        let row_id = egui::Id::unique("zoom_pan_row_main");
+                        let slider_width = size_slider_pair(ui, row_id);
 
                         ui.label("Zoom:");
                         let mut zoom = connected.spectrum_zoom;
@@ -6073,6 +6071,7 @@ impl eframe::App for HpsdrApp {
                             connected.spectrum_pan = 0.0;
                             settings_changed = true;
                         }
+                        remember_slider_pair_other(ui, row_id, slider_width);
                     });
 
                     ui.add_space(8.0);
@@ -10946,6 +10945,25 @@ fn scroll_drag_value_f32(
     changed
 }
 
+/// Zoom/Pan rows: sets the row's slider width so its two sliders share
+/// whatever the other widgets (labels, value boxes, Reset) leave. That
+/// width is measured from the previous frame by
+/// remember_slider_pair_other -- a fixed allowance (230 px) cut Reset off
+/// once egui 0.37 widened its padding. Returns the slider width set.
+fn size_slider_pair(ui: &mut egui::Ui, row_id: egui::Id) -> f32 {
+    let other = ui.data(|d| d.get_temp::<f32>(row_id)).unwrap_or(320.0);
+    let width = ((ui.available_width() - other) / 2.0).max(80.0);
+    ui.spacing_mut().slider_width = width;
+    width
+}
+
+/// Records how much of the row was not slider rail, for next frame's
+/// size_slider_pair. Call after the row's last widget.
+fn remember_slider_pair_other(ui: &mut egui::Ui, row_id: egui::Id, slider_width: f32) {
+    let other = ui.min_rect().width() - 2.0 * slider_width + 4.0;
+    ui.data_mut(|d| d.insert_temp(row_id, other));
+}
+
 fn scroll_slider_f32(
     ui: &mut egui::Ui,
     scroll_accum: &mut f32,
@@ -12288,10 +12306,9 @@ fn render_extra_receiver_ui(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceiver>>) {
 
     // Zoom/Pan -- see the main receiver's identical controls.
     ui.horizontal(|ui| {
-        // Fill the available width -- see the main receiver's identical
-        // treatment.
-        let reserved = 230.0;
-        ui.spacing_mut().slider_width = ((ui.available_width() - reserved) / 2.0).max(80.0);
+        // Fill the available width -- see size_slider_pair.
+        let row_id = egui::Id::unique(("zoom_pan_row_extra", rx.ddc_index));
+        let slider_width = size_slider_pair(ui, row_id);
 
         ui.label("Zoom:");
         let mut zoom = rx.spectrum_zoom;
@@ -12313,6 +12330,7 @@ fn render_extra_receiver_ui(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceiver>>) {
             rx.spectrum_pan = 0.0;
             rx.settings_dirty.store(true, Ordering::Relaxed);
         }
+        remember_slider_pair_other(ui, row_id, slider_width);
     });
 
     // Bounded rather than unconditional -- see the same call in the
