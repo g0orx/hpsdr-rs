@@ -443,6 +443,9 @@ impl MiriSdrDevice {
     pub fn close(&mut self) {
         let _ = self.streaming_stop();
         let _ = self.adc_stop();
+        // Leave the stick in alt setting 0 (no bulk endpoint), so the next
+        // session starts from a clean interface -- see initialise.
+        let _ = self.interface.set_alt_setting(0).wait();
     }
 }
 
@@ -508,23 +511,23 @@ pub fn initialise(mac: [u8; 6], initial_freq_hz: u32, gain_db: u32) -> io::Resul
     dev.set_hard(SAMPLE_RATE_HZ)?;
     dev.set_center_freq(initial_freq_hz)?;
 
+    // Through alt setting 0 first: SET_INTERFACE resets the stream
+    // endpoint's halt and data-toggle state on both sides. Linux resets
+    // the device on open, which also does that; WinUSB can't reset a
+    // device, and if the stick is still in alt 3 from a previous session
+    // (a sample rate change restarts it), the second start failed with
+    // "stream read failed: endpoint stalled". (CLEAR_FEATURE via
+    // WinUsb_ResetPipe was tried instead and hung the start on Windows.)
+    if let Err(e) = interface.set_alt_setting(0).wait() {
+        eprintln!("MSi2500: selecting alt setting 0 failed ({e}), continuing");
+    }
     interface
         .set_alt_setting(ALT_SETTING_BULK)
         .wait()
         .map_err(|e| io_err(format!("couldn't select the MSi2500's bulk alt setting {ALT_SETTING_BULK}: {e}")))?;
-    // Clear any halt / data-toggle state the previous session left on the
-    // stream endpoint. Linux resets the device on open, which does this;
-    // WinUSB can't reset a device, so on Windows a restart (e.g. a sample
-    // rate change) inherited a stalled endpoint ("stream read failed:
-    // endpoint stalled"). CLEAR_FEATURE(ENDPOINT_HALT) is harmless when
-    // nothing is stalled.
-    let mut endpoint = interface
+    let reader = interface
         .endpoint::<Bulk, In>(EP_STREAM_IN)
-        .map_err(|e| io_err(format!("couldn't open the MSi2500's stream endpoint: {e}")))?;
-    if let Err(e) = endpoint.clear_halt().wait() {
-        eprintln!("MSi2500: clearing the stream endpoint failed ({e}), continuing");
-    }
-    let reader = endpoint
+        .map_err(|e| io_err(format!("couldn't open the MSi2500's stream endpoint: {e}")))?
         .reader(STREAM_READ_SIZE)
         .with_num_transfers(STREAM_NUM_TRANSFERS)
         .with_read_timeout(Duration::from_millis(500));
