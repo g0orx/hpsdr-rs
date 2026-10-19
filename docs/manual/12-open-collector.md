@@ -98,7 +98,7 @@ configured XVTR), an **RX** column (**ANT1**/**ANT2**/**ANT3**, plus
 (**ANT1**-**ANT3** only). Same "which band applies" rule as Open
 Collector above.
 
-![Screenshot needed: Antenna settings tab](images/12-antenna-tab.png)
+![Antenna settings tab](images/12-antenna-tab.png)
 
 ---
 

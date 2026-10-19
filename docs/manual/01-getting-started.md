@@ -13,9 +13,11 @@ cargo run --release
 
 ## Discovering your radio
 
-On launch, the **Discover HPSDR Radios** window opens automatically and
+On launch, the **Discover HPSDR Radios** list opens automatically and
 immediately starts discovering radios on all the network interfaces (standard
-openHPSDR UDP discovery broadcast, port 1024).
+openHPSDR UDP discovery broadcast, port 1024). On Linux under Wayland (the
+usual desktop today) it's shown inside the main window; elsewhere it's a
+separate window.
 
 ![Discovery window](images/01-discovery-window.png)
 

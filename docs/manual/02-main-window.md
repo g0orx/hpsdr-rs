@@ -43,7 +43,7 @@ that VFO is the one actually transmitting (see
   instead this drags the CTUN listen point directly, the same direction as
   your cursor, the same way clicking a spot tunes straight to it.
 
-![Screenshot needed: the right-click frequency-entry keypad popup](images/02-frequency-entry.png)
+![The right-click frequency-entry keypad](images/02-frequency-entry.png)
 
 ### CTUN (Click to Tune)
 
@@ -90,6 +90,8 @@ MHz) monitors the QO-100 middle beacon -- the 400 bit/s PSK beacon
 AMSAT-DL sends from the DK0SB ground station. It decodes the beacon's
 text pages and measures exactly where the beacon is, which **Lock LNB**
 uses to cancel your LNB's drift.
+
+![QO-100 with the PSK Beacon panel decoding and Lock LNB on](images/02-psk-beacon.png)
 
 It works on the whole received span, not on what you're listening to,
 so the main receiver stays free for normal use. The intended setup:
