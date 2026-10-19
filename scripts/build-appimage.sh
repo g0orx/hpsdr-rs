@@ -5,7 +5,8 @@
 # Usage (from anywhere):  scripts/build-appimage.sh
 #
 # Needs the normal build prerequisites (Rust, a C compiler, pkg-config,
-# libfftw3-dev, libasound2-dev) plus curl. linuxdeploy and its AppImage
+# libfftw3-dev, libasound2-dev) plus curl, libxkbcommon0 and
+# libxkbcommon-x11-0 (bundled, see below). linuxdeploy and its AppImage
 # plugin are downloaded into target/appimage-tools on first use. Runs
 # without FUSE (APPIMAGE_EXTRACT_AND_RUN), so it works in containers/CI.
 #
@@ -70,6 +71,22 @@ install -Dm644 LICENSE "$docdir/LICENSE"
 cp -r docs/manual "$docdir/manual"
 install -Dm644 -t "$docdir" assets/*.rules
 
+# winit loads libxkbcommon(-x11) with dlopen, so linuxdeploy can't see
+# them as dependencies; bundle them explicitly (issue #14: the AppImage
+# panicked with "Library libxkbcommon-x11.so could not be loaded" on a
+# system without them).
+extra_libs=()
+for soname in libxkbcommon.so.0 libxkbcommon-x11.so.0; do
+  # First match, but read all input: an early awk exit would SIGPIPE
+  # ldconfig and fail the pipeline under pipefail.
+  path="$(ldconfig -p | awk -v s="$soname" '$1 == s && !p {p = $NF} END {print p}')"
+  if [ -z "$path" ]; then
+    echo "$soname not found -- install libxkbcommon0 and libxkbcommon-x11-0" >&2
+    exit 1
+  fi
+  extra_libs+=(--library "$path")
+done
+
 export APPIMAGE_EXTRACT_AND_RUN=1
 export PATH="$tools:$PATH"
 export LINUXDEPLOY_OUTPUT_VERSION="$version"
@@ -79,6 +96,7 @@ export OUTPUT="hpsdr-rs-${version}-${arch}.AppImage"
   --appdir "$appdir" \
   --desktop-file assets/hpsdr-rs.desktop \
   --icon-file assets/icons/hpsdr-rs.png \
+  "${extra_libs[@]}" \
   --output appimage
 
 echo "Built $root/$OUTPUT"

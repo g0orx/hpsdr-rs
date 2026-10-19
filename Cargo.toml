@@ -149,6 +149,9 @@ equalizer, and rigctl/TCI control servers for use with WSJT-X and similar \
 digital-mode software."""
 section = "hamradio"
 priority = "optional"
+# $auto covers what the binary links; libxkbcommon(-x11) are loaded by
+# winit at runtime (dlopen), so cargo-deb can't see them (issue #14).
+depends = "$auto, libxkbcommon0, libxkbcommon-x11-0"
 # Debian revision suffix (the "-N" after the crate version in the built
 # .deb's filename/package version) -- defaults to "1" when unset.
 # Bump this on its own, independent of [package]'s `version` above,
@@ -207,6 +210,9 @@ release = "1"
 summary = "Desktop client for openHPSDR software-defined radios"
 url = "https://github.com/g0orx/hpsdr-rs"
 auto-req = "auto"
+# Loaded by winit at runtime (dlopen), so auto-req can't see them -- by
+# soname, like the auto-generated requires (issue #14).
+requires = { "libxkbcommon.so.0()(64bit)" = "*", "libxkbcommon-x11.so.0()(64bit)" = "*" }
 assets = [
     { source = "target/release/hpsdr-rs", dest = "/usr/bin/hpsdr-rs", mode = "755" },
     { source = "README.md", dest = "/usr/share/doc/hpsdr-rs/README.md", mode = "644", doc = true },
