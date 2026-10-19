@@ -325,13 +325,19 @@ impl RxEndpoint {
 
 impl MiriSdrDevice {
     /// libusb_control_transfer(dh, 0x42, request, value, index, NULL, 0)
-    /// -- 0x42 is vendor/OUT with an endpoint recipient.
+    /// -- 0x42 is vendor/OUT with an endpoint recipient. Windows sends it
+    /// with a device recipient (0x40) instead: WinUSB checks an
+    /// endpoint-recipient request's wIndex names a real endpoint, and
+    /// write_reg packs register data into wIndex, so it failed with
+    /// ERROR_INVALID_PARAMETER (87). The MSi2500 decodes these from
+    /// bRequest/wValue/wIndex; Linux keeps libmirisdr's exact 0x42.
     fn vendor_out(&self, request: u8, value: u16, index: u16) -> io::Result<()> {
+        let recipient = if cfg!(windows) { Recipient::Device } else { Recipient::Endpoint };
         self.interface
             .control_out(
                 ControlOut {
                     control_type: ControlType::Vendor,
-                    recipient: Recipient::Endpoint,
+                    recipient,
                     request,
                     value,
                     index,
@@ -340,7 +346,7 @@ impl MiriSdrDevice {
                 CTRL_TIMEOUT,
             )
             .wait()
-            .map_err(io_err)
+            .map_err(|e| io_err(format!("MSi2500 control request 0x{request:02x} failed: {e}")))
     }
 
     /// mirisdr_write_reg
@@ -479,8 +485,16 @@ pub fn initialise(mac: [u8; 6], initial_freq_hz: u32, gain_db: u32) -> io::Resul
     // making the user blacklist msi2500/msi001.
     let interface = device.detach_and_claim_interface(0).wait().map_err(|e| {
         io_err(format!(
-            "couldn't claim the MSi2500's USB interface ({e}) -- on Linux, check the udev rules \
-             (90-mirisdr.rules) give your user access; elsewhere, check no other SDR program is using it"
+            "couldn't claim the MSi2500's USB interface ({e}) -- {}",
+            if cfg!(windows) {
+                "on Windows, bind the WinUSB driver to it with Zadig (see the manual), and check no \
+                 other SDR program is using it"
+            } else if cfg!(target_os = "linux") {
+                "check the udev rules (90-mirisdr.rules) give your user access, and check no other SDR \
+                 program is using it"
+            } else {
+                "check no other SDR program is using it"
+            }
         ))
     })?;
 
@@ -494,10 +508,13 @@ pub fn initialise(mac: [u8; 6], initial_freq_hz: u32, gain_db: u32) -> io::Resul
     dev.set_hard(SAMPLE_RATE_HZ)?;
     dev.set_center_freq(initial_freq_hz)?;
 
-    interface.set_alt_setting(ALT_SETTING_BULK).wait().map_err(io_err)?;
+    interface
+        .set_alt_setting(ALT_SETTING_BULK)
+        .wait()
+        .map_err(|e| io_err(format!("couldn't select the MSi2500's bulk alt setting {ALT_SETTING_BULK}: {e}")))?;
     let reader = interface
         .endpoint::<Bulk, In>(EP_STREAM_IN)
-        .map_err(io_err)?
+        .map_err(|e| io_err(format!("couldn't open the MSi2500's stream endpoint: {e}")))?
         .reader(STREAM_READ_SIZE)
         .with_num_transfers(STREAM_NUM_TRANSFERS)
         .with_read_timeout(Duration::from_millis(500));

@@ -1180,8 +1180,16 @@ fn find_and_open(mac: [u8; 6]) -> io::Result<(nusb::Device, Interface, String, b
     // rather than making the user blacklist the module.
     let interface = device.detach_and_claim_interface(0).wait().map_err(|e| {
         io_err(format!(
-            "couldn't claim the RTL-SDR's USB interface ({e}) -- on Linux, check the udev rules \
-             (rtl-sdr.rules) give your user access; elsewhere, check no other SDR program is using it"
+            "couldn't claim the RTL-SDR's USB interface ({e}) -- {}",
+            if cfg!(windows) {
+                "on Windows, bind the WinUSB driver to it with Zadig (see the manual), and check no \
+                 other SDR program is using it"
+            } else if cfg!(target_os = "linux") {
+                "check the udev rules (rtl-sdr.rules) give your user access, and check no other SDR \
+                 program is using it"
+            } else {
+                "check no other SDR program is using it"
+            }
         ))
     })?;
     Ok((device, interface, name, is_blog_v4))
