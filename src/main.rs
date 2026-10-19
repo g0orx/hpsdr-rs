@@ -4383,7 +4383,11 @@ impl eframe::App for HpsdrApp {
                                         {
                                             digits.push('0');
                                         }
-                                        if ui.add_sized(button_size, egui::Button::new("\u{2190}")).clicked() {
+                                        // Monospace: "←" is only in egui's Hack font, which
+                                        // 0.37 no longer uses as a fallback for normal text
+                                        // (it drew as an empty box).
+                                        let backspace = egui::RichText::new("\u{2190}").monospace();
+                                        if ui.add_sized(button_size, egui::Button::new(backspace)).clicked() {
                                             digits.pop();
                                         }
                                         ui.end_row();
@@ -9031,9 +9035,13 @@ impl eframe::App for HpsdrApp {
                                         for xvtr in connected.xvtrs.iter_mut() {
                                             if ui
                                                 .add(
+                                                    // min_size, not just desired_width: egui 0.37
+                                                    // caps a TextEdit at the grid cell's available
+                                                    // width, which squeezed this to "70cr"/"(u...".
                                                     egui::TextEdit::singleline(&mut xvtr.name)
                                                         .hint_text("(unused)")
-                                                        .desired_width(80.0),
+                                                        .desired_width(80.0)
+                                                        .min_size(egui::vec2(80.0, 0.0)),
                                                 )
                                                 .changed()
                                             {
@@ -11409,7 +11417,13 @@ fn draw_s_meter(ui: &mut egui::Ui, rect: egui::Rect, db: f64) {
     // radius*1.16*Y_SQUASH from center (the squash applies to its
     // height same as everything else), so that's what TOP_MARGIN is
     // measured against, not the bare arc radius itself.
-    let radius = (rect.width() * 0.45).min((rect.height() - TEXT_ZONE - TOP_MARGIN) / (1.16 * Y_SQUASH));
+    // Scale labels sit LABEL_R x radius out; at the arc's ends they're
+    // horizontal, so leave LABEL_HALF_W for half a label inside the box
+    // (sized from the arc alone, "+60"/"200" were cut off at the edge).
+    const LABEL_R: f32 = 1.14;
+    const LABEL_HALF_W: f32 = 11.0;
+    let radius = ((rect.width() / 2.0 - LABEL_HALF_W) / LABEL_R)
+        .min((rect.height() - TEXT_ZONE - TOP_MARGIN) / (1.16 * Y_SQUASH));
 
     const S9: f64 = -73.0;
     const DB_MIN: f64 = S9 - 54.0; // S0
@@ -11448,7 +11462,7 @@ fn draw_s_meter(ui: &mut egui::Ui, rect: egui::Rect, db: f64) {
         );
         if major {
             painter.text(
-                point_at(angle, radius * 1.16),
+                point_at(angle, radius * LABEL_R),
                 egui::Align2::CENTER_CENTER,
                 if s == 1 { "S".to_string() } else { format!("{s}") },
                 egui::FontId::proportional(11.0),
@@ -11470,7 +11484,7 @@ fn draw_s_meter(ui: &mut egui::Ui, rect: egui::Rect, db: f64) {
         );
         if major {
             painter.text(
-                point_at(angle, radius * 1.18),
+                point_at(angle, radius * LABEL_R),
                 egui::Align2::CENTER_CENTER,
                 format!("+{over}"),
                 egui::FontId::proportional(10.0),
@@ -11518,7 +11532,13 @@ fn draw_power_meter(ui: &mut egui::Ui, rect: egui::Rect, watts: f32, swr: f32, m
     const TOP_MARGIN: f32 = 6.0;
     const Y_SQUASH: f32 = 0.55;
     let center = egui::pos2(rect.center().x, rect.bottom() - TEXT_ZONE);
-    let radius = (rect.width() * 0.45).min((rect.height() - TEXT_ZONE - TOP_MARGIN) / (1.16 * Y_SQUASH));
+    // Scale labels sit LABEL_R x radius out; at the arc's ends they're
+    // horizontal, so leave LABEL_HALF_W for half a label inside the box
+    // (sized from the arc alone, "+60"/"200" were cut off at the edge).
+    const LABEL_R: f32 = 1.14;
+    const LABEL_HALF_W: f32 = 11.0;
+    let radius = ((rect.width() / 2.0 - LABEL_HALF_W) / LABEL_R)
+        .min((rect.height() - TEXT_ZONE - TOP_MARGIN) / (1.16 * Y_SQUASH));
 
     let max_watts = max_watts.max(1.0);
     let angle_for_watts = |w: f32| -> f32 {
@@ -11560,7 +11580,7 @@ fn draw_power_meter(ui: &mut egui::Ui, rect: egui::Rect, watts: f32, swr: f32, m
             egui::Stroke::new(2.0, egui::Color32::WHITE),
         );
         painter.text(
-            point_at(angle, radius * 1.16),
+            point_at(angle, radius * LABEL_R),
             egui::Align2::CENTER_CENTER,
             format!("{w:.0}"),
             egui::FontId::proportional(11.0),
