@@ -1509,7 +1509,10 @@ impl Decimator {
             prev_out_q = y_q;
 
             if decimation == 1 {
-                emit(((y_i * gain_comp) as i32, -((y_q * gain_comp) as i32)));
+                // gain_comp divides out CIC_INPUT_SCALE, which step 4
+                // applies -- so apply it here too.
+                let scale = gain_comp * CIC_INPUT_SCALE;
+                emit(((y_i * scale) as i32, -((y_q * scale) as i32)));
                 continue;
             }
 
@@ -1824,6 +1827,18 @@ mod tests {
                 let db = 20.0 * (tone_rms(decimation, frac * out_rate) / reference).log10();
                 assert!(db.abs() < 0.1, "decimation {decimation}, {frac} of output rate: {db:.3}dB");
             }
+        }
+    }
+
+    #[test]
+    fn gain_is_the_same_at_every_decimation() {
+        // REAL REPORT (MSI.SDR): no audio at 1536k, fine at 768k. The
+        // R=1 shortcut skipped the CIC_INPUT_SCALE that gain_comp divides
+        // out, so its output was 256x (48dB) low.
+        let reference = tone_rms(2, 20_000.0);
+        for decimation in [1, 4, 8, 32] {
+            let db = 20.0 * (tone_rms(decimation, 20_000.0) / reference).log10();
+            assert!(db.abs() < 0.1, "decimation {decimation}: {db:.3}dB relative to decimation 2");
         }
     }
 
