@@ -30,7 +30,7 @@
 use crate::rtlsdr;
 use crate::usb_port;
 use nusb::transfer::{Bulk, ControlOut, ControlType, In, Recipient};
-use nusb::{Interface, MaybeFuture};
+use nusb::{Endpoint, Interface, MaybeFuture};
 use std::io::{self, Read};
 use std::time::Duration;
 
@@ -326,23 +326,54 @@ impl RxEndpoint {
     /// to a second) until every one has completed, so the stick is only
     /// stopped once nothing is outstanding on the stream (see
     /// MiriSdrDevice::close). Dropping the reader alone cancels without
-    /// waiting.
-    pub fn cancel_and_drain(&mut self) {
-        self.reader.cancel_all();
-        let mut buf = vec![0u8; STREAM_READ_SIZE];
-        let deadline = std::time::Instant::now() + Duration::from_secs(1);
-        while std::time::Instant::now() < deadline {
-            match self.reader.read(&mut buf) {
-                Ok(0) => return,
-                Ok(_) => {}
-                Err(e) if e.kind() == io::ErrorKind::TimedOut => {}
-                // A cancelled read completes with an error; keep going
-                // until the reader reports nothing left (Ok(0)).
-                Err(_) => {}
-            }
-        }
-        eprintln!("MSi2500: stream reads still pending 1 s after cancelling");
+    /// waiting. Works on the raw endpoint: once a read has failed,
+    /// EndpointRead returns that same error on every later read.
+    pub fn cancel_and_drain(self) {
+        drain(&mut self.reader.into_inner());
     }
+}
+
+/// Cancels every queued read on `endpoint` and waits (up to a second)
+/// for them all to complete.
+fn drain(endpoint: &mut Endpoint<Bulk, In>) {
+    endpoint.cancel_all();
+    let deadline = std::time::Instant::now() + Duration::from_secs(1);
+    while endpoint.pending() > 0 && std::time::Instant::now() < deadline {
+        endpoint.wait_next_complete(Duration::from_millis(100));
+    }
+    if endpoint.pending() > 0 {
+        eprintln!("MSi2500: {} stream reads still pending 1 s after cancelling", endpoint.pending());
+    }
+}
+
+/// How many reads stream_check keeps queued.
+const CHECK_TRANSFERS: usize = 4;
+
+/// Queues reads and waits up to a second for the first to complete.
+/// Ok(()) on data, with the reads left queued for the reader to pick up;
+/// otherwise the error (or "no data"), with every read drained.
+fn stream_check(endpoint: &mut Endpoint<Bulk, In>) -> Result<(), String> {
+    while endpoint.pending() < CHECK_TRANSFERS {
+        let buf = endpoint.allocate(STREAM_READ_SIZE);
+        endpoint.submit(buf);
+    }
+    let deadline = std::time::Instant::now() + Duration::from_secs(1);
+    let result = loop {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        let Some(c) = endpoint.wait_next_complete(left) else {
+            break Err("no data within 1 s".to_string());
+        };
+        match c.status {
+            Ok(()) if c.actual_len > 0 => {
+                endpoint.submit(c.buffer);
+                return Ok(());
+            }
+            Ok(()) => endpoint.submit(c.buffer), // zero-length; keep waiting
+            Err(e) => break Err(e.to_string()),
+        }
+    };
+    drain(endpoint);
+    result
 }
 
 impl MiriSdrDevice {
@@ -549,13 +580,79 @@ pub fn initialise(mac: [u8; 6], initial_freq_hz: u32, gain_db: u32) -> io::Resul
     dev.set_hard(SAMPLE_RATE_HZ)?;
     dev.set_center_freq(initial_freq_hz)?;
 
-    // Through alt setting 0 first: SET_INTERFACE resets the stream
-    // endpoint's halt and data-toggle state on both sides. Linux resets
-    // the device on open, which also does that; WinUSB can't reset a
-    // device, and if the stick is still in alt 3 from a previous session
-    // (a sample rate change restarts it), the second start failed with
-    // "stream read failed: endpoint stalled". (CLEAR_FEATURE via
-    // WinUsb_ResetPipe was tried instead and hung the start on Windows.)
+    let mut endpoint = select_bulk_endpoint(&interface)?;
+    dev.streaming_start()?;
+
+    // On Windows the stick only streams on its first start after being
+    // plugged in: every later start (another session, without a replug)
+    // fails its very first read with "endpoint stalled" -- even after a
+    // clean libmirisdr-style close and the alt setting round trip above.
+    // Linux resets the device on open, and a real reset isn't available
+    // from user mode on Windows. So check the stream, and if it's dead,
+    // try progressively stronger recovery sequences, logging each, until
+    // one delivers data. Which one works (if any) isn't known yet.
+    let mut check = stream_check(&mut endpoint);
+    match &check {
+        Ok(()) => println!("MSi2500: stream check OK"),
+        Err(e) => eprintln!("MSi2500: stream check failed: {e} -- trying to recover"),
+    }
+    if check.is_err() {
+        for step in 1..=4 {
+            let what = match step {
+                1 => "clear halt",
+                2 => "stop streaming, clear halt, start streaming",
+                3 => "stop streaming, alt setting 0 -> 3, clear halt, start streaming",
+                _ => "stop streaming, ADC sleep, full re-init, alt setting 0 -> 3, clear halt, start streaming",
+            };
+            if step >= 2 {
+                dev.streaming_stop()?;
+            }
+            if step >= 3 {
+                drop(endpoint);
+                if step == 4 {
+                    dev.adc_stop()?;
+                    dev.adc_init()?;
+                    dev.set_hard(SAMPLE_RATE_HZ)?;
+                    dev.set_center_freq(initial_freq_hz)?;
+                }
+                endpoint = select_bulk_endpoint(&interface)?;
+            }
+            if let Err(e) = endpoint.clear_halt().wait() {
+                eprintln!("MSi2500: recovery {step}: clear halt failed: {e}");
+            }
+            if step >= 2 {
+                dev.streaming_start()?;
+            }
+            check = stream_check(&mut endpoint);
+            match &check {
+                Ok(()) => println!("MSi2500: recovery {step} ({what}) WORKED"),
+                Err(e) => eprintln!("MSi2500: recovery {step} ({what}) failed: {e}"),
+            }
+            if check.is_ok() {
+                break;
+            }
+        }
+    }
+    if let Err(e) = check {
+        let _ = dev.streaming_stop();
+        return Err(io_err(format!(
+            "the MSi2500's stream won't start ({e}) -- unplug the MSI.SDR, plug it back in and start again"
+        )));
+    }
+
+    let reader = endpoint
+        .reader(STREAM_READ_SIZE)
+        .with_num_transfers(STREAM_NUM_TRANSFERS)
+        .with_read_timeout(Duration::from_millis(500));
+    Ok((dev, RxEndpoint { reader }, name))
+}
+
+/// Through alt setting 0 first: SET_INTERFACE resets the stream
+/// endpoint's halt and data-toggle state on both sides -- by the spec;
+/// the MSi2500 doesn't seem to honour it (see initialise). (CLEAR_FEATURE
+/// via WinUsb_ResetPipe before starting the stream was tried on its own
+/// and gave no data at all.)
+fn select_bulk_endpoint(interface: &Interface) -> io::Result<Endpoint<Bulk, In>> {
     if let Err(e) = interface.set_alt_setting(0).wait() {
         eprintln!("MSi2500: selecting alt setting 0 failed ({e}), continuing");
     }
@@ -563,15 +660,9 @@ pub fn initialise(mac: [u8; 6], initial_freq_hz: u32, gain_db: u32) -> io::Resul
         .set_alt_setting(ALT_SETTING_BULK)
         .wait()
         .map_err(|e| io_err(format!("couldn't select the MSi2500's bulk alt setting {ALT_SETTING_BULK}: {e}")))?;
-    let reader = interface
+    interface
         .endpoint::<Bulk, In>(EP_STREAM_IN)
-        .map_err(|e| io_err(format!("couldn't open the MSi2500's stream endpoint: {e}")))?
-        .reader(STREAM_READ_SIZE)
-        .with_num_transfers(STREAM_NUM_TRANSFERS)
-        .with_read_timeout(Duration::from_millis(500));
-    dev.streaming_start()?;
-
-    Ok((dev, RxEndpoint { reader }, name))
+        .map_err(|e| io_err(format!("couldn't open the MSi2500's stream endpoint: {e}")))
 }
 
 // ---------------------------------------------------------------------
