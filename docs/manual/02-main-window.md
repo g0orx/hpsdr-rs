@@ -120,8 +120,10 @@ The panel beside the spectrum/waterfall shows:
   reported over CAT/rigctl/TCI) stay right as the LNB drifts, and the
   station you're listening to stays put -- the listening point moves
   with the drift, not the radio. **Correction** shows how much is being
-  applied. If the beacon is lost, the last correction is held. Turning
-  the lock (or PSK Beacon) off takes the correction back out. With CTUN
+  applied. If the beacon is lost, the last correction is held. The
+  correction is saved, so after a restart it starts from where it left
+  off until the beacon is found again. Turning the lock (or PSK Beacon)
+  off takes the correction back out. With CTUN
   off, the radio itself has to be retuned instead, so it's only
   corrected in 10 Hz steps; use CTUN.
 - **Frames**: pages received with a good checksum. A page arrives about

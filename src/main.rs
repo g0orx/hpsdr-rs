@@ -292,8 +292,14 @@ pub struct Xvtr {
     pub default_mode: spectrum::Mode,
     /// Live LNB drift correction from the QO-100 beacon monitor ("Lock
     /// LNB", see apply_lnb_correction) -- added to the offset like
-    /// lo_error_hz, but measured rather than set, so never saved.
-    #[serde(skip)]
+    /// lo_error_hz, but measured rather than set. Saved, so a restart
+    /// starts from the last correction rather than 0 until the beacon is
+    /// found again: the saved VFO/CTUN frequencies are IF with the
+    /// correction already applied, so restoring them without it showed
+    /// the wrong RF -- which the lock then kept, re-applying the
+    /// correction on top and moving the listening frequency by it on
+    /// every restart.
+    #[serde(default)]
     pub lnb_correction_hz: i64,
 }
 
@@ -344,19 +350,6 @@ fn beacon_iq_offset_hz(connected: &ConnectedState) -> Option<f64> {
     (offset.abs() <= connected.sample_rate as f64 / 2.0 - psk_beacon::EDGE_MARGIN_HZ).then_some(offset)
 }
 
-/// "Lock LNB": sets the beacon-covering active transverter's
-/// lnb_correction_hz from the beacon monitor's measured offset, so the
-/// displayed RF (and CAT/rigctl/TCI) stay right as the LNB drifts. The
-/// listening frequency moves with it -- by the same amount the other
-/// way in IF -- so the station being listened to stays put. The
-/// radio's own tuning isn't touched while CTUN is on (the intended
-/// setup: e.g. 768 kHz with the beacon in the middle, CTUN to tune
-/// around); with CTUN off the hardware has to follow instead, so that
-/// only happens in steps of LNB_RETUNE_STEP_HZ.
-///
-/// While the beacon is lost the last correction is held. With the lock
-/// (or PSK Beacon) off, or on any other transverter, the correction is
-/// taken back out, again keeping the listening frequency's RF.
 /// Satellite VFO tracking mode -- see ConnectedState::sat_mode.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 enum SatMode {
@@ -441,6 +434,21 @@ fn sat_follow_vfo_b(
     connected.sat_last = None;
 }
 
+/// "Lock LNB": sets the beacon-covering active transverter's
+/// lnb_correction_hz from the beacon monitor's measured offset, so the
+/// displayed RF (and CAT/rigctl/TCI) stay right as the LNB drifts. The
+/// listening frequency moves with it -- by the same amount the other
+/// way in IF -- so the station being listened to stays put. The
+/// radio's own tuning isn't touched while CTUN is on (the intended
+/// setup: e.g. 768 kHz with the beacon in the middle, CTUN to tune
+/// around); with CTUN off the hardware has to follow instead, so that
+/// only happens in steps of LNB_RETUNE_STEP_HZ.
+///
+/// While the beacon is lost the last correction is held -- including
+/// the saved one after a restart, until the beacon is found again. With
+/// the lock (or PSK Beacon) off, or on any other transverter, the
+/// correction is taken back out, again keeping the listening
+/// frequency's RF.
 fn apply_lnb_correction(connected: &mut ConnectedState) {
     const LNB_RETUNE_STEP_HZ: i64 = 10;
     let locking = connected.psk_beacon_enabled && connected.lnb_lock_enabled;
@@ -13822,6 +13830,18 @@ fn main() -> eframe::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lnb_correction_is_saved() {
+        let x = Xvtr { name: "QO-100".into(), lnb_correction_hz: -1234, ..Default::default() };
+        let back: Xvtr = serde_json::from_str(&serde_json::to_string(&x).unwrap()).unwrap();
+        assert_eq!(back.lnb_correction_hz, -1234);
+        // A config saved before it was: loads as no correction.
+        let mut old = serde_json::to_value(&x).unwrap();
+        old.as_object_mut().unwrap().remove("lnb_correction_hz");
+        let back: Xvtr = serde_json::from_value(old).unwrap();
+        assert_eq!(back.lnb_correction_hz, 0);
+    }
 
     #[test]
     fn transverter_tuning_has_its_own_band_memory() {
