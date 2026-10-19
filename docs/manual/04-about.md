@@ -13,11 +13,15 @@ Shows details of the radio currently connected to:
   Ethernet).
 - **Protocol Version** -- the firmware's reported protocol version.
 - **IP Address** -- the radio's own address on the network. Shows "USB"
-  for [Ozy USB](19-ozy-usb.md) instead, which has no network address.
+  instead for the USB-connected boards, which have no network address:
+  [Ozy](19-ozy-usb.md), [RX-888 Mk2](20-rx888-mk2.md), RTL-SDR and
+  MSI.SDR.
 - **MAC Address** -- the radio's hardware Ethernet address. Not shown
-  for Ozy (no real MAC).
+  for the USB-connected boards (no real MAC).
 - **Interface** -- which of this computer's own network interfaces (e.g.
-  `eth0`) the connection is using. Shows "USB" for Ozy.
+  `eth0`) the connection is using. For an RTL-SDR or MSI.SDR, the USB
+  port it's plugged into (e.g. `USB 4-1.3` above), which tells two
+  dongles apart; "USB" for Ozy and the RX-888.
 
 Connected to Ozy USB specifically, three extra rows also appear: **Ozy
 FX2 Version**, **Mercury FW** (one or two version numbers, separated by
