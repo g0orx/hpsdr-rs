@@ -3179,17 +3179,22 @@ fn spawn_mirisdr_threads(
         mirisdr::initialise(mac, frequency_hz.load(Ordering::Relaxed) + offset_hz, rx_attenuation.load(Ordering::Relaxed))?;
     println!("MSi2500: {name} streaming at {} Hz, decimating by {decimation}", mirisdr::SAMPLE_RATE_HZ);
 
+    // Set by the receiver thread once it has dropped its reader (which
+    // cancels the reads it keeps queued) -- see mirisdr_control_loop.
+    let receiver_done = Arc::new(AtomicBool::new(false));
     let receiver_buffer = Arc::clone(iq_buffer);
     let receiver_stop = Arc::clone(stop_flag);
+    let receiver_done_tx = Arc::clone(&receiver_done);
     let receiver_thread = thread::spawn(move || {
         mirisdr_receiver_loop(rx_endpoint, receiver_buffer, receiver_stop, decimation);
+        receiver_done_tx.store(true, Ordering::Release);
     });
 
     let control_frequency_hz = Arc::clone(frequency_hz);
     let control_rx_attenuation = Arc::clone(rx_attenuation);
     let control_stop = Arc::clone(stop_flag);
     let control_thread = thread::spawn(move || {
-        mirisdr_control_loop(device, control_frequency_hz, offset_hz, control_rx_attenuation, control_stop);
+        mirisdr_control_loop(device, control_frequency_hz, offset_hz, control_rx_attenuation, control_stop, receiver_done);
     });
     Ok((receiver_thread, control_thread))
 }
@@ -3230,6 +3235,7 @@ fn mirisdr_control_loop(
     offset_hz: u32,
     rx_attenuation: Arc<AtomicU32>,
     stop_flag: Arc<AtomicBool>,
+    receiver_done: Arc<AtomicBool>,
 ) {
     // initialise() already applied these.
     let mut last_freq = frequency_hz.load(Ordering::Relaxed);
@@ -3253,6 +3259,16 @@ fn mirisdr_control_loop(
             last_gain = gain;
         }
         thread::sleep(RTLSDR_CONTROL_POLL);
+    }
+    // Stop the stick only after the receiver has cancelled its queued
+    // reads: stopping the stream under pending bulk reads left the
+    // endpoint stalled. Linux's reset-on-open hid that; on Windows (no
+    // reset) every later start failed with "endpoint stalled" until the
+    // stick was replugged. The receiver notices stop_flag within its
+    // 500 ms read timeout.
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while !receiver_done.load(Ordering::Acquire) && std::time::Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(10));
     }
     device.close();
 }
