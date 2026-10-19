@@ -1838,6 +1838,11 @@ struct ConnectedState {
     /// from the beacon monitor's measurement, see apply_lnb_correction.
     /// Off by default.
     lnb_lock_enabled: bool,
+    /// The PSK Beacon panel shrunk to a narrow strip (see
+    /// render_psk_beacon_panel_beside), giving the spectrum/waterfall its
+    /// width back. Only the panel: the beacon monitor and Lock LNB keep
+    /// running.
+    psk_panel_minimized: bool,
     /// RIT ("Receiver Incremental Tuning"): when on, rit_offset_hz is
     /// added to the RXA demod shift (see spectrum::SpectrumHandle::
     /// set_ctun -- RIT and CTUN share WDSP's one RXA shift register, so
@@ -2844,6 +2849,7 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
             let cw_decode_enabled = cfg.cw_decode_enabled.unwrap_or(true);
             let psk_beacon_enabled = cfg.psk_beacon_enabled.unwrap_or(false);
             let lnb_lock_enabled = cfg.lnb_lock_enabled.unwrap_or(false);
+            let psk_panel_minimized = cfg.psk_panel_minimized.unwrap_or(false);
             // RIT / XIT -- see ConnectedState's own doc comments. Values
             // themselves already computed above (before RadioSession::
             // start), reused here.
@@ -2938,6 +2944,7 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                 cw_decode_enabled,
                 psk_beacon_enabled,
                 lnb_lock_enabled,
+                psk_panel_minimized,
                 rit_enabled,
                 rit_offset_hz,
                 rit_scroll_accum: 0.0,
@@ -5546,10 +5553,12 @@ impl eframe::App for HpsdrApp {
                     let psk_panel_visible = !cw_panel_visible
                         && connected.psk_beacon_enabled
                         && connected.xvtrs.iter().any(xvtr_covers_beacon);
+                    let psk_panel_width =
+                        if connected.psk_panel_minimized { PSK_PANEL_MINIMIZED_WIDTH } else { PSK_PANEL_WIDTH };
                     let cw_panel_reserved_width = if cw_panel_visible {
                         CW_PANEL_WIDTH + CW_PANEL_GAP
                     } else if psk_panel_visible {
-                        PSK_PANEL_WIDTH + CW_PANEL_GAP
+                        psk_panel_width + CW_PANEL_GAP
                     } else {
                         0.0
                     };
@@ -6174,7 +6183,7 @@ impl eframe::App for HpsdrApp {
                             connected,
                             egui::Rect::from_min_max(
                                 egui::pos2(spectrum_right + CW_PANEL_GAP, spectrum_top),
-                                egui::pos2(spectrum_right + CW_PANEL_GAP + PSK_PANEL_WIDTH, waterfall_bottom),
+                                egui::pos2(spectrum_right + CW_PANEL_GAP + psk_panel_width, waterfall_bottom),
                             ),
                         )
                     {
@@ -10328,6 +10337,7 @@ impl eframe::App for HpsdrApp {
                         cw_decode_enabled: Some(connected.cw_decode_enabled),
                         psk_beacon_enabled: Some(connected.psk_beacon_enabled),
                         lnb_lock_enabled: Some(connected.lnb_lock_enabled),
+                        psk_panel_minimized: Some(connected.psk_panel_minimized),
                         rit_enabled: Some(connected.rit_enabled),
                         rit_offset_hz: Some(connected.rit_offset_hz),
                         xit_enabled: Some(connected.xit_enabled),
@@ -10550,6 +10560,9 @@ const CW_PANEL_GAP: f32 = 8.0;
 /// PSK beacon panel width -- fits the beacon's 64-character page lines
 /// in the 11pt monospace font render_psk_beacon_panel uses.
 const PSK_PANEL_WIDTH: f32 = 460.0;
+/// Its width minimized (ConnectedState::psk_panel_minimized): just the
+/// expand button and a status dot.
+const PSK_PANEL_MINIMIZED_WIDTH: f32 = 28.0;
 
 /// "Auto" Low tuning -- see ConnectedState::db_low_auto's doc comment.
 /// Bins within the excluded edge (max of 1/20th of the trace width and
@@ -10702,7 +10715,8 @@ fn render_cw_decoder_panel_beside(ui: &mut egui::Ui, spectrum: &SpectrumHandle, 
 /// Content of the QO-100 PSK beacon panel (see psk_beacon.rs): the
 /// beacon monitor's measurement, the "Lock LNB" checkbox, frame counts
 /// and the decoded text pages, newest first. Returns true if the lock
-/// checkbox changed (caller marks settings dirty).
+/// checkbox or the minimize button changed (caller marks settings
+/// dirty).
 fn render_psk_beacon_panel(ui: &mut egui::Ui, connected: &mut ConnectedState) -> bool {
     let status = connected.spectrum.psk_status();
     let mut changed = false;
@@ -10711,6 +10725,16 @@ fn render_psk_beacon_panel(ui: &mut egui::Ui, connected: &mut ConnectedState) ->
         if ui.button("Clear").clicked() {
             connected.spectrum.clear_psk_status();
         }
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if ui
+                .button("»")
+                .on_hover_text("Minimize -- the beacon monitor and Lock LNB keep running")
+                .clicked()
+            {
+                connected.psk_panel_minimized = true;
+                changed = true;
+            }
+        });
     });
     let green = egui::Color32::from_rgb(80, 200, 80);
     if !status.in_span {
@@ -10797,7 +10821,9 @@ fn render_psk_beacon_panel(ui: &mut egui::Ui, connected: &mut ConnectedState) ->
 }
 
 /// Places the PSK beacon panel beside the spectrum/waterfall, the same
-/// way as render_cw_decoder_panel_beside (see its doc comment).
+/// way as render_cw_decoder_panel_beside (see its doc comment) -- or,
+/// minimized, a narrow strip with an expand button and a status dot
+/// (green: beacon found; hover for the offset and correction).
 fn render_psk_beacon_panel_beside(ui: &mut egui::Ui, connected: &mut ConnectedState, rect: egui::Rect) -> bool {
     egui::Area::new(egui::Id::unique("psk_beacon_panel_main"))
         .fixed_pos(rect.min)
@@ -10806,11 +10832,47 @@ fn render_psk_beacon_panel_beside(ui: &mut egui::Ui, connected: &mut ConnectedSt
                 .show(ui, |ui| {
                     ui.set_width(rect.width());
                     ui.set_height(rect.height());
-                    render_psk_beacon_panel(ui, connected)
+                    if connected.psk_panel_minimized {
+                        render_psk_beacon_strip(ui, connected)
+                    } else {
+                        render_psk_beacon_panel(ui, connected)
+                    }
                 })
                 .inner
         })
         .inner
+}
+
+/// The minimized PSK beacon panel. Returns true if it was expanded.
+fn render_psk_beacon_strip(ui: &mut egui::Ui, connected: &mut ConnectedState) -> bool {
+    let status = connected.spectrum.psk_status();
+    let found = status.in_span && status.offset_hz.is_some() && status.predicted_offset_hz.is_some();
+    let mut summary = match (status.in_span, status.predicted_offset_hz.filter(|_| found)) {
+        (false, _) => "PSK Beacon: not in the received span".to_string(),
+        (true, Some(p)) => format!("PSK Beacon: {p:+.0} Hz from expected"),
+        (true, None) => "PSK Beacon: searching".to_string(),
+    };
+    if connected.lnb_lock_enabled {
+        let correction = connected
+            .active_xvtr
+            .as_deref()
+            .and_then(|name| connected.xvtrs.iter().find(|x| x.name == name))
+            .map_or(0, |x| x.lnb_correction_hz);
+        summary.push_str(&format!(", Lock LNB correction {correction:+} Hz"));
+    }
+    let mut expanded = false;
+    ui.vertical_centered(|ui| {
+        if ui.button("«").on_hover_text(format!("{summary}\nClick to show the panel")).clicked() {
+            connected.psk_panel_minimized = false;
+            expanded = true;
+        }
+        ui.add_space(4.0);
+        let (dot, dot_resp) = ui.allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::hover());
+        let colour = if found { egui::Color32::from_rgb(80, 200, 80) } else { egui::Color32::GRAY };
+        ui.painter().circle_filled(dot.center(), 5.0, colour);
+        dot_resp.on_hover_text(summary);
+    });
+    expanded
 }
 
 /// Small audio-waveform display drawn in the top-right corner of the

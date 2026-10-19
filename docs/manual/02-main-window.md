@@ -129,6 +129,11 @@ The panel beside the spectrum/waterfall shows:
 - **Frames**: pages received with a good checksum. A page arrives about
   every 25 seconds; each page letter (K, L, M, N, ...) shows its latest
   version, newest first. **Clear** empties the list.
+- **»** (top right) minimizes the panel to a narrow strip, giving the
+  spectrum and waterfall their width back. The beacon monitor and Lock
+  LNB keep running. The strip's dot is green while the beacon is found;
+  hover over it for the offset and correction, and click **«** to show
+  the panel again. Whether it's minimized is remembered.
 
 Only the beacon's plain (uncoded) frames are decoded. The beacon also
 sends FEC-coded frames between them, which aren't decoded yet. It runs
