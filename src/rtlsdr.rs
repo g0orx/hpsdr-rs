@@ -1293,9 +1293,17 @@ pub fn initialise(
     }
     dev.reset_buffer()?;
 
-    let reader = interface
-        .endpoint::<Bulk, In>(EP_STREAM_IN)
-        .map_err(io_err)?
+    // Clear any halt / data-toggle state the previous session left on the
+    // stream endpoint. Linux resets the device on open, which does this;
+    // WinUSB can't reset a device, so on Windows a restart (e.g. a sample
+    // rate change) inherited a stalled endpoint ("stream read failed:
+    // endpoint stalled"). CLEAR_FEATURE(ENDPOINT_HALT) is harmless when
+    // nothing is stalled.
+    let mut endpoint = interface.endpoint::<Bulk, In>(EP_STREAM_IN).map_err(io_err)?;
+    if let Err(e) = endpoint.clear_halt().wait() {
+        eprintln!("RTL-SDR: clearing the stream endpoint failed ({e}), continuing");
+    }
+    let reader = endpoint
         .reader(STREAM_READ_SIZE)
         .with_num_transfers(STREAM_NUM_TRANSFERS)
         .with_read_timeout(Duration::from_millis(500));

@@ -512,9 +512,19 @@ pub fn initialise(mac: [u8; 6], initial_freq_hz: u32, gain_db: u32) -> io::Resul
         .set_alt_setting(ALT_SETTING_BULK)
         .wait()
         .map_err(|e| io_err(format!("couldn't select the MSi2500's bulk alt setting {ALT_SETTING_BULK}: {e}")))?;
-    let reader = interface
+    // Clear any halt / data-toggle state the previous session left on the
+    // stream endpoint. Linux resets the device on open, which does this;
+    // WinUSB can't reset a device, so on Windows a restart (e.g. a sample
+    // rate change) inherited a stalled endpoint ("stream read failed:
+    // endpoint stalled"). CLEAR_FEATURE(ENDPOINT_HALT) is harmless when
+    // nothing is stalled.
+    let mut endpoint = interface
         .endpoint::<Bulk, In>(EP_STREAM_IN)
-        .map_err(|e| io_err(format!("couldn't open the MSi2500's stream endpoint: {e}")))?
+        .map_err(|e| io_err(format!("couldn't open the MSi2500's stream endpoint: {e}")))?;
+    if let Err(e) = endpoint.clear_halt().wait() {
+        eprintln!("MSi2500: clearing the stream endpoint failed ({e}), continuing");
+    }
+    let reader = endpoint
         .reader(STREAM_READ_SIZE)
         .with_num_transfers(STREAM_NUM_TRANSFERS)
         .with_read_timeout(Duration::from_millis(500));
