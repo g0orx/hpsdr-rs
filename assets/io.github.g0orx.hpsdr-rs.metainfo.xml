@@ -31,6 +31,7 @@
   <url type="bugtracker">https://github.com/g0orx/hpsdr-rs/issues</url>
   <content_rating type="oars-1.1"/>
   <releases>
+    <release version="0.8.3" date="2026-10-19"/>
     <release version="0.8.2" date="2026-10-16"/>
     <release version="0.8.1" date="2026-10-16"/>
     <release version="0.8.0" date="2026-10-16"/>
