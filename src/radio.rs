@@ -1278,6 +1278,10 @@ pub struct RadioSession {
     /// (MSI.SDR) session -- same reasoning as `rtlsdr_mac`, and shares
     /// its start/restart path (see start_usb_dongle).
     mirisdr_mac: Option<[u8; 6]>,
+    /// RTL-SDR / MSi2500 only: see DongleRate -- how a sample rate change
+    /// reaches the running receiver/control threads without reopening
+    /// the dongle.
+    dongle_rate: Option<Arc<DongleRate>>,
 }
 
 impl RadioSession {
@@ -1621,7 +1625,15 @@ impl RadioSession {
     /// Only ever called for `is_rx888`/`is_rtlsdr` sessions; harmless
     /// no-op otherwise (both threads are always `None` for every other
     /// board).
+    ///
+    /// RTL-SDR / MSi2500: only pauses the receiver -- the dongle stays
+    /// open and streaming, see DongleRate.
     pub fn stop_usb_sdr_threads(&mut self) {
+        if let Some(rate) = &self.dongle_rate {
+            rate.paused.store(true, Ordering::Release);
+            self.iq_buffers[0].lock().unwrap().clear();
+            return;
+        }
         self.stop_flag.store(true, Ordering::SeqCst);
         if let Some(t) = self.receiver_thread.take() {
             let _ = t.join();
@@ -1693,19 +1705,38 @@ impl RadioSession {
     /// RTL-SDR / MSi2500 counterpart of `restart_rx888_at_rate`, same
     /// ordering contract with stop_usb_sdr_threads (see its doc
     /// comment). The dongle itself always runs at rtlsdr::DONGLE_RATE_HZ
-    /// -- only the software decimation changes -- but the device is
-    /// still fully reopened, same "only reuse the proven bring-up path"
-    /// reasoning as the RX-888's. Returns the rate actually in use.
+    /// and stays open: this just switches the running threads' decimation
+    /// and resumes the receiver (see DongleRate). Only if the receiver
+    /// has already died (a stream error) is the dongle reopened. Returns
+    /// the rate actually in use.
     pub fn restart_dongle_at_rate(&mut self, output_rate_hz: u32) -> io::Result<u32> {
-        let output_rate_hz = if rtlsdr::decimation_for_output_rate(output_rate_hz).is_some() {
-            output_rate_hz
-        } else {
-            rtlsdr::DEFAULT_OUTPUT_RATE_HZ
+        let decimation = rtlsdr::decimation_for_output_rate(output_rate_hz);
+        let (output_rate_hz, decimation) = match decimation {
+            Some(d) => (output_rate_hz, d),
+            None => (rtlsdr::DEFAULT_OUTPUT_RATE_HZ, rtlsdr::DONGLE_RATE_HZ / rtlsdr::DEFAULT_OUTPUT_RATE_HZ),
         };
+        let rate = self.dongle_rate.clone().ok_or_else(|| io::Error::other("not an RTL-SDR/MSI.SDR session"))?;
+        rate.decimation.store(decimation, Ordering::Relaxed);
+        // Again: a read that was mid-block when stop_usb_sdr_threads
+        // paused may have pushed old-rate samples after its clear.
+        self.iq_buffers[0].lock().unwrap().clear();
+        rate.paused.store(false, Ordering::Release);
+        if self.receiver_thread.as_ref().is_some_and(|t| !t.is_finished()) {
+            return Ok(output_rate_hz);
+        }
+
+        // Receiver gone -- shut down what's left and reopen.
+        self.stop_flag.store(true, Ordering::SeqCst);
+        if let Some(t) = self.receiver_thread.take() {
+            let _ = t.join();
+        }
+        if let Some(t) = self.usb_control_thread.take() {
+            let _ = t.join();
+        }
         let stop_flag = Arc::new(AtomicBool::new(false));
         self.stop_flag = Arc::clone(&stop_flag);
         let (receiver_thread, control_thread) = if let Some(mac) = self.mirisdr_mac {
-            spawn_mirisdr_threads(mac, &self.iq_buffers[0], &self.frequency_hz, &self.rx_attenuation, &stop_flag, output_rate_hz)?
+            spawn_mirisdr_threads(mac, &self.iq_buffers[0], &self.frequency_hz, &self.rx_attenuation, &stop_flag, &rate)?
         } else {
             let controls = self
                 .rtlsdr_controls
@@ -1719,7 +1750,7 @@ impl RadioSession {
                 &self.rx_attenuation,
                 &controls,
                 &stop_flag,
-                output_rate_hz,
+                &rate,
             )?
         };
         self.receiver_thread = Some(receiver_thread);
@@ -2225,6 +2256,7 @@ fn start_protocol1(
         rtlsdr_mac: None,
         rtlsdr_controls: None,
         mirisdr_mac: None,
+        dongle_rate: None,
     })
 }
 
@@ -2564,6 +2596,7 @@ fn start_protocol1_ozy_usb(
         rtlsdr_mac: None,
         rtlsdr_controls: None,
         mirisdr_mac: None,
+        dongle_rate: None,
     })
 }
 
@@ -2830,6 +2863,7 @@ fn start_rx888_usb(
         rtlsdr_mac: None,
         rtlsdr_controls: None,
         mirisdr_mac: None,
+        dongle_rate: None,
     })
 }
 
@@ -2934,11 +2968,12 @@ fn start_usb_dongle(
     let xit_offset_hz = Arc::new(AtomicI32::new(settings.xit_offset_hz));
 
     let stop_flag = Arc::new(AtomicBool::new(false));
+    let dongle_rate = DongleRate::new(rtlsdr::DONGLE_RATE_HZ / output_rate);
     let (receiver_thread, control_thread) = match &controls {
         Some(controls) => {
-            spawn_rtlsdr_threads(device.mac, &iq_buffers[0], &frequency_hz, &rx_attenuation, controls, &stop_flag, output_rate)?
+            spawn_rtlsdr_threads(device.mac, &iq_buffers[0], &frequency_hz, &rx_attenuation, controls, &stop_flag, &dongle_rate)?
         }
-        None => spawn_mirisdr_threads(device.mac, &iq_buffers[0], &frequency_hz, &rx_attenuation, &stop_flag, output_rate)?,
+        None => spawn_mirisdr_threads(device.mac, &iq_buffers[0], &frequency_hz, &rx_attenuation, &stop_flag, &dongle_rate)?,
     };
 
     let mute_local_audio_for_tci = Arc::new(AtomicBool::new(false));
@@ -3025,7 +3060,32 @@ fn start_usb_dongle(
         rtlsdr_mac: (!is_mirisdr).then_some(device.mac),
         rtlsdr_controls: controls,
         mirisdr_mac: is_mirisdr.then_some(device.mac),
+        dongle_rate: Some(dongle_rate),
     })
+}
+
+/// RTL-SDR / MSi2500: the software decimation the receiver thread
+/// applies, shared with the control thread (the tuning offset depends on
+/// it). The dongle itself always streams at rtlsdr::DONGLE_RATE_HZ, so a
+/// sample rate change only rewrites `decimation` -- the stick stays open
+/// and streaming. REAL REPORT (2026-10-19, MSI.SDR on Windows): closing
+/// and reopening the stick for a rate change left its stream endpoint
+/// failing ("endpoint stalled") until it was replugged; Linux's
+/// reset-on-open hid it, WinUSB can't reset a device, and neither an
+/// alt-setting round trip nor stopping the stick after the reads were
+/// cancelled helped. Every rate started fine from a fresh plug.
+struct DongleRate {
+    decimation: AtomicU32,
+    /// Set by stop_usb_sdr_threads while main.rs rebuilds the WDSP
+    /// channel: the receiver keeps reading the USB stream (so nothing
+    /// backs up in the stick) but drops the samples.
+    paused: AtomicBool,
+}
+
+impl DongleRate {
+    fn new(decimation: u32) -> Arc<Self> {
+        Arc::new(Self { decimation: AtomicU32::new(decimation), paused: AtomicBool::new(false) })
+    }
 }
 
 /// Opens the dongle and starts its receiver + control threads. Shared
@@ -3037,10 +3097,9 @@ fn spawn_rtlsdr_threads(
     rx_attenuation: &Arc<AtomicU32>,
     controls: &Arc<rtlsdr::Controls>,
     stop_flag: &Arc<AtomicBool>,
-    output_rate_hz: u32,
+    rate: &Arc<DongleRate>,
 ) -> io::Result<(JoinHandle<()>, JoinHandle<()>)> {
-    let decimation = rtlsdr::decimation_for_output_rate(output_rate_hz)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, format!("RTL-SDR: unsupported rate {output_rate_hz}")))?;
+    let decimation = rate.decimation.load(Ordering::Relaxed);
     // See rtlsdr::Decimator's doc comment -- the dongle sits this far
     // above the dial so its own centre spike stays out of the way.
     let offset_hz = rtlsdr::tuning_offset_hz(decimation);
@@ -3055,16 +3114,18 @@ fn spawn_rtlsdr_threads(
 
     let receiver_buffer = Arc::clone(iq_buffer);
     let receiver_stop = Arc::clone(stop_flag);
+    let receiver_rate = Arc::clone(rate);
     let receiver_thread = thread::spawn(move || {
-        rtlsdr_receiver_loop(rx_endpoint, receiver_buffer, receiver_stop, decimation);
+        rtlsdr_receiver_loop(rx_endpoint, receiver_buffer, receiver_stop, receiver_rate);
     });
 
     let control_frequency_hz = Arc::clone(frequency_hz);
     let control_rx_attenuation = Arc::clone(rx_attenuation);
     let control_controls = Arc::clone(controls);
     let control_stop = Arc::clone(stop_flag);
+    let control_rate = Arc::clone(rate);
     let control_thread = thread::spawn(move || {
-        rtlsdr_control_loop(device, control_frequency_hz, offset_hz, control_rx_attenuation, control_controls, control_stop);
+        rtlsdr_control_loop(device, control_frequency_hz, control_rate, control_rx_attenuation, control_controls, control_stop);
     });
     Ok((receiver_thread, control_thread))
 }
@@ -3077,8 +3138,9 @@ fn rtlsdr_receiver_loop(
     mut rx_endpoint: rtlsdr::RxEndpoint,
     iq_buffer: Arc<Mutex<VecDeque<IqSample>>>,
     stop_flag: Arc<AtomicBool>,
-    decimation: u32,
+    rate: Arc<DongleRate>,
 ) {
+    let mut decimation = rate.decimation.load(Ordering::Relaxed);
     let mut decimator = rtlsdr::Decimator::new(decimation);
     let mut buf = vec![0u8; rtlsdr::STREAM_READ_SIZE];
     while !stop_flag.load(Ordering::Relaxed) {
@@ -3091,6 +3153,15 @@ fn rtlsdr_receiver_loop(
                 break;
             }
         };
+        // See DongleRate.
+        if rate.paused.load(Ordering::Acquire) {
+            continue;
+        }
+        let wanted = rate.decimation.load(Ordering::Relaxed);
+        if wanted != decimation {
+            decimation = wanted;
+            decimator = rtlsdr::Decimator::new(decimation);
+        }
         decimator.process_block(&buf[..n], |(iv, qv)| {
             push_sample(&iq_buffer, IqSample { i: iv, q: qv }, IQ_BUFFER_CAPACITY);
         });
@@ -3108,9 +3179,10 @@ const RTLSDR_CONTROL_POLL: Duration = Duration::from_millis(20);
 /// spinning the VFO quickly coalesces into one retune per poll rather
 /// than queuing a backlog of them.
 ///
-/// The dongle is tuned `offset_hz` above the dial (see
-/// rtlsdr::Decimator's doc comment); the direct-sampling switch below
-/// still goes by the dial frequency itself.
+/// The dongle is tuned rtlsdr::tuning_offset_hz above the dial (see
+/// rtlsdr::Decimator's doc comment), which depends on `rate`'s current
+/// decimation, so a rate change retunes too; the direct-sampling switch
+/// below still goes by the dial frequency itself.
 ///
 /// Direct sampling switches automatically: tuned below
 /// rtlsdr::DIRECT_SAMPLING_BELOW_HZ with it enabled -> that ADC branch,
@@ -3120,16 +3192,18 @@ const RTLSDR_CONTROL_POLL: Duration = Duration::from_millis(20);
 fn rtlsdr_control_loop(
     mut device: rtlsdr::RtlSdrDevice,
     frequency_hz: Arc<AtomicU32>,
-    offset_hz: u32,
+    rate: Arc<DongleRate>,
     rx_attenuation: Arc<AtomicU32>,
     controls: Arc<rtlsdr::Controls>,
     stop_flag: Arc<AtomicBool>,
 ) {
     // initialise() already applied these.
     let mut last_freq = frequency_hz.load(Ordering::Relaxed);
+    let mut last_offset = rtlsdr::tuning_offset_hz(rate.decimation.load(Ordering::Relaxed));
     let mut last_gain = (rx_attenuation.load(Ordering::Relaxed), controls.tuner_agc.load(Ordering::Relaxed));
     while !stop_flag.load(Ordering::Relaxed) {
         let freq = frequency_hz.load(Ordering::Relaxed);
+        let offset_hz = rtlsdr::tuning_offset_hz(rate.decimation.load(Ordering::Relaxed));
         let ds_setting = controls.direct_sampling.load(Ordering::Relaxed);
         let wanted_ds = if freq < rtlsdr::DIRECT_SAMPLING_BELOW_HZ { ds_setting } else { 0 };
         let gain = (rx_attenuation.load(Ordering::Relaxed), controls.tuner_agc.load(Ordering::Relaxed));
@@ -3142,13 +3216,14 @@ fn rtlsdr_control_loop(
             force_gain = wanted_ds == 0;
             last_freq = u32::MAX; // retune in the new mode
         }
-        if freq != last_freq {
+        if freq != last_freq || offset_hz != last_offset {
             // Hardware sits offset_hz above the dial -- see
             // rtlsdr::Decimator's doc comment.
             if let Err(e) = device.set_center_freq(freq + offset_hz) {
                 eprintln!("RTL-SDR: tune to {} Hz failed: {e}", freq + offset_hz);
             }
             last_freq = freq;
+            last_offset = offset_hz;
         }
         // Gain only means anything with the tuner in use.
         if device.direct_sampling() == 0 && (gain != last_gain || force_gain) {
@@ -3170,10 +3245,9 @@ fn spawn_mirisdr_threads(
     frequency_hz: &Arc<AtomicU32>,
     rx_attenuation: &Arc<AtomicU32>,
     stop_flag: &Arc<AtomicBool>,
-    output_rate_hz: u32,
+    rate: &Arc<DongleRate>,
 ) -> io::Result<(JoinHandle<()>, JoinHandle<()>)> {
-    let decimation = rtlsdr::decimation_for_output_rate(output_rate_hz)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, format!("MSi2500: unsupported rate {output_rate_hz}")))?;
+    let decimation = rate.decimation.load(Ordering::Relaxed);
     let offset_hz = rtlsdr::tuning_offset_hz(decimation);
     let (device, rx_endpoint, name) =
         mirisdr::initialise(mac, frequency_hz.load(Ordering::Relaxed) + offset_hz, rx_attenuation.load(Ordering::Relaxed))?;
@@ -3185,16 +3259,18 @@ fn spawn_mirisdr_threads(
     let receiver_buffer = Arc::clone(iq_buffer);
     let receiver_stop = Arc::clone(stop_flag);
     let receiver_done_tx = Arc::clone(&receiver_done);
+    let receiver_rate = Arc::clone(rate);
     let receiver_thread = thread::spawn(move || {
-        mirisdr_receiver_loop(rx_endpoint, receiver_buffer, receiver_stop, decimation);
+        mirisdr_receiver_loop(rx_endpoint, receiver_buffer, receiver_stop, receiver_rate);
         receiver_done_tx.store(true, Ordering::Release);
     });
 
     let control_frequency_hz = Arc::clone(frequency_hz);
     let control_rx_attenuation = Arc::clone(rx_attenuation);
     let control_stop = Arc::clone(stop_flag);
+    let control_rate = Arc::clone(rate);
     let control_thread = thread::spawn(move || {
-        mirisdr_control_loop(device, control_frequency_hz, offset_hz, control_rx_attenuation, control_stop, receiver_done);
+        mirisdr_control_loop(device, control_frequency_hz, control_rate, control_rx_attenuation, control_stop, receiver_done);
     });
     Ok((receiver_thread, control_thread))
 }
@@ -3206,9 +3282,10 @@ fn mirisdr_receiver_loop(
     mut rx_endpoint: mirisdr::RxEndpoint,
     iq_buffer: Arc<Mutex<VecDeque<IqSample>>>,
     stop_flag: Arc<AtomicBool>,
-    decimation: u32,
+    rate: Arc<DongleRate>,
 ) {
     let mut unpacker = mirisdr::Unpacker::new();
+    let mut decimation = rate.decimation.load(Ordering::Relaxed);
     let mut decimator = rtlsdr::Decimator::with_full_scale(decimation, mirisdr::SAMPLE_FULL_SCALE);
     let mut buf = vec![0u8; mirisdr::STREAM_READ_SIZE];
     let mut push = |(iv, qv): (i32, i32)| push_sample(&iq_buffer, IqSample { i: iv, q: qv }, IQ_BUFFER_CAPACITY);
@@ -3222,6 +3299,17 @@ fn mirisdr_receiver_loop(
                 break;
             }
         };
+        // See DongleRate. Paused reads skip the Unpacker too, so its
+        // sample counter check would report one gap on resume -- reset it.
+        if rate.paused.load(Ordering::Acquire) {
+            unpacker = mirisdr::Unpacker::new();
+            continue;
+        }
+        let wanted = rate.decimation.load(Ordering::Relaxed);
+        if wanted != decimation {
+            decimation = wanted;
+            decimator = rtlsdr::Decimator::with_full_scale(decimation, mirisdr::SAMPLE_FULL_SCALE);
+        }
         unpacker.process(&buf[..n], |samples| decimator.process_samples(samples.iter().copied(), &mut push));
     }
 }
@@ -3232,17 +3320,19 @@ fn mirisdr_receiver_loop(
 fn mirisdr_control_loop(
     mut device: mirisdr::MiriSdrDevice,
     frequency_hz: Arc<AtomicU32>,
-    offset_hz: u32,
+    rate: Arc<DongleRate>,
     rx_attenuation: Arc<AtomicU32>,
     stop_flag: Arc<AtomicBool>,
     receiver_done: Arc<AtomicBool>,
 ) {
     // initialise() already applied these.
     let mut last_freq = frequency_hz.load(Ordering::Relaxed);
+    let mut last_offset = rtlsdr::tuning_offset_hz(rate.decimation.load(Ordering::Relaxed));
     let mut last_gain = rx_attenuation.load(Ordering::Relaxed);
     while !stop_flag.load(Ordering::Relaxed) {
         let freq = frequency_hz.load(Ordering::Relaxed);
-        if freq != last_freq {
+        let offset_hz = rtlsdr::tuning_offset_hz(rate.decimation.load(Ordering::Relaxed));
+        if freq != last_freq || offset_hz != last_offset {
             // Hardware sits offset_hz above the dial -- see
             // rtlsdr::Decimator's doc comment. set_center_freq also
             // re-applies the gain.
@@ -3250,6 +3340,7 @@ fn mirisdr_control_loop(
                 eprintln!("MSi2500: tune to {} Hz failed: {e}", freq + offset_hz);
             }
             last_freq = freq;
+            last_offset = offset_hz;
         }
         let gain = rx_attenuation.load(Ordering::Relaxed);
         if gain != last_gain {
@@ -6631,6 +6722,7 @@ fn start_protocol2(
         rtlsdr_mac: None,
         rtlsdr_controls: None,
         mirisdr_mac: None,
+        dongle_rate: None,
     })
 }
 
