@@ -495,25 +495,13 @@ impl MiriSdrDevice {
     /// 20 ms after the reads were cancelled (RxEndpoint::cancel_and_drain),
     /// stop streaming -- and nothing else. libmirisdr's own comment there:
     /// stopping the ADC too would be tidy, but the next open would then
-    /// need a re-init. This used to add mirisdr_adc_stop and a return to
-    /// alt setting 0; on Windows (no USB reset on open) the stick then
-    /// failed every later start with "endpoint stalled" until replugged.
-    /// Not yet known whether those extras were the cause, so
-    /// HPSDR_MSI_CLOSE=full still selects them for comparison.
+    /// need a re-init. (Adding mirisdr_adc_stop and a return to alt
+    /// setting 0 made no difference to the Windows restart problem
+    /// described in initialise.)
     pub fn close(&mut self) {
         std::thread::sleep(Duration::from_millis(20));
-        let full = std::env::var("HPSDR_MSI_CLOSE").is_ok_and(|v| v.eq_ignore_ascii_case("full"));
-        println!("MSi2500: closing ({})", if full { "full: stop + ADC sleep + alt 0" } else { "stop streaming only" });
         if let Err(e) = self.streaming_stop() {
             eprintln!("MSi2500: close: {e}");
-        }
-        if full {
-            if let Err(e) = self.adc_stop() {
-                eprintln!("MSi2500: close: ADC sleep: {e}");
-            }
-            if let Err(e) = self.interface.set_alt_setting(0).wait() {
-                eprintln!("MSi2500: close: selecting alt setting 0 failed: {e}");
-            }
         }
     }
 }
@@ -580,60 +568,32 @@ pub fn initialise(mac: [u8; 6], initial_freq_hz: u32, gain_db: u32) -> io::Resul
     dev.set_hard(SAMPLE_RATE_HZ)?;
     dev.set_center_freq(initial_freq_hz)?;
 
-    let mut endpoint = select_bulk_endpoint(&interface)?;
+    // Through alt setting 0 first: by the USB spec SET_INTERFACE resets
+    // the stream endpoint's halt and data-toggle state on both sides.
+    if let Err(e) = interface.set_alt_setting(0).wait() {
+        eprintln!("MSi2500: selecting alt setting 0 failed ({e}), continuing");
+    }
+    interface
+        .set_alt_setting(ALT_SETTING_BULK)
+        .wait()
+        .map_err(|e| io_err(format!("couldn't select the MSi2500's bulk alt setting {ALT_SETTING_BULK}: {e}")))?;
+    let mut endpoint = interface
+        .endpoint::<Bulk, In>(EP_STREAM_IN)
+        .map_err(|e| io_err(format!("couldn't open the MSi2500's stream endpoint: {e}")))?;
     dev.streaming_start()?;
 
-    // On Windows the stick only streams on its first start after being
-    // plugged in: every later start (another session, without a replug)
-    // fails its very first read with "endpoint stalled" -- even after a
-    // clean libmirisdr-style close and the alt setting round trip above.
-    // Linux resets the device on open, and a real reset isn't available
-    // from user mode on Windows. So check the stream, and if it's dead,
-    // try progressively stronger recovery sequences, logging each, until
-    // one delivers data. Which one works (if any) isn't known yet.
-    let mut check = stream_check(&mut endpoint);
-    match &check {
-        Ok(()) => println!("MSi2500: stream check OK"),
-        Err(e) => eprintln!("MSi2500: stream check failed: {e} -- trying to recover"),
-    }
-    if check.is_err() {
-        for step in 1..=4 {
-            let what = match step {
-                1 => "clear halt",
-                2 => "stop streaming, clear halt, start streaming",
-                3 => "stop streaming, alt setting 0 -> 3, clear halt, start streaming",
-                _ => "stop streaming, ADC sleep, full re-init, alt setting 0 -> 3, clear halt, start streaming",
-            };
-            if step >= 2 {
-                dev.streaming_stop()?;
-            }
-            if step >= 3 {
-                drop(endpoint);
-                if step == 4 {
-                    dev.adc_stop()?;
-                    dev.adc_init()?;
-                    dev.set_hard(SAMPLE_RATE_HZ)?;
-                    dev.set_center_freq(initial_freq_hz)?;
-                }
-                endpoint = select_bulk_endpoint(&interface)?;
-            }
-            if let Err(e) = endpoint.clear_halt().wait() {
-                eprintln!("MSi2500: recovery {step}: clear halt failed: {e}");
-            }
-            if step >= 2 {
-                dev.streaming_start()?;
-            }
-            check = stream_check(&mut endpoint);
-            match &check {
-                Ok(()) => println!("MSi2500: recovery {step} ({what}) WORKED"),
-                Err(e) => eprintln!("MSi2500: recovery {step} ({what}) failed: {e}"),
-            }
-            if check.is_ok() {
-                break;
-            }
-        }
-    }
-    if let Err(e) = check {
+    // REAL REPORT (2026-10-19, Windows): the stick only streams on its
+    // first start after being plugged in. Every later start -- another
+    // session, without a replug -- gets no data, or "endpoint stalled"
+    // on its first read, however cleanly the last session closed.
+    // Linux resets the device on open (above), which hides this; on
+    // Windows a reset isn't available from user mode, and none of these
+    // brought the stream back, each tried on real hardware: the alt
+    // setting round trip above, CLEAR_FEATURE(ENDPOINT_HALT), stopping
+    // and restarting the stream, disabling USB selective suspend. So
+    // check the stream and, if it's dead, say how to fix it rather than
+    // leave a silent, empty spectrum.
+    if let Err(e) = stream_check(&mut endpoint) {
         let _ = dev.streaming_stop();
         return Err(io_err(format!(
             "the MSi2500's stream won't start ({e}) -- unplug the MSI.SDR, plug it back in and start again"
@@ -645,24 +605,6 @@ pub fn initialise(mac: [u8; 6], initial_freq_hz: u32, gain_db: u32) -> io::Resul
         .with_num_transfers(STREAM_NUM_TRANSFERS)
         .with_read_timeout(Duration::from_millis(500));
     Ok((dev, RxEndpoint { reader }, name))
-}
-
-/// Through alt setting 0 first: SET_INTERFACE resets the stream
-/// endpoint's halt and data-toggle state on both sides -- by the spec;
-/// the MSi2500 doesn't seem to honour it (see initialise). (CLEAR_FEATURE
-/// via WinUsb_ResetPipe before starting the stream was tried on its own
-/// and gave no data at all.)
-fn select_bulk_endpoint(interface: &Interface) -> io::Result<Endpoint<Bulk, In>> {
-    if let Err(e) = interface.set_alt_setting(0).wait() {
-        eprintln!("MSi2500: selecting alt setting 0 failed ({e}), continuing");
-    }
-    interface
-        .set_alt_setting(ALT_SETTING_BULK)
-        .wait()
-        .map_err(|e| io_err(format!("couldn't select the MSi2500's bulk alt setting {ALT_SETTING_BULK}: {e}")))?;
-    interface
-        .endpoint::<Bulk, In>(EP_STREAM_IN)
-        .map_err(|e| io_err(format!("couldn't open the MSi2500's stream endpoint: {e}")))
 }
 
 // ---------------------------------------------------------------------
