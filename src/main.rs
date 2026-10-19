@@ -13674,6 +13674,12 @@ fn redirect_stdio_to_log_file() {
     let Some(path) = debug_log::log_path("hpsdr-rs.log") else {
         return;
     };
+    // Keep the previous run's log: a problem that shows up on the next
+    // start (an MSI.SDR that won't restart without a replug) needs to be
+    // read alongside how the last session ended.
+    if let Some(prev) = debug_log::log_path("hpsdr-rs.prev.log") {
+        let _ = std::fs::rename(&path, prev);
+    }
     let Ok(file) = std::fs::File::create(&path) else {
         return;
     };

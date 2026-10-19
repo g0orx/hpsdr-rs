@@ -321,6 +321,28 @@ impl RxEndpoint {
     pub fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         self.reader.read(buf)
     }
+
+    /// mirisdr_cancel_async_now: cancels the queued reads and waits (up
+    /// to a second) until every one has completed, so the stick is only
+    /// stopped once nothing is outstanding on the stream (see
+    /// MiriSdrDevice::close). Dropping the reader alone cancels without
+    /// waiting.
+    pub fn cancel_and_drain(&mut self) {
+        self.reader.cancel_all();
+        let mut buf = vec![0u8; STREAM_READ_SIZE];
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        while std::time::Instant::now() < deadline {
+            match self.reader.read(&mut buf) {
+                Ok(0) => return,
+                Ok(_) => {}
+                Err(e) if e.kind() == io::ErrorKind::TimedOut => {}
+                // A cancelled read completes with an error; keep going
+                // until the reader reports nothing left (Ok(0)).
+                Err(_) => {}
+            }
+        }
+        eprintln!("MSi2500: stream reads still pending 1 s after cancelling");
+    }
 }
 
 impl MiriSdrDevice {
@@ -438,14 +460,30 @@ impl MiriSdrDevice {
         self.write_gain()
     }
 
-    /// The stream stop libmirisdr does at the end of mirisdr_read_async,
-    /// plus mirisdr_adc_stop so the stick isn't left running.
+    /// The stream stop libmirisdr does at the end of mirisdr_read_async:
+    /// 20 ms after the reads were cancelled (RxEndpoint::cancel_and_drain),
+    /// stop streaming -- and nothing else. libmirisdr's own comment there:
+    /// stopping the ADC too would be tidy, but the next open would then
+    /// need a re-init. This used to add mirisdr_adc_stop and a return to
+    /// alt setting 0; on Windows (no USB reset on open) the stick then
+    /// failed every later start with "endpoint stalled" until replugged.
+    /// Not yet known whether those extras were the cause, so
+    /// HPSDR_MSI_CLOSE=full still selects them for comparison.
     pub fn close(&mut self) {
-        let _ = self.streaming_stop();
-        let _ = self.adc_stop();
-        // Leave the stick in alt setting 0 (no bulk endpoint), so the next
-        // session starts from a clean interface -- see initialise.
-        let _ = self.interface.set_alt_setting(0).wait();
+        std::thread::sleep(Duration::from_millis(20));
+        let full = std::env::var("HPSDR_MSI_CLOSE").is_ok_and(|v| v.eq_ignore_ascii_case("full"));
+        println!("MSi2500: closing ({})", if full { "full: stop + ADC sleep + alt 0" } else { "stop streaming only" });
+        if let Err(e) = self.streaming_stop() {
+            eprintln!("MSi2500: close: {e}");
+        }
+        if full {
+            if let Err(e) = self.adc_stop() {
+                eprintln!("MSi2500: close: ADC sleep: {e}");
+            }
+            if let Err(e) = self.interface.set_alt_setting(0).wait() {
+                eprintln!("MSi2500: close: selecting alt setting 0 failed: {e}");
+            }
+        }
     }
 }
 

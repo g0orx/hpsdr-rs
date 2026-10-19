@@ -3289,16 +3289,35 @@ fn mirisdr_receiver_loop(
     let mut decimator = rtlsdr::Decimator::with_full_scale(decimation, mirisdr::SAMPLE_FULL_SCALE);
     let mut buf = vec![0u8; mirisdr::STREAM_READ_SIZE];
     let mut push = |(iv, qv): (i32, i32)| push_sample(&iq_buffer, IqSample { i: iv, q: qv }, IQ_BUFFER_CAPACITY);
+    // Logged because a stick that won't restart (Windows, see
+    // MiriSdrDevice::close) has shown up both as an error and as a
+    // stream that silently never delivers anything.
+    let started = std::time::Instant::now();
+    let mut total_bytes: u64 = 0;
+    let mut warned_no_data = false;
     while !stop_flag.load(Ordering::Relaxed) {
         let n = match rx_endpoint.read(&mut buf) {
             Ok(0) => break,
             Ok(n) => n,
-            Err(e) if e.kind() == io::ErrorKind::TimedOut => continue,
+            Err(e) if e.kind() == io::ErrorKind::TimedOut => {
+                if total_bytes == 0 && !warned_no_data && started.elapsed() >= Duration::from_secs(2) {
+                    eprintln!("MSi2500: no stream data 2 s after starting");
+                    warned_no_data = true;
+                }
+                continue;
+            }
             Err(e) => {
-                eprintln!("MSi2500: stream read failed: {e}");
+                eprintln!(
+                    "MSi2500: stream read failed after {:.1} s and {total_bytes} bytes: {e}",
+                    started.elapsed().as_secs_f64()
+                );
                 break;
             }
         };
+        if total_bytes == 0 {
+            println!("MSi2500: first stream data after {} ms", started.elapsed().as_millis());
+        }
+        total_bytes += n as u64;
         // See DongleRate. Paused reads skip the Unpacker too, so its
         // sample counter check would report one gap on resume -- reset it.
         if rate.paused.load(Ordering::Acquire) {
@@ -3312,6 +3331,8 @@ fn mirisdr_receiver_loop(
         }
         unpacker.process(&buf[..n], |samples| decimator.process_samples(samples.iter().copied(), &mut push));
     }
+    rx_endpoint.cancel_and_drain();
+    println!("MSi2500: stream reads cancelled after {total_bytes} bytes");
 }
 
 /// MSi2500 control thread -- rtlsdr_control_loop minus direct sampling
@@ -3352,12 +3373,10 @@ fn mirisdr_control_loop(
         thread::sleep(RTLSDR_CONTROL_POLL);
     }
     // Stop the stick only after the receiver has cancelled its queued
-    // reads: stopping the stream under pending bulk reads left the
-    // endpoint stalled. Linux's reset-on-open hid that; on Windows (no
-    // reset) every later start failed with "endpoint stalled" until the
-    // stick was replugged. The receiver notices stop_flag within its
-    // 500 ms read timeout.
-    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    // reads and they've all completed -- libmirisdr's order (see
+    // MiriSdrDevice::close). The receiver notices stop_flag within its
+    // 500 ms read timeout, and cancel_and_drain takes up to 1 s.
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
     while !receiver_done.load(Ordering::Acquire) && std::time::Instant::now() < deadline {
         thread::sleep(Duration::from_millis(10));
     }
