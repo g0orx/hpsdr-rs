@@ -567,7 +567,11 @@ pub fn initialise(hex_path: &Path, rbf_path: &Path) -> io::Result<(OzyDevice, Rx
                 eprintln!("ozy: claiming TX bulk endpoint 0x{EP2_OUT:02x} failed: {e}");
                 io_err(e)
             })?
-            .writer(EP2_WRITE_SIZE),
+            .writer(EP2_WRITE_SIZE)
+            // Unlimited by default: an Ozy that stopped taking frames
+            // would block the sender silently. radio.rs's ozy_sender_loop
+            // reports the timeout and keeps trying.
+            .with_write_timeout(Duration::from_secs(1)),
     };
 
     eprintln!("ozy: initialise() complete -- FX2 {ozy_fx2:?}, Mercury {:?}, Penny {:?}", versions.mercury, versions.penny);

@@ -2377,6 +2377,8 @@ fn start_protocol1_ozy_usb(
             )
         })?;
     let (ozy_device, rx_endpoint, tx_endpoint, ozy_versions) = crate::ozy::initialise(&hex_path, &rbf_path)?;
+    let atlas_c1 = ozy_atlas_config(ozy_versions.penny.is_some());
+    eprintln!("ozy: Atlas bus config (C1) 0x{atlas_c1:02x}");
 
     let stop_flag = Arc::new(AtomicBool::new(false));
     // Ozy's historical 2-receiver cap (see discover_ozy_usb's own doc
@@ -2459,6 +2461,7 @@ fn start_protocol1_ozy_usb(
             sender_mic_ptt_enabled,
             sender_mic_bias_enabled,
             sender_mic_ptt_on_tip,
+            atlas_c1,
             sender_stop,
         );
     });
@@ -5649,6 +5652,30 @@ fn receiver_loop(
     }
 }
 
+/// Atlas bus configuration bits in register 0's C1 (piHPSDR
+/// old_protocol.c's CONFIG_* / *_SOURCE). Hermes-family boards ignore
+/// them, which is why p1_build_packet doesn't set them; an Ozy needs
+/// them -- piHPSDR: "CONFIG_BOTH seems to be critical to getting ozy to
+/// respond". REAL REPORT (issue #8, Ozy + Mercury + Penny): start-up
+/// completed but no spectrum or audio, with these bits all zero
+/// ("neither Mercury nor Penny present").
+const ATLAS_CONFIG_PENELOPE: u8 = 0x20;
+const ATLAS_CONFIG_MERCURY: u8 = 0x40;
+const ATLAS_MERCURY_122_88MHZ_SOURCE: u8 = 0x10;
+
+/// piHPSDR's defaults: Mercury always present; Penny supplies the
+/// 122.88 MHz clock (so it's marked present too) and Atlas the 10 MHz
+/// reference (both _SOURCE values 0). With no Penny answering at
+/// start-up (see ozy::read_firmware_versions), Mercury has to supply
+/// the 122.88 MHz clock instead, or nothing clocks the bus.
+fn ozy_atlas_config(has_penny: bool) -> u8 {
+    if has_penny {
+        ATLAS_CONFIG_MERCURY | ATLAS_CONFIG_PENELOPE
+    } else {
+        ATLAS_CONFIG_MERCURY | ATLAS_MERCURY_122_88MHZ_SOURCE
+    }
+}
+
 /// Ozy USB counterpart to sender_loop -- same packet-content
 /// construction (p1_build_packet, unchanged), just written as two
 /// separate 512-byte USB bulk OUT transfers instead of one 1032-byte
@@ -5686,10 +5713,15 @@ fn ozy_sender_loop(
     mic_ptt_enabled: Arc<AtomicBool>,
     mic_bias_enabled: Arc<AtomicBool>,
     mic_ptt_on_tip: Arc<AtomicBool>,
+    // See ozy_atlas_config. OR'd into frame 1's C1 (frame 1 is always
+    // register 0; frame 2 cycles through 1-11 and never is).
+    atlas_c1: u8,
     stop: Arc<AtomicBool>,
 ) {
     let mut seq: u32 = 0;
     let mut ozy_command: u8 = 1;
+    let mut frames_sent: u64 = 0;
+    let mut timeout_reported = false;
     let mut current_receiver: u8 = 0;
     let mut rx_audio_pacer = RxAudioPacer::new();
     let mut tx_iq_pacer = TxIqPacer::new();
@@ -5709,7 +5741,7 @@ fn ozy_sender_loop(
         // that interval is fixed to represent exactly 126 samples.
         let tx_iq_slots_per_sample = 1.0;
 
-        let packet = p1_build_packet(
+        let mut packet = p1_build_packet(
             seq,
             &mut ozy_command,
             &mut current_receiver,
@@ -5764,14 +5796,35 @@ fn ozy_sender_loop(
             None, // hl2_iob_cc -- Ozy is never a HermesLite
         );
 
+        // Frame 1's C1 (sync x3, C0, then C1) -- see atlas_c1.
+        packet[HEADER_SIZE + 4] |= atlas_c1;
+
         // `packet` is [8-byte Metis header][512-byte frame][512-byte
         // frame] (see PACKET_SIZE's own doc comment) -- Ozy sends those
         // same two frames directly over USB bulk OUT, no Metis header,
         // no UDP wrapping.
-        let ok = tx_endpoint.write(&packet[HEADER_SIZE..HEADER_SIZE + USB_FRAME_SIZE]).is_ok()
-            && tx_endpoint.write(&packet[HEADER_SIZE + USB_FRAME_SIZE..PACKET_SIZE]).is_ok();
-        if !ok {
-            break; // device gone; let the thread exit
+        let result = tx_endpoint
+            .write(&packet[HEADER_SIZE..HEADER_SIZE + USB_FRAME_SIZE])
+            .and_then(|()| tx_endpoint.write(&packet[HEADER_SIZE + USB_FRAME_SIZE..PACKET_SIZE]));
+        match result {
+            Ok(()) => {
+                if frames_sent == 0 {
+                    eprintln!("ozy: first C&C frames sent to EP2");
+                }
+                frames_sent += 2;
+            }
+            // Ozy not taking frames: report once, keep trying (see
+            // ozy::TxEndpoint's write timeout).
+            Err(e) if e.kind() == io::ErrorKind::TimedOut => {
+                if !timeout_reported {
+                    eprintln!("ozy: EP2 write timed out after {frames_sent} frames -- the radio isn't accepting C&C frames");
+                    timeout_reported = true;
+                }
+            }
+            Err(e) => {
+                eprintln!("ozy: EP2 write failed after {frames_sent} frames: {e}");
+                break; // device gone; let the thread exit
+            }
         }
 
         seq = seq.wrapping_add(1);
@@ -5826,10 +5879,28 @@ fn ozy_receiver_loop(
     let ps_rx_feedback_iq: Arc<Mutex<VecDeque<IqSample>>> = Arc::new(Mutex::new(VecDeque::new()));
     let ps_tx_feedback_iq: Arc<Mutex<VecDeque<IqSample>>> = Arc::new(Mutex::new(VecDeque::new()));
     let diversity_main_raw_iq: Arc<Mutex<VecDeque<IqSample>>> = Arc::new(Mutex::new(VecDeque::new()));
+    // Logged because a start-up that completes and then shows nothing
+    // (issue #8) needs to say whether data arrived at all.
+    let started = Instant::now();
+    let mut total_bytes: u64 = 0;
+    let mut warned_no_data = false;
+    let mut reported_sync = false;
 
     while !stop.load(Ordering::Relaxed) {
+        if total_bytes == 0 && !warned_no_data && started.elapsed() >= Duration::from_secs(3) {
+            eprintln!("ozy: no EP6 (RX) data 3 s after starting");
+            warned_no_data = true;
+        }
         match rx_endpoint.read(&mut buf) {
             Ok(n) if n > 0 => {
+                if total_bytes == 0 {
+                    eprintln!(
+                        "ozy: first EP6 (RX) data after {} ms ({n} bytes, starting {:02x?})",
+                        started.elapsed().as_millis(),
+                        &buf[..n.min(8)]
+                    );
+                }
+                total_bytes += n as u64;
                 let capacity = iq_buffer_capacity_for_rate(sample_rate.load(Ordering::Relaxed));
                 let receivers = (active_receiver_count.load(Ordering::Relaxed) as u8).max(1);
                 let _ = parse_iq_stream(
@@ -5855,6 +5926,13 @@ fn ozy_receiver_loop(
                     &mut frame_synced,
                     &AtomicBool::new(false), // no HL2 IO board on Ozy
                 );
+                if frame_synced && !reported_sync {
+                    eprintln!("ozy: EP6 frame sync found after {total_bytes} bytes");
+                    reported_sync = true;
+                } else if !frame_synced && !reported_sync && total_bytes >= 64 * 1024 {
+                    eprintln!("ozy: no EP6 frame sync in the first {total_bytes} bytes");
+                    reported_sync = true;
+                }
             }
             Ok(_) => continue, // 0 bytes -- transient, keep polling
             Err(e)
@@ -5862,7 +5940,10 @@ fn ozy_receiver_loop(
             {
                 continue // the NORMAL idle case -- see ozy.rs's IO_TIMEOUT doc comment
             }
-            Err(_) => break, // device gone
+            Err(e) => {
+                eprintln!("ozy: EP6 read failed after {total_bytes} bytes: {e}");
+                break; // device gone
+            }
         }
     }
 }
@@ -8273,6 +8354,15 @@ fn p2_tx_iq_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ozy_atlas_config_matches_pihpsdr_defaults() {
+        // piHPSDR, all atlas_* settings at their defaults:
+        // CONFIG_MERCURY | CONFIG_PENELOPE (Penny supplies 122.88 MHz).
+        assert_eq!(ozy_atlas_config(true), 0x60);
+        // No Penny: Mercury present and supplying 122.88 MHz.
+        assert_eq!(ozy_atlas_config(false), 0x50);
+    }
 
     /// Issue #13: an uncalibrated Hermes-Lite must reach full drive at
     /// its 5 W maximum, not the ~59/255 the 100 W default gave.
