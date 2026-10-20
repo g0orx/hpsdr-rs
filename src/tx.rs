@@ -862,7 +862,15 @@ impl TxProcessor {
             iq_scratch: vec![0.0; out_iq_pairs * 2],
             last_mode: None,
             last_gain: None,
-            last_passband: Some(default_passband),
+            // None, not Some(default_passband): process() also sets the
+            // Tune tone (PostGen) frequency on a passband change, and
+            // open() leaves it at 0 Hz -- so with the mode/width at the
+            // default (USB 2700 Hz) it was never set, and Tune sent a
+            // carrier on the TX frequency itself, outside the filter.
+            // REAL REPORT (2026-10-20, ANAN-8000DLE, seen on Duplex's TX
+            // inset); reproduced with this real TXA chain feeding the TX
+            // analyzer (tx_inset_probe below).
+            last_passband: None,
             last_eq: None,
             last_compressor: None,
             last_post_gen: None,
@@ -2638,5 +2646,59 @@ impl TxHandle {
 impl Drop for TxHandle {
     fn drop(&mut self) {
         self.stop();
+    }
+}
+
+#[cfg(test)]
+mod tune_tone_tests {
+    use super::*;
+    use crate::spectrum::SpectrumHandle;
+    use std::sync::atomic::AtomicBool;
+
+    /// The real TXA chain (Protocol 2 rates, USB 2700 Hz -- the default
+    /// mode/width, see TxProcessor::last_passband) with Tune on, fed into
+    /// a TX analyzer exactly as tx_loop does, zoomed the way Duplex's TX
+    /// inset zooms it (main.rs's tx_inset_*): the tone must sit mid-filter.
+    /// It was at 0 Hz -- a carrier outside the filter. Needs WDSP's FFTW
+    /// wisdom and real-time threads, so run on demand:
+    /// `cargo test --release tune_tone -- --ignored`.
+    #[test]
+    #[ignore]
+    fn tune_tone_is_mid_filter_in_tx_spectrum() {
+        let rate = 192_000.0;
+        let iq_buf = Arc::new(Mutex::new(VecDeque::new()));
+        let analyzer = SpectrumHandle::start(
+            21,
+            Arc::clone(&iq_buf),
+            rate as i32,
+            None,
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+        );
+        // SpectrumAnalyzer::open does WDSP's one-time setup on its thread;
+        // the TXA channel must not open before it.
+        std::thread::sleep(Duration::from_secs(2));
+        let mut processor = TxProcessor::open(20, 2, 48_000, rate as i32, None);
+        let passband = crate::spectrum::passband_for(Mode::Usb, 2700.0);
+        let filter = crate::tx_inset_filter(Mode::Usb, passband);
+        let (zoom, pan, shown) = crate::tx_inset_zoom_pan(crate::tx_inset_window(filter), rate);
+        analyzer.set_zoom_pan(zoom, pan);
+        let mic = vec![0.0f32; TX_BUFFER_SIZE];
+        for _ in 0..8 {
+            for _ in 0..(12_000 / TX_BUFFER_SIZE) {
+                let (iq, _) =
+                    processor.process(&mic, Mode::Usb, 1.0, 2700.0, true, false, EqualizerParams::default(), false, 0.0, false);
+                let mut q = iq_buf.lock().unwrap();
+                for pair in iq.chunks_exact(2) {
+                    q.push_back(IqSample { i: (pair[0] * PS_IQ_NORM) as i32, q: (pair[1] * PS_IQ_NORM) as i32 });
+                }
+            }
+            std::thread::sleep(Duration::from_millis(250));
+        }
+        let row = analyzer.display.lock().unwrap().spectrum.clone();
+        let peak = row.iter().enumerate().fold((0, f32::MIN), |a, (i, &v)| if v > a.1 { (i, v) } else { a }).0;
+        let tone_hz = (passband.0 + passband.1) / 2.0;
+        let expected = (tone_hz - shown.0) / (shown.1 - shown.0) * (row.len() - 1) as f64;
+        assert!((peak as f64 - expected).abs() <= 2.0, "peak at pixel {peak}, expected {expected:.1}");
     }
 }
