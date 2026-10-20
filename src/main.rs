@@ -152,8 +152,39 @@ fn gen_band(frequency_min: u64, frequency_max: u64) -> Band {
 /// directly into the radio's own hardware -- see main.rs's CW
 /// break-in handling (search "radio_keyed") for why that specific
 /// path can't be gated by software at all, by design.
+///
+/// Through a transverter, `freq_hz` (the radio's IF) isn't what goes
+/// out on the air, so the ham-band check is meaningless there: what
+/// counts is whether the RF frequency is inside the transverter's own
+/// configured range (TX_XVTR_STATE, set every frame alongside
+/// RadioSession::tx_frequency_hz). REAL REPORT (ANAN-8000DLE, 2m and
+/// 70cm transverters with 116/404 MHz LOs): MOX and Tune were greyed
+/// out because the IFs, 29.85 and 31.85 MHz, are outside 10m.
 pub(crate) fn tx_frequency_allowed(freq_hz: u32, allow_out_of_band: bool) -> bool {
-    allow_out_of_band || band_for_frequency(freq_hz).is_some()
+    allow_out_of_band
+        || match TX_XVTR_STATE.load(Ordering::Relaxed) {
+            TX_XVTR_IN_RANGE => true,
+            TX_XVTR_OUT_OF_RANGE => false,
+            _ => band_for_frequency(freq_hz).is_some(),
+        }
+}
+
+/// Whether TX currently goes through a transverter, and if so whether
+/// its RF frequency is inside that transverter's range -- see
+/// tx_frequency_allowed.
+static TX_XVTR_STATE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(TX_NO_XVTR);
+const TX_NO_XVTR: u8 = 0;
+const TX_XVTR_IN_RANGE: u8 = 1;
+const TX_XVTR_OUT_OF_RANGE: u8 = 2;
+
+/// TX_XVTR_STATE for transmitting at `tx_rf_hz` through `xvtr` (None:
+/// no transverter, so the IF itself is checked against the ham bands).
+fn tx_xvtr_state(xvtr: Option<&Xvtr>, tx_rf_hz: u64) -> u8 {
+    match xvtr {
+        None => TX_NO_XVTR,
+        Some(x) if (x.frequency_min_hz..=x.frequency_max_hz).contains(&tx_rf_hz) => TX_XVTR_IN_RANGE,
+        Some(_) => TX_XVTR_OUT_OF_RANGE,
+    }
 }
 
 /// Looks up the current band's calibrated PA gain (dB), falling back to
@@ -3763,10 +3794,16 @@ impl eframe::App for HpsdrApp {
                 connected.session.tx_frequency_hz.store(tx_dial_freq_hz, std::sync::atomic::Ordering::Relaxed);
                 // The HL2 IO board switches amplifiers/transverters on the
                 // real RF TX frequency, not the radio's IF.
-                connected.session.hl2_io_board.tx_rf_frequency_hz.store(
-                    (tx_dial_freq_hz as i64 + tx_rf_offset_hz).max(0) as u64,
-                    std::sync::atomic::Ordering::Relaxed,
-                );
+                let tx_rf_hz = (tx_dial_freq_hz as i64 + tx_rf_offset_hz).max(0) as u64;
+                connected.session.hl2_io_board.tx_rf_frequency_hz.store(tx_rf_hz, std::sync::atomic::Ordering::Relaxed);
+                // Through a transverter, the out-of-band TX check goes by
+                // its RF range -- see tx_frequency_allowed.
+                let tx_xvtr = if tx_on_b {
+                    vfo_b_xvtr(connected)
+                } else {
+                    connected.active_xvtr.as_deref().and_then(|name| connected.xvtrs.iter().find(|x| x.name == name))
+                };
+                TX_XVTR_STATE.store(tx_xvtr_state(tx_xvtr, tx_rf_hz), std::sync::atomic::Ordering::Relaxed);
 
                 // While transmitting, show tx_spectrum (fed with the
                 // actual generated TX IQ -- see ConnectedState::tx_spectrum's
@@ -5203,8 +5240,9 @@ impl eframe::App for HpsdrApp {
                                 .on_hover_text(if mox_tx_allowed {
                                     "Click to toggle transmit on/off"
                                 } else {
-                                    "Blocked: outside every ham band -- enable \"Allow TX outside ham \
-                                     bands\" in Settings -> TX to override"
+                                    "Blocked: outside every ham band (or, through a transverter, \
+                                     outside its RF range in Settings -> XVTR) -- enable \"Allow TX \
+                                     outside ham bands\" in Settings -> TX to override"
                                 });
                             if mox_resp.clicked() {
                                 connected.session.set_mox(!mox_now);
@@ -14267,6 +14305,23 @@ fn main() -> eframe::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn transverter_tx_is_checked_against_its_rf_range() {
+        let x70 = Xvtr {
+            name: "70cm".into(),
+            frequency_min_hz: 432_000_000,
+            frequency_max_hz: 436_000_000,
+            lo_offset_hz: 404_000_000,
+            ..Default::default()
+        };
+        // The report: 435.850 MHz via a 404 MHz LO is a 31.85 MHz IF --
+        // outside every ham band, but inside the transverter's range.
+        assert!(band_for_frequency(31_850_000).is_none());
+        assert_eq!(tx_xvtr_state(Some(&x70), 435_850_000), TX_XVTR_IN_RANGE);
+        assert_eq!(tx_xvtr_state(Some(&x70), 437_000_000), TX_XVTR_OUT_OF_RANGE);
+        assert_eq!(tx_xvtr_state(None, 31_850_000), TX_NO_XVTR);
+    }
 
     #[test]
     fn tx_inset_covers_the_filter_with_a_margin() {

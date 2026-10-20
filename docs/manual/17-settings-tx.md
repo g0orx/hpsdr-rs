@@ -75,6 +75,11 @@ Kenwood CAT `KY` and rigctl `send_morse` remote equivalents), and CAT
 An already-running transmission can always be stopped regardless of this
 setting -- only *starting* one out of band is blocked.
 
+Through a [transverter](18-xvtr.md), the radio's own (IF) frequency
+isn't what goes out on the air, so instead the RF frequency must be
+inside the transverter's own **RF range** -- set that range to the part
+of the band you're allowed to transmit in.
+
 Turn this on only if you have your own explicit authorization for
 out-of-band operation (MARS/CAP, testing/development, etc.) -- it
 doesn't check any regulatory database, it only removes hpsdr-rs's own
