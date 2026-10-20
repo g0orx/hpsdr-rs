@@ -845,8 +845,11 @@ fn rx_gain_slider(ui: &mut egui::Ui, connected: &mut ConnectedState) -> bool {
         let agc = controls.tuner_agc.load(Ordering::Relaxed);
         let mut gain_db = connected.session.rx_attenuation.load(Ordering::Relaxed).min(50) as i32;
         // Same test rtlsdr_control_loop uses to pick the ADC branch.
-        let direct_sampling_active = controls.direct_sampling.load(Ordering::Relaxed) != 0
-            && connected.session.frequency_hz.load(Ordering::Relaxed) < rtlsdr::DIRECT_SAMPLING_BELOW_HZ;
+        let direct_sampling_active = rtlsdr::direct_sampling_branch(
+            connected.session.frequency_hz.load(Ordering::Relaxed),
+            controls.direct_sampling.load(Ordering::Relaxed),
+            controls.blog_v4.load(Ordering::Relaxed),
+        ) != 0;
         let enabled = !agc && !direct_sampling_active;
         let hover = if direct_sampling_active {
             "Not used in direct sampling mode (below 24 MHz) -- the tuner is bypassed."
@@ -2487,7 +2490,8 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
     settings.ozy_fpga_path = cfg.ozy_fpga_path.clone();
     settings.rx888_firmware_path = cfg.rx888_firmware_path.clone();
     if let Some(v) = cfg.rtlsdr_direct_sampling {
-        settings.rtlsdr_direct_sampling = v.min(2);
+        // Older versions' 0 ("Off") can't receive below 24 MHz -- now Q.
+        settings.rtlsdr_direct_sampling = if v == 1 { 1 } else { 2 };
     }
     if let Some(v) = cfg.rtlsdr_tuner_agc {
         settings.rtlsdr_tuner_agc = v;
@@ -8165,9 +8169,12 @@ impl eframe::App for HpsdrApp {
                                         let mut agc = controls.tuner_agc.load(Ordering::Relaxed);
                                         // Same test rtlsdr_control_loop uses to pick the
                                         // ADC branch: the tuner (and its gain) is bypassed.
-                                        let direct_sampling_active = controls.direct_sampling.load(Ordering::Relaxed) != 0
-                                            && connected.session.frequency_hz.load(Ordering::Relaxed)
-                                                < rtlsdr::DIRECT_SAMPLING_BELOW_HZ;
+                                        let blog_v4 = controls.blog_v4.load(Ordering::Relaxed);
+                                        let direct_sampling_active = rtlsdr::direct_sampling_branch(
+                                            connected.session.frequency_hz.load(Ordering::Relaxed),
+                                            controls.direct_sampling.load(Ordering::Relaxed),
+                                            blog_v4,
+                                        ) != 0;
                                         ui.horizontal(|ui| {
                                             if ui
                                                 .add_enabled(!direct_sampling_active, egui::Checkbox::new(&mut agc, "Tuner AGC"))
@@ -8185,23 +8192,32 @@ impl eframe::App for HpsdrApp {
                                              RF Gain slider is greyed out while this is on.",
                                         );
                                         ui.add_space(4.0);
-                                        let mut ds = controls.direct_sampling.load(Ordering::Relaxed);
-                                        ui.horizontal(|ui| {
-                                            ui.label("Below 24 MHz:");
-                                            for (value, label) in [(0u8, "Off"), (1, "Direct sampling (I)"), (2, "Direct sampling (Q)")] {
-                                                if ui.add(egui::Button::selectable(ds == value, label)).clicked() && ds != value {
-                                                    ds = value;
-                                                    controls.direct_sampling.store(ds, Ordering::Relaxed);
-                                                    settings_changed = true;
+                                        if blog_v4 {
+                                            ui.weak(
+                                                "RTL-SDR Blog V4: below 28.8 MHz the tuner receives HF through \
+                                                 the dongle's built-in upconverter.",
+                                            );
+                                        } else {
+                                            // Older versions saved 0 for "Off"; it now means Q
+                                            // (see rtlsdr::direct_sampling_branch).
+                                            let mut ds = if controls.direct_sampling.load(Ordering::Relaxed) == 1 { 1 } else { 2 };
+                                            ui.horizontal(|ui| {
+                                                ui.label("Below 24 MHz:");
+                                                for (value, label) in [(2u8, "Direct sampling (Q)"), (1, "Direct sampling (I)")] {
+                                                    if ui.add(egui::Button::selectable(ds == value, label)).clicked() && ds != value {
+                                                        ds = value;
+                                                        controls.direct_sampling.store(ds, Ordering::Relaxed);
+                                                        settings_changed = true;
+                                                    }
                                                 }
-                                            }
-                                        });
-                                        ui.weak(
-                                            "The tuner stops at ~24 MHz. Below that, direct sampling feeds the antenna \
-                                             straight into one of the RTL2832U's ADC inputs -- only useful on a dongle \
-                                             modified (or built) for HF; an unmodified NESDR Smart just shows noise. \
-                                             RF Gain and Tuner AGC have no effect in direct sampling mode.",
-                                        );
+                                            });
+                                            ui.weak(
+                                                "The tuner stops at ~24 MHz, so below that direct sampling is used \
+                                                 automatically: the antenna goes straight into one of the RTL2832U's \
+                                                 ADC inputs. Q suits most dongles (including the NESDR Smart); try I if \
+                                                 Q is weak. RF Gain and Tuner AGC have no effect in direct sampling mode.",
+                                            );
+                                        }
                                         ui.separator();
                                     }
 

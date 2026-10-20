@@ -116,9 +116,26 @@ pub fn decimation_for_output_rate(output_rate_hz: u32) -> Option<u32> {
 }
 
 /// Tuned below this, the R82xx can't help (its PLL bottoms out around
-/// 24MHz) and direct sampling takes over automatically if enabled --
-/// see `Controls::direct_sampling`.
+/// 24MHz) and direct sampling takes over automatically -- see
+/// `direct_sampling_branch`.
 pub const DIRECT_SAMPLING_BELOW_HZ: u32 = 24_000_000;
+
+/// The ADC branch to use when tuned to `freq_hz` (librtlsdr's
+/// numbering: 0 = tuner, 1 = I, 2 = Q). Below DIRECT_SAMPLING_BELOW_HZ
+/// the tuner can't receive at all, so direct sampling is always used
+/// there -- `setting` only picks the branch, and anything but 1 (a 0
+/// saved by older versions' "Off") means Q. A Blog V4 receives HF
+/// through its own upconverter (see R82xx::set_freq), so it stays on
+/// the tuner.
+pub fn direct_sampling_branch(freq_hz: u32, setting: u8, blog_v4: bool) -> u8 {
+    if blog_v4 || freq_hz >= DIRECT_SAMPLING_BELOW_HZ {
+        0
+    } else if setting == 1 {
+        1
+    } else {
+        2
+    }
+}
 
 /// Top of the R820T2's usable range (librtlsdr has no hard limit; this
 /// is the commonly quoted figure, and above it the PLL simply fails to
@@ -140,12 +157,12 @@ const R82XX_GAINS_TENTH_DB: [i32; 29] = [
 /// 0-50) rather than here, so MIDI and config persistence pick it up
 /// for free, same as the RX-888's attenuator.
 pub struct Controls {
-    /// 0 = off, 1 = I-branch, 2 = Q-branch (librtlsdr's own numbering
-    /// for rtlsdr_set_direct_sampling). Only takes effect while tuned
-    /// below DIRECT_SAMPLING_BELOW_HZ; above it the tuner is always used.
-    /// The NESDR Smart needs a hardware mod to get anything useful from
-    /// either branch -- on an unmodified dongle this just shows noise.
+    /// Direct-sampling branch below DIRECT_SAMPLING_BELOW_HZ: 1 = I,
+    /// 2 = Q (librtlsdr's numbering). See direct_sampling_branch.
     pub direct_sampling: AtomicU8,
+    /// Set once the dongle is open: an RTL-SDR Blog V4, which receives
+    /// HF through the tuner (built-in upconverter), not direct sampling.
+    pub blog_v4: AtomicBool,
     /// Hands gain control to the R82xx's own LNA/mixer AGC instead of
     /// the RF Gain value (rtlsdr_set_tuner_gain_mode(dev, 0)).
     pub tuner_agc: AtomicBool,
@@ -1143,6 +1160,10 @@ impl RtlSdrDevice {
         self.direct_sampling
     }
 
+    pub fn is_blog_v4(&self) -> bool {
+        self.tuner.is_blog_v4
+    }
+
     /// rtlsdr_reset_buffer
     fn reset_buffer(&self) -> io::Result<()> {
         self.usb.write_reg(USBB, USB_EPA_CTL, 0x1002, 2)?;
@@ -1279,12 +1300,11 @@ pub fn initialise(
 
     // --- end of rtlsdr_open; client-side bring-up from here ---
     dev.set_sample_rate(DONGLE_RATE_HZ)?;
-    let ds = if initial_freq_hz < DIRECT_SAMPLING_BELOW_HZ { direct_sampling } else { 0 };
+    let ds = direct_sampling_branch(initial_freq_hz, direct_sampling, is_blog_v4);
     if ds != 0 {
         dev.set_direct_sampling(ds)?;
     }
-    // A frequency the tuner can't reach (e.g. HF with direct sampling
-    // off) isn't fatal -- the user can retune -- so just log it.
+    // A frequency the tuner can't reach isn't fatal -- the user can retune -- so just log it.
     if let Err(e) = dev.set_center_freq(initial_freq_hz) {
         eprintln!("RTL-SDR: couldn't tune to {initial_freq_hz} Hz: {e}");
     }
@@ -1706,6 +1726,18 @@ fn solve_linear(mut a: Vec<Vec<f64>>, mut b: Vec<f64>) -> Vec<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn direct_sampling_is_automatic_below_24mhz() {
+        // A 0 saved by older versions' "Off" means Q, not silence.
+        assert_eq!(direct_sampling_branch(14_175_000, 0, false), 2);
+        assert_eq!(direct_sampling_branch(14_175_000, 2, false), 2);
+        assert_eq!(direct_sampling_branch(14_175_000, 1, false), 1);
+        assert_eq!(direct_sampling_branch(DIRECT_SAMPLING_BELOW_HZ, 2, false), 0);
+        assert_eq!(direct_sampling_branch(145_000_000, 1, false), 0);
+        // Blog V4: HF through its upconverter, on the tuner.
+        assert_eq!(direct_sampling_branch(7_100_000, 2, true), 0);
+    }
 
     #[test]
     fn every_supported_rate_is_an_exact_decimation() {

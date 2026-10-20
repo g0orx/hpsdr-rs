@@ -55,16 +55,16 @@ different port makes it look like a new dongle.
 - **~24 MHz to 1.766 GHz** through the tuner. Band buttons for **10m,
   6m, 2m, 70cm and 23cm** appear, plus [**Gen**](02-main-window.md#bands-and-modes)
   for anywhere else.
-- **Below 24 MHz**, the tuner can't help. Settings → RX → **Below 24
-  MHz** chooses what happens there:
-  - **Direct sampling (Q)** (the default) or **(I)**: the antenna is fed
-    straight into one of the RTL2832U's ADC inputs, and hpsdr-rs switches
-    to it automatically whenever you tune below 24 MHz, and back to the
-    tuner above it. This only works on a dongle modified or designed for
-    HF reception (most HF mods use the Q branch). **An unmodified NESDR
-    Smart just shows noise here.**
-  - **Off**: below 24 MHz the tuner simply can't lock, and you get
-    silence.
+- **Below 24 MHz**, the tuner can't help, so hpsdr-rs switches to
+  **direct sampling** automatically whenever you tune below 24 MHz, and
+  back to the tuner above it. The antenna is then fed straight into one
+  of the RTL2832U's ADC inputs. Settings → RX → **Below 24 MHz** picks
+  which one:
+  - **Direct sampling (Q)** (the default) suits most dongles, including
+    the NESDR Smart.
+  - **Direct sampling (I)**: try it if Q is weak.
+- An **RTL-SDR Blog V4** has a built-in HF upconverter, so it stays on
+  the tuner below 28.8 MHz and the choice isn't shown.
 
 ## RF Gain
 

@@ -2972,6 +2972,7 @@ fn start_usb_dongle(
     let controls = (!is_mirisdr).then(|| {
         Arc::new(rtlsdr::Controls {
             direct_sampling: AtomicU8::new(settings.rtlsdr_direct_sampling),
+            blog_v4: AtomicBool::new(false),
             tuner_agc: AtomicBool::new(settings.rtlsdr_tuner_agc),
         })
     });
@@ -3139,6 +3140,7 @@ fn spawn_rtlsdr_threads(
         controls.direct_sampling.load(Ordering::Relaxed),
     )?;
     println!("RTL-SDR: {name} streaming at {} Hz, decimating by {decimation}", rtlsdr::DONGLE_RATE_HZ);
+    controls.blog_v4.store(device.is_blog_v4(), Ordering::Relaxed);
 
     let receiver_buffer = Arc::clone(iq_buffer);
     let receiver_stop = Arc::clone(stop_flag);
@@ -3213,8 +3215,8 @@ const RTLSDR_CONTROL_POLL: Duration = Duration::from_millis(20);
 /// below still goes by the dial frequency itself.
 ///
 /// Direct sampling switches automatically: tuned below
-/// rtlsdr::DIRECT_SAMPLING_BELOW_HZ with it enabled -> that ADC branch,
-/// otherwise the tuner. Switching back to the tuner re-runs its init
+/// rtlsdr::DIRECT_SAMPLING_BELOW_HZ -> the chosen ADC branch, otherwise
+/// the tuner (see rtlsdr::direct_sampling_branch). Switching back to the tuner re-runs its init
 /// (librtlsdr does the same), which resets its gain registers, so gain
 /// is re-applied after every mode change.
 fn rtlsdr_control_loop(
@@ -3233,7 +3235,7 @@ fn rtlsdr_control_loop(
         let freq = frequency_hz.load(Ordering::Relaxed);
         let offset_hz = rtlsdr::tuning_offset_hz(rate.decimation.load(Ordering::Relaxed));
         let ds_setting = controls.direct_sampling.load(Ordering::Relaxed);
-        let wanted_ds = if freq < rtlsdr::DIRECT_SAMPLING_BELOW_HZ { ds_setting } else { 0 };
+        let wanted_ds = rtlsdr::direct_sampling_branch(freq, ds_setting, device.is_blog_v4());
         let gain = (rx_attenuation.load(Ordering::Relaxed), controls.tuner_agc.load(Ordering::Relaxed));
 
         let mut force_gain = false;

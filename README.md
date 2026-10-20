@@ -221,9 +221,8 @@ no librtlsdr or libusb to install.
 
 - Tunes **~24 MHz – 1.766 GHz** with the tuner; **2m, 70cm and 23cm**
   band buttons appear for it alongside 10m/6m.
-- Below 24 MHz, **direct sampling** (Settings → RX, I or Q branch) is used
-  automatically — this needs a dongle modified or built for HF; an
-  unmodified NESDR Smart just shows noise there.
+- Below 24 MHz, **direct sampling** (Settings → RX, Q or I branch) is used
+  automatically; an RTL-SDR Blog V4 uses its built-in HF upconverter instead.
 - **RF Gain** (0–50 dB) is on the main window next to AGC Gain; **Tuner AGC** is in Settings → RX.
 - Sample rates **48–1536 kHz**; one receiver.
 
