@@ -134,6 +134,32 @@ const MAX_PAGES: usize = 32;
 /// IqSample's full scale (24-bit) -- same as spectrum.rs's IQ_NORM.
 const IQ_NORM: f32 = 8_388_608.0;
 
+/// The narrowband transponder's lower and upper CW beacons (10489.500
+/// and 10490.000 MHz) sit this far either side of the PSK beacon. An LNB
+/// error moves all three together, so the 500 kHz spacing is a marker
+/// that's easy to find over a much wider range than WIDE_SEARCH_HZ -- see
+/// PairSearch.
+const CW_BEACON_SPACING_HZ: f64 = 250_000.0;
+/// PairSearch only runs if it can cover at least this much LNB error,
+/// i.e. clearly more than the wide search alone (in practice: a span of
+/// 768 kHz or more with the PSK beacon near the middle).
+const PAIR_MIN_RANGE_HZ: f64 = 20_000.0;
+/// And never further than this either side of the expected position.
+const PAIR_MAX_RANGE_HZ: f64 = 150_000.0;
+/// Room left between a CW beacon and the edge of the span.
+const PAIR_EDGE_MARGIN_HZ: f64 = 4_000.0;
+/// FFT bins of roughly this width (Hz), so a CW carrier stands well out.
+const PAIR_BIN_HZ: f64 = 12.0;
+/// Windows averaged before deciding; one window in every two is used
+/// (to halve the cost), so ~2 s at any rate.
+const PAIR_WINDOWS: usize = 12;
+/// How far from exactly 500 kHz apart the two beacons may come out --
+/// the receiver's sample clock error (50 Hz is 100 ppm).
+const PAIR_SPACING_TOLERANCE_HZ: f64 = 60.0;
+/// The weaker of the two beacons' peaks must be at least this many times
+/// the median of the searched bins. Noise alone stays below ~2.
+pub const PAIR_MIN_LEVEL: f32 = 8.0;
+
 #[derive(Clone, Copy, Default, Debug)]
 struct Cx {
     re: f32,
@@ -183,6 +209,12 @@ pub struct BeaconStatus {
     /// While searching: the most likely candidate the wide search saw,
     /// shown in the panel to help when it isn't found.
     pub candidate: Option<SearchCandidate>,
+    /// PairSearch is looking for the lower/upper CW beacons.
+    pub pair_searching: bool,
+    /// Where PairSearch found the CW beacons, as the LNB error (Hz from
+    /// expected) -- the wide search then starts from there. None if it
+    /// hasn't run, or didn't find them.
+    pub pair_offset_hz: Option<f64>,
     pub frames_ok: u32,
     pub frames_bad: u32,
     pub pages: Vec<BeaconPage>,
@@ -652,6 +684,112 @@ impl BeaconCore {
     }
 }
 
+/// Coarse LNB-error search from the lower and upper CW beacons, which
+/// sit CW_BEACON_SPACING_HZ below and above the PSK beacon: power-average
+/// the whole received span at ~PAIR_BIN_HZ resolution, then find the
+/// shift (within `range_hz`) that puts a strong carrier at BOTH beacons'
+/// expected positions. Run once when the monitor starts, so the wide
+/// search -- which only reaches +/-WIDE_SEARCH_HZ -- starts at the right
+/// place even with an LNB tens of kHz out.
+struct PairSearch {
+    /// The PSK beacon's expected offset from the IQ centre when this
+    /// started; a retune that moves it restarts the average.
+    expected_hz: f64,
+    rate_hz: f64,
+    range_hz: f64,
+    buf: Vec<Cx>,
+    pos: usize,
+    /// Samples still to skip before filling the next window.
+    skip: usize,
+    window: Vec<f32>,
+    avg: Vec<f32>,
+    windows: usize,
+}
+
+impl PairSearch {
+    /// How much LNB error a pair search could cover with the PSK beacon
+    /// expected `expected_hz` from the centre of a `rate_hz` span: both
+    /// CW beacons, moved by up to that much, must stay inside it.
+    fn range_hz(expected_hz: f64, rate_hz: f64) -> f64 {
+        (rate_hz / 2.0 - CW_BEACON_SPACING_HZ - expected_hz.abs() - PAIR_EDGE_MARGIN_HZ).min(PAIR_MAX_RANGE_HZ)
+    }
+
+    fn new(expected_hz: f64, rate_hz: f64) -> Self {
+        let n = ((rate_hz / PAIR_BIN_HZ) as usize).next_power_of_two();
+        Self {
+            expected_hz,
+            rate_hz,
+            range_hz: Self::range_hz(expected_hz, rate_hz),
+            buf: vec![Cx::default(); n],
+            pos: 0,
+            skip: 0,
+            window: (0..n).map(|i| (0.5 - 0.5 * (2.0 * PI * i as f64 / n as f64).cos()) as f32).collect(),
+            avg: vec![0.0; n],
+            windows: 0,
+        }
+    }
+
+    /// Adds one raw sample. Once PAIR_WINDOWS windows are averaged,
+    /// returns the result: Some(the LNB error, Hz from expected) if both
+    /// beacons were found, else None.
+    fn push(&mut self, x: Cx) -> Option<Option<f64>> {
+        if self.skip > 0 {
+            self.skip -= 1;
+            return None;
+        }
+        self.buf[self.pos] = x;
+        self.pos += 1;
+        if self.pos < self.buf.len() {
+            return None;
+        }
+        self.pos = 0;
+        self.skip = self.buf.len();
+        let mut spectrum: Vec<Cx> = self.buf.iter().zip(&self.window).map(|(z, w)| z.scale(*w)).collect();
+        fft(&mut spectrum);
+        for (avg, v) in self.avg.iter_mut().zip(&spectrum) {
+            *avg += v.norm_sqr();
+        }
+        self.windows += 1;
+        (self.windows >= PAIR_WINDOWS).then(|| self.decide())
+    }
+
+    fn decide(&self) -> Option<f64> {
+        let n = self.avg.len() as i64;
+        let bin_hz = self.rate_hz / n as f64;
+        let to_bin = |hz: f64| (hz / bin_hz).round() as i64;
+        let power = |bin: i64| self.avg[bin.rem_euclid(n) as usize];
+        let lower = to_bin(self.expected_hz - CW_BEACON_SPACING_HZ);
+        let upper = to_bin(self.expected_hz + CW_BEACON_SPACING_HZ);
+        let range = to_bin(self.range_hz);
+        let tol = to_bin(PAIR_SPACING_TOLERANCE_HZ).max(1);
+        // Strongest bin within the spacing tolerance of `centre`.
+        let peak = |centre: i64| (centre - tol..=centre + tol).map(|b| (b, power(b))).fold((centre, 0.0f32), |a, x| if x.1 > a.1 { x } else { a });
+
+        let mut searched: Vec<f32> = (-range - tol..=range + tol).flat_map(|d| [power(lower + d), power(upper + d)]).collect();
+        let mid = searched.len() / 2;
+        let floor = *searched.select_nth_unstable_by(mid, |a, b| a.total_cmp(b)).1;
+        if floor <= 0.0 {
+            return None;
+        }
+        // The shift whose weaker beacon is strongest.
+        let (mut best_level, mut best) = (0.0f32, None);
+        for d in -range..=range {
+            let (lo, hi) = (peak(lower + d), peak(upper + d));
+            let level = lo.1.min(hi.1);
+            if level > best_level {
+                best_level = level;
+                best = Some((lo.0, hi.0));
+            }
+        }
+        let (lo_bin, hi_bin) = best?;
+        if best_level / floor < PAIR_MIN_LEVEL {
+            return None;
+        }
+        // Average the two beacons' shifts.
+        Some(((lo_bin - lower) + (hi_bin - upper)) as f64 * bin_hz / 2.0)
+    }
+}
+
 /// The beacon monitor: wideband IQ in, BeaconStatus out.
 pub struct BeaconMonitor {
     status: Arc<Mutex<BeaconStatus>>,
@@ -676,6 +814,10 @@ pub struct BeaconMonitor {
     plain_avg: Vec<f32>,
     sq_avg: Vec<f32>,
     wide_windows: usize,
+    /// The CW-beacon pair search, while it runs (see PairSearch), and
+    /// whether it has run since the monitor was last started.
+    pair: Option<PairSearch>,
+    pair_done: bool,
 }
 
 impl BeaconMonitor {
@@ -702,6 +844,8 @@ impl BeaconMonitor {
             plain_avg: vec![0.0; WIDE_LEN],
             sq_avg: vec![0.0; WIDE_LEN],
             wide_windows: 0,
+            pair: None,
+            pair_done: false,
         }
     }
 
@@ -713,12 +857,18 @@ impl BeaconMonitor {
             if self.expected_hz.is_some() {
                 self.expected_hz = None;
                 self.restart();
-                self.status.lock().unwrap().in_span = false;
+                // Monitor off: look for the CW beacons again next time.
+                self.pair = None;
+                self.pair_done = false;
+                let mut status = self.status.lock().unwrap();
+                status.in_span = false;
+                status.pair_searching = false;
             }
             return;
         };
         if input_rate_hz != self.input_rate_hz {
             self.set_input_rate(input_rate_hz);
+            self.pair = None;
         }
         // A big jump (retuned, another transverter) invalidates the
         // search windows; small moves are just followed. coarse_hz is
@@ -729,6 +879,19 @@ impl BeaconMonitor {
         }
         self.expected_hz = Some(expected);
         self.nco.set_freq(expected + self.coarse_hz, input_rate_hz);
+        // The pair search averages ~2 s of the span as it lies: any retune
+        // that moves it means starting that average again.
+        if self.pair.as_ref().is_some_and(|p| (p.expected_hz - expected).abs() > PAIR_BIN_HZ) {
+            self.pair = None;
+        }
+        if self.pair.is_none()
+            && !self.pair_done
+            && self.core.carrier_hz.is_none()
+            && PairSearch::range_hz(expected, input_rate_hz) >= PAIR_MIN_RANGE_HZ
+        {
+            self.pair = Some(PairSearch::new(expected, input_rate_hz));
+            self.status.lock().unwrap().pair_searching = true;
+        }
         for s in iq {
             // q is the real part: WDSP's analyzer (analyzer.c Spectrum0)
             // takes the second value of each pair spectrum.rs passes it --
@@ -737,7 +900,11 @@ impl BeaconMonitor {
             // instead mirrors the spectrum, which got the beacon's offset,
             // and so the LNB correction, the wrong way round on a real
             // MSI.SDR.
-            let x = Cx::new(s.q as f32 / IQ_NORM, s.i as f32 / IQ_NORM).mul(self.nco.next());
+            let raw = Cx::new(s.q as f32 / IQ_NORM, s.i as f32 / IQ_NORM);
+            if let Some(result) = self.pair.as_mut().and_then(|p| p.push(raw)) {
+                self.pair_found(result);
+            }
+            let x = raw.mul(self.nco.next());
             let mid = match self.to_mid.as_mut() {
                 Some(d) => match d.push(x) {
                     Some(v) => v,
@@ -766,6 +933,25 @@ impl BeaconMonitor {
                 if let Some(c) = self.core.carrier_hz.filter(|c| c.abs() > RECENTRE_HZ) {
                     self.recentre(self.coarse_hz + c);
                 }
+            }
+        }
+    }
+
+    /// The pair search has finished: Some(LNB error) if it found both CW
+    /// beacons. Unless the wide search has already found the PSK beacon,
+    /// move it to start from there (if that's further than a small
+    /// fraction of its own reach from where it's looking now).
+    fn pair_found(&mut self, result: Option<f64>) {
+        self.pair = None;
+        self.pair_done = true;
+        {
+            let mut status = self.status.lock().unwrap();
+            status.pair_searching = false;
+            status.pair_offset_hz = result;
+        }
+        if let Some(offset) = result {
+            if self.core.carrier_hz.is_none() && (offset - self.coarse_hz).abs() > WIDE_SEARCH_HZ / 4.0 {
+                self.recentre(offset);
             }
         }
     }
@@ -891,6 +1077,11 @@ impl BeaconMonitor {
             // Centre the core on the line (carrier) and start tracking.
             self.recentre(cand.offset_hz);
             self.core.acquire(0.0);
+            // Found it already: no need for the CW beacons.
+            if self.pair.take().is_some() {
+                self.pair_done = true;
+                self.status.lock().unwrap().pair_searching = false;
+            }
         }
     }
 
@@ -1087,6 +1278,78 @@ mod tests {
         let st = status.lock().unwrap();
         assert!(st.offset_hz.is_none());
         assert_eq!(st.frames_ok + st.frames_bad, 0);
+        // The pair search ran (768 kHz, beacon centred) and found nothing.
+        assert!(!st.pair_searching);
+        assert!(st.pair_offset_hz.is_none());
+    }
+
+    /// PairSearch alone at 1536 kHz: an LNB 100 kHz low, the PSK beacon
+    /// expected 30 kHz off-centre, a decoy carrier 10 dB stronger than
+    /// the beacons 7 kHz from the PSK beacon's position, and noise.
+    #[test]
+    fn pair_search_at_1536k_finds_large_negative_offset() {
+        let rate = 1_536_000.0;
+        let (expected, lnb) = (30_000.0, -100_000.0);
+        let mut search = PairSearch::new(expected, rate);
+        assert_eq!(search.range_hz, PAIR_MAX_RANGE_HZ);
+        let tones = [
+            (expected + lnb - CW_BEACON_SPACING_HZ, 0.3),
+            (expected + lnb + CW_BEACON_SPACING_HZ, 0.3),
+            (expected + lnb - CW_BEACON_SPACING_HZ + 250_000.0 + 7_000.0, 1.0),
+        ];
+        let mut rng = Lcg(7);
+        let mut result = None;
+        for n in 0..(rate * 3.0) as usize {
+            let mut x = Cx::new((0.05 * rng.gauss()) as f32, (0.05 * rng.gauss()) as f32);
+            for (hz, amp) in tones {
+                let ph = 2.0 * PI * hz * n as f64 / rate;
+                x = x.add(Cx::new((amp * ph.cos()) as f32, (amp * ph.sin()) as f32).scale(0.1));
+            }
+            if let Some(r) = search.push(x) {
+                result = Some(r);
+                break;
+            }
+        }
+        let offset = result.expect("finished within 3 s").expect("found");
+        assert!((offset - lnb).abs() < 20.0, "offset {offset}");
+    }
+
+    /// An LNB 45 kHz out -- far beyond the wide search's +/-10 kHz -- at
+    /// 768 kHz with the beacon centred: the CW beacons 250 kHz either
+    /// side (30 Hz further apart than nominal, a sample clock error)
+    /// give the offset, then the PSK beacon is found and decoded as
+    /// usual. Plus a strong stray carrier that mustn't confuse it.
+    #[test]
+    fn cw_beacon_pair_finds_lnb_far_out() {
+        let rate = 768_000.0;
+        let lnb = 45_000.0;
+        // Longer fill first: the pair search (~2 s) comes before the
+        // usual acquisition.
+        let mut bytes = vec![0x50u8; 500];
+        bytes.extend(frame_bytes('L', "HI de Qatar-OSCAR 100 (DK0SB)"));
+        bytes.extend(vec![0x50u8; 100]);
+        bytes.extend(frame_bytes('M', "Second page"));
+        bytes.extend(vec![0x50u8; 20]);
+        let (mut iq, end_freq) = modulate_iq(&bytes, rate, lnb, 2.0, 2.0);
+        let scale = IQ_NORM as f64 * 0.1;
+        for (n, s) in iq.iter_mut().enumerate() {
+            for (hz, amp) in [(lnb - CW_BEACON_SPACING_HZ - 15.0, 1.0), (lnb + CW_BEACON_SPACING_HZ + 15.0, 1.0), (-90_000.0, 3.0)] {
+                let ph = 2.0 * PI * hz * n as f64 / rate;
+                s.q += (scale * amp * ph.cos()) as i32;
+                s.i += (scale * amp * ph.sin()) as i32;
+            }
+        }
+        let status = Arc::new(Mutex::new(BeaconStatus::default()));
+        let mut mon = BeaconMonitor::new(Arc::clone(&status));
+        for block in iq.chunks(2048) {
+            mon.process(block, rate, Some(0.0));
+        }
+        let st = status.lock().unwrap();
+        let pair = st.pair_offset_hz.expect("CW beacons found");
+        assert!((pair - lnb).abs() < 20.0, "pair offset {pair}");
+        assert_eq!(st.frames_ok, 2, "{st:?}");
+        let predicted = st.predicted_offset_hz.expect("carrier found");
+        assert!((predicted - end_freq).abs() < 3.0, "predicted {predicted}, true {end_freq}");
     }
 
     /// Replays a real AUDIO recording of the beacon (USB, beacon in the

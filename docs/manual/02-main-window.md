@@ -105,9 +105,17 @@ so the main receiver stays free for normal use. The intended setup:
 
 The beacon just has to be in the span (not within 12 kHz of its edge);
 the mode and filter don't matter. It's searched for within 10 kHz of
-where the transverter's **LO Offset** and **LO Error** say it should be,
-so if your LNB is further off than that, set LO Error closer by hand
-first. Only a signal with the beacon's PSK shape is accepted, so a
+where the transverter's **LO Offset** and **LO Error** say it should be.
+
+With a wide enough span -- 768 kHz or more with the beacon near the
+middle -- it first looks for the transponder's lower and upper CW
+beacons (10489.500 and 10490.000 MHz). An LNB error moves all three
+beacons together but leaves the CW pair exactly 500 kHz apart, so
+finding that pair shows how far out the LNB is, up to about 130 kHz at
+768 kHz (150 kHz at 1536 kHz), and the PSK beacon search starts from
+there. This takes about 2 seconds when the monitor starts. With a
+narrower span, or if the CW beacons aren't found, an LNB more than 10
+kHz out needs LO Error set closer by hand first. Only a signal with the beacon's PSK shape is accepted, so a
 stronger CW carrier nearby won't be mistaken for it. While it's
 searching, the panel shows the best candidate it has seen and how it
 measured up, which helps if it's never found.

@@ -10829,11 +10829,29 @@ fn render_psk_beacon_panel(ui: &mut egui::Ui, connected: &mut ConnectedState) ->
                      put it -- i.e. the LNB's drift.",
                 );
             }
+            _ if status.pair_searching => {
+                ui.colored_label(egui::Color32::GRAY, "Looking for the lower and upper CW beacons (500 kHz apart)")
+                    .on_hover_text(
+                        "With the whole narrowband transponder in the span (768 kHz or more, beacon near the \
+                         middle), the CW beacons at 10489.500 and 10490.000 MHz show how far out your LNB is, \
+                         even well beyond the PSK beacon search's +/-10 kHz. Takes about 2 seconds.",
+                    );
+            }
             _ => {
-                ui.colored_label(egui::Color32::GRAY, "Searching for the beacon (within +/-10 kHz)").on_hover_text(
-                    "Takes a few seconds. If it's never found, your LNB may be more than 10 kHz \
-                     off: set the transverter's LO Error closer first.",
-                );
+                let (text, hover) = match status.pair_offset_hz {
+                    Some(lnb) => (
+                        format!("CW beacons found {lnb:+.0} Hz from expected -- searching for the PSK beacon there"),
+                        "Takes a few seconds.".to_string(),
+                    ),
+                    None => (
+                        "Searching for the beacon (within +/-10 kHz)".to_string(),
+                        "Takes a few seconds. If it's never found, your LNB may be more than 10 kHz off: set the \
+                         transverter's LO Error closer first, or use a sample rate of 768 kHz or more with the \
+                         beacon near the middle, so the CW beacons 250 kHz either side can be used to find it."
+                            .to_string(),
+                    ),
+                };
+                ui.colored_label(egui::Color32::GRAY, text).on_hover_text(hover);
                 // What the search is seeing -- for working out why it
                 // isn't finding the beacon.
                 if let Some(c) = status.candidate {
