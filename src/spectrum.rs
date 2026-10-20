@@ -163,8 +163,13 @@ pub fn passband_for(mode: Mode, width_hz: f64) -> (f64, f64) {
     let width_hz = width_hz.max(50.0);
     let low_cut = 150.0_f64.min(width_hz * 0.1);
     match mode {
-        Mode::Lsb | Mode::Digl => (-width_hz, -low_cut),
-        Mode::Usb | Mode::Digu => (low_cut, width_hz),
+        Mode::Lsb => (-width_hz, -low_cut),
+        Mode::Usb => (low_cut, width_hz),
+        // Digital modes start at 0 Hz (real request: the QO-100
+        // high-speed modem uses the whole audio passband) -- RX, TX and
+        // the passband shading alike, since they all come from here.
+        Mode::Digl => (-width_hz, 0.0),
+        Mode::Digu => (0.0, width_hz),
         Mode::Dsb | Mode::Am | Mode::Sam | Mode::Drm | Mode::Spec | Mode::Fmn => {
             (-width_hz, width_hz)
         }
@@ -2393,6 +2398,15 @@ impl Drop for SpectrumHandle {
 #[cfg(test)]
 mod squelch_tests {
     use super::*;
+
+    #[test]
+    fn digital_modes_start_at_0_hz() {
+        assert_eq!(passband_for(Mode::Digu, 2800.0), (0.0, 2800.0));
+        assert_eq!(passband_for(Mode::Digl, 2800.0), (-2800.0, 0.0));
+        // SSB keeps its 150 Hz low cut.
+        assert_eq!(passband_for(Mode::Usb, 2700.0), (150.0, 2700.0));
+        assert_eq!(passband_for(Mode::Lsb, 2700.0), (-2700.0, -150.0));
+    }
 
     #[test]
     fn squelch_maps_level_per_mode() {

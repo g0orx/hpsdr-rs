@@ -13,8 +13,10 @@ that VFO is the one actually transmitting (see
 
 - **Scroll** while hovering the frequency display, or the spectrum/waterfall
   panes: steps by 1 kHz per notch. Hold **Shift** while scrolling for 100 Hz
-  steps. In CW mode (**CWL**/**CWU**), steps are finer -- 100 Hz per notch,
-  10 Hz with Shift -- matching how tightly CW is normally zero-beaten.
+  steps, or **Alt** for 10 Hz steps (in any mode -- e.g. for fine-tuning a
+  digital modem). In CW mode (**CWL**/**CWU**), steps are finer -- 100 Hz
+  per notch, 10 Hz with Shift -- matching how tightly CW is normally
+  zero-beaten.
   Clicking a signal on the spectrum/waterfall in CW mode also centers it in
   the (narrow) CW filter passband rather than at the dial frequency itself,
   using the *exact* frequency under the cursor rather than rounding to the
@@ -158,7 +160,7 @@ working.
 Next to the **VFO-A** box is a second, independent **VFO-B** box -- a
 second remembered frequency with no receiver of its own (this app doesn't
 receive on two frequencies at once). You can scroll on the VFO-B box the
-same way as VFO-A (Shift for 100 Hz steps, otherwise 1 kHz) to change its
+same way as VFO-A (Alt for 10 Hz steps, Shift for 100 Hz, otherwise 1 kHz) to change its
 stored value directly, or use the buttons between the two boxes:
 
 - **A>B** -- copies VFO A's current frequency (and transverter) into VFO
@@ -244,7 +246,10 @@ Below that, a row of mode buttons: **LSB, USB, DSB, CWL, CWU, FM, AM, DIGU,
 SPEC, DIGL, SAM, DRM**.
 
 Next to the mode row, **Filter width** sets the demodulator passband width
-in Hz (50-5000 Hz). Each mode remembers its own last-used width.
+in Hz (50-5000 Hz). Each mode remembers its own last-used width. **USB**
+and **LSB** filters start 150 Hz from the carrier; **DIGU** and **DIGL**
+start at 0 Hz, using the whole audio passband (e.g. for a high-speed
+modem) -- for transmit as well as receive.
 
 ## Audio gain
 
