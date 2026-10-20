@@ -54,6 +54,20 @@ the scenes, hpsdr-rs loads the FX2 firmware, waits a few seconds for the
 device to re-enumerate, then loads the FPGA bitstream, before streaming
 actually begins.
 
+## Atlas clocks
+
+**Settings → RX → Atlas clocks** says which boards supply the Atlas
+bus's clocks -- the same choices as PowerSDR's and piHPSDR's clock
+source settings. Set them to match how your boards are jumpered:
+
+- **122.88 MHz from**: **Penelope** or **Mercury**. Until you choose,
+  it's Penelope if one answers at start-up, otherwise Mercury.
+- **10 MHz reference from**: **Atlas** (another board on the bus, e.g.
+  Excalibur; the default), **Penelope** or **Mercury**.
+
+With the wrong source nothing clocks the bus: start-up completes, but
+there's no spectrum or audio. Changes apply straight away.
+
 ## Differences from network-connected boards
 
 - **2-receiver cap.** Classic Ozy hardware is capped at 2 receivers,

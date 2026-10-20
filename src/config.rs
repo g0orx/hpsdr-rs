@@ -293,6 +293,12 @@ pub struct Config {
     pub rtlsdr_direct_sampling: Option<u8>,
     #[serde(default)]
     pub rtlsdr_tuner_agc: Option<bool>,
+    /// Ozy only -- see radio::OzyAtlas's doc comment. `None` for the
+    /// 122.88 MHz source means automatic; for the 10 MHz one, Atlas.
+    #[serde(default)]
+    pub ozy_clock_122_88: Option<u8>,
+    #[serde(default)]
+    pub ozy_clock_10mhz: Option<u8>,
     /// Spectrum/waterfall display range while transmitting -- separate
     /// from db_low/db_high/waterfall_db_low/waterfall_db_high (which
     /// are for receiving) because a locally-picked-up TX signal is

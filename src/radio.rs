@@ -241,6 +241,11 @@ pub struct RadioSettings {
     /// doc comment).
     pub rtlsdr_direct_sampling: u8,
     pub rtlsdr_tuner_agc: bool,
+    /// Ozy only -- initial values for OzyAtlas (see its doc comment).
+    /// `None` = automatic (Penelope if one answers at start-up, else
+    /// Mercury).
+    pub ozy_clock_122_88: Option<u8>,
+    pub ozy_clock_10mhz: u8,
     /// Initial value for RadioSession::filter_board -- see that
     /// field's doc comment.
     pub filter_board: u8,
@@ -290,6 +295,8 @@ impl Default for RadioSettings {
             // Blog V3's built-in HF path) use.
             rtlsdr_direct_sampling: 2,
             rtlsdr_tuner_agc: false,
+            ozy_clock_122_88: None,
+            ozy_clock_10mhz: OZY_10MHZ_ATLAS,
             // See RadioSession::filter_board's doc comment -- ALEX is
             // the behavior-preserving default.
             filter_board: FILTER_BOARD_ALEX,
@@ -1251,6 +1258,9 @@ pub struct RadioSession {
     /// `pub` so main.rs's About tab can show the firmware versions read
     /// at connect time.
     pub ozy_versions: Option<crate::ozy::OzyVersions>,
+    /// Ozy only: the Atlas clock sources -- see OzyAtlas. `pub` for
+    /// main.rs's Settings -> RX.
+    pub ozy_atlas: Option<Arc<OzyAtlas>>,
     /// ozy_i2c_loop's handle -- joined in `stop()` alongside the other
     /// threads. Always None on every other transport.
     ozy_i2c_thread: Option<JoinHandle<()>>,
@@ -2250,6 +2260,7 @@ fn start_protocol1(
         stop_socket,
         is_ozy: false,
         ozy_versions: None,
+        ozy_atlas: None,
         ozy_i2c_thread: None,
         is_rx888: false,
         usb_control_thread: None,
@@ -2377,8 +2388,18 @@ fn start_protocol1_ozy_usb(
             )
         })?;
     let (ozy_device, rx_endpoint, tx_endpoint, ozy_versions) = crate::ozy::initialise(&hex_path, &rbf_path)?;
-    let atlas_c1 = ozy_atlas_config(ozy_versions.penny.is_some());
-    eprintln!("ozy: Atlas bus config (C1) 0x{atlas_c1:02x}");
+    let has_penny = ozy_versions.penny.is_some();
+    let ozy_atlas = Arc::new(OzyAtlas {
+        // Automatic: Penny if there is one, otherwise nothing would clock
+        // the bus unless Mercury does.
+        clock_122_88: AtomicU8::new(settings.ozy_clock_122_88.unwrap_or(if has_penny {
+            OZY_122_88_PENELOPE
+        } else {
+            OZY_122_88_MERCURY
+        })),
+        clock_10mhz: AtomicU8::new(settings.ozy_clock_10mhz),
+        has_penny,
+    });
 
     let stop_flag = Arc::new(AtomicBool::new(false));
     // Ozy's historical 2-receiver cap (see discover_ozy_usb's own doc
@@ -2432,6 +2453,7 @@ fn start_protocol1_ozy_usb(
     let sender_mic_ptt_on_tip = Arc::clone(&mic_ptt_on_tip);
     let sender_adc = Arc::clone(&adc);
     let sender_extra_adcs = extra_adcs.clone();
+    let sender_ozy_atlas = Arc::clone(&ozy_atlas);
     let sender_thread = thread::spawn(move || {
         ozy_sender_loop(
             tx_endpoint,
@@ -2461,7 +2483,7 @@ fn start_protocol1_ozy_usb(
             sender_mic_ptt_enabled,
             sender_mic_bias_enabled,
             sender_mic_ptt_on_tip,
-            atlas_c1,
+            sender_ozy_atlas,
             sender_stop,
         );
     });
@@ -2593,6 +2615,7 @@ fn start_protocol1_ozy_usb(
         stop_socket: UdpSocket::bind(("0.0.0.0", 0))?,
         is_ozy: true,
         ozy_versions: Some(ozy_versions),
+        ozy_atlas: Some(ozy_atlas),
         ozy_i2c_thread: Some(i2c_thread),
         is_rx888: false,
         usb_control_thread: None,
@@ -2860,6 +2883,7 @@ fn start_rx888_usb(
         stop_socket: UdpSocket::bind(("0.0.0.0", 0))?,
         is_ozy: false,
         ozy_versions: None,
+        ozy_atlas: None,
         ozy_i2c_thread: None,
         is_rx888: true,
         usb_control_thread: Some(control_thread),
@@ -3057,6 +3081,7 @@ fn start_usb_dongle(
         stop_socket: UdpSocket::bind(("0.0.0.0", 0))?,
         is_ozy: false,
         ozy_versions: None,
+        ozy_atlas: None,
         ozy_i2c_thread: None,
         is_rx888: false,
         usb_control_thread: Some(control_thread),
@@ -5662,18 +5687,47 @@ fn receiver_loop(
 const ATLAS_CONFIG_PENELOPE: u8 = 0x20;
 const ATLAS_CONFIG_MERCURY: u8 = 0x40;
 const ATLAS_MERCURY_122_88MHZ_SOURCE: u8 = 0x10;
+const ATLAS_PENELOPE_10MHZ_SOURCE: u8 = 0x04;
+const ATLAS_MERCURY_10MHZ_SOURCE: u8 = 0x08;
 
-/// piHPSDR's defaults: Mercury always present; Penny supplies the
-/// 122.88 MHz clock (so it's marked present too) and Atlas the 10 MHz
-/// reference (both _SOURCE values 0). With no Penny answering at
-/// start-up (see ozy::read_firmware_versions), Mercury has to supply
-/// the 122.88 MHz clock instead, or nothing clocks the bus.
-fn ozy_atlas_config(has_penny: bool) -> u8 {
+/// OzyAtlas::clock_122_88 values (piHPSDR's atlas_clock_source_128mhz).
+pub const OZY_122_88_PENELOPE: u8 = 0;
+pub const OZY_122_88_MERCURY: u8 = 1;
+/// OzyAtlas::clock_10mhz values (piHPSDR's atlas_clock_source_10mhz).
+pub const OZY_10MHZ_ATLAS: u8 = 0;
+pub const OZY_10MHZ_PENELOPE: u8 = 1;
+pub const OZY_10MHZ_MERCURY: u8 = 2;
+
+/// Ozy only: which boards supply the Atlas bus's 122.88 MHz clock and
+/// 10 MHz reference (Settings -> RX), read by ozy_sender_loop for every
+/// packet so a change applies at once.
+pub struct OzyAtlas {
+    pub clock_122_88: AtomicU8,
+    pub clock_10mhz: AtomicU8,
+    /// Whether a Penelope answered at start-up (ozy::OzyVersions).
+    pub has_penny: bool,
+}
+
+/// piHPSDR's ozy_send_buffer logic: Mercury always present; Penny
+/// present if detected, and also whenever it's chosen as a clock source
+/// (piHPSDR then assumes one implicitly). Its defaults -- Penny for
+/// 122.88 MHz, Atlas for 10 MHz -- give 0x60.
+fn ozy_atlas_config(has_penny: bool, clock_122_88: u8, clock_10mhz: u8) -> u8 {
+    let mut c1 = ATLAS_CONFIG_MERCURY;
     if has_penny {
-        ATLAS_CONFIG_MERCURY | ATLAS_CONFIG_PENELOPE
-    } else {
-        ATLAS_CONFIG_MERCURY | ATLAS_MERCURY_122_88MHZ_SOURCE
+        c1 |= ATLAS_CONFIG_PENELOPE;
     }
+    if clock_122_88 == OZY_122_88_MERCURY {
+        c1 |= ATLAS_MERCURY_122_88MHZ_SOURCE;
+    } else {
+        c1 |= ATLAS_CONFIG_PENELOPE; // PENELOPE_122_88MHZ_SOURCE is 0
+    }
+    match clock_10mhz {
+        OZY_10MHZ_PENELOPE => c1 |= ATLAS_PENELOPE_10MHZ_SOURCE | ATLAS_CONFIG_PENELOPE,
+        OZY_10MHZ_MERCURY => c1 |= ATLAS_MERCURY_10MHZ_SOURCE,
+        _ => {} // ATLAS_10MHZ_SOURCE is 0
+    }
+    c1
 }
 
 /// Ozy USB counterpart to sender_loop -- same packet-content
@@ -5715,13 +5769,14 @@ fn ozy_sender_loop(
     mic_ptt_on_tip: Arc<AtomicBool>,
     // See ozy_atlas_config. OR'd into frame 1's C1 (frame 1 is always
     // register 0; frame 2 cycles through 1-11 and never is).
-    atlas_c1: u8,
+    ozy_atlas: Arc<OzyAtlas>,
     stop: Arc<AtomicBool>,
 ) {
     let mut seq: u32 = 0;
     let mut ozy_command: u8 = 1;
     let mut frames_sent: u64 = 0;
     let mut timeout_reported = false;
+    let mut last_atlas_c1: Option<u8> = None;
     let mut current_receiver: u8 = 0;
     let mut rx_audio_pacer = RxAudioPacer::new();
     let mut tx_iq_pacer = TxIqPacer::new();
@@ -5796,7 +5851,16 @@ fn ozy_sender_loop(
             None, // hl2_iob_cc -- Ozy is never a HermesLite
         );
 
-        // Frame 1's C1 (sync x3, C0, then C1) -- see atlas_c1.
+        // Frame 1's C1 (sync x3, C0, then C1) -- see ozy_atlas.
+        let atlas_c1 = ozy_atlas_config(
+            ozy_atlas.has_penny,
+            ozy_atlas.clock_122_88.load(Ordering::Relaxed),
+            ozy_atlas.clock_10mhz.load(Ordering::Relaxed),
+        );
+        if last_atlas_c1 != Some(atlas_c1) {
+            eprintln!("ozy: Atlas bus config (C1) 0x{atlas_c1:02x}");
+            last_atlas_c1 = Some(atlas_c1);
+        }
         packet[HEADER_SIZE + 4] |= atlas_c1;
 
         // `packet` is [8-byte Metis header][512-byte frame][512-byte
@@ -6802,6 +6866,7 @@ fn start_protocol2(
         stop_socket,
         is_ozy: false,
         ozy_versions: None,
+        ozy_atlas: None,
         ozy_i2c_thread: None,
         is_rx888: false,
         usb_control_thread: None,
@@ -8359,9 +8424,13 @@ mod tests {
     fn ozy_atlas_config_matches_pihpsdr_defaults() {
         // piHPSDR, all atlas_* settings at their defaults:
         // CONFIG_MERCURY | CONFIG_PENELOPE (Penny supplies 122.88 MHz).
-        assert_eq!(ozy_atlas_config(true), 0x60);
-        // No Penny: Mercury present and supplying 122.88 MHz.
-        assert_eq!(ozy_atlas_config(false), 0x50);
+        assert_eq!(ozy_atlas_config(true, OZY_122_88_PENELOPE, OZY_10MHZ_ATLAS), 0x60);
+        // No Penny (the automatic choice): Mercury supplies 122.88 MHz.
+        assert_eq!(ozy_atlas_config(false, OZY_122_88_MERCURY, OZY_10MHZ_ATLAS), 0x50);
+        // Mercury for both clocks, Penny present for TX.
+        assert_eq!(ozy_atlas_config(true, OZY_122_88_MERCURY, OZY_10MHZ_MERCURY), 0x78);
+        // Penny as a clock source marks it present even if undetected.
+        assert_eq!(ozy_atlas_config(false, OZY_122_88_MERCURY, OZY_10MHZ_PENELOPE), 0x74);
     }
 
     /// Issue #13: an uncalibrated Hermes-Lite must reach full drive at

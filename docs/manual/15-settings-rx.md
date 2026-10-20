@@ -31,6 +31,10 @@ The **RX Attenuation** / **RX Gain** / **RF Gain** slider is on the
 Gain**. On an [RTL-SDR](21-rtl-sdr.md), its **Tuner AGC** and direct
 sampling options stay here in Settings → RX.
 
+On an [Ozy](19-ozy-usb.md#atlas-clocks), the **Atlas clocks** section
+here picks which boards supply the 122.88 MHz clock and 10 MHz
+reference.
+
 ## Send RX audio to radio
 
 A checkbox that routes the demodulated audio back out through the radio's

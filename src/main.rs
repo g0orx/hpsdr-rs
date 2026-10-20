@@ -2058,6 +2058,10 @@ struct ConnectedState {
     /// RadioSettings before RadioSession::start is called.
     ozy_firmware_path: Option<String>,
     ozy_fpga_path: Option<String>,
+    /// Ozy: whether the 122.88 MHz clock source has been chosen in
+    /// Settings -> RX (or was in the loaded config). If not, it's saved
+    /// as unset so it stays automatic -- see RadioSettings::ozy_clock_122_88.
+    ozy_clock_122_88_set: bool,
     /// RX-888 Mk2 only -- see Config::rx888_firmware_path and
     /// radio::RadioSettings::rx888_firmware_path. Set via the Discover
     /// window's "RX-888 USB setup" file picker (not post-connect
@@ -2386,6 +2390,10 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
     }
     if let Some(v) = cfg.rtlsdr_tuner_agc {
         settings.rtlsdr_tuner_agc = v;
+    }
+    settings.ozy_clock_122_88 = cfg.ozy_clock_122_88.map(|v| v.min(radio::OZY_122_88_MERCURY));
+    if let Some(v) = cfg.ozy_clock_10mhz {
+        settings.ozy_clock_10mhz = v.min(radio::OZY_10MHZ_MERCURY);
     }
     match RadioSession::start(&device, settings.clone()) {
         Ok(session) => {
@@ -3032,6 +3040,7 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                 max_swr: cfg.max_swr.unwrap_or(3.0),
                 ozy_firmware_path: cfg.ozy_firmware_path.clone(),
                 ozy_fpga_path: cfg.ozy_fpga_path.clone(),
+                ozy_clock_122_88_set: cfg.ozy_clock_122_88.is_some(),
                 rx888_firmware_path: cfg.rx888_firmware_path.clone(),
                 tune_active: false,
                 pre_tune_power_watts: None,
@@ -7951,6 +7960,60 @@ impl eframe::App for HpsdrApp {
                                         ui.separator();
                                     }
 
+                                    // Ozy: which boards clock the Atlas bus -- see
+                                    // radio::OzyAtlas. Applies at once.
+                                    if let Some(atlas) = connected.session.ozy_atlas.clone() {
+                                        ui.strong("Atlas clocks");
+                                        let mut clock_122_88 = atlas.clock_122_88.load(Ordering::Relaxed);
+                                        ui.horizontal(|ui| {
+                                            ui.label("122.88 MHz from:");
+                                            for (value, label) in
+                                                [(radio::OZY_122_88_PENELOPE, "Penelope"), (radio::OZY_122_88_MERCURY, "Mercury")]
+                                            {
+                                                if ui.add(egui::Button::selectable(clock_122_88 == value, label)).clicked()
+                                                    && clock_122_88 != value
+                                                {
+                                                    clock_122_88 = value;
+                                                    atlas.clock_122_88.store(value, Ordering::Relaxed);
+                                                    connected.ozy_clock_122_88_set = true;
+                                                    settings_changed = true;
+                                                }
+                                            }
+                                        });
+                                        let mut clock_10mhz = atlas.clock_10mhz.load(Ordering::Relaxed);
+                                        ui.horizontal(|ui| {
+                                            ui.label("10 MHz reference from:");
+                                            for (value, label) in [
+                                                (radio::OZY_10MHZ_ATLAS, "Atlas"),
+                                                (radio::OZY_10MHZ_PENELOPE, "Penelope"),
+                                                (radio::OZY_10MHZ_MERCURY, "Mercury"),
+                                            ] {
+                                                if ui.add(egui::Button::selectable(clock_10mhz == value, label)).clicked()
+                                                    && clock_10mhz != value
+                                                {
+                                                    clock_10mhz = value;
+                                                    atlas.clock_10mhz.store(value, Ordering::Relaxed);
+                                                    settings_changed = true;
+                                                }
+                                            }
+                                        });
+                                        let penny_selected = clock_122_88 == radio::OZY_122_88_PENELOPE
+                                            || clock_10mhz == radio::OZY_10MHZ_PENELOPE;
+                                        if penny_selected && !atlas.has_penny {
+                                            ui.colored_label(
+                                                egui::Color32::from_rgb(220, 140, 60),
+                                                "No Penelope answered at start-up, but it's selected as a clock source.",
+                                            );
+                                        }
+                                        ui.weak(
+                                            "Set these to match how your boards are jumpered -- the same choices as \
+                                             PowerSDR's and piHPSDR's clock source settings. With the wrong source \
+                                             nothing clocks the bus and there's no receive data. \"Atlas\" means a \
+                                             10 MHz reference from another board on the bus (e.g. Excalibur).",
+                                        );
+                                        ui.separator();
+                                    }
+
                                     // Streams the main receiver's demodulated audio back to the
                                     // radio's own local audio output (a headphone/speaker jack
                                     // driven by the radio's own DAC, independent of this PC's
@@ -10261,6 +10324,17 @@ impl eframe::App for HpsdrApp {
                         max_swr: Some(connected.max_swr),
                         ozy_firmware_path: connected.ozy_firmware_path.clone(),
                         ozy_fpga_path: connected.ozy_fpga_path.clone(),
+                        ozy_clock_122_88: connected
+                            .session
+                            .ozy_atlas
+                            .as_ref()
+                            .filter(|_| connected.ozy_clock_122_88_set)
+                            .map(|a| a.clock_122_88.load(Ordering::Relaxed)),
+                        ozy_clock_10mhz: connected
+                            .session
+                            .ozy_atlas
+                            .as_ref()
+                            .map(|a| a.clock_10mhz.load(Ordering::Relaxed)),
                         rx888_firmware_path: connected.rx888_firmware_path.clone(),
                         rtlsdr_direct_sampling: connected
                             .session
