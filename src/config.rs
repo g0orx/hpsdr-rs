@@ -448,6 +448,14 @@ pub struct Config {
     /// See ConnectedState::sat_mode: 0 off, 1 SAT, 2 SATR.
     #[serde(default)]
     pub sat_mode: Option<u8>,
+    /// See ConnectedState::vfo_b_xvtr. Some("") is "no transverter";
+    /// `None` (a config saved before VFO B had its own) falls back to
+    /// active_xvtr, which is what VFO B was displayed through then.
+    #[serde(default)]
+    pub vfo_b_xvtr: Option<String>,
+    /// See ConnectedState::duplex. `None` falls back to off.
+    #[serde(default)]
+    pub duplex: Option<bool>,
     /// See ConnectedState::cw_decode_enabled's doc comment. `None`
     /// (a config saved before this existed) falls back to true, same
     /// as a fresh connect.

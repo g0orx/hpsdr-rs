@@ -161,11 +161,12 @@ receive on two frequencies at once). You can scroll on the VFO-B box the
 same way as VFO-A (Shift for 100 Hz steps, otherwise 1 kHz) to change its
 stored value directly, or use the buttons between the two boxes:
 
-- **A>B** -- copies VFO A's current frequency into VFO B.
-- **B>A** -- retunes VFO A to VFO B's frequency (moving the CTUN listen
-  point instead of the real hardware frequency if CTUN is on -- see
-  above).
-- **A<>B** -- swaps VFO A and VFO B.
+- **A>B** -- copies VFO A's current frequency (and transverter) into VFO
+  B.
+- **B>A** -- retunes VFO A to VFO B's frequency and transverter (moving
+  the CTUN listen point instead of the real hardware frequency if CTUN is
+  on -- see above).
+- **A<>B** -- swaps VFO A and VFO B, transverters included.
 - **Split** -- while enabled, transmit uses VFO B's frequency instead of
   VFO A's, while reception continues on VFO A as normal. The box that's
   actually red while transmitting follows whichever VFO is really in use
@@ -182,6 +183,34 @@ stored value directly, or use the buttons between the two boxes:
   B>A, A<>B, typing a VFO A or VFO B frequency, changing band or
   transverter, and Lock LNB corrections leave the other VFO alone. Set up
   VFO B first (e.g. with A>B and then adjust it), then tune with VFO A.
+- **Duplex** -- keep receiving on VFO A while transmitting on VFO B, for
+  setups with separate receive and transmit paths, such as QO-100 (hear
+  your own signal come back on the downlink). Switching it on also turns
+  Split on; switching Split off turns it off. While transmitting, the
+  spectrum, waterfall and speaker audio stay on the receiver, and a small
+  **TX** spectrum appears below the audio waveform box, showing the TX
+  filter (shaded) plus a little either side. TCI's audio stream is still
+  muted while transmitting, so a TCI client can't hear itself. During TX
+  the receiver's ADC0 still gets **TX ADC0 Attenuation** ([Settings:
+  TX](17-settings-tx.md), 20 dB by default, protecting it from the radio's
+  own TX leakage); with a genuinely separate receive path, set that to 0
+  so the downlink isn't 20 dB weaker while you transmit.
+
+### VFO B's transverter
+
+VFO B has its own [transverter](18-xvtr.md), chosen with the selector
+next to the **VFO-B** label (shown once any transverter is set up) or
+picked automatically when you type a VFO B frequency inside a
+transverter's RF range. So on QO-100, VFO A can be on the downlink
+transverter (an LNB, LO Offset 9750 MHz) while VFO B is on an uplink one
+(e.g. 2400.000-2400.500 MHz, with your upconverter's offset, or 0 for a
+radio transmitting at 2.4 GHz directly). Transmitting on VFO B (Split or
+Duplex) uses VFO B's transverter for the TX frequency, its **Disable PA**
+setting, and its band's TX [Open Collector](12-open-collector.md) outputs
+and TX [antenna](12-open-collector.md#settings-antenna). Choosing a transverter keeps
+VFO B's frequency if it's inside the new range, otherwise moves it to the
+middle of the range. Lock LNB corrections only move VFO B if it's on the
+same transverter as VFO A.
 
 ## Bands and modes
 

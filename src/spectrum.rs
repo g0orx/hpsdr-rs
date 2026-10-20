@@ -1692,6 +1692,9 @@ fn run(
     // Muted (not pushed to any of the four audio outputs above) while
     // MOX is active -- see SpectrumHandle::start's doc comment on why.
     mox: Arc<AtomicBool>,
+    // Duplex: while MOX is active, only the TCI stream is muted -- see
+    // SpectrumHandle::set_duplex.
+    duplex: Arc<AtomicBool>,
     // Mutes ONLY the local speaker tap (audio_out) while true --
     // tci_audio_out/waveform_out/rx_audio_to_radio are untouched. See
     // SpectrumHandle::start's doc comment.
@@ -1865,12 +1868,16 @@ fn run(
             // PureSignal's own feedback path are untouched -- this only
             // gates the post-demod AUDIO taps below.
             let mox_active = mox.load(Ordering::Relaxed);
+            // Duplex (main.rs's ConnectedState::duplex): the operator is
+            // listening to their own downlink while transmitting, so MOX
+            // only mutes TCI's stream -- the feedback case above.
+            let mute_all = mox_active && !duplex.load(Ordering::Relaxed);
             // See this function's own mute_local_for_tci param doc
             // comment -- read once per chunk, not per-sample, same as
             // mox_active above.
             let mute_local = mute_local_for_tci.load(Ordering::Relaxed);
             for (l, r) in audio {
-                if mox_active {
+                if mute_all {
                     continue;
                 }
                 // See DcBlocker's own doc comment -- strips the raw
@@ -1911,10 +1918,12 @@ fn run(
                     out.push_back((l, r));
                     recorder.write_frame(l, r);
                 }
-                if tci_out.len() >= AUDIO_BUFFER_CAPACITY {
-                    tci_out.pop_front();
+                if !mox_active {
+                    if tci_out.len() >= AUDIO_BUFFER_CAPACITY {
+                        tci_out.pop_front();
+                    }
+                    tci_out.push_back((l, r));
                 }
-                tci_out.push_back((l, r));
                 if let Some(radio_out) = radio_out.as_mut() {
                     let mono_gained = (mono * params.gain).clamp(-1.0, 1.0);
                     let filtered = radio_audio_lpf.feed(mono_gained);
@@ -1968,6 +1977,8 @@ pub struct SpectrumHandle {
     /// (matches this project's other "existing behavior unchanged"
     /// toggles) via set_cw_decode_enabled's own call site.
     cw_decode_enabled: Arc<AtomicBool>,
+    /// See set_duplex.
+    duplex: Arc<AtomicBool>,
     /// QO-100 beacon monitor output, and where it should look -- see
     /// psk_beacon.rs and run()'s doc comment on these same fields. Idle
     /// (None) by default (set_psk_beacon_offset).
@@ -2044,12 +2055,14 @@ impl SpectrumHandle {
         let iq_out = Arc::new(Mutex::new(VecDeque::with_capacity(IQ_OUT_CAPACITY)));
         let cw_text = Arc::new(Mutex::new(String::new()));
         let cw_decode_enabled = Arc::new(AtomicBool::new(true));
+        let duplex = Arc::new(AtomicBool::new(false));
         let psk_status = Arc::new(Mutex::new(BeaconStatus::default()));
         let psk_beacon_offset = Arc::new(Mutex::new(None));
         let recorder = AudioRecorder::new();
         let stop = Arc::new(AtomicBool::new(false));
         let iq_buffer_for_clear = Arc::clone(&iq_buffer);
         let thread = {
+            let duplex = Arc::clone(&duplex);
             let display = Arc::clone(&display);
             let demod_params = Arc::clone(&demod_params);
             let audio_out = Arc::clone(&audio_out);
@@ -2080,6 +2093,7 @@ impl SpectrumHandle {
                     recorder,
                     rx_audio_to_radio,
                     mox,
+                    duplex,
                     mute_local_for_tci,
                     stop,
                 )
@@ -2093,6 +2107,7 @@ impl SpectrumHandle {
             iq_out,
             cw_text,
             cw_decode_enabled,
+            duplex,
             psk_status,
             psk_beacon_offset,
             recorder,
@@ -2165,6 +2180,14 @@ impl SpectrumHandle {
     /// panel is being drawn.
     pub fn set_cw_decode_enabled(&self, enabled: bool) {
         self.cw_decode_enabled.store(enabled, Ordering::Relaxed);
+    }
+
+    /// Duplex (main.rs's ConnectedState::duplex, pushed every frame):
+    /// keep the receiver's audio (speaker, recording, waveform, CW
+    /// decoder) going while transmitting. TCI's stream stays muted
+    /// during TX either way.
+    pub fn set_duplex(&self, duplex: bool) {
+        self.duplex.store(duplex, Ordering::Relaxed);
     }
 
     /// Snapshot of the beacon monitor's measurement, frame counts and

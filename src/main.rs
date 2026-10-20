@@ -331,6 +331,44 @@ fn xvtr_covers_beacon(xvtr: &Xvtr) -> bool {
         && (xvtr.frequency_min_hz..=xvtr.frequency_max_hz).contains(&psk_beacon::BEACON_RF_HZ)
 }
 
+/// VFO B's transverter (see ConnectedState::vfo_b_xvtr), if it's set
+/// and still configured.
+fn vfo_b_xvtr(connected: &ConnectedState) -> Option<&Xvtr> {
+    let name = connected.vfo_b_xvtr.as_deref()?;
+    connected.xvtrs.iter().find(|x| x.name == name)
+}
+
+/// The RF-space offset VFO B is displayed and transmitted through.
+fn vfo_b_rf_offset(connected: &ConnectedState) -> i64 {
+    vfo_b_xvtr(connected).map_or(0, xvtr_rf_offset)
+}
+
+/// Switches VFO B to transverter `name` (None = no transverter) from its
+/// selector. Keeps VFO B's RF frequency if that's inside the new
+/// transverter's range (or, with none, the radio's own range); otherwise
+/// moves it to the middle of the new range.
+fn set_vfo_b_xvtr(connected: &mut ConnectedState, name: Option<String>) {
+    let rf = connected.vfo_b_frequency_hz as i64 + vfo_b_rf_offset(connected);
+    connected.vfo_b_xvtr = name;
+    let (if_hz, fits) = match vfo_b_xvtr(connected) {
+        Some(x) => {
+            let fits = (x.frequency_min_hz as i64..=x.frequency_max_hz as i64).contains(&rf);
+            let rf = if fits { rf } else { (x.frequency_min_hz + x.frequency_max_hz) as i64 / 2 };
+            (rf - xvtr_rf_offset(x), true)
+        }
+        None => (rf, (connected.device.frequency_min as i64..=connected.device.frequency_max as i64).contains(&rf)),
+    };
+    if fits {
+        connected.vfo_b_frequency_hz =
+            if_hz.clamp(connected.device.frequency_min as i64, connected.device.frequency_max as i64) as u32;
+    }
+}
+
+/// Whether TX uses VFO B: Split, or Duplex (which always transmits on B).
+fn tx_on_vfo_b(connected: &ConnectedState) -> bool {
+    connected.split || connected.duplex
+}
+
 /// Where the QO-100 beacon should be relative to the main receiver's IQ
 /// centre (Hz), for the beacon monitor (spectrum.rs/psk_beacon.rs), or
 /// None if the monitor should idle: PSK Beacon off, the active
@@ -454,7 +492,9 @@ fn apply_lnb_correction(connected: &mut ConnectedState) {
     let locking = connected.psk_beacon_enabled && connected.lnb_lock_enabled;
     let measured = connected.spectrum.psk_status().predicted_offset_hz;
     let active = connected.active_xvtr.clone();
+    let vfo_b_xvtr = connected.vfo_b_xvtr.clone();
     let mut listen_shift_hz = 0i64;
+    let mut vfo_b_shift_hz = 0i64;
     for x in connected.xvtrs.iter_mut() {
         let is_active = active.as_deref() == Some(x.name.as_str()) && !x.name.is_empty();
         let target = if locking && is_active && xvtr_covers_beacon(x) {
@@ -472,17 +512,23 @@ fn apply_lnb_correction(connected: &mut ConnectedState) {
             continue;
         }
         x.lnb_correction_hz = target;
+        // RF = IF + offset: the offset grew by delta, so the same RF is
+        // now delta lower in IF.
         if is_active {
-            // RF = IF + offset: the offset grew by delta, so the same RF
-            // is now delta lower in IF.
             listen_shift_hz -= delta;
         }
+        // VFO B is IF too: if it's displayed through this transverter,
+        // move it the same way so its RF stays put -- but not if it's on
+        // another one (e.g. a QO-100 uplink, whose offset didn't change).
+        if vfo_b_xvtr.as_deref() == Some(x.name.as_str()) {
+            vfo_b_shift_hz -= delta;
+        }
+    }
+    if vfo_b_shift_hz != 0 {
+        connected.vfo_b_frequency_hz =
+            (connected.vfo_b_frequency_hz as i64 + vfo_b_shift_hz).clamp(0, u32::MAX as i64) as u32;
     }
     if listen_shift_hz != 0 {
-        // VFO B is IF too and displayed through the same offset: move it
-        // with A so its RF frequency stays put.
-        connected.vfo_b_frequency_hz =
-            (connected.vfo_b_frequency_hz as i64 + listen_shift_hz).clamp(0, u32::MAX as i64) as u32;
         if connected.ctun {
             connected.ctun_frequency_hz = (connected.ctun_frequency_hz as i64 + listen_shift_hz).clamp(0, u32::MAX as i64) as u32;
         } else {
@@ -998,7 +1044,10 @@ fn dispatch_midi_event(connected: &mut ConnectedState, ev: RawMidiEvent, freq_hz
                 }
             }
         }
-        MidiAction::Split => connected.split = !connected.split,
+        MidiAction::Split => {
+            connected.split = !connected.split;
+            connected.duplex &= connected.split;
+        }
         // Same as the SAT button: cycle, and turn Split on with it.
         MidiAction::SatMode => {
             connected.sat_mode = connected.sat_mode.next();
@@ -1022,9 +1071,13 @@ fn dispatch_midi_event(connected: &mut ConnectedState, ev: RawMidiEvent, freq_hz
             connected.xit_offset_hz = 0.0;
             connected.session.xit_offset_hz.store(0, Ordering::Relaxed);
         }
-        MidiAction::VfoAtoB => connected.vfo_b_frequency_hz = dial_freq_hz,
+        MidiAction::VfoAtoB => {
+            connected.vfo_b_frequency_hz = dial_freq_hz;
+            connected.vfo_b_xvtr = connected.active_xvtr.clone();
+        }
         MidiAction::VfoBtoA => {
             connected.sat_last = None;
+            connected.active_xvtr = connected.vfo_b_xvtr.clone();
             let (effective_freq, retune) =
                 resolve_tune(connected.ctun, freq_hz, sample_rate, passband, connected.vfo_b_frequency_hz);
             if let Some(lo) = retune {
@@ -1035,6 +1088,7 @@ fn dispatch_midi_event(connected: &mut ConnectedState, ev: RawMidiEvent, freq_hz
         }
         MidiAction::VfoSwap => {
             connected.sat_last = None;
+            std::mem::swap(&mut connected.active_xvtr, &mut connected.vfo_b_xvtr);
             let new_b = dial_freq_hz;
             let (effective_freq, retune) =
                 resolve_tune(connected.ctun, freq_hz, sample_rate, passband, connected.vfo_b_frequency_hz);
@@ -1817,6 +1871,22 @@ struct ConnectedState {
     /// track_sat_vfo_b. None after an explicit VFO A set (B>A, A<>B,
     /// typed entry), so that jump doesn't drag VFO B along.
     sat_last: Option<(u64, String)>,
+    /// VFO B's own transverter (a configured Xvtr's name; None = no
+    /// transverter) -- VFO B is displayed and entered through it, and
+    /// when transmitting on VFO B (Split/Duplex) it sets the TX RF
+    /// frequency, PA disable, and the TX OC/antenna band. So a QO-100
+    /// uplink (e.g. 2400 MHz, offset 0, or an upconverter's offset) and
+    /// downlink (LNB, +9750 MHz) can each have their own. Set by typing a
+    /// VFO B frequency (the transverter whose RF range covers it), its
+    /// selector in the VFO-B box, or A>B/A<>B. Like active_xvtr, cleared
+    /// if VFO B is scrolled outside its IF range.
+    vfo_b_xvtr: Option<String>,
+    /// Duplex: keep receiving on VFO A while transmitting on VFO B -- the
+    /// RX spectrum/waterfall and speaker audio stay live during TX, and a
+    /// small TX spectrum inset shows the transmitted signal (see
+    /// draw_tx_spectrum_inset). For full-duplex setups such as QO-100
+    /// (separate uplink and downlink). Turning it on turns Split on.
+    duplex: bool,
     /// "CW Decode" toggle (button next to CTUN) -- controls both
     /// whether main.rs draws the decoder panel AND (pushed to
     /// spectrum.rs every frame via set_cw_decode_enabled) whether the
@@ -2948,6 +3018,11 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                 vfo_b_scroll_accum: 0.0,
                 split,
                 sat_mode: SatMode::from_config(cfg.sat_mode.unwrap_or(0)),
+                vfo_b_xvtr: match &cfg.vfo_b_xvtr {
+                    Some(name) => (!name.is_empty()).then(|| name.clone()),
+                    None => cfg.active_xvtr.clone(),
+                },
+                duplex: cfg.duplex.unwrap_or(false),
                 sat_last: None,
                 cw_decode_enabled,
                 psk_beacon_enabled,
@@ -3486,6 +3561,7 @@ impl eframe::App for HpsdrApp {
                     .spectrum
                     .set_ctun(connected.ctun || connected.rit_enabled, ctun_offset_hz + rit_offset_hz);
                 connected.spectrum.set_cw_decode_enabled(connected.cw_decode_enabled);
+                connected.spectrum.set_duplex(connected.duplex);
                 // Zoom should keep the CTUN'd listen frequency (where the
                 // filter/passband actually is) centered, not the parked
                 // hardware LO -- otherwise the filter drifts toward one
@@ -3505,7 +3581,19 @@ impl eframe::App for HpsdrApp {
                 // is always centered on the real TX carrier (see the "force
                 // ctun_offset_hz to 0 while transmitting" passband-overlay
                 // logic below) -- so it zooms around the plain slider Pan.
-                connected.tx_spectrum.set_zoom_pan(connected.spectrum_zoom, connected.spectrum_pan);
+                // Duplex: the main panel stays on RX, and tx_spectrum only
+                // feeds the inset, zoomed to the TX filter plus a margin
+                // (tx_inset_shown_hz, for draw_tx_spectrum_inset).
+                let tx_spectrum_rate = if connected.device.protocol == 2 { 192_000.0 } else { 48_000.0 };
+                let tx_inset_filter_hz = tx_inset_filter(current_mode, passband);
+                let tx_inset_shown_hz = if connected.duplex {
+                    let (zoom, pan, shown) = tx_inset_zoom_pan(tx_inset_window(tx_inset_filter_hz), tx_spectrum_rate);
+                    connected.tx_spectrum.set_zoom_pan(zoom, pan);
+                    shown
+                } else {
+                    connected.tx_spectrum.set_zoom_pan(connected.spectrum_zoom, connected.spectrum_pan);
+                    (0.0, 0.0)
+                };
                 let dial_freq_hz = if connected.ctun { connected.ctun_frequency_hz } else { freq_hz };
                 // Active transverter (if any) -- see
                 // ConnectedState::active_xvtr's doc comment: EXPLICIT
@@ -3541,10 +3629,26 @@ impl eframe::App for HpsdrApp {
                         None => (0, false, None),
                     };
                 let displayed_freq_hz = (dial_freq_hz as i64 + xvtr_rf_offset_hz).max(0) as u64;
+                // VFO B's own transverter -- same auto-clear as VFO A's
+                // just above if VFO B has been scrolled out of its range.
+                if let Some(x) = vfo_b_xvtr(connected) {
+                    let offset = xvtr_rf_offset(x);
+                    let f = connected.vfo_b_frequency_hz as i64;
+                    if f < x.frequency_min_hz as i64 - offset || f > x.frequency_max_hz as i64 - offset {
+                        connected.vfo_b_xvtr = None;
+                    }
+                }
+                let vfo_b_rf_offset_hz = vfo_b_rf_offset(connected);
+                // Transmitting on VFO B (Split/Duplex): its transverter, not
+                // VFO A's, decides the TX RF frequency, PA disable and TX
+                // OC/antenna band (below).
+                let tx_on_b = tx_on_vfo_b(connected);
+                let tx_xvtr_disable_pa =
+                    if tx_on_b { vfo_b_xvtr(connected).is_some_and(|x| x.disable_pa) } else { xvtr_disable_pa };
                 connected
                     .session
                     .disable_pa
-                    .store(xvtr_disable_pa, std::sync::atomic::Ordering::Relaxed);
+                    .store(tx_xvtr_disable_pa, std::sync::atomic::Ordering::Relaxed);
                 // See RadioSession::mute_local_audio_for_tci's doc comment
                 // -- recomputed every frame (not just when the checkbox or
                 // TCI Start/Stop are clicked) so it stays correct even
@@ -3580,15 +3684,28 @@ impl eframe::App for HpsdrApp {
                 if track_sat_vfo_b(connected, displayed_freq_hz, current_band_name) {
                     connected.settings_dirty.store(true, std::sync::atomic::Ordering::Relaxed);
                 }
+                // TX on VFO B: its transverter's (or IF's) band for the TX
+                // OC outputs and TX antenna -- same resolution as
+                // current_band_name.
+                let tx_band_name: String = if tx_on_b {
+                    match vfo_b_xvtr(connected) {
+                        Some(x) => x.name.clone(),
+                        None => band_for_frequency(connected.vfo_b_frequency_hz).map(|b| b.name).unwrap_or("Gen").to_string(),
+                    }
+                } else {
+                    current_band_name.to_string()
+                };
                 let oc = connected.oc_settings.get(current_band_name).copied().unwrap_or_default();
-                let oc_tx_resolved = if connected.tune_active { oc.tx | connected.oc_tune } else { oc.tx };
+                let oc_tx = connected.oc_settings.get(tx_band_name.as_str()).copied().unwrap_or_default().tx;
+                let oc_tx_resolved = if connected.tune_active { oc_tx | connected.oc_tune } else { oc_tx };
                 connected.session.oc_rx.store(oc.rx, std::sync::atomic::Ordering::Relaxed);
                 connected.session.oc_tx.store(oc_tx_resolved, std::sync::atomic::Ordering::Relaxed);
                 // RX/TX antenna -- see AntennaMask's doc comment. Same
-                // per-band resolution as OC just above, same current_band_name.
+                // per-band resolution as OC just above.
                 let ant = connected.antenna_settings.get(current_band_name).copied().unwrap_or_default();
+                let tx_ant = connected.antenna_settings.get(tx_band_name.as_str()).copied().unwrap_or_default().tx;
                 connected.session.rx_antenna.store(ant.rx, std::sync::atomic::Ordering::Relaxed);
-                connected.session.tx_antenna.store(ant.tx, std::sync::atomic::Ordering::Relaxed);
+                connected.session.tx_antenna.store(tx_ant, std::sync::atomic::Ordering::Relaxed);
                 // See RadioSession::rx_frequency_hz's doc comment -- kept
                 // in sync every frame here so rigctl/TCI/CAT report the
                 // CTUN'd listen frequency, not the parked hardware LO --
@@ -3602,9 +3719,10 @@ impl eframe::App for HpsdrApp {
                 // regardless of which of CTUN/Split (if either) is
                 // active. Split takes priority over CTUN when both are
                 // somehow on at once -- see ConnectedState::split's doc
-                // comment for why that's the correct precedence.
-                let tx_dial_freq_hz =
-                    if connected.split { connected.vfo_b_frequency_hz } else { dial_freq_hz };
+                // comment for why that's the correct precedence. Duplex
+                // always transmits on VFO B too.
+                let tx_dial_freq_hz = if tx_on_b { connected.vfo_b_frequency_hz } else { dial_freq_hz };
+                let tx_rf_offset_hz = if tx_on_b { vfo_b_rf_offset_hz } else { xvtr_rf_offset_hz };
                 // XIT ("Transmitter Incremental Tuning"): nudges the real
                 // TX NCO frequency on top of whichever of Split/dial is
                 // already selected above -- see ConnectedState::
@@ -3646,7 +3764,7 @@ impl eframe::App for HpsdrApp {
                 // The HL2 IO board switches amplifiers/transverters on the
                 // real RF TX frequency, not the radio's IF.
                 connected.session.hl2_io_board.tx_rf_frequency_hz.store(
-                    (tx_dial_freq_hz as i64 + xvtr_rf_offset_hz).max(0) as u64,
+                    (tx_dial_freq_hz as i64 + tx_rf_offset_hz).max(0) as u64,
                     std::sync::atomic::Ordering::Relaxed,
                 );
 
@@ -3666,6 +3784,15 @@ impl eframe::App for HpsdrApp {
                     connected.tx_spectrum.clear_display();
                 }
                 connected.tx_spectrum_mox_was_active = transmitting;
+                // Duplex: the main spectrum/waterfall keep showing the
+                // receiver while transmitting, and the TX signal gets its
+                // own inset (draw_tx_spectrum_inset). Everything below that
+                // picks the TX analyzer, axis or dB range uses
+                // `transmitting` in that "show TX" sense; `keyed` is the
+                // real TX state (VFO colours, the TX audio waveform, the
+                // inset).
+                let keyed = transmitting;
+                let transmitting = transmitting && !connected.duplex;
 
                 // ROOT CAUSE FIX for a real, persistent report of a wide
                 // spectral "skirt" appearing on ANY mic-chain TX audio
@@ -3869,13 +3996,14 @@ impl eframe::App for HpsdrApp {
                     // While Split is on, TX actually goes out on VFO B
                     // (see ConnectedState::split's doc comment), so the
                     // red highlight follows VFO B instead of VFO A --
-                    // otherwise it would point at the wrong box.
-                    let freq_a_color = if transmitting && !connected.split {
+                    // otherwise it would point at the wrong box. Same for
+                    // Duplex.
+                    let freq_a_color = if keyed && !tx_on_b {
                         egui::Color32::RED
                     } else {
                         egui::Color32::GREEN
                     };
-                    let freq_b_color = if transmitting && connected.split {
+                    let freq_b_color = if keyed && tx_on_b {
                         egui::Color32::RED
                     } else {
                         egui::Color32::GRAY
@@ -3949,18 +4077,20 @@ impl eframe::App for HpsdrApp {
                                 ui.horizontal(|ui| {
                                     if ui
                                         .button("A>B")
-                                        .on_hover_text("Copy VFO A's frequency to VFO B")
+                                        .on_hover_text("Copy VFO A's frequency (and transverter) to VFO B")
                                         .clicked()
                                     {
                                         connected.vfo_b_frequency_hz = dial_freq_hz;
+                                        connected.vfo_b_xvtr = connected.active_xvtr.clone();
                                         settings_changed = true;
                                     }
                                     if ui
                                         .button("B>A")
-                                        .on_hover_text("Retune VFO A to VFO B's frequency")
+                                        .on_hover_text("Retune VFO A to VFO B's frequency (and transverter)")
                                         .clicked()
                                     {
                                         connected.sat_last = None;
+                                        connected.active_xvtr = connected.vfo_b_xvtr.clone();
                                         // While CTUN is on, "A" is the
                                         // CTUN'd listen frequency, not the
                                         // parked hardware LO -- move that
@@ -3987,10 +4117,11 @@ impl eframe::App for HpsdrApp {
                                 ui.horizontal(|ui| {
                                     if ui
                                         .button("A<>B")
-                                        .on_hover_text("Swap VFO A and VFO B")
+                                        .on_hover_text("Swap VFO A and VFO B (and their transverters)")
                                         .clicked()
                                     {
                                         connected.sat_last = None;
+                                        std::mem::swap(&mut connected.active_xvtr, &mut connected.vfo_b_xvtr);
                                         // Same CTUN-aware handling as B>A
                                         // above.
                                         let new_b = dial_freq_hz;
@@ -4017,6 +4148,9 @@ impl eframe::App for HpsdrApp {
                                         .clicked()
                                     {
                                         connected.split = !connected.split;
+                                        // Duplex transmits on VFO B, so it
+                                        // goes with Split.
+                                        connected.duplex &= connected.split;
                                         settings_changed = true;
                                     }
                                     if ui
@@ -4033,6 +4167,25 @@ impl eframe::App for HpsdrApp {
                                     {
                                         connected.sat_mode = connected.sat_mode.next();
                                         if connected.sat_mode != SatMode::Off {
+                                            connected.split = true;
+                                        }
+                                        settings_changed = true;
+                                    }
+                                    if ui
+                                        .add(egui::Button::selectable(connected.duplex, "Duplex"))
+                                        .on_hover_text(
+                                            "Keep receiving on VFO A while transmitting on VFO B (e.g. hear \
+                                             your own QO-100 downlink). The spectrum, waterfall and speaker \
+                                             audio stay live during TX, with a small TX spectrum inset. \
+                                             Needs a radio with separate RX and TX paths -- and with a \
+                                             separate receive path, set Settings -> TX -> TX ADC0 \
+                                             Attenuation to 0, or the downlink is that much weaker \
+                                             during TX. Turns Split on.",
+                                        )
+                                        .clicked()
+                                    {
+                                        connected.duplex = !connected.duplex;
+                                        if connected.duplex {
                                             connected.split = true;
                                         }
                                         settings_changed = true;
@@ -4107,15 +4260,45 @@ impl eframe::App for HpsdrApp {
                             let vfo_b_label = ui
                                 .group(|ui| {
                                     ui.vertical(|ui| {
-                                        ui.label("VFO-B");
+                                        ui.horizontal(|ui| {
+                                            ui.label("VFO-B");
+                                            // VFO B's own transverter -- see
+                                            // ConnectedState::vfo_b_xvtr.
+                                            let names: Vec<String> = connected
+                                                .xvtrs
+                                                .iter()
+                                                .filter(|x| !x.name.is_empty())
+                                                .map(|x| x.name.clone())
+                                                .collect();
+                                            if !names.is_empty() {
+                                                let mut chosen = connected.vfo_b_xvtr.clone();
+                                                egui::ComboBox::from_id_salt("vfo_b_xvtr")
+                                                    .selected_text(chosen.as_deref().unwrap_or("No XVTR"))
+                                                    .show_ui(ui, |ui| {
+                                                        ui.selectable_value(&mut chosen, None, "No XVTR");
+                                                        for name in names {
+                                                            ui.selectable_value(&mut chosen, Some(name.clone()), name);
+                                                        }
+                                                    })
+                                                    .response
+                                                    .on_hover_text(
+                                                        "VFO B's transverter -- e.g. a QO-100 uplink, separate \
+                                                         from VFO A's downlink. Used for TX with Split/Duplex.",
+                                                    );
+                                                if chosen != connected.vfo_b_xvtr {
+                                                    set_vfo_b_xvtr(connected, chosen);
+                                                    settings_changed = true;
+                                                }
+                                            }
+                                        });
                                         let resp = ui
                                             .add(
                                                 egui::Label::new(
                                                     // VFO B is stored as IF like VFO A's
-                                                    // dial; show it in the same RF space
-                                                    // (active transverter's offset added).
+                                                    // dial; show it in RF space through
+                                                    // its own transverter (vfo_b_xvtr).
                                                     egui::RichText::new(format_frequency(
-                                                        (connected.vfo_b_frequency_hz as i64 + xvtr_rf_offset_hz).max(0)
+                                                        (connected.vfo_b_frequency_hz as i64 + vfo_b_rf_offset_hz).max(0)
                                                             as u64,
                                                     ))
                                                     .monospace()
@@ -4445,24 +4628,20 @@ impl eframe::App for HpsdrApp {
                                                 // configured transverter's RF
                                                 // range selects it and tunes its
                                                 // IF (see active_xvtr's doc
-                                                // comment). VFO-B is entered in the
-                                                // active transverter's RF space, as
-                                                // it is displayed.
-                                                let xvtr = if vfo_b { None } else { xvtr_for_rf_freq(&connected.xvtrs, freq) };
-                                                let offset = if vfo_b {
-                                                    xvtr_rf_offset_hz
-                                                } else {
-                                                    xvtr.map(xvtr_rf_offset).unwrap_or(0)
-                                                };
+                                                // comment). VFO-B the same, but
+                                                // for its own transverter
+                                                // (vfo_b_xvtr) -- e.g. a QO-100
+                                                // uplink frequency picks the
+                                                // uplink transverter.
+                                                let xvtr = xvtr_for_rf_freq(&connected.xvtrs, freq);
+                                                let offset = xvtr.map(xvtr_rf_offset).unwrap_or(0);
                                                 let xvtr_name = xvtr.map(|x| x.name.clone());
                                                 let clamped = (freq as i64 - offset).clamp(
                                                     connected.device.frequency_min as i64,
                                                     connected.device.frequency_max as i64,
                                                 ) as u32;
-                                                if !vfo_b {
-                                                    connected.active_xvtr = xvtr_name;
-                                                }
                                                 if vfo_b {
+                                                    connected.vfo_b_xvtr = xvtr_name;
                                                     connected.vfo_b_frequency_hz = clamped;
                                                 } else {
                                                     // Unconditional retune, CTUN
@@ -4473,6 +4652,7 @@ impl eframe::App for HpsdrApp {
                                                     // handling, not a small nudge
                                                     // resolve_tune's CTUN-window
                                                     // clamping is meant for.
+                                                    connected.active_xvtr = xvtr_name;
                                                     connected.session.set_frequency(clamped);
                                                     connected.ctun_frequency_hz = clamped;
                                                     connected.sat_last = None;
@@ -5971,7 +6151,7 @@ impl eframe::App for HpsdrApp {
                     // comment: fed at the same point as tx_audio_monitor,
                     // post source selection, so this reflects mic/TCI/
                     // radio-mic alike regardless of which is in use).
-                    let waveform_samples = if transmitting {
+                    let waveform_samples = if keyed {
                         connected
                             .tx_handle
                             .as_ref()
@@ -5981,6 +6161,17 @@ impl eframe::App for HpsdrApp {
                     };
                     if let Some(samples) = waveform_samples {
                         draw_audio_waveform(ui.painter(), rect, &samples);
+                    }
+                    if keyed && connected.duplex {
+                        let row = connected.tx_spectrum.display.lock().unwrap().spectrum.clone();
+                        draw_tx_spectrum_inset(
+                            ui.painter(),
+                            rect,
+                            &row,
+                            tx_inset_shown_hz,
+                            tx_inset_filter_hz,
+                            (connected.tx_db_low, connected.tx_db_high),
+                        );
                     }
 
                     if let Some(pos) = spectrum_resp.hover_pos() {
@@ -10408,6 +10599,8 @@ impl eframe::App for HpsdrApp {
                         vfo_b_frequency_hz: Some(connected.vfo_b_frequency_hz),
                         split: Some(connected.split),
                         sat_mode: Some(connected.sat_mode.to_config()),
+                        vfo_b_xvtr: Some(connected.vfo_b_xvtr.clone().unwrap_or_default()),
+                        duplex: Some(connected.duplex),
                         cw_decode_enabled: Some(connected.cw_decode_enabled),
                         psk_beacon_enabled: Some(connected.psk_beacon_enabled),
                         lnb_lock_enabled: Some(connected.lnb_lock_enabled),
@@ -10983,6 +11176,94 @@ fn render_psk_beacon_strip(ui: &mut egui::Ui, connected: &mut ConnectedState) ->
 /// voice/mic audio, since a peak trace touches close to full-scale on
 /// nearly every column once each column spans more than about one pitch
 /// period; see the per-column comment below for the full reasoning).
+/// The TX filter in Hz from the TX carrier (tx_spectrum's baseband).
+/// `passband` is spectrum::passband_for's, which for CW sits at the CW
+/// pitch; the TX carrier itself is generated at 0 Hz, so shift it back.
+fn tx_inset_filter(mode: spectrum::Mode, passband: (f64, f64)) -> (f64, f64) {
+    let pitch = spectrum::cw_pitch_hz();
+    match mode {
+        spectrum::Mode::Cwu => (passband.0 - pitch, passband.1 - pitch),
+        spectrum::Mode::Cwl => (passband.0 + pitch, passband.1 + pitch),
+        _ => passband,
+    }
+}
+
+/// The TX spectrum inset's frequency range: the TX filter plus a margin
+/// either side.
+fn tx_inset_window(filter: (f64, f64)) -> (f64, f64) {
+    let margin = ((filter.1 - filter.0) * 0.25).max(300.0);
+    (filter.0 - margin, filter.1 + margin)
+}
+
+/// tx_spectrum's zoom/pan to show `window` (see SpectrumAnalyzer::
+/// set_zoom_pan: the visible span is rate/zoom wide, centred at
+/// pan * (rate/2) * (1 - 1/zoom)), and the range that actually shows --
+/// zoom is a whole number, so it's at least as wide as asked.
+fn tx_inset_zoom_pan(window: (f64, f64), rate: f64) -> (i32, f32, (f64, f64)) {
+    let zoom = ((rate / (window.1 - window.0)).floor() as i32).max(1);
+    let half = rate / 2.0 / zoom as f64;
+    let reach = rate / 2.0 - half;
+    let centre = ((window.0 + window.1) / 2.0).clamp(-reach, reach);
+    let pan = if reach > 0.0 { (centre / reach) as f32 } else { 0.0 };
+    (zoom, pan, (centre - half, centre + half))
+}
+
+/// Duplex: a small TX spectrum below the audio waveform box (see
+/// draw_audio_waveform), while the main panel stays on the receiver.
+/// `row` is tx_spectrum's, zoomed to `shown` (Hz from the TX carrier);
+/// `filter` is the TX filter, shaded.
+fn draw_tx_spectrum_inset(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    row: &[f32],
+    shown: (f64, f64),
+    filter: (f64, f64),
+    db_range: (f32, f32),
+) {
+    const MARGIN: f32 = 8.0;
+    const WIDTH: f32 = 160.0;
+    const HEIGHT: f32 = 60.0;
+    const GAP: f32 = 6.0;
+    let waveform_bottom = rect.top() + MARGIN + 50.0; // draw_audio_waveform's box
+    let panel = egui::Rect::from_min_size(
+        egui::pos2(rect.right() - MARGIN - WIDTH, waveform_bottom + GAP),
+        egui::vec2(WIDTH, HEIGHT),
+    );
+    painter.rect_filled(panel, 3.0, egui::Color32::from_rgba_unmultiplied(20, 20, 20, 220));
+    let x_for = |hz: f64| -> f32 {
+        let frac = ((hz - shown.0) / (shown.1 - shown.0)).clamp(0.0, 1.0) as f32;
+        panel.left() + frac * panel.width()
+    };
+    painter.rect_filled(
+        egui::Rect::from_min_max(egui::pos2(x_for(filter.0), panel.top()), egui::pos2(x_for(filter.1), panel.bottom())),
+        0.0,
+        egui::Color32::from_rgba_unmultiplied(230, 90, 70, 60),
+    );
+    let (db_low, db_high) = if db_range.0 < db_range.1 { db_range } else { (db_range.1, db_range.1 + 1.0) };
+    if row.len() >= 2 {
+        let points: Vec<egui::Pos2> = row
+            .iter()
+            .enumerate()
+            .map(|(i, &db)| {
+                let frac = ((db - db_low) / (db_high - db_low)).clamp(0.0, 1.0);
+                egui::pos2(
+                    panel.left() + i as f32 / (row.len() - 1) as f32 * panel.width(),
+                    panel.bottom() - 1.0 - frac * (panel.height() - 2.0),
+                )
+            })
+            .collect();
+        painter.add(egui::Shape::line(points, egui::Stroke::new(1.0, egui::Color32::from_rgb(255, 120, 90))));
+    }
+    painter.text(
+        panel.left_top() + egui::vec2(4.0, 2.0),
+        egui::Align2::LEFT_TOP,
+        "TX",
+        egui::FontId::proportional(11.0),
+        egui::Color32::from_gray(200),
+    );
+    painter.rect_stroke(panel, 3.0, egui::Stroke::new(1.0, egui::Color32::WHITE), egui::StrokeKind::Inside);
+}
+
 fn draw_audio_waveform(painter: &egui::Painter, rect: egui::Rect, samples: &[f32]) {
     const MARGIN: f32 = 8.0;
     const WIDTH: f32 = 160.0;
@@ -13986,6 +14267,30 @@ fn main() -> eframe::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tx_inset_covers_the_filter_with_a_margin() {
+        for (mode, width, rate) in [
+            (spectrum::Mode::Usb, 2700.0, 48_000.0),
+            (spectrum::Mode::Lsb, 2700.0, 192_000.0),
+            (spectrum::Mode::Cwu, 500.0, 192_000.0),
+            (spectrum::Mode::Am, 3000.0, 48_000.0),
+        ] {
+            let filter = tx_inset_filter(mode, spectrum::passband_for(mode, width));
+            let window = tx_inset_window(filter);
+            assert!(window.0 < filter.0 - 299.0 && window.1 > filter.1 + 299.0, "{mode:?}");
+            let (zoom, pan, shown) = tx_inset_zoom_pan(window, rate);
+            assert!(shown.0 <= window.0 && shown.1 >= window.1, "{mode:?}: {shown:?} vs {window:?}");
+            // Zoomed in, not showing the whole TX span.
+            assert!(zoom > 4, "{mode:?}: zoom {zoom}");
+            // SpectrumAnalyzer::set_zoom_pan's centre for that zoom/pan.
+            let centre = pan as f64 * rate / 2.0 * (1.0 - 1.0 / zoom as f64);
+            assert!((centre - (shown.0 + shown.1) / 2.0).abs() < 1.0, "{mode:?}");
+        }
+        // CW: the TX carrier is at 0 Hz, so the filter sits around it.
+        let cw = tx_inset_filter(spectrum::Mode::Cwu, spectrum::passband_for(spectrum::Mode::Cwu, 500.0));
+        assert!(cw.0 < 0.0 && cw.1 > 0.0, "{cw:?}");
+    }
 
     #[test]
     fn lnb_correction_is_saved() {

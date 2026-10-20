@@ -74,6 +74,12 @@ shared across every receiver, the same way antenna and PA gain selection
 already are, since there's only one physical front end. Extra receiver
 windows don't have their own Open Collector settings.
 
+The exception is transmitting on VFO B (Split or Duplex): the **TX**
+outputs (and TX antenna) then come from VFO B's band or
+[transverter](02-main-window.md#vfo-bs-transverter), so a QO-100 uplink
+can switch its own amplifier while the receive side stays on the
+downlink's settings.
+
 ## Limitations
 
 - **N2ADR confirmed working** on a real Hermes-Lite 2 with an N2ADR filter
