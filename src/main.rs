@@ -10832,9 +10832,10 @@ fn render_psk_beacon_panel(ui: &mut egui::Ui, connected: &mut ConnectedState) ->
             _ if status.pair_searching => {
                 ui.colored_label(egui::Color32::GRAY, "Looking for the lower and upper CW beacons (500 kHz apart)")
                     .on_hover_text(
-                        "With the whole narrowband transponder in the span (768 kHz or more, beacon near the \
-                         middle), the CW beacons at 10489.500 and 10490.000 MHz show how far out your LNB is, \
-                         even well beyond the PSK beacon search's +/-10 kHz. Takes about 2 seconds.",
+                        "With a span of 768 kHz or more, the CW beacons at 10489.500 and 10490.000 MHz -- \
+                         500 kHz apart, with the PSK beacon midway -- show how far out your LNB is, even well \
+                         beyond the PSK beacon search's +/-10 kHz, as long as both are inside the span. Takes \
+                         about 2 seconds.",
                     );
             }
             _ => {
@@ -10846,8 +10847,9 @@ fn render_psk_beacon_panel(ui: &mut egui::Ui, connected: &mut ConnectedState) ->
                     None => (
                         "Searching for the beacon (within +/-10 kHz)".to_string(),
                         "Takes a few seconds. If it's never found, your LNB may be more than 10 kHz off: set the \
-                         transverter's LO Error closer first, or use a sample rate of 768 kHz or more with the \
-                         beacon near the middle, so the CW beacons 250 kHz either side can be used to find it."
+                         transverter's LO Error closer first, or use a sample rate of 768 kHz or more and tune \
+                         so both CW beacons (250 kHz either side of it) are in the span, then turn PSK Beacon \
+                         off and on -- they're used to find it."
                             .to_string(),
                     ),
                 };
