@@ -4208,25 +4208,6 @@ impl eframe::App for HpsdrApp {
                                         }
                                         settings_changed = true;
                                     }
-                                    if ui
-                                        .add(egui::Button::selectable(connected.duplex, "Duplex"))
-                                        .on_hover_text(
-                                            "Keep receiving on VFO A while transmitting on VFO B (e.g. hear \
-                                             your own QO-100 downlink). The spectrum, waterfall and speaker \
-                                             audio stay live during TX, with a small TX spectrum inset. \
-                                             Needs a radio with separate RX and TX paths -- and with a \
-                                             separate receive path, set Settings -> TX -> TX ADC0 \
-                                             Attenuation to 0, or the downlink is that much weaker \
-                                             during TX. Turns Split on.",
-                                        )
-                                        .clicked()
-                                    {
-                                        connected.duplex = !connected.duplex;
-                                        if connected.duplex {
-                                            connected.split = true;
-                                        }
-                                        settings_changed = true;
-                                    }
                                 });
                                 ui.horizontal(|ui| {
                                     if ui
@@ -4249,6 +4230,25 @@ impl eframe::App for HpsdrApp {
                                             connected.ctun_frequency_hz = freq_hz;
                                         }
                                         connected.ctun = !connected.ctun;
+                                        settings_changed = true;
+                                    }
+                                    if ui
+                                        .add(egui::Button::selectable(connected.duplex, "Duplex"))
+                                        .on_hover_text(
+                                            "Keep receiving on VFO A while transmitting on VFO B (e.g. hear \
+                                             your own QO-100 downlink). The spectrum, waterfall and speaker \
+                                             audio stay live during TX, with a small TX spectrum inset. \
+                                             Needs a radio with separate RX and TX paths -- and with a \
+                                             separate receive path, set Settings -> TX -> TX ADC0 \
+                                             Attenuation to 0, or the downlink is that much weaker \
+                                             during TX. Turns Split on.",
+                                        )
+                                        .clicked()
+                                    {
+                                        connected.duplex = !connected.duplex;
+                                        if connected.duplex {
+                                            connected.split = true;
+                                        }
                                         settings_changed = true;
                                     }
                                     // Only shown while actually in CW

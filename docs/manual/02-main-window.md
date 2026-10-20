@@ -183,7 +183,7 @@ stored value directly, or use the buttons between the two boxes:
   B>A, A<>B, typing a VFO A or VFO B frequency, changing band or
   transverter, and Lock LNB corrections leave the other VFO alone. Set up
   VFO B first (e.g. with A>B and then adjust it), then tune with VFO A.
-- **Duplex** -- keep receiving on VFO A while transmitting on VFO B, for
+- **Duplex** (next to **CTUN**) -- keep receiving on VFO A while transmitting on VFO B, for
   setups with separate receive and transmit paths, such as QO-100 (hear
   your own signal come back on the downlink). Switching it on also turns
   Split on; switching Split off turns it off. While transmitting, the
