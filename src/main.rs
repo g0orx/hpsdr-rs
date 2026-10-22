@@ -10838,10 +10838,12 @@ fn nice_tick_step(span: f64, target_ticks: f64) -> f64 {
 /// margin near each edge skips labels that would otherwise get clipped
 /// or hang off into the surrounding UI -- expressed as a fraction of the
 /// span rather than a fixed tick index, since ticks are no longer evenly
-/// spaced. `rf_offset_hz` shifts only the printed label (RF space when a
-/// transverter is active), never the tick's real IF-space x position --
-/// same convention as draw_band_edge_markers (0 for callers with no XVTR
-/// concept, e.g. extra receiver windows).
+/// spaced. Ticks are snapped in label space, `rf_offset_hz` above the
+/// IF-space x positions (RF space when a transverter is active; 0 for
+/// callers with no XVTR concept, e.g. extra receiver windows), so the
+/// labels stay round with an offset that isn't (LO Error, LNB
+/// correction). A label that would run past the right edge -- into the
+/// PSK beacon/CW decoder panel beside the spectrum -- is skipped.
 fn draw_freq_axis_ticks(
     painter: &egui::Painter,
     rect: egui::Rect,
@@ -10853,30 +10855,29 @@ fn draw_freq_axis_ticks(
     let range_start = view_center_hz - visible_half_span_hz;
     let range_end = view_center_hz + visible_half_span_hz;
     let edge_margin_hz = 2.0 * visible_half_span_hz * 0.03;
-    let mut f = (range_start / step_hz).ceil() * step_hz;
-    while f <= range_end {
+    let offset = rf_offset_hz as f64;
+    let mut label_freq = ((range_start + offset) / step_hz).ceil() * step_hz;
+    while label_freq - offset <= range_end {
+        let f = label_freq - offset;
         let frac = ((f - range_start) / (2.0 * visible_half_span_hz)) as f32;
         let x = rect.left() + frac * rect.width();
         painter.line_segment(
             [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
             egui::Stroke::new(1.0, egui::Color32::from_gray(55)),
         );
-        if f - range_start >= edge_margin_hz && range_end - f >= edge_margin_hz {
-            let label_freq = f + rf_offset_hz as f64;
+        if f - range_start >= edge_margin_hz {
             let label = if step_hz >= 1000.0 {
                 format!("{:.0}", label_freq / 1000.0)
             } else {
                 format!("{:.1}", label_freq / 1000.0)
             };
-            painter.text(
-                egui::pos2(x + 2.0, rect.bottom() - 2.0),
-                egui::Align2::LEFT_BOTTOM,
-                label,
-                egui::FontId::monospace(13.0),
-                egui::Color32::GRAY,
-            );
+            let galley = painter.layout_no_wrap(label, egui::FontId::monospace(13.0), egui::Color32::GRAY);
+            if x + 2.0 + galley.size().x <= rect.right() {
+                let pos = egui::pos2(x + 2.0, rect.bottom() - 2.0 - galley.size().y);
+                painter.galley(pos, galley, egui::Color32::GRAY);
+            }
         }
-        f += step_hz;
+        label_freq += step_hz;
     }
 }
 
