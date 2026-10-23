@@ -25,7 +25,7 @@ use crate::rx888;
 use std::collections::VecDeque;
 use std::io;
 use std::net::UdpSocket;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -525,6 +525,13 @@ pub struct RadioSession {
     /// heard) rather than the parked hardware LO. See
     /// `requested_frequency_hz` below for the "set" side of this.
     pub rx_frequency_hz: Arc<AtomicU64>,
+    /// The active transverter's RF offset (RF = IF + this; 0 without
+    /// one), kept in sync every frame alongside rx_frequency_hz -- so
+    /// TCI can report the hardware LO (`dds`) in the same RF space as
+    /// the VFO.
+    pub rx_rf_offset_hz: Arc<AtomicI64>,
+    /// VFO B for TCI -- see VfoBShared.
+    pub vfo_b: Arc<VfoBShared>,
     /// N2ADR HL2 IO board state -- see Hl2IoBoardShared. Only P1
     /// (HermesLite2) sessions ever probe for or write to one.
     pub hl2_io_board: Arc<Hl2IoBoardShared>,
@@ -2189,6 +2196,8 @@ fn start_protocol1(
         frequency_hz,
         tx_frequency_hz,
         rx_frequency_hz,
+        rx_rf_offset_hz: Arc::default(),
+        vfo_b: Arc::default(),
         hl2_io_board,
         requested_frequency_hz,
         sample_rate,
@@ -2544,6 +2553,8 @@ fn start_protocol1_ozy_usb(
         frequency_hz,
         tx_frequency_hz,
         rx_frequency_hz,
+        rx_rf_offset_hz: Arc::default(),
+        vfo_b: Arc::default(),
         hl2_io_board: Arc::default(),
         requested_frequency_hz,
         sample_rate,
@@ -2812,6 +2823,8 @@ fn start_rx888_usb(
         frequency_hz,
         tx_frequency_hz,
         rx_frequency_hz,
+        rx_rf_offset_hz: Arc::default(),
+        vfo_b: Arc::default(),
         hl2_io_board: Arc::default(),
         requested_frequency_hz,
         sample_rate,
@@ -3011,6 +3024,8 @@ fn start_usb_dongle(
         frequency_hz,
         tx_frequency_hz,
         rx_frequency_hz,
+        rx_rf_offset_hz: Arc::default(),
+        vfo_b: Arc::default(),
         hl2_io_board: Arc::default(),
         requested_frequency_hz,
         sample_rate,
@@ -4138,6 +4153,17 @@ fn p1_send_preconfig_and_start(
 /// Shared between main.rs (which knows the RF frequency, transverter
 /// included), sender_loop (which writes the registers) and receiver_loop
 /// (which sees the presence probe's answer).
+/// VFO B as TCI sees it (`vfo:0,1,...`). VFO B itself lives in the UI
+/// layer (ConnectedState::vfo_b_frequency_hz, IF, with its own
+/// transverter), so main.rs keeps `frequency_hz` in sync every frame, in
+/// RF space like rx_frequency_hz, and applies `requested_hz` (RF, 0 =
+/// nothing pending) like a VFO-B keypad entry.
+#[derive(Default)]
+pub struct VfoBShared {
+    pub frequency_hz: AtomicU64,
+    pub requested_hz: AtomicU64,
+}
+
 #[derive(Default)]
 pub struct Hl2IoBoardShared {
     /// Set once the board answers the presence probe.
@@ -6797,6 +6823,8 @@ fn start_protocol2(
         frequency_hz,
         tx_frequency_hz,
         rx_frequency_hz,
+        rx_rf_offset_hz: Arc::default(),
+        vfo_b: Arc::default(),
         hl2_io_board: Arc::default(),
         requested_frequency_hz,
         sample_rate,

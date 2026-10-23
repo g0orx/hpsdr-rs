@@ -2657,6 +2657,8 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                     Arc::clone(&session.requested_frequency_hz),
                     Arc::clone(&session.rx_frequency_hz),
                     Arc::clone(&session.frequency_hz),
+                    Arc::clone(&session.rx_rf_offset_hz),
+                    Arc::clone(&session.vfo_b),
                     Arc::clone(&session.sample_rate),
                     spectrum.demod_params_handle(),
                     Arc::clone(&session.mox),
@@ -3747,6 +3749,24 @@ impl eframe::App for HpsdrApp {
                 // and, if a transverter is active, the real RF frequency
                 // rather than the radio's own IF.
                 connected.session.rx_frequency_hz.store(displayed_freq_hz, std::sync::atomic::Ordering::Relaxed);
+                connected.session.rx_rf_offset_hz.store(xvtr_rf_offset_hz, std::sync::atomic::Ordering::Relaxed);
+                // VFO B for TCI -- see radio::VfoBShared. A requested
+                // frequency is applied like a VFO-B keypad entry: RF
+                // space, picking the transverter whose range covers it.
+                let vfo_b_request = connected.session.vfo_b.requested_hz.swap(0, std::sync::atomic::Ordering::Relaxed);
+                if vfo_b_request != 0 {
+                    let xvtr = xvtr_for_rf_freq(&connected.xvtrs, vfo_b_request);
+                    let offset = xvtr.map(xvtr_rf_offset).unwrap_or(0);
+                    connected.vfo_b_xvtr = xvtr.map(|x| x.name.clone());
+                    connected.vfo_b_frequency_hz = (vfo_b_request as i64 - offset)
+                        .clamp(connected.device.frequency_min as i64, connected.device.frequency_max as i64)
+                        as u32;
+                    connected.settings_dirty.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+                connected.session.vfo_b.frequency_hz.store(
+                    (connected.vfo_b_frequency_hz as i64 + vfo_b_rf_offset(connected)).max(0) as u64,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
                 // See RadioSession::tx_frequency_hz's doc comment --
                 // kept in sync every frame here (same "cheap, no call
                 // site can forget it" reasoning as ctun_offset_hz just
@@ -7076,6 +7096,8 @@ impl eframe::App for HpsdrApp {
                                                 Arc::clone(&connected.session.requested_frequency_hz),
                                                 Arc::clone(&connected.session.rx_frequency_hz),
                                                 Arc::clone(&connected.session.frequency_hz),
+                                                Arc::clone(&connected.session.rx_rf_offset_hz),
+                                                Arc::clone(&connected.session.vfo_b),
                                                 Arc::clone(&connected.session.sample_rate),
                                                 connected.spectrum.demod_params_handle(),
                                                 Arc::clone(&connected.session.mox),

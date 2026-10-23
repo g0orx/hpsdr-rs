@@ -135,7 +135,7 @@ use crate::debug_log::DebugLog;
 use crate::spectrum::{Agc, DemodParams, Mode, NoiseBlanker, NoiseReduction, passband_for};
 use std::collections::VecDeque;
 use std::net::{TcpListener, TcpStream};
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -419,6 +419,12 @@ impl TciServer {
         // genuinely captured around the LO -- ends up looking shifted
         // relative to it.
         hw_frequency_hz: Arc<AtomicU32>,
+        // RadioSession::rx_rf_offset_hz: added to hw_frequency_hz so dds
+        // is in the same (transverter RF) space as vfo. Without it, a
+        // QO-100 LNB's ~9.75 GHz offset ended up in `if`.
+        rx_rf_offset_hz: Arc<AtomicI64>,
+        // See radio::VfoBShared: reported as vfo:0,1 and set by it.
+        vfo_b: Arc<crate::radio::VfoBShared>,
         sample_rate: Arc<AtomicU32>,
         demod_params: Arc<Mutex<DemodParams>>,
         mox: Arc<AtomicBool>,
@@ -485,6 +491,8 @@ impl TciServer {
                         let freq = Arc::clone(&requested_frequency_hz);
                         let rx_freq = Arc::clone(&rx_frequency_hz);
                         let hw_freq = Arc::clone(&hw_frequency_hz);
+                        let rf_offset = Arc::clone(&rx_rf_offset_hz);
+                        let conn_vfo_b = Arc::clone(&vfo_b);
                         let rate = Arc::clone(&sample_rate);
                         let params = Arc::clone(&accept_demod_params);
                         let conn_audio_iq_registry = Arc::clone(&accept_audio_iq_registry);
@@ -508,7 +516,7 @@ impl TciServer {
                                 conn_local_addrs.lock().unwrap().push(addr);
                             }
                             handle_client(
-                                stream, freq, rx_freq, hw_freq, rate, params, conn_audio_iq_registry, tx_audio,
+                                stream, freq, rx_freq, hw_freq, rf_offset, conn_vfo_b, rate, params, conn_audio_iq_registry, tx_audio,
                                 tx_gain, wants_mic, conn_mox, conn_tx_frequency_hz, conn_allow_out_of_band_tx,
                                 conn_rit_enabled, conn_rit_offset_hz, conn_xit_enabled, conn_xit_offset_hz,
                                 conn_stop, conn_board_name, conn_logging,
@@ -657,6 +665,8 @@ fn handle_client(
     requested_frequency_hz: Arc<AtomicU64>,
     rx_frequency_hz: Arc<AtomicU64>,
     hw_frequency_hz: Arc<AtomicU32>,
+    rx_rf_offset_hz: Arc<AtomicI64>,
+    vfo_b: Arc<crate::radio::VfoBShared>,
     sample_rate: Arc<AtomicU32>,
     demod_params: DemodParamsCell,
     // See ClientAudioIqSink's doc comment -- this client registers its
@@ -781,8 +791,8 @@ fn handle_client(
     // raw IQ tap is actually centered on, and if_offset (the `if`
     // message) is the gap between that and the CTUN'd `freq`/vfo above
     // -- 0 whenever CTUN is off, since the two are then equal.
-    let dds_freq = hw_frequency_hz.load(Ordering::Relaxed);
-    let if_offset = freq as i64 - dds_freq as i64;
+    let dds_freq = (hw_frequency_hz.load(Ordering::Relaxed) as i64 + rx_rf_offset_hz.load(Ordering::Relaxed)).max(0);
+    let if_offset = freq as i64 - dds_freq;
     let params = *demod_params.lock().unwrap().clone().lock().unwrap();
     let mode = params.mode;
     let (pb_low, pb_high) = passband_for(mode, params.width_hz);
@@ -905,6 +915,11 @@ fn handle_client(
     send_logged(&mut ws, &logging, format!("vfo:0,0,{freq};").into());
     send_logged(&mut ws, &logging, format!("if:0,0,{if_offset};").into());
     send_logged(&mut ws, &logging, format!("dds:0,{dds_freq};").into());
+    let vfo_b_freq = vfo_b.frequency_hz.load(Ordering::Relaxed);
+    if vfo_b_freq != 0 {
+        send_logged(&mut ws, &logging, format!("vfo:0,1,{vfo_b_freq};").into());
+        send_logged(&mut ws, &logging, format!("if:0,1,{};", vfo_b_freq as i64 - dds_freq).into());
+    }
     // MODULATIONS_LIST uses the canonical spellings tci_to_mode below
     // actually keys on, not its aliases (CWR/PKTUSB/PKTLSB/WFM).
     // IF_LIMITS/VFO_LIMITS: VFO_LIMITS mirrors rigctl.rs's own
@@ -1086,6 +1101,7 @@ fn handle_client(
                     if let Some(response) = handle_command(
                         cmd,
                         &requested_frequency_hz,
+                        &vfo_b,
                         &current_params,
                         &mox,
                         &tx_frequency_hz,
@@ -1546,13 +1562,19 @@ fn handle_client(
             // CTUN mid-session doesn't leave an already-connected
             // client's dds/if stuck at whatever they were at connect
             // time.
-            let dds_freq = hw_frequency_hz.load(Ordering::Relaxed);
-            let if_offset = freq as i64 - dds_freq as i64;
+            let dds_freq =
+                (hw_frequency_hz.load(Ordering::Relaxed) as i64 + rx_rf_offset_hz.load(Ordering::Relaxed)).max(0);
+            let if_offset = freq as i64 - dds_freq;
             let mode = demod_params.lock().unwrap().clone().lock().unwrap().mode;
             let mox_on = mox.load(Ordering::Relaxed);
             let _ = ws.send(Message::Text(format!("vfo:0,0,{freq};").into()));
             let _ = ws.send(Message::Text(format!("if:0,0,{if_offset};").into()));
             let _ = ws.send(Message::Text(format!("dds:0,{dds_freq};").into()));
+            let vfo_b_freq = vfo_b.frequency_hz.load(Ordering::Relaxed);
+            if vfo_b_freq != 0 {
+                let _ = ws.send(Message::Text(format!("vfo:0,1,{vfo_b_freq};").into()));
+                let _ = ws.send(Message::Text(format!("if:0,1,{};", vfo_b_freq as i64 - dds_freq).into()));
+            }
             let _ =
                 ws.send(Message::Text(format!("modulation:0,{};", mode_to_tci(mode)).into()));
             if ws
@@ -1788,6 +1810,7 @@ fn decode_binary_message(data: &[u8]) -> Option<(u32, Vec<f32>)> {
 fn handle_command(
     cmd: &str,
     requested_frequency_hz: &Arc<AtomicU64>,
+    vfo_b: &crate::radio::VfoBShared,
     demod_params: &Arc<Mutex<DemodParams>>,
     mox: &Arc<AtomicBool>,
     // See main.rs's tx_frequency_allowed doc comment -- real request, a
@@ -1814,7 +1837,15 @@ fn handle_command(
         "vfo" => {
             let f = args.get(2)?.parse::<f64>().ok()?;
             let f = f.round().max(0.0) as u64;
-            requested_frequency_hz.store(f, Ordering::Relaxed);
+            // The second argument picks the VFO: 1 is VFO B, which used
+            // to retune VFO A.
+            if args.get(1).map(|v| v.trim()) == Some("1") {
+                if f != 0 {
+                    vfo_b.requested_hz.store(f, Ordering::Relaxed);
+                }
+            } else {
+                requested_frequency_hz.store(f, Ordering::Relaxed);
+            }
             Some(format!(
                 "vfo:{},{},{};",
                 args.first().unwrap_or(&"0"),
