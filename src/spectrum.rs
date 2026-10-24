@@ -270,6 +270,17 @@ impl NoiseBlanker {
         }
     }
 
+    pub const ALL: [Self; 3] = [NoiseBlanker::Off, NoiseBlanker::Nb, NoiseBlanker::Nb2];
+
+    /// The choice on its own, for the main window's NB menu.
+    pub fn name(self) -> &'static str {
+        match self {
+            NoiseBlanker::Off => "Off",
+            NoiseBlanker::Nb => "NB",
+            NoiseBlanker::Nb2 => "NB2",
+        }
+    }
+
     pub fn label(self) -> &'static str {
         match self {
             NoiseBlanker::Off => "NB: Off",
@@ -318,6 +329,19 @@ impl NoiseReduction {
             NoiseReduction::Nr => NoiseReduction::Nr2,
             NoiseReduction::Nr2 => NoiseReduction::Nr3,
             NoiseReduction::Nr3 => NoiseReduction::Off,
+        }
+    }
+
+    pub const ALL: [Self; 4] = [NoiseReduction::Off, NoiseReduction::Nr, NoiseReduction::Nr2, NoiseReduction::Nr3];
+
+    /// The choice on its own, for the main window's NR menu (NNR: see
+    /// label below).
+    pub fn name(self) -> &'static str {
+        match self {
+            NoiseReduction::Off => "Off",
+            NoiseReduction::Nr => "NR",
+            NoiseReduction::Nr2 => "NR2",
+            NoiseReduction::Nr3 => "NNR",
         }
     }
 

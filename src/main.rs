@@ -822,6 +822,65 @@ fn midi_knob_range(value: u8, lo: f64, hi: f64) -> f64 {
     lo + (value as f64 / 127.0) * (hi - lo)
 }
 
+/// A toggle-row button that opens a menu of `choices` instead of
+/// cycling through them: highlighted unless `off` is selected, with a
+/// small down arrow drawn at its right (the UI font has no arrow glyph,
+/// so it's painted, like egui's ComboBox). Returns the choice clicked,
+/// if it differs from `current`.
+fn choice_menu_button<T: Copy + PartialEq>(
+    ui: &mut egui::Ui,
+    current: T,
+    off: T,
+    label: &str,
+    choices: &[(T, &str)],
+    hover: &str,
+) -> Option<T> {
+    const ARROW_SPACE: f32 = 12.0;
+    let mut picked = None;
+    let button = egui::Button::selectable(current != off, format!("{label}    "));
+    let (response, _) = egui::containers::menu::MenuButton::from_button(button).ui(ui, |ui| {
+        for &(value, name) in choices {
+            if ui.add(egui::Button::selectable(value == current, name)).clicked() && value != current {
+                picked = Some(value);
+            }
+        }
+    });
+    let r = response.rect;
+    let c = egui::pos2(r.right() - ARROW_SPACE / 2.0 - 4.0, r.center().y);
+    let color = ui.style().interact_selectable(&response, current != off).fg_stroke.color;
+    ui.painter().add(egui::Shape::convex_polygon(
+        vec![egui::pos2(c.x - 4.0, c.y - 2.0), egui::pos2(c.x + 4.0, c.y - 2.0), egui::pos2(c.x, c.y + 3.0)],
+        color,
+        egui::Stroke::NONE,
+    ));
+    response.on_hover_text(hover);
+    picked
+}
+
+fn noise_blanker_menu(ui: &mut egui::Ui, current: spectrum::NoiseBlanker) -> Option<spectrum::NoiseBlanker> {
+    let choices: Vec<_> = spectrum::NoiseBlanker::ALL.iter().map(|&v| (v, v.name())).collect();
+    choice_menu_button(
+        ui,
+        current,
+        spectrum::NoiseBlanker::Off,
+        current.label(),
+        &choices,
+        "Noise blanker: click to choose Off, NB or NB2",
+    )
+}
+
+fn noise_reduction_menu(ui: &mut egui::Ui, current: spectrum::NoiseReduction) -> Option<spectrum::NoiseReduction> {
+    let choices: Vec<_> = spectrum::NoiseReduction::ALL.iter().map(|&v| (v, v.name())).collect();
+    choice_menu_button(
+        ui,
+        current,
+        spectrum::NoiseReduction::Off,
+        current.label(),
+        &choices,
+        "Noise reduction: click to choose Off, NR, NR2 or NNR",
+    )
+}
+
 /// The main window's RX front-end gain slider, next to AGC Gain (moved
 /// from Settings -> RX). One control, four meanings, all stored in
 /// RadioSession::rx_attenuation (see its doc comment for each one's wire
@@ -5013,21 +5072,13 @@ impl eframe::App for HpsdrApp {
 
                     ui.horizontal_wrapped(|ui| {
                         let nb = connected.spectrum.noise_blanker();
-                        if ui
-                            .add(egui::Button::selectable(nb != spectrum::NoiseBlanker::Off, nb.label()))
-                            .on_hover_text("Click to cycle: Off -> NB -> NB2 -> Off")
-                            .clicked()
-                        {
-                            connected.spectrum.set_noise_blanker(nb.next());
+                        if let Some(v) = noise_blanker_menu(ui, nb) {
+                            connected.spectrum.set_noise_blanker(v);
                             settings_changed = true;
                         }
                         let nr = connected.spectrum.noise_reduction();
-                        if ui
-                            .add(egui::Button::selectable(nr != spectrum::NoiseReduction::Off, nr.label()))
-                            .on_hover_text("Click to cycle: Off -> NR -> NR2 -> NNR -> Off")
-                            .clicked()
-                        {
-                            connected.spectrum.set_noise_reduction(nr.next());
+                        if let Some(v) = noise_reduction_menu(ui, nr) {
+                            connected.spectrum.set_noise_reduction(v);
                             settings_changed = true;
                         }
                         let snb = connected.spectrum.snb();
@@ -7008,7 +7059,7 @@ impl eframe::App for HpsdrApp {
 
                             match connected.settings_tab {
                                 SettingsTab::Network => {
-                                    ui.label("rigctl (for WSJT-X's \"Hamlib NET rigctl\", etc.):");
+                                    ui.strong("rigctl (for WSJT-X's \"Hamlib NET rigctl\", etc.):");
                                     ui.horizontal(|ui| {
                                         let running = connected.rigctl_server.is_some();
                                         ui.add_enabled(
@@ -7076,8 +7127,10 @@ impl eframe::App for HpsdrApp {
                                         }
                                     }
 
-                                    ui.add_space(8.0);
-                                    ui.label("TCI (Transceiver Control Interface):");
+                                    ui.add_space(4.0);
+                                    ui.separator();
+                                    ui.add_space(4.0);
+                                    ui.strong("TCI (Transceiver Control Interface):");
                                     ui.horizontal(|ui| {
                                         let running = connected.tci_server.is_some();
                                         ui.add_enabled(
@@ -7172,8 +7225,10 @@ impl eframe::App for HpsdrApp {
                                         }
                                     }
 
-                                    ui.add_space(8.0);
-                                    ui.label(
+                                    ui.add_space(4.0);
+                                    ui.separator();
+                                    ui.add_space(4.0);
+                                    ui.strong(
                                         "CAT (Kenwood TS-2000 emulation, for loggers/rig-control software \
                                          e.g. N1MM+, Log4OM, DXLab Commander, Ham Radio Deluxe):",
                                     );
@@ -7243,7 +7298,9 @@ impl eframe::App for HpsdrApp {
                                         }
                                     }
 
-                                    ui.add_space(8.0);
+                                    ui.add_space(4.0);
+                                    ui.separator();
+                                    ui.add_space(4.0);
                                     ui.weak(
                                         "Format: address:port -- each protocol above shows its own default \
                                          (0.0.0.0 listens on every network interface, so another machine on \
@@ -12531,21 +12588,13 @@ fn render_extra_receiver_ui(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceiver>>) {
         // CTUN moved up to the VFO-A/VFO-B row above, matching the main
         // receiver's own layout -- see that block's doc comment.
         let nb = rx.spectrum.noise_blanker();
-        if ui
-            .add(egui::Button::selectable(nb != spectrum::NoiseBlanker::Off, nb.label()))
-            .on_hover_text("Click to cycle: Off -> NB -> NB2 -> Off")
-            .clicked()
-        {
-            rx.spectrum.set_noise_blanker(nb.next());
+        if let Some(v) = noise_blanker_menu(ui, nb) {
+            rx.spectrum.set_noise_blanker(v);
             rx.settings_dirty.store(true, Ordering::Relaxed);
         }
         let nr = rx.spectrum.noise_reduction();
-        if ui
-            .add(egui::Button::selectable(nr != spectrum::NoiseReduction::Off, nr.label()))
-            .on_hover_text("Click to cycle: Off -> NR -> NR2 -> NNR -> Off")
-            .clicked()
-        {
-            rx.spectrum.set_noise_reduction(nr.next());
+        if let Some(v) = noise_reduction_menu(ui, nr) {
+            rx.spectrum.set_noise_reduction(v);
             rx.settings_dirty.store(true, Ordering::Relaxed);
         }
         let snb = rx.spectrum.snb();
