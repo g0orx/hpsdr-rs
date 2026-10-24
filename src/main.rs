@@ -2059,7 +2059,7 @@ struct ConnectedState {
     /// startup" case to report here -- only ones the user triggered.
     rigctl_error: Option<String>,
     tci_error: Option<String>,
-    /// "Mute local audio output while TCI is running" (Settings ->
+    /// "Mute local audio output while a TCI client is connected" (Settings ->
     /// Network) -- see RadioSession::mute_local_audio_for_tci's doc
     /// comment for the mechanism and the real report that prompted it.
     /// Persisted (unlike ps_oneshot/ps_auto_attenuate) -- this is a
@@ -3749,8 +3749,11 @@ impl eframe::App for HpsdrApp {
                 // -- recomputed every frame (not just when the checkbox or
                 // TCI Start/Stop are clicked) so it stays correct even
                 // while Settings -> Network isn't the visible tab.
+                // Only while a client is actually connected, not merely
+                // while the server is listening.
                 connected.session.mute_local_audio_for_tci.store(
-                    connected.mute_local_audio_during_tci && connected.tci_server.is_some(),
+                    connected.mute_local_audio_during_tci
+                        && connected.tci_server.as_ref().is_some_and(|s| s.is_connected()),
                     std::sync::atomic::Ordering::Relaxed,
                 );
                 // Open Collector outputs -- see OcMask's doc comment.
@@ -7207,7 +7210,7 @@ impl eframe::App for HpsdrApp {
                                     {
                                         let mut mute = connected.mute_local_audio_during_tci;
                                         if ui
-                                            .checkbox(&mut mute, "Mute local audio output while TCI is running")
+                                            .checkbox(&mut mute, "Mute local audio output while a TCI client is connected")
                                             .on_hover_text(
                                                 "Prevents a client (e.g. WSJT-X) that's ALSO picking up \
                                                  hpsdr-rs's local audio output device (e.g. a virtual \

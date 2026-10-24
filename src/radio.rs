@@ -870,7 +870,7 @@ pub struct RadioSession {
     /// SpectrumHandle::run, same mechanism as its own `mox`-gating
     /// param) while true. Computed fresh each UI frame from
     /// `Settings::mute_local_audio_during_tci` (the user's own toggle)
-    /// AND whether the TCI server is actually running -- see main.rs's
+    /// AND whether a TCI client is actually connected -- see main.rs's
     /// update loop. Added after a real report: with a local audio
     /// output device also routed into WSJT-X (e.g. a virtual audio
     /// cable, from before TCI was in use, or for local monitoring),

@@ -100,7 +100,7 @@ pub struct Config {
     /// value here).
     #[serde(default)]
     pub cat_addr: Option<String>,
-    /// "Mute local audio output while TCI is running" (Settings ->
+    /// "Mute local audio output while a TCI client is connected" (Settings ->
     /// Network) -- see radio::RadioSession::mute_local_audio_for_tci's
     /// doc comment. Missing/false means unchanged behavior (both local
     /// audio and TCI stream, as before this option existed).

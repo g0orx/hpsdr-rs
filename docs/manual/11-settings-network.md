@@ -72,15 +72,16 @@ streaming), both directly and through TCI Remote Compactor.
   (`dds`) and the offset of the listening frequency from it (`if`) are
   reported in the same RF terms, so a client's own spectrum display lines
   up with a transverter band too.
-- **Mute local audio output while TCI is running** -- hpsdr-rs normally
+- **Mute local audio output while a TCI client is connected** -- hpsdr-rs normally
   streams RX audio to both its own local audio device and TCI at the same
   time. If that local device is *also* independently picked up by your TCI
   client (e.g. a virtual audio cable left over from before TCI was set
   up), the client receives the same audio twice -- once via TCI, once via
   the device -- which shows up as a doubled/offset waterfall segment and
   fuzzy-sounding decodes. Enable this to mute only the local device output
-  while TCI is actually running; TCI clients keep receiving audio
-  normally either way.
+  while at least one TCI client is connected; with the server running but
+  no client connected, local audio plays as normal. TCI clients keep
+  receiving audio normally either way.
 
 ### TCI Remote
 
