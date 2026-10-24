@@ -7306,10 +7306,11 @@ impl eframe::App for HpsdrApp {
                                          (0.0.0.0 listens on every network interface, so another machine on \
                                          your network can connect too, not just this one). Use 127.0.0.1:PORT \
                                          instead to restrict it to this machine only. None of these have any \
-                                         authentication, so only expose them on networks you trust. rigctl \
-                                         and TCI are RX only -- PTT is accepted but not implemented. CAT's \
-                                         TX;/RX; commands do drive real PTT (same as the on-screen PTT \
-                                         button), but only while Settings -> TX -> Enable Transmit is on.",
+                                         authentication, so only expose them on networks you trust. PTT from \
+                                         any of them (rigctl's set_ptt, TCI's trx, CAT's TX;/RX;) keys the \
+                                         radio like the on-screen PTT button -- only while Settings -> TX -> \
+                                         Enable Transmit is on, and only inside the ham bands (or a \
+                                         transverter's RF range) unless Allow TX outside ham bands is on.",
                                     );
                                 }
 
