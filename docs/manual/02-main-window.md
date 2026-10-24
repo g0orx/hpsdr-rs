@@ -261,14 +261,14 @@ being too coarse and the high end too fine on a plain linear scale.
 
 ## Noise/AGC toggles
 
-A row of buttons plus one slider:
+A row of buttons and two sliders:
 
 - **NB** -- click to choose Off, NB or NB2 from a menu (two
   mutually-exclusive noise blanker stages; the threshold both share is
   in Settings → RX). Highlighted while one is on.
-- **NR** -- click to choose Off, NR, NR2 or NNR from a menu (three mutually-exclusive
-  noise reduction algorithms; NNR is WDSP's built-in neural-net noise
-  reduction). NNR has Standard and Premium models (Settings → RX); in
+- **NR** -- click to choose Off, NR, NR2 or NNR from a menu (three
+  mutually-exclusive noise reduction algorithms; NNR is WDSP's built-in
+  neural-net noise reduction). Highlighted while one is on. NNR has Standard and Premium models (Settings → RX); in
   CWL/CWU it switches to WDSP's CW-trained models automatically, since
   the voice models treat CW as noise.
 - **SNB** -- toggles the Spectral Noise Blanker on/off, independently of NB

@@ -13,11 +13,19 @@ would start the server, red when it would stop it. None of the three
 require authentication, so only bind `0.0.0.0` (all interfaces) if you
 trust your local network.
 
-PTT sent through any of these three does drive the radio's real transmit
-(the same `mox` flag as the on-screen **MOX** button and Spacebar
-hold-to-talk), but only while Settings → TX → **Enable Transmit** is on --
-with transmit not armed, a PTT request is accepted (so the client's own
-handshake doesn't fail) but has no receiver on the other end.
+PTT sent through any of these three (rigctl's `set_ptt`, TCI's `trx`,
+CAT's `TX;`/`RX;`) does drive the radio's real transmit (the same `mox`
+flag as the on-screen **MOX** button and Spacebar hold-to-talk), but only
+while Settings → TX → **Enable Transmit** is on -- with transmit not armed,
+a PTT request is accepted (so the client's own handshake doesn't fail) but
+has no receiver on the other end. The same transmit-frequency check as the
+on-screen button applies too: inside the ham bands, or inside the active
+transverter's RF range, unless Settings → TX → **Allow TX outside ham
+bands** is on.
+
+Frequencies are always exchanged in the frequency shown on screen: with a
+[transverter](18-xvtr.md) active, clients see and set its RF frequency
+(e.g. 10489.540 MHz on QO-100), never the radio's IF.
 
 [RIT and XIT](02-main-window.md#transmit-controls) are readable and
 settable through all three servers too, and stay in sync with the
@@ -58,6 +66,12 @@ streaming), both directly and through TCI Remote Compactor.
   actually use).
 - Same **Start**/**Stop**/status/logging behavior as rigctl above (logs to
   `tci_log.txt`).
+- **VFO A and VFO B** are both reported to clients (`vfo:0,0` and
+  `vfo:0,1`) and both can be set from them -- VFO B through its own
+  transverter, the same as typing a frequency into it. The spectrum centre
+  (`dds`) and the offset of the listening frequency from it (`if`) are
+  reported in the same RF terms, so a client's own spectrum display lines
+  up with a transverter band too.
 - **Mute local audio output while TCI is running** -- hpsdr-rs normally
   streams RX audio to both its own local audio device and TCI at the same
   time. If that local device is *also* independently picked up by your TCI
@@ -84,6 +98,10 @@ IP address and the TCI port above (`50001` by default).
 
 *Example of TCI Remote running on an Apple iPad*
 
+On a microwave band such as QO-100, TCI Remote may show **OUT OF BAND**
+over its waterfall. That comes from TCI Remote's own band plan, not from
+hpsdr-rs -- the frequency, spectrum and tuning are all still correct.
+
 ## CAT (Kenwood TS-2000 emulation)
 
 A plain-ASCII, semicolon-terminated command set for logging/rig-control
@@ -106,8 +124,9 @@ named "rigctl" too.
   toggled on/off (`XT`), not set to a specific value -- matches real
   Kenwood TS-2000 behavior, which has no such command either.
 
-None of the three servers auto-start -- start them explicitly here each
-session, or whenever you need them.
+Each server's running state is saved: whichever were running when you
+last disconnected start again automatically the next time you connect to
+the same radio. A server you've stopped stays stopped.
 
 ---
 

@@ -21,7 +21,8 @@ One row per slot, each with:
   `RF = IF + LO Offset + LO Error`.
 - **LO Error** -- a small trim on top of LO Offset, for whatever the real
   LO measures in practice (kept separate so you don't have to recompute the
-  nominal offset every time you touch it).
+  nominal offset every time you touch it). Scroll over it to adjust: 100 Hz
+  per notch, **Alt** 10 Hz, **Shift** 1 kHz.
 - **Disable PA** -- when checked, this radio's internal PA and antenna T/R
   relay are left alone while transmitting on this band, so full PA
   drive/relay switching never gets routed into a transverter's low-level IF

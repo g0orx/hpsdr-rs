@@ -9486,10 +9486,16 @@ impl eframe::App for HpsdrApp {
                                             {
                                                 settings_changed = true;
                                             }
-                                            if ui
-                                                .add(egui::DragValue::new(&mut xvtr.lo_error_hz))
-                                                .changed()
-                                            {
+                                            let resp = ui.add(egui::DragValue::new(&mut xvtr.lo_error_hz)).on_hover_text(
+                                                "Scroll to adjust -- Alt: 10 Hz, none: 100 Hz, Shift: 1 kHz",
+                                            );
+                                            let scrolled = scroll_adjust_hz(
+                                                ui,
+                                                &resp,
+                                                &mut connected.slider_scroll_accum,
+                                                &mut xvtr.lo_error_hz,
+                                            );
+                                            if resp.changed() || scrolled {
                                                 settings_changed = true;
                                             }
                                             if ui.checkbox(&mut xvtr.disable_pa, "").changed() {
@@ -11769,6 +11775,39 @@ fn scroll_slider_f32_db(
     }
     if changed {
         *gain = 10f32.powf(db / 20.0);
+    }
+    changed
+}
+
+/// Scroll-wheel adjustment of a Hz value while `resp` (its field) is
+/// hovered: 100 Hz per notch, 10 Hz with Alt, 1 kHz with Shift (latched
+/// per wheel event, see scroll_tune_input). Consumes the wheel motion so
+/// the surrounding Settings page doesn't scroll too. Returns true if
+/// `value` changed.
+fn scroll_adjust_hz(ui: &mut egui::Ui, resp: &egui::Response, scroll_accum: &mut f32, value: &mut i64) -> bool {
+    if !resp.hovered() {
+        return false;
+    }
+    let (delta, shift, alt) = scroll_tune_input(ui);
+    ui.input_mut(|i| i.smooth_scroll_delta = egui::Vec2::ZERO);
+    if delta == 0.0 {
+        return false;
+    }
+    const NOTCH: f32 = 100.0;
+    let step: i64 = if alt {
+        10
+    } else if shift {
+        1_000
+    } else {
+        100
+    };
+    *scroll_accum += delta;
+    let mut changed = false;
+    while scroll_accum.abs() >= NOTCH {
+        let sign = scroll_accum.signum();
+        *scroll_accum -= sign * NOTCH;
+        *value += step * sign as i64;
+        changed = true;
     }
     changed
 }
