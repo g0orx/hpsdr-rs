@@ -12,7 +12,9 @@ Selectable buttons for the receiver's sample rate. Protocol 2 radios offer
 **48, 96, 192, 384, 768, 1536** kHz; Protocol 1 radios offer **48, 96, 192,
 384** kHz. An [RX-888 Mk2](20-rx888-mk2.md) offers only **96, 192, 384**
 kHz -- see that chapter for why. An [RTL-SDR](21-rtl-sdr.md) or [MSI.SDR](22-msi-sdr.md) stick offers
-**48, 96, 192, 384, 768, 1536** kHz. Changing this briefly interrupts audio/
+**48, 96, 192, 384, 768, 1536** kHz (up to 768 kHz with the MSI.SDR's
+[wide stream](22-msi-sdr.md#wide-stream)), and these sticks can also
+[record raw IQ](21-rtl-sdr.md#recording-raw-iq). Changing this briefly interrupts audio/
 spectrum while the demod chain restarts (on an RX-888, this also stops
 and restarts USB streaming, so it's a bigger interruption than a real
 radio's own live rate change, but still brief).

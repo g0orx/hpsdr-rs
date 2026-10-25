@@ -111,8 +111,22 @@ pub const SUPPORTED_OUTPUT_RATES: [u32; 6] = [48_000, 96_000, 192_000, 384_000, 
 /// without leaning on CPU the way 1536k would.
 pub const DEFAULT_OUTPUT_RATE_HZ: u32 = 192_000;
 
-pub fn decimation_for_output_rate(output_rate_hz: u32) -> Option<u32> {
-    SUPPORTED_OUTPUT_RATES.contains(&output_rate_hz).then(|| DONGLE_RATE_HZ / output_rate_hz)
+/// The decimation from a dongle streaming at `input_rate_hz` (normally
+/// DONGLE_RATE_HZ; the MSI.SDR's wide mode is faster) to
+/// `output_rate_hz`, if it's one of SUPPORTED_OUTPUT_RATES and the
+/// Decimator can reach it exactly: 1, or an even integer (its CIC does
+/// all but the final decimate-by-2).
+pub fn decimation_for_output_rate(input_rate_hz: u32, output_rate_hz: u32) -> Option<u32> {
+    if !SUPPORTED_OUTPUT_RATES.contains(&output_rate_hz) || !input_rate_hz.is_multiple_of(output_rate_hz) {
+        return None;
+    }
+    let decimation = input_rate_hz / output_rate_hz;
+    (decimation == 1 || decimation.is_multiple_of(2)).then_some(decimation)
+}
+
+/// SUPPORTED_OUTPUT_RATES narrowed to those reachable from `input_rate_hz`.
+pub fn supported_output_rates(input_rate_hz: u32) -> Vec<u32> {
+    SUPPORTED_OUTPUT_RATES.iter().copied().filter(|&r| decimation_for_output_rate(input_rate_hz, r).is_some()).collect()
 }
 
 /// Tuned below this, the R82xx can't help (its PLL bottoms out around
@@ -1443,19 +1457,19 @@ pub struct Decimator {
 
 impl Decimator {
     pub fn new(decimation: u32) -> Self {
-        Self::with_full_scale(decimation, 255.0)
+        Self::with_full_scale(DONGLE_RATE_HZ, decimation, 255.0)
     }
 
-    /// For a source other than this dongle's centred 8-bit samples
-    /// (mirisdr.rs's 14-bit ones): `full_scale` is the input magnitude
-    /// that should map to IqSample's own full scale, before
-    /// HEADROOM_FACTOR.
-    pub fn with_full_scale(decimation: u32, full_scale: f64) -> Self {
+    /// For a source other than this dongle's centred 8-bit samples at
+    /// DONGLE_RATE_HZ (mirisdr.rs's 14-bit ones, at `input_rate_hz`):
+    /// `full_scale` is the input magnitude that should map to IqSample's
+    /// own full scale, before HEADROOM_FACTOR.
+    pub fn with_full_scale(input_rate_hz: u32, decimation: u32, full_scale: f64) -> Self {
         let decimation = decimation.max(1);
         let cic_decimation = (decimation / 2).max(1);
         let cic_gain = (cic_decimation as f64).powi(CIC_STAGES as i32);
         let phase_inc =
-            2.0 * std::f64::consts::PI * tuning_offset_hz(decimation) as f64 / DONGLE_RATE_HZ as f64;
+            2.0 * std::f64::consts::PI * tuning_offset_hz(decimation) as f64 / input_rate_hz as f64;
         Self {
             decimation,
             cic_decimation,
@@ -1742,11 +1756,15 @@ mod tests {
     #[test]
     fn every_supported_rate_is_an_exact_decimation() {
         for &rate in &SUPPORTED_OUTPUT_RATES {
-            let d = decimation_for_output_rate(rate).unwrap();
+            let d = decimation_for_output_rate(DONGLE_RATE_HZ, rate).unwrap();
             assert_eq!(DONGLE_RATE_HZ / d, rate);
             assert_eq!(DONGLE_RATE_HZ % rate, 0);
         }
-        assert_eq!(decimation_for_output_rate(250_000), None);
+        assert_eq!(decimation_for_output_rate(DONGLE_RATE_HZ, 250_000), None);
+        // The MSI.SDR's wide rate: 1536k would be an odd decimation (3).
+        let wide = crate::mirisdr::WIDE_SAMPLE_RATE_HZ;
+        assert_eq!(supported_output_rates(wide), vec![48_000, 96_000, 192_000, 384_000, 768_000]);
+        assert_eq!(decimation_for_output_rate(wide, 768_000), Some(6));
     }
 
     #[test]
@@ -1827,7 +1845,7 @@ mod tests {
             let ph = 2.0 * std::f64::consts::PI * f_in * k as f64 / DONGLE_RATE_HZ as f64;
             (1000.0 * ph.cos(), 1000.0 * ph.sin())
         });
-        let mut d = Decimator::with_full_scale(decimation, 1000.0);
+        let mut d = Decimator::with_full_scale(DONGLE_RATE_HZ, decimation, 1000.0);
         let mut out = Vec::new();
         d.process_samples(samples, &mut |s| out.push(s));
         let tail = &out[out.len() / 2..];

@@ -19,7 +19,10 @@ mod cw_decoder;
 mod cw_encoder;
 mod debug_log;
 mod discovery;
+mod datv;
 mod discovery_ui;
+mod dvbs2;
+mod iq_recorder;
 mod midi;
 mod midi_import;
 mod mirisdr;
@@ -2231,6 +2234,23 @@ struct ConnectedState {
     /// Settings -- needed just to complete the very first connect); kept
     /// here only so it round-trips back into Config unchanged on save.
     rx888_firmware_path: Option<String>,
+    /// MSI.SDR only: Settings -> RX "Wide stream" -- see
+    /// radio::RadioSettings::mirisdr_wide. Takes effect on the next
+    /// connect, so this can differ from what the session is running.
+    mirisdr_wide: bool,
+    /// RTL-SDR / MSI.SDR: Settings -> RX "Record raw IQ" -- the running
+    /// (or just-finished) recording, its length limit, and the last
+    /// result line. Transient.
+    iq_recorder: Option<iq_recorder::IqRecorder>,
+    iq_record_seconds: f64,
+    iq_record_status: Option<String>,
+    /// RTL-SDR / MSI.SDR: the DATV window (see datv.rs) -- whether it's
+    /// open, its settings (saved), the running receiver and the last
+    /// start error.
+    datv_window_open: bool,
+    datv_settings: datv::DatvSettings,
+    datv: Option<datv::DatvReceiver>,
+    datv_error: Option<String>,
     /// Whether the Tune button is currently engaged -- transient, not
     /// persisted. See the main-panel Tune button handler for the full
     /// mechanism (WDSP PostGen tone + a temporary TX Power override).
@@ -2488,7 +2508,15 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
         settings.sample_rate = rx888::OUTPUT_SAMPLE_RATE_HZ;
     }
     // RTL-SDR / MSi2500: same idea -- only rates rtlsdr.rs can decimate to exactly.
-    if matches!(device.board, Boards::RtlSdr | Boards::MsiSdr) && rtlsdr::decimation_for_output_rate(settings.sample_rate).is_none() {
+    settings.mirisdr_wide = device.board == Boards::MsiSdr && cfg.mirisdr_wide.unwrap_or(false);
+    let dongle_input_rate = if device.board == Boards::MsiSdr {
+        mirisdr::sample_rate_hz(settings.mirisdr_wide)
+    } else {
+        rtlsdr::DONGLE_RATE_HZ
+    };
+    if matches!(device.board, Boards::RtlSdr | Boards::MsiSdr)
+        && rtlsdr::decimation_for_output_rate(dongle_input_rate, settings.sample_rate).is_none()
+    {
         settings.sample_rate = rtlsdr::DEFAULT_OUTPUT_RATE_HZ;
     }
     // Pre-size for multiple receivers, per whatever the
@@ -3213,6 +3241,19 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                 ozy_fpga_path: cfg.ozy_fpga_path.clone(),
                 ozy_clock_122_88_set: cfg.ozy_clock_122_88.is_some(),
                 rx888_firmware_path: cfg.rx888_firmware_path.clone(),
+                mirisdr_wide: cfg.mirisdr_wide.unwrap_or(false),
+                iq_recorder: None,
+                iq_record_seconds: 10.0,
+                iq_record_status: None,
+                datv_window_open: false,
+                datv_settings: datv::DatvSettings {
+                    frequency_hz: cfg.datv_frequency_hz.unwrap_or(datv::QO100_WB_BEACON_HZ),
+                    symbol_rate: cfg.datv_symbol_rate.unwrap_or(1_500_000),
+                    rolloff: cfg.datv_rolloff.unwrap_or(0.35),
+                    udp_addr: cfg.datv_udp_addr.clone().unwrap_or_else(|| "127.0.0.1:1234".to_string()),
+                },
+                datv: None,
+                datv_error: None,
                 tune_active: false,
                 pre_tune_power_watts: None,
                 two_tone_active: false,
@@ -4377,6 +4418,17 @@ impl eframe::App for HpsdrApp {
                                         connected.psk_beacon_enabled = !connected.psk_beacon_enabled;
                                         settings_changed = true;
                                     }
+                                    if connected.session.wideband_tap().is_some()
+                                        && ui
+                                            .add(egui::Button::selectable(connected.datv_window_open, "DATV"))
+                                            .on_hover_text(
+                                                "Receive DVB-S2 digital TV (e.g. QO-100's wideband transponder) \
+                                                 and send its video to VLC or ffplay",
+                                            )
+                                            .clicked()
+                                    {
+                                        connected.datv_window_open = !connected.datv_window_open;
+                                    }
                                 });
                             });
 
@@ -4613,6 +4665,10 @@ impl eframe::App for HpsdrApp {
                             }
                         }
                     });
+
+                    if connected.datv_window_open && render_datv_window(ui.ctx(), connected) {
+                        settings_changed = true;
+                    }
 
                     // Right-click VFO -> keypad frequency-entry popup --
                     // real request. Opened by freq_label/vfo_b_label's
@@ -8161,11 +8217,13 @@ impl eframe::App for HpsdrApp {
                                         // only has entries up to 384000 and would silently fall
                                         // through to 48kHz for anything higher, so these extra
                                         // rates are P2-only).
+                                        let dongle_rates;
                                         let rates: &[u32] = if connected.device.board == Boards::Rx888 {
                                             &[96_000, 192_000, 384_000]
-                                        } else if matches!(connected.device.board, Boards::RtlSdr | Boards::MsiSdr) {
-                                            // See rtlsdr::SUPPORTED_OUTPUT_RATES.
-                                            &rtlsdr::SUPPORTED_OUTPUT_RATES
+                                        } else if let Some(input_rate) = connected.session.dongle_input_rate_hz() {
+                                            // See rtlsdr::supported_output_rates.
+                                            dongle_rates = rtlsdr::supported_output_rates(input_rate);
+                                            &dongle_rates
                                         } else if connected.device.protocol == 2 {
                                             &[48_000, 96_000, 192_000, 384_000, 768_000, 1_536_000]
                                         } else {
@@ -8191,11 +8249,37 @@ impl eframe::App for HpsdrApp {
                                              and restarts it -- a bigger interruption than a real P1/P2 radio's \
                                              live rate change, but still brief.",
                                         );
-                                    } else if matches!(connected.device.board, Boards::RtlSdr | Boards::MsiSdr) {
-                                        ui.weak(
-                                            "The dongle always samples at 1536 kHz; this picks how far that is \
+                                    } else if let Some(input_rate) = connected.session.dongle_input_rate_hz() {
+                                        ui.weak(format!(
+                                            "The dongle always samples at {} kHz; this picks how far that is \
                                              decimated. Changing it briefly stops and restarts streaming.",
-                                        );
+                                            input_rate / 1000
+                                        ));
+                                        if connected.device.board == Boards::MsiSdr {
+                                            ui.add_space(4.0);
+                                            if ui
+                                                .checkbox(&mut connected.mirisdr_wide, "Wide stream (4608 kHz)")
+                                                .on_hover_text(
+                                                    "Samples at 4608 kHz with the 5 MHz IF filter instead of \
+                                                     1536 kHz with the 1.5 MHz one, for signals wider than \
+                                                     1.5 MHz such as QO-100's wideband DATV. Recordings and \
+                                                     DATV use the whole stream; the receiver itself can't \
+                                                     use 1536 kHz in this mode.",
+                                                )
+                                                .changed()
+                                            {
+                                                settings_changed = true;
+                                            }
+                                            let running_wide = input_rate == mirisdr::WIDE_SAMPLE_RATE_HZ;
+                                            if connected.mirisdr_wide != running_wide {
+                                                ui.colored_label(
+                                                    egui::Color32::from_rgb(220, 160, 40),
+                                                    "Takes effect when you next connect.",
+                                                );
+                                            }
+                                        }
+                                        ui.add_space(4.0);
+                                        iq_recording_ui(ui, connected, input_rate);
                                     } else {
                                         ui.weak(
                                             "Changing this briefly interrupts audio/spectrum while the demod chain restarts.",
@@ -10696,6 +10780,7 @@ impl eframe::App for HpsdrApp {
                             .rtlsdr_controls
                             .as_ref()
                             .map(|c| c.tuner_agc.load(Ordering::Relaxed)),
+                        mirisdr_wide: (connected.device.board == Boards::MsiSdr).then_some(connected.mirisdr_wide),
                         rigctl_addr: Some(connected.rigctl_addr.clone()),
                         tci_addr: Some(connected.tci_addr.clone()),
                         cat_addr: Some(connected.cat_addr.clone()),
@@ -10762,6 +10847,10 @@ impl eframe::App for HpsdrApp {
                         duplex: Some(connected.duplex),
                         cw_decode_enabled: Some(connected.cw_decode_enabled),
                         psk_beacon_enabled: Some(connected.psk_beacon_enabled),
+                        datv_frequency_hz: Some(connected.datv_settings.frequency_hz),
+                        datv_symbol_rate: Some(connected.datv_settings.symbol_rate),
+                        datv_rolloff: Some(connected.datv_settings.rolloff),
+                        datv_udp_addr: Some(connected.datv_settings.udp_addr.clone()),
                         lnb_lock_enabled: Some(connected.lnb_lock_enabled),
                         psk_panel_minimized: Some(connected.psk_panel_minimized),
                         rit_enabled: Some(connected.rit_enabled),
@@ -10933,6 +11022,293 @@ fn nice_tick_step(span: f64, target_ticks: f64) -> f64 {
 /// labels stay round with an offset that isn't (LO Error, LNB
 /// correction). A label that would run past the right edge -- into the
 /// PSK beacon/CW decoder panel beside the spectrum -- is skipped.
+/// The DATV window (see datv.rs), in its own viewport like Settings.
+/// Closing it stops the receiver. Returns true if a saved setting changed.
+fn render_datv_window(ctx: &egui::Context, connected: &mut ConnectedState) -> bool {
+    let mut changed = false;
+    let mut close = false;
+    ctx.show_viewport_immediate(
+        egui::ViewportId::from_hash_of("datv_window"),
+        egui::ViewportBuilder::default().with_title("DATV").with_inner_size([420.0, 520.0]),
+        |ui, _class| {
+            if ui.input(|i| i.viewport().close_requested()) {
+                close = true;
+                return;
+            }
+            egui::CentralPanel::default().show(ui, |ui| {
+                changed = datv_controls(ui, connected);
+            });
+        },
+    );
+    if close {
+        connected.datv_window_open = false;
+        connected.datv = None;
+    }
+    changed
+}
+
+fn datv_controls(ui: &mut egui::Ui, connected: &mut ConnectedState) -> bool {
+    let mut changed = false;
+    let running = connected.datv.is_some();
+    let Some(tap) = connected.session.wideband_tap() else {
+        ui.label("DATV needs an RTL-SDR or MSI.SDR.");
+        return false;
+    };
+    let rate_hz = tap.rate_hz;
+    let s = &mut connected.datv_settings;
+
+    egui::Grid::new("datv_settings").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
+        ui.label("Frequency:");
+        ui.horizontal(|ui| {
+            let mut mhz = s.frequency_hz as f64 / 1e6;
+            if ui
+                .add_enabled(!running, egui::DragValue::new(&mut mhz).speed(0.001).fixed_decimals(3).suffix(" MHz"))
+                .changed()
+            {
+                s.frequency_hz = (mhz * 1e6).round().max(0.0) as u64;
+                changed = true;
+            }
+            if ui
+                .add_enabled(!running, egui::Button::new("VFO A"))
+                .on_hover_text("Use VFO A's frequency")
+                .clicked()
+            {
+                s.frequency_hz = connected.session.rx_frequency_hz.load(Ordering::Relaxed);
+                changed = true;
+            }
+            if ui
+                .add_enabled(!running, egui::Button::new("Beacon"))
+                .on_hover_text("QO-100's wideband beacon, 10491.500 MHz, 1500 kS/s")
+                .clicked()
+            {
+                s.frequency_hz = datv::QO100_WB_BEACON_HZ;
+                s.symbol_rate = 1_500_000;
+                changed = true;
+            }
+        });
+        ui.end_row();
+
+        ui.label("Symbol rate:");
+        ui.horizontal_wrapped(|ui| {
+            for ks in [125u32, 250, 333, 500, 1000, 1500, 2000] {
+                if ui
+                    .add_enabled(!running, egui::Button::selectable(s.symbol_rate == ks * 1000, ks.to_string()))
+                    .clicked()
+                {
+                    s.symbol_rate = ks * 1000;
+                    changed = true;
+                }
+            }
+            let mut ks = s.symbol_rate as f64 / 1000.0;
+            if ui
+                .add_enabled(!running, egui::DragValue::new(&mut ks).range(25.0..=4000.0).speed(1.0).suffix(" kS/s"))
+                .changed()
+            {
+                s.symbol_rate = (ks * 1000.0).round() as u32;
+                changed = true;
+            }
+        });
+        ui.end_row();
+
+        ui.label("Roll-off:");
+        ui.horizontal(|ui| {
+            for r in [0.35f32, 0.25, 0.20] {
+                if ui.add_enabled(!running, egui::Button::selectable((s.rolloff - r).abs() < 1e-3, format!("{r:.2}"))).clicked() {
+                    s.rolloff = r;
+                    changed = true;
+                }
+            }
+        });
+        ui.end_row();
+
+        ui.label("Send to:");
+        if ui.add_enabled(!running, egui::TextEdit::singleline(&mut s.udp_addr).desired_width(160.0)).changed() {
+            changed = true;
+        }
+        ui.end_row();
+    });
+
+    let bandwidth = s.symbol_rate as f64 * (1.0 + s.rolloff as f64);
+    if bandwidth > rate_hz as f64 * 0.85 {
+        ui.colored_label(
+            egui::Color32::from_rgb(220, 160, 40),
+            format!(
+                "A {:.0} kHz wide signal won't fit the {} kHz stream{}.",
+                bandwidth / 1000.0,
+                rate_hz / 1000,
+                if connected.device.board == Boards::MsiSdr && rate_hz != mirisdr::WIDE_SAMPLE_RATE_HZ {
+                    " -- turn on Wide stream in Settings -> RX"
+                } else {
+                    ""
+                }
+            ),
+        );
+    }
+
+    ui.add_space(6.0);
+    ui.horizontal(|ui| {
+        if running {
+            if ui.add(egui::Button::new("Stop").fill(egui::Color32::from_rgb(170, 40, 40))).clicked() {
+                connected.datv = None;
+            }
+        } else if ui
+            .add_enabled(connected.iq_recorder.is_none(), egui::Button::new("Start").fill(egui::Color32::from_rgb(40, 140, 40)))
+            .on_disabled_hover_text("Not while a raw IQ recording is running")
+            .clicked()
+        {
+            connected.datv_error = None;
+            match datv::DatvReceiver::start(tap, Arc::clone(&connected.session.rx_rf_offset_hz), s.clone()) {
+                Ok(r) => connected.datv = Some(r),
+                Err(e) => connected.datv_error = Some(e),
+            }
+        }
+        let port = s.udp_addr.rsplit(':').next().unwrap_or("1234");
+        ui.weak(format!("Watch with: vlc udp://@:{port}  or  ffplay udp://127.0.0.1:{port}"));
+    });
+    if let Some(e) = &connected.datv_error {
+        ui.colored_label(egui::Color32::from_rgb(220, 60, 60), e);
+    }
+
+    if let Some(r) = &connected.datv {
+        let st = r.status();
+        ui.separator();
+        let d = &st.demod;
+        let (colour, text) = if d.locked {
+            (egui::Color32::from_rgb(60, 180, 60), "Locked")
+        } else {
+            (egui::Color32::from_rgb(200, 60, 60), "Searching")
+        };
+        egui::Grid::new("datv_status").num_columns(2).spacing([12.0, 4.0]).show(ui, |ui| {
+            ui.label("Signal:");
+            ui.colored_label(colour, text);
+            ui.end_row();
+            if let Some(pls) = d.pls.filter(|_| d.locked) {
+                ui.label("Mode:");
+                ui.label(match pls.modcod() {
+                    Some((m, rate)) => format!(
+                        "{} {}, {} frames{}",
+                        match m {
+                            dvbs2::params::Modulation::Qpsk => "QPSK",
+                            dvbs2::params::Modulation::Psk8 => "8PSK",
+                            dvbs2::params::Modulation::Apsk16 => "16APSK",
+                            dvbs2::params::Modulation::Apsk32 => "32APSK",
+                        },
+                        rate.name(),
+                        if pls.short { "short" } else { "normal" },
+                        if pls.pilots { ", pilots" } else { "" }
+                    ),
+                    None => "dummy frames".to_string(),
+                });
+                ui.end_row();
+                ui.label("SNR:");
+                ui.label(format!("{:.1} dB", d.snr_db));
+                ui.end_row();
+            }
+            ui.label("Carrier:");
+            ui.label(format!(
+                "{:+.1} kHz{}",
+                d.carrier_offset_hz / 1000.0,
+                if d.inverted { " (spectrum inverted)" } else { "" }
+            ));
+            ui.end_row();
+            let dec = &st.decoder;
+            ui.label("Frames:");
+            ui.label(format!("{} decoded, {} failed", dec.frames - dec.bch_failures, dec.bch_failures));
+            ui.end_row();
+            ui.label("Transport stream:");
+            ui.label(format!("{:.0} kbit/s, {} packets", st.ts_bitrate / 1000.0, dec.packets));
+            ui.end_row();
+            if st.dropped_frames + st.dropped_blocks > 0 {
+                ui.label("Dropped:");
+                ui.label(format!(
+                    "{} frames, {} USB reads (the computer isn't keeping up)",
+                    st.dropped_frames, st.dropped_blocks
+                ));
+                ui.end_row();
+            }
+        });
+        ui.ctx().request_repaint_after(std::time::Duration::from_millis(250));
+    }
+    changed
+}
+
+/// Settings -> RX "Record raw IQ" for an RTL-SDR / MSI.SDR: records the
+/// dongle's whole undecimated stream (see iq_recorder.rs).
+fn iq_recording_ui(ui: &mut egui::Ui, connected: &mut ConnectedState, input_rate: u32) {
+    if connected.iq_recorder.as_ref().is_some_and(|r| r.is_finished()) {
+        let mut rec = connected.iq_recorder.take().unwrap();
+        rec.stop();
+        connected.iq_record_status = Some(iq_recording_result(&rec));
+    }
+    ui.horizontal(|ui| {
+        ui.label("Record raw IQ:");
+        let recording = connected.iq_recorder.is_some();
+        ui.add_enabled(
+            !recording,
+            egui::DragValue::new(&mut connected.iq_record_seconds).range(1.0..=600.0).speed(1.0).suffix(" s"),
+        );
+        if let Some(rec) = connected.iq_recorder.as_mut() {
+            if ui.add(egui::Button::new("Stop").fill(egui::Color32::from_rgb(170, 40, 40))).clicked() {
+                rec.stop();
+                let rec = connected.iq_recorder.take().unwrap();
+                connected.iq_record_status = Some(iq_recording_result(&rec));
+            } else {
+                ui.label(format!("{:.1} s", rec.seconds()));
+                ui.ctx().request_repaint_after(std::time::Duration::from_millis(200));
+            }
+        } else if ui
+            .add_enabled(connected.datv.is_none(), egui::Button::new("Record"))
+            .on_disabled_hover_text("Not while DATV is running")
+            .clicked()
+        {
+            connected.iq_record_status = None;
+            let tap = connected.session.wideband_tap();
+            match (tap, iq_recorder::recording_base()) {
+                (Some(tap), Some(base)) => {
+                    let description = format!(
+                        "{:?} at {} kHz, VFO A {} MHz",
+                        connected.device.board,
+                        input_rate / 1000,
+                        format_frequency(connected.session.rx_frequency_hz.load(Ordering::Relaxed))
+                    );
+                    match iq_recorder::IqRecorder::start(
+                        tap,
+                        &base,
+                        connected.iq_record_seconds,
+                        Arc::clone(&connected.session.rx_rf_offset_hz),
+                        description,
+                    ) {
+                        Ok(rec) => connected.iq_recorder = Some(rec),
+                        Err(e) => connected.iq_record_status = Some(format!("Couldn't start: {e}")),
+                    }
+                }
+                _ => connected.iq_record_status = Some("Couldn't create the recordings folder".to_string()),
+            }
+        }
+    });
+    let mb_per_s = input_rate as f64 * 4.0 / 1e6;
+    ui.weak(format!(
+        "Saves the dongle's whole {} kHz stream, before decimation, as a SigMF recording (~{mb_per_s:.0} MB/s) \
+         in the recordings folder next to this radio's settings.",
+        input_rate / 1000
+    ));
+    if let Some(status) = &connected.iq_record_status {
+        ui.label(status);
+    }
+}
+
+fn iq_recording_result(rec: &iq_recorder::IqRecorder) -> String {
+    if let Some(e) = rec.progress.error.lock().unwrap().clone() {
+        return format!("Recording failed: {e}");
+    }
+    let dropped = rec.progress.dropped_blocks.load(Ordering::Relaxed);
+    let mut s = format!("Saved {:.1} s to {}", rec.seconds(), rec.data_path.display());
+    if dropped > 0 {
+        s.push_str(&format!(" -- {dropped} USB reads were dropped, so it has gaps"));
+    }
+    s
+}
+
 fn draw_freq_axis_ticks(
     painter: &egui::Painter,
     rect: egui::Rect,

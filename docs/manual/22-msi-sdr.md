@@ -1,4 +1,4 @@
-[← RTL-SDR](21-rtl-sdr.md) | [Index](README.md)
+[← RTL-SDR](21-rtl-sdr.md) | [Index](README.md) | [DATV →](23-datv.md)
 
 # MSI.SDR / MSi2500 sticks (receive-only)
 
@@ -66,11 +66,31 @@ up. Every HF band button appears, plus **2m, 70cm and 23cm**, and
 
 ## Sample rate
 
-The stick always samples at 1536 kHz. As with the RTL-SDR, [Settings:
+The stick normally samples at 1536 kHz. As with the RTL-SDR, [Settings:
 RX](15-settings-rx.md#sample-rate)'s Sample Rate buttons choose how far
 hpsdr-rs decimates that: **48, 96, 192, 384, 768 or 1536** kHz (default
 192). The MSi001's IF filter is set to 1.536 MHz to match. Changing the
 rate briefly stops and restarts streaming.
+
+### Wide stream
+
+**Wide stream (4608 kHz)**, under the Sample Rate buttons, makes the
+stick sample at 4608 kHz with the MSi001's 5 MHz IF filter instead. That
+gives about 4 MHz of usable bandwidth (the filter rolls off at roughly
++-2 MHz). It's for signals wider than 1.5 MHz, such as QO-100's wideband
+DATV transponder. The receiver's own rates are then **48 to 768** kHz
+(1536 kHz isn't available in this mode).
+
+The stick is only set up when you connect, so a change takes effect the
+next time you connect. Confirmed on a real MSI.SDR: 4608 kHz streams
+without losing samples. [DATV](23-datv.md) needs this for anything wider
+than about 1 MS/s.
+
+## Recording raw IQ
+
+**Record raw IQ** in Settings: RX saves the stick's whole stream, before
+any decimation -- see [the RTL-SDR chapter](21-rtl-sdr.md#recording-raw-iq).
+In wide mode that's the full 4608 kHz (about 18 MB a second).
 
 ## Centre spike
 
@@ -96,4 +116,4 @@ the dial, and a DC blocker removes what's left.
 
 ---
 
-[← RTL-SDR](21-rtl-sdr.md) | [Index](README.md)
+[← RTL-SDR](21-rtl-sdr.md) | [Index](README.md) | [DATV →](23-datv.md)

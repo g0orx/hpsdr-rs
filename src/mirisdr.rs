@@ -53,6 +53,24 @@ const KNOWN_DEVICES: &[(u16, u16, &str)] = &[
 /// offset all apply unchanged.
 pub const SAMPLE_RATE_HZ: u32 = rtlsdr::DONGLE_RATE_HZ;
 
+/// The wide mode's rate (Settings -> RX, "Wide stream"), for signals
+/// wider than SAMPLE_RATE_HZ can hold -- QO-100's wideband DATV, whose
+/// 1.5 MS/s beacon is ~2 MHz wide. 3 x 1.536MS/s, so every output rate
+/// but 1536k is still an even decimation (see
+/// rtlsdr::decimation_for_output_rate), and still at or below 6.048MS/s,
+/// so the stream stays 252_S16. Paired with the 5 MHz IF filter: its
+/// +-2.5 MHz only just overlaps this rate's +-2.304 MHz Nyquist band.
+pub const WIDE_SAMPLE_RATE_HZ: u32 = 4_608_000;
+
+/// The stream rate for the wide setting.
+pub fn sample_rate_hz(wide: bool) -> u32 {
+    if wide {
+        WIDE_SAMPLE_RATE_HZ
+    } else {
+        SAMPLE_RATE_HZ
+    }
+}
+
 /// Top of the MSi001's frequency plan in practice (libmirisdr's table
 /// runs to a 2.4GHz sentinel; sticks are sold as "up to 2GHz").
 pub const FREQUENCY_MAX_HZ: u64 = 2_000_000_000;
@@ -170,6 +188,8 @@ const IF_MODE_ZERO: u32 = 3;
 /// filter. libmirisdr defaults to 8MHz, which at this sample rate would
 /// fold everything up to +-4MHz into the passband.
 const BW_1536KHZ: u32 = 0x03;
+/// FIL_BW_SEL for 5MHz (MIRISDR_BW_5MHZ), used at WIDE_SAMPLE_RATE_HZ.
+const BW_5MHZ: u32 = 0x04;
 /// XTAL_SEL for 24MHz (libmirisdr only supports its default crystal).
 const XTAL_24M: u32 = 0x02;
 const RF_SYNTHESIZER_RESERVED_PROGRAMMING: u32 = 0x28;
@@ -178,7 +198,7 @@ const RF_SYNTHESIZER_RESERVED_PROGRAMMING: u32 = 0x28;
 /// it selects (needed for gain). Pure, so it can be tested against
 /// values from upstream's own C arithmetic. Returns (band,
 /// band_select_word, reg0, reg2, reg3, reg5).
-fn soft_regs(freq: u32) -> (Band, u32, u32, u32, u32, u32) {
+fn soft_regs(freq: u32, bandwidth: u32) -> (Band, u32, u32, u32, u32, u32) {
     let mut reg0: u32 = 0;
     let mut reg2: u32 = 2;
     let mut reg5: u32 = 5;
@@ -219,7 +239,7 @@ fn soft_regs(freq: u32) -> (Band, u32, u32, u32, u32, u32) {
 
     reg0 |= RF_SYNTHESIZER_ON << 10;
     reg0 |= IF_MODE_ZERO << 12;
-    reg0 |= BW_1536KHZ << 14;
+    reg0 |= bandwidth << 14;
     reg0 |= XTAL_24M << 17;
     // IF_LPMODE_NORMAL / VCO_LPMODE_NORMAL are both 0.
 
@@ -311,6 +331,8 @@ pub struct MiriSdrDevice {
     interface: Interface,
     band: Band,
     gain_db: u32,
+    /// FIL_BW_SEL code, matched to the stream rate (see initialise).
+    bandwidth: u32,
 }
 
 pub struct RxEndpoint {
@@ -442,7 +464,7 @@ impl MiriSdrDevice {
 
     /// mirisdr_set_soft (bias off, so reg8 is just the band-select word).
     fn set_soft(&mut self, freq: u32) -> io::Result<()> {
-        let (band, band_select_word, reg0, reg2, reg3, reg5) = soft_regs(freq);
+        let (band, band_select_word, reg0, reg2, reg3, reg5) = soft_regs(freq, self.bandwidth);
         self.band = band;
         self.write_reg(0x08, band_select_word)?;
         self.write_reg(0x09, 0x0e)?;
@@ -527,7 +549,14 @@ fn find_and_open(mac: [u8; 6]) -> io::Result<(nusb::Device, String)> {
 /// setting, stream on, for the stick `mac` (a discover() port MAC)
 /// names. Returns the control half, the streaming half, and the
 /// device's name.
-pub fn initialise(mac: [u8; 6], initial_freq_hz: u32, gain_db: u32) -> io::Result<(MiriSdrDevice, RxEndpoint, String)> {
+/// `wide`: stream at WIDE_SAMPLE_RATE_HZ with the 5 MHz IF filter rather
+/// than SAMPLE_RATE_HZ with the 1.536 MHz one.
+pub fn initialise(
+    mac: [u8; 6],
+    initial_freq_hz: u32,
+    gain_db: u32,
+    wide: bool,
+) -> io::Result<(MiriSdrDevice, RxEndpoint, String)> {
     // "reset je potřeba, jinak občas zařízení odmítá komunikovat" --
     // libmirisdr always resets on open (otherwise the device sometimes
     // refuses to talk). A reset can re-enumerate it, so look it up again
@@ -558,14 +587,19 @@ pub fn initialise(mac: [u8; 6], initial_freq_hz: u32, gain_db: u32) -> io::Resul
         ))
     })?;
 
-    let mut dev = MiriSdrDevice { interface: interface.clone(), band: Band::Vhf, gain_db: gain_db.min(MAX_GAIN_DB) };
+    let mut dev = MiriSdrDevice {
+        interface: interface.clone(),
+        band: Band::Vhf,
+        gain_db: gain_db.min(MAX_GAIN_DB),
+        bandwidth: if wide { BW_5MHZ } else { BW_1536KHZ },
+    };
 
     // also stop any streaming that may be active from before
     dev.streaming_stop()?;
     dev.adc_stop()?;
 
     dev.adc_init()?;
-    dev.set_hard(SAMPLE_RATE_HZ)?;
+    dev.set_hard(sample_rate_hz(wide))?;
     dev.set_center_freq(initial_freq_hz)?;
 
     // Through alt setting 0 first: by the USB spec SET_INTERFACE resets
@@ -705,7 +739,7 @@ mod tests {
             (1_900_000_000, 0xfa80, 0x04f500, 0x270072, 0x000003, 0x2800c5),
         ];
         for (freq, bsw, r0, r2, r3, r5) in cases {
-            let (_, b, reg0, reg2, reg3, reg5) = soft_regs(freq);
+            let (_, b, reg0, reg2, reg3, reg5) = soft_regs(freq, BW_1536KHZ);
             assert_eq!((b, reg0, reg2, reg3, reg5), (bsw, r0, r2, r3, r5), "{freq}");
         }
     }
@@ -714,17 +748,100 @@ mod tests {
     fn hard_regs_match_upstream_c() {
         assert_eq!(hard_regs(1_536_000), (0x011497, 0x0374bc));
         assert_eq!(hard_regs(3_072_000), (0x01148b, 0x0374bc));
+        assert_eq!(hard_regs(WIDE_SAMPLE_RATE_HZ), (0x011487, 0x0374bc));
     }
 
     #[test]
     fn sample_rate_is_in_range_and_uses_252_format() {
         assert!((1_300_000..=6_048_000).contains(&SAMPLE_RATE_HZ));
+        assert!((1_300_000..=6_048_000).contains(&WIDE_SAMPLE_RATE_HZ));
+    }
+
+    /// Needs a real stick plugged in: streams for 3 s in wide mode and
+    /// checks the measured rate and that no samples were lost.
+    /// `cargo test --release wide_stream -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn wide_stream_on_real_hardware() {
+        let (_, mac) = *discover().first().expect("no MSi2500 plugged in");
+        let (mut dev, mut rx, name) = initialise(mac, 739_750_000, DEFAULT_GAIN_DB, true).unwrap();
+        let mut unpacker = Unpacker::new();
+        let mut buf = vec![0u8; STREAM_READ_SIZE];
+        let mut samples = 0u64;
+        let mut peak = 0.0f64;
+        // Let the stream settle before timing it.
+        let settle = std::time::Instant::now();
+        while settle.elapsed() < Duration::from_millis(500) {
+            let n = rx.read(&mut buf).unwrap();
+            unpacker.process(&buf[..n], |_| {});
+        }
+        let start = std::time::Instant::now();
+        while start.elapsed() < Duration::from_secs(3) {
+            let n = rx.read(&mut buf).unwrap();
+            unpacker.process(&buf[..n], |s| {
+                samples += s.len() as u64;
+                for &(i, q) in s {
+                    peak = peak.max(i.abs()).max(q.abs());
+                }
+            });
+        }
+        let rate = samples as f64 / start.elapsed().as_secs_f64();
+        let gaps = unpacker.gaps_reported;
+        rx.cancel_and_drain();
+        dev.close();
+        println!("{name}: {rate:.0} samples/s, {gaps} gaps, peak {peak}");
+        assert_eq!(gaps, 0);
+        assert!((rate - WIDE_SAMPLE_RATE_HZ as f64).abs() < 0.02 * WIDE_SAMPLE_RATE_HZ as f64, "{rate}");
+        assert!(peak > 0.0);
+    }
+
+    /// Needs a real stick: records `HPSDR_MSI_SECONDS` (default 2) of
+    /// the wide stream at `HPSDR_MSI_FREQ` Hz to `HPSDR_MSI_OUT` as
+    /// ci16_le -- raw material for developing wideband decoders.
+    #[test]
+    #[ignore]
+    fn record_wide_stream() {
+        let freq: u32 = std::env::var("HPSDR_MSI_FREQ").map(|v| v.parse().unwrap()).unwrap_or(741_500_000);
+        let seconds: f64 = std::env::var("HPSDR_MSI_SECONDS").map(|v| v.parse().unwrap()).unwrap_or(2.0);
+        let gain: u32 = std::env::var("HPSDR_MSI_GAIN").map(|v| v.parse().unwrap()).unwrap_or(DEFAULT_GAIN_DB);
+        let out = std::env::var("HPSDR_MSI_OUT").expect("set HPSDR_MSI_OUT");
+        let (_, mac) = *discover().first().expect("no MSi2500 plugged in");
+        let (mut dev, mut rx, _) = initialise(mac, freq, gain, true).unwrap();
+        let mut unpacker = Unpacker::new();
+        let mut buf = vec![0u8; STREAM_READ_SIZE];
+        let want = (seconds * WIDE_SAMPLE_RATE_HZ as f64) as usize;
+        let mut bytes = Vec::with_capacity(want * 4);
+        let settle = std::time::Instant::now();
+        while settle.elapsed() < Duration::from_millis(500) {
+            let n = rx.read(&mut buf).unwrap();
+            unpacker.process(&buf[..n], |_| {});
+        }
+        while bytes.len() < want * 4 {
+            let n = rx.read(&mut buf).unwrap();
+            unpacker.process(&buf[..n], |s| {
+                for &(i, q) in s {
+                    bytes.extend_from_slice(&(i as i16).to_le_bytes());
+                    bytes.extend_from_slice(&(q as i16).to_le_bytes());
+                }
+            });
+        }
+        rx.cancel_and_drain();
+        dev.close();
+        std::fs::write(&out, &bytes[..want * 4]).unwrap();
+        assert_eq!(unpacker.gaps_reported, 0);
+    }
+
+    #[test]
+    fn wide_bandwidth_only_changes_the_filter_field() {
+        let (_, _, narrow, ..) = soft_regs(739_750_000, BW_1536KHZ);
+        let (_, _, wide, ..) = soft_regs(739_750_000, BW_5MHZ);
+        assert_eq!(narrow ^ wide, (BW_1536KHZ ^ BW_5MHZ) << 14);
     }
 
     #[test]
     fn hf_selects_an_am_band_and_vhf_does_not() {
-        assert_eq!(soft_regs(7_074_000).0, Band::Am2);
-        assert_eq!(soft_regs(144_174_000).0, Band::B3);
+        assert_eq!(soft_regs(7_074_000, BW_1536KHZ).0, Band::Am2);
+        assert_eq!(soft_regs(144_174_000, BW_1536KHZ).0, Band::B3);
     }
 
     #[test]

@@ -293,6 +293,9 @@ pub struct Config {
     pub rtlsdr_direct_sampling: Option<u8>,
     #[serde(default)]
     pub rtlsdr_tuner_agc: Option<bool>,
+    /// MSI.SDR only -- radio::RadioSettings::mirisdr_wide.
+    #[serde(default)]
+    pub mirisdr_wide: Option<bool>,
     /// Ozy only -- see radio::OzyAtlas's doc comment. `None` for the
     /// 122.88 MHz source means automatic; for the 10 MHz one, Atlas.
     #[serde(default)]
@@ -465,6 +468,16 @@ pub struct Config {
     /// falls back to off.
     #[serde(default)]
     pub psk_beacon_enabled: Option<bool>,
+    /// The DATV window's settings -- see datv::DatvSettings. `None`
+    /// falls back to the QO-100 wideband beacon.
+    #[serde(default)]
+    pub datv_frequency_hz: Option<u64>,
+    #[serde(default)]
+    pub datv_symbol_rate: Option<u32>,
+    #[serde(default)]
+    pub datv_rolloff: Option<f32>,
+    #[serde(default)]
+    pub datv_udp_addr: Option<String>,
     /// See ConnectedState::lnb_lock_enabled's doc comment. `None` falls
     /// back to off.
     #[serde(default)]

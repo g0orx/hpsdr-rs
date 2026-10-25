@@ -241,6 +241,10 @@ pub struct RadioSettings {
     /// doc comment).
     pub rtlsdr_direct_sampling: u8,
     pub rtlsdr_tuner_agc: bool,
+    /// MSi2500 only: stream at mirisdr::WIDE_SAMPLE_RATE_HZ (see its doc
+    /// comment). Read at connect; the stick is never reopened at runtime
+    /// (see DongleRate).
+    pub mirisdr_wide: bool,
     /// Ozy only -- initial values for OzyAtlas (see its doc comment).
     /// `None` = automatic (Penelope if one answers at start-up, else
     /// Mercury).
@@ -295,6 +299,7 @@ impl Default for RadioSettings {
             // Blog V3's built-in HF path) use.
             rtlsdr_direct_sampling: 2,
             rtlsdr_tuner_agc: false,
+            mirisdr_wide: false,
             ozy_clock_122_88: None,
             ozy_clock_10mhz: OZY_10MHZ_ATLAS,
             // See RadioSession::filter_board's doc comment -- ALEX is
@@ -1645,6 +1650,17 @@ impl RadioSession {
     ///
     /// RTL-SDR / MSi2500: only pauses the receiver -- the dongle stays
     /// open and streaming, see DongleRate.
+    /// RTL-SDR / MSi2500: the rate the dongle itself streams at.
+    pub fn dongle_input_rate_hz(&self) -> Option<u32> {
+        self.dongle_rate.as_ref().map(|r| r.input_rate_hz)
+    }
+
+    /// RTL-SDR / MSi2500: the dongle's undecimated stream (see
+    /// WidebandTap).
+    pub fn wideband_tap(&self) -> Option<Arc<WidebandTap>> {
+        self.dongle_rate.as_ref().map(|r| Arc::clone(&r.tap))
+    }
+
     pub fn stop_usb_sdr_threads(&mut self) {
         if let Some(rate) = &self.dongle_rate {
             rate.paused.store(true, Ordering::Release);
@@ -1721,18 +1737,18 @@ impl RadioSession {
 
     /// RTL-SDR / MSi2500 counterpart of `restart_rx888_at_rate`, same
     /// ordering contract with stop_usb_sdr_threads (see its doc
-    /// comment). The dongle itself always runs at rtlsdr::DONGLE_RATE_HZ
-    /// and stays open: this just switches the running threads' decimation
+    /// comment). The dongle itself keeps streaming at its fixed input
+    /// rate and stays open: this just switches the running threads' decimation
     /// and resumes the receiver (see DongleRate). Only if the receiver
     /// has already died (a stream error) is the dongle reopened. Returns
     /// the rate actually in use.
     pub fn restart_dongle_at_rate(&mut self, output_rate_hz: u32) -> io::Result<u32> {
-        let decimation = rtlsdr::decimation_for_output_rate(output_rate_hz);
+        let rate = self.dongle_rate.clone().ok_or_else(|| io::Error::other("not an RTL-SDR/MSI.SDR session"))?;
+        let decimation = rtlsdr::decimation_for_output_rate(rate.input_rate_hz, output_rate_hz);
         let (output_rate_hz, decimation) = match decimation {
             Some(d) => (output_rate_hz, d),
-            None => (rtlsdr::DEFAULT_OUTPUT_RATE_HZ, rtlsdr::DONGLE_RATE_HZ / rtlsdr::DEFAULT_OUTPUT_RATE_HZ),
+            None => (rtlsdr::DEFAULT_OUTPUT_RATE_HZ, rate.input_rate_hz / rtlsdr::DEFAULT_OUTPUT_RATE_HZ),
         };
-        let rate = self.dongle_rate.clone().ok_or_else(|| io::Error::other("not an RTL-SDR/MSI.SDR session"))?;
         rate.decimation.store(decimation, Ordering::Relaxed);
         // Again: a read that was mid-block when stop_usb_sdr_threads
         // paused may have pushed old-rate samples after its clear.
@@ -2976,12 +2992,13 @@ fn start_usb_dongle(
     // A saved rate only sticks if it's one rtlsdr.rs can decimate to
     // exactly (see rtlsdr::decimation_for_output_rate); main.rs's
     // connect_to_device already does the same check, this is the backstop.
+    let is_mirisdr = device.board == Boards::MsiSdr;
+    let input_rate = if is_mirisdr { mirisdr::sample_rate_hz(settings.mirisdr_wide) } else { rtlsdr::DONGLE_RATE_HZ };
     let output_rate = sample_rate.load(Ordering::Relaxed);
     let output_rate =
-        if rtlsdr::decimation_for_output_rate(output_rate).is_some() { output_rate } else { rtlsdr::DEFAULT_OUTPUT_RATE_HZ };
+        if rtlsdr::decimation_for_output_rate(input_rate, output_rate).is_some() { output_rate } else { rtlsdr::DEFAULT_OUTPUT_RATE_HZ };
     sample_rate.store(output_rate, Ordering::Relaxed);
 
-    let is_mirisdr = device.board == Boards::MsiSdr;
     let controls = (!is_mirisdr).then(|| {
         Arc::new(rtlsdr::Controls {
             direct_sampling: AtomicU8::new(settings.rtlsdr_direct_sampling),
@@ -3009,7 +3026,7 @@ fn start_usb_dongle(
     let xit_offset_hz = Arc::new(AtomicI32::new(settings.xit_offset_hz));
 
     let stop_flag = Arc::new(AtomicBool::new(false));
-    let dongle_rate = DongleRate::new(rtlsdr::DONGLE_RATE_HZ / output_rate);
+    let dongle_rate = DongleRate::new(input_rate, input_rate / output_rate);
     let (receiver_thread, control_thread) = match &controls {
         Some(controls) => {
             spawn_rtlsdr_threads(device.mac, &iq_buffers[0], &frequency_hz, &rx_attenuation, controls, &stop_flag, &dongle_rate)?
@@ -3110,7 +3127,8 @@ fn start_usb_dongle(
 
 /// RTL-SDR / MSi2500: the software decimation the receiver thread
 /// applies, shared with the control thread (the tuning offset depends on
-/// it). The dongle itself always streams at rtlsdr::DONGLE_RATE_HZ, so a
+/// it). The dongle itself always streams at `input_rate_hz`
+/// (rtlsdr::DONGLE_RATE_HZ, or the MSI.SDR's wide rate), so a
 /// sample rate change only rewrites `decimation` -- the stick stays open
 /// and streaming. REAL REPORT (2026-10-19, MSI.SDR on Windows): closing
 /// and reopening the stick for a rate change left its stream endpoint
@@ -3119,16 +3137,26 @@ fn start_usb_dongle(
 /// alt-setting round trip nor stopping the stick after the reads were
 /// cancelled helped. Every rate started fine from a fresh plug.
 struct DongleRate {
+    /// The rate the dongle streams at -- fixed for the session.
+    input_rate_hz: u32,
     decimation: AtomicU32,
     /// Set by stop_usb_sdr_threads while main.rs rebuilds the WDSP
     /// channel: the receiver keeps reading the USB stream (so nothing
     /// backs up in the stick) but drops the samples.
     paused: AtomicBool,
+    /// See WidebandTap -- lives here because both threads already share
+    /// this, and survives a receiver reopen like the rate does.
+    tap: Arc<WidebandTap>,
 }
 
 impl DongleRate {
-    fn new(decimation: u32) -> Arc<Self> {
-        Arc::new(Self { decimation: AtomicU32::new(decimation), paused: AtomicBool::new(false) })
+    fn new(input_rate_hz: u32, decimation: u32) -> Arc<Self> {
+        Arc::new(Self {
+            input_rate_hz,
+            decimation: AtomicU32::new(decimation),
+            paused: AtomicBool::new(false),
+            tap: WidebandTap::new(input_rate_hz),
+        })
     }
 }
 
@@ -3160,8 +3188,9 @@ fn spawn_rtlsdr_threads(
     let receiver_buffer = Arc::clone(iq_buffer);
     let receiver_stop = Arc::clone(stop_flag);
     let receiver_rate = Arc::clone(rate);
+    let receiver_frequency_hz = Arc::clone(frequency_hz);
     let receiver_thread = thread::spawn(move || {
-        rtlsdr_receiver_loop(rx_endpoint, receiver_buffer, receiver_stop, receiver_rate);
+        rtlsdr_receiver_loop(rx_endpoint, receiver_buffer, receiver_stop, receiver_rate, receiver_frequency_hz);
     });
 
     let control_frequency_hz = Arc::clone(frequency_hz);
@@ -3184,6 +3213,7 @@ fn rtlsdr_receiver_loop(
     iq_buffer: Arc<Mutex<VecDeque<IqSample>>>,
     stop_flag: Arc<AtomicBool>,
     rate: Arc<DongleRate>,
+    frequency_hz: Arc<AtomicU32>,
 ) {
     let mut decimation = rate.decimation.load(Ordering::Relaxed);
     let mut decimator = rtlsdr::Decimator::new(decimation);
@@ -3206,6 +3236,16 @@ fn rtlsdr_receiver_loop(
         if wanted != decimation {
             decimation = wanted;
             decimator = rtlsdr::Decimator::new(decimation);
+        }
+        if rate.tap.is_attached() {
+            // Odd trailing bytes don't happen in practice (reads are
+            // whole USB packets); dropping one would only cost a sample.
+            let samples = buf[..n]
+                .chunks_exact(2)
+                .map(|p| [((2 * p[0] as i32 - 255) << 7) as i16, ((2 * p[1] as i32 - 255) << 7) as i16])
+                .collect();
+            let center_hz = frequency_hz.load(Ordering::Relaxed) + rtlsdr::tuning_offset_hz(decimation);
+            rate.tap.send(WidebandBlock { center_hz, samples });
         }
         decimator.process_block(&buf[..n], |(iv, qv)| {
             push_sample(&iq_buffer, IqSample { i: iv, q: qv }, IQ_BUFFER_CAPACITY);
@@ -3282,8 +3322,9 @@ fn rtlsdr_control_loop(
     device.close();
 }
 
-/// MSi2500 counterpart of spawn_rtlsdr_threads. Same fixed
-/// rtlsdr::DONGLE_RATE_HZ, same Decimator and tuning offset.
+/// MSi2500 counterpart of spawn_rtlsdr_threads. Same Decimator and
+/// tuning offset; streams at rtlsdr::DONGLE_RATE_HZ, or
+/// mirisdr::WIDE_SAMPLE_RATE_HZ in wide mode.
 fn spawn_mirisdr_threads(
     mac: [u8; 6],
     iq_buffer: &Arc<Mutex<VecDeque<IqSample>>>,
@@ -3294,9 +3335,13 @@ fn spawn_mirisdr_threads(
 ) -> io::Result<(JoinHandle<()>, JoinHandle<()>)> {
     let decimation = rate.decimation.load(Ordering::Relaxed);
     let offset_hz = rtlsdr::tuning_offset_hz(decimation);
-    let (device, rx_endpoint, name) =
-        mirisdr::initialise(mac, frequency_hz.load(Ordering::Relaxed) + offset_hz, rx_attenuation.load(Ordering::Relaxed))?;
-    println!("MSi2500: {name} streaming at {} Hz, decimating by {decimation}", mirisdr::SAMPLE_RATE_HZ);
+    let (device, rx_endpoint, name) = mirisdr::initialise(
+        mac,
+        frequency_hz.load(Ordering::Relaxed) + offset_hz,
+        rx_attenuation.load(Ordering::Relaxed),
+        rate.input_rate_hz == mirisdr::WIDE_SAMPLE_RATE_HZ,
+    )?;
+    println!("MSi2500: {name} streaming at {} Hz, decimating by {decimation}", rate.input_rate_hz);
 
     // Set by the receiver thread once it has dropped its reader (which
     // cancels the reads it keeps queued) -- see mirisdr_control_loop.
@@ -3305,8 +3350,9 @@ fn spawn_mirisdr_threads(
     let receiver_stop = Arc::clone(stop_flag);
     let receiver_done_tx = Arc::clone(&receiver_done);
     let receiver_rate = Arc::clone(rate);
+    let receiver_frequency_hz = Arc::clone(frequency_hz);
     let receiver_thread = thread::spawn(move || {
-        mirisdr_receiver_loop(rx_endpoint, receiver_buffer, receiver_stop, receiver_rate);
+        mirisdr_receiver_loop(rx_endpoint, receiver_buffer, receiver_stop, receiver_rate, receiver_frequency_hz);
         receiver_done_tx.store(true, Ordering::Release);
     });
 
@@ -3328,10 +3374,11 @@ fn mirisdr_receiver_loop(
     iq_buffer: Arc<Mutex<VecDeque<IqSample>>>,
     stop_flag: Arc<AtomicBool>,
     rate: Arc<DongleRate>,
+    frequency_hz: Arc<AtomicU32>,
 ) {
     let mut unpacker = mirisdr::Unpacker::new();
     let mut decimation = rate.decimation.load(Ordering::Relaxed);
-    let mut decimator = rtlsdr::Decimator::with_full_scale(decimation, mirisdr::SAMPLE_FULL_SCALE);
+    let mut decimator = rtlsdr::Decimator::with_full_scale(rate.input_rate_hz, decimation, mirisdr::SAMPLE_FULL_SCALE);
     let mut buf = vec![0u8; mirisdr::STREAM_READ_SIZE];
     let mut push = |(iv, qv): (i32, i32)| push_sample(&iq_buffer, IqSample { i: iv, q: qv }, IQ_BUFFER_CAPACITY);
     let started = std::time::Instant::now();
@@ -3359,9 +3406,19 @@ fn mirisdr_receiver_loop(
         let wanted = rate.decimation.load(Ordering::Relaxed);
         if wanted != decimation {
             decimation = wanted;
-            decimator = rtlsdr::Decimator::with_full_scale(decimation, mirisdr::SAMPLE_FULL_SCALE);
+            decimator = rtlsdr::Decimator::with_full_scale(rate.input_rate_hz, decimation, mirisdr::SAMPLE_FULL_SCALE);
         }
-        unpacker.process(&buf[..n], |samples| decimator.process_samples(samples.iter().copied(), &mut push));
+        let mut wide = rate.tap.is_attached().then(|| Vec::with_capacity(n / 4));
+        unpacker.process(&buf[..n], |samples| {
+            if let Some(wide) = wide.as_mut() {
+                wide.extend(samples.iter().map(|&(i, q)| [i as i16, q as i16]));
+            }
+            decimator.process_samples(samples.iter().copied(), &mut push)
+        });
+        if let Some(samples) = wide {
+            let center_hz = frequency_hz.load(Ordering::Relaxed) + rtlsdr::tuning_offset_hz(decimation);
+            rate.tap.send(WidebandBlock { center_hz, samples });
+        }
     }
     rx_endpoint.cancel_and_drain();
 }
@@ -4162,6 +4219,65 @@ fn p1_send_preconfig_and_start(
 pub struct VfoBShared {
     pub frequency_hz: AtomicU64,
     pub requested_hz: AtomicU64,
+}
+
+/// One USB read's worth of a dongle's raw samples, before any
+/// decimation: standard I/Q (not this codebase's conjugated IqSample
+/// convention), full scale +-32768, centred on `center_hz` -- the
+/// frequency the hardware was tuned to (the dial plus
+/// rtlsdr::tuning_offset_hz), as of this read.
+pub struct WidebandBlock {
+    pub center_hz: u32,
+    pub samples: Vec<[i16; 2]>,
+}
+
+/// RTL-SDR / MSi2500: the dongle's whole stream, for consumers that
+/// need more than the receiver's decimated span -- the raw IQ recorder,
+/// and DATV. At most one consumer at a time; the receiver thread costs
+/// nothing extra while none is attached. Never blocks the receiver: if
+/// the consumer falls behind, blocks are dropped and counted.
+pub struct WidebandTap {
+    pub rate_hz: u32,
+    sink: Mutex<Option<mpsc::SyncSender<WidebandBlock>>>,
+    pub dropped_blocks: AtomicU64,
+}
+
+impl WidebandTap {
+    /// Room for ~0.5 s of reads before dropping.
+    const QUEUE_BLOCKS: usize = 256;
+
+    pub(crate) fn new(rate_hz: u32) -> Arc<Self> {
+        Arc::new(Self { rate_hz, sink: Mutex::new(None), dropped_blocks: AtomicU64::new(0) })
+    }
+
+    /// Replaces any existing consumer.
+    pub fn attach(&self) -> mpsc::Receiver<WidebandBlock> {
+        let (tx, rx) = mpsc::sync_channel(Self::QUEUE_BLOCKS);
+        self.dropped_blocks.store(0, Ordering::Relaxed);
+        *self.sink.lock().unwrap() = Some(tx);
+        rx
+    }
+
+    pub fn detach(&self) {
+        *self.sink.lock().unwrap() = None;
+    }
+
+    fn is_attached(&self) -> bool {
+        self.sink.lock().unwrap().is_some()
+    }
+
+    pub(crate) fn send(&self, block: WidebandBlock) {
+        let mut sink = self.sink.lock().unwrap();
+        if let Some(tx) = sink.as_ref() {
+            match tx.try_send(block) {
+                Ok(()) => {}
+                Err(mpsc::TrySendError::Full(_)) => {
+                    self.dropped_blocks.fetch_add(1, Ordering::Relaxed);
+                }
+                Err(mpsc::TrySendError::Disconnected(_)) => *sink = None,
+            }
+        }
+    }
 }
 
 #[derive(Default)]

@@ -85,6 +85,31 @@ RX](15-settings-rx.md#sample-rate)'s Sample Rate buttons choose how far
 hpsdr-rs decimates that: **48, 96, 192, 384, 768 or 1536** kHz (default
 192). Changing it briefly stops and restarts streaming.
 
+## Recording raw IQ
+
+**Record raw IQ** in [Settings: RX](15-settings-rx.md#sample-rate), under
+the Sample Rate buttons, saves the dongle's whole stream -- all 1536 kHz,
+before hpsdr-rs decimates it -- for the number of seconds you set (up to
+600), or until you click **Stop**. It's useful for looking at a signal in
+other software, or for sending a real off-air signal to a developer.
+
+Recordings are saved in the `recordings` folder next to this radio's
+[settings](README.md#conventions-used-in-this-manual) as a
+[SigMF](https://sigmf.org) pair:
+
+- `hpsdr-rs_<time>_iq.sigmf-data`: the samples, as interleaved 16-bit I/Q
+  (`ci16_le`). That's about 6 MB a second at 1536 kHz.
+- `hpsdr-rs_<time>_iq.sigmf-meta`: the sample rate, the time, and the
+  centre frequency. With a [transverter](18-xvtr.md) active, this is the
+  real RF frequency (e.g. 10491.8 MHz on QO-100). Retuning during a
+  recording adds another capture entry, with the sample it starts at.
+
+GNU Radio, inspectrum and SDR++ open these directly. The centre
+frequency is where the dongle itself was tuned: 300 kHz above the dial
+(see below), except at 1536 kHz. If the computer can't keep up, the
+recording skips some of the stream, and the result line under the button
+says how many USB reads were lost.
+
 ## Centre spike
 
 RTL-SDR dongles produce a spike at whatever frequency the dongle itself is

@@ -253,6 +253,8 @@ libusb to install.
   HF band plus **2m, 70cm and 23cm** band buttons.
 - **RF Gain** (0–102 dB) is on the main window next to AGC Gain.
 - Sample rates **48–1536 kHz**; one receiver.
+- **Wide stream**: 4608 kHz with the 5 MHz IF filter, for
+  [DATV](#datv-dvb-s2-receive) and other wide signals.
 
 Setup:
 
@@ -266,6 +268,21 @@ Setup:
 3. **macOS**: no extra driver needed. Untested.
 
 See [the full MSI.SDR chapter](docs/manual/22-msi-sdr.md).
+
+## DATV (DVB-S2 receive)
+
+> **New, not yet confirmed off-air**: decodes video end to end from
+> synthetic test signals, and finds the real QO-100 wideband beacon's
+> frames.
+
+With an RTL-SDR or MSI.SDR, the **DATV** window receives DVB-S2 digital
+TV, such as QO-100's wideband transponder, and sends the MPEG transport
+stream over UDP for VLC or ffplay to show. It handles QPSK and 8PSK,
+every code rate, normal and short frames, with or without pilots. The
+receiver is written from the DVB-S2 standard (ETSI EN 302 307-1) for this
+project. Either dongle can also record its whole raw stream as SigMF.
+
+See [the DATV chapter](docs/manual/23-datv.md).
 
 ## Packaging (Debian/Ubuntu)
 
