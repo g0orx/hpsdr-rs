@@ -28,7 +28,8 @@ from source and project status, see the [top-level README](../../README.md).
 20. [RX-888 Mk2](20-rx888-mk2.md) -- receive-only direct-sampling SDR, software DDC, multiple receivers
 21. [RTL-SDR](21-rtl-sdr.md) -- receive-only RTL2832U + R820T2 dongles (e.g. NooElec NESDR Smart), VHF/UHF and direct-sampling HF
 22. [MSI.SDR](22-msi-sdr.md) -- receive-only Mirics MSi2500 + MSi001 sticks (MSI.SDR, SDRplay RSP1), HF to 2 GHz
-23. [DATV](23-datv.md) -- receiving DVB-S2 digital TV (QO-100's wideband transponder) with an RTL-SDR or MSI.SDR (new, unconfirmed off-air)
+23. [DATV](23-datv.md) -- receiving DVB-S2 digital TV (QO-100's wideband transponder) with an RTL-SDR, MSI.SDR or Pluto, and the Pluto's whole-transponder view
+24. [ADALM-Pluto](24-pluto.md) -- the Pluto and its clones as a receiver (AD9363, 325 MHz to 3.8 GHz), over its USB network link; transmit not yet
 
 **PDF**: this whole manual is also available as a single PDF, useful for
 offline/printed reading. It's built automatically by the "Manual PDF"

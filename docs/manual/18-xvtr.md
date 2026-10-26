@@ -35,7 +35,8 @@ All frequencies are entered in **Hz**.
 
 A QO-100 narrowband downlink (10489.5-10490 MHz) received through a
 standard 9750 MHz LNB lands at an IF of 739.5-740 MHz, which an
-[RTL-SDR](21-rtl-sdr.md) or [MSI.SDR](22-msi-sdr.md) can tune directly:
+[RTL-SDR](21-rtl-sdr.md), [MSI.SDR](22-msi-sdr.md) or
+[Pluto](24-pluto.md) can tune directly:
 
 | Name | RF Min | RF Max | LO Offset | LO Error |
 |---|---|---|---|---|

@@ -100,8 +100,8 @@ so the main receiver stays free for normal use. The intended setup:
 
 1. Select the QO-100 transverter and tune to about 10489.750 MHz, so the
    beacon is near the middle of the span.
-2. Choose a wide sample rate -- e.g. **768 kHz** on an RTL-SDR or
-   MSI.SDR, which covers the whole narrowband transponder.
+2. Choose a wide sample rate -- e.g. **768 kHz** on an RTL-SDR,
+   MSI.SDR or Pluto, which covers the whole narrowband transponder.
 3. Turn **CTUN** on and tune around the transponder with it. The radio
    stays put, so the beacon stays in the span.
 
@@ -218,7 +218,8 @@ same transverter as VFO A.
 
 One row of band buttons -- **160m, 80m, 60m, 40m, 30m, 20m, 17m, 15m, 12m,
 10m, 6m**, plus **2m, 70cm, 23cm** on a VHF/UHF-capable board such as an
-[RTL-SDR](21-rtl-sdr.md) or [MSI.SDR](22-msi-sdr.md) -- jumps to that band's remembered frequency, mode, and filter
+[RTL-SDR](21-rtl-sdr.md), [MSI.SDR](22-msi-sdr.md) or
+[Pluto](24-pluto.md) -- jumps to that band's remembered frequency, mode, and filter
 width (or sensible defaults the first time you visit a band). Each band
 remembers its own settings independently as you use the app. A band whose
 range the connected radio can't actually tune to doesn't get a button at
@@ -295,8 +296,9 @@ A row of buttons and two sliders:
     values attenuate. Lower it if the spectrum looks garbled/overloaded
     on a strong band. Over Protocol 2 a HermesLite2 shows RX Attenuation
     instead.
-  - **RF Gain** on an [RTL-SDR](21-rtl-sdr.md#rf-gain) (0-50 dB) or
-    [MSI.SDR](22-msi-sdr.md#rf-gain) (0-102 dB).
+  - **RF Gain** on an [RTL-SDR](21-rtl-sdr.md#rf-gain) (0-50 dB),
+    [MSI.SDR](22-msi-sdr.md#rf-gain) (0-102 dB) or
+    [Pluto](24-pluto.md#rf-gain) (0-71 dB).
 
   Hover over the label for a reminder of what it does.
 - **SQL** and its slider (0-100) -- squelch, next to Audio gain (above

@@ -17,7 +17,8 @@ Shows details of the radio currently connected to:
   [Ozy](19-ozy-usb.md), [RX-888 Mk2](20-rx888-mk2.md), RTL-SDR and
   MSI.SDR.
 - **MAC Address** -- the radio's hardware Ethernet address. Not shown
-  for the USB-connected boards (no real MAC).
+  for the USB-connected boards (no real MAC), or for a
+  [Pluto](24-pluto.md), which is told apart by its serial number.
 - **Interface** -- which of this computer's own network interfaces (e.g.
   `eth0`) the connection is using. For an RTL-SDR or MSI.SDR, the USB
   port it's plugged into (e.g. `USB 4-1.3` above), which tells two
