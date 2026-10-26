@@ -211,6 +211,10 @@ mod tests {
             eprintln!("{:.1} s {:?}", (n + 1) as f64 / 10.0, demod.status);
         }
         eprintln!("{:?}", decoder.stats);
+        // HPSDR_DVBS2_TS_OUT: write the transport stream, for ffprobe.
+        if let Ok(out) = std::env::var("HPSDR_DVBS2_TS_OUT") {
+            std::fs::write(out, packets.concat()).unwrap();
+        }
         let seconds = samples.len() as f64 / fs;
         eprintln!(
             "{seconds:.1} s of signal: demod {:.2} s, decode {:.2} s",

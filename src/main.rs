@@ -35,6 +35,7 @@ mod rtlsdr;
 mod rx888;
 mod spectrum;
 mod tci;
+mod transponder;
 mod tx;
 mod usb_port;
 mod wdsp_sys;
@@ -11115,7 +11116,7 @@ fn render_datv_window(ctx: &egui::Context, connected: &mut ConnectedState) -> bo
     let mut close = false;
     ctx.show_viewport_immediate(
         egui::ViewportId::from_hash_of("datv_window"),
-        egui::ViewportBuilder::default().with_title("DATV").with_inner_size([420.0, 520.0]),
+        egui::ViewportBuilder::default().with_title("DATV").with_inner_size([560.0, 720.0]),
         |ui, _class| {
             if ui.input(|i| i.viewport().close_requested()) {
                 close = true;
@@ -11129,6 +11130,170 @@ fn render_datv_window(ctx: &egui::Context, connected: &mut ConnectedState) -> bo
     if close {
         connected.datv_window_open = false;
         connected.datv = None;
+        if let Some(scan) = &connected.session.pluto_scan {
+            scan.stop();
+        }
+    }
+    changed
+}
+
+/// Retunes VFO A onto DATV's frequency if the signal doesn't fit in the
+/// stream as tuned -- DATV only sees the receiver's stream (`rate_hz`
+/// wide, centred rtlsdr::tuning_offset_hz above the dial). REAL REPORT:
+/// a station picked in the transponder view, 6 MHz from where the dial
+/// was, just searched forever. On the dial itself the signal sits that
+/// offset below the stream's centre, which leaves room for anything
+/// DATV can receive at that rate.
+fn datv_bring_into_stream(connected: &mut ConnectedState, rate_hz: u32) {
+    let s = &connected.datv_settings;
+    let rf_offset = connected.session.rx_rf_offset_hz.load(Ordering::Relaxed);
+    let dial_if = connected.session.frequency_hz.load(Ordering::Relaxed) as i64;
+    let decimation = connected.session.dongle_input_rate_hz().map_or(1, |input| input / connected.sample_rate.max(1));
+    let stream_centre_rf = dial_if + rtlsdr::tuning_offset_hz(decimation) as i64 + rf_offset;
+    let half_width = s.symbol_rate as f64 * (1.0 + s.rolloff as f64) / 2.0;
+    let off = (s.frequency_hz as i64 - stream_centre_rf).abs() as f64;
+    if off + half_width <= 0.45 * rate_hz as f64 {
+        return;
+    }
+    let signal_if = s.frequency_hz as i64 - rf_offset;
+    if !(connected.device.frequency_min as i64..=connected.device.frequency_max as i64).contains(&signal_if) {
+        return;
+    }
+    let signal_if = signal_if as u32;
+    connected.session.set_frequency(signal_if);
+    if connected.ctun {
+        connected.ctun_frequency_hz = signal_if;
+    }
+}
+
+/// The DATV window's transponder view (Pluto only; see transponder.rs):
+/// a spectrum of all of QO-100's wideband transponder, where clicking a
+/// signal sets DATV's frequency and symbol rate. Returns true if it
+/// changed the DATV settings.
+fn transponder_view(ui: &mut egui::Ui, connected: &mut ConnectedState) -> bool {
+    let Some(scan) = connected.session.pluto_scan.clone() else {
+        return false;
+    };
+    let running = connected.datv.is_some();
+    // RF = IF + the active transverter's offset (LNB correction included).
+    let rf_offset = connected.session.rx_rf_offset_hz.load(Ordering::Relaxed);
+    let centre_rf = (transponder::QO100_WB_LOW_HZ + transponder::QO100_WB_HIGH_HZ) as i64 / 2;
+    let centre_if = centre_rf - rf_offset;
+    let usable = rf_offset != 0
+        && (connected.device.frequency_min as i64..=connected.device.frequency_max as i64).contains(&centre_if);
+    let mut on = scan.is_requested();
+    if on && (running || !usable) {
+        scan.stop();
+        on = false;
+    }
+    ui.horizontal(|ui| {
+        let hover = "All of QO-100's wideband transponder, 10491-10499.5 MHz. The Pluto runs faster \
+                     than its USB link can carry for this, so the receiver is paused while it's shown. \
+                     Click a signal to set the frequency and symbol rate below.";
+        let disabled = if running {
+            "Not while DATV is running"
+        } else {
+            "Needs the QO-100 transverter selected, with an LO offset that puts the transponder in the Pluto's range"
+        };
+        let resp = ui
+            .add_enabled(usable && !running, egui::Button::selectable(on, "Transponder view"))
+            .on_hover_text(hover)
+            .on_disabled_hover_text(disabled);
+        if resp.clicked() {
+            if on {
+                scan.stop();
+            } else {
+                scan.request(centre_if as u32);
+            }
+            on = !on;
+        }
+        if on {
+            ui.weak("Receiver paused while this is shown");
+        }
+    });
+    if !on {
+        return false;
+    }
+    // Follow the LNB correction, but not by every hertz: each re-centre
+    // restarts the averaging.
+    if (scan.request_if_hz.load(Ordering::Relaxed) as i64 - centre_if).abs() > 50_000 {
+        scan.request(centre_if as u32);
+    }
+    ui.ctx().request_repaint_after(std::time::Duration::from_millis(100));
+
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 180.0), egui::Sense::click());
+    let painter = ui.painter_at(rect);
+    painter.rect_filled(rect, 2.0, egui::Color32::from_rgb(12, 14, 20));
+    let Some(spec) = scan.current() else {
+        painter.text(rect.center(), egui::Align2::CENTER_CENTER, "Waiting for the Pluto...", egui::FontId::proportional(14.0), egui::Color32::GRAY);
+        return false;
+    };
+
+    // The view: the transponder plus a little either side, in RF.
+    let rf_centre = spec.centre_if_hz as f64 + rf_offset as f64;
+    let half_span = 4_500_000.0;
+    let n = spec.db.len();
+    let bin_hz = spec.rate_hz as f64 / n as f64;
+    let bin_rf = |k: usize| rf_centre + (k as f64 - n as f64 / 2.0) * bin_hz;
+    let x_of = |rf: f64| rect.left() + ((rf - (rf_centre - half_span)) / (2.0 * half_span)) as f32 * rect.width();
+    let visible: Vec<usize> = (0..n).filter(|&k| (bin_rf(k) - rf_centre).abs() <= half_span).collect();
+    let mut levels: Vec<f32> = visible.iter().map(|&k| spec.db[k]).collect();
+    levels.sort_by(f32::total_cmp);
+    let floor = levels[levels.len() / 10] - 2.0;
+    let top = (levels[levels.len() - 1] + 3.0).max(floor + 10.0);
+    let y_of = |db: f32| rect.bottom() - ((db - floor) / (top - floor)).clamp(0.0, 1.0) * rect.height();
+
+    // A line each MHz, labelled.
+    let grid = egui::Color32::from_gray(50);
+    let first_mhz = ((rf_centre - half_span) / 1e6).ceil() as i64;
+    let last_mhz = ((rf_centre + half_span) / 1e6).floor() as i64;
+    for mhz in first_mhz..=last_mhz {
+        let x = x_of(mhz as f64 * 1e6);
+        painter.line_segment([egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())], egui::Stroke::new(1.0, grid));
+        painter.text(
+            egui::pos2(x + 2.0, rect.bottom() - 2.0),
+            egui::Align2::LEFT_BOTTOM,
+            format!("{mhz}"),
+            egui::FontId::proportional(10.0),
+            egui::Color32::GRAY,
+        );
+    }
+
+    // Where DATV is set: the signal's occupied width.
+    let s = &connected.datv_settings;
+    let half_width = s.symbol_rate as f64 * (1.0 + s.rolloff as f64) / 2.0;
+    let (x0, x1) = (x_of(s.frequency_hz as f64 - half_width), x_of(s.frequency_hz as f64 + half_width));
+    if x1 > rect.left() && x0 < rect.right() {
+        painter.rect_filled(
+            egui::Rect::from_x_y_ranges(x0.max(rect.left())..=x1.min(rect.right()), rect.y_range()),
+            0.0,
+            egui::Color32::from_rgba_unmultiplied(230, 140, 40, 40),
+        );
+    }
+
+    let points: Vec<egui::Pos2> = visible.iter().map(|&k| egui::pos2(x_of(bin_rf(k)), y_of(spec.db[k]))).collect();
+    painter.add(egui::Shape::line(points, egui::Stroke::new(1.0, egui::Color32::from_rgb(90, 200, 255))));
+
+    let mut changed = false;
+    if let Some(pos) = resp.hover_pos() {
+        let rf = rf_centre - half_span + ((pos.x - rect.left()) / rect.width()) as f64 * 2.0 * half_span;
+        painter.text(
+            egui::pos2(rect.left() + 4.0, rect.top() + 2.0),
+            egui::Align2::LEFT_TOP,
+            format!("{:.3} MHz", rf / 1e6),
+            egui::FontId::proportional(12.0),
+            egui::Color32::WHITE,
+        );
+        if resp.clicked() {
+            let click = (((rf - rf_centre) / bin_hz) + n as f64 / 2.0).round().clamp(0.0, (n - 1) as f64) as usize;
+            let picked = transponder::pick(&spec.db, spec.rate_hz, click);
+            let s = &mut connected.datv_settings;
+            s.frequency_hz = (((rf_centre + picked.offset_hz) / 1000.0).round() * 1000.0).max(0.0) as u64;
+            if let Some(rs) = picked.symbol_rate {
+                s.symbol_rate = rs;
+            }
+            changed = true;
+        }
     }
     changed
 }
@@ -11137,10 +11302,11 @@ fn datv_controls(ui: &mut egui::Ui, connected: &mut ConnectedState) -> bool {
     let mut changed = false;
     let running = connected.datv.is_some();
     let Some(tap) = connected.session.wideband_tap() else {
-        ui.label("DATV needs an RTL-SDR or MSI.SDR.");
+        ui.label("DATV needs an RTL-SDR, MSI.SDR or Pluto.");
         return false;
     };
     let rate_hz = tap.rate_hz;
+    changed |= transponder_view(ui, connected);
     let s = &mut connected.datv_settings;
 
     egui::Grid::new("datv_settings").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
@@ -11235,6 +11401,7 @@ fn datv_controls(ui: &mut egui::Ui, connected: &mut ConnectedState) -> bool {
     }
 
     ui.add_space(6.0);
+    let port = s.udp_addr.rsplit(':').next().unwrap_or("1234").to_string();
     ui.horizontal(|ui| {
         if running {
             if ui.add(egui::Button::new("Stop").fill(egui::Color32::from_rgb(170, 40, 40))).clicked() {
@@ -11246,12 +11413,17 @@ fn datv_controls(ui: &mut egui::Ui, connected: &mut ConnectedState) -> bool {
             .clicked()
         {
             connected.datv_error = None;
+            // DATV needs the receiver's own stream back.
+            if let Some(scan) = &connected.session.pluto_scan {
+                scan.stop();
+            }
+            datv_bring_into_stream(connected, rate_hz);
+            let s = &connected.datv_settings;
             match datv::DatvReceiver::start(tap, Arc::clone(&connected.session.rx_rf_offset_hz), s.clone()) {
                 Ok(r) => connected.datv = Some(r),
                 Err(e) => connected.datv_error = Some(e),
             }
         }
-        let port = s.udp_addr.rsplit(':').next().unwrap_or("1234");
         ui.weak(format!("Watch with: vlc udp://@:{port}  or  ffplay udp://127.0.0.1:{port}"));
     });
     if let Some(e) = &connected.datv_error {

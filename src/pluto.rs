@@ -62,6 +62,28 @@ pub const WIDE_SAMPLE_RATE_HZ: u32 = 4_608_000;
 /// DATV beacon with room to tune either side of it.
 const WIDE_RF_BANDWIDTH_HZ: u32 = 4_000_000;
 
+/// The transponder view's rate: all of QO-100's wideband transponder
+/// (10491-10499.5 MHz) at once. Faster than the USB link can carry --
+/// REAL MEASUREMENT on a Pluto clone (2026-10-26): ~6.45M samples/s
+/// arrive at any rate from 9.2 MS/s up, in whole buffers with gaps
+/// between -- so it's only for a spectrum, which doesn't need the stream
+/// to be continuous; see transponder.rs. Since the link limits what
+/// arrives either way, a faster rate costs nothing, and leaves the
+/// transponder well inside the filters' flat part: at 10.24 MS/s with a
+/// 9.2 MHz filter the beacon, at the bottom edge, was tilted enough to
+/// read 82 kHz off centre.
+pub const SCAN_SAMPLE_RATE_HZ: u32 = 12_288_000;
+
+/// The analog filter for SCAN_SAMPLE_RATE_HZ: measured flat to within
+/// ~0.3 dB across the transponder.
+const SCAN_RF_BANDWIDTH_HZ: u32 = 11_000_000;
+
+/// Buffers to throw away after changing rate with the stream open: the
+/// Pluto keeps a few filled at the old rate. REAL MEASUREMENT: skipping
+/// 3 after going back to the wide rate from the scan rate still counted
+/// ~4% too many samples over the next 2 s.
+pub const RATE_CHANGE_STALE_BUFFERS: usize = 6;
+
 pub fn sample_rate_hz(wide: bool) -> u32 {
     if wide {
         WIDE_SAMPLE_RATE_HZ
@@ -261,6 +283,33 @@ impl PlutoDevice {
     pub fn set_gain(&mut self, gain_db: u32) -> io::Result<()> {
         self.iiod.write_attr(&format!("{PHY} INPUT voltage0"), "hardwaregain", &gain_db.min(MAX_GAIN_DB).to_string())
     }
+
+    /// The receiver's own stream rate: SAMPLE_RATE_HZ, or with `wide`
+    /// WIDE_SAMPLE_RATE_HZ. Works with the stream open.
+    pub fn set_stream_rate(&mut self, wide: bool) -> io::Result<()> {
+        if wide {
+            self.set_rates(WIDE_SAMPLE_RATE_HZ, WIDE_SAMPLE_RATE_HZ, WIDE_RF_BANDWIDTH_HZ)
+        } else {
+            self.set_rates(SAMPLE_RATE_HZ * FPGA_DECIMATION, SAMPLE_RATE_HZ, SAMPLE_RATE_HZ)
+        }
+    }
+
+    /// SCAN_SAMPLE_RATE_HZ, for the transponder view.
+    pub fn set_scan_rate(&mut self) -> io::Result<()> {
+        self.set_rates(SCAN_SAMPLE_RATE_HZ, SCAN_SAMPLE_RATE_HZ, SCAN_RF_BANDWIDTH_HZ)
+    }
+
+    /// `phy_rate`: the AD936x's own; `rate`: what the FPGA delivers (the
+    /// same, or phy_rate / FPGA_DECIMATION); `rf_bandwidth`: the analog
+    /// filter.
+    fn set_rates(&mut self, phy_rate: u32, rate: u32, rf_bandwidth: u32) -> io::Result<()> {
+        let rx = format!("{PHY} INPUT voltage0");
+        self.iiod.write_attr(&rx, "sampling_frequency", &phy_rate.to_string())?;
+        // Only valid once the phy rate above is set: the FPGA offers that
+        // rate and rate/8.
+        self.iiod.write_attr(&format!("{RX_ADC} INPUT voltage0"), "sampling_frequency", &rate.to_string())?;
+        self.iiod.write_attr(&rx, "rf_bandwidth", &rf_bandwidth.to_string())
+    }
 }
 
 /// Configures the receive side, opens the stream and returns the
@@ -276,23 +325,14 @@ pub fn initialise(
     let xml = iiod.print_xml()?;
     let model = context_attribute(&xml, "hw_model").unwrap_or_else(|| "AD936x".to_string());
 
-    let (phy_rate, rate, rf_bandwidth) = if wide {
-        (WIDE_SAMPLE_RATE_HZ, WIDE_SAMPLE_RATE_HZ, WIDE_RF_BANDWIDTH_HZ)
-    } else {
-        (SAMPLE_RATE_HZ * FPGA_DECIMATION, SAMPLE_RATE_HZ, SAMPLE_RATE_HZ)
-    };
     let rx = format!("{PHY} INPUT voltage0");
-    iiod.write_attr(&rx, "sampling_frequency", &phy_rate.to_string())?;
-    // Only valid once the phy rate above is set: the FPGA offers that
-    // rate and rate/8.
-    iiod.write_attr(&format!("{RX_ADC} INPUT voltage0"), "sampling_frequency", &rate.to_string())?;
-    iiod.write_attr(&rx, "rf_bandwidth", &rf_bandwidth.to_string())?;
     iiod.write_attr(&rx, "rf_port_select", "A_BALANCED")?;
     iiod.write_attr(&rx, "gain_control_mode", "manual")?;
     // Receive-only: keep the transmitter's LO off, so nothing leaks out
     // of the TX port.
     iiod.write_attr(&format!("{PHY} OUTPUT altvoltage1"), "powerdown", "1")?;
     let mut device = PlutoDevice { iiod };
+    device.set_stream_rate(wide)?;
     device.set_center_freq(frequency_hz)?;
     device.set_gain(gain_db)?;
 
@@ -384,6 +424,40 @@ mod tests {
     #[ignore]
     fn streams_wide_from_a_real_pluto() {
         stream_test(true);
+    }
+
+    /// The transponder view switches rates with the stream open: wide ->
+    /// scan -> wide, measuring what arrives at each.
+    #[test]
+    #[ignore]
+    fn switches_rate_with_the_stream_open() {
+        let info = probe(DEFAULT_IP).expect("no Pluto at 192.168.2.1");
+        let (mut device, mut stream, _) = initialise(info.addr, 745_250_000, DEFAULT_GAIN_DB, true).unwrap();
+        let mut buf = vec![0u8; stream.buffer_samples() * 4];
+        let mut measure = |stream: &mut RxStream, label: &str| {
+            // The first buffers can still hold the old rate's samples.
+            for _ in 0..RATE_CHANGE_STALE_BUFFERS {
+                stream.read(&mut buf).unwrap();
+            }
+            let start = std::time::Instant::now();
+            let mut samples = 0;
+            while start.elapsed() < Duration::from_secs(2) {
+                stream.read(&mut buf).unwrap();
+                samples += buf.len() / 4;
+            }
+            let rate = samples as f64 / start.elapsed().as_secs_f64();
+            println!("{label}: {rate:.0} samples/s");
+            rate
+        };
+        let wide = measure(&mut stream, "wide");
+        device.set_scan_rate().unwrap();
+        let scan = measure(&mut stream, "scan");
+        device.set_stream_rate(true).unwrap();
+        let back = measure(&mut stream, "wide again");
+        assert!((wide - WIDE_SAMPLE_RATE_HZ as f64).abs() < 0.03 * WIDE_SAMPLE_RATE_HZ as f64);
+        // Faster than wide, but the link can't keep up with all of it.
+        assert!(scan > wide * 1.2, "{scan}");
+        assert!((back - WIDE_SAMPLE_RATE_HZ as f64).abs() < 0.03 * WIDE_SAMPLE_RATE_HZ as f64);
     }
 
     fn stream_test(wide: bool) {

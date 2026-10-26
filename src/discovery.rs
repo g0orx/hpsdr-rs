@@ -637,7 +637,7 @@ fn discover_pluto(devices: &Arc<Mutex<Vec<Device>>>) {
     }
 }
 
-fn pluto_device(info: &pluto::Info) -> Device {
+pub(crate) fn pluto_device(info: &pluto::Info) -> Device {
     Device {
         address: info.addr,
         my_address: info.local_addr,

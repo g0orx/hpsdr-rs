@@ -161,6 +161,10 @@ const RESIDUAL_SIGMA_FLOOR: f32 = 2.0 * PI * 30.0 / 1.5e6;
 /// phase noise.
 const CARRIER_LOOP_KP: f32 = 0.007;
 const CARRIER_LOOP_KI: f32 = 2.45e-5;
+/// How far apart (rad/symbol) the two headers that confirm a lock may
+/// put the carrier before one is taken to be wrong -- see next_header.
+/// ~5x the worst genuine disagreement measured at 3 dB.
+const CONFIRM_ROTATION_AGREEMENT: f32 = 0.04;
 /// Missed headers in a row before going back to searching.
 const MAX_MISSES: u32 = 3;
 
@@ -554,7 +558,23 @@ impl Demod {
                 }
             }
             if self.state == State::Confirming {
-                self.adjust_frequency((self.pending_rotation + w) / 2.0, 1.0);
+                // The two headers' carrier readings, averaged -- unless
+                // they disagree, when one is a bad reading: then the
+                // smaller correction. MEASURED: genuine pairs agree to
+                // 0.008 rad/symbol even at 3 dB; the bad pairs seen (a
+                // REAL RECORDING of a 250 kS/s QO-100 station at ~2.5 dB,
+                // and the synthetic sweep at 3 dB) read ~0 then ~0.19, and
+                // averaging them threw the carrier to the -62.5 kHz limit
+                // on the former. Dropping such a confirmation instead
+                // lost a good lock (sweep QPSK 1/2 short: 541 -> 498
+                // packets).
+                let (a, b) = (self.pending_rotation, w);
+                let rotation = if (a - b).abs() > CONFIRM_ROTATION_AGREEMENT {
+                    if a.abs() < b.abs() { a } else { b }
+                } else {
+                    (a + b) / 2.0
+                };
+                self.adjust_frequency(rotation, 1.0);
                 self.residual_sigma = RESIDUAL_SIGMA_LOCK;
             } else if !self.pls.is_some_and(|p| p.pilots) {
                 // (Frames with pilots trim the frequency in pilot_phase.)
@@ -656,8 +676,14 @@ impl Demod {
         // recording (steps of 9 kHz, then 84 kHz). Not much tighter:
         // genuine readings spread wider at low SNR (HEADER_ROTATION_SIGMA
         // is for 8 dB), and rejecting them cost frames at 3 dB.
-        let outlier = 12.0 * HEADER_ROTATION_SIGMA;
-        if self.locked_headers >= 4 && w.abs() > outlier {
+        //
+        // Before that, lock has only just been confirmed by two headers
+        // that agreed (see next_header), so a reading beyond the agreement
+        // bound is just as surely bad. REAL RECORDING (250 kS/s QO-100
+        // station, ~2.5 dB): the first header after lock read -2.2
+        // rad/symbol and, trusted in full, sent the carrier to its limit.
+        let outlier = if self.locked_headers >= 4 { 12.0 * HEADER_ROTATION_SIGMA } else { CONFIRM_ROTATION_AGREEMENT };
+        if w.abs() > outlier {
             return;
         }
         // A running mean over the first headers after lock (one header's
@@ -779,8 +805,17 @@ impl Demod {
         if anchors.len() >= 2 {
             let (t0, p0) = anchors[0];
             let (t1, p1) = anchors[anchors.len() - 1];
-            self.freq += 0.5 * (p1 - p0) / (t1 - t0);
-            self.residual_sigma = (self.residual_sigma * 0.6).max(RESIDUAL_SIGMA_FLOOR);
+            let slope = (p1 - p0) / (t1 - t0);
+            // Same bound as track_frequency's: beyond it the pilots
+            // weren't really there or were lost in noise. REAL RECORDING
+            // (QO-100, a 250 kS/s QPSK station without pilots at ~2.5
+            // dB): a header misread as having pilots trimmed the carrier
+            // from "pilots" that were data, dragging it to the edge of
+            // its range.
+            if slope.abs() <= 12.0 * HEADER_ROTATION_SIGMA {
+                self.freq += 0.5 * slope;
+                self.residual_sigma = (self.residual_sigma * 0.6).max(RESIDUAL_SIGMA_FLOOR);
+            }
         }
         let mut a = 0;
         for (k, s) in symbols.iter_mut().enumerate() {

@@ -22,6 +22,7 @@ use crate::ozy;
 use crate::mirisdr;
 use crate::pluto;
 use crate::rtlsdr;
+use crate::transponder;
 use crate::rx888;
 use std::collections::VecDeque;
 use std::io;
@@ -1316,6 +1317,9 @@ pub struct RadioSession {
     /// Some(iiod's address) only for a Pluto session -- shares the
     /// dongles' start/restart path too.
     pluto_addr: Option<std::net::SocketAddr>,
+    /// Pluto only: the transponder view (see transponder.rs). `pub` for
+    /// the DATV window.
+    pub pluto_scan: Option<Arc<transponder::Scan>>,
     /// RTL-SDR / MSi2500 / Pluto only: see DongleRate -- how a sample rate change
     /// reaches the running receiver/control threads without reopening
     /// the dongle.
@@ -1786,8 +1790,8 @@ impl RadioSession {
         self.stop_flag = Arc::clone(&stop_flag);
         let (receiver_thread, control_thread) = if let Some(mac) = self.mirisdr_mac {
             spawn_mirisdr_threads(mac, &self.iq_buffers[0], &self.frequency_hz, &self.rx_attenuation, &stop_flag, &rate)?
-        } else if let Some(addr) = self.pluto_addr {
-            spawn_pluto_threads(addr, &self.iq_buffers[0], &self.frequency_hz, &self.rx_attenuation, &stop_flag, &rate)?
+        } else if let (Some(addr), Some(scan)) = (self.pluto_addr, self.pluto_scan.as_ref()) {
+            spawn_pluto_threads(addr, &self.iq_buffers[0], &self.frequency_hz, &self.rx_attenuation, &stop_flag, &rate, scan)?
         } else {
             let controls = self
                 .rtlsdr_controls
@@ -2315,6 +2319,7 @@ fn start_protocol1(
         rtlsdr_controls: None,
         mirisdr_mac: None,
         pluto_addr: None,
+        pluto_scan: None,
         dongle_rate: None,
     })
 }
@@ -2673,6 +2678,7 @@ fn start_protocol1_ozy_usb(
         rtlsdr_controls: None,
         mirisdr_mac: None,
         pluto_addr: None,
+        pluto_scan: None,
         dongle_rate: None,
     })
 }
@@ -2944,6 +2950,7 @@ fn start_rx888_usb(
         rtlsdr_controls: None,
         mirisdr_mac: None,
         pluto_addr: None,
+        pluto_scan: None,
         dongle_rate: None,
     })
 }
@@ -3059,13 +3066,20 @@ fn start_usb_dongle(
 
     let stop_flag = Arc::new(AtomicBool::new(false));
     let dongle_rate = DongleRate::new(input_rate, input_rate / output_rate);
+    let pluto_scan = is_pluto.then(|| Arc::new(transponder::Scan::default()));
     let (receiver_thread, control_thread) = match &controls {
         Some(controls) => {
             spawn_rtlsdr_threads(device.mac, &iq_buffers[0], &frequency_hz, &rx_attenuation, controls, &stop_flag, &dongle_rate)?
         }
-        None if is_pluto => {
-            spawn_pluto_threads(device.address, &iq_buffers[0], &frequency_hz, &rx_attenuation, &stop_flag, &dongle_rate)?
-        }
+        None if is_pluto => spawn_pluto_threads(
+            device.address,
+            &iq_buffers[0],
+            &frequency_hz,
+            &rx_attenuation,
+            &stop_flag,
+            &dongle_rate,
+            pluto_scan.as_ref().unwrap(),
+        )?,
         None => spawn_mirisdr_threads(device.mac, &iq_buffers[0], &frequency_hz, &rx_attenuation, &stop_flag, &dongle_rate)?,
     };
 
@@ -3157,6 +3171,7 @@ fn start_usb_dongle(
         rtlsdr_controls: controls,
         mirisdr_mac: is_mirisdr.then_some(device.mac),
         pluto_addr: is_pluto.then_some(device.address),
+        pluto_scan,
         dongle_rate: Some(dongle_rate),
     })
 }
@@ -3517,9 +3532,12 @@ fn spawn_pluto_threads(
     rx_attenuation: &Arc<AtomicU32>,
     stop_flag: &Arc<AtomicBool>,
     rate: &Arc<DongleRate>,
+    scan: &Arc<transponder::Scan>,
 ) -> io::Result<(JoinHandle<()>, JoinHandle<()>)> {
     let decimation = rate.decimation.load(Ordering::Relaxed);
     let offset_hz = rtlsdr::tuning_offset_hz(decimation);
+    // A reopened Pluto starts at its normal rate, whatever the view was.
+    scan.active_if_hz.store(0, Ordering::Relaxed);
     let (device, stream, name) = pluto::initialise(
         addr,
         frequency_hz.load(Ordering::Relaxed) + offset_hz,
@@ -3532,28 +3550,38 @@ fn spawn_pluto_threads(
     let receiver_stop = Arc::clone(stop_flag);
     let receiver_rate = Arc::clone(rate);
     let receiver_frequency_hz = Arc::clone(frequency_hz);
+    let receiver_scan = Arc::clone(scan);
     let receiver_thread = thread::spawn(move || {
-        pluto_receiver_loop(stream, receiver_buffer, receiver_stop, receiver_rate, receiver_frequency_hz);
+        pluto_receiver_loop(stream, receiver_buffer, receiver_stop, receiver_rate, receiver_frequency_hz, receiver_scan);
     });
 
     let control_frequency_hz = Arc::clone(frequency_hz);
     let control_rx_attenuation = Arc::clone(rx_attenuation);
     let control_stop = Arc::clone(stop_flag);
     let control_rate = Arc::clone(rate);
+    let control_scan = Arc::clone(scan);
     let control_thread = thread::spawn(move || {
-        pluto_control_loop(device, control_frequency_hz, control_rate, control_rx_attenuation, control_stop);
+        pluto_control_loop(device, control_frequency_hz, control_rate, control_rx_attenuation, control_stop, control_scan);
     });
     Ok((receiver_thread, control_thread))
 }
 
-/// Pluto receiver thread -- same shape as mirisdr_receiver_loop.
+/// Pluto receiver thread -- same shape as mirisdr_receiver_loop. While
+/// the transponder view is on (`scan`, see transponder.rs) its buffers
+/// go to that view instead, and the receiver hears nothing.
 fn pluto_receiver_loop(
     mut stream: pluto::RxStream,
     iq_buffer: Arc<Mutex<VecDeque<IqSample>>>,
     stop_flag: Arc<AtomicBool>,
     rate: Arc<DongleRate>,
     frequency_hz: Arc<AtomicU32>,
+    scan: Arc<transponder::Scan>,
 ) {
+    let mut accumulator = transponder::Accumulator::new();
+    // The view's IF as of the last buffer (0: normal), and buffers left to
+    // drop after a change, which still hold the old rate's samples.
+    let mut scan_if_hz = 0u32;
+    let mut stale = 0usize;
     let mut decimation = rate.decimation.load(Ordering::Relaxed);
     let mut decimator = rtlsdr::Decimator::with_full_scale(rate.input_rate_hz, decimation, pluto::SAMPLE_FULL_SCALE);
     let mut buf = vec![0u8; stream.buffer_samples() * 4];
@@ -3570,6 +3598,27 @@ fn pluto_receiver_loop(
         if let Err(e) = stream.read(&mut buf) {
             eprintln!("Pluto: stream read failed: {e}");
             break;
+        }
+        let active = scan.active_if_hz.load(Ordering::Relaxed);
+        if active != scan_if_hz {
+            scan_if_hz = active;
+            stale = pluto::RATE_CHANGE_STALE_BUFFERS;
+            window_start = std::time::Instant::now();
+            window_samples = 0;
+            if active == 0 {
+                // Back to the receiver: start its filters afresh.
+                decimator = rtlsdr::Decimator::with_full_scale(rate.input_rate_hz, decimation, pluto::SAMPLE_FULL_SCALE);
+            }
+        }
+        if stale > 0 {
+            stale -= 1;
+            continue;
+        }
+        if scan_if_hz != 0 {
+            let samples: Vec<[i16; 2]> =
+                buf.chunks_exact(4).map(|p| [i16::from_le_bytes([p[0], p[1]]), i16::from_le_bytes([p[2], p[3]])]).collect();
+            accumulator.add(&samples, scan_if_hz, pluto::SCAN_SAMPLE_RATE_HZ, &scan);
+            continue;
         }
         window_samples += (buf.len() / 4) as u64;
         let elapsed = window_start.elapsed().as_secs_f64();
@@ -3608,22 +3657,43 @@ fn pluto_receiver_loop(
 
 /// Pluto control thread -- mirisdr_control_loop's tuning and gain,
 /// as iiod attribute writes. RF gain is `rx_attenuation` as whole dB,
-/// 0..=pluto::MAX_GAIN_DB.
+/// 0..=pluto::MAX_GAIN_DB. Also switches the Pluto to and from the
+/// transponder view's rate and centre (`scan`), with the stream left
+/// open -- see pluto::RATE_CHANGE_STALE_BUFFERS.
 fn pluto_control_loop(
     mut device: pluto::PlutoDevice,
     frequency_hz: Arc<AtomicU32>,
     rate: Arc<DongleRate>,
     rx_attenuation: Arc<AtomicU32>,
     stop_flag: Arc<AtomicBool>,
+    scan: Arc<transponder::Scan>,
 ) {
     // initialise() already applied these.
     let mut last_freq = frequency_hz.load(Ordering::Relaxed);
     let mut last_offset = rtlsdr::tuning_offset_hz(rate.decimation.load(Ordering::Relaxed));
     let mut last_gain = rx_attenuation.load(Ordering::Relaxed);
+    let wide = rate.input_rate_hz == pluto::WIDE_SAMPLE_RATE_HZ;
     while !stop_flag.load(Ordering::Relaxed) {
+        let requested = scan.request_if_hz.load(Ordering::Relaxed);
+        let active = scan.active_if_hz.load(Ordering::Relaxed);
+        if requested != active {
+            let result = if requested != 0 {
+                device.set_scan_rate().and_then(|()| device.set_center_freq(requested))
+            } else {
+                // Back to the receiver's own rate and frequency.
+                last_freq = frequency_hz.load(Ordering::Relaxed);
+                last_offset = rtlsdr::tuning_offset_hz(rate.decimation.load(Ordering::Relaxed));
+                device.set_stream_rate(wide).and_then(|()| device.set_center_freq(last_freq + last_offset))
+            };
+            if let Err(e) = result {
+                eprintln!("Pluto: switching the transponder view failed: {e}");
+            }
+            scan.active_if_hz.store(requested, Ordering::Relaxed);
+        }
         let freq = frequency_hz.load(Ordering::Relaxed);
         let offset_hz = rtlsdr::tuning_offset_hz(rate.decimation.load(Ordering::Relaxed));
-        if freq != last_freq || offset_hz != last_offset {
+        // While the view is up, tuning waits until it's closed.
+        if requested == 0 && (freq != last_freq || offset_hz != last_offset) {
             // Hardware sits offset_hz above the dial -- see
             // rtlsdr::Decimator's doc comment.
             if let Err(e) = device.set_center_freq(freq + offset_hz) {
@@ -7198,6 +7268,7 @@ fn start_protocol2(
         rtlsdr_controls: None,
         mirisdr_mac: None,
         pluto_addr: None,
+        pluto_scan: None,
         dongle_rate: None,
     })
 }
@@ -8752,6 +8823,61 @@ fn p2_tx_iq_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The transponder view on a real Pluto at DEFAULT_IP, through the
+    /// session's own threads: the receiver gets samples, then the view a
+    /// spectrum (and the receiver nothing), then the receiver again.
+    /// `HPSDR_SCAN_IF`: the IF to centre the view on (default 745.25 MHz,
+    /// QO-100's wideband transponder through a 9750 MHz LNB).
+    #[test]
+    #[ignore]
+    fn pluto_transponder_view_comes_and_goes() {
+        let info = pluto::probe(pluto::DEFAULT_IP).expect("no Pluto at 192.168.2.1");
+        let device = crate::discovery::pluto_device(&info);
+        let settings =
+            RadioSettings { frequency_hz: 741_500_000, sample_rate: 48_000, mirisdr_wide: true, ..Default::default() };
+        let mut session = RadioSession::start(&device, settings).unwrap();
+        let scan = session.pluto_scan.clone().unwrap();
+        // Over 150 ms -- several of the stream's ~57 ms buffers, and at 48k
+        // still inside IQ_BUFFER_CAPACITY.
+        let receiver_samples = |session: &RadioSession| {
+            session.iq_buffers[0].lock().unwrap().clear();
+            thread::sleep(Duration::from_millis(150));
+            session.iq_buffers[0].lock().unwrap().len()
+        };
+
+        thread::sleep(Duration::from_secs(1));
+        let before = receiver_samples(&session);
+        let if_hz = std::env::var("HPSDR_SCAN_IF").map_or(745_250_000, |v| v.parse().unwrap());
+        scan.request(if_hz);
+        let start = Instant::now();
+        let spectrum = loop {
+            if let Some(s) = scan.current() {
+                break s;
+            }
+            assert!(start.elapsed() < Duration::from_secs(5), "no spectrum");
+            thread::sleep(Duration::from_millis(50));
+        };
+        let during = receiver_samples(&session);
+        let mut db = spectrum.db.clone();
+        db.sort_by(f32::total_cmp);
+        println!(
+            "receiver {before} samples/150 ms; view up after {:.2} s, {} bins, {:.1}..{:.1} dB; receiver {during} samples/150 ms",
+            start.elapsed().as_secs_f64(),
+            db.len(),
+            db[db.len() / 10],
+            db[db.len() - 1]
+        );
+        scan.stop();
+        thread::sleep(Duration::from_secs(1));
+        let after = receiver_samples(&session);
+        println!("view down: receiver {after} samples/150 ms");
+        session.stop();
+        // 48k for 150 ms is 7200; samples arrive a buffer at a time.
+        assert!(before > 4_000 && after > 4_000, "{before} {after}");
+        assert!(during == 0, "{during}");
+        assert_eq!(spectrum.db.len(), transponder::FFT_SIZE);
+    }
 
     #[test]
     fn ozy_atlas_config_matches_pihpsdr_defaults() {
