@@ -148,6 +148,19 @@ const HEADER_ROTATION_SIGMA: f32 = 2.0 * PI * 250.0 / 1.5e6;
 /// it's ever assumed to be.
 const RESIDUAL_SIGMA_LOCK: f32 = 2.0 * PI * 1_000.0 / 1.5e6;
 const RESIDUAL_SIGMA_FLOOR: f32 = 2.0 * PI * 30.0 / 1.5e6;
+/// Decision-directed carrier loop gains (phase, frequency) per symbol:
+/// damping 0.707, ~4 kHz noise bandwidth at 1.5 MS/s. Tuned on four real
+/// QO-100 beacon recordings near threshold (Pluto, roll-off 0.20,
+/// 2026-10-26): against the original 0.02 / 0.0002, the frames failing
+/// fell from 122 to 44 of 445 on one and from 402 to 301 of 448 on the
+/// weakest, with none worse. A wide loop lets noisy decisions push the
+/// phase around: 0.04 failed nearly every frame. 0.004-0.005 did a
+/// little better still on the beacon, but cost more on the synthetic
+/// sweep's QPSK 1/2 short frames at 3 dB (380-410 packets of 1500, this
+/// 492, the original 596); 0.0025 and below lost track of the LNB's
+/// phase noise.
+const CARRIER_LOOP_KP: f32 = 0.007;
+const CARRIER_LOOP_KI: f32 = 2.45e-5;
 /// Missed headers in a row before going back to searching.
 const MAX_MISSES: u32 = 3;
 
@@ -214,6 +227,12 @@ pub struct Demod {
     residual_sigma: f32,
     /// Working on the conjugated input (a spectrum-inverted signal).
     inverted: bool,
+    /// The carrier at the last strong header (see lose_lock).
+    good_carrier_hz: Option<f64>,
+    /// See false_lock: one bit per header since lock, newest lowest,
+    /// set if it was convincing.
+    strong_headers: u16,
+    headers_since_lock: u16,
 }
 
 impl Demod {
@@ -262,6 +281,9 @@ impl Demod {
             pending_rotation: 0.0,
             residual_sigma: RESIDUAL_SIGMA_LOCK,
             inverted: false,
+            good_carrier_hz: None,
+            strong_headers: 0,
+            headers_since_lock: 0,
         };
         demod.retune();
         demod
@@ -464,6 +486,7 @@ impl Demod {
                         self.inverted = !self.inverted;
                         self.status.inverted = self.inverted;
                         self.carrier_hz = -self.carrier_hz;
+                        self.good_carrier_hz = None;
                         self.retune();
                         self.recent.clear();
                         self.diffs.clear();
@@ -511,6 +534,13 @@ impl Demod {
     /// At the point the next header should have just completed.
     fn next_header(&mut self, frames: &mut Vec<Frame>) {
         let (metric, _) = self.header_metric(0);
+        if self.state == State::Locked && self.false_lock(metric) {
+            self.lose_lock();
+            self.recent.clear();
+            self.diffs.clear();
+            self.frame.clear();
+            return;
+        }
         let found = metric > if self.state == State::Locked { TRACK_THRESHOLD } else { SEARCH_THRESHOLD * 0.8 };
         // The finished frame's own symbols (without this header).
         let mut done = std::mem::take(&mut self.frame);
@@ -530,6 +560,11 @@ impl Demod {
                 // (Frames with pilots trim the frequency in pilot_phase.)
                 self.track_frequency(w);
             }
+            // A header as clear as one the search would start from is a
+            // trustworthy place to come back to (see lose_lock).
+            if metric > SEARCH_THRESHOLD {
+                self.good_carrier_hz = Some(self.carrier_hz + self.freq as f64 * self.symbol_rate / (2.0 * std::f64::consts::PI));
+            }
             self.state = State::Locked;
             self.status.locked = true;
             self.misses = 0;
@@ -537,9 +572,7 @@ impl Demod {
         } else {
             self.misses += 1;
             if self.state == State::Confirming || self.misses > MAX_MISSES {
-                self.state = State::Searching;
-                self.status.locked = false;
-                self.locked_headers = 0;
+                self.lose_lock();
                 self.recent.clear();
                 self.diffs.clear();
                 self.frame.clear();
@@ -551,11 +584,42 @@ impl Demod {
         }
     }
 
+    /// Whether a lock has gone without a convincing header for too long
+    /// to be real, given this header's correlation. TRACK_THRESHOLD is
+    /// low so that a real lock rides out a few noisy headers -- but
+    /// random data clears it often enough that a false lock, once made,
+    /// could last forever. REAL REPORT (QO-100 beacon, QPSK 4/5 normal
+    /// frames, ~4.6 dB): the receiver locked as 8PSK 5/6 short frames and
+    /// stayed there, every frame failing. On a real lock at that SNR 94%
+    /// of headers score above SEARCH_THRESHOLD * 0.8 (median 0.85), so
+    /// fewer than 4 of the last 16 means the lock is false.
+    fn false_lock(&mut self, metric: f32) -> bool {
+        self.strong_headers = (self.strong_headers << 1) | u16::from(metric > SEARCH_THRESHOLD * 0.8);
+        self.headers_since_lock = self.headers_since_lock.saturating_add(1);
+        self.headers_since_lock >= 16 && self.strong_headers.count_ones() < 4
+    }
+
+    /// Back to searching. The carrier goes back to where the last strong
+    /// header put it: REAL RECORDING (QO-100 beacon, ~4.8 dB, roll-off
+    /// 0.20) -- a run of noisy headers walked the carrier off to -375 kHz
+    /// before lock was lost, and the search never found the signal again
+    /// from there.
+    fn lose_lock(&mut self) {
+        self.state = State::Searching;
+        self.status.locked = false;
+        self.locked_headers = 0;
+        self.headers_since_lock = 0;
+        self.strong_headers = 0;
+        if let Some(good) = self.good_carrier_hz {
+            self.carrier_hz = good;
+            self.freq = 0.0;
+            self.retune();
+        }
+    }
+
     fn start_frame(&mut self, code: PlsCode) {
         let Some(len) = code.frame_symbols() else {
-            self.state = State::Searching;
-            self.status.locked = false;
-            self.locked_headers = 0;
+            self.lose_lock();
             return;
         };
         self.pls = Some(code);
@@ -585,6 +649,17 @@ impl Demod {
     /// to make the carrier loop slip (about one frame in ten failed at
     /// 7 dB in the synthetic test; none do without it).
     fn track_frequency(&mut self, w: f32) {
+        // Past the first few headers the carrier is known to within a few
+        // hundred Hz and an LNB drifts by Hz per second: a reading kHz out
+        // is a header too noisy to measure, not a real change. Applying
+        // them is what walked the carrier away in lose_lock's real
+        // recording (steps of 9 kHz, then 84 kHz). Not much tighter:
+        // genuine readings spread wider at low SNR (HEADER_ROTATION_SIGMA
+        // is for 8 dB), and rejecting them cost frames at 3 dB.
+        let outlier = 12.0 * HEADER_ROTATION_SIGMA;
+        if self.locked_headers >= 4 && w.abs() > outlier {
+            return;
+        }
         // A running mean over the first headers after lock (one header's
         // measurement alone is only good to ~600 Hz at 8 dB, too coarse
         // for pilot_phase to unwrap between pilot blocks), then a steady
@@ -634,8 +709,12 @@ impl Demod {
             _ => return,
         };
         let e = (s * decision.conj()).arg();
-        self.phase += 0.02 * e;
-        self.freq += 0.0002 * e;
+        self.phase += CARRIER_LOOP_KP * e;
+        // Bounded like track_frequency's hand-over to the mixer: drift
+        // beyond it is the mixer's job, and on noise alone this loop can
+        // otherwise wander off.
+        let limit = 2.0 * PI * 2_000.0 / self.symbol_rate as f32;
+        self.freq = (self.freq + CARRIER_LOOP_KI * e).clamp(-limit, limit);
     }
 
     /// Frames with pilots: the carrier phase measured on every known
@@ -748,15 +827,35 @@ impl Demod {
         if out.len() != n / bits {
             return None;
         }
-        let (llr, snr_db) = match modulation {
+        let (llr, _) = match modulation {
             Modulation::Qpsk => qpsk_llr(&out),
             Modulation::Psk8 => psk8_llr(&out, pls),
             _ => return None,
         };
         self.status.frames += 1;
-        self.status.snr_db = snr_db;
+        self.status.snr_db = m2m4_snr_db(&out);
         Some(Frame { pls, llr })
     }
+}
+
+/// Es/N0 by the M2M4 moments estimator, for the status display. Needs no
+/// decisions, so unlike the LLR functions' own noise figures it doesn't
+/// read high near threshold: those count every wrong decision as signal,
+/// and showed ~6.0 dB for a synthetic signal really at 4.6 dB, where the
+/// QO-100 beacon's QPSK 4/5 is on the edge of decoding. Exact for a
+/// constant-modulus constellation (QPSK, 8PSK) in Gaussian noise.
+fn m2m4_snr_db(symbols: &[Cf]) -> f32 {
+    let n = symbols.len().max(1) as f64;
+    let (mut m2, mut m4) = (0.0f64, 0.0f64);
+    for s in symbols {
+        let p = s.norm_sqr() as f64;
+        m2 += p;
+        m4 += p * p;
+    }
+    let (m2, m4) = (m2 / n, m4 / n);
+    let signal = (2.0 * m2 * m2 - m4).max(0.0).sqrt();
+    let noise = (m2 - signal).max(1e-12);
+    (10.0 * (signal.max(1e-12) / noise).log10()) as f32
 }
 
 /// QPSK (figure 9): I's sign carries the first bit, Q's the second; 0 is

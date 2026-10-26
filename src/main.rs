@@ -27,6 +27,7 @@ mod midi;
 mod midi_import;
 mod mirisdr;
 mod ozy;
+mod pluto;
 mod psk_beacon;
 mod radio;
 mod rigctl;
@@ -946,6 +947,23 @@ fn rx_gain_slider(ui: &mut egui::Ui, connected: &mut ConnectedState) -> bool {
             connected.session.rx_attenuation.store(gain_db as u32, Ordering::Relaxed);
             changed = true;
         }
+    } else if connected.device.board == Boards::Pluto {
+        let mut gain_db = connected.session.rx_attenuation.load(Ordering::Relaxed).min(pluto::MAX_GAIN_DB) as i32;
+        ui.label("RF Gain:").on_hover_text(
+            "AD936x receive gain (LNA, mixer and baseband together). Lower it if \
+             strong signals produce spurs or a raised noise floor.",
+        );
+        if scroll_slider_i32(
+            ui,
+            &mut connected.slider_scroll_accum,
+            &mut gain_db,
+            0..=pluto::MAX_GAIN_DB as i32,
+            1,
+            " dB",
+        ) {
+            connected.session.rx_attenuation.store(gain_db as u32, Ordering::Relaxed);
+            changed = true;
+        }
     } else if connected.device.protocol == 1
         && matches!(connected.device.board, Boards::HermesLite | Boards::HermesLite2)
     {
@@ -1426,6 +1444,11 @@ fn dispatch_midi_event(connected: &mut ConnectedState, ev: RawMidiEvent, freq_hz
             } else if connected.device.board == Boards::MsiSdr {
                 // MSi2500: rx_attenuation is RF gain, 0-102 dB.
                 let max = mirisdr::MAX_GAIN_DB as f64;
+                let gain_db = midi_knob_range(ev.value, 0.0, max);
+                connected.session.rx_attenuation.store(gain_db.clamp(0.0, max) as u32, Ordering::Relaxed);
+            } else if connected.device.board == Boards::Pluto {
+                // Pluto: rx_attenuation is RF gain, 0-71 dB.
+                let max = pluto::MAX_GAIN_DB as f64;
                 let gain_db = midi_knob_range(ev.value, 0.0, max);
                 connected.session.rx_attenuation.store(gain_db.clamp(0.0, max) as u32, Ordering::Relaxed);
             } else {
@@ -2234,7 +2257,7 @@ struct ConnectedState {
     /// Settings -- needed just to complete the very first connect); kept
     /// here only so it round-trips back into Config unchanged on save.
     rx888_firmware_path: Option<String>,
-    /// MSI.SDR only: Settings -> RX "Wide stream" -- see
+    /// MSI.SDR / Pluto only: Settings -> RX "Wide stream" -- see
     /// radio::RadioSettings::mirisdr_wide. Takes effect on the next
     /// connect, so this can differ from what the session is running.
     mirisdr_wide: bool,
@@ -2516,13 +2539,23 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
         settings.sample_rate = rx888::OUTPUT_SAMPLE_RATE_HZ;
     }
     // RTL-SDR / MSi2500: same idea -- only rates rtlsdr.rs can decimate to exactly.
-    settings.mirisdr_wide = device.board == Boards::MsiSdr && cfg.mirisdr_wide.unwrap_or(false);
+    settings.mirisdr_wide =
+        matches!(device.board, Boards::MsiSdr | Boards::Pluto) && cfg.mirisdr_wide.unwrap_or(false);
     let dongle_input_rate = if device.board == Boards::MsiSdr {
         mirisdr::sample_rate_hz(settings.mirisdr_wide)
+    } else if device.board == Boards::Pluto {
+        pluto::sample_rate_hz(settings.mirisdr_wide)
     } else {
         rtlsdr::DONGLE_RATE_HZ
     };
-    if matches!(device.board, Boards::RtlSdr | Boards::MsiSdr)
+    // A Pluto can't tune HF, so a never-configured one (still on
+    // RadioSettings::default's 7.1MHz) starts on 70cm instead.
+    if device.board == Boards::Pluto
+        && !(device.frequency_min..=device.frequency_max).contains(&(settings.frequency_hz as u64))
+    {
+        settings.frequency_hz = 432_174_000u32.clamp(device.frequency_min as u32, device.frequency_max as u32);
+    }
+    if matches!(device.board, Boards::RtlSdr | Boards::MsiSdr | Boards::Pluto)
         && rtlsdr::decimation_for_output_rate(dongle_input_rate, settings.sample_rate).is_none()
     {
         settings.sample_rate = rtlsdr::DEFAULT_OUTPUT_RATE_HZ;
@@ -2554,6 +2587,8 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
     } else if device.board == Boards::MsiSdr {
         // Same, for the MSi001's 0-102 dB RF gain.
         settings.rx_attenuation = mirisdr::DEFAULT_GAIN_DB;
+    } else if device.board == Boards::Pluto {
+        settings.rx_attenuation = pluto::DEFAULT_GAIN_DB;
     }
     if let Some(atten) = cfg.ps_tx_attenuation {
         settings.ps_tx_attenuation = atten;
@@ -3033,7 +3068,8 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
             // (harmless -- there's no sender thread for this board to
             // act on any of it, see start_rx888_usb's doc comment -- but
             // confusing UI for hardware that can never transmit).
-            let tx_enabled = tx_enabled && !matches!(device.board, Boards::Rx888 | Boards::RtlSdr | Boards::MsiSdr);
+            let tx_enabled =
+                tx_enabled && !matches!(device.board, Boards::Rx888 | Boards::RtlSdr | Boards::MsiSdr | Boards::Pluto);
 
             println!(
                 "Started {:?} at {} (protocol {}, {} ADC(s), reports supporting {} receiver(s))",
@@ -3259,7 +3295,7 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                 datv_settings: datv::DatvSettings {
                     frequency_hz: cfg.datv_frequency_hz.unwrap_or(datv::QO100_WB_BEACON_HZ),
                     symbol_rate: cfg.datv_symbol_rate.unwrap_or(1_500_000),
-                    rolloff: cfg.datv_rolloff.unwrap_or(0.35),
+                    rolloff: cfg.datv_rolloff.unwrap_or(datv::QO100_WB_BEACON_ROLLOFF),
                     udp_addr: cfg.datv_udp_addr.clone().unwrap_or_else(|| "127.0.0.1:1234".to_string()),
                 },
                 datv: None,
@@ -7830,7 +7866,8 @@ impl eframe::App for HpsdrApp {
                                         });
                                         ui.end_row();
 
-                                        if !is_usb_board {
+                                        // A Pluto's "MAC" is a hash of its serial.
+                                        if !is_usb_board && connected.device.board != Boards::Pluto {
                                             ui.label("MAC Address:");
                                             let mac = connected.device.mac;
                                             ui.label(format!(
@@ -8268,21 +8305,28 @@ impl eframe::App for HpsdrApp {
                                              decimated. Changing it briefly stops and restarts streaming.",
                                             input_rate / 1000
                                         ));
-                                        if connected.device.board == Boards::MsiSdr {
+                                        if matches!(connected.device.board, Boards::MsiSdr | Boards::Pluto) {
                                             ui.add_space(4.0);
+                                            let hover = if connected.device.board == Boards::Pluto {
+                                                "Samples at 4608 kHz with a 4 MHz filter instead of 1536 kHz, \
+                                                 for signals wider than 1.5 MHz such as QO-100's wideband \
+                                                 DATV. Recordings and DATV use the whole stream; the \
+                                                 receiver itself can't use 1536 kHz in this mode."
+                                            } else {
+                                                "Samples at 4608 kHz with the 5 MHz IF filter instead of \
+                                                 1536 kHz with the 1.5 MHz one, for signals wider than \
+                                                 1.5 MHz such as QO-100's wideband DATV. Recordings and \
+                                                 DATV use the whole stream; the receiver itself can't \
+                                                 use 1536 kHz in this mode."
+                                            };
                                             if ui
                                                 .checkbox(&mut connected.mirisdr_wide, "Wide stream (4608 kHz)")
-                                                .on_hover_text(
-                                                    "Samples at 4608 kHz with the 5 MHz IF filter instead of \
-                                                     1536 kHz with the 1.5 MHz one, for signals wider than \
-                                                     1.5 MHz such as QO-100's wideband DATV. Recordings and \
-                                                     DATV use the whole stream; the receiver itself can't \
-                                                     use 1536 kHz in this mode.",
-                                                )
+                                                .on_hover_text(hover)
                                                 .changed()
                                             {
                                                 settings_changed = true;
                                             }
+                                            // Both boards' wide rate is the same 4608 kHz.
                                             let running_wide = input_rate == mirisdr::WIDE_SAMPLE_RATE_HZ;
                                             if connected.mirisdr_wide != running_wide {
                                                 ui.colored_label(
@@ -9142,7 +9186,9 @@ impl eframe::App for HpsdrApp {
                                     // RX-888: receive-only hardware, no TX capability at
                                     // all -- don't let this checkbox re-enable the MOX/
                                     // TUNE/etc. row the connect-time override above hides.
-                                    if matches!(connected.device.board, Boards::Rx888 | Boards::RtlSdr | Boards::MsiSdr) {
+                                    if connected.device.board == Boards::Pluto {
+                                        ui.weak("Enable Transmit (not supported on the Pluto yet)");
+                                    } else if matches!(connected.device.board, Boards::Rx888 | Boards::RtlSdr | Boards::MsiSdr) {
                                         ui.weak("Enable Transmit (receive-only hardware)");
                                     } else {
                                     let mut tx_enabled = connected.tx_enabled;
@@ -10818,7 +10864,8 @@ impl eframe::App for HpsdrApp {
                             .rtlsdr_controls
                             .as_ref()
                             .map(|c| c.tuner_agc.load(Ordering::Relaxed)),
-                        mirisdr_wide: (connected.device.board == Boards::MsiSdr).then_some(connected.mirisdr_wide),
+                        mirisdr_wide: matches!(connected.device.board, Boards::MsiSdr | Boards::Pluto)
+                            .then_some(connected.mirisdr_wide),
                         rigctl_addr: Some(connected.rigctl_addr.clone()),
                         tci_addr: Some(connected.tci_addr.clone()),
                         cat_addr: Some(connected.cat_addr.clone()),
@@ -11117,11 +11164,12 @@ fn datv_controls(ui: &mut egui::Ui, connected: &mut ConnectedState) -> bool {
             }
             if ui
                 .add_enabled(!running, egui::Button::new("Beacon"))
-                .on_hover_text("QO-100's wideband beacon, 10491.500 MHz, 1500 kS/s")
+                .on_hover_text("QO-100's wideband beacon, 10491.500 MHz, 1500 kS/s, roll-off 0.20")
                 .clicked()
             {
                 s.frequency_hz = datv::QO100_WB_BEACON_HZ;
                 s.symbol_rate = 1_500_000;
+                s.rolloff = datv::QO100_WB_BEACON_ROLLOFF;
                 changed = true;
             }
         });
@@ -11175,7 +11223,9 @@ fn datv_controls(ui: &mut egui::Ui, connected: &mut ConnectedState) -> bool {
                 "A {:.0} kHz wide signal won't fit the {} kHz stream{}.",
                 bandwidth / 1000.0,
                 rate_hz / 1000,
-                if connected.device.board == Boards::MsiSdr && rate_hz != mirisdr::WIDE_SAMPLE_RATE_HZ {
+                if matches!(connected.device.board, Boards::MsiSdr | Boards::Pluto)
+                    && rate_hz != mirisdr::WIDE_SAMPLE_RATE_HZ
+                {
                     " -- turn on Wide stream in Settings -> RX"
                 } else {
                     ""
@@ -12363,7 +12413,7 @@ fn default_max_tx_power_watts(board: Boards) -> u32 {
         // Receive-only hardware -- 0W makes the TX Power slider/control
         // meaningless rather than picking an arbitrary non-zero default
         // it can never actually reach. See radio.rs's start_rx888_usb.
-        Boards::Rx888 | Boards::RtlSdr | Boards::MsiSdr => 0,
+        Boards::Rx888 | Boards::RtlSdr | Boards::MsiSdr | Boards::Pluto => 0,
         Boards::Unknown => 100,
     }
 }
@@ -12426,7 +12476,7 @@ fn power_watts_and_swr(raw_forward: u32, raw_reverse: u32, board: Boards) -> (f3
         // all -- never actually displayed (max_tx_power_watts is 0, see
         // default_max_tx_power_watts), placeholder purely so this match
         // stays exhaustive.
-        Boards::Rx888 | Boards::RtlSdr | Boards::MsiSdr => (3.3, 0.09),
+        Boards::Rx888 | Boards::RtlSdr | Boards::MsiSdr | Boards::Pluto => (3.3, 0.09),
         Boards::Unknown => (3.3, 0.09),
     };
 
@@ -14295,7 +14345,7 @@ fn change_sample_rate(connected: &mut ConnectedState, new_rate: u32) {
     // RadioSession::stop_usb_sdr_threads's own doc comment for why this is
     // split into a stop call here and a restart call at the end of this
     // function rather than one atomic call. No-op for every other board.
-    if matches!(connected.device.board, Boards::Rx888 | Boards::RtlSdr | Boards::MsiSdr) {
+    if matches!(connected.device.board, Boards::Rx888 | Boards::RtlSdr | Boards::MsiSdr | Boards::Pluto) {
         connected.session.stop_usb_sdr_threads();
     }
 
@@ -14466,7 +14516,7 @@ fn change_sample_rate(connected: &mut ConnectedState, new_rate: u32) {
             None => eprintln!("RX-888: no firmware path available, cannot restart streaming"),
         }
     }
-    if matches!(connected.device.board, Boards::RtlSdr | Boards::MsiSdr) {
+    if matches!(connected.device.board, Boards::RtlSdr | Boards::MsiSdr | Boards::Pluto) {
         match connected.session.restart_dongle_at_rate(new_rate) {
             Ok(actual_rate) => {
                 connected.sample_rate = actual_rate;

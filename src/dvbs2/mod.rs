@@ -172,14 +172,18 @@ mod tests {
     /// or the app's raw IQ recorder write): `HPSDR_DVBS2_FILE`, sample
     /// rate `HPSDR_DVBS2_FS` (default 4608000), channel offset
     /// `HPSDR_DVBS2_CHANNEL` Hz from the recording's centre, symbol rate
-    /// `HPSDR_DVBS2_RS` (default 1.5 MS/s).
+    /// `HPSDR_DVBS2_RS` (default 1.5 MS/s), roll-off `HPSDR_DVBS2_ROLLOFF`
+    /// (default 0.20).
     #[test]
     #[ignore]
     fn replay_recording() {
         let env = |k: &str, d: f64| std::env::var(k).map(|v| v.parse().unwrap()).unwrap_or(d);
         let path = std::env::var("HPSDR_DVBS2_FILE").expect("set HPSDR_DVBS2_FILE");
         let (fs, channel, rs) = (env("HPSDR_DVBS2_FS", 4_608_000.0), env("HPSDR_DVBS2_CHANNEL", 0.0), env("HPSDR_DVBS2_RS", 1_500_000.0));
+        // HPSDR_DVBS2_SKIP: seconds to skip, to try acquiring elsewhere.
+        let skip = (env("HPSDR_DVBS2_SKIP", 0.0) * fs) as usize * 4;
         let bytes = std::fs::read(path).unwrap();
+        let bytes = &bytes[skip.min(bytes.len())..];
         let samples: Vec<super::Cf> = bytes
             .chunks_exact(4)
             .map(|c| {
@@ -188,15 +192,81 @@ mod tests {
                 super::Cf::new(i, q)
             })
             .collect();
-        let mut demod = Demod::new(fs, channel, rs, 0.35);
+        // Default: the QO-100 beacon's, 0.20 (its BBHEADER's MATYPE 0xE2).
+        let mut demod = Demod::new(fs, channel, rs, env("HPSDR_DVBS2_ROLLOFF", 0.20));
         let mut decoder = Decoder::new();
         let (mut frames, mut packets) = (Vec::new(), Vec::new());
+        // Each must keep up with real time (they run on separate threads
+        // in datv.rs).
+        let (mut demod_time, mut decode_time) = (std::time::Duration::ZERO, std::time::Duration::ZERO);
         for (n, chunk) in samples.chunks(fs as usize / 10).enumerate() {
+            let t = std::time::Instant::now();
             demod.process(chunk, &mut frames);
+            demod_time += t.elapsed();
+            let t = std::time::Instant::now();
             for f in frames.drain(..) {
                 decoder.decode(f, &mut packets);
             }
+            decode_time += t.elapsed();
             eprintln!("{:.1} s {:?}", (n + 1) as f64 / 10.0, demod.status);
+        }
+        eprintln!("{:?}", decoder.stats);
+        let seconds = samples.len() as f64 / fs;
+        eprintln!(
+            "{seconds:.1} s of signal: demod {:.2} s, decode {:.2} s",
+            demod_time.as_secs_f64(),
+            decode_time.as_secs_f64()
+        );
+    }
+
+    /// The receiver's waterfall on the QO-100 beacon's format (QPSK 4/5
+    /// normal frames, no pilots) at roll-off `HPSDR_DVBS2_ROLLOFF`
+    /// (default 0.20, the beacon's): frame failure rate against Es/N0.
+    /// The LDPC decoder alone needs ~4.4 dB, so anything above that is
+    /// the demodulator's loss.
+    #[test]
+    #[ignore]
+    fn waterfall() {
+        let rolloff: f64 = std::env::var("HPSDR_DVBS2_ROLLOFF").map_or(0.20, |v| v.parse().unwrap());
+        let (fs, rs) = (4_608_000.0, 1_500_000.0);
+        let pls = PlsCode { modcod: 8, short: false, pilots: false };
+        let symbols = frames(&test_packets(3000), pls);
+        for esn0_db in [4.6, 5.0, 5.4, 5.8, 6.2] {
+            let ch = Channel { fs, symbol_rate: rs, rolloff, carrier_hz: 12_000.0, clock_ppm: 20.0, esn0_db, seed: 5 };
+            let samples = waveform(&symbols, &ch);
+            let mut demod = Demod::new(fs, 0.0, rs, rolloff);
+            let mut decoder = Decoder::new();
+            let (mut got, mut demod_frames) = (Vec::new(), Vec::new());
+            for chunk in samples.chunks(10_000) {
+                demod.process(chunk, &mut demod_frames);
+                for f in demod_frames.drain(..) {
+                    decoder.decode(f, &mut got);
+                }
+            }
+            let s = decoder.stats;
+            eprintln!(
+                "{esn0_db:.1} dB: {} frames, {} failed ({:.0}%), demod SNR {:.2} dB",
+                s.frames,
+                s.ldpc_failures,
+                100.0 * s.ldpc_failures as f64 / s.frames.max(1) as f64,
+                demod.status.snr_db
+            );
+        }
+    }
+
+    /// Decodes LLRs from an offline reference demodulator (raw f32, 64800
+    /// per QPSK 4/5 normal frame, positive meaning bit 0):
+    /// `HPSDR_DVBS2_LLR`. Separates demodulator losses from the FEC.
+    #[test]
+    #[ignore]
+    fn decode_llr_file() {
+        let bytes = std::fs::read(std::env::var("HPSDR_DVBS2_LLR").expect("set HPSDR_DVBS2_LLR")).unwrap();
+        let llr: Vec<f32> = bytes.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+        let pls = PlsCode { modcod: 8, short: false, pilots: false };
+        let mut decoder = Decoder::new();
+        let mut packets = Vec::new();
+        for frame in llr.chunks_exact(64_800) {
+            decoder.decode(super::demod::Frame { pls, llr: frame.to_vec() }, &mut packets);
         }
         eprintln!("{:?}", decoder.stats);
     }

@@ -20,6 +20,7 @@
 use crate::discovery::{Boards, Device};
 use crate::ozy;
 use crate::mirisdr;
+use crate::pluto;
 use crate::rtlsdr;
 use crate::rx888;
 use std::collections::VecDeque;
@@ -246,9 +247,9 @@ pub struct RadioSettings {
     /// doc comment).
     pub rtlsdr_direct_sampling: u8,
     pub rtlsdr_tuner_agc: bool,
-    /// MSi2500 only: stream at mirisdr::WIDE_SAMPLE_RATE_HZ (see its doc
-    /// comment). Read at connect; the stick is never reopened at runtime
-    /// (see DongleRate).
+    /// MSi2500 / Pluto only: stream at mirisdr::WIDE_SAMPLE_RATE_HZ /
+    /// pluto::WIDE_SAMPLE_RATE_HZ (see their doc comments). Read at
+    /// connect; the device is never reopened at runtime (see DongleRate).
     pub mirisdr_wide: bool,
     /// Ozy only -- initial values for OzyAtlas (see its doc comment).
     /// `None` = automatic (Penelope if one answers at start-up, else
@@ -385,7 +386,13 @@ fn ps_feedback_config(protocol: u8, board: Boards) -> Option<(u8, u8, Option<u8>
             // start_protocol1_ozy_usb's doc comment) -- no reservation.
             // RX-888: receive-only hardware, no TX/feedback path at all
             // (see start_rx888_usb's doc comment).
-            Boards::Saturn | Boards::Ozy | Boards::Rx888 | Boards::RtlSdr | Boards::MsiSdr | Boards::Unknown => None,
+            Boards::Saturn
+            | Boards::Ozy
+            | Boards::Rx888
+            | Boards::RtlSdr
+            | Boards::MsiSdr
+            | Boards::Pluto
+            | Boards::Unknown => None,
         },
         // P2: DDC0/DDC1 reservation is universal, not board-dependent --
         // confirmed via new_protocol.c, no per-board variation in that
@@ -1306,7 +1313,10 @@ pub struct RadioSession {
     /// (MSI.SDR) session -- same reasoning as `rtlsdr_mac`, and shares
     /// its start/restart path (see start_usb_dongle).
     mirisdr_mac: Option<[u8; 6]>,
-    /// RTL-SDR / MSi2500 only: see DongleRate -- how a sample rate change
+    /// Some(iiod's address) only for a Pluto session -- shares the
+    /// dongles' start/restart path too.
+    pluto_addr: Option<std::net::SocketAddr>,
+    /// RTL-SDR / MSi2500 / Pluto only: see DongleRate -- how a sample rate change
     /// reaches the running receiver/control threads without reopening
     /// the dongle.
     dongle_rate: Option<Arc<DongleRate>>,
@@ -1418,7 +1428,7 @@ impl RadioSession {
                 diversity_enabled, diversity_gain_db, diversity_phase_deg, diversity_main_raw_iq,
                 puresignal_enabled,
             )
-        } else if matches!(device.board, Boards::RtlSdr | Boards::MsiSdr) {
+        } else if matches!(device.board, Boards::RtlSdr | Boards::MsiSdr | Boards::Pluto) {
             start_usb_dongle(
                 device, settings, frequency_hz, tx_frequency_hz, rx_frequency_hz, requested_frequency_hz, sample_rate, adc, rx_antenna, tx_antenna, rx_attenuation,
                 ps_tx_attenuation, mox, tx_iq, tci_tx_audio, tci_tx_gain, tx_power_watts, cw_keyer, cw_mode_active, pa_gain_db,
@@ -1776,6 +1786,8 @@ impl RadioSession {
         self.stop_flag = Arc::clone(&stop_flag);
         let (receiver_thread, control_thread) = if let Some(mac) = self.mirisdr_mac {
             spawn_mirisdr_threads(mac, &self.iq_buffers[0], &self.frequency_hz, &self.rx_attenuation, &stop_flag, &rate)?
+        } else if let Some(addr) = self.pluto_addr {
+            spawn_pluto_threads(addr, &self.iq_buffers[0], &self.frequency_hz, &self.rx_attenuation, &stop_flag, &rate)?
         } else {
             let controls = self
                 .rtlsdr_controls
@@ -2302,6 +2314,7 @@ fn start_protocol1(
         rtlsdr_mac: None,
         rtlsdr_controls: None,
         mirisdr_mac: None,
+        pluto_addr: None,
         dongle_rate: None,
     })
 }
@@ -2659,6 +2672,7 @@ fn start_protocol1_ozy_usb(
         rtlsdr_mac: None,
         rtlsdr_controls: None,
         mirisdr_mac: None,
+        pluto_addr: None,
         dongle_rate: None,
     })
 }
@@ -2929,6 +2943,7 @@ fn start_rx888_usb(
         rtlsdr_mac: None,
         rtlsdr_controls: None,
         mirisdr_mac: None,
+        pluto_addr: None,
         dongle_rate: None,
     })
 }
@@ -3003,13 +3018,20 @@ fn start_usb_dongle(
     // exactly (see rtlsdr::decimation_for_output_rate); main.rs's
     // connect_to_device already does the same check, this is the backstop.
     let is_mirisdr = device.board == Boards::MsiSdr;
-    let input_rate = if is_mirisdr { mirisdr::sample_rate_hz(settings.mirisdr_wide) } else { rtlsdr::DONGLE_RATE_HZ };
+    let is_pluto = device.board == Boards::Pluto;
+    let input_rate = if is_mirisdr {
+        mirisdr::sample_rate_hz(settings.mirisdr_wide)
+    } else if is_pluto {
+        pluto::sample_rate_hz(settings.mirisdr_wide)
+    } else {
+        rtlsdr::DONGLE_RATE_HZ
+    };
     let output_rate = sample_rate.load(Ordering::Relaxed);
     let output_rate =
         if rtlsdr::decimation_for_output_rate(input_rate, output_rate).is_some() { output_rate } else { rtlsdr::DEFAULT_OUTPUT_RATE_HZ };
     sample_rate.store(output_rate, Ordering::Relaxed);
 
-    let controls = (!is_mirisdr).then(|| {
+    let controls = (!is_mirisdr && !is_pluto).then(|| {
         Arc::new(rtlsdr::Controls {
             direct_sampling: AtomicU8::new(settings.rtlsdr_direct_sampling),
             blog_v4: AtomicBool::new(false),
@@ -3040,6 +3062,9 @@ fn start_usb_dongle(
     let (receiver_thread, control_thread) = match &controls {
         Some(controls) => {
             spawn_rtlsdr_threads(device.mac, &iq_buffers[0], &frequency_hz, &rx_attenuation, controls, &stop_flag, &dongle_rate)?
+        }
+        None if is_pluto => {
+            spawn_pluto_threads(device.address, &iq_buffers[0], &frequency_hz, &rx_attenuation, &stop_flag, &dongle_rate)?
         }
         None => spawn_mirisdr_threads(device.mac, &iq_buffers[0], &frequency_hz, &rx_attenuation, &stop_flag, &dongle_rate)?,
     };
@@ -3128,9 +3153,10 @@ fn start_usb_dongle(
         ozy_i2c_thread: None,
         is_rx888: false,
         usb_control_thread: Some(control_thread),
-        rtlsdr_mac: (!is_mirisdr).then_some(device.mac),
+        rtlsdr_mac: (!is_mirisdr && !is_pluto).then_some(device.mac),
         rtlsdr_controls: controls,
         mirisdr_mac: is_mirisdr.then_some(device.mac),
+        pluto_addr: is_pluto.then_some(device.address),
         dongle_rate: Some(dongle_rate),
     })
 }
@@ -3479,6 +3505,142 @@ fn mirisdr_control_loop(
         thread::sleep(Duration::from_millis(10));
     }
     device.close();
+}
+
+/// Pluto counterpart of spawn_mirisdr_threads: the same Decimator and
+/// tuning offset, with the stream and the control side each on their
+/// own iiod connection (see pluto.rs's module doc comment).
+fn spawn_pluto_threads(
+    addr: std::net::SocketAddr,
+    iq_buffer: &Arc<Mutex<VecDeque<IqSample>>>,
+    frequency_hz: &Arc<AtomicU32>,
+    rx_attenuation: &Arc<AtomicU32>,
+    stop_flag: &Arc<AtomicBool>,
+    rate: &Arc<DongleRate>,
+) -> io::Result<(JoinHandle<()>, JoinHandle<()>)> {
+    let decimation = rate.decimation.load(Ordering::Relaxed);
+    let offset_hz = rtlsdr::tuning_offset_hz(decimation);
+    let (device, stream, name) = pluto::initialise(
+        addr,
+        frequency_hz.load(Ordering::Relaxed) + offset_hz,
+        rx_attenuation.load(Ordering::Relaxed),
+        rate.input_rate_hz == pluto::WIDE_SAMPLE_RATE_HZ,
+    )?;
+    println!("Pluto: {name} streaming at {} Hz, decimating by {decimation}", rate.input_rate_hz);
+
+    let receiver_buffer = Arc::clone(iq_buffer);
+    let receiver_stop = Arc::clone(stop_flag);
+    let receiver_rate = Arc::clone(rate);
+    let receiver_frequency_hz = Arc::clone(frequency_hz);
+    let receiver_thread = thread::spawn(move || {
+        pluto_receiver_loop(stream, receiver_buffer, receiver_stop, receiver_rate, receiver_frequency_hz);
+    });
+
+    let control_frequency_hz = Arc::clone(frequency_hz);
+    let control_rx_attenuation = Arc::clone(rx_attenuation);
+    let control_stop = Arc::clone(stop_flag);
+    let control_rate = Arc::clone(rate);
+    let control_thread = thread::spawn(move || {
+        pluto_control_loop(device, control_frequency_hz, control_rate, control_rx_attenuation, control_stop);
+    });
+    Ok((receiver_thread, control_thread))
+}
+
+/// Pluto receiver thread -- same shape as mirisdr_receiver_loop.
+fn pluto_receiver_loop(
+    mut stream: pluto::RxStream,
+    iq_buffer: Arc<Mutex<VecDeque<IqSample>>>,
+    stop_flag: Arc<AtomicBool>,
+    rate: Arc<DongleRate>,
+    frequency_hz: Arc<AtomicU32>,
+) {
+    let mut decimation = rate.decimation.load(Ordering::Relaxed);
+    let mut decimator = rtlsdr::Decimator::with_full_scale(rate.input_rate_hz, decimation, pluto::SAMPLE_FULL_SCALE);
+    let mut buf = vec![0u8; stream.buffer_samples() * 4];
+    let mut push = |(iv, qv): (i32, i32)| push_sample(&iq_buffer, IqSample { i: iv, q: qv }, IQ_BUFFER_CAPACITY);
+    // iiod never says when the Pluto's buffers overflowed, so compare
+    // what arrived against the clock instead: a shortfall means samples
+    // were lost, which breaks anything that needs a continuous stream
+    // (DATV, most of all).
+    let mut window_start = std::time::Instant::now();
+    let mut window_samples = 0u64;
+    while !stop_flag.load(Ordering::Relaxed) {
+        // Any error, a timeout included, leaves the connection somewhere
+        // mid-reply, so there's no picking it back up.
+        if let Err(e) = stream.read(&mut buf) {
+            eprintln!("Pluto: stream read failed: {e}");
+            break;
+        }
+        window_samples += (buf.len() / 4) as u64;
+        let elapsed = window_start.elapsed().as_secs_f64();
+        if elapsed >= 10.0 {
+            let expected = elapsed * rate.input_rate_hz as f64;
+            // The first window also counts the stream's start-up delay.
+            if (window_samples as f64) < expected * 0.995 {
+                eprintln!(
+                    "Pluto: received {:.1}% of the expected samples over {elapsed:.1} s -- some were lost",
+                    100.0 * window_samples as f64 / expected
+                );
+            }
+            window_start = std::time::Instant::now();
+            window_samples = 0;
+        }
+        // See DongleRate.
+        if rate.paused.load(Ordering::Acquire) {
+            continue;
+        }
+        let wanted = rate.decimation.load(Ordering::Relaxed);
+        if wanted != decimation {
+            decimation = wanted;
+            decimator = rtlsdr::Decimator::with_full_scale(rate.input_rate_hz, decimation, pluto::SAMPLE_FULL_SCALE);
+        }
+        let samples = buf.chunks_exact(4).map(|p| (i16::from_le_bytes([p[0], p[1]]), i16::from_le_bytes([p[2], p[3]])));
+        if rate.tap.is_attached() {
+            // WidebandBlock wants +-32768 full scale; the ADC is 12-bit.
+            let wide = samples.clone().map(|(i, q)| [i << 4, q << 4]).collect();
+            let center_hz = frequency_hz.load(Ordering::Relaxed) + rtlsdr::tuning_offset_hz(decimation);
+            rate.tap.send(WidebandBlock { center_hz, samples: wide });
+        }
+        decimator.process_samples(samples.map(|(i, q)| (i as f64, q as f64)), &mut push);
+    }
+    stream.close();
+}
+
+/// Pluto control thread -- mirisdr_control_loop's tuning and gain,
+/// as iiod attribute writes. RF gain is `rx_attenuation` as whole dB,
+/// 0..=pluto::MAX_GAIN_DB.
+fn pluto_control_loop(
+    mut device: pluto::PlutoDevice,
+    frequency_hz: Arc<AtomicU32>,
+    rate: Arc<DongleRate>,
+    rx_attenuation: Arc<AtomicU32>,
+    stop_flag: Arc<AtomicBool>,
+) {
+    // initialise() already applied these.
+    let mut last_freq = frequency_hz.load(Ordering::Relaxed);
+    let mut last_offset = rtlsdr::tuning_offset_hz(rate.decimation.load(Ordering::Relaxed));
+    let mut last_gain = rx_attenuation.load(Ordering::Relaxed);
+    while !stop_flag.load(Ordering::Relaxed) {
+        let freq = frequency_hz.load(Ordering::Relaxed);
+        let offset_hz = rtlsdr::tuning_offset_hz(rate.decimation.load(Ordering::Relaxed));
+        if freq != last_freq || offset_hz != last_offset {
+            // Hardware sits offset_hz above the dial -- see
+            // rtlsdr::Decimator's doc comment.
+            if let Err(e) = device.set_center_freq(freq + offset_hz) {
+                eprintln!("Pluto: tune to {} Hz failed: {e}", freq + offset_hz);
+            }
+            last_freq = freq;
+            last_offset = offset_hz;
+        }
+        let gain = rx_attenuation.load(Ordering::Relaxed);
+        if gain != last_gain {
+            if let Err(e) = device.set_gain(gain) {
+                eprintln!("Pluto: gain change failed: {e}");
+            }
+            last_gain = gain;
+        }
+        thread::sleep(RTLSDR_CONTROL_POLL);
+    }
 }
 
 /// RX-888 receiver thread -- owns the bulk streaming `RxEndpoint`
@@ -7035,6 +7197,7 @@ fn start_protocol2(
         rtlsdr_mac: None,
         rtlsdr_controls: None,
         mirisdr_mac: None,
+        pluto_addr: None,
         dongle_rate: None,
     })
 }

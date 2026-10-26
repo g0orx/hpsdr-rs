@@ -24,8 +24,68 @@ pub struct DecoderStats {
     pub last_iterations: usize,
 }
 
-pub struct Decoder {
+/// The FEC half of decoding: LLRs -> LDPC -> BCH -> descrambled
+/// BBFRAME. It depends on nothing but the frame itself, so several can
+/// run at once on different frames (datv.rs does, because one LDPC
+/// decode takes longer than a frame lasts); Decoder::apply then puts the
+/// results back in order.
+#[derive(Default)]
+pub struct FecDecoder {
     codes: HashMap<(bool, Rate), (LdpcCode, BchCode)>,
+}
+
+/// What FecDecoder made of one frame.
+pub enum FecOutcome {
+    /// A MODCOD this receiver doesn't decode.
+    Skipped,
+    Decoded {
+        ldpc_failed: bool,
+        iterations: usize,
+        bch: BchResult,
+        /// The BBFRAME's header and bits, if BCH succeeded and the header
+        /// checked out.
+        bbframe: Option<(bbframe::BbHeader, Vec<u8>)>,
+    },
+}
+
+impl FecDecoder {
+    pub fn decode(&mut self, mut frame: Frame) -> FecOutcome {
+        let Some((_, rate)) = frame.pls.modcod() else {
+            return FecOutcome::Skipped;
+        };
+        let short = frame.pls.short;
+        let Some(p) = fec_params(short, rate) else {
+            return FecOutcome::Skipped;
+        };
+        let (ldpc, bch) = self
+            .codes
+            .entry((short, rate))
+            .or_insert_with(|| (LdpcCode::new(&p), BchCode::new(short, p.kldpc, p.kbch, p.t)));
+        // On failure BCH may still clean up a few residual errors.
+        let decoded = ldpc.decode(&mut frame.llr, MAX_ITERATIONS);
+        let mut bits: Vec<u8> = frame.llr[..p.kldpc].iter().map(|&l| u8::from(l < 0.0)).collect();
+        let bch = bch.decode(&mut bits);
+        let bbframe = (!matches!(bch, BchResult::Failed))
+            .then(|| {
+                bits.truncate(p.kbch);
+                bbframe::descramble(&mut bits);
+                bbframe::parse_header(&bits).map(|h| (h, bits))
+            })
+            .flatten();
+        FecOutcome::Decoded {
+            ldpc_failed: decoded.is_none(),
+            iterations: decoded.unwrap_or(MAX_ITERATIONS),
+            bch,
+            bbframe,
+        }
+    }
+}
+
+pub struct Decoder {
+    // For decode(), which only the tests need -- datv.rs runs its own
+    // FecDecoders and calls apply().
+    #[cfg_attr(not(test), allow(dead_code))]
+    fec: FecDecoder,
     ts: TsExtractor,
     pub stats: DecoderStats,
 }
@@ -38,33 +98,28 @@ impl Default for Decoder {
 
 impl Decoder {
     pub fn new() -> Self {
-        Self { codes: HashMap::new(), ts: TsExtractor::default(), stats: DecoderStats::default() }
+        Self { fec: FecDecoder::default(), ts: TsExtractor::default(), stats: DecoderStats::default() }
     }
 
     /// Decodes one frame, appending any complete TS packets to `out`.
-    pub fn decode(&mut self, mut frame: Frame, out: &mut Vec<[u8; TS_PACKET]>) {
-        let Some((_, rate)) = frame.pls.modcod() else {
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn decode(&mut self, frame: Frame, out: &mut Vec<[u8; TS_PACKET]>) {
+        let outcome = self.fec.decode(frame);
+        self.apply(outcome, out);
+    }
+
+    /// The in-order half: counts a FecDecoder outcome and extracts its
+    /// TS packets. Outcomes must arrive in frame order.
+    pub fn apply(&mut self, outcome: FecOutcome, out: &mut Vec<[u8; TS_PACKET]>) {
+        let FecOutcome::Decoded { ldpc_failed, iterations, bch, bbframe } = outcome else {
             return;
         };
-        let short = frame.pls.short;
-        let Some(p) = fec_params(short, rate) else {
-            return;
-        };
-        let (ldpc, bch) = self
-            .codes
-            .entry((short, rate))
-            .or_insert_with(|| (LdpcCode::new(&p), BchCode::new(short, p.kldpc, p.kbch, p.t)));
         self.stats.frames += 1;
-        match ldpc.decode(&mut frame.llr, MAX_ITERATIONS) {
-            Some(n) => self.stats.last_iterations = n,
-            None => {
-                // BCH may still clean up a few residual errors.
-                self.stats.ldpc_failures += 1;
-                self.stats.last_iterations = MAX_ITERATIONS;
-            }
+        self.stats.last_iterations = iterations;
+        if ldpc_failed {
+            self.stats.ldpc_failures += 1;
         }
-        let mut bits: Vec<u8> = frame.llr[..p.kldpc].iter().map(|&l| u8::from(l < 0.0)).collect();
-        match bch.decode(&mut bits) {
+        match bch {
             BchResult::Clean => {}
             BchResult::Corrected(_) => self.stats.bch_corrected += 1,
             BchResult::Failed => {
@@ -72,9 +127,7 @@ impl Decoder {
                 return;
             }
         }
-        bits.truncate(p.kbch);
-        bbframe::descramble(&mut bits);
-        let Some(header) = bbframe::parse_header(&bits) else {
+        let Some((header, bits)) = bbframe else {
             self.stats.header_errors += 1;
             return;
         };

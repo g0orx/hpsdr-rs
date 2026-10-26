@@ -29,6 +29,11 @@ pub struct LdpcCode {
 /// Min-sum's overestimate correction.
 const NORMALIZATION: f32 = 0.8;
 
+/// See decode's stall test: from this iteration on, give up unless the
+/// unsatisfied checks are 5% fewer than STALL_WINDOW iterations before.
+const STALL_FROM: usize = 15;
+const STALL_WINDOW: usize = 10;
+
 impl LdpcCode {
     pub fn new(p: &FecParams) -> Self {
         let (n, k, q) = (p.nldpc, p.kldpc, p.q);
@@ -83,11 +88,19 @@ impl LdpcCode {
     }
 
     /// Whether `bits` (n of them, 0/1) satisfies every parity check.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn is_codeword(&self, bits: &[u8]) -> bool {
-        (0..self.n - self.k).all(|c| {
-            let vars = &self.check_vars[self.check_start[c] as usize..self.check_start[c + 1] as usize];
-            vars.iter().fold(0u8, |a, &v| a ^ bits[v as usize]) == 0
-        })
+        self.unsatisfied_checks(bits) == 0
+    }
+
+    /// How many parity checks `bits` (n of them, 0/1) fails.
+    fn unsatisfied_checks(&self, bits: &[u8]) -> usize {
+        (0..self.n - self.k)
+            .filter(|&c| {
+                let vars = &self.check_vars[self.check_start[c] as usize..self.check_start[c + 1] as usize];
+                vars.iter().fold(0u8, |a, &v| a ^ bits[v as usize]) != 0
+            })
+            .count()
     }
 
     /// Decodes in place: `llr` holds n log-likelihood ratios, positive
@@ -100,6 +113,8 @@ impl LdpcCode {
         let mut r = vec![0f32; self.check_vars.len()];
         let mut t = Vec::with_capacity(64);
         let mut hard = vec![0u8; self.n];
+        // Unsatisfied checks after each iteration, for the stall test.
+        let mut history = Vec::with_capacity(max_iterations);
         for iteration in 1..=max_iterations {
             for c in 0..m {
                 let (start, end) = (self.check_start[c] as usize, self.check_start[c + 1] as usize);
@@ -135,8 +150,20 @@ impl LdpcCode {
             for (h, &l) in hard.iter_mut().zip(llr.iter()) {
                 *h = u8::from(l < 0.0);
             }
-            if self.is_codeword(&hard) {
+            let unsatisfied = self.unsatisfied_checks(&hard);
+            if unsatisfied == 0 {
                 return Some(iteration);
+            }
+            // Give up on a frame that has stopped improving -- it only
+            // costs CPU, and while the signal is too weak, every frame
+            // does. REAL RECORDINGS (QO-100 beacon, QPSK 4/5, two at
+            // ~4.6-5 dB, 994 frames): stopping once the unsatisfied checks
+            // fell by less than 5% over 10 iterations (from the 15th) lost
+            // 1 of the 547 frames that decode, and saved a third of all
+            // iterations.
+            history.push(unsatisfied);
+            if iteration >= STALL_FROM && unsatisfied * 100 > history[iteration - 1 - STALL_WINDOW] * 95 {
+                return None;
             }
         }
         None

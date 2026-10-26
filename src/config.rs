@@ -293,7 +293,7 @@ pub struct Config {
     pub rtlsdr_direct_sampling: Option<u8>,
     #[serde(default)]
     pub rtlsdr_tuner_agc: Option<bool>,
-    /// MSI.SDR only -- radio::RadioSettings::mirisdr_wide.
+    /// MSI.SDR / Pluto only -- radio::RadioSettings::mirisdr_wide.
     #[serde(default)]
     pub mirisdr_wide: Option<bool>,
     /// Ozy only -- see radio::OzyAtlas's doc comment. `None` for the

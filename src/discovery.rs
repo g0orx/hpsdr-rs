@@ -14,6 +14,7 @@ use crate::config::Config;
 use crate::ozy;
 use crate::rx888;
 use crate::mirisdr;
+use crate::pluto;
 use crate::usb_port;
 use crate::rtlsdr;
 use network_interface::{Addr, NetworkInterface, NetworkInterfaceConfig};
@@ -63,6 +64,12 @@ pub enum Boards {
     /// radio.rs's start_usb_dongle. `Device::protocol` is the same
     /// meaningless placeholder 1.
     MsiSdr,
+    /// ADALM-Pluto (AD9363) and its clones -- reached over the network
+    /// (iiod on TCP 30431), even when plugged into USB, which gives it
+    /// an Ethernet-over-USB link; see pluto.rs and radio.rs's
+    /// start_usb_dongle, which it shares with the USB dongles.
+    /// `Device::protocol` is the same meaningless placeholder 1.
+    Pluto,
     Unknown,
 }
 
@@ -402,6 +409,7 @@ pub fn discover(devices: Arc<Mutex<Vec<Device>>>, interface_names: Arc<Mutex<Has
     discover_rx888_usb(&devices);
     discover_rtlsdr_usb(&devices);
     discover_mirisdr_usb(&devices);
+    discover_pluto(&devices);
 
     let interfaces = match NetworkInterface::show() {
         Ok(v) => v,
@@ -603,6 +611,52 @@ fn discover_mirisdr_usb(devices: &Arc<Mutex<Vec<Device>>>) {
     }
 }
 
+/// Probes for a Pluto at its default address, and at the .1 of any
+/// local subnet where this machine is .10 -- the address the Pluto's
+/// own DHCP server hands out, so this also finds one whose config.txt
+/// moved it off 192.168.2.1.
+fn discover_pluto(devices: &Arc<Mutex<Vec<Device>>>) {
+    let mut candidates = vec![pluto::DEFAULT_IP];
+    if let Ok(interfaces) = NetworkInterface::show() {
+        for itf in interfaces {
+            for addr in &itf.addr {
+                if let Addr::V4(v4) = addr {
+                    let o = v4.ip.octets();
+                    let ip = IpAddr::V4(std::net::Ipv4Addr::new(o[0], o[1], o[2], 1));
+                    if o[3] == 10 && !candidates.contains(&ip) {
+                        candidates.push(ip);
+                    }
+                }
+            }
+        }
+    }
+    for ip in candidates {
+        if let Some(info) = pluto::probe(ip) {
+            devices.lock().unwrap().push(pluto_device(&info));
+        }
+    }
+}
+
+fn pluto_device(info: &pluto::Info) -> Device {
+    Device {
+        address: info.addr,
+        my_address: info.local_addr,
+        device: 0,
+        board: Boards::Pluto,
+        protocol: 1, // meaningless for this board -- see Boards::Pluto's doc comment
+        version: 0,
+        status: 2, // available
+        mac: info.mac(),
+        // One receiver, same reasoning as discover_rtlsdr_usb.
+        supported_receivers: 1,
+        supported_transmitters: 0, // receive-only so far
+        adcs: 1,
+        frequency_min: info.frequency_min_hz,
+        frequency_max: info.frequency_max_hz,
+        usb_link_speed_warning: None,
+    }
+}
+
 /// Looks up which local network interface (e.g. "eth0"/"enp3s0")
 /// currently owns `ip` -- same lookup `discover`'s own interface_names
 /// map is built from, but standalone and side-effect-free (no
@@ -670,6 +724,12 @@ pub fn manual_discovery(devices: Arc<Mutex<Vec<Device>>>, target_ip: IpAddr) -> 
                 }
             }
         }
+    }
+
+    // Not an HPSDR radio -- perhaps a Pluto with a non-default address.
+    if let Some(info) = pluto::probe(target_ip) {
+        devices.lock().unwrap().push(pluto_device(&info));
+        return true;
     }
 
     false
