@@ -193,6 +193,11 @@ pub struct RadioSettings {
     /// afterward is `RadioSession::set_puresignal_enabled`, a true live
     /// setting on both protocols (no reconnect).
     pub puresignal_enabled: bool,
+    /// Whether to reserve PureSignal's 2 feedback receivers for this
+    /// session at all (set at connect). Off gives them back to "Add
+    /// Receiver" -- the board then behaves as if it had no PureSignal
+    /// support, and `puresignal_enabled` must be false.
+    pub puresignal_reserve: bool,
     /// Initial value for RadioSession::rx_attenuation (P1, standard
     /// boards only) -- see that field's doc comment. main.rs loads
     /// this from Config, falling back to this struct's own default
@@ -269,6 +274,7 @@ impl Default for RadioSettings {
             sample_rate: 48_000,
             receivers: 1, // hardcoded single-receiver for this first version
             puresignal_enabled: false,
+            puresignal_reserve: true,
             // Non-zero rather than 0dB -- see RadioSession::rx_attenuation's
             // doc comment for why 0dB caused real front-end overload.
             rx_attenuation: 12,
@@ -1975,7 +1981,11 @@ fn start_protocol1(
     // Every board with a reservation keeps at least one real receiver
     // (max_real >= 2 below); Metis/HermesLite, where it would have been
     // zero, have no PureSignal at all -- see ps_feedback_config.
-    let ps_config = ps_feedback_config(1, device.board);
+    //
+    // `settings.puresignal_reserve` off skips the reservation entirely,
+    // exactly as on a board without PureSignal, so every receiver the
+    // board has is available to "Add Receiver".
+    let ps_config = if settings.puresignal_reserve { ps_feedback_config(1, device.board) } else { None };
     let mut real_receivers = match ps_config {
         Some((_, _, Some(max_real))) => settings.receivers.max(1).min(max_real),
         Some((_, _, None)) | None => settings.receivers.max(1),
@@ -6702,7 +6712,11 @@ fn start_protocol2(
     // comment for why that's exactly what made a live toggle impossible.
     // `ps_supported` is board support only now, independent of PS's
     // initial (or current) on/off state.
-    let ps_supported = ps_feedback_config(2, device.board).is_some();
+    //
+    // `settings.puresignal_reserve` off skips the reservation: no DDC0/
+    // DDC1 entries, real receivers start at DDC0 (`ps_supported` is
+    // passed to both loops as `ps_reserved`).
+    let ps_supported = settings.puresignal_reserve && ps_feedback_config(2, device.board).is_some();
     let mut real_receivers = if ps_supported {
         settings.receivers.max(1).saturating_sub(2).max(1)
     } else {
@@ -6846,6 +6860,7 @@ fn start_protocol2(
             sender_cw_mode_active,
             sender_pa_gain_db,
             sender_hp_request,
+            ps_supported,
             sender_puresignal_enabled,
             sender_ps_tx_attenuation,
             sender_rx_attenuation,
@@ -6919,6 +6934,7 @@ fn start_protocol2(
             receiver_adc1_overload,
             receiver_tx_fifo_underrun,
             receiver_tx_fifo_overrun,
+            ps_supported,
             receiver_puresignal_enabled,
             receiver_ps_rx_feedback_iq,
             receiver_ps_tx_feedback_iq,
@@ -7759,6 +7775,11 @@ fn p2_sender_loop(
     // (read fresh each cycle, same treatment as diversity_enabled just
     // below) only controls DDC0/DDC1's *enable bits* -- whether they're
     // actually streaming right now -- via ps_mox_gate below.
+    //
+    // `ps_reserved` false (Settings -> PureSignal -> "Reserve receivers
+    // for PureSignal" off at connect): no DDC0/DDC1 entries at all, real
+    // receivers start at DDC0 and ps_mox_gate is None.
+    ps_reserved: bool,
     puresignal_enabled: Arc<AtomicBool>,
     // See RadioSession::ps_tx_attenuation's doc comment.
     ps_tx_attenuation: Arc<AtomicU32>,
@@ -7897,12 +7918,14 @@ fn p2_sender_loop(
         // Diversity regardless of whether diversity_enabled is currently
         // true -- only the ENABLE bits (ps_mox_gate below) depend on the
         // live flag.
-        freqs.push(tx_freq_hz);
-        rates.push(192_000);
-        adcs.push(0);
-        freqs.push(tx_freq_hz);
-        rates.push(192_000);
-        adcs.push(num_adcs as u32);
+        if ps_reserved {
+            freqs.push(tx_freq_hz);
+            rates.push(192_000);
+            adcs.push(0);
+            freqs.push(tx_freq_hz);
+            rates.push(192_000);
+            adcs.push(num_adcs as u32);
+        }
         let main_freq = frequency_hz.load(Ordering::Relaxed);
         let main_adc = adc.load(Ordering::Relaxed);
         // RX2/Alex1 bandpass filter frequency -- see p2_sender_loop's
@@ -7979,7 +8002,7 @@ fn p2_sender_loop(
         // simply toggled off. The inner bool -- whether DDC0's enable
         // bit/sync byte should actually be active right now -- is what
         // carries the live on/off + MOX state instead.
-        let ps_mox_gate = Some(puresignal_enabled.load(Ordering::Relaxed) && mox_on);
+        let ps_mox_gate = ps_reserved.then(|| puresignal_enabled.load(Ordering::Relaxed) && mox_on);
         let ps_tx_atten = ps_tx_attenuation.load(Ordering::Relaxed) as u8;
         let rx_atten = (rx_attenuation.load(Ordering::Relaxed) as u8) & 0x1F;
 
@@ -8100,6 +8123,10 @@ fn p2_receiver_loop(
     // both feedback streams interleaved; DDC1 is never independently
     // enabled) versus just being dropped (harmless: nothing else is
     // indexed at DDC0/DDC1 while they're reserved).
+    //
+    // `ps_reserved` false: nothing is reserved, real receivers start at
+    // DDC0 -- see p2_sender_loop's matching param.
+    ps_reserved: bool,
     puresignal_enabled: Arc<AtomicBool>,
     ps_rx_feedback_iq: Arc<Mutex<VecDeque<IqSample>>>,
     ps_tx_feedback_iq: Arc<Mutex<VecDeque<IqSample>>>,
@@ -8121,11 +8148,10 @@ fn p2_receiver_loop(
     // isn't turning it into spectrum/waterfall pixels" (a WDSP-side
     // issue -- see SpectrumAnalyzer::open's XCreateAnalyzer success
     // check and demod()'s fexchange0 error check).
-    // Unconditional now -- see start_protocol2's ps_supported doc
-    // comment: P2 always reserves DDC0/DDC1's wire positions regardless
-    // of PureSignal's live on/off state, so real receivers always start
-    // at DDC2.
-    let ddc_reserved: usize = 2;
+    // See start_protocol2's ps_supported doc comment: when reserved,
+    // DDC0/DDC1's wire positions are held regardless of PureSignal's
+    // live on/off state, so real receivers start at DDC2.
+    let ddc_reserved: usize = if ps_reserved { 2 } else { 0 };
     let mut ddc_seen = vec![false; buffers.len() + ddc_reserved];
     // BUG FIX: forward/reverse power used to be stored as the single
     // latest raw per-packet ADC reading, with only a UI-frame-rate
@@ -8162,7 +8188,7 @@ fn p2_receiver_loop(
                     }
                     if n == P2_PACKET_SIZE {
                         let capacity = iq_buffer_capacity_for_rate(sample_rate.load(Ordering::Relaxed));
-                        if puresignal_enabled.load(Ordering::Relaxed) && ddc == 0 {
+                        if ps_reserved && puresignal_enabled.load(Ordering::Relaxed) && ddc == 0 {
                             // See p2_parse_ps_feedback_packet's doc comment --
                             // DDC0 alone carries both feedback streams,
                             // interleaved. DDC1 (ddc == 1) is never
@@ -8202,9 +8228,7 @@ fn p2_receiver_loop(
                             // buffers[1] untouched. Written as `ddc ==
                             // ddc_reserved` rather than the previous `ddc
                             // - ddc_reserved == 0` -- equivalent when
-                            // reached (diversity forces real_receivers
-                            // >= 2, so ddc_reserved is always 2 here
-                            // regardless), but doesn't rely on
+                            // reached, but doesn't rely on
                             // short-circuit evaluation order to avoid the
                             // same underflow the branch above now guards
                             // against explicitly.

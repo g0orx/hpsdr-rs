@@ -20,7 +20,9 @@ receiver count.
 On a [PureSignal](14-puresignal.md)-capable radio, "max" here is 2 lower
 than the radio's full receiver capacity -- PureSignal's two feedback
 receivers are reserved for the whole session as soon as you connect,
-whether or not PureSignal is actually enabled.
+whether or not PureSignal is actually enabled. If you don't use
+PureSignal, uncheck **Reserve receivers for PureSignal** in Settings ->
+PureSignal and reconnect to get those two receivers back.
 
 ![An extra receiver's own window](images/11-extra-receiver-window.png)
 

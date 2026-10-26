@@ -23,6 +23,15 @@ reserved for the whole session as soon as you connect, whether or not
 PureSignal is actually enabled -- so [Extra Receivers](03-extra-receivers.md)'
 maximum count is 2 lower than the radio's full capacity on any such radio.
 
+## Freeing the feedback receivers
+
+If you don't use PureSignal, uncheck **Reserve receivers for PureSignal**
+at the top of the tab and reconnect. The two feedback receivers then
+become ordinary receivers you can open with **Add Receiver**, and
+**Enable PureSignal** is greyed out for that session. Check it again and
+reconnect to get PureSignal back. The setting is saved, so it stays as
+you left it on later connects.
+
 Once enabled (and TX armed), the rest of this tab's controls appear:
 
 - **Running (continuous auto-calibrate)** checkbox.

@@ -2356,6 +2356,14 @@ struct ConnectedState {
     /// wire-level receiver/DDC count is fixed for the life of the
     /// sender/receiver threads).
     puresignal_enabled: bool,
+    /// Settings -> PureSignal "Reserve receivers for PureSignal" -- see
+    /// radio::RadioSettings::puresignal_reserve. Takes effect on the
+    /// next connect, so this can differ from `puresignal_reserved`.
+    puresignal_reserve: bool,
+    /// Whether THIS session actually reserved PureSignal's feedback
+    /// receivers (board support AND `puresignal_reserve` at connect).
+    /// PureSignal can only be turned on when this is true.
+    puresignal_reserved: bool,
     /// Diversity (2-ADC boards, see radio::RadioSession::diversity_enabled).
     /// Same "reflects what THIS session started with, editable in
     /// Settings but only takes effect on next connect" staging as
@@ -2529,7 +2537,9 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
     // stuck at 1 for every P1 radio regardless of what it
     // actually supports).
     settings.receivers = device.supported_receivers.max(1);
+    settings.puresignal_reserve = cfg.puresignal_reserve.unwrap_or(true);
     settings.puresignal_enabled = cfg.puresignal_enabled.unwrap_or(false)
+        && settings.puresignal_reserve
         && radio::puresignal_supported(device.protocol, device.board);
     settings.diversity_enabled = cfg.diversity_enabled.unwrap_or(false);
     settings.diversity_gain_db = cfg.diversity_gain_db.unwrap_or(0.0);
@@ -3268,6 +3278,9 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                 tx_fifo_warning_until: None,
                 tx_spectrum_mox_was_active: false,
                 puresignal_enabled: settings.puresignal_enabled,
+                puresignal_reserve: settings.puresignal_reserve,
+                puresignal_reserved: settings.puresignal_reserve
+                    && radio::puresignal_supported(device.protocol, device.board),
                 diversity_enabled: settings.diversity_enabled,
                 eq_tab_is_tx: false,
                 ps_was_correcting: false,
@@ -10011,12 +10024,37 @@ impl eframe::App for HpsdrApp {
                                     // from the radio; tx::PsParams/PsStatus
                                     // for the live calibration controls.
                                     ui.add_space(4.0);
+                                    if ui
+                                        .checkbox(&mut connected.puresignal_reserve, "Reserve receivers for PureSignal")
+                                        .on_hover_text(
+                                            "PureSignal needs 2 of the radio's receivers for its feedback \
+                                             signals, held for the whole session. Turn this off to use \
+                                             them with \"Add Receiver\" instead; PureSignal is then \
+                                             unavailable.",
+                                        )
+                                        .changed()
+                                    {
+                                        settings_changed = true;
+                                    }
+                                    if connected.puresignal_reserve != connected.puresignal_reserved {
+                                        ui.colored_label(
+                                            egui::Color32::from_rgb(220, 160, 40),
+                                            "Takes effect when you next connect.",
+                                        );
+                                    }
+                                    if !connected.puresignal_reserved {
+                                        ui.weak(
+                                            "PureSignal is unavailable this session: its 2 feedback \
+                                             receivers are free for \"Add Receiver\".",
+                                        );
+                                    }
+                                    ui.add_space(4.0);
                                     let mut puresignal_enabled = connected.puresignal_enabled;
                                     // Mutually exclusive with Diversity -- both reserve
                                     // wire indices at fixed positions that would collide
                                     // (see radio::RadioSession::diversity_enabled's doc
                                     // comment). Disabled, not hidden, so it's clear why.
-                                    ui.add_enabled_ui(!connected.diversity_enabled, |ui| {
+                                    ui.add_enabled_ui(connected.puresignal_reserved && !connected.diversity_enabled, |ui| {
                                         if ui
                                             .checkbox(&mut puresignal_enabled, "Enable PureSignal")
                                             .changed()
@@ -10038,13 +10076,13 @@ impl eframe::App for HpsdrApp {
                                     if connected.diversity_enabled {
                                         ui.weak("Disabled while Diversity is enabled (Settings -> Diversity).");
                                     }
-                                    ui.weak(
-                                        "Instant -- no reconnect needed. This radio/board \
-                                         permanently reserves 2 feedback receivers for \
-                                         PureSignal (reducing \"Add Receiver\" capacity by 2) \
-                                         whether or not it's currently enabled, so toggling \
-                                         here can't drop your rigctl/TCI connections.",
-                                    );
+                                    if connected.puresignal_reserved {
+                                        ui.weak(
+                                            "Instant -- no reconnect needed. The 2 reserved feedback \
+                                             receivers are held whether or not PureSignal is on, so \
+                                             toggling here can't drop your rigctl/TCI connections.",
+                                        );
+                                    }
 
                                     if connected.puresignal_enabled {
                                         if let Some(tx) = &connected.tx_handle {
@@ -10796,6 +10834,7 @@ impl eframe::App for HpsdrApp {
                             connected.allow_out_of_band_tx.load(std::sync::atomic::Ordering::Relaxed),
                         ),
                         puresignal_enabled: Some(connected.puresignal_enabled),
+                        puresignal_reserve: Some(connected.puresignal_reserve),
                         diversity_enabled: Some(connected.diversity_enabled),
                         diversity_gain_db: Some(f32::from_bits(
                             connected.session.diversity_gain_db.load(std::sync::atomic::Ordering::Relaxed),

@@ -333,6 +333,11 @@ pub struct Config {
     /// matching field doc comment for why this can't be a live toggle.
     #[serde(default)]
     pub puresignal_enabled: Option<bool>,
+    /// Settings -> PureSignal "Reserve receivers for PureSignal" --
+    /// radio::RadioSettings::puresignal_reserve. `None` = reserve (the
+    /// long-standing behaviour). Takes effect on the next connect.
+    #[serde(default)]
+    pub puresignal_reserve: Option<bool>,
     /// TX Settings' "Allow TX outside ham bands" checkbox -- real
     /// request, a safety default against accidentally transmitting
     /// outside the ham bands (e.g. while parked on "Gen"/general
