@@ -1320,6 +1320,9 @@ pub struct RadioSession {
     /// Pluto only: the transponder view (see transponder.rs). `pub` for
     /// the DATV window.
     pub pluto_scan: Option<Arc<transponder::Scan>>,
+    /// Pluto only: stops pluto_tx_loop (tx_iq_thread) -- see its spawn
+    /// in start_usb_dongle for why not `stop_flag`.
+    pluto_tx_stop: Option<Arc<AtomicBool>>,
     /// RTL-SDR / MSi2500 / Pluto only: see DongleRate -- how a sample rate change
     /// reaches the running receiver/control threads without reopening
     /// the dongle.
@@ -1829,6 +1832,9 @@ impl RadioSession {
         if let Some(t) = self.sender_thread.take() {
             let _ = t.join();
         }
+        if let Some(stop) = &self.pluto_tx_stop {
+            stop.store(true, Ordering::SeqCst);
+        }
         if let Some(t) = self.tx_iq_thread.take() {
             let _ = t.join();
         }
@@ -2320,6 +2326,7 @@ fn start_protocol1(
         mirisdr_mac: None,
         pluto_addr: None,
         pluto_scan: None,
+        pluto_tx_stop: None,
         dongle_rate: None,
     })
 }
@@ -2679,6 +2686,7 @@ fn start_protocol1_ozy_usb(
         mirisdr_mac: None,
         pluto_addr: None,
         pluto_scan: None,
+        pluto_tx_stop: None,
         dongle_rate: None,
     })
 }
@@ -2951,6 +2959,7 @@ fn start_rx888_usb(
         mirisdr_mac: None,
         pluto_addr: None,
         pluto_scan: None,
+        pluto_tx_stop: None,
         dongle_rate: None,
     })
 }
@@ -3083,6 +3092,24 @@ fn start_usb_dongle(
         None => spawn_mirisdr_threads(device.mac, &iq_buffers[0], &frequency_hz, &rx_attenuation, &stop_flag, &dongle_rate)?,
     };
 
+    // Pluto: the transmit thread (see pluto_tx_loop), idle until MOX. Its
+    // own stop flag, as `stop_flag` is replaced if the receiver is ever
+    // reopened (see restart_dongle_at_rate).
+    let pluto_tx_stop = is_pluto.then(|| Arc::new(AtomicBool::new(false)));
+    let pluto_tx = pluto_tx_stop.as_ref().map(|stop| {
+        let (addr, mox, tx_iq, freq, power, rate, scan, stop) = (
+            device.address,
+            Arc::clone(&mox),
+            Arc::clone(&tx_iq),
+            Arc::clone(&tx_frequency_hz),
+            Arc::clone(&tx_power_watts),
+            Arc::clone(&dongle_rate),
+            Arc::clone(pluto_scan.as_ref().unwrap()),
+            Arc::clone(stop),
+        );
+        thread::spawn(move || pluto_tx_loop(addr, mox, tx_iq, freq, power, rate, scan, stop))
+    });
+
     let mute_local_audio_for_tci = Arc::new(AtomicBool::new(false));
 
     Ok(RadioSession {
@@ -3154,7 +3181,8 @@ fn start_usb_dongle(
         stop_flag,
         sender_thread: None,
         receiver_thread: Some(receiver_thread),
-        tx_iq_thread: None,
+        tx_iq_thread: pluto_tx,
+        pluto_tx_stop,
         rx_audio_thread: None,
         diversity_combiner_thread: None,
         diversity_combiner_stop: None,
@@ -3710,6 +3738,157 @@ fn pluto_control_loop(
             last_gain = gain;
         }
         thread::sleep(RTLSDR_CONTROL_POLL);
+    }
+}
+
+/// Pluto TX: I/Q pairs to have queued (at pluto::TX_INPUT_RATE_HZ)
+/// before the first buffer is sent, ~21 ms -- the same cushion as
+/// TX_PREBUFFER_PAIRS gives Protocol 2 at its 192 kHz.
+const PLUTO_TX_PREBUFFER_PAIRS: usize = 1024;
+
+/// Pluto transmit thread, with its own iiod connections. While MOX is
+/// on (and the Pluto is at its normal rate -- see below) it powers the
+/// TX LO up, sets frequency and drive, and streams tx_iq through
+/// pluto::TxInterpolator; at key-up it closes the stream and powers the
+/// LO back down, so nothing leaks out between transmissions. The
+/// receiver keeps running throughout: the AD936x is full duplex, with
+/// its own TX LO (QO-100's 2400 MHz uplink while the RX hears the LNB's
+/// IF, for one).
+///
+/// Only at pluto::SAMPLE_RATE_HZ: the TX sample rate is tied to the
+/// receiver's, and at the wide stream's rate RX and TX together need
+/// ~36 MB/s, more than the USB link carries (~26 MB/s measured); the
+/// transponder view's rate is beyond it on its own. main.rs disables
+/// TX in both cases; this is the backstop.
+///
+/// I/Q: tx.rs's pairs are in the HPSDR convention, the analytic signal
+/// being pair[1] + j*pair[0] (the same as received IqSamples -- see
+/// IqSample) -- so the Pluto, which takes standard I + jQ, gets
+/// I = pair[1], Q = pair[0].
+#[allow(clippy::too_many_arguments)]
+fn pluto_tx_loop(
+    addr: std::net::SocketAddr,
+    mox: Arc<AtomicBool>,
+    tx_iq: Arc<Mutex<VecDeque<f32>>>,
+    tx_frequency_hz: Arc<AtomicU32>,
+    tx_power_watts: Arc<AtomicU32>,
+    rate: Arc<DongleRate>,
+    scan: Arc<transponder::Scan>,
+    stop: Arc<AtomicBool>,
+) {
+    let normal_rate = rate.input_rate_hz == pluto::SAMPLE_RATE_HZ;
+    let mut control: Option<pluto::PlutoDevice> = None;
+    let mut stream: Option<pluto::TxStream> = None;
+    let mut interp = pluto::TxInterpolator::new();
+    let mut buf = vec![0u8; pluto::TX_BUFFER_SAMPLES * 4];
+    let pairs_per_buffer = pluto::TX_BUFFER_SAMPLES / pluto::TX_INTERPOLATION;
+    let (mut last_freq, mut last_drive) = (0u32, u32::MAX);
+    let mut warmed_up = false;
+    let mut warned = false;
+    while !stop.load(Ordering::Relaxed) {
+        let keyed = mox.load(Ordering::Relaxed)
+            && normal_rate
+            && scan.request_if_hz.load(Ordering::Relaxed) == 0
+            && scan.active_if_hz.load(Ordering::Relaxed) == 0;
+        if !keyed {
+            if stream.take().is_some() {
+                if let Some(c) = control.as_mut() {
+                    if let Err(e) = c.set_tx_powerdown(true) {
+                        eprintln!("Pluto TX: powering the TX LO down failed: {e}");
+                    }
+                }
+            }
+            if mox.load(Ordering::Relaxed) && !normal_rate && !warned {
+                eprintln!("Pluto TX: not transmitting -- the wide stream is on (turn it off to transmit)");
+                warned = true;
+            }
+            warmed_up = false;
+            thread::sleep(Duration::from_millis(5));
+            continue;
+        }
+        warned = false;
+
+        if stream.is_none() {
+            let started = (|| -> io::Result<pluto::TxStream> {
+                if control.is_none() {
+                    control = Some(pluto::PlutoDevice::connect(addr)?);
+                }
+                let c = control.as_mut().unwrap();
+                last_freq = tx_frequency_hz.load(Ordering::Relaxed);
+                last_drive = tx_power_watts.load(Ordering::Relaxed);
+                c.set_tx_freq(last_freq)?;
+                c.set_tx_drive_db(pluto::tx_drive_db(last_drive))?;
+                c.set_tx_powerdown(false)?;
+                pluto::TxStream::open(addr)
+            })();
+            match started {
+                Ok(s) => {
+                    stream = Some(s);
+                    interp = pluto::TxInterpolator::new();
+                }
+                Err(e) => {
+                    eprintln!("Pluto TX: couldn't start transmitting: {e}");
+                    // It may have got as far as powering the LO up.
+                    if let Some(c) = control.as_mut() {
+                        let _ = c.set_tx_powerdown(true);
+                    }
+                    control = None;
+                    // Don't spin on a Pluto that's gone; MOX stays on, so
+                    // this retries.
+                    thread::sleep(Duration::from_millis(500));
+                    continue;
+                }
+            }
+        }
+        let c = control.as_mut().unwrap();
+        let freq = tx_frequency_hz.load(Ordering::Relaxed);
+        if freq != last_freq {
+            if let Err(e) = c.set_tx_freq(freq) {
+                eprintln!("Pluto TX: tune to {freq} Hz failed: {e}");
+            }
+            last_freq = freq;
+        }
+        let drive = tx_power_watts.load(Ordering::Relaxed);
+        if drive != last_drive {
+            if let Err(e) = c.set_tx_drive_db(pluto::tx_drive_db(drive)) {
+                eprintln!("Pluto TX: drive change failed: {e}");
+            }
+            last_drive = drive;
+        }
+
+        {
+            let mut q = tx_iq.lock().unwrap();
+            if !warmed_up && q.len() >= PLUTO_TX_PREBUFFER_PAIRS * 2 {
+                warmed_up = true;
+            }
+            let mut out = buf.chunks_exact_mut(4);
+            for _ in 0..pairs_per_buffer {
+                let (p0, p1) = if warmed_up {
+                    (q.pop_front().unwrap_or(0.0), q.pop_front().unwrap_or(0.0))
+                } else {
+                    (0.0, 0.0)
+                };
+                interp.push(p1, p0, |i, q| {
+                    let o = out.next().unwrap();
+                    o[..2].copy_from_slice(&((i.clamp(-1.0, 1.0) * 32767.0) as i16).to_le_bytes());
+                    o[2..].copy_from_slice(&((q.clamp(-1.0, 1.0) * 32767.0) as i16).to_le_bytes());
+                });
+            }
+        }
+        // Blocks until the Pluto has room: this is the loop's pacing.
+        if let Err(e) = stream.as_mut().unwrap().write(&buf) {
+            eprintln!("Pluto TX: stream write failed: {e}");
+            stream = None;
+            if let Some(c) = control.as_mut() {
+                let _ = c.set_tx_powerdown(true);
+            }
+            control = None;
+            thread::sleep(Duration::from_millis(500));
+        }
+    }
+    drop(stream);
+    if let Some(c) = control.as_mut() {
+        let _ = c.set_tx_powerdown(true);
     }
 }
 
@@ -7269,6 +7448,7 @@ fn start_protocol2(
         mirisdr_mac: None,
         pluto_addr: None,
         pluto_scan: None,
+        pluto_tx_stop: None,
         dongle_rate: None,
     })
 }
@@ -8877,6 +9057,100 @@ mod tests {
         assert!(before > 4_000 && after > 4_000, "{before} {after}");
         assert!(during == 0, "{during}");
         assert_eq!(spectrum.db.len(), transponder::FFT_SIZE);
+    }
+
+    /// The Pluto's TX chain end to end, without RF: tx.rs-convention I/Q
+    /// for an upper-sideband tone (+10 kHz) goes through pluto_tx_loop,
+    /// the AD9363's digital loopback hands it to the receiver, and it
+    /// must arrive at +10 kHz (not mirrored to -10 kHz) at the expected
+    /// level. Drive at its minimum, and the TX LO is powered down again
+    /// as soon as the stream is running -- the loopback is digital, so
+    /// it doesn't need it. Needs a Pluto at DEFAULT_IP with hpsdr-rs
+    /// disconnected.
+    #[test]
+    #[ignore]
+    fn pluto_tx_loopback_is_upper_sideband() {
+        struct Restore(pluto::PlutoDevice);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                let _ = self.0.set_tx_powerdown(true);
+                let _ = self.0.set_loopback(false);
+            }
+        }
+        let info = pluto::probe(pluto::DEFAULT_IP).expect("no Pluto at 192.168.2.1");
+        let device = crate::discovery::pluto_device(&info);
+        let settings = RadioSettings { frequency_hz: 432_000_000, sample_rate: 192_000, ..Default::default() };
+        let mut session = RadioSession::start(&device, settings).unwrap();
+        session.tx_power_watts.store(0, Ordering::Relaxed); // MIN_TX_DRIVE_DB
+        session.tx_frequency_hz.store(2_400_100_000, Ordering::Relaxed);
+        let mut guard = Restore(pluto::PlutoDevice::connect(device.address).unwrap());
+        guard.0.set_loopback(true).unwrap();
+        let wide = session.wideband_tap().unwrap().attach();
+
+        // +10 kHz, amplitude 0.5: analytic pair[1] + j*pair[0] = 0.5 e^{jwt}.
+        let tone = 10_000.0;
+        let feeding = Arc::new(AtomicBool::new(true));
+        let feeder = {
+            let (tx_iq, feeding) = (Arc::clone(&session.tx_iq), Arc::clone(&feeding));
+            thread::spawn(move || {
+                let mut n = 0u64;
+                while feeding.load(Ordering::Relaxed) {
+                    let mut q = tx_iq.lock().unwrap();
+                    while q.len() < 8192 {
+                        let ph = 2.0 * std::f64::consts::PI * tone * n as f64 / pluto::TX_INPUT_RATE_HZ as f64;
+                        q.push_back((0.5 * ph.sin()) as f32);
+                        q.push_back((0.5 * ph.cos()) as f32);
+                        n += 1;
+                    }
+                    drop(q);
+                    thread::sleep(Duration::from_millis(10));
+                }
+            })
+        };
+        session.mox.store(true, Ordering::Relaxed);
+        thread::sleep(Duration::from_millis(250));
+        guard.0.set_tx_powerdown(true).unwrap();
+        thread::sleep(Duration::from_millis(500));
+
+        // Half a second of the raw receive stream (standard I/Q).
+        while wide.try_recv().is_ok() {}
+        let mut samples = Vec::new();
+        while samples.len() < pluto::SAMPLE_RATE_HZ as usize / 2 {
+            samples.extend(wide.recv_timeout(Duration::from_secs(2)).unwrap().samples);
+        }
+        session.mox.store(false, Ordering::Relaxed);
+        feeding.store(false, Ordering::Relaxed);
+        feeder.join().unwrap();
+        thread::sleep(Duration::from_millis(100));
+        drop(guard);
+        session.stop();
+
+        let fs = pluto::SAMPLE_RATE_HZ as f64;
+        let level = |f: f64| {
+            let (mut re, mut im) = (0.0, 0.0);
+            for (n, s) in samples.iter().enumerate() {
+                let (i, q) = (s[0] as f64 / 32768.0, s[1] as f64 / 32768.0);
+                let ph = -2.0 * std::f64::consts::PI * f * n as f64 / fs;
+                re += i * ph.cos() - q * ph.sin();
+                im += i * ph.sin() + q * ph.cos();
+            }
+            (re * re + im * im).sqrt() / samples.len() as f64
+        };
+        // Exact zeros: the DAC had nothing to send. FIRST RUN (before the
+        // TX side's FPGA interpolation was set): 75% zeros, and the tone
+        // at 80 kHz -- the DAC running 8x too fast.
+        let zeros = samples.iter().filter(|s| s[0] == 0 && s[1] == 0).count();
+        let (upper, lower) = (level(tone), level(-tone));
+        println!(
+            "+10 kHz: {:.1} dBFS, -10 kHz {:.1} dB below it; {zeros} zero samples",
+            20.0 * upper.log10(),
+            20.0 * (upper / lower.max(1e-12)).log10()
+        );
+        // Measured: -18.1 dBFS for the 0.5 amplitude sent (the loopback
+        // path's own scaling), and no image at all.
+        assert!(upper > 0.05, "no tone came back: {upper}");
+        assert!(upper > 30.0 * lower, "wrong sideband or image: +{upper} -{lower}");
+        assert!(zeros < samples.len() / 1000, "the DAC ran dry: {zeros} zero samples");
     }
 
     #[test]

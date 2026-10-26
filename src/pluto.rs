@@ -105,6 +105,24 @@ pub const SAMPLE_FULL_SCALE: f64 = 2048.0;
 pub const MAX_GAIN_DB: u32 = 71;
 pub const DEFAULT_GAIN_DB: u32 = 40;
 
+/// The TX Drive control's range, dB below the Pluto's full output. The
+/// AD9363 goes down to -89.75 dB, but nothing useful happens that far
+/// down; -60 dB is already well under a microwatt.
+pub const MIN_TX_DRIVE_DB: f32 = -60.0;
+
+/// The TX Drive control reuses RadioSession::tx_power_watts as its
+/// store: drive dB + this, so 0..=TX_DRIVE_STEPS covers MIN_TX_DRIVE_DB
+/// to 0 dB in whole dB.
+pub const TX_DRIVE_STEPS: u32 = 60;
+
+pub fn tx_drive_db(tx_power_watts: u32) -> f32 {
+    tx_power_watts.min(TX_DRIVE_STEPS) as f32 + MIN_TX_DRIVE_DB
+}
+
+/// TX samples per WRITEBUF: ~5 ms at SAMPLE_RATE_HZ, which bounds how
+/// late a key-up reaches the air. Also the kernel buffer size.
+pub const TX_BUFFER_SAMPLES: usize = 8 * 1024;
+
 /// The stock AD9363's tuning range, used until the real one is read
 /// from the radio (a Pluto switched to AD9364 mode reports 70MHz-6GHz).
 const DEFAULT_FREQUENCY_MIN_HZ: u64 = 325_000_000;
@@ -135,6 +153,7 @@ pub const MAC_TAG: u8 = 4;
 
 const PHY: &str = "ad9361-phy";
 const RX_ADC: &str = "cf-ad9361-lpc";
+const TX_DAC: &str = "cf-ad9361-dds-core-lpc";
 
 const CONNECT_TIMEOUT: Duration = Duration::from_millis(400);
 const IO_TIMEOUT: Duration = Duration::from_secs(2);
@@ -276,6 +295,12 @@ pub struct PlutoDevice {
 }
 
 impl PlutoDevice {
+    /// A control connection of its own -- the transmit thread's, so it
+    /// never waits behind the receiver's control thread.
+    pub fn connect(addr: SocketAddr) -> io::Result<Self> {
+        Ok(Self { iiod: Iiod::connect(addr)? })
+    }
+
     pub fn set_center_freq(&mut self, hz: u32) -> io::Result<()> {
         self.iiod.write_attr(&format!("{PHY} OUTPUT altvoltage0"), "frequency", &hz.to_string())
     }
@@ -294,6 +319,30 @@ impl PlutoDevice {
         }
     }
 
+    pub fn set_tx_freq(&mut self, hz: u32) -> io::Result<()> {
+        self.iiod.write_attr(&format!("{PHY} OUTPUT altvoltage1"), "frequency", &hz.to_string())
+    }
+
+    /// The transmitter's LO: off whenever not transmitting, so nothing
+    /// leaks out of the TX port.
+    pub fn set_tx_powerdown(&mut self, down: bool) -> io::Result<()> {
+        self.iiod.write_attr(&format!("{PHY} OUTPUT altvoltage1"), "powerdown", if down { "1" } else { "0" })
+    }
+
+    /// TX attenuation as a gain, MIN_TX_DRIVE_DB..=0 dB (0 is the Pluto's
+    /// full output); the AD9363 steps in 0.25 dB.
+    pub fn set_tx_drive_db(&mut self, db: f32) -> io::Result<()> {
+        let db = ((db.clamp(MIN_TX_DRIVE_DB, 0.0) * 4.0).round() / 4.0).to_string();
+        self.iiod.write_attr(&format!("{PHY} OUTPUT voltage0"), "hardwaregain", &db)
+    }
+
+    /// The AD936x's digital loopback (TX samples straight back into the
+    /// receiver, inside the chip): for testing the TX chain without RF.
+    #[cfg(test)]
+    pub fn set_loopback(&mut self, on: bool) -> io::Result<()> {
+        self.iiod.write_attr(&format!("{PHY} DEBUG"), "loopback", if on { "1" } else { "0" })
+    }
+
     /// SCAN_SAMPLE_RATE_HZ, for the transponder view.
     pub fn set_scan_rate(&mut self) -> io::Result<()> {
         self.set_rates(SCAN_SAMPLE_RATE_HZ, SCAN_SAMPLE_RATE_HZ, SCAN_RF_BANDWIDTH_HZ)
@@ -308,6 +357,11 @@ impl PlutoDevice {
         // Only valid once the phy rate above is set: the FPGA offers that
         // rate and rate/8.
         self.iiod.write_attr(&format!("{RX_ADC} INPUT voltage0"), "sampling_frequency", &rate.to_string())?;
+        // The same for the transmit side's FPGA interpolation. REAL
+        // TEST (digital loopback, 2026-10-26): without it the DAC ran at
+        // the phy rate, 8x too fast -- a 10 kHz tone came back at 80 kHz,
+        // with the DAC idle three quarters of the time.
+        self.iiod.write_attr(&format!("{TX_DAC} OUTPUT voltage0"), "sampling_frequency", &rate.to_string())?;
         self.iiod.write_attr(&rx, "rf_bandwidth", &rf_bandwidth.to_string())
     }
 }
@@ -396,6 +450,138 @@ impl Drop for RxStream {
     }
 }
 
+/// The transmit stream, on its own connection, open only while
+/// transmitting. Writes are paced by the DAC: each WRITEBUF returns once
+/// the Pluto has room, so the writer runs at exactly the TX sample rate.
+pub struct TxStream {
+    iiod: Iiod,
+    open: bool,
+}
+
+impl TxStream {
+    pub fn open(addr: SocketAddr) -> io::Result<Self> {
+        let mut iiod = Iiod::connect(addr)?;
+        // Channel mask 3: voltage0 (I) and voltage1 (Q). Not cyclic.
+        iiod.command(&format!("OPEN {TX_DAC} {TX_BUFFER_SAMPLES} 00000003"))?;
+        Ok(Self { iiod, open: true })
+    }
+
+    /// Sends one buffer: `buf` is TX_BUFFER_SAMPLES interleaved I/Q
+    /// pairs, little-endian, full scale +-32767 (the DAC's 12 bits sit
+    /// at the top). The exchange, confirmed on a real Pluto (iiod 0.26):
+    /// the command line gets a 0 back, then the data gets its length.
+    pub fn write(&mut self, buf: &[u8]) -> io::Result<()> {
+        self.iiod.command(&format!("WRITEBUF {TX_DAC} {}", buf.len()))?;
+        self.iiod.writer.write_all(buf)?;
+        let n = self.iiod.read_int()?;
+        if n != buf.len() as i64 {
+            return Err(io::Error::other(format!("iiod: WRITEBUF took {n} of {} bytes", buf.len())));
+        }
+        Ok(())
+    }
+
+    pub fn close(&mut self) {
+        if self.open {
+            self.open = false;
+            let _ = self.iiod.command(&format!("CLOSE {TX_DAC}"));
+        }
+    }
+}
+
+impl Drop for TxStream {
+    fn drop(&mut self) {
+        self.close();
+    }
+}
+
+/// TX I/Q from the app's 48 kHz to the Pluto's SAMPLE_RATE_HZ: a
+/// polyphase FIR interpolating by TX_INTERPOLATION.
+pub const TX_INPUT_RATE_HZ: u32 = 48_000;
+pub const TX_INTERPOLATION: usize = (SAMPLE_RATE_HZ / TX_INPUT_RATE_HZ) as usize;
+/// Taps per polyphase branch: TX_INTERPOLATION * this in all. With a
+/// Kaiser window (beta 8) that passes +-20 kHz and is down >80 dB from
+/// 28 kHz -- where the first image of anything in +-20 kHz lands.
+const TX_TAPS_PER_PHASE: usize = 31;
+
+pub struct TxInterpolator {
+    /// branches[p][k]: weight of the k-th newest input for output phase p.
+    branches: Vec<[f32; TX_TAPS_PER_PHASE]>,
+    /// The newest TX_TAPS_PER_PHASE inputs, each stored twice (at `pos`
+    /// and `pos + TX_TAPS_PER_PHASE`) so they're always contiguous.
+    history_i: [f32; 2 * TX_TAPS_PER_PHASE],
+    history_q: [f32; 2 * TX_TAPS_PER_PHASE],
+    pos: usize,
+}
+
+impl Default for TxInterpolator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl TxInterpolator {
+    pub fn new() -> Self {
+        let l = TX_INTERPOLATION;
+        let n = l * TX_TAPS_PER_PHASE;
+        let centre = (n - 1) as f64 / 2.0;
+        // Cutoff midway between the passband (20 kHz) and the first
+        // image (28 kHz), as a fraction of the output rate.
+        let fc = 24_000.0 / SAMPLE_RATE_HZ as f64;
+        let beta = 8.0;
+        let bessel_i0 = |x: f64| {
+            let (mut sum, mut term, mut k) = (1.0, 1.0, 1.0);
+            while term > 1e-12 * sum {
+                term *= (x / (2.0 * k)).powi(2);
+                sum += term;
+                k += 1.0;
+            }
+            sum
+        };
+        let h: Vec<f64> = (0..n)
+            .map(|i| {
+                let t = i as f64 - centre;
+                let sinc = if t == 0.0 { 2.0 * fc } else { (2.0 * std::f64::consts::PI * fc * t).sin() / (std::f64::consts::PI * t) };
+                let r = t / centre;
+                let window = bessel_i0(beta * (1.0 - r * r).max(0.0).sqrt()) / bessel_i0(beta);
+                // x L: interpolation spreads each input's energy over L
+                // outputs.
+                sinc * window * l as f64
+            })
+            .collect();
+        let branches = (0..l)
+            .map(|p| {
+                let mut b = [0f32; TX_TAPS_PER_PHASE];
+                for (k, w) in b.iter_mut().enumerate() {
+                    *w = h[p + k * l] as f32;
+                }
+                b
+            })
+            .collect();
+        Self { branches, history_i: [0.0; 2 * TX_TAPS_PER_PHASE], history_q: [0.0; 2 * TX_TAPS_PER_PHASE], pos: 0 }
+    }
+
+    /// One input sample in, TX_INTERPOLATION outputs out via `emit`.
+    pub fn push(&mut self, i: f32, q: f32, mut emit: impl FnMut(f32, f32)) {
+        // Newest first from `pos`: write the new sample just before the
+        // previous newest.
+        self.pos = (self.pos + TX_TAPS_PER_PHASE - 1) % TX_TAPS_PER_PHASE;
+        self.history_i[self.pos] = i;
+        self.history_i[self.pos + TX_TAPS_PER_PHASE] = i;
+        self.history_q[self.pos] = q;
+        self.history_q[self.pos + TX_TAPS_PER_PHASE] = q;
+        let hi = &self.history_i[self.pos..self.pos + TX_TAPS_PER_PHASE];
+        let hq = &self.history_q[self.pos..self.pos + TX_TAPS_PER_PHASE];
+        for b in &self.branches {
+            let (mut si, mut sq) = (0f32, 0f32);
+            for k in 0..TX_TAPS_PER_PHASE {
+                si += b[k] * hi[k];
+                sq += b[k] * hq[k];
+            }
+            emit(si, sq);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -409,6 +595,40 @@ mod tests {
         assert_eq!(context_attribute(xml, "hw_model").as_deref(), Some("Analog Devices PlutoSDR Rev.B (Z7010-AD9363A)"));
         assert_eq!(context_attribute(xml, "hw_serial").as_deref(), Some("03df643eb44b274e38d76c36bc533f5620"));
         assert_eq!(context_attribute(xml, "fw_version"), None);
+    }
+
+    /// A 10 kHz tone through the TX interpolator: it comes out at the
+    /// same amplitude, and every image (48 kHz +- 10 kHz and up) is more
+    /// than 70 dB down.
+    #[test]
+    fn tx_interpolator_passes_the_tone_and_rejects_images() {
+        let mut interp = TxInterpolator::new();
+        let (fs_in, tone) = (TX_INPUT_RATE_HZ as f64, 10_000.0);
+        let mut out = Vec::new();
+        for n in 0..4096 {
+            let ph = 2.0 * std::f64::consts::PI * tone * n as f64 / fs_in;
+            interp.push(ph.cos() as f32, ph.sin() as f32, |i, q| out.push((i as f64, q as f64)));
+        }
+        // Past the filter's start-up, a whole number of tone cycles.
+        let fs = SAMPLE_RATE_HZ as f64;
+        let len = 65_536;
+        let x = &out[out.len() - len..];
+        let level = |f: f64| {
+            let (mut re, mut im) = (0.0, 0.0);
+            for (n, &(i, q)) in x.iter().enumerate() {
+                let w = 0.5 - 0.5 * (2.0 * std::f64::consts::PI * n as f64 / len as f64).cos();
+                let ph = -2.0 * std::f64::consts::PI * f * n as f64 / fs;
+                re += w * (i * ph.cos() - q * ph.sin());
+                im += w * (i * ph.sin() + q * ph.cos());
+            }
+            (re * re + im * im).sqrt() / (len as f64 * 0.5)
+        };
+        let wanted = level(tone);
+        assert!((wanted - 1.0).abs() < 0.02, "tone amplitude {wanted}");
+        for image in [-38_000.0, 58_000.0, 106_000.0, -86_000.0, 490_000.0] {
+            let db = 20.0 * (level(image) / wanted).log10();
+            assert!(db < -70.0, "image at {image} Hz: {db:.1} dB");
+        }
     }
 
     /// Needs a Pluto at DEFAULT_IP, and one test at a time (the Pluto

@@ -79,7 +79,7 @@ struct Band {
     default_mode: spectrum::Mode,
 }
 
-const BANDS: [Band; 14] = [
+const BANDS: [Band; 15] = [
     Band { name: "160m", low_hz: 1_800_000, high_hz: 2_000_000, default_hz: 1_900_000, default_mode: spectrum::Mode::Lsb },
     Band { name: "80m", low_hz: 3_500_000, high_hz: 4_000_000, default_hz: 3_573_000, default_mode: spectrum::Mode::Lsb },
     Band { name: "60m", low_hz: 5_330_000, high_hz: 5_406_000, default_hz: 5_357_000, default_mode: spectrum::Mode::Usb }, // USB by regulatory convention despite being below 10MHz
@@ -91,7 +91,7 @@ const BANDS: [Band; 14] = [
     Band { name: "12m", low_hz: 24_890_000, high_hz: 24_990_000, default_hz: 24_915_000, default_mode: spectrum::Mode::Usb },
     Band { name: "10m", low_hz: 28_000_000, high_hz: 29_700_000, default_hz: 28_074_000, default_mode: spectrum::Mode::Usb },
     Band { name: "6m", low_hz: 50_000_000, high_hz: 54_000_000, default_hz: 50_313_000, default_mode: spectrum::Mode::Usb },
-    // VHF/UHF -- only reachable by the USB dongles (RTL-SDR, MSi2500) so far (every band
+    // VHF/UHF -- only reachable by the USB dongles (RTL-SDR, MSi2500) and the Pluto so far (every band
     // consumer filters by the device's own frequency_min/max, so no
     // HPSDR board shows these). Ranges are the widest ITU-region
     // allocation; defaults are the FT8 frequencies, matching HF's.
@@ -100,6 +100,11 @@ const BANDS: [Band; 14] = [
     Band { name: "2m", low_hz: 144_000_000, high_hz: 148_000_000, default_hz: 144_174_000, default_mode: spectrum::Mode::Usb },
     Band { name: "70cm", low_hz: 420_000_000, high_hz: 450_000_000, default_hz: 432_174_000, default_mode: spectrum::Mode::Usb },
     Band { name: "23cm", low_hz: 1_240_000_000, high_hz: 1_300_000_000, default_hz: 1_296_174_000, default_mode: spectrum::Mode::Usb },
+    // The Pluto's: it covers this, and it's where QO-100's uplink is
+    // (2400.0-2400.5 MHz), so it's what lets the Pluto transmit there
+    // without "Allow out-of-band TX" (see tx_frequency_allowed). The
+    // IARU narrowband calling frequency as the default.
+    Band { name: "13cm", low_hz: 2_300_000_000, high_hz: 2_450_000_000, default_hz: 2_320_200_000, default_mode: spectrum::Mode::Usb },
 ];
 
 fn band_for_frequency(freq_hz: u32) -> Option<&'static Band> {
@@ -1149,7 +1154,7 @@ fn dispatch_midi_event(connected: &mut ConnectedState, ev: RawMidiEvent, freq_hz
                 if tune_may_start {
                     let current_watts = connected.session.tx_power_watts.load(Ordering::Relaxed);
                     connected.pre_tune_power_watts = Some(current_watts);
-                    let tune_watts = current_watts * connected.tune_power_percent / 100;
+                    let tune_watts = tune_power_level(connected, current_watts);
                     connected.session.tx_power_watts.store(tune_watts, Ordering::Relaxed);
                     if let Some(tx) = &connected.tx_handle {
                         tx.set_tune(true);
@@ -3069,8 +3074,12 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
             // (harmless -- there's no sender thread for this board to
             // act on any of it, see start_rx888_usb's doc comment -- but
             // confusing UI for hardware that can never transmit).
-            let tx_enabled =
-                tx_enabled && !matches!(device.board, Boards::Rx888 | Boards::RtlSdr | Boards::MsiSdr | Boards::Pluto);
+            let tx_enabled = tx_enabled
+                && !matches!(device.board, Boards::Rx888 | Boards::RtlSdr | Boards::MsiSdr)
+                && !pluto_tx_blocked_by_wide(
+                    device.board,
+                    session.dongle_input_rate_hz() == Some(pluto::WIDE_SAMPLE_RATE_HZ),
+                );
 
             println!(
                 "Started {:?} at {} (protocol {}, {} ADC(s), reports supporting {} receiver(s))",
@@ -3279,9 +3288,13 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                     }
                     antenna_settings
                 },
-                max_tx_power_watts: cfg
-                    .max_tx_power_watts
-                    .unwrap_or_else(|| default_max_tx_power_watts(device.board)),
+                // A Pluto's is the TX Drive range, not a setting (and an
+                // older config saved the receive-only 0).
+                max_tx_power_watts: if device.board == Boards::Pluto {
+                    pluto::TX_DRIVE_STEPS
+                } else {
+                    cfg.max_tx_power_watts.unwrap_or_else(|| default_max_tx_power_watts(device.board))
+                },
                 tune_power_percent: cfg.tune_power_percent.unwrap_or(20),
                 max_swr: cfg.max_swr.unwrap_or(3.0),
                 ozy_firmware_path: cfg.ozy_firmware_path.clone(),
@@ -5126,7 +5139,18 @@ impl eframe::App for HpsdrApp {
                             // slider already could.
                             ui.add_space(12.0);
                             ui.horizontal(|ui| {
-                                ui.label("TX Power:");
+                                // A Pluto has no watts to set: tx_power_watts
+                                // holds its TX Drive, dB + TX_DRIVE_STEPS --
+                                // see pluto::tx_drive_db.
+                                let pluto = connected.device.board == Boards::Pluto;
+                                if pluto {
+                                    ui.label("TX Drive:").on_hover_text(
+                                        "The Pluto's output level: 0 dB is its full output (a few \
+                                         milliwatts). Set it to what your amplifier needs.",
+                                    );
+                                } else {
+                                    ui.label("TX Power:");
+                                }
                                 // Adjustable during Tune too, not just
                                 // normal TX -- Tune Power only sets the
                                 // starting reduced level when TUNE is
@@ -5136,14 +5160,30 @@ impl eframe::App for HpsdrApp {
                                 // operation while tuning.
                                 let mut watts =
                                     connected.session.tx_power_watts.load(Ordering::Relaxed) as i32;
-                                if scroll_slider_i32(
-                                    ui,
-                                    &mut connected.slider_scroll_accum,
-                                    &mut watts,
-                                    0..=connected.max_tx_power_watts as i32,
-                                    1,
-                                    "W",
-                                ) {
+                                let changed = if pluto {
+                                    let offset = pluto::TX_DRIVE_STEPS as i32;
+                                    let mut db = watts.min(offset) - offset;
+                                    let changed = scroll_slider_i32(
+                                        ui,
+                                        &mut connected.slider_scroll_accum,
+                                        &mut db,
+                                        -offset..=0,
+                                        1,
+                                        " dB",
+                                    );
+                                    watts = db + offset;
+                                    changed
+                                } else {
+                                    scroll_slider_i32(
+                                        ui,
+                                        &mut connected.slider_scroll_accum,
+                                        &mut watts,
+                                        0..=connected.max_tx_power_watts as i32,
+                                        1,
+                                        "W",
+                                    )
+                                };
+                                if changed {
                                     connected.session.tx_power_watts.store(watts as u32, Ordering::Relaxed);
                                     settings_changed = true;
                                     // A manual adjustment while Tune is active is
@@ -5501,7 +5541,7 @@ impl eframe::App for HpsdrApp {
                                     // (see below, no more add_enabled_ui
                                     // wrapper) rather than fighting a
                                     // per-frame override.
-                                    let tune_watts = current_watts * connected.tune_power_percent / 100;
+                                    let tune_watts = tune_power_level(connected, current_watts);
                                     connected.session.tx_power_watts.store(tune_watts, Ordering::Relaxed);
                                     if let Some(tx) = &connected.tx_handle {
                                         tx.set_tune(true);
@@ -5581,7 +5621,7 @@ impl eframe::App for HpsdrApp {
                                     let current_watts =
                                         connected.session.tx_power_watts.load(Ordering::Relaxed);
                                     connected.pre_tune_power_watts = Some(current_watts);
-                                    let tune_watts = current_watts * connected.tune_power_percent / 100;
+                                    let tune_watts = tune_power_level(connected, current_watts);
                                     connected.session.tx_power_watts.store(tune_watts, Ordering::Relaxed);
                                     if let Some(tx) = &connected.tx_handle {
                                         tx.set_two_tone(true);
@@ -6696,7 +6736,9 @@ impl eframe::App for HpsdrApp {
                         // the actual space math).
                         let (meter_rect, _resp) =
                             ui.allocate_exact_size(egui::vec2(180.0, 85.0), egui::Sense::hover());
-                        if connected.session.mox_active() {
+                        // A Pluto has no power detector: its meter stays an
+                        // S-meter (it keeps receiving while transmitting).
+                        if connected.session.mox_active() && connected.device.board != Boards::Pluto {
                             let raw_fwd = connected
                                 .session
                                 .tx_forward_power
@@ -7154,6 +7196,12 @@ impl eframe::App for HpsdrApp {
                                     if tab == SettingsTab::PureSignal
                                         && !radio::puresignal_supported(connected.device.protocol, connected.device.board)
                                     {
+                                        continue;
+                                    }
+                                    // A Pluto's drive is set directly in dB,
+                                    // and it has no power detector to
+                                    // calibrate against.
+                                    if tab == SettingsTab::PaCalibration && connected.device.board == Boards::Pluto {
                                         continue;
                                     }
                                     if ui
@@ -8941,6 +8989,9 @@ impl eframe::App for HpsdrApp {
                                     );
                                     ui.add_space(8.0);
 
+                                    // A Pluto's drive is in dB (main window's
+                                    // TX Drive), with no watts to cap.
+                                    if connected.device.board != Boards::Pluto {
                                     ui.horizontal(|ui| {
                                         ui.label(format!("Max TX Power ({:?}):", connected.device.board));
                                         let mut max_watts = connected.max_tx_power_watts as i32;
@@ -8963,6 +9014,7 @@ impl eframe::App for HpsdrApp {
                                         }
                                     });
                                     ui.add_space(8.0);
+                                    }
 
                                     ui.horizontal(|ui| {
                                         ui.label("Tune Power:");
@@ -9187,8 +9239,11 @@ impl eframe::App for HpsdrApp {
                                     // RX-888: receive-only hardware, no TX capability at
                                     // all -- don't let this checkbox re-enable the MOX/
                                     // TUNE/etc. row the connect-time override above hides.
-                                    if connected.device.board == Boards::Pluto {
-                                        ui.weak("Enable Transmit (not supported on the Pluto yet)");
+                                    if pluto_tx_blocked_by_wide(
+                                        connected.device.board,
+                                        connected.session.dongle_input_rate_hz() == Some(pluto::WIDE_SAMPLE_RATE_HZ),
+                                    ) {
+                                        ui.weak("Enable Transmit (not with the Pluto's Wide stream on -- turn it off in RX and reconnect)");
                                     } else if matches!(connected.device.board, Boards::Rx888 | Boards::RtlSdr | Boards::MsiSdr) {
                                         ui.weak("Enable Transmit (receive-only hardware)");
                                     } else {
@@ -12585,9 +12640,32 @@ fn default_max_tx_power_watts(board: Boards) -> u32 {
         // Receive-only hardware -- 0W makes the TX Power slider/control
         // meaningless rather than picking an arbitrary non-zero default
         // it can never actually reach. See radio.rs's start_rx888_usb.
-        Boards::Rx888 | Boards::RtlSdr | Boards::MsiSdr | Boards::Pluto => 0,
+        Boards::Rx888 | Boards::RtlSdr | Boards::MsiSdr => 0,
+        // Not watts: the TX Drive range -- see pluto::TX_DRIVE_STEPS.
+        Boards::Pluto => pluto::TX_DRIVE_STEPS,
         Boards::Unknown => 100,
     }
+}
+
+/// The reduced level Tune and Two Tone start at: Tune Power % of
+/// `current` (tx_power_watts). On a Pluto that's its TX Drive in dB (see
+/// pluto::tx_drive_db), so the percentage is taken as a power ratio and
+/// subtracted in dB -- 20% is 7 dB below the drive, not the bottom of
+/// the scale.
+fn tune_power_level(connected: &ConnectedState, current: u32) -> u32 {
+    let percent = connected.tune_power_percent;
+    if connected.device.board != Boards::Pluto {
+        return current * percent / 100;
+    }
+    let down_db = -10.0 * (percent.max(1) as f32 / 100.0).log10();
+    (current as f32 - down_db).round().clamp(0.0, pluto::TX_DRIVE_STEPS as f32) as u32
+}
+
+/// The Pluto can't transmit while its wide stream is on: its TX rate is
+/// tied to the receiver's, and RX and TX together at that rate need more
+/// than its USB link carries -- see radio.rs's pluto_tx_loop.
+fn pluto_tx_blocked_by_wide(board: Boards, wide: bool) -> bool {
+    board == Boards::Pluto && wide
 }
 
 /// Draws a classic analog S-meter: semicircular scale, S0..S9 on the
