@@ -3613,7 +3613,17 @@ fn pluto_receiver_loop(
     let mut decimation = rate.decimation.load(Ordering::Relaxed);
     let mut decimator = rtlsdr::Decimator::with_full_scale(rate.input_rate_hz, decimation, pluto::SAMPLE_FULL_SCALE);
     let mut buf = vec![0u8; stream.buffer_samples() * 4];
-    let mut push = |(iv, qv): (i32, i32)| push_sample(&iq_buffer, IqSample { i: iv, q: qv }, IQ_BUFFER_CAPACITY);
+    // Each buffer arrives whole, so its output is pushed in one burst --
+    // at 768 kHz, 16384 samples every 21 ms, more than IQ_BUFFER_CAPACITY
+    // holds: the oldest quarter of each burst was dropped before the
+    // demodulator could take it. REAL REPORT (QO-100 SSB on a Pluto at
+    // 768 kHz): audio "under water", where an MSI.SDR (whose reads are a
+    // few thousand samples) was clean. Room for two bursts at the current
+    // decimation; the demodulator drains it as it goes, so this only adds
+    // latency if it falls behind.
+    let buffer_samples = buf.len() / 4;
+    let capacity = |decimation: u32| IQ_BUFFER_CAPACITY.max(2 * buffer_samples / decimation.max(1) as usize);
+    let mut iq_capacity = capacity(decimation);
     // iiod never says when the Pluto's buffers overflowed, so compare
     // what arrived against the clock instead: a shortfall means samples
     // were lost, which breaks anything that needs a continuous stream
@@ -3670,6 +3680,7 @@ fn pluto_receiver_loop(
         if wanted != decimation {
             decimation = wanted;
             decimator = rtlsdr::Decimator::with_full_scale(rate.input_rate_hz, decimation, pluto::SAMPLE_FULL_SCALE);
+            iq_capacity = capacity(decimation);
         }
         let samples = buf.chunks_exact(4).map(|p| (i16::from_le_bytes([p[0], p[1]]), i16::from_le_bytes([p[2], p[3]])));
         if rate.tap.is_attached() {
@@ -3678,7 +3689,9 @@ fn pluto_receiver_loop(
             let center_hz = frequency_hz.load(Ordering::Relaxed) + rtlsdr::tuning_offset_hz(decimation);
             rate.tap.send(WidebandBlock { center_hz, samples: wide });
         }
-        decimator.process_samples(samples.map(|(i, q)| (i as f64, q as f64)), &mut push);
+        decimator.process_samples(samples.map(|(i, q)| (i as f64, q as f64)), &mut |(iv, qv)| {
+            push_sample(&iq_buffer, IqSample { i: iv, q: qv }, iq_capacity)
+        });
     }
     stream.close();
 }
@@ -9057,6 +9070,42 @@ mod tests {
         assert!(before > 4_000 && after > 4_000, "{before} {after}");
         assert!(during == 0, "{during}");
         assert_eq!(spectrum.db.len(), transponder::FFT_SIZE);
+    }
+
+    /// A Pluto at 768 kHz delivers every sample to a reader draining the
+    /// queue the way spectrum.rs does (BUFFER_SIZE blocks, 5 ms naps when
+    /// short). REAL REPORT: before its queue was sized for whole-buffer
+    /// bursts, about a quarter of each one was dropped ("under water"
+    /// audio). Needs a Pluto at DEFAULT_IP with hpsdr-rs disconnected.
+    #[test]
+    #[ignore]
+    fn pluto_receiver_delivers_every_sample() {
+        let info = pluto::probe(pluto::DEFAULT_IP).expect("no Pluto at 192.168.2.1");
+        let device = crate::discovery::pluto_device(&info);
+        let rate_hz = 768_000;
+        let settings = RadioSettings { frequency_hz: 741_500_000, sample_rate: rate_hz, ..Default::default() };
+        let mut session = RadioSession::start(&device, settings).unwrap();
+        let buffer = Arc::clone(&session.iq_buffers[0]);
+        let drain_for = |seconds: f64| {
+            let start = Instant::now();
+            let mut got = 0usize;
+            while start.elapsed().as_secs_f64() < seconds {
+                let mut b = buffer.lock().unwrap();
+                if b.len() >= crate::spectrum::BUFFER_SIZE {
+                    b.drain(..crate::spectrum::BUFFER_SIZE);
+                    got += crate::spectrum::BUFFER_SIZE;
+                } else {
+                    drop(b);
+                    thread::sleep(Duration::from_millis(5));
+                }
+            }
+            got as f64 / start.elapsed().as_secs_f64()
+        };
+        drain_for(1.0); // start-up
+        let delivered = drain_for(3.0);
+        session.stop();
+        println!("{delivered:.0} samples/s delivered at {rate_hz} Hz");
+        assert!(delivered > 0.99 * rate_hz as f64, "{delivered}");
     }
 
     /// The Pluto's TX chain end to end, without RF: tx.rs-convention I/Q
