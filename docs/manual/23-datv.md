@@ -12,6 +12,10 @@ demodulates and decodes the signal itself. The resulting MPEG transport
 stream (the video and sound) goes out over the network to a video
 player such as **VLC** or **ffplay**.
 
+![QO-100's wideband beacon received with a Pluto: the DATV window
+(locked, QPSK 4/5, 5.2 dB) and the beacon's video playing in
+VLC](images/23-datv-beacon-in-vlc.png)
+
 DATV works with an [RTL-SDR](21-rtl-sdr.md), an [MSI.SDR](22-msi-sdr.md)
 or a [Pluto](24-pluto.md), because it uses the radio's whole raw stream
 rather than the receiver's own span. Click **DATV**, next to CTUN in the
