@@ -611,16 +611,21 @@ fn discover_mirisdr_usb(devices: &Arc<Mutex<Vec<Device>>>) {
     }
 }
 
-/// Probes for a Pluto at its default address, and at the .1 of any
-/// local subnet where this machine is .10 -- the address the Pluto's
-/// own DHCP server hands out, so this also finds one whose config.txt
-/// moved it off 192.168.2.1.
+/// Probes for a Pluto at its default address, at the .1 of any local
+/// subnet where this machine is .10 -- the address the Pluto's own DHCP
+/// server hands out, so this also finds one whose config.txt moved it
+/// off 192.168.2.1 -- and at whatever answers an mDNS query for iiod
+/// (pluto::mdns_discover), which finds one on Ethernet wherever the
+/// network put it. A Pluto reachable both ways lists once per address,
+/// sharing its settings (they're keyed by its serial).
 fn discover_pluto(devices: &Arc<Mutex<Vec<Device>>>) {
     let mut candidates = vec![pluto::DEFAULT_IP];
+    let mut local = Vec::new();
     if let Ok(interfaces) = NetworkInterface::show() {
         for itf in interfaces {
             for addr in &itf.addr {
                 if let Addr::V4(v4) = addr {
+                    local.push(v4.ip);
                     let o = v4.ip.octets();
                     let ip = IpAddr::V4(std::net::Ipv4Addr::new(o[0], o[1], o[2], 1));
                     if o[3] == 10 && !candidates.contains(&ip) {
@@ -628,6 +633,11 @@ fn discover_pluto(devices: &Arc<Mutex<Vec<Device>>>) {
                     }
                 }
             }
+        }
+    }
+    for ip in pluto::mdns_discover(&local) {
+        if !candidates.contains(&ip) {
+            candidates.push(ip);
         }
     }
     for ip in candidates {

@@ -264,6 +264,72 @@ fn parse_range(s: &str) -> Option<(u64, u64)> {
     Some((min, max))
 }
 
+/// The Pluto the hardware tests use: `HPSDR_PLUTO_IP`, or DEFAULT_IP
+/// (the USB link).
+#[cfg(test)]
+pub fn test_ip() -> IpAddr {
+    std::env::var("HPSDR_PLUTO_IP").map_or(DEFAULT_IP, |v| v.parse().expect("HPSDR_PLUTO_IP"))
+}
+
+/// How long mdns_discover listens for answers.
+const MDNS_LISTEN: Duration = Duration::from_millis(500);
+
+/// Addresses of iiod servers that answer an mDNS query for `_iio._tcp`
+/// on any of this machine's IPv4 interfaces -- how a Pluto on Ethernet
+/// (a Pluto+, or a USB-Ethernet adapter on its OTG port) is found
+/// wherever the network's DHCP put it. Its firmware's avahi advertises
+/// the service; the Pluto on the USB link answers too. Sent from an
+/// ordinary port, which makes it a "legacy unicast" query (RFC 6762
+/// section 6.7): responders reply straight to that port, so no 5353
+/// listener is needed. Callers still probe() each address.
+pub fn mdns_discover(interfaces: &[Ipv4Addr]) -> Vec<IpAddr> {
+    use socket2::{Domain, Protocol, Socket, Type};
+    // Header (id 0, flags 0, one question), then _iio._tcp.local PTR IN.
+    let mut query = vec![0u8, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0];
+    for label in ["_iio", "_tcp", "local"] {
+        query.push(label.len() as u8);
+        query.extend_from_slice(label.as_bytes());
+    }
+    query.extend_from_slice(&[0, 0, 12, 0, 1]);
+    let target = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(224, 0, 0, 251)), 5353);
+
+    let sockets: Vec<std::net::UdpSocket> = interfaces
+        .iter()
+        .filter(|ip| !ip.is_loopback())
+        .filter_map(|&ip| {
+            let s = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP)).ok()?;
+            s.set_multicast_if_v4(&ip).ok()?;
+            s.set_multicast_ttl_v4(255).ok()?;
+            s.bind(&SocketAddr::new(IpAddr::V4(ip), 0).into()).ok()?;
+            s.set_nonblocking(true).ok()?;
+            let s: std::net::UdpSocket = s.into();
+            s.send_to(&query, target).ok()?;
+            Some(s)
+        })
+        .collect();
+
+    let mut found = Vec::new();
+    let deadline = std::time::Instant::now() + MDNS_LISTEN;
+    let mut buf = [0u8; 1500];
+    while std::time::Instant::now() < deadline {
+        let mut any = false;
+        for s in &sockets {
+            while let Ok((n, from)) = s.recv_from(&mut buf) {
+                any = true;
+                // A response (QR bit) that mentions the service.
+                let reply = &buf[..n];
+                if n > 12 && reply[2] & 0x80 != 0 && reply.windows(4).any(|w| w == b"_iio") && !found.contains(&from.ip()) {
+                    found.push(from.ip());
+                }
+            }
+        }
+        if !any {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+    found
+}
+
 /// Asks the iiod at `ip` what it is. None if nothing answers, or it
 /// isn't an AD936x radio.
 pub fn probe(ip: IpAddr) -> Option<Info> {
@@ -597,6 +663,23 @@ mod tests {
         assert_eq!(context_attribute(xml, "fw_version"), None);
     }
 
+    /// mDNS finds the Pluto -- the one on the USB link is enough to show
+    /// the query and its answer work: cargo test mdns -- --ignored
+    #[test]
+    #[ignore]
+    fn mdns_finds_a_pluto() {
+        use network_interface::{Addr, NetworkInterface, NetworkInterfaceConfig};
+        let ips: Vec<Ipv4Addr> = NetworkInterface::show()
+            .unwrap()
+            .iter()
+            .flat_map(|i| i.addr.iter())
+            .filter_map(|a| if let Addr::V4(v4) = a { Some(v4.ip) } else { None })
+            .collect();
+        let found = mdns_discover(&ips);
+        println!("interfaces {ips:?}: found {found:?}");
+        assert!(found.iter().any(|ip| probe(*ip).is_some()), "no Pluto answered");
+    }
+
     /// A 10 kHz tone through the TX interpolator: it comes out at the
     /// same amplitude, and every image (48 kHz +- 10 kHz and up) is more
     /// than 70 dB down.
@@ -631,9 +714,9 @@ mod tests {
         }
     }
 
-    /// Needs a Pluto at DEFAULT_IP, and one test at a time (the Pluto
-    /// streams to one client only):
-    /// cargo test pluto -- --ignored --test-threads=1
+    /// Needs a Pluto at test_ip() (DEFAULT_IP, or HPSDR_PLUTO_IP for one
+    /// on Ethernet), and one test at a time (the Pluto streams to one
+    /// client only): cargo test pluto -- --ignored --test-threads=1
     #[test]
     #[ignore]
     fn streams_from_a_real_pluto() {
@@ -651,7 +734,7 @@ mod tests {
     #[test]
     #[ignore]
     fn switches_rate_with_the_stream_open() {
-        let info = probe(DEFAULT_IP).expect("no Pluto at 192.168.2.1");
+        let info = probe(test_ip()).expect("no Pluto there");
         let (mut device, mut stream, _) = initialise(info.addr, 745_250_000, DEFAULT_GAIN_DB, true).unwrap();
         let mut buf = vec![0u8; stream.buffer_samples() * 4];
         let mut measure = |stream: &mut RxStream, label: &str| {
@@ -681,7 +764,7 @@ mod tests {
     }
 
     fn stream_test(wide: bool) {
-        let info = probe(DEFAULT_IP).expect("no Pluto at 192.168.2.1");
+        let info = probe(test_ip()).expect("no Pluto there");
         println!("range {}..{} Hz, mac {:02x?}", info.frequency_min_hz, info.frequency_max_hz, info.mac());
         let (mut device, mut stream, name) = initialise(info.addr, 432_474_000, DEFAULT_GAIN_DB, wide).unwrap();
         println!("{name}");

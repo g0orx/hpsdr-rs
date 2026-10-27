@@ -25,9 +25,37 @@ with its IP address. Select it and click **Start**.
 Discovery looks for a Pluto at 192.168.2.1. It also tries the `.1`
 address of any network where this computer's own address ends in `.10`,
 which is what the Pluto hands out, so one moved to another subnet in its
-`config.txt` is found too. A Pluto anywhere else (for example a model
-with Ethernet, on your LAN) can be added with the Discover window's
+`config.txt` is found too.
+
+### Over Ethernet
+
+A Pluto on your network (a Pluto+ with its own Ethernet socket, or a
+USB-Ethernet adapter on the OTG port) is found automatically too, at
+whatever address your router gave it. Discovery asks the network for
+iiod servers (an mDNS query for `_iio._tcp`), which the Pluto's
+firmware answers. If yours doesn't show up -- mDNS doesn't cross routers,
+for one -- add its address with the Discover window's
 [Manual IP](01-getting-started.md#discovering-your-radio).
+
+A Pluto reachable both ways (USB and Ethernet at once) is listed once
+for each address; pick either.
+
+Mind the link's speed. The normal stream needs about 6 MB/s, and
+receive and transmit together about 12 MB/s. [Wide
+stream](#wide-stream) needs about 18 MB/s. A 100 Mbit/s adapter carries
+at most about 11 MB/s, so on one of those use the normal stream, and
+expect transmitting while receiving to be marginal. With a gigabit
+adapter on the OTG port, a Pluto clone streamed the wide stream without
+loss and topped out at about 29 MB/s -- the Pluto's own USB port is the
+limit then, much as over USB. If samples go missing, hpsdr-rs says so
+in the terminal.
+
+The adapter has to be on the OTG port with a true OTG cable or adapter
+(one that grounds the ID pin), which puts the port into USB host mode.
+On a clone whose port stayed in device mode (`dmesg` shows `usb0` and
+no `eth0`), it could be switched by hand from the Pluto's console:
+`echo host > /sys/kernel/debug/usb/ci_hdrc.0/role`, then
+`udhcpc -i eth0` for an address -- neither survives a reboot.
 
 Settings are saved per Pluto, keyed by its serial number, so they
 follow the radio whichever address it has.

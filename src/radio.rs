@@ -9017,7 +9017,7 @@ fn p2_tx_iq_loop(
 mod tests {
     use super::*;
 
-    /// The transponder view on a real Pluto at DEFAULT_IP, through the
+    /// The transponder view on a real Pluto at pluto::test_ip(), through the
     /// session's own threads: the receiver gets samples, then the view a
     /// spectrum (and the receiver nothing), then the receiver again.
     /// `HPSDR_SCAN_IF`: the IF to centre the view on (default 745.25 MHz,
@@ -9025,7 +9025,7 @@ mod tests {
     #[test]
     #[ignore]
     fn pluto_transponder_view_comes_and_goes() {
-        let info = pluto::probe(pluto::DEFAULT_IP).expect("no Pluto at 192.168.2.1");
+        let info = pluto::probe(pluto::test_ip()).expect("no Pluto there");
         let device = crate::discovery::pluto_device(&info);
         let settings =
             RadioSettings { frequency_hz: 741_500_000, sample_rate: 48_000, mirisdr_wide: true, ..Default::default() };
@@ -9076,11 +9076,12 @@ mod tests {
     /// queue the way spectrum.rs does (BUFFER_SIZE blocks, 5 ms naps when
     /// short). REAL REPORT: before its queue was sized for whole-buffer
     /// bursts, about a quarter of each one was dropped ("under water"
-    /// audio). Needs a Pluto at DEFAULT_IP with hpsdr-rs disconnected.
+    /// audio). Needs a Pluto at pluto::test_ip() with hpsdr-rs
+    /// disconnected.
     #[test]
     #[ignore]
     fn pluto_receiver_delivers_every_sample() {
-        let info = pluto::probe(pluto::DEFAULT_IP).expect("no Pluto at 192.168.2.1");
+        let info = pluto::probe(pluto::test_ip()).expect("no Pluto there");
         let device = crate::discovery::pluto_device(&info);
         let rate_hz = 768_000;
         let settings = RadioSettings { frequency_hz: 741_500_000, sample_rate: rate_hz, ..Default::default() };
@@ -9114,7 +9115,7 @@ mod tests {
     /// must arrive at +10 kHz (not mirrored to -10 kHz) at the expected
     /// level. Drive at its minimum, and the TX LO is powered down again
     /// as soon as the stream is running -- the loopback is digital, so
-    /// it doesn't need it. Needs a Pluto at DEFAULT_IP with hpsdr-rs
+    /// it doesn't need it. Needs a Pluto at pluto::test_ip() with hpsdr-rs
     /// disconnected.
     #[test]
     #[ignore]
@@ -9126,7 +9127,7 @@ mod tests {
                 let _ = self.0.set_loopback(false);
             }
         }
-        let info = pluto::probe(pluto::DEFAULT_IP).expect("no Pluto at 192.168.2.1");
+        let info = pluto::probe(pluto::test_ip()).expect("no Pluto there");
         let device = crate::discovery::pluto_device(&info);
         let settings = RadioSettings { frequency_hz: 432_000_000, sample_rate: 192_000, ..Default::default() };
         let mut session = RadioSession::start(&device, settings).unwrap();
