@@ -256,9 +256,16 @@ modem) -- for transmit as well as receive.
 
 **Audio gain** controls the speaker/headphone volume for the received
 audio (this is WDSP's own output gain stage, not your OS/sound-card
-volume). The slider is scaled in dB (-100 to +18), so each step is an equal
+volume). The slider is scaled in dB (-100 to +30), so each step is an equal
 relative loudness change across the whole range rather than the low end
 being too coarse and the high end too fine on a plain linear scale.
+
+**Mute**, next to the slider, silences the speakers without moving it,
+so unmuting comes back at the same level. It's shown in red while on.
+Only the speakers go quiet: [Record](#record), TCI's audio stream, the
+waveform display and the CW decoder all carry on. Mute isn't saved, so
+hpsdr-rs always starts with sound. Extra receiver windows have their
+own.
 
 ## Noise/AGC toggles
 

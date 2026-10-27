@@ -35,6 +35,7 @@ boxes with **A>B**/**B>A**/**A<>B** buttons (same as the main window's own
 **CTUN** and, while in CW mode, **CW Decode** (see
 [CW decoder](02-main-window.md#cw-decode)) in the row underneath, band
 and mode rows, **Filter width** and **Audio gain** sliders (with
+[Mute](02-main-window.md#audio-gain) and
 [squelch](02-main-window.md#noiseagc-toggles) next to Audio gain), the
 **Record**/NB/NR/SNB/ANF/BIN/AGC/AGC Gain/RIT toggle row -- RIT here
 works the same as the

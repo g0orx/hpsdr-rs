@@ -5032,6 +5032,7 @@ impl eframe::App for HpsdrApp {
                                 connected.spectrum.set_gain(gain);
                                 settings_changed = true;
                             }
+                            mute_button(ui, &connected.spectrum);
                         });
 
                         // Squelch -- see spectrum::Squelch. Next to Audio
@@ -12674,6 +12675,19 @@ fn tune_power_level(connected: &ConnectedState, current: u32) -> u32 {
     (current as f32 - down_db).round().clamp(0.0, pluto::TX_DRIVE_STEPS as f32) as u32
 }
 
+/// Mute, next to Audio gain: silences the speakers without touching the
+/// gain, so unmuting comes back at the same level. Record, TCI and the
+/// rest still get the audio (see spectrum::DemodParams::muted). Not
+/// saved: a restart always starts with sound.
+fn mute_button(ui: &mut egui::Ui, spectrum: &SpectrumHandle) {
+    let muted = spectrum.muted();
+    let button = egui::Button::selectable(muted, "Mute");
+    let button = if muted { button.fill(egui::Color32::from_rgb(170, 40, 40)) } else { button };
+    if ui.add(button).on_hover_text("Silence the speakers. Recording and TCI carry on.").clicked() {
+        spectrum.set_muted(!muted);
+    }
+}
+
 /// The Pluto can't transmit while its wide stream is on: its TX rate is
 /// tied to the receiver's, and RX and TX together at that rate need more
 /// than its USB link carries -- see radio.rs's pluto_tx_loop.
@@ -13329,6 +13343,7 @@ fn render_extra_receiver_ui(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceiver>>) {
             rx.spectrum.set_gain(gain);
             rx.settings_dirty.store(true, Ordering::Relaxed);
         }
+        mute_button(ui, &rx.spectrum);
 
         // Squelch -- same control as the main window's, next to Audio
         // gain; see spectrum::Squelch.
@@ -14599,6 +14614,7 @@ fn change_sample_rate(connected: &mut ConnectedState, new_rate: u32) {
     let mode = connected.spectrum.mode();
     let width_hz = connected.spectrum.width_hz();
     let gain = connected.spectrum.gain();
+    let muted = connected.spectrum.muted();
     let agc = connected.spectrum.agc();
     let agc_params = connected.spectrum.agc_params();
 
@@ -14642,6 +14658,7 @@ fn change_sample_rate(connected: &mut ConnectedState, new_rate: u32) {
     spectrum.set_mode(mode);
     spectrum.set_width_hz(width_hz);
     spectrum.set_gain(gain);
+    spectrum.set_muted(muted);
     spectrum.set_agc(agc);
     spectrum.set_agc_attack_ms(agc_params.agc_attack_ms);
     spectrum.set_agc_decay_ms(agc_params.agc_decay_ms);
@@ -14813,6 +14830,7 @@ fn change_extra_receiver_sample_rate(rx: &mut ExtraReceiver, new_rate: u32) {
     let mode = rx.spectrum.mode();
     let width_hz = rx.spectrum.width_hz();
     let gain = rx.spectrum.gain();
+    let muted = rx.spectrum.muted();
     let agc = rx.spectrum.agc();
     let agc_params = rx.spectrum.agc_params();
 
@@ -14836,6 +14854,7 @@ fn change_extra_receiver_sample_rate(rx: &mut ExtraReceiver, new_rate: u32) {
     spectrum.set_mode(mode);
     spectrum.set_width_hz(width_hz);
     spectrum.set_gain(gain);
+    spectrum.set_muted(muted);
     spectrum.set_agc(agc);
     spectrum.set_agc_attack_ms(agc_params.agc_attack_ms);
     spectrum.set_agc_decay_ms(agc_params.agc_decay_ms);

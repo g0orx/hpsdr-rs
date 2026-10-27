@@ -471,6 +471,9 @@ pub struct DemodParams {
     pub mode: Mode,
     pub width_hz: f64,
     pub gain: f32,
+    /// The main window's Mute: the speakers get silence, while Record
+    /// and every other tap (TCI, the waveform, the CW decoder) carry on.
+    pub muted: bool,
     pub agc: Agc,
     // Units assumed (not confirmed against your reference): attack/decay/
     // hang in milliseconds, top/slope in dB. Tune by ear/meter.
@@ -625,6 +628,7 @@ impl Default for DemodParams {
             // WDSP's RXA output is much hotter than typical audio-app
             // expectations (e.g. WSJT-X) -- starting well below unity.
             gain: 0.3,
+            muted: false,
             // Off by default: AGC pumping works against the steady
             // levels digital-mode decoders like WSJT-X expect.
             agc: Agc::Off,
@@ -1944,7 +1948,10 @@ fn run(
                     if out.len() >= AUDIO_BUFFER_CAPACITY {
                         out.pop_front();
                     }
-                    out.push_back((l, r));
+                    // Muted: silence rather than nothing, so the sound
+                    // card stays fed and unmuting doesn't start with a
+                    // glitch; the recording still gets the audio.
+                    out.push_back(if params.muted { (0.0, 0.0) } else { (l, r) });
                     recorder.write_frame(l, r);
                 }
                 if !mox_active {
@@ -2260,6 +2267,15 @@ impl SpectrumHandle {
     pub fn set_gain(&self, gain: f32) {
         let mut p = self.demod_params.lock().unwrap();
         p.gain = gain.max(0.0);
+    }
+
+    pub fn muted(&self) -> bool {
+        self.demod_params.lock().unwrap().muted
+    }
+
+    /// See DemodParams::muted.
+    pub fn set_muted(&self, muted: bool) {
+        self.demod_params.lock().unwrap().muted = muted;
     }
 
     pub fn agc(&self) -> Agc {
