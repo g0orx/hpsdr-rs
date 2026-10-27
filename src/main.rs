@@ -5412,6 +5412,19 @@ impl eframe::App for HpsdrApp {
                         }
                     });
 
+                    // Where MOX and Tune would be: say why they aren't.
+                    // REAL REPORT: with the wide stream left on from DATV,
+                    // a Pluto's transmit controls just weren't there.
+                    if !connected.tx_enabled
+                        && pluto_tx_blocked_by_wide(
+                            connected.device.board,
+                            connected.session.dongle_input_rate_hz() == Some(pluto::WIDE_SAMPLE_RATE_HZ),
+                        )
+                    {
+                        ui.add_space(4.0);
+                        ui.weak("No transmit while the Pluto's Wide stream is on: turn it off in Settings -> RX and reconnect.");
+                    }
+
                     if connected.tx_enabled {
                         ui.add_space(4.0);
                         ui.horizontal(|ui| {
