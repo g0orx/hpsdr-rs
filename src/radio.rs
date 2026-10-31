@@ -3579,8 +3579,18 @@ fn spawn_pluto_threads(
     let receiver_rate = Arc::clone(rate);
     let receiver_frequency_hz = Arc::clone(frequency_hz);
     let receiver_scan = Arc::clone(scan);
+    let receiver_rx_attenuation = Arc::clone(rx_attenuation);
     let receiver_thread = thread::spawn(move || {
-        pluto_receiver_loop(stream, receiver_buffer, receiver_stop, receiver_rate, receiver_frequency_hz, receiver_scan);
+        pluto_receiver_loop(
+            addr,
+            stream,
+            receiver_buffer,
+            receiver_stop,
+            receiver_rate,
+            receiver_frequency_hz,
+            receiver_rx_attenuation,
+            receiver_scan,
+        );
     });
 
     let control_frequency_hz = Arc::clone(frequency_hz);
@@ -3589,7 +3599,7 @@ fn spawn_pluto_threads(
     let control_rate = Arc::clone(rate);
     let control_scan = Arc::clone(scan);
     let control_thread = thread::spawn(move || {
-        pluto_control_loop(device, control_frequency_hz, control_rate, control_rx_attenuation, control_stop, control_scan);
+        pluto_control_loop(addr, device, control_frequency_hz, control_rate, control_rx_attenuation, control_stop, control_scan);
     });
     Ok((receiver_thread, control_thread))
 }
@@ -3597,12 +3607,15 @@ fn spawn_pluto_threads(
 /// Pluto receiver thread -- same shape as mirisdr_receiver_loop. While
 /// the transponder view is on (`scan`, see transponder.rs) its buffers
 /// go to that view instead, and the receiver hears nothing.
+#[allow(clippy::too_many_arguments)]
 fn pluto_receiver_loop(
+    addr: std::net::SocketAddr,
     mut stream: pluto::RxStream,
     iq_buffer: Arc<Mutex<VecDeque<IqSample>>>,
     stop_flag: Arc<AtomicBool>,
     rate: Arc<DongleRate>,
     frequency_hz: Arc<AtomicU32>,
+    rx_attenuation: Arc<AtomicU32>,
     scan: Arc<transponder::Scan>,
 ) {
     let mut accumulator = transponder::Accumulator::new();
@@ -3632,10 +3645,25 @@ fn pluto_receiver_loop(
     let mut window_samples = 0u64;
     while !stop_flag.load(Ordering::Relaxed) {
         // Any error, a timeout included, leaves the connection somewhere
-        // mid-reply, so there's no picking it back up.
+        // mid-reply, so there's no picking it back up: start a fresh one.
+        // REAL REPORT (Pluto clone on Ethernet through a USB adapter):
+        // "stream read failed: Resource temporarily unavailable" after a
+        // while -- no data for the 2 s read timeout -- and the receiver
+        // then stayed dead until a reconnect.
         if let Err(e) = stream.read(&mut buf) {
-            eprintln!("Pluto: stream read failed: {e}");
-            break;
+            eprintln!("Pluto: stream read failed: {e} -- reconnecting");
+            match pluto_reconnect_stream(addr, &stop_flag, &rate, &frequency_hz, &rx_attenuation, &scan) {
+                Some(s) => {
+                    stream = s;
+                    buf.resize(stream.buffer_samples() * 4, 0);
+                    decimator =
+                        rtlsdr::Decimator::with_full_scale(rate.input_rate_hz, decimation, pluto::SAMPLE_FULL_SCALE);
+                    window_start = std::time::Instant::now();
+                    window_samples = 0;
+                    continue;
+                }
+                None => break, // stopping
+            }
         }
         let active = scan.active_if_hz.load(Ordering::Relaxed);
         if active != scan_if_hz {
@@ -3696,12 +3724,53 @@ fn pluto_receiver_loop(
     stream.close();
 }
 
+/// After a stream failure: sets the Pluto up again from scratch and
+/// opens a new stream, retrying once a second until it answers (it may
+/// have dropped off the network, or rebooted and lost its settings).
+/// None if the session stops meanwhile. A transponder view that was up
+/// is marked inactive, so the control thread puts it back.
+fn pluto_reconnect_stream(
+    addr: std::net::SocketAddr,
+    stop_flag: &AtomicBool,
+    rate: &DongleRate,
+    frequency_hz: &AtomicU32,
+    rx_attenuation: &AtomicU32,
+    scan: &transponder::Scan,
+) -> Option<pluto::RxStream> {
+    let mut attempts = 0u32;
+    while !stop_flag.load(Ordering::Relaxed) {
+        thread::sleep(Duration::from_secs(1));
+        let offset_hz = rtlsdr::tuning_offset_hz(rate.decimation.load(Ordering::Relaxed));
+        match pluto::initialise(
+            addr,
+            frequency_hz.load(Ordering::Relaxed) + offset_hz,
+            rx_attenuation.load(Ordering::Relaxed),
+            rate.input_rate_hz == pluto::WIDE_SAMPLE_RATE_HZ,
+        ) {
+            Ok((_device, stream, _)) => {
+                scan.active_if_hz.store(0, Ordering::Relaxed);
+                eprintln!("Pluto: reconnected");
+                return Some(stream);
+            }
+            Err(e) => {
+                // Once, then every 30 s, not every second.
+                if attempts % 30 == 0 {
+                    eprintln!("Pluto: reconnect failed, still trying: {e}");
+                }
+                attempts += 1;
+            }
+        }
+    }
+    None
+}
+
 /// Pluto control thread -- mirisdr_control_loop's tuning and gain,
 /// as iiod attribute writes. RF gain is `rx_attenuation` as whole dB,
 /// 0..=pluto::MAX_GAIN_DB. Also switches the Pluto to and from the
 /// transponder view's rate and centre (`scan`), with the stream left
 /// open -- see pluto::RATE_CHANGE_STALE_BUFFERS.
 fn pluto_control_loop(
+    addr: std::net::SocketAddr,
     mut device: pluto::PlutoDevice,
     frequency_hz: Arc<AtomicU32>,
     rate: Arc<DongleRate>,
@@ -3714,7 +3783,29 @@ fn pluto_control_loop(
     let mut last_offset = rtlsdr::tuning_offset_hz(rate.decimation.load(Ordering::Relaxed));
     let mut last_gain = rx_attenuation.load(Ordering::Relaxed);
     let wide = rate.input_rate_hz == pluto::WIDE_SAMPLE_RATE_HZ;
+    // A failed write leaves the connection unusable (see
+    // pluto_receiver_loop's reconnect): set when one fails, then a fresh
+    // connection is tried once a second, and everything re-sent.
+    let mut broken = false;
+    let mut last_attempt = Instant::now();
     while !stop_flag.load(Ordering::Relaxed) {
+        if broken {
+            if last_attempt.elapsed() < Duration::from_secs(1) {
+                thread::sleep(RTLSDR_CONTROL_POLL);
+                continue;
+            }
+            last_attempt = Instant::now();
+            match pluto::PlutoDevice::connect(addr) {
+                Ok(d) => {
+                    device = d;
+                    broken = false;
+                    // Force a re-send of both on this pass.
+                    last_freq = u32::MAX;
+                    last_gain = u32::MAX;
+                }
+                Err(_) => continue,
+            }
+        }
         let requested = scan.request_if_hz.load(Ordering::Relaxed);
         let active = scan.active_if_hz.load(Ordering::Relaxed);
         if requested != active {
@@ -3728,6 +3819,8 @@ fn pluto_control_loop(
             };
             if let Err(e) = result {
                 eprintln!("Pluto: switching the transponder view failed: {e}");
+                broken = true;
+                continue;
             }
             scan.active_if_hz.store(requested, Ordering::Relaxed);
         }
@@ -3738,7 +3831,9 @@ fn pluto_control_loop(
             // Hardware sits offset_hz above the dial -- see
             // rtlsdr::Decimator's doc comment.
             if let Err(e) = device.set_center_freq(freq + offset_hz) {
-                eprintln!("Pluto: tune to {} Hz failed: {e}", freq + offset_hz);
+                eprintln!("Pluto: tune to {} Hz failed: {e} -- reconnecting", freq + offset_hz);
+                broken = true;
+                continue;
             }
             last_freq = freq;
             last_offset = offset_hz;
@@ -3746,7 +3841,9 @@ fn pluto_control_loop(
         let gain = rx_attenuation.load(Ordering::Relaxed);
         if gain != last_gain {
             if let Err(e) = device.set_gain(gain) {
-                eprintln!("Pluto: gain change failed: {e}");
+                eprintln!("Pluto: gain change failed: {e} -- reconnecting");
+                broken = true;
+                continue;
             }
             last_gain = gain;
         }
@@ -9107,6 +9204,34 @@ mod tests {
         session.stop();
         println!("{delivered:.0} samples/s delivered at {rate_hz} Hz");
         assert!(delivered > 0.99 * rate_hz as f64, "{delivered}");
+    }
+
+    /// For checking the receiver's reconnect by hand: prints the samples
+    /// arriving each second for `HPSDR_PLUTO_SECONDS` (default 45) while
+    /// you unplug and replug the Pluto's network or USB link.
+    #[test]
+    #[ignore]
+    fn pluto_receiver_through_a_dropout() {
+        let info = pluto::probe(pluto::test_ip()).expect("no Pluto there");
+        let device = crate::discovery::pluto_device(&info);
+        let settings = RadioSettings { frequency_hz: 741_500_000, sample_rate: 48_000, ..Default::default() };
+        let mut session = RadioSession::start(&device, settings).unwrap();
+        let buffer = Arc::clone(&session.iq_buffers[0]);
+        let seconds: u64 = std::env::var("HPSDR_PLUTO_SECONDS").map_or(45, |v| v.parse().unwrap());
+        let mut alive_at_end = false;
+        for s in 0..seconds {
+            let start = Instant::now();
+            let mut got = 0usize;
+            while start.elapsed() < Duration::from_secs(1) {
+                let n = { let mut b = buffer.lock().unwrap(); let n = b.len(); b.clear(); n };
+                got += n;
+                thread::sleep(Duration::from_millis(5));
+            }
+            println!("{s:3} s: {got} samples");
+            alive_at_end = got > 40_000;
+        }
+        session.stop();
+        assert!(alive_at_end, "not receiving at the end");
     }
 
     /// The Pluto's TX chain end to end, without RF: tx.rs-convention I/Q
