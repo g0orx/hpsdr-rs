@@ -52,10 +52,39 @@ in the terminal.
 
 The adapter has to be on the OTG port with a true OTG cable or adapter
 (one that grounds the ID pin), which puts the port into USB host mode.
-On a clone whose port stayed in device mode (`dmesg` shows `usb0` and
-no `eth0`), it could be switched by hand from the Pluto's console:
-`echo host > /sys/kernel/debug/usb/ci_hdrc.0/role`, then
-`udhcpc -i eth0` for an address -- neither survives a reboot.
+A clone with a **USB-C** socket has no ID pin: an OTG adapter signals
+on USB-C's CC pins instead, which a Pluto without a USB-C controller
+ignores, so it boots as a USB device whatever cable is used (`dmesg`
+shows `usb0` and no `eth0`). Switch it by hand from the Pluto's console
+(`root`, password `analog`):
+
+```sh
+echo host > /sys/kernel/debug/usb/ci_hdrc.0/role
+udhcpc -i eth0
+```
+
+To have that happen at every boot, put it in `/mnt/jffs2/autorun.sh`,
+which the Pluto's firmware runs at startup (`/mnt/jffs2` is its
+persistent storage). One command per line is safest over a serial
+console:
+
+```sh
+echo '[ -d /sys/kernel/debug/usb ] || mount -t debugfs debugfs /sys/kernel/debug' > /mnt/jffs2/autorun.sh
+echo 'echo host > /sys/kernel/debug/usb/ci_hdrc.0/role' >> /mnt/jffs2/autorun.sh
+echo 'for i in 1 2 3 4 5 6 7 8 9 10; do [ -e /sys/class/net/eth0 ] && break; sleep 1; done' >> /mnt/jffs2/autorun.sh
+echo 'ifup eth0 2>/dev/null || udhcpc -b -i eth0' >> /mnt/jffs2/autorun.sh
+sync
+```
+
+That port then stays a USB host, so it can't connect to a PC by USB;
+`rm /mnt/jffs2/autorun.sh` undoes it. If the file has vanished after a
+reboot, `/mnt/jffs2` isn't mounted: `mount | grep jffs2` shows nothing,
+and `dmesg | grep jffs2` complains. One clone's partition held leftover
+data instead of a filesystem; `flash_erase -j /dev/mtd2 0 0` then
+`mount -a` formatted it (this erases only `mtd2`, the small
+user-settings partition -- check `cat /proc/mtd` lists it as
+`qspi-nvmfs` first), after which the script survived and ran at every
+boot.
 
 Settings are saved per Pluto, keyed by its serial number, so they
 follow the radio whichever address it has.
