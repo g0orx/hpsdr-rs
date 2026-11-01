@@ -2665,10 +2665,21 @@ mod tune_tone_tests {
     #[test]
     #[ignore]
     fn tune_tone_is_mid_filter_in_tx_spectrum() {
-        let rate = 192_000.0;
+        tune_tone_check(20, 21, 2, 192_000.0);
+    }
+
+    /// The same at Protocol 1's rates (48 kHz out), which a Pluto -- and
+    /// every Protocol 1 radio -- uses.
+    #[test]
+    #[ignore]
+    fn tune_tone_is_mid_filter_at_protocol_1_rates() {
+        tune_tone_check(22, 23, 1, 48_000.0);
+    }
+
+    fn tune_tone_check(txa_channel: i32, analyzer_channel: i32, protocol: u8, rate: f64) {
         let iq_buf = Arc::new(Mutex::new(VecDeque::new()));
         let analyzer = SpectrumHandle::start(
-            21,
+            analyzer_channel,
             Arc::clone(&iq_buf),
             rate as i32,
             None,
@@ -2678,7 +2689,7 @@ mod tune_tone_tests {
         // SpectrumAnalyzer::open does WDSP's one-time setup on its thread;
         // the TXA channel must not open before it.
         std::thread::sleep(Duration::from_secs(2));
-        let mut processor = TxProcessor::open(20, 2, 48_000, rate as i32, None);
+        let mut processor = TxProcessor::open(txa_channel, protocol, 48_000, rate as i32, None);
         let passband = crate::spectrum::passband_for(Mode::Usb, 2700.0);
         let filter = crate::tx_inset_filter(Mode::Usb, passband);
         let (zoom, pan, shown) = crate::tx_inset_zoom_pan(crate::tx_inset_window(filter), rate);

@@ -183,6 +183,10 @@ pub(crate) fn tx_frequency_allowed(freq_hz: u32, allow_out_of_band: bool) -> boo
 /// its RF frequency is inside that transverter's range -- see
 /// tx_frequency_allowed.
 static TX_XVTR_STATE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(TX_NO_XVTR);
+/// Protocol 1's TX I/Q rate: fixed, whatever the RX rate (piHPSDR's
+/// transmitter.c; the Pluto's TX thread interpolates from it too).
+const P1_DUC_RATE: i32 = 48_000;
+
 const TX_NO_XVTR: u8 = 0;
 const TX_XVTR_IN_RANGE: u8 = 1;
 const TX_XVTR_OUT_OF_RANGE: u8 = 2;
@@ -14720,14 +14724,16 @@ fn change_sample_rate(connected: &mut ConnectedState, new_rate: u32) {
     connected.spectrum = spectrum;
     connected.sample_rate = new_rate;
 
-    // P1 has one shared RX/TX clock (no separate DUC rate the way P2
-    // has a fixed 192ksps regardless of RX rate) -- if TX is armed,
-    // tx.rs's TXA channel was opened expecting the *old* sample rate
-    // and needs rebuilding against the new one, or TX audio would come
-    // out at the wrong pitch/speed. Mic capture itself (audio.rs's
-    // MicInput) is unaffected -- only the TXA channel's output rate
-    // needs to change, so only tx_handle is torn down and recreated
-    // here, not mic_input.
+    // P1: if TX is armed, its TXA channel and tx_spectrum are rebuilt
+    // here alongside the RX side. Their rate stays P1's fixed 48 kHz TX
+    // rate, NOT new_rate (see connect_to_device's duc_rate): this used
+    // new_rate, so after any rate change TX IQ came out at the RX rate.
+    // REAL REPORT (2026-11-01, Pluto at 768 kHz, Duplex TX inset): the
+    // Tune tone sat at the filter's low edge -- the inset (zoomed for 48
+    // kHz) was showing a 768 kHz analyzer, and the Pluto's TX thread,
+    // which interpolates from 48 kHz, got 16x too many samples. Every P1
+    // radio was affected the same way. Mic capture itself (audio.rs's
+    // MicInput) is unaffected, so only tx_handle is recreated.
     if connected.tx_enabled && connected.device.protocol == 1 {
         if let Some(old_tx) = connected.tx_handle.take() {
             let mic_gain = connected.mic_gain;
@@ -14739,7 +14745,7 @@ fn change_sample_rate(connected: &mut ConnectedState, new_rate: u32) {
             connected.tx_spectrum = SpectrumHandle::start(
                 connected.session.iq_buffers.len() as i32 + 1,
                 Arc::clone(&tx_spectrum_iq),
-                new_rate as i32,
+                P1_DUC_RATE,
                 None,
                 Arc::clone(&connected.session.mox),
                 Arc::clone(&connected.session.mute_local_audio_for_tci),
@@ -14757,7 +14763,7 @@ fn change_sample_rate(connected: &mut ConnectedState, new_rate: u32) {
                     connected.session.iq_buffers.len() as i32,
                     connected.device.protocol,
                     48_000,
-                    new_rate as i32,
+                    P1_DUC_RATE,
                     connected.puresignal_enabled,
                     Arc::clone(&connected.session.ps_rx_feedback_iq),
                     Arc::clone(&connected.session.ps_tx_feedback_iq),
