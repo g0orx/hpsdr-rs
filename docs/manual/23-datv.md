@@ -51,6 +51,11 @@ the narrowband transponder).
    - VLC: `vlc udp://@:1234`
    - ffplay: `ffplay udp://127.0.0.1:1234`
 
+Many stations send quiet audio (the beacon averages about -29 dBFS).
+hpsdr-rs passes the stations' audio through untouched, so Audio gain
+doesn't affect it; turn it up in the player instead: `vlc --gain=4
+udp://@:1234` (up to 8), or `ffplay -af "volume=15dB" udp://127.0.0.1:1234`.
+
 If the signal isn't inside the receiver's stream when you click
 **Start**, VFO A moves onto the DATV frequency first, so you don't have
 to tune there yourself.

@@ -1,14 +1,16 @@
 [← DATV](23-datv.md) | [Index](README.md)
 
-# ADALM-Pluto (receive-only, for now)
+# ADALM-Pluto
 
 > **Confirmed working on a real Pluto clone** (Analog Devices PlutoSDR
-> Rev.B, AD9363, firmware v0.39): receiving QO-100 through an LNB, and
-> [DATV](23-datv.md) on the wideband transponder. Transmit isn't
-> supported yet.
+> Rev.B, AD9363, firmware v0.39, and later F5OEO's Tezuka v0.3.24):
+> receiving QO-100 through an LNB, and [DATV](23-datv.md) on the
+> wideband transponder. [Transmit](#transmit) is checked through the
+> chip's own loopback and shows correctly on the TX display, but hasn't
+> been tested on air yet.
 
 hpsdr-rs can use an **ADALM-Pluto** (or one of its many clones) as a
-receiver. Unlike the USB dongles, the Pluto is reached over the network:
+receiver and transmitter. Unlike the USB dongles, the Pluto is reached over the network:
 it runs Analog Devices' own server, iiod, which hpsdr-rs talks to
 directly. There's no libiio, libad9361 or SoapySDR to install.
 
@@ -169,6 +171,32 @@ shows all of QO-100's wideband transponder (10491-10499.5 MHz) at once,
 so you can see which stations are on and click one to receive it. See
 the DATV chapter.
 
+## Transmit
+
+The Pluto transmits full duplex: its receiver keeps running while it
+transmits, so you can hear your own downlink on QO-100 while sending on
+the 2400 MHz uplink (the new **13cm** band, 2300-2450 MHz, covers it).
+Turn on **Enable Transmit** in [Settings: TX](17-settings-tx.md) as for
+any radio; MOX, Tune, Two Tone and [Duplex](02-main-window.md) work as
+usual.
+
+- **TX Drive** replaces the TX Power slider: -60 to 0 dB, where 0 dB is
+  the Pluto's full output -- only a few milliwatts, so an uplink needs an
+  amplifier after it. The scroll wheel and the **TX Drive** MIDI control
+  move it in 1 dB steps. Tune and Two Tone use **Tune Power %** as a share
+  of that power.
+- There's no power detector, so the watts meter, Max TX Power and PA
+  Calibration are hidden.
+- The transmitter is powered down whenever you're not transmitting, so
+  it puts nothing out between overs.
+- **Not with the Wide stream on**: the transmit sample rate follows the
+  receiver's, and at the wide rate the two together need more than the
+  link carries. The main window says so in place of the transmit
+  controls; turn Wide stream off and reconnect.
+
+Check the output on a spectrum analyser or a second receiver, into a
+dummy load, before connecting an amplifier.
+
 ## Recording raw IQ
 
 **Record raw IQ** in Settings: RX saves the Pluto's whole stream, before
@@ -183,8 +211,8 @@ removes what's left -- see [the RTL-SDR chapter](21-rtl-sdr.md#centre-spike).
 
 ## Limitations
 
-- **Receive only** for now: the transmit controls are hidden, and the
-  Pluto's transmitter is kept switched off.
+- **Transmit is untested on air**, and not available with the Wide
+  stream on.
 - **One receiver**: extra receivers aren't available.
 - No frequency (ppm) correction yet. For QO-100, the transverter's LO
   Error and [PSK Beacon](02-main-window.md#psk-beacon-qo-100)'s Lock LNB

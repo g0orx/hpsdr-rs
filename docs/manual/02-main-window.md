@@ -217,7 +217,7 @@ same transverter as VFO A.
 ## Bands and modes
 
 One row of band buttons -- **160m, 80m, 60m, 40m, 30m, 20m, 17m, 15m, 12m,
-10m, 6m**, plus **2m, 70cm, 23cm** on a VHF/UHF-capable board such as an
+10m, 6m**, plus **2m, 70cm, 23cm** (and **13cm** on a Pluto) on a VHF/UHF-capable board such as an
 [RTL-SDR](21-rtl-sdr.md), [MSI.SDR](22-msi-sdr.md) or
 [Pluto](24-pluto.md) -- jumps to that band's remembered frequency, mode, and filter
 width (or sensible defaults the first time you visit a band). Each band
@@ -399,7 +399,8 @@ The controls themselves:
   field has keyboard focus.
 
 While transmitting, a line beneath the gain controls shows **Mic level**
-and **ALC** readouts, and Mic gain / TCI TX gain / TX Power sliders appear
+and **ALC** readouts, and Mic gain / TCI TX gain / TX Power (TX Drive, in dB, on a
+[Pluto](24-pluto.md#transmit)) sliders appear
 alongside Audio gain.
 
 **Always bench-test into a dummy load at reduced drive before transmitting
