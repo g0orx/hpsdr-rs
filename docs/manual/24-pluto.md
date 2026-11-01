@@ -59,22 +59,31 @@ shows `usb0` and no `eth0`). Switch it by hand from the Pluto's console
 (`root`, password `analog`):
 
 ```sh
-echo host > /sys/kernel/debug/usb/ci_hdrc.0/role
+echo host > /sys/bus/platform/devices/ci_hdrc.0/role
 udhcpc -i eth0
 ```
 
+(On firmware where that `role` file doesn't exist, the same switch is
+`echo host > /sys/kernel/debug/usb/ci_hdrc.0/role`.)
+
 To have that happen at every boot, put it in `/mnt/jffs2/autorun.sh`,
 which the Pluto's firmware runs at startup (`/mnt/jffs2` is its
-persistent storage). One command per line is safest over a serial
-console:
+persistent storage) -- both Analog Devices' firmware and F5OEO's Tezuka
+do. One command per line is safest over a serial console; this tries
+both switches, and logs each boot to `/mnt/jffs2/autorun.log`:
 
 ```sh
-echo '[ -d /sys/kernel/debug/usb ] || mount -t debugfs debugfs /sys/kernel/debug' > /mnt/jffs2/autorun.sh
-echo 'echo host > /sys/kernel/debug/usb/ci_hdrc.0/role' >> /mnt/jffs2/autorun.sh
+echo 'date >> /mnt/jffs2/autorun.log' > /mnt/jffs2/autorun.sh
+echo 'echo host > /sys/bus/platform/devices/ci_hdrc.0/role 2>> /mnt/jffs2/autorun.log || { mount -t debugfs debugfs /sys/kernel/debug 2>/dev/null; echo host > /sys/kernel/debug/usb/ci_hdrc.0/role; }' >> /mnt/jffs2/autorun.sh
 echo 'for i in 1 2 3 4 5 6 7 8 9 10; do [ -e /sys/class/net/eth0 ] && break; sleep 1; done' >> /mnt/jffs2/autorun.sh
+echo 'ip link show eth0 >> /mnt/jffs2/autorun.log 2>&1' >> /mnt/jffs2/autorun.sh
 echo 'ifup eth0 2>/dev/null || udhcpc -b -i eth0' >> /mnt/jffs2/autorun.sh
 sync
 ```
+
+On Tezuka v0.3.24 the debugfs switch alone worked by hand but not from
+this script at boot; the `role` file in `/sys/bus/platform/devices`
+(what Tezuka's own `/root/usb_host.sh` uses) works in both.
 
 That port then stays a USB host, so it can't connect to a PC by USB;
 `rm /mnt/jffs2/autorun.sh` undoes it. If the file has vanished after a
