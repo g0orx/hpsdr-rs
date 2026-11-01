@@ -252,6 +252,11 @@ pub struct RadioSettings {
     /// pluto::WIDE_SAMPLE_RATE_HZ (see their doc comments). Read at
     /// connect; the device is never reopened at runtime (see DongleRate).
     pub mirisdr_wide: bool,
+    /// Pluto only: run the normal stream at pluto::DIRECT_SAMPLE_RATE_HZ
+    /// without the FPGA's rate conversion, on firmware where that
+    /// misbehaves -- see pluto::fpga_rate_conversion_ok, which main.rs
+    /// runs at connect to set this.
+    pub pluto_direct: bool,
     /// Ozy only -- initial values for OzyAtlas (see its doc comment).
     /// `None` = automatic (Penelope if one answers at start-up, else
     /// Mercury).
@@ -308,6 +313,7 @@ impl Default for RadioSettings {
             rtlsdr_direct_sampling: 2,
             rtlsdr_tuner_agc: false,
             mirisdr_wide: false,
+            pluto_direct: false,
             ozy_clock_122_88: None,
             ozy_clock_10mhz: OZY_10MHZ_ATLAS,
             // See RadioSession::filter_board's doc comment -- ALEX is
@@ -3038,7 +3044,7 @@ fn start_usb_dongle(
     let input_rate = if is_mirisdr {
         mirisdr::sample_rate_hz(settings.mirisdr_wide)
     } else if is_pluto {
-        pluto::sample_rate_hz(settings.mirisdr_wide)
+        pluto::sample_rate_hz(settings.mirisdr_wide, settings.pluto_direct)
     } else {
         rtlsdr::DONGLE_RATE_HZ
     };
@@ -3570,7 +3576,7 @@ fn spawn_pluto_threads(
         addr,
         frequency_hz.load(Ordering::Relaxed) + offset_hz,
         rx_attenuation.load(Ordering::Relaxed),
-        rate.input_rate_hz == pluto::WIDE_SAMPLE_RATE_HZ,
+        rate.input_rate_hz,
     )?;
     println!("Pluto: {name} streaming at {} Hz, decimating by {decimation}", rate.input_rate_hz);
 
@@ -3745,7 +3751,7 @@ fn pluto_reconnect_stream(
             addr,
             frequency_hz.load(Ordering::Relaxed) + offset_hz,
             rx_attenuation.load(Ordering::Relaxed),
-            rate.input_rate_hz == pluto::WIDE_SAMPLE_RATE_HZ,
+            rate.input_rate_hz,
         ) {
             Ok((_device, stream, _)) => {
                 scan.active_if_hz.store(0, Ordering::Relaxed);
@@ -3782,7 +3788,6 @@ fn pluto_control_loop(
     let mut last_freq = frequency_hz.load(Ordering::Relaxed);
     let mut last_offset = rtlsdr::tuning_offset_hz(rate.decimation.load(Ordering::Relaxed));
     let mut last_gain = rx_attenuation.load(Ordering::Relaxed);
-    let wide = rate.input_rate_hz == pluto::WIDE_SAMPLE_RATE_HZ;
     // A failed write leaves the connection unusable (see
     // pluto_receiver_loop's reconnect): set when one fails, then a fresh
     // connection is tried once a second, and everything re-sent.
@@ -3815,7 +3820,7 @@ fn pluto_control_loop(
                 // Back to the receiver's own rate and frequency.
                 last_freq = frequency_hz.load(Ordering::Relaxed);
                 last_offset = rtlsdr::tuning_offset_hz(rate.decimation.load(Ordering::Relaxed));
-                device.set_stream_rate(wide).and_then(|()| device.set_center_freq(last_freq + last_offset))
+                device.set_stream_rate(rate.input_rate_hz).and_then(|()| device.set_center_freq(last_freq + last_offset))
             };
             if let Err(e) = result {
                 eprintln!("Pluto: switching the transponder view failed: {e}");
@@ -3865,11 +3870,14 @@ const PLUTO_TX_PREBUFFER_PAIRS: usize = 1024;
 /// its own TX LO (QO-100's 2400 MHz uplink while the RX hears the LNB's
 /// IF, for one).
 ///
-/// Only at pluto::SAMPLE_RATE_HZ: the TX sample rate is tied to the
-/// receiver's, and at the wide stream's rate RX and TX together need
-/// ~36 MB/s, more than the USB link carries (~26 MB/s measured); the
-/// transponder view's rate is beyond it on its own. main.rs disables
-/// TX in both cases; this is the backstop.
+/// Only at the normal stream's rate (pluto::SAMPLE_RATE_HZ, or
+/// DIRECT_SAMPLE_RATE_HZ on firmware without working FPGA rate
+/// conversion -- ~24 MB/s for RX and TX together then, near what the
+/// link carries): the TX sample rate is tied to the receiver's, and at
+/// the wide stream's rate RX and TX together need ~36 MB/s, more than
+/// the USB link carries (~26 MB/s measured); the transponder view's
+/// rate is beyond it on its own. main.rs disables TX in both cases;
+/// this is the backstop.
 ///
 /// I/Q: tx.rs's pairs are in the HPSDR convention, the analytic signal
 /// being pair[1] + j*pair[0] (the same as received IqSamples -- see
@@ -3886,12 +3894,12 @@ fn pluto_tx_loop(
     scan: Arc<transponder::Scan>,
     stop: Arc<AtomicBool>,
 ) {
-    let normal_rate = rate.input_rate_hz == pluto::SAMPLE_RATE_HZ;
+    let normal_rate = rate.input_rate_hz != pluto::WIDE_SAMPLE_RATE_HZ;
     let mut control: Option<pluto::PlutoDevice> = None;
     let mut stream: Option<pluto::TxStream> = None;
-    let mut interp = pluto::TxInterpolator::new();
+    let mut interp = pluto::TxInterpolator::new(rate.input_rate_hz);
     let mut buf = vec![0u8; pluto::TX_BUFFER_SAMPLES * 4];
-    let pairs_per_buffer = pluto::TX_BUFFER_SAMPLES / pluto::TX_INTERPOLATION;
+    let pairs_per_buffer = pluto::TX_BUFFER_SAMPLES / interp.interpolation();
     let (mut last_freq, mut last_drive) = (0u32, u32::MAX);
     let mut warmed_up = false;
     let mut warned = false;
@@ -3934,7 +3942,7 @@ fn pluto_tx_loop(
             match started {
                 Ok(s) => {
                     stream = Some(s);
-                    interp = pluto::TxInterpolator::new();
+                    interp = pluto::TxInterpolator::new(rate.input_rate_hz);
                 }
                 Err(e) => {
                     eprintln!("Pluto TX: couldn't start transmitting: {e}");
@@ -9114,6 +9122,14 @@ fn p2_tx_iq_loop(
 mod tests {
     use super::*;
 
+    /// What main.rs's connect decides for this Pluto: whether its FPGA
+    /// rate conversion works (pluto::fpga_rate_conversion_ok).
+    fn pluto_test_direct(addr: std::net::SocketAddr) -> bool {
+        let direct = !pluto::fpga_rate_conversion_ok(addr).unwrap();
+        println!("Pluto stream: {}", if direct { "direct (FPGA rate conversion off)" } else { "through the FPGA" });
+        direct
+    }
+
     /// The transponder view on a real Pluto at pluto::test_ip(), through the
     /// session's own threads: the receiver gets samples, then the view a
     /// spectrum (and the receiver nothing), then the receiver again.
@@ -9181,7 +9197,12 @@ mod tests {
         let info = pluto::probe(pluto::test_ip()).expect("no Pluto there");
         let device = crate::discovery::pluto_device(&info);
         let rate_hz = 768_000;
-        let settings = RadioSettings { frequency_hz: 741_500_000, sample_rate: rate_hz, ..Default::default() };
+        let settings = RadioSettings {
+            frequency_hz: 741_500_000,
+            sample_rate: rate_hz,
+            pluto_direct: pluto_test_direct(device.address),
+            ..Default::default()
+        };
         let mut session = RadioSession::start(&device, settings).unwrap();
         let buffer = Arc::clone(&session.iq_buffers[0]);
         let drain_for = |seconds: f64| {
@@ -9214,7 +9235,12 @@ mod tests {
     fn pluto_receiver_through_a_dropout() {
         let info = pluto::probe(pluto::test_ip()).expect("no Pluto there");
         let device = crate::discovery::pluto_device(&info);
-        let settings = RadioSettings { frequency_hz: 741_500_000, sample_rate: 48_000, ..Default::default() };
+        let settings = RadioSettings {
+            frequency_hz: 741_500_000,
+            sample_rate: 48_000,
+            pluto_direct: pluto_test_direct(device.address),
+            ..Default::default()
+        };
         let mut session = RadioSession::start(&device, settings).unwrap();
         let buffer = Arc::clone(&session.iq_buffers[0]);
         let seconds: u64 = std::env::var("HPSDR_PLUTO_SECONDS").map_or(45, |v| v.parse().unwrap());
@@ -9254,7 +9280,12 @@ mod tests {
         }
         let info = pluto::probe(pluto::test_ip()).expect("no Pluto there");
         let device = crate::discovery::pluto_device(&info);
-        let settings = RadioSettings { frequency_hz: 432_000_000, sample_rate: 192_000, ..Default::default() };
+        let settings = RadioSettings {
+            frequency_hz: 432_000_000,
+            sample_rate: 192_000,
+            pluto_direct: pluto_test_direct(device.address),
+            ..Default::default()
+        };
         let mut session = RadioSession::start(&device, settings).unwrap();
         session.tx_power_watts.store(0, Ordering::Relaxed); // MIN_TX_DRIVE_DB
         session.tx_frequency_hz.store(2_400_100_000, Ordering::Relaxed);
@@ -9290,7 +9321,8 @@ mod tests {
         // Half a second of the raw receive stream (standard I/Q).
         while wide.try_recv().is_ok() {}
         let mut samples = Vec::new();
-        while samples.len() < pluto::SAMPLE_RATE_HZ as usize / 2 {
+        let stream_rate = session.dongle_input_rate_hz().unwrap();
+        while samples.len() < stream_rate as usize / 2 {
             samples.extend(wide.recv_timeout(Duration::from_secs(2)).unwrap().samples);
         }
         session.mox.store(false, Ordering::Relaxed);
@@ -9300,7 +9332,7 @@ mod tests {
         drop(guard);
         session.stop();
 
-        let fs = pluto::SAMPLE_RATE_HZ as f64;
+        let fs = stream_rate as f64;
         let level = |f: f64| {
             let (mut re, mut im) = (0.0, 0.0);
             for (n, s) in samples.iter().enumerate() {

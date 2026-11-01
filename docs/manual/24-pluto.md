@@ -138,6 +138,15 @@ Sample Rate buttons choose how far hpsdr-rs decimates that: **48, 96,
 192, 384, 768 or 1536** kHz (default 192). Changing the rate is quick:
 the Pluto keeps streaming.
 
+Some firmware's FPGA doesn't convert rates the way it reports: on
+F5OEO's **Tezuka** (v0.3.24), only 40% of the samples arrived, and
+transmit ran at the wrong rate. hpsdr-rs times the stream when it
+connects, and on such firmware runs the AD936x at 3072 kHz directly and
+does all the rate conversion itself; the terminal says so when it does.
+Everything works the same, but the normal stream then needs about 12
+MB/s (receive and transmit together about 24 MB/s, close to what the
+link carries).
+
 ### Wide stream
 
 **Wide stream (4608 kHz)**, under the Sample Rate buttons, makes the

@@ -84,12 +84,49 @@ const SCAN_RF_BANDWIDTH_HZ: u32 = 11_000_000;
 /// ~4% too many samples over the next 2 s.
 pub const RATE_CHANGE_STALE_BUFFERS: usize = 6;
 
-pub fn sample_rate_hz(wide: bool) -> u32 {
+/// The normal stream's rate on firmware whose FPGA rate conversion
+/// misbehaves (see fpga_rate_conversion_ok): the AD936x run directly at
+/// the lowest rate above its ~2.083 MS/s floor that every output rate
+/// from 48 to 1536 kHz is an even decimation of, with no FPGA stage, for
+/// receive and transmit alike. Twice SAMPLE_RATE_HZ's link load (~12 MB/s
+/// each way).
+pub const DIRECT_SAMPLE_RATE_HZ: u32 = 3_072_000;
+
+/// The stream's rate: the wide stream, or the normal one at
+/// SAMPLE_RATE_HZ through the FPGA, or at DIRECT_SAMPLE_RATE_HZ without
+/// it (`direct`).
+pub fn sample_rate_hz(wide: bool, direct: bool) -> u32 {
     if wide {
         WIDE_SAMPLE_RATE_HZ
+    } else if direct {
+        DIRECT_SAMPLE_RATE_HZ
     } else {
         SAMPLE_RATE_HZ
     }
+}
+
+/// Whether the FPGA's decimate-by-8 delivers the rate it reports, timed
+/// over a few buffers at connect. REAL MEASUREMENT (Pluto clone running
+/// F5OEO's Tezuka v0.3.24, 2026-11-01): with cf-ad9361-lpc reporting
+/// phy/8, exactly 40% of that arrived at every rate tried (phy/20), so
+/// the receiver lost 60% of its samples; the TX side's interpolation was
+/// off too (the DAC took samples ~2x too fast). Analog Devices' own
+/// firmware delivers the full rate. Leaves the Pluto at the normal rate.
+pub fn fpga_rate_conversion_ok(addr: SocketAddr) -> io::Result<bool> {
+    let mut device = PlutoDevice::connect(addr)?;
+    device.set_stream_rate(SAMPLE_RATE_HZ)?;
+    let mut stream = RxStream::open(addr, BUFFER_SAMPLES)?;
+    let mut buf = vec![0u8; BUFFER_SAMPLES * 4];
+    for _ in 0..RATE_CHANGE_STALE_BUFFERS {
+        stream.read(&mut buf)?;
+    }
+    let buffers = 12;
+    let start = std::time::Instant::now();
+    for _ in 0..buffers {
+        stream.read(&mut buf)?;
+    }
+    let rate = (buffers * BUFFER_SAMPLES) as f64 / start.elapsed().as_secs_f64();
+    Ok(rate > 0.8 * SAMPLE_RATE_HZ as f64)
 }
 
 /// The FPGA's fixed decimation (cf-ad9361-lpc's only other rate).
@@ -375,13 +412,16 @@ impl PlutoDevice {
         self.iiod.write_attr(&format!("{PHY} INPUT voltage0"), "hardwaregain", &gain_db.min(MAX_GAIN_DB).to_string())
     }
 
-    /// The receiver's own stream rate: SAMPLE_RATE_HZ, or with `wide`
-    /// WIDE_SAMPLE_RATE_HZ. Works with the stream open.
-    pub fn set_stream_rate(&mut self, wide: bool) -> io::Result<()> {
-        if wide {
-            self.set_rates(WIDE_SAMPLE_RATE_HZ, WIDE_SAMPLE_RATE_HZ, WIDE_RF_BANDWIDTH_HZ)
-        } else {
-            self.set_rates(SAMPLE_RATE_HZ * FPGA_DECIMATION, SAMPLE_RATE_HZ, SAMPLE_RATE_HZ)
+    /// The session's stream rate (see sample_rate_hz): WIDE_SAMPLE_RATE_HZ,
+    /// DIRECT_SAMPLE_RATE_HZ, or SAMPLE_RATE_HZ through the FPGA. Works
+    /// with the stream open.
+    pub fn set_stream_rate(&mut self, rate_hz: u32) -> io::Result<()> {
+        match rate_hz {
+            WIDE_SAMPLE_RATE_HZ => self.set_rates(WIDE_SAMPLE_RATE_HZ, WIDE_SAMPLE_RATE_HZ, WIDE_RF_BANDWIDTH_HZ),
+            // The same analog filter as through the FPGA: the widest
+            // output rate is still SAMPLE_RATE_HZ.
+            DIRECT_SAMPLE_RATE_HZ => self.set_rates(DIRECT_SAMPLE_RATE_HZ, DIRECT_SAMPLE_RATE_HZ, SAMPLE_RATE_HZ),
+            _ => self.set_rates(SAMPLE_RATE_HZ * FPGA_DECIMATION, SAMPLE_RATE_HZ, SAMPLE_RATE_HZ),
         }
     }
 
@@ -433,14 +473,15 @@ impl PlutoDevice {
 }
 
 /// Configures the receive side, opens the stream and returns the
-/// control and streaming halves. `wide`: stream at WIDE_SAMPLE_RATE_HZ
-/// rather than SAMPLE_RATE_HZ.
+/// control and streaming halves. `rate_hz`: the stream's rate, from
+/// sample_rate_hz.
 pub fn initialise(
     addr: SocketAddr,
     frequency_hz: u32,
     gain_db: u32,
-    wide: bool,
+    rate_hz: u32,
 ) -> io::Result<(PlutoDevice, RxStream, String)> {
+    let wide = rate_hz == WIDE_SAMPLE_RATE_HZ;
     let mut iiod = Iiod::connect(addr)?;
     let xml = iiod.print_xml()?;
     let model = context_attribute(&xml, "hw_model").unwrap_or_else(|| "AD936x".to_string());
@@ -452,7 +493,7 @@ pub fn initialise(
     // of the TX port.
     iiod.write_attr(&format!("{PHY} OUTPUT altvoltage1"), "powerdown", "1")?;
     let mut device = PlutoDevice { iiod };
-    device.set_stream_rate(wide)?;
+    device.set_stream_rate(rate_hz)?;
     device.set_center_freq(frequency_hz)?;
     device.set_gain(gain_db)?;
 
@@ -560,11 +601,12 @@ impl Drop for TxStream {
     }
 }
 
-/// TX I/Q from the app's 48 kHz to the Pluto's SAMPLE_RATE_HZ: a
-/// polyphase FIR interpolating by TX_INTERPOLATION.
+/// TX I/Q from the app's 48 kHz to the Pluto's stream rate (SAMPLE_RATE_HZ,
+/// or DIRECT_SAMPLE_RATE_HZ): a polyphase FIR interpolating by their
+/// ratio (TxInterpolator::interpolation).
 pub const TX_INPUT_RATE_HZ: u32 = 48_000;
-pub const TX_INTERPOLATION: usize = (SAMPLE_RATE_HZ / TX_INPUT_RATE_HZ) as usize;
-/// Taps per polyphase branch: TX_INTERPOLATION * this in all. With a
+/// Taps per polyphase branch: interpolation * this in all, so the filter
+/// lengthens with the ratio and keeps the same response in Hz. With a
 /// Kaiser window (beta 8) that passes +-20 kHz and is down >80 dB from
 /// 28 kHz -- where the first image of anything in +-20 kHz lands.
 const TX_TAPS_PER_PHASE: usize = 31;
@@ -579,20 +621,15 @@ pub struct TxInterpolator {
     pos: usize,
 }
 
-impl Default for TxInterpolator {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl TxInterpolator {
-    pub fn new() -> Self {
-        let l = TX_INTERPOLATION;
+    /// To `output_rate_hz`, a whole multiple of TX_INPUT_RATE_HZ.
+    pub fn new(output_rate_hz: u32) -> Self {
+        let l = (output_rate_hz / TX_INPUT_RATE_HZ) as usize;
         let n = l * TX_TAPS_PER_PHASE;
         let centre = (n - 1) as f64 / 2.0;
         // Cutoff midway between the passband (20 kHz) and the first
         // image (28 kHz), as a fraction of the output rate.
-        let fc = 24_000.0 / SAMPLE_RATE_HZ as f64;
+        let fc = 24_000.0 / output_rate_hz as f64;
         let beta = 8.0;
         let bessel_i0 = |x: f64| {
             let (mut sum, mut term, mut k) = (1.0, 1.0, 1.0);
@@ -626,7 +663,12 @@ impl TxInterpolator {
         Self { branches, history_i: [0.0; 2 * TX_TAPS_PER_PHASE], history_q: [0.0; 2 * TX_TAPS_PER_PHASE], pos: 0 }
     }
 
-    /// One input sample in, TX_INTERPOLATION outputs out via `emit`.
+    /// Outputs per input sample.
+    pub fn interpolation(&self) -> usize {
+        self.branches.len()
+    }
+
+    /// One input sample in, interpolation() outputs out via `emit`.
     pub fn push(&mut self, i: f32, q: f32, mut emit: impl FnMut(f32, f32)) {
         // Newest first from `pos`: write the new sample just before the
         // previous newest.
@@ -680,12 +722,19 @@ mod tests {
         assert!(found.iter().any(|ip| probe(*ip).is_some()), "no Pluto answered");
     }
 
-    /// A 10 kHz tone through the TX interpolator: it comes out at the
-    /// same amplitude, and every image (48 kHz +- 10 kHz and up) is more
-    /// than 70 dB down.
+    /// A 10 kHz tone through the TX interpolator, at both stream rates:
+    /// it comes out at the same amplitude, and every image (48 kHz +- 10
+    /// kHz and up) is more than 70 dB down.
     #[test]
     fn tx_interpolator_passes_the_tone_and_rejects_images() {
-        let mut interp = TxInterpolator::new();
+        for rate in [SAMPLE_RATE_HZ, DIRECT_SAMPLE_RATE_HZ] {
+            interpolator_check(rate);
+        }
+    }
+
+    fn interpolator_check(output_rate_hz: u32) {
+        let mut interp = TxInterpolator::new(output_rate_hz);
+        assert_eq!(interp.interpolation(), (output_rate_hz / TX_INPUT_RATE_HZ) as usize);
         let (fs_in, tone) = (TX_INPUT_RATE_HZ as f64, 10_000.0);
         let mut out = Vec::new();
         for n in 0..4096 {
@@ -693,7 +742,7 @@ mod tests {
             interp.push(ph.cos() as f32, ph.sin() as f32, |i, q| out.push((i as f64, q as f64)));
         }
         // Past the filter's start-up, a whole number of tone cycles.
-        let fs = SAMPLE_RATE_HZ as f64;
+        let fs = output_rate_hz as f64;
         let len = 65_536;
         let x = &out[out.len() - len..];
         let level = |f: f64| {
@@ -720,13 +769,22 @@ mod tests {
     #[test]
     #[ignore]
     fn streams_from_a_real_pluto() {
-        stream_test(false);
+        // The normal stream as a session would pick it.
+        let ok = fpga_rate_conversion_ok(SocketAddr::new(test_ip(), IIOD_PORT)).unwrap();
+        println!("FPGA rate conversion {}", if ok { "works" } else { "is off: direct" });
+        stream_test(sample_rate_hz(false, !ok));
+    }
+
+    #[test]
+    #[ignore]
+    fn streams_direct_from_a_real_pluto() {
+        stream_test(DIRECT_SAMPLE_RATE_HZ);
     }
 
     #[test]
     #[ignore]
     fn streams_wide_from_a_real_pluto() {
-        stream_test(true);
+        stream_test(WIDE_SAMPLE_RATE_HZ);
     }
 
     /// The transponder view switches rates with the stream open: wide ->
@@ -735,7 +793,8 @@ mod tests {
     #[ignore]
     fn switches_rate_with_the_stream_open() {
         let info = probe(test_ip()).expect("no Pluto there");
-        let (mut device, mut stream, _) = initialise(info.addr, 745_250_000, DEFAULT_GAIN_DB, true).unwrap();
+        let (mut device, mut stream, _) =
+            initialise(info.addr, 745_250_000, DEFAULT_GAIN_DB, WIDE_SAMPLE_RATE_HZ).unwrap();
         let mut buf = vec![0u8; stream.buffer_samples() * 4];
         let mut measure = |stream: &mut RxStream, label: &str| {
             // The first buffers can still hold the old rate's samples.
@@ -755,7 +814,7 @@ mod tests {
         let wide = measure(&mut stream, "wide");
         device.set_scan_rate().unwrap();
         let scan = measure(&mut stream, "scan");
-        device.set_stream_rate(true).unwrap();
+        device.set_stream_rate(WIDE_SAMPLE_RATE_HZ).unwrap();
         let back = measure(&mut stream, "wide again");
         assert!((wide - WIDE_SAMPLE_RATE_HZ as f64).abs() < 0.03 * WIDE_SAMPLE_RATE_HZ as f64);
         // Faster than wide, but the link can't keep up with all of it.
@@ -763,12 +822,12 @@ mod tests {
         assert!((back - WIDE_SAMPLE_RATE_HZ as f64).abs() < 0.03 * WIDE_SAMPLE_RATE_HZ as f64);
     }
 
-    fn stream_test(wide: bool) {
+    fn stream_test(rate_hz: u32) {
         let info = probe(test_ip()).expect("no Pluto there");
         println!("range {}..{} Hz, mac {:02x?}", info.frequency_min_hz, info.frequency_max_hz, info.mac());
-        let (mut device, mut stream, name) = initialise(info.addr, 432_474_000, DEFAULT_GAIN_DB, wide).unwrap();
+        let (mut device, mut stream, name) = initialise(info.addr, 432_474_000, DEFAULT_GAIN_DB, rate_hz).unwrap();
         println!("{name}");
-        let expected = sample_rate_hz(wide) as f64;
+        let expected = rate_hz as f64;
         let mut buf = vec![0u8; stream.buffer_samples() * 4];
         let start = std::time::Instant::now();
         let mut buffers = 0;

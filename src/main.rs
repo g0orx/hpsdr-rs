@@ -2547,10 +2547,23 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
     // RTL-SDR / MSi2500: same idea -- only rates rtlsdr.rs can decimate to exactly.
     settings.mirisdr_wide =
         matches!(device.board, Boards::MsiSdr | Boards::Pluto) && cfg.mirisdr_wide.unwrap_or(false);
+    // Pluto: check the FPGA's rate conversion delivers what it reports --
+    // see pluto::fpga_rate_conversion_ok (it doesn't on Tezuka). The wide
+    // stream doesn't use it, so isn't checked. If the check itself fails,
+    // RadioSession::start's own connection will report why.
+    if device.board == Boards::Pluto && !settings.mirisdr_wide {
+        settings.pluto_direct = matches!(pluto::fpga_rate_conversion_ok(device.address), Ok(false));
+        if settings.pluto_direct {
+            println!(
+                "Pluto: its FPGA rate conversion doesn't deliver the reported rate; streaming at {} Hz directly",
+                pluto::DIRECT_SAMPLE_RATE_HZ
+            );
+        }
+    }
     let dongle_input_rate = if device.board == Boards::MsiSdr {
         mirisdr::sample_rate_hz(settings.mirisdr_wide)
     } else if device.board == Boards::Pluto {
-        pluto::sample_rate_hz(settings.mirisdr_wide)
+        pluto::sample_rate_hz(settings.mirisdr_wide, settings.pluto_direct)
     } else {
         rtlsdr::DONGLE_RATE_HZ
     };
