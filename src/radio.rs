@@ -401,10 +401,21 @@ fn ps_feedback_config(protocol: u8, board: Boards) -> Option<(u8, u8, Option<u8>
             | Boards::Pluto
             | Boards::Unknown => None,
         },
-        // P2: DDC0/DDC1 reservation is universal, not board-dependent --
-        // confirmed via new_protocol.c, no per-board variation in that
-        // branch unlike P1's.
-        2 => Some((0, 1, None)),
+        // P2: DDC0/DDC1 are reserved, with receivers from DDC2, only on
+        // the boards piHPSDR/deskHPSDR offset (new_protocol.c: "for
+        // HERMES, receiver[i] is associated with DDC(i) but beyond (that
+        // is, ANGELIA, ORION, ORION2) receiver[i] is associated with
+        // DDC(i+2)"; deskHPSDR adds Saturn). This used to apply to every
+        // P2 board. REAL REPORT (2026-11-01, Brick2: Hermes, 2 DDCs): its
+        // one receiver went to DDC2, which it doesn't have, and no IQ came
+        // back. On Hermes-class boards piHPSDR shares DDC0/DDC1 between
+        // the receivers and PureSignal's feedback during TX, which this
+        // project's whole-session reservation doesn't do -- so no
+        // PureSignal there on P2 for now.
+        2 => match board {
+            Boards::Angelia | Boards::Orion | Boards::Orion2 | Boards::Saturn => Some((0, 1, None)),
+            _ => None,
+        },
         _ => None,
     }
 }

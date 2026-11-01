@@ -9,8 +9,9 @@ both reserve extra receiver resources on the radio in incompatible ways, so
 only one can be enabled at a time.
 
 The tab is hidden on radios this doesn't support: Metis and the original
-Hermes-Lite (their two receivers can't spare the feedback pair), and the
-receive-only USB devices.
+Hermes-Lite (their two receivers can't spare the feedback pair), Hermes-class
+boards (Hermes, Hermes II, Atlas -- and radios that report as one, such as
+the Brick2) on Protocol 2, and the receive-only USB devices.
 
 ![PureSignal settings tab before enabling](images/08-puresignal-tab.png)
 

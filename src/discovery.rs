@@ -163,8 +163,17 @@ impl Device {
         let mac = [buf[5], buf[6], buf[7], buf[8], buf[9], buf[10]];
         let board_id = buf[11];
         let version = buf[13];
-        let (board, adcs, supported_receivers, supported_transmitters, frequency_min, frequency_max) =
+        let (board, adcs, table_receivers, supported_transmitters, frequency_min, frequency_max) =
             board_info_p2(board_id);
+        // Byte 20 is the number of DDCs the firmware implements (P2 spec;
+        // deskHPSDR logs it as such). It wins over the board table, which
+        // only knows the board type: REAL REPORT (2026-11-01, Brick2, board
+        // id 1 = Hermes, 2 DDCs) -- the table's 5 had us enabling DDCs the
+        // radio doesn't have. 0 (or a short reply) falls back to the table.
+        let supported_receivers = match buf.get(20) {
+            Some(&n) if n > 0 => n,
+            _ => table_receivers,
+        };
 
         Some(Device {
             address: src,
@@ -743,4 +752,28 @@ pub fn manual_discovery(devices: Arc<Mutex<Vec<Device>>>, target_ip: IpAddr) -> 
     }
 
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A Brick2's real P2 discovery reply (from a Wireshark capture,
+    /// 2026-11-01): board id 1 (Hermes), 2 DDCs in byte 20.
+    #[test]
+    fn p2_reply_takes_the_ddc_count_from_the_radio() {
+        let mut reply = vec![0u8; 60];
+        reply[4..24].copy_from_slice(&[
+            0x02, 0x00, 0x1c, 0xc0, 0xa2, 0x22, 0x5c, 0x01, 0x26, 0x78, 0, 0, 0, 0, 0, 0, 0x02, 0x01, 0, 0,
+        ]);
+        let addr: SocketAddr = "192.168.1.22:1024".parse().unwrap();
+        let device = Device::from_p2_reply(&reply, addr, addr).unwrap();
+        assert_eq!(device.board, Boards::Hermes);
+        assert_eq!(device.supported_receivers, 2);
+        // Its receivers start at DDC0: no DDC0/DDC1 reservation.
+        assert!(!crate::radio::puresignal_supported(2, device.board));
+        // A reply without the count keeps the board table's.
+        reply[20] = 0;
+        assert_eq!(Device::from_p2_reply(&reply, addr, addr).unwrap().supported_receivers, 5);
+    }
 }
