@@ -775,6 +775,32 @@ mod tests {
         stream_test(sample_rate_hz(false, !ok));
     }
 
+    /// RF Gain sweep: raw I/Q at each gain, for choosing the setting
+    /// offline. HPSDR_PLUTO_SWEEP_DIR names the output directory and
+    /// HPSDR_PLUTO_SWEEP_HZ the centre frequency.
+    #[test]
+    #[ignore]
+    fn gain_sweep_on_a_real_pluto() {
+        let dir = std::path::PathBuf::from(std::env::var("HPSDR_PLUTO_SWEEP_DIR").expect("HPSDR_PLUTO_SWEEP_DIR"));
+        let centre: u32 = std::env::var("HPSDR_PLUTO_SWEEP_HZ").expect("HPSDR_PLUTO_SWEEP_HZ").parse().unwrap();
+        let info = probe(test_ip()).expect("no Pluto there");
+        let (mut device, mut stream, _) = initialise(info.addr, centre, 0, DIRECT_SAMPLE_RATE_HZ).unwrap();
+        let mut buf = vec![0u8; stream.buffer_samples() * 4];
+        for gain in (0..=70).step_by(5).chain([MAX_GAIN_DB]) {
+            device.set_gain(gain).unwrap();
+            for _ in 0..RATE_CHANGE_STALE_BUFFERS {
+                stream.read(&mut buf).unwrap();
+            }
+            let mut out = Vec::new();
+            for _ in 0..64 {
+                stream.read(&mut buf).unwrap();
+                out.extend_from_slice(&buf);
+            }
+            std::fs::write(dir.join(format!("gain{gain:02}.ci16")), &out).unwrap();
+            println!("gain {gain} dB: {} samples", out.len() / 4);
+        }
+    }
+
     #[test]
     #[ignore]
     fn streams_direct_from_a_real_pluto() {

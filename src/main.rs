@@ -1001,6 +1001,18 @@ fn rx_gain_slider(ui: &mut egui::Ui, connected: &mut ConnectedState) -> bool {
     changed
 }
 
+/// The Pluto's spectrum/S-meter offset (spectrum::DemodParams::
+/// rf_gain_offset_db) for RF Gain `gain_db`: takes the gain back out, so
+/// levels stay put as the gain changes. Relative to pluto::DEFAULT_GAIN_DB,
+/// so at the default nothing moves and existing display ranges and S-meter
+/// calibration still hold. The AD936x's manual gain is close to dB for dB:
+/// measured on the QO-100 narrowband transponder (2026-11-03), the noise
+/// rose from -63.2 to -18.4 dBFS (44.8 dB) for gains 0 -> 50, and the
+/// beacon with it.
+fn pluto_rf_gain_offset_db(gain_db: u32) -> f64 {
+    pluto::DEFAULT_GAIN_DB as f64 - gain_db.min(pluto::MAX_GAIN_DB) as f64
+}
+
 /// Display label for a MIDI action, given the currently connected radio
 /// -- same board/protocol-dependent naming as Settings -> RX's own
 /// slider (see dispatch_midi_event's RfAttenuation arm and
@@ -3794,6 +3806,11 @@ impl eframe::App for HpsdrApp {
                 let rx_effective_pan =
                     if rx_max_pan_hz > 0.0 { (rx_pan_offset_hz / rx_max_pan_hz) as f32 } else { 0.0 };
                 connected.spectrum.set_zoom_pan(connected.spectrum_zoom, rx_effective_pan);
+                if connected.device.board == Boards::Pluto {
+                    connected.spectrum.set_rf_gain_offset_db(pluto_rf_gain_offset_db(
+                        connected.session.rx_attenuation.load(Ordering::Relaxed),
+                    ));
+                }
                 // TX has no CTUN concept -- tx_spectrum's own generated IQ
                 // is always centered on the real TX carrier (see the "force
                 // ctun_offset_hz to 0 while transmitting" passband-overlay

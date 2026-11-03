@@ -128,8 +128,20 @@ set up the [QO-100 transverter](18-xvtr.md#example-qo-100-with-an-lnb).
 **RF Gain** (0-71 dB), on the main window next to AGC Gain, sets the
 AD9363's receive gain (its LNA, mixer and baseband stages together). The
 default is 40 dB. Lower it if strong signals cause spurs or a raised
-noise floor. On QO-100 with an LNB, 40-50 dB is a good starting point.
-The **RF Attenuation** MIDI control drives this too.
+noise floor. The **RF Attenuation** MIDI control drives this too.
+
+The spectrum, waterfall and S-meter take RF Gain back out, so signal
+levels and the noise floor stay put as you change it (to within about 3
+dB, as the chip's gain steps aren't perfectly even). They read as they
+would at the default 40 dB.
+
+On QO-100's narrowband transponder, with the Pluto at the dish and only a
+short lead from the LNB, anything from 15 to 45 dB gave the same
+signal-to-noise ratio: below that the Pluto's own noise takes over, and
+from 50 dB the strongest samples near full scale (clipping from 60 dB).
+**30 dB** is a good setting, leaving plenty of room for strong signals.
+With a long coax run from the LNB, or a different LNB, the best setting
+will be somewhat higher.
 
 ## Sample rate
 

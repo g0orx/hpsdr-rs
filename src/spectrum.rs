@@ -617,6 +617,11 @@ pub struct DemodParams {
     /// these false.
     pub charly25_preamp1: bool,
     pub charly25_preamp2: bool,
+    /// Added to the spectrum/waterfall and S-meter, like the Charly25
+    /// offset above, so they read the same whatever the front end's gain:
+    /// on a Pluto -(RF Gain - pluto::DEFAULT_GAIN_DB), set by main.rs
+    /// (pluto_rf_gain_offset_db). 0 elsewhere.
+    pub rf_gain_offset_db: f64,
 }
 
 impl Default for DemodParams {
@@ -672,6 +677,7 @@ impl Default for DemodParams {
             meter_calibration_db: 0.0,
             charly25_preamp1: false,
             charly25_preamp2: false,
+            rf_gain_offset_db: 0.0,
         }
     }
 }
@@ -1807,8 +1813,10 @@ fn run(
         // additive, independent of meter_calibration_db below. Computed
         // once here since both the spectrum/waterfall correction below
         // and the S-meter correction further down need the same value.
-        let charly25_offset_db =
-            -18.0 * (params.charly25_preamp1 as i32 + params.charly25_preamp2 as i32) as f64;
+        // The RF Gain offset (DemodParams::rf_gain_offset_db) rides along
+        // with it.
+        let charly25_offset_db = -18.0 * (params.charly25_preamp1 as i32 + params.charly25_preamp2 as i32) as f64
+            + params.rf_gain_offset_db;
 
         let (spectrum, waterfall) = analyzer.feed(&chunk);
         if spectrum.is_some() || waterfall.is_some() {
@@ -2316,6 +2324,11 @@ impl SpectrumHandle {
     }
     pub fn set_charly25_preamp2(&self, v: bool) {
         self.demod_params.lock().unwrap().charly25_preamp2 = v;
+    }
+
+    /// See DemodParams::rf_gain_offset_db.
+    pub fn set_rf_gain_offset_db(&self, v: f64) {
+        self.demod_params.lock().unwrap().rf_gain_offset_db = v;
     }
 
     pub fn noise_blanker(&self) -> NoiseBlanker {
