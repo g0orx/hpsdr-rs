@@ -188,7 +188,7 @@ fn sigmf_meta(rate_hz: u32, datetime: &str, description: &str, dropped_blocks: u
 }
 
 /// UTC now as `YYYY-MM-DDTHH:MM:SSZ`.
-fn iso8601_now() -> String {
+pub(crate) fn iso8601_now() -> String {
     let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
     iso8601(secs)
 }

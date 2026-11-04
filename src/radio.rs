@@ -3710,7 +3710,8 @@ fn pluto_receiver_loop(
             // The first window also counts the stream's start-up delay.
             if (window_samples as f64) < expected * 0.995 {
                 eprintln!(
-                    "Pluto: received {:.1}% of the expected samples over {elapsed:.1} s -- some were lost",
+                    "{} Pluto: received {:.1}% of the expected samples over {elapsed:.1} s -- some were lost",
+                    crate::iq_recorder::iso8601_now(),
                     100.0 * window_samples as f64 / expected
                 );
             }
