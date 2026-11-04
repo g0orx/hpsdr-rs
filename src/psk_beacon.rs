@@ -423,11 +423,19 @@ struct BeaconCore {
     sample_count: usize,
     energy: [f32; SAMPLES_PER_BIT],
     symbol_phase: usize,
+    /// Samples since the last bit was taken, and how many until the next
+    /// (SAMPLES_PER_BIT, or one either side when the phase moves) -- see
+    /// demod_sample. None until the first bit.
+    since_bit: Option<usize>,
+    next_bit_in: usize,
     prev_symbol: Option<Cx>,
     shift: u32,
     frame: Option<Vec<u8>>,
     byte: u8,
     byte_bits: u8,
+    /// Tests only: each bit's differential product, before slicing.
+    #[cfg(test)]
+    soft: Vec<f32>,
 }
 
 impl BeaconCore {
@@ -458,11 +466,15 @@ impl BeaconCore {
             sample_count: 0,
             energy: [0.0; SAMPLES_PER_BIT],
             symbol_phase: 0,
+            since_bit: None,
+            next_bit_in: SAMPLES_PER_BIT,
             prev_symbol: None,
             shift: 0,
             frame: None,
             byte: 0,
             byte_bits: 0,
+            #[cfg(test)]
+            soft: Vec::new(),
         }
     }
 
@@ -495,6 +507,7 @@ impl BeaconCore {
         self.mf.iter_mut().for_each(|v| *v = Cx::default());
         self.mf_pos = 0;
         self.energy = [0.0; SAMPLES_PER_BIT];
+        self.since_bit = None;
         self.prev_symbol = None;
         self.shift = 0;
         self.frame = None;
@@ -616,23 +629,49 @@ impl BeaconCore {
 
         // Symbol timing: the sample phase (within a bit) with the most
         // matched-filter energy, averaged over ~32 bits. Switching only
-        // on a clear winner avoids flapping between neighbours. The
-        // beacon and receiver clocks agree to a tiny fraction of a
-        // sample per second, so no finer tracking is needed.
+        // on a clear winner avoids flapping between neighbours. Decided
+        // as each bit is taken, moving one sample at a time the shortest
+        // way round, and the next bit is timed from this one -- so bits
+        // are always 23-25 samples apart.
+        //
+        // REAL REPORT (2026-11-04, Pluto on the beacon): over half the
+        // frames failed their CRC at an Eb/N0 (~13.7 dB) that should
+        // decode nearly all of them. The decision used to be made on the
+        // sample at phase 23, before that sample's own bit check: a move
+        // 22 -> 23 then took the same bit again one sample later, and
+        // 23 -> 22 skipped one (47 samples) -- either way the rest of the
+        // frame was lost. The clocks drift through every phase in turn (a
+        // real Pluto clone was 16 ppm out: one whole bit every ~156 s), so
+        // this hit about one frame in 15 at that offset, and more as noise
+        // moves the broad energy peak back and forth.
         let phase = self.sample_count % SAMPLES_PER_BIT;
         self.sample_count = self.sample_count.wrapping_add(1);
         self.energy[phase] += (out.norm_sqr() - self.energy[phase]) / 32.0;
-        if phase == SAMPLES_PER_BIT - 1 {
-            let best = (0..SAMPLES_PER_BIT).max_by(|&a, &b| self.energy[a].total_cmp(&self.energy[b])).unwrap();
-            if self.energy[best] > 1.2 * self.energy[self.symbol_phase] {
-                self.symbol_phase = best;
+        match self.since_bit.as_mut() {
+            // The first bit is at the chosen phase.
+            None if phase != self.symbol_phase => return,
+            None => {}
+            Some(since) => {
+                *since += 1;
+                if *since < self.next_bit_in {
+                    return;
+                }
             }
         }
-        if phase != self.symbol_phase {
-            return;
-        }
+        self.since_bit = Some(0);
+        let best = (0..SAMPLES_PER_BIT).max_by(|&a, &b| self.energy[a].total_cmp(&self.energy[b])).unwrap();
+        let step = if self.energy[best] > 1.2 * self.energy[self.symbol_phase] {
+            let n = SAMPLES_PER_BIT as i64;
+            ((best as i64 - self.symbol_phase as i64 + n + n / 2).rem_euclid(n) - n / 2).signum()
+        } else {
+            0
+        };
+        self.symbol_phase = (self.symbol_phase as i64 + step).rem_euclid(SAMPLES_PER_BIT as i64) as usize;
+        self.next_bit_in = (SAMPLES_PER_BIT as i64 + step) as usize;
         if let Some(prev) = self.prev_symbol {
             let d = out.re * prev.re + out.im * prev.im;
+            #[cfg(test)]
+            self.soft.push(d);
             self.push_bit(d < 0.0);
         }
         self.prev_symbol = Some(out);
@@ -1211,10 +1250,164 @@ mod tests {
         (out, freq)
     }
 
+    /// modulate_iq's signal with the beacon's bit clock `ppm` off the
+    /// receiver's (each bit `rate / 400 * (1 + ppm / 1e6)` samples, so the
+    /// bit timing drifts through the receiver's samples), on a fixed
+    /// carrier. `noise` per component, relative to the signal's 1.
+    fn modulate_iq_clock(bytes: &[u8], rate: f64, carrier_hz: f64, noise: f64, ppm: f64) -> Vec<IqSample> {
+        let spb = rate / 400.0 * (1.0 + ppm / 1e6);
+        let bits: Vec<bool> = bytes.iter().flat_map(|&b| (0..8).rev().map(move |k| (b >> k) & 1 == 1)).collect();
+        let mut signs = Vec::with_capacity(bits.len());
+        let mut sign = 1.0f64;
+        for &bit in &bits {
+            if bit {
+                sign = -sign;
+            }
+            signs.push(sign);
+        }
+        let mut rng = Lcg(6789);
+        let scale = IQ_NORM as f64 * 0.01;
+        let total = (bits.len() as f64 * spb) as usize;
+        (0..total)
+            .map(|n| {
+                let t = n as f64 / spb;
+                let (bit, within) = (t as usize, t.fract());
+                let chip = if within < 0.5 { signs[bit] } else { -signs[bit] };
+                let phase = 2.0 * PI * carrier_hz * n as f64 / rate;
+                IqSample {
+                    q: (scale * (chip * phase.cos() + noise * rng.gauss())) as i32,
+                    i: (scale * (chip * phase.sin() + noise * rng.gauss())) as i32,
+                }
+            })
+            .collect()
+    }
+
+    /// 20 frames (~3.5 minutes) at a real beacon's Eb/N0 (~13.7 dB) with
+    /// the beacon's bit clock off the receiver's by a real Pluto clone's
+    /// 16 ppm, both ways: every frame must decode, and the same number of
+    /// bits come out whatever the offset. Before demod_sample's timing fix
+    /// a frame slipped each time the drift took the timing past phase 23
+    /// (19 and 18 of 20 here). At 48 kHz, Eb/N0 = rate / (800 sigma^2), so
+    /// sigma = 1.6 for 23.4 (13.7 dB). On demand (a few seconds in release,
+    /// minutes in debug): `cargo test --release clocks_16_ppm -- --ignored`.
+    #[test]
+    #[ignore]
+    fn decodes_every_frame_with_the_clocks_16_ppm_apart() {
+        let rate = 48_000.0;
+        // ~4 s lead-in: the wide search takes ~2 s to find the carrier.
+        let mut bytes = vec![0x50u8; 200];
+        for k in 0..20 {
+            bytes.extend(frame_bytes((b'A' + k as u8) as char, "clock test"));
+            bytes.extend(vec![0x50u8; 30]);
+        }
+        let mut results = Vec::new();
+        for ppm in [0.0, 16.0, -16.0] {
+            let iq = modulate_iq_clock(&bytes, rate, 300.0, 1.6, ppm);
+            let status = Arc::new(Mutex::new(BeaconStatus::default()));
+            let mut mon = BeaconMonitor::new(Arc::clone(&status));
+            for block in iq.chunks(2048) {
+                mon.process(block, rate, Some(0.0));
+            }
+            let st = status.lock().unwrap().clone();
+            println!(
+                "{ppm:+} ppm: {} ok, {} bad; {} bits out of {} sent",
+                st.frames_ok,
+                st.frames_bad,
+                mon.core.soft.len(),
+                bytes.len() * 8
+            );
+            results.push((ppm, st.frames_ok, st.frames_bad));
+        }
+        for (ppm, ok, bad) in results {
+            assert_eq!((ok, bad), (20, 0), "{ppm:+} ppm");
+        }
+    }
+
     #[test]
     fn crc_of_frame_with_crc_is_zero() {
         let f = frame_bytes('L', "HI de test");
         assert_eq!(crc16_ccitt(&f[4..], 0xFFFF), 0);
+    }
+
+    /// A real SigMF ci16 recording (HPSDR_BEACON_RECORDING, the
+    /// .sigmf-data path), shifted to put HPSDR_BEACON_CENTRE_HZ (RF) at
+    /// the centre and decimated by HPSDR_BEACON_DECIMATE (default 4), then
+    /// fed to the monitor the way spectrum.rs does. Prints what it decoded
+    /// and the soft decisions' statistics: their spread gives the bit error
+    /// rate the demodulator is achieving, which a 10 s recording -- shorter
+    /// than one 10.4 s frame -- can't show through CRCs.
+    #[test]
+    #[ignore]
+    fn decodes_a_recording() {
+        let path = std::env::var("HPSDR_BEACON_RECORDING").expect("HPSDR_BEACON_RECORDING");
+        let centre: f64 = std::env::var("HPSDR_BEACON_CENTRE_HZ").expect("HPSDR_BEACON_CENTRE_HZ").parse().unwrap();
+        let decimate: usize = std::env::var("HPSDR_BEACON_DECIMATE").ok().and_then(|v| v.parse().ok()).unwrap_or(4);
+        let meta: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(path.replace(".sigmf-data", ".sigmf-meta")).unwrap()).unwrap();
+        let in_rate = meta["global"]["core:sample_rate"].as_f64().unwrap();
+        let fc = meta["captures"][0]["core:frequency"].as_f64().unwrap();
+        let rate = in_rate / decimate as f64;
+        let shift = centre - fc;
+        let raw = std::fs::read(&path).unwrap();
+        let taps = 32 * decimate + 1;
+        let cut = 0.4 / decimate as f64;
+        let h: Vec<f64> = (0..taps)
+            .map(|k| {
+                let t = k as f64 - (taps - 1) as f64 / 2.0;
+                let sinc = if t == 0.0 { 2.0 * cut } else { (2.0 * PI * cut * t).sin() / (PI * t) };
+                sinc * (0.54 - 0.46 * (2.0 * PI * k as f64 / (taps - 1) as f64).cos())
+            })
+            .collect();
+        let x: Vec<(f64, f64)> = raw
+            .chunks_exact(4)
+            .enumerate()
+            .map(|(n, p)| {
+                let (re, im) = (i16::from_le_bytes([p[0], p[1]]) as f64, i16::from_le_bytes([p[2], p[3]]) as f64);
+                let ph = -2.0 * PI * shift * n as f64 / in_rate;
+                (re * ph.cos() - im * ph.sin(), re * ph.sin() + im * ph.cos())
+            })
+            .collect();
+        let iq: Vec<IqSample> = (0..(x.len() - taps) / decimate)
+            .map(|m| {
+                let (mut re, mut im) = (0.0, 0.0);
+                for (k, &hk) in h.iter().enumerate() {
+                    re += hk * x[m * decimate + k].0;
+                    im += hk * x[m * decimate + k].1;
+                }
+                // q is the real part (see BeaconMonitor::process); ci16 to 24 bits.
+                IqSample { i: (im * 256.0) as i32, q: (re * 256.0) as i32 }
+            })
+            .collect();
+        let status = Arc::new(Mutex::new(BeaconStatus::default()));
+        let mut mon = BeaconMonitor::new(Arc::clone(&status));
+        let expected = BEACON_RF_HZ as f64 - centre;
+        for block in iq.chunks(1024) {
+            mon.process(block, rate, Some(expected));
+        }
+        let st = status.lock().unwrap().clone();
+        println!(
+            "{rate} Hz, beacon expected at {expected:+.0} Hz: offset {:?}, drift {:.2} Hz/s, frames {} ok {} bad",
+            st.offset_hz, st.drift_hz_per_s, st.frames_ok, st.frames_bad
+        );
+        let soft = &mon.core.soft;
+        // Skip the loops' settling.
+        let settled = &soft[soft.len().min(200)..];
+        let mean_abs = settled.iter().map(|d| d.abs() as f64).sum::<f64>() / settled.len().max(1) as f64;
+        let var = settled.iter().map(|d| (d.abs() as f64 - mean_abs).powi(2)).sum::<f64>() / settled.len().max(1) as f64;
+        let q = mean_abs / var.sqrt();
+        // Q(q) = erfc(q / sqrt 2) / 2, Abramowitz & Stegun 7.1.26.
+        let z = q / 2f64.sqrt();
+        let t = 1.0 / (1.0 + 0.327_591_1 * z);
+        let erfc = t
+            * (0.254_829_592 + t * (-0.284_496_736 + t * (1.421_413_741 + t * (-1.453_152_027 + t * 1.061_405_429))))
+            * (-z * z).exp();
+        let near_zero = settled.iter().filter(|d| (d.abs() as f64) < 0.25 * mean_abs).count();
+        println!(
+            "{} bits ({} settled): |d| mean/spread {q:.2}, Gaussian BER estimate {:.1e}, {near_zero} within 25% of zero",
+            soft.len(),
+            settled.len(),
+            erfc / 2.0
+        );
     }
 
     fn run_monitor(rate: f64, expected_offset: f64, actual_start: f64, drift: f64, noise: f64) -> (BeaconStatus, f64) {
