@@ -131,17 +131,20 @@ default is 40 dB. Lower it if strong signals cause spurs or a raised
 noise floor. The **RF Attenuation** MIDI control drives this too.
 
 The spectrum, waterfall and S-meter take RF Gain back out, so signal
-levels and the noise floor stay put as you change it (to within about 3
-dB, as the chip's gain steps aren't perfectly even). They read as they
-would at the default 40 dB.
+levels and the noise floor stay put as you change it. They read as they
+would at the default 40 dB. The chip's gain steps aren't 1 dB each, so
+below 1300 MHz (70cm, and the QO-100 LNB's IF) hpsdr-rs uses steps
+measured on a real Pluto; above that it assumes 1 dB per dB, which can
+be a few dB out.
 
 On QO-100's narrowband transponder, with the Pluto at the dish and only a
-short lead from the LNB, anything from 15 to 45 dB gave the same
-signal-to-noise ratio: below that the Pluto's own noise takes over, and
-from 50 dB the strongest samples near full scale (clipping from 60 dB).
-**30 dB** is a good setting, leaving plenty of room for strong signals.
-With a long coax run from the LNB, or a different LNB, the best setting
-will be somewhat higher.
+short lead from the LNB, every setting from 0 to 62 dB gave the same
+signal-to-noise ratio, within about 1 dB: the LNB's noise is far above
+the Pluto's own. The ADC starts to clip at 58 dB. **30 dB** is a good
+setting: the strongest samples stay over 20 dB below full scale, leaving
+room for strong signals. With a long coax run from the LNB, or a weaker
+LNB, low settings can lose signal-to-noise ratio; raise it until the
+noise floor stops improving.
 
 ## Sample rate
 

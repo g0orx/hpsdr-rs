@@ -1002,15 +1002,13 @@ fn rx_gain_slider(ui: &mut egui::Ui, connected: &mut ConnectedState) -> bool {
 }
 
 /// The Pluto's spectrum/S-meter offset (spectrum::DemodParams::
-/// rf_gain_offset_db) for RF Gain `gain_db`: takes the gain back out, so
-/// levels stay put as the gain changes. Relative to pluto::DEFAULT_GAIN_DB,
-/// so at the default nothing moves and existing display ranges and S-meter
-/// calibration still hold. The AD936x's manual gain is close to dB for dB:
-/// measured on the QO-100 narrowband transponder (2026-11-03), the noise
-/// rose from -63.2 to -18.4 dBFS (44.8 dB) for gains 0 -> 50, and the
-/// beacon with it.
-fn pluto_rf_gain_offset_db(gain_db: u32) -> f64 {
-    pluto::DEFAULT_GAIN_DB as f64 - gain_db.min(pluto::MAX_GAIN_DB) as f64
+/// rf_gain_offset_db) for RF Gain `gain_db` at LO `lo_hz`: takes the
+/// chip's actual gain (pluto::rx_gain_rel_db, measured -- its steps
+/// aren't 1 dB each) back out, so levels stay put as the gain changes.
+/// Relative to pluto::DEFAULT_GAIN_DB, so at the default nothing moves and
+/// existing display ranges and S-meter calibration still hold.
+fn pluto_rf_gain_offset_db(gain_db: u32, lo_hz: u32) -> f64 {
+    -pluto::rx_gain_rel_db(gain_db, lo_hz)
 }
 
 /// Display label for a MIDI action, given the currently connected radio
@@ -3809,6 +3807,7 @@ impl eframe::App for HpsdrApp {
                 if connected.device.board == Boards::Pluto {
                     connected.spectrum.set_rf_gain_offset_db(pluto_rf_gain_offset_db(
                         connected.session.rx_attenuation.load(Ordering::Relaxed),
+                        connected.session.frequency_hz.load(Ordering::Relaxed),
                     ));
                 }
                 // TX has no CTUN concept -- tx_spectrum's own generated IQ

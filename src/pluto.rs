@@ -140,6 +140,41 @@ pub const SAMPLE_FULL_SCALE: f64 = 2048.0;
 /// hardwaregain_available on a real clone). The slider stops at 0 --
 /// rx_attenuation is unsigned, and negative gain is never useful here.
 pub const MAX_GAIN_DB: u32 = 71;
+
+/// The AD936x's actual receive gain at RF Gain 0, 2, 4 ... 62 dB, relative
+/// to DEFAULT_GAIN_DB -- its gain table's steps aren't 1 dB each (and
+/// 30 -> 32 dB actually goes DOWN). Measured on a real Pluto clone
+/// (2026-11-03, gain_sweep_on_a_real_pluto): four QO-100 narrowband
+/// beacons at a 740 MHz LO, agreeing within ~0.3 dB. Above 62 dB the ADC
+/// clips, so the measurement isn't the gain any more; rx_gain_rel_db
+/// carries on at 1 dB per dB from there.
+const MEASURED_GAIN_REL_DB: [f64; 32] = [
+    -36.7, -35.0, -33.0, -30.8, -28.8, -26.9, -24.8, -22.8, -20.8, -19.3, -17.2, -15.3, -13.4, -11.4, -9.1, -7.1,
+    -8.4, -6.0, -4.1, -2.2, 0.0, 1.8, 3.8, 6.0, 7.7, 9.7, 10.1, 12.2, 14.2, 16.0, 18.0, 20.0,
+];
+/// The AD936x uses one gain table up to this LO and others above, so
+/// MEASURED_GAIN_REL_DB only holds below it.
+const MEASURED_GAIN_MAX_LO_HZ: u32 = 1_300_000_000;
+
+/// The receive gain at RF Gain `gain_db` and LO `lo_hz`, in dB relative to
+/// DEFAULT_GAIN_DB: measured below MEASURED_GAIN_MAX_LO_HZ (interpolating
+/// odd settings), 1 dB per dB elsewhere.
+pub fn rx_gain_rel_db(gain_db: u32, lo_hz: u32) -> f64 {
+    let gain_db = gain_db.min(MAX_GAIN_DB);
+    if lo_hz >= MEASURED_GAIN_MAX_LO_HZ {
+        return gain_db as f64 - DEFAULT_GAIN_DB as f64;
+    }
+    let last = (MEASURED_GAIN_REL_DB.len() - 1) * 2;
+    if gain_db as usize >= last {
+        return MEASURED_GAIN_REL_DB[MEASURED_GAIN_REL_DB.len() - 1] + (gain_db as usize - last) as f64;
+    }
+    let i = gain_db as usize / 2;
+    if gain_db % 2 == 0 {
+        MEASURED_GAIN_REL_DB[i]
+    } else {
+        (MEASURED_GAIN_REL_DB[i] + MEASURED_GAIN_REL_DB[i + 1]) / 2.0
+    }
+}
 pub const DEFAULT_GAIN_DB: u32 = 40;
 
 /// The TX Drive control's range, dB below the Pluto's full output. The
@@ -775,6 +810,19 @@ mod tests {
         stream_test(sample_rate_hz(false, !ok));
     }
 
+    #[test]
+    fn rx_gain_follows_the_measured_table_below_1300_mhz() {
+        let lo = 739_650_000;
+        assert_eq!(rx_gain_rel_db(DEFAULT_GAIN_DB, lo), 0.0);
+        assert_eq!(rx_gain_rel_db(0, lo), -36.7);
+        assert_eq!(rx_gain_rel_db(32, lo), -8.4);
+        assert!((rx_gain_rel_db(31, lo) - -7.75).abs() < 1e-9);
+        assert_eq!(rx_gain_rel_db(62, lo), 20.0);
+        assert_eq!(rx_gain_rel_db(MAX_GAIN_DB, lo), 29.0);
+        // Another gain table above 1300 MHz: dB for dB.
+        assert_eq!(rx_gain_rel_db(0, 2_400_000_000), -40.0);
+    }
+
     /// RF Gain sweep: raw I/Q at each gain, for choosing the setting
     /// offline. HPSDR_PLUTO_SWEEP_DIR names the output directory and
     /// HPSDR_PLUTO_SWEEP_HZ the centre frequency.
@@ -784,11 +832,21 @@ mod tests {
         let dir = std::path::PathBuf::from(std::env::var("HPSDR_PLUTO_SWEEP_DIR").expect("HPSDR_PLUTO_SWEEP_DIR"));
         let centre: u32 = std::env::var("HPSDR_PLUTO_SWEEP_HZ").expect("HPSDR_PLUTO_SWEEP_HZ").parse().unwrap();
         let info = probe(test_ip()).expect("no Pluto there");
-        let (mut device, mut stream, _) = initialise(info.addr, centre, 0, DIRECT_SAMPLE_RATE_HZ).unwrap();
+        let (mut device, mut stream, _) =
+            initialise(info.addr, centre, DEFAULT_GAIN_DB, DIRECT_SAMPLE_RATE_HZ).unwrap();
         let mut buf = vec![0u8; stream.buffer_samples() * 4];
-        for gain in (0..=70).step_by(5).chain([MAX_GAIN_DB]) {
+        // Let the freshly set-up stream settle before the first step (a
+        // first sweep's 0 and 5 dB steps, straight after initialise, read
+        // wrong).
+        let start = std::time::Instant::now();
+        while start.elapsed() < Duration::from_secs(1) {
+            stream.read(&mut buf).unwrap();
+        }
+        // 0 dB again at the end, to show any settling effect.
+        let steps = (0..=70).step_by(2).chain([MAX_GAIN_DB]).map(|g| (g, "")).chain([(0, "b")]);
+        for (gain, suffix) in steps {
             device.set_gain(gain).unwrap();
-            for _ in 0..RATE_CHANGE_STALE_BUFFERS {
+            for _ in 0..2 * RATE_CHANGE_STALE_BUFFERS {
                 stream.read(&mut buf).unwrap();
             }
             let mut out = Vec::new();
@@ -796,8 +854,8 @@ mod tests {
                 stream.read(&mut buf).unwrap();
                 out.extend_from_slice(&buf);
             }
-            std::fs::write(dir.join(format!("gain{gain:02}.ci16")), &out).unwrap();
-            println!("gain {gain} dB: {} samples", out.len() / 4);
+            std::fs::write(dir.join(format!("gain{gain:02}{suffix}.ci16")), &out).unwrap();
+            println!("gain {gain} dB{suffix}: {} samples", out.len() / 4);
         }
     }
 
