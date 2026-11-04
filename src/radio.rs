@@ -8718,10 +8718,21 @@ fn p2_receiver_loop(
     // even heavier UI-side smoothing.
     let mut fwd_acc: u32 = 0;
     let mut rev_acc: u32 = 0;
+    // HPSDR_P2_DEBUG set: log the first packet from each of the radio's
+    // ports. REAL REPORT (2026-11-04, ANAN-8000DLE, bad network
+    // connection): status (1025) and mic (1026) packets arrived but no IQ
+    // (1035+) -- which this showed at once.
+    let mut ports_seen: Option<Vec<u16>> = std::env::var_os("HPSDR_P2_DEBUG").map(|_| Vec::new());
     while !stop.load(Ordering::Relaxed) {
         match socket.recv_from(&mut buf) {
             Ok((n, src)) => {
                 let port = src.port();
+                if let Some(seen) = &mut ports_seen {
+                    if !seen.contains(&port) {
+                        seen.push(port);
+                        eprintln!("P2 debug: first packet from {src}, {n} bytes");
+                    }
+                }
                 if port >= P2_DDC0_IQ_PORT
                     && ((port - P2_DDC0_IQ_PORT) as usize) < buffers.len() + ddc_reserved
                 {
@@ -9237,6 +9248,38 @@ mod tests {
         session.stop();
         println!("{delivered:.0} samples/s delivered at {rate_hz} Hz");
         assert!(delivered > 0.99 * rate_hz as f64, "{delivered}");
+    }
+
+    /// Receive only (never MOX): starts a session on the P2 radio at
+    /// HPSDR_P2_IP the way the app does and counts what reaches the first
+    /// receiver, with the DDC count the radio reports and, if
+    /// HPSDR_P2_RECEIVERS is set, with that instead.
+    #[test]
+    #[ignore]
+    fn p2_receiver_gets_iq() {
+        let ip: std::net::IpAddr = std::env::var("HPSDR_P2_IP").expect("HPSDR_P2_IP").parse().unwrap();
+        let devices = Arc::new(Mutex::new(Vec::new()));
+        crate::discovery::discover(Arc::clone(&devices), Arc::new(Mutex::new(Default::default())));
+        let mut device =
+            devices.lock().unwrap().iter().find(|d| d.address.ip() == ip).cloned().expect("radio not discovered");
+        if let Some(n) = std::env::var("HPSDR_P2_RECEIVERS").ok().and_then(|v| v.parse().ok()) {
+            device.supported_receivers = n;
+        }
+        println!("{:?}, {} receivers", device.board, device.supported_receivers);
+        let settings = RadioSettings {
+            frequency_hz: 14_200_000,
+            sample_rate: 192_000,
+            receivers: device.supported_receivers,
+            // HPSDR_P2_NO_RESERVE: receivers from DDC0, not DDC2.
+            puresignal_reserve: std::env::var_os("HPSDR_P2_NO_RESERVE").is_none(),
+            ..Default::default()
+        };
+        let mut session = RadioSession::start(&device, settings).unwrap();
+        thread::sleep(Duration::from_secs(3));
+        let got = session.iq_buffers[0].lock().unwrap().len();
+        session.stop();
+        println!("{} iq buffers, {got} samples waiting in the first", session.iq_buffers.len());
+        assert!(got > 0, "no IQ");
     }
 
     /// For checking the receiver's reconnect by hand: prints the samples

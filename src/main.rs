@@ -14933,15 +14933,23 @@ fn change_extra_receiver_sample_rate(rx: &mut ExtraReceiver, new_rate: u32) {
 /// display, the same way upstream reference clients (e.g. piHPSDR)
 /// poll it, so a torn read at worst shows one garbled frame of text
 /// rather than anything unsafe.
+///
+/// WDSP only writes the status while it's actually planning FFTs; with
+/// the wisdom file loaded it stays empty, and after planning it says
+/// "FFTW planning complete." Either way no rows means no samples yet, so
+/// the fallback says that. It used to say "Creating FFTW Wisdom File...":
+/// REAL REPORT (2026-11-04, ANAN-8000DLE with a bad network connection)
+/// -- it showed that indefinitely, wisdom file present, because no IQ
+/// was arriving.
 fn wisdom_status_text() -> String {
-    const FALLBACK: &str = "Creating FFTW Wisdom File...";
+    const FALLBACK: &str = "Waiting for samples from the radio...";
     unsafe {
         let ptr = wdsp_sys::wisdom_get_status();
         if ptr.is_null() {
             return FALLBACK.to_string();
         }
         match std::ffi::CStr::from_ptr(ptr).to_str() {
-            Ok(s) if !s.trim().is_empty() => s.trim().to_string(),
+            Ok(s) if !s.trim().is_empty() && !s.contains("complete") => s.trim().to_string(),
             _ => FALLBACK.to_string(),
         }
     }
