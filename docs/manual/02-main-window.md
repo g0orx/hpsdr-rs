@@ -471,6 +471,14 @@ Anchored in the top-right of the window:
 
 Below the meter:
 
+- **SNR** -- the signal-to-noise ratio in the receive filter: the power
+  across the passband against the noise floor either side of it (the
+  median, so nearby stations don't count), in the same bandwidth. Tune a
+  steady signal into the passband and peak the number, for example the
+  QO-100 beacon while aligning a dish or LNB. It's within about 1-2 dB
+  of the true figure. It's blank while transmitting, when the passband
+  is under 3 pixels wide on the spectrum (zoom in), or when it's too
+  close to the edge of the view to see the noise beside it.
 - **Settings...** opens the [Settings window](11-settings-network.md).
 - **Add Receiver (n/max)** adds another independent receiver window (see
   [Extra Receivers](03-extra-receivers.md)) -- hidden once you've reached

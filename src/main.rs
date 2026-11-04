@@ -2379,6 +2379,9 @@ struct ConnectedState {
     /// ballistic damping for exactly this reason.
     smoothed_fwd_power: f32,
     smoothed_rev_power: f32,
+    /// The receive passband's signal-to-noise ratio (passband_snr_db),
+    /// smoothed, shown under the S-meter. None while it can't be measured.
+    smoothed_snr_db: Option<f64>,
     /// See RadioSession::tx_fifo_underrun's doc comment. Latched for a
     /// couple of seconds after last seen set (same reasoning as
     /// piHPSDR's own rx_panadapter.c: a single status packet's worth
@@ -3352,6 +3355,7 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                 cw_text_sending: false,
                 smoothed_fwd_power: 0.0,
                 smoothed_rev_power: 0.0,
+                smoothed_snr_db: None,
                 tx_fifo_warning_until: None,
                 tx_spectrum_mox_was_active: false,
                 puresignal_enabled: settings.puresignal_enabled,
@@ -6367,6 +6371,18 @@ impl eframe::App for HpsdrApp {
                     }
                     let x_dial = x_for_offset(ctun_offset_hz);
 
+                    // SNR readout under the S-meter, from the row drawn here.
+                    let snr = if transmitting {
+                        None
+                    } else {
+                        let frac = |x: f32| ((x - rect.left()) / rect.width()) as f64;
+                        passband_snr_db(&spectrum_row, frac(x_low), frac(x_high))
+                    };
+                    connected.smoothed_snr_db = match (snr, connected.smoothed_snr_db) {
+                        (Some(v), Some(s)) => Some(s + SNR_SMOOTHING * (v - s)),
+                        (v, _) => v,
+                    };
+
                     // Label shown in RF space when a transverter is active
                     // (see xvtr_rf_offset_hz's doc comment above) -- tick
                     // x positions stay in real IF space, only the printed
@@ -6906,6 +6922,15 @@ impl eframe::App for HpsdrApp {
                             egui::vec2(180.0, line_height),
                             egui::Sense::hover(),
                         );
+                        if let Some(snr) = connected.smoothed_snr_db {
+                            ui.painter().text(
+                                row_rect.right_center(),
+                                egui::Align2::RIGHT_CENTER,
+                                format!("SNR {snr:.1} dB"),
+                                egui::TextStyle::Body.resolve(ui.style()),
+                                egui::Color32::from_gray(200),
+                            );
+                        }
                         if adc0_ov || adc1_ov {
                             let text = if adc0_ov && adc1_ov {
                                 "ADC0+ADC1 OVERLOAD"
@@ -12803,6 +12828,54 @@ fn power_watts_and_swr(raw_forward: u32, raw_reverse: u32, board: Boards) -> (f3
     (forward, reverse, swr)
 }
 
+/// Per-frame weight of a new reading in ConnectedState::smoothed_snr_db:
+/// steady enough to read, quick enough to peak a dish or LNB by.
+const SNR_SMOOTHING: f64 = 0.08;
+
+/// Signal-to-noise ratio in the receive passband, in dB, from a spectrum
+/// row (dB per pixel) and the passband's edges as fractions of the row's
+/// width: the power across the passband over the noise floor -- the median
+/// of the pixels either side (four passband widths each way, past a small
+/// gap), so nearby stations don't count -- in the same bandwidth. For
+/// peaking a dish or LNB on a beacon. None if the passband is under 3
+/// pixels wide (zoom in) or too near the edge of the view to measure the
+/// noise beside it.
+///
+/// Checked with a carrier in white noise through the real analyzer
+/// (snr_reads_the_true_ratio_through_the_real_analyzer): within about
+/// 1 dB of the true SNR at 48/192/768 kHz, up to 1.7 dB high at 48 kHz
+/// zoom 4. No correction for WDSP's log-domain averaging (which alone
+/// would read noise 2.5 dB low): averaging the FFT bins into each pixel
+/// first leaves it next to nothing, as that test showed.
+fn passband_snr_db(row: &[f32], frac_low: f64, frac_high: f64) -> Option<f64> {
+    let n = row.len();
+    if n < 16 || !(0.0..=1.0).contains(&frac_low) || !(0.0..=1.0).contains(&frac_high) || frac_high <= frac_low {
+        return None;
+    }
+    let lo = (frac_low * (n - 1) as f64).round() as usize;
+    let hi = (frac_high * (n - 1) as f64).round() as usize;
+    let width = hi - lo + 1;
+    if width < 3 {
+        return None;
+    }
+    let gap = (width / 4).max(1);
+    let mut noise: Vec<f32> = row[lo.saturating_sub(gap + 4 * width)..lo.saturating_sub(gap)]
+        .iter()
+        .chain(&row[(hi + 1 + gap).min(n)..(hi + 1 + gap + 4 * width).min(n)])
+        .copied()
+        .collect();
+    if noise.len() < 2 * width {
+        return None;
+    }
+    noise.sort_by(f32::total_cmp);
+    let floor = 10f64.powf(noise[noise.len() / 2] as f64 / 10.0);
+    let total: f64 = row[lo..=hi].iter().map(|&db| 10f64.powf(db as f64 / 10.0)).sum();
+    let signal = total - width as f64 * floor;
+    let noise_power = width as f64 * floor;
+    // Below about -10 dB it's just noise.
+    Some((10.0 * (signal.max(0.0) / noise_power).log10()).max(-10.0))
+}
+
 fn draw_s_meter(ui: &mut egui::Ui, rect: egui::Rect, db: f64) {
     let painter = ui.painter();
     painter.rect_filled(rect, 4.0, egui::Color32::from_gray(20));
@@ -15250,6 +15323,87 @@ fn main() -> eframe::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A carrier plus white noise at known SNRs, through the real WDSP
+    /// analyzer the way the main window feeds it, at several sample rates
+    /// and zooms: passband_snr_db must read the true SNR in the passband.
+    /// Needs WDSP's FFTW wisdom and real-time threads, so on demand:
+    /// `cargo test --release snr_reads -- --ignored`.
+    #[test]
+    #[ignore]
+    fn snr_reads_the_true_ratio_through_the_real_analyzer() {
+        let mut errors = Vec::new();
+        for (channel, rate, zoom) in [(24, 48_000.0, 1), (25, 48_000.0, 4), (26, 192_000.0, 1), (27, 768_000.0, 1), (28, 768_000.0, 8)] {
+            errors.extend(snr_check(channel, rate, zoom));
+        }
+        for (rate, zoom, true_snr_db, error) in errors {
+            assert!(error.abs() < 2.0, "{rate} Hz zoom {zoom}, true {true_snr_db}: {error:+.2} dB out");
+        }
+    }
+
+    fn snr_check(channel: i32, rate: f64, zoom: i32) -> Vec<(f64, i32, f64, f64)> {
+        let iq_buf = Arc::new(Mutex::new(std::collections::VecDeque::new()));
+        let mut analyzer = spectrum::SpectrumHandle::start(
+            channel,
+            Arc::clone(&iq_buf),
+            rate as i32,
+            None,
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        );
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        analyzer.set_zoom_pan(zoom, 0.0);
+        let passband = spectrum::passband_for(spectrum::Mode::Usb, 2700.0);
+        let bandwidth = passband.1 - passband.0;
+        let mut seed = 0x2545_f491_4f6c_dd1du64 ^ channel as u64;
+        let mut uniform = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed >> 11) as f64 / (1u64 << 53) as f64
+        };
+        let mut gauss = move || (-2.0 * uniform().max(1e-300).ln()).sqrt() * (2.0 * std::f64::consts::PI * uniform()).cos();
+        let noise_rms = 0.001; // per component
+        let span = rate / zoom as f64;
+        let mut errors = Vec::new();
+        for true_snr_db in [0.0, 10.0, 20.0] {
+            // Noise in the passband: 2 sigma^2 * B / fs; the tone's power A^2.
+            let noise_in_band = 2.0 * noise_rms * noise_rms * bandwidth / rate;
+            let amp = (noise_in_band * 10f64.powf(true_snr_db / 10.0)).sqrt();
+            iq_buf.lock().unwrap().clear();
+            let mut n = 0u64;
+            let mut readings = Vec::new();
+            for step in 0..40 {
+                let mut q = iq_buf.lock().unwrap();
+                for _ in 0..(rate as usize / 10) {
+                    let ph = 2.0 * std::f64::consts::PI * 1000.0 * n as f64 / rate;
+                    let re = amp * ph.cos() + noise_rms * gauss();
+                    let im = amp * ph.sin() + noise_rms * gauss();
+                    // The analytic signal is q + j*i (see IqSample).
+                    q.push_back(IqSample { i: (im * 8_388_608.0) as i32, q: (re * 8_388_608.0) as i32 });
+                    n += 1;
+                }
+                drop(q);
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                if step >= 20 {
+                    let row = analyzer.display.lock().unwrap().spectrum.clone();
+                    let frac = |f: f64| (f + span / 2.0) / span;
+                    if let Some(v) = passband_snr_db(&row, frac(passband.0), frac(passband.1)) {
+                        readings.push(v);
+                    }
+                }
+            }
+            if readings.is_empty() {
+                println!("{rate} Hz zoom {zoom}: passband too narrow to measure");
+                break;
+            }
+            let mean = readings.iter().sum::<f64>() / readings.len() as f64;
+            println!("{rate} Hz zoom {zoom}: true SNR {true_snr_db:.1} dB, read {mean:.2} dB");
+            errors.push((rate, zoom, true_snr_db, mean - true_snr_db));
+        }
+        analyzer.stop();
+        errors
+    }
 
     #[test]
     fn alt_scroll_tunes_in_10_hz_steps() {
