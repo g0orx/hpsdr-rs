@@ -475,8 +475,12 @@ Below the meter:
   across the passband against the noise floor either side of it (the
   median, so nearby stations don't count), in the same bandwidth. Tune a
   steady signal into the passband and peak the number, for example the
-  QO-100 beacon while aligning a dish or LNB. It's within about 1-2 dB
-  of the true figure. It's blank while transmitting, when the passband
+  QO-100 beacon while aligning a dish or LNB. It's within about 1 dB
+  of the true figure. The filter width changes it: the noise grows with
+  the bandwidth, so a signal narrower than the filter reads lower in a
+  wider one (QO-100's PSK beacon is about 1 kHz wide, so it reads about
+  3 dB higher in a 1.2 kHz filter than in 2.4 kHz). Use the same width
+  when comparing. It's blank while transmitting, when the passband
   is under 3 pixels wide on the spectrum (zoom in), or when it's too
   close to the edge of the view to see the noise beside it.
 - **Settings...** opens the [Settings window](11-settings-network.md).

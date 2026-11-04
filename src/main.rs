@@ -12843,8 +12843,9 @@ const SNR_SMOOTHING: f64 = 0.08;
 ///
 /// Checked with a carrier in white noise through the real analyzer
 /// (snr_reads_the_true_ratio_through_the_real_analyzer): within about
-/// 1 dB of the true SNR at 48/192/768 kHz, up to 1.7 dB high at 48 kHz
-/// zoom 4. No correction for WDSP's log-domain averaging (which alone
+/// 0.7 dB of the true SNR at 48/192/768 kHz, up to 1.7 dB high at 48 kHz
+/// zoom 4; and on a real QO-100 beacon recording at 768 kHz
+/// (snr_of_a_recording), 6.15 dB against 5.9 dB measured from the file. No correction for WDSP's log-domain averaging (which alone
 /// would read noise 2.5 dB low): averaging the FFT bins into each pixel
 /// first leaves it next to nothing, as that test showed.
 fn passband_snr_db(row: &[f32], frac_low: f64, frac_high: f64) -> Option<f64> {
@@ -12852,8 +12853,9 @@ fn passband_snr_db(row: &[f32], frac_low: f64, frac_high: f64) -> Option<f64> {
     if n < 16 || !(0.0..=1.0).contains(&frac_low) || !(0.0..=1.0).contains(&frac_high) || frac_high <= frac_low {
         return None;
     }
-    let lo = (frac_low * (n - 1) as f64).round() as usize;
-    let hi = (frac_high * (n - 1) as f64).round() as usize;
+    let (lo_px, hi_px) = (frac_low * (n - 1) as f64, frac_high * (n - 1) as f64);
+    let lo = lo_px.round() as usize;
+    let hi = hi_px.round() as usize;
     let width = hi - lo + 1;
     if width < 3 {
         return None;
@@ -12871,7 +12873,11 @@ fn passband_snr_db(row: &[f32], frac_low: f64, frac_high: f64) -> Option<f64> {
     let floor = 10f64.powf(noise[noise.len() / 2] as f64 / 10.0);
     let total: f64 = row[lo..=hi].iter().map(|&db| 10f64.powf(db as f64 / 10.0)).sum();
     let signal = total - width as f64 * floor;
-    let noise_power = width as f64 * floor;
+    // The noise in the passband's exact width, not the whole pixels it
+    // touches: at 768 kHz (750 Hz pixels) a 2.4 kHz passband is 3.2 pixels
+    // but rounds to 4, which read 1 dB low (REAL REPORT, 2026-11-04,
+    // Pluto on the QO-100 beacon: 3.9 dB against 5.9 dB from a recording).
+    let noise_power = (hi_px - lo_px) * floor;
     // Below about -10 dB it's just noise.
     Some((10.0 * (signal.max(0.0) / noise_power).log10()).max(-10.0))
 }
@@ -15339,6 +15345,84 @@ mod tests {
         for (rate, zoom, true_snr_db, error) in errors {
             assert!(error.abs() < 2.0, "{rate} Hz zoom {zoom}, true {true_snr_db}: {error:+.2} dB out");
         }
+    }
+
+    /// A real SigMF ci16 recording (HPSDR_SNR_RECORDING, the .sigmf-data
+    /// path) replayed through the analyzer at its rate / HPSDR_SNR_DECIMATE
+    /// (default 4), shifted so the dial (HPSDR_SNR_DIAL_OFFSET_HZ from the
+    /// recording's centre) is at 0: prints the readout's SNR in a USB
+    /// 2.4 kHz passband, to compare with one measured from the file directly.
+    #[test]
+    #[ignore]
+    fn snr_of_a_recording() {
+        let path = std::env::var("HPSDR_SNR_RECORDING").expect("HPSDR_SNR_RECORDING");
+        let dial: f64 = std::env::var("HPSDR_SNR_DIAL_OFFSET_HZ").expect("HPSDR_SNR_DIAL_OFFSET_HZ").parse().unwrap();
+        let decimate: usize = std::env::var("HPSDR_SNR_DECIMATE").ok().and_then(|v| v.parse().ok()).unwrap_or(4);
+        let meta: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(path.replace(".sigmf-data", ".sigmf-meta")).unwrap()).unwrap();
+        let in_rate = meta["global"]["core:sample_rate"].as_f64().unwrap();
+        let rate = in_rate / decimate as f64;
+        let raw = std::fs::read(&path).unwrap();
+        let iq_buf = Arc::new(Mutex::new(std::collections::VecDeque::new()));
+        let mut analyzer = spectrum::SpectrumHandle::start(
+            29,
+            Arc::clone(&iq_buf),
+            rate as i32,
+            None,
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        );
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        // Windowed-sinc low-pass for the decimation, cut off at 0.4 of the
+        // output rate.
+        let taps = 32 * decimate + 1;
+        let fc = 0.4 / decimate as f64;
+        let h: Vec<f64> = (0..taps)
+            .map(|k| {
+                let t = k as f64 - (taps - 1) as f64 / 2.0;
+                let sinc = if t == 0.0 { 2.0 * fc } else { (2.0 * std::f64::consts::PI * fc * t).sin() / (std::f64::consts::PI * t) };
+                sinc * (0.54 - 0.46 * (2.0 * std::f64::consts::PI * k as f64 / (taps - 1) as f64).cos())
+            })
+            .collect();
+        let samples: Vec<(f64, f64)> = raw
+            .chunks_exact(4)
+            .enumerate()
+            .map(|(n, p)| {
+                let (re, im) = (i16::from_le_bytes([p[0], p[1]]) as f64, i16::from_le_bytes([p[2], p[3]]) as f64);
+                let ph = -2.0 * std::f64::consts::PI * dial * n as f64 / in_rate;
+                (re * ph.cos() - im * ph.sin(), re * ph.sin() + im * ph.cos())
+            })
+            .collect();
+        let passband = spectrum::passband_for(spectrum::Mode::Usb, 2400.0);
+        let frac = |f: f64| (f + rate / 2.0) / rate;
+        let per_chunk = rate as usize / 10;
+        let mut readings = Vec::new();
+        let mut out = 0usize;
+        while (out + per_chunk) * decimate + taps < samples.len() {
+            let mut q = iq_buf.lock().unwrap();
+            for m in out..out + per_chunk {
+                let (mut re, mut im) = (0.0, 0.0);
+                for (k, &hk) in h.iter().enumerate() {
+                    let s = samples[m * decimate + k];
+                    re += hk * s.0;
+                    im += hk * s.1;
+                }
+                // The analytic signal is q + j*i (see IqSample); ci16 to 24 bits.
+                q.push_back(IqSample { i: (im * 256.0) as i32, q: (re * 256.0) as i32 });
+            }
+            drop(q);
+            out += per_chunk;
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            if out > 2 * rate as usize {
+                let row = analyzer.display.lock().unwrap().spectrum.clone();
+                if let Some(v) = passband_snr_db(&row, frac(passband.0), frac(passband.1)) {
+                    readings.push(v);
+                }
+            }
+        }
+        analyzer.stop();
+        let mean = readings.iter().sum::<f64>() / readings.len() as f64;
+        println!("readout at {rate} Hz: {mean:.2} dB over {} readings", readings.len());
     }
 
     fn snr_check(channel: i32, rate: f64, zoom: i32) -> Vec<(f64, i32, f64, f64)> {
