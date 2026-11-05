@@ -15204,6 +15204,19 @@ pub(crate) fn running_on_wayland() -> bool {
     cfg!(target_os = "linux") && std::env::var_os("WAYLAND_DISPLAY").is_some()
 }
 
+/// The graphics APIs wgpu may use: WGPU_BACKEND if set (vulkan, dx12,
+/// gl ...), else egui-wgpu's default -- except on Windows, where it's
+/// DirectX 12 with OpenGL as a fallback, and Vulkan isn't started at all.
+/// REAL REPORT (2026-11-05, Windows 11 on an Intel NUC): hpsdr-rs died at
+/// start with nothing in its log, an access violation inside Intel's
+/// Vulkan driver (igvk64.dll 27.20.100.8681, from 2020) -- just starting
+/// Vulkan alongside DX12 loads it. DX12 is Windows' own API, and what its
+/// drivers are tested against.
+fn wgpu_backends() -> eframe::wgpu::Backends {
+    use eframe::wgpu::Backends;
+    Backends::from_env().unwrap_or(if cfg!(windows) { Backends::DX12 | Backends::GL } else { Backends::PRIMARY | Backends::GL })
+}
+
 fn main() -> eframe::Result<()> {
     // See the crate-level `windows_subsystem` attribute above for why
     // this matters: with no console auto-allocated on Windows release
@@ -15305,16 +15318,21 @@ fn main() -> eframe::Result<()> {
             // on Raspberry Pi 5, which only offers 4). Request the
             // adapter's own advertised limits instead, which by
             // definition it can satisfy.
-            wgpu_setup: eframe::egui_wgpu::WgpuSetup::CreateNew(
+            wgpu_setup: eframe::egui_wgpu::WgpuSetup::CreateNew({
+                let base = eframe::egui_wgpu::WgpuSetupCreateNew::without_display_handle();
                 eframe::egui_wgpu::WgpuSetupCreateNew {
+                    instance_descriptor: eframe::wgpu::InstanceDescriptor {
+                        backends: wgpu_backends(),
+                        ..base.instance_descriptor
+                    },
                     device_descriptor: std::sync::Arc::new(|adapter| eframe::wgpu::DeviceDescriptor {
                         label: Some("egui wgpu device"),
                         required_limits: adapter.limits(),
                         ..Default::default()
                     }),
-                    ..eframe::egui_wgpu::WgpuSetupCreateNew::without_display_handle()
-                },
-            ),
+                    ..base
+                }
+            }),
             ..Default::default()
         },
         ..Default::default()
