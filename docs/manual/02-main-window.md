@@ -243,6 +243,9 @@ mode, filter width, and the audio gain, or **Audio muted** in red); click
 folded away, including MIDI and rigctl/TCI/CAT, and whether they're
 minimized is remembered.
 
+![The control rows folded into one line: » and QO-100, USB, 3000 Hz,
+Audio -57 dB, with MOX directly below](images/02-controls-minimized.png)
+
 ## Bands and modes
 
 One row of band buttons -- **160m, 80m, 60m, 40m, 30m, 20m, 17m, 15m, 12m,
