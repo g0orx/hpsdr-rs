@@ -9808,7 +9808,7 @@ impl eframe::App for HpsdrApp {
                                     // calibrated power, 0 = "no
                                     // adjustment yet" so this is a no-op
                                     // until populated). Workflow: key
-                                    // Tune at each %% of your calibrated
+                                    // Tune at each % of your calibrated
                                     // power (e.g. 10W/20W/.../90W of a
                                     // 100W calibration) and adjust that
                                     // column's value until the wattmeter
@@ -9821,8 +9821,8 @@ impl eframe::App for HpsdrApp {
                                     ui.label(
                                         "Drive Level Linearization -- dB adjustment (subtracted from \
                                          the base gain above) at each % of the power PA Calibration \
-                                         was itself set at. Key Tune at each %% and adjust until the \
-                                         meter matches; 0 = no adjustment.",
+                                         was itself set at. Key Tune at each of those levels and adjust \
+                                         until the meter matches; 0 = no adjustment.",
                                     );
                                     ui.add_space(6.0);
                                     egui::Grid::new("pa_drive_adjust_grid").striped(true).show(ui, |ui| {
