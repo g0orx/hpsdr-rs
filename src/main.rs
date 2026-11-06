@@ -6210,8 +6210,11 @@ impl eframe::App for HpsdrApp {
                     // Stop button) below the visible window.
                     let below_waterfall_reserve = 2.0 * (ui.spacing().interact_size.y + 8.0)
                         + SPECTRUM_WATERFALL_DIVIDER_HEIGHT;
+                    // 120, not 200: lets the window go down to its
+                    // minimum (see main's with_min_inner_size) without
+                    // pushing Zoom/Pan and Stop off the bottom.
                     let spectrum_waterfall_height =
-                        (ui.available_height() - below_waterfall_reserve).max(200.0);
+                        (ui.available_height() - below_waterfall_reserve).max(120.0);
                     // Waterfall disabled (Settings -> Spectrum): give the
                     // spectrum trace the FULL combined height instead of
                     // its ratio-based share -- no divider to drag against
@@ -15512,7 +15515,12 @@ fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1200.0, 660.0])
-            .with_min_inner_size([900.0, 520.0])
+            // Down from 520 high (real request) now the control rows fold
+            // away (ConnectedState::controls_minimized): folded, the
+            // window still shows everything down to Stop at 360, with
+            // spectrum_waterfall_height's own minimum lowered to match.
+            // Unfolded, that small a window cuts off the bottom.
+            .with_min_inner_size([900.0, 360.0])
             .with_icon(icon),
         wgpu_options: eframe::egui_wgpu::WgpuConfiguration {
             // NOTE: this used to override `surface` to force
