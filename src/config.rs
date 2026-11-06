@@ -464,6 +464,9 @@ pub struct Config {
     /// See ConnectedState::duplex. `None` falls back to off.
     #[serde(default)]
     pub duplex: Option<bool>,
+    /// Named setups (the main window's Setups menu), in the order saved.
+    #[serde(default)]
+    pub setups: Vec<SavedSetup>,
     /// See ConnectedState::cw_decode_enabled's doc comment. `None`
     /// (a config saved before this existed) falls back to true, same
     /// as a fresh connect.
@@ -581,6 +584,45 @@ fn default_nb_threshold() -> f64 {
 
 fn default_nnr_mask_floor_db() -> f64 {
     -25.0
+}
+
+/// A named snapshot of the main receiver's VFOs and the buttons that go
+/// with them, for the main window's Setups menu (real request: a QO-100
+/// setup has VFO A and B, CTUN, Duplex, Split and SAT all set).
+///
+/// Frequencies are RF -- what's displayed, through each VFO's own
+/// transverter (by name; None = none) -- and turned back into IF with the
+/// transverter's offset at recall. Not IF: with Lock LNB the offset moves
+/// as the LNB drifts, so a saved IF came back somewhere else. REAL REPORT
+/// (2026-11-06): QO-100 saved at 10489.750 recalled as 10489.751806.
+/// Missing (None) in a setup saved before they were RF, which then leaves
+/// that VFO where it is.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct SavedSetup {
+    pub name: String,
+    /// VFO A's hardware frequency -- with CTUN on, where the receiver is
+    /// parked, and `ctun_rf_hz` where it's listening.
+    #[serde(default)]
+    pub vfo_a_rf_hz: Option<u64>,
+    pub ctun: bool,
+    #[serde(default)]
+    pub ctun_rf_hz: Option<u64>,
+    pub vfo_a_xvtr: Option<String>,
+    pub mode: Mode,
+    pub width_hz: f64,
+    #[serde(default)]
+    pub vfo_b_rf_hz: Option<u64>,
+    pub vfo_b_xvtr: Option<String>,
+    pub split: bool,
+    /// ConnectedState::sat_mode as stored: 0 off, 1 SAT, 2 SATR.
+    pub sat_mode: u8,
+    pub duplex: bool,
+    /// PSK Beacon and its Lock LNB (None in a setup saved before these
+    /// were, leaving them as they are).
+    #[serde(default)]
+    pub psk_beacon: Option<bool>,
+    #[serde(default)]
+    pub lnb_lock: Option<bool>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -805,4 +847,47 @@ impl Config {
 
 fn default_squelch_level() -> f32 {
     30.0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A named setup survives a save and load, and a config written before
+    /// setups existed still loads, with none.
+    #[test]
+    fn setups_round_trip_and_old_configs_load() {
+        let setup = SavedSetup {
+            name: "QO-100".to_string(),
+            vfo_a_rf_hz: Some(10_489_650_000),
+            ctun: true,
+            ctun_rf_hz: Some(10_489_750_000),
+            vfo_a_xvtr: Some("QO-100".to_string()),
+            mode: Mode::Usb,
+            width_hz: 2400.0,
+            vfo_b_rf_hz: Some(2_400_250_000),
+            vfo_b_xvtr: None,
+            split: true,
+            sat_mode: 1,
+            duplex: true,
+            psk_beacon: Some(true),
+            lnb_lock: Some(true),
+        };
+        let cfg = Config { setups: vec![setup.clone()], ..Default::default() };
+        let back: Config = serde_json::from_str(&serde_json::to_string(&cfg).unwrap()).unwrap();
+        assert_eq!(back.setups, vec![setup]);
+        let old: Config = serde_json::from_str(r#"{"frequency_hz": 7100000}"#).unwrap();
+        assert!(old.setups.is_empty());
+        // A setup saved when its frequencies were IF still loads (so the
+        // whole config does), without them.
+        let if_era: Config = serde_json::from_str(
+            r#"{"setups": [{"name": "QO-100", "vfo_a_frequency_hz": 739650000, "ctun": true,
+                "ctun_frequency_hz": 739749000, "vfo_a_xvtr": "QO-100", "mode": "Usb",
+                "width_hz": 2400.0, "vfo_b_frequency_hz": 2400249000, "vfo_b_xvtr": null,
+                "split": true, "sat_mode": 1, "duplex": true}]}"#,
+        )
+        .unwrap();
+        assert_eq!(if_era.setups[0].name, "QO-100");
+        assert_eq!((if_era.setups[0].vfo_a_rf_hz, if_era.setups[0].psk_beacon), (None, None));
+    }
 }

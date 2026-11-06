@@ -831,6 +831,153 @@ fn apply_mode(connected: &mut ConnectedState, mode: spectrum::Mode, dial_freq_hz
     );
 }
 
+/// The main receiver's current VFOs and their buttons, as a named setup
+/// (see config::SavedSetup).
+fn capture_setup(connected: &ConnectedState, name: String) -> config::SavedSetup {
+    let a_offset = xvtr_offset_named(connected, &connected.active_xvtr);
+    let rf = |if_hz: u32, offset: i64| (if_hz as i64 + offset).max(0) as u64;
+    config::SavedSetup {
+        name,
+        vfo_a_rf_hz: Some(rf(connected.session.frequency_hz.load(Ordering::Relaxed), a_offset)),
+        ctun: connected.ctun,
+        ctun_rf_hz: Some(rf(connected.ctun_frequency_hz, a_offset)),
+        vfo_a_xvtr: connected.active_xvtr.clone(),
+        mode: connected.spectrum.mode(),
+        width_hz: connected.spectrum.width_hz(),
+        vfo_b_rf_hz: Some(rf(connected.vfo_b_frequency_hz, vfo_b_rf_offset(connected))),
+        vfo_b_xvtr: connected.vfo_b_xvtr.clone(),
+        split: connected.split,
+        sat_mode: connected.sat_mode.to_config(),
+        duplex: connected.duplex,
+        psk_beacon: Some(connected.psk_beacon_enabled),
+        lnb_lock: Some(connected.lnb_lock_enabled),
+    }
+}
+
+/// The RF offset of the transverter called `name` as it is now (Lock
+/// LNB's live correction included), or 0 for none or one not configured.
+fn xvtr_offset_named(connected: &ConnectedState, name: &Option<String>) -> i64 {
+    name.as_deref().and_then(|n| connected.xvtrs.iter().find(|x| x.name == n)).map_or(0, xvtr_rf_offset)
+}
+
+/// Recalls a named setup: VFO A (hardware frequency, CTUN and its listen
+/// frequency, transverter, mode and filter width), VFO B and its
+/// transverter, Split, SAT, Duplex, PSK Beacon and Lock LNB -- as they were
+/// saved, not adjusted to one another the way the buttons are (a saved
+/// setup was already consistent). The frequencies are RF, so come back as
+/// displayed through each transverter's offset now, Lock LNB's correction
+/// included; from then on Lock LNB keeps them as usual. A transverter since
+/// deleted is dropped (None), and frequencies are kept within the radio's
+/// range.
+fn apply_setup(connected: &mut ConnectedState, setup: &config::SavedSetup) {
+    let known = |name: &Option<String>, xvtrs: &[Xvtr]| name.clone().filter(|n| xvtrs.iter().any(|x| &x.name == n));
+    let to_if = |rf: u64, offset: i64, d: &Device| {
+        (rf as i64 - offset).clamp(d.frequency_min as i64, d.frequency_max as i64) as u32
+    };
+    // Don't let SAT drag VFO B along with this jump of VFO A.
+    connected.sat_last = None;
+    if let Some(on) = setup.psk_beacon {
+        connected.psk_beacon_enabled = on;
+    }
+    if let Some(on) = setup.lnb_lock {
+        connected.lnb_lock_enabled = on;
+    }
+    connected.active_xvtr = known(&setup.vfo_a_xvtr, &connected.xvtrs);
+    let a_offset = xvtr_offset_named(connected, &connected.active_xvtr);
+    let lo = match setup.vfo_a_rf_hz {
+        Some(rf) => to_if(rf, a_offset, &connected.device),
+        None => connected.session.frequency_hz.load(Ordering::Relaxed),
+    };
+    connected.session.set_frequency(lo);
+    connected.ctun = setup.ctun;
+    connected.ctun_frequency_hz = match (setup.ctun, setup.ctun_rf_hz) {
+        (true, Some(rf)) => to_if(rf, a_offset, &connected.device),
+        _ => lo,
+    };
+    let dial = connected.ctun_frequency_hz;
+    apply_mode(connected, setup.mode, dial);
+    connected.width_memory.insert(setup.mode.label().to_string(), setup.width_hz);
+    connected.spectrum.set_width_hz(setup.width_hz);
+    if let Some(tx) = &connected.tx_handle {
+        tx.set_width_hz(setup.width_hz);
+    }
+    connected.vfo_b_xvtr = known(&setup.vfo_b_xvtr, &connected.xvtrs);
+    if let Some(rf) = setup.vfo_b_rf_hz {
+        connected.vfo_b_frequency_hz = to_if(rf, vfo_b_rf_offset(connected), &connected.device);
+    }
+    connected.split = setup.split;
+    connected.sat_mode = SatMode::from_config(setup.sat_mode);
+    connected.duplex = setup.duplex;
+}
+
+/// The Setups menu button: recall or delete a saved setup, or save the
+/// current one under a name (Enter or Save; a name already used is
+/// replaced). Returns true if anything changed, for the caller to save the
+/// config.
+fn setups_menu(ui: &mut egui::Ui, connected: &mut ConnectedState) -> bool {
+    use egui::containers::menu::{MenuButton, MenuConfig};
+    let (mut recall, mut delete, mut save) = (None, None, None);
+    // Clicking into the name field mustn't close it; recall and save do.
+    let config = MenuConfig::default().close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside);
+    let (response, _) = MenuButton::from_button(egui::Button::new("Setups")).config(config).ui(ui, |ui| {
+        if connected.setups.is_empty() {
+            ui.weak("No setups saved yet");
+        }
+        for (i, setup) in connected.setups.iter().enumerate() {
+            ui.horizontal(|ui| {
+                if ui.button(&setup.name).on_hover_text("Recall this setup").clicked() {
+                    recall = Some(i);
+                    ui.close();
+                }
+                if ui.small_button("Delete").clicked() {
+                    delete = Some(i);
+                }
+            });
+        }
+        ui.separator();
+        ui.horizontal(|ui| {
+            let field = ui.add(egui::TextEdit::singleline(&mut connected.setup_name).hint_text("Name").desired_width(140.0));
+            let name = connected.setup_name.trim().to_string();
+            let exists = connected.setups.iter().any(|s| s.name == name);
+            let enter = field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            let clicked = ui
+                .add_enabled(!name.is_empty(), egui::Button::new(if exists { "Replace" } else { "Save" }))
+                .on_hover_text("Save VFO A and B as they are now under this name")
+                .clicked();
+            if !name.is_empty() && (clicked || enter) {
+                save = Some(name);
+                ui.close();
+            }
+        });
+    });
+    response.on_hover_text(
+        "Named setups: VFO A and B (frequencies and transverters), mode and filter width, CTUN, Split, \
+         SAT and Duplex -- e.g. one for QO-100",
+    );
+    if let Some(i) = delete {
+        connected.setups.remove(i);
+    }
+    if let Some(i) = recall {
+        let setup = connected.setups[i].clone();
+        apply_setup(connected, &setup);
+    }
+    if let Some(name) = &save {
+        save_setup(connected, name);
+        connected.setup_name.clear();
+    }
+    delete.is_some() || recall.is_some() || save.is_some()
+}
+
+/// Saves the current setup as `name`, replacing one already of that name
+/// (keeping its place in the list) -- the Setups menu's Save.
+fn save_setup(connected: &mut ConnectedState, name: &str) {
+    let setup = capture_setup(connected, name.to_string());
+    match connected.setups.iter_mut().find(|s| s.name == name) {
+        Some(existing) => *existing = setup,
+        None => connected.setups.push(setup),
+    }
+}
+
 /// Linearly maps a 7-bit MIDI knob value (0-127) onto `lo..=hi`.
 fn midi_knob_range(value: u8, lo: f64, hi: f64) -> f64 {
     lo + (value as f64 / 127.0) * (hi - lo)
@@ -2026,6 +2173,10 @@ struct ConnectedState {
     /// draw_tx_spectrum_inset). For full-duplex setups such as QO-100
     /// (separate uplink and downlink). Turning it on turns Split on.
     duplex: bool,
+    /// Named setups (the Setups menu; see SavedSetup), and the name being
+    /// typed there to save the current one under.
+    setups: Vec<config::SavedSetup>,
+    setup_name: String,
     /// "CW Decode" toggle (button next to CTUN) -- controls both
     /// whether main.rs draws the decoder panel AND (pushed to
     /// spectrum.rs every frame via set_cw_decode_enabled) whether the
@@ -3233,6 +3384,8 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                     None => cfg.active_xvtr.clone(),
                 },
                 duplex: cfg.duplex.unwrap_or(false),
+                setups: cfg.setups.clone(),
+                setup_name: String::new(),
                 sat_last: None,
                 cw_decode_enabled,
                 psk_beacon_enabled,
@@ -4375,6 +4528,9 @@ impl eframe::App for HpsdrApp {
                                         } else {
                                             connected.ctun_frequency_hz = effective_freq;
                                         }
+                                        settings_changed = true;
+                                    }
+                                    if setups_menu(ui, connected) {
                                         settings_changed = true;
                                     }
                                 });
@@ -11068,6 +11224,7 @@ impl eframe::App for HpsdrApp {
                         sat_mode: Some(connected.sat_mode.to_config()),
                         vfo_b_xvtr: Some(connected.vfo_b_xvtr.clone().unwrap_or_default()),
                         duplex: Some(connected.duplex),
+                        setups: connected.setups.clone(),
                         cw_decode_enabled: Some(connected.cw_decode_enabled),
                         psk_beacon_enabled: Some(connected.psk_beacon_enabled),
                         datv_frequency_hz: Some(connected.datv_settings.frequency_hz),

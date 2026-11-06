@@ -168,6 +168,17 @@ stored value directly, or use the buttons between the two boxes:
 - **B>A** -- retunes VFO A to VFO B's frequency and transverter (moving
   the CTUN listen point instead of the real hardware frequency if CTUN is
   on -- see above).
+- **Setups** (next to **B>A**) -- save the way the VFOs are set up under
+  a name, and get it back with one click. A setup holds VFO A (its
+  frequency, transverter, mode and filter width, and with CTUN on both
+  where the receiver is parked and where you're listening), VFO B and its
+  transverter, and **CTUN**, **Split**, **SAT**, **Duplex**, **PSK
+  Beacon** and **Lock LNB** -- for example everything for QO-100. The
+  frequencies come back as they were displayed, even if Lock LNB's
+  correction has changed since. Type a name and press **Save** (or
+  Enter); saving under a name already used replaces it (the button then
+  says **Replace**). Click a setup's name to recall it, or **Delete** to
+  remove it. Setups are saved per radio, with its other settings.
 - **A<>B** -- swaps VFO A and VFO B, transverters included.
 - **Split** -- while enabled, transmit uses VFO B's frequency instead of
   VFO A's, while reception continues on VFO A as normal. The box that's
