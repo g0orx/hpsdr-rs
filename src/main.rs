@@ -2203,6 +2203,12 @@ struct ConnectedState {
     /// width back. Only the panel: the beacon monitor and Lock LNB keep
     /// running.
     psk_panel_minimized: bool,
+    /// The control rows from the band buttons down to rigctl/TCI/CAT
+    /// folded away to one line (see controls_strip), giving the spectrum
+    /// and waterfall the room -- the PSK Beacon panel's idea, upwards
+    /// (real request). Only the rows: everything they control keeps
+    /// running, and MIDI/CAT still change it.
+    controls_minimized: bool,
     /// RIT ("Receiver Incremental Tuning"): when on, rit_offset_hz is
     /// added to the RXA demod shift (see spectrum::SpectrumHandle::
     /// set_ctun -- RIT and CTUN share WDSP's one RXA shift register, so
@@ -3391,6 +3397,7 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                 psk_beacon_enabled,
                 lnb_lock_enabled,
                 psk_panel_minimized,
+                controls_minimized: cfg.controls_minimized.unwrap_or(false),
                 rit_enabled,
                 rit_offset_hz,
                 rit_scroll_accum: 0.0,
@@ -4807,7 +4814,24 @@ impl eframe::App for HpsdrApp {
                         .inner;
 
                     ui.add_space(8.0);
+                    // The control rows, bands to rigctl, can be folded to
+                    // one line -- see ConnectedState::controls_minimized.
+                    // Two blocks: the DATV window and the frequency-entry
+                    // popup between them run either way.
+                    if connected.controls_minimized {
+                        if controls_strip(ui, connected) {
+                            settings_changed = true;
+                        }
+                    } else {
                     ui.horizontal_wrapped(|ui| {
+                        if ui
+                            .button("«")
+                            .on_hover_text("Minimize the control rows (bands to rigctl), giving the spectrum more room")
+                            .clicked()
+                        {
+                            connected.controls_minimized = true;
+                            settings_changed = true;
+                        }
                         // Suppressed (None) whenever an XVTR is active --
                         // otherwise both the XVTR button AND whichever
                         // fixed HF band happens to contain its real
@@ -4921,6 +4945,7 @@ impl eframe::App for HpsdrApp {
                             }
                         }
                     });
+                    }
 
                     if connected.datv_window_open && render_datv_window(ui.ctx(), connected) {
                         settings_changed = true;
@@ -5105,6 +5130,7 @@ impl eframe::App for HpsdrApp {
                         }
                     }
 
+                    if !connected.controls_minimized {
                     ui.horizontal_wrapped(|ui| {
                         for mode in ALL_MODES {
                             let selected = mode == current_mode;
@@ -5609,6 +5635,7 @@ impl eframe::App for HpsdrApp {
                             }
                         }
                     });
+                    }
 
                     // Where MOX and Tune would be: say why they aren't.
                     // REAL REPORT: with the wide stream left on from DATV,
@@ -11233,6 +11260,7 @@ impl eframe::App for HpsdrApp {
                         datv_udp_addr: Some(connected.datv_settings.udp_addr.clone()),
                         lnb_lock_enabled: Some(connected.lnb_lock_enabled),
                         psk_panel_minimized: Some(connected.psk_panel_minimized),
+                        controls_minimized: Some(connected.controls_minimized),
                         rit_enabled: Some(connected.rit_enabled),
                         rit_offset_hz: Some(connected.rit_offset_hz),
                         xit_enabled: Some(connected.xit_enabled),
@@ -12218,6 +12246,45 @@ fn render_psk_beacon_panel_beside(ui: &mut egui::Ui, connected: &mut ConnectedSt
                 .inner
         })
         .inner
+}
+
+/// The control rows minimized (ConnectedState::controls_minimized): one
+/// line, an expand button and what they're set to -- band, mode and filter
+/// width, and audio gain (red while muted). Returns true if it was
+/// expanded.
+fn controls_strip(ui: &mut egui::Ui, connected: &mut ConnectedState) -> bool {
+    let dial = if connected.ctun {
+        connected.ctun_frequency_hz
+    } else {
+        connected.session.frequency_hz.load(Ordering::Relaxed)
+    };
+    let band = connected
+        .active_xvtr
+        .clone()
+        .filter(|name| !name.is_empty())
+        .or_else(|| band_for_frequency(dial).map(|b| b.name.to_string()))
+        .unwrap_or_else(|| "Gen".to_string());
+    let mode = connected.spectrum.mode();
+    let summary = format!("{band}   {}   {:.0} Hz", mode.label(), connected.spectrum.width_hz());
+    let mut expanded = false;
+    ui.horizontal(|ui| {
+        if ui
+            .button("»")
+            .on_hover_text("Show the control rows (bands, modes, gains, noise/AGC, rigctl)")
+            .clicked()
+        {
+            connected.controls_minimized = false;
+            expanded = true;
+        }
+        ui.weak(summary);
+        let gain_db = 20.0 * connected.spectrum.gain().max(1e-9).log10();
+        if connected.spectrum.muted() {
+            ui.colored_label(egui::Color32::from_rgb(220, 60, 60), "Audio muted");
+        } else {
+            ui.weak(format!("Audio {gain_db:.0} dB"));
+        }
+    });
+    expanded
 }
 
 /// The minimized PSK beacon panel. Returns true if it was expanded.

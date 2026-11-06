@@ -494,6 +494,10 @@ pub struct Config {
     /// falls back to not minimized.
     #[serde(default)]
     pub psk_panel_minimized: Option<bool>,
+    /// See ConnectedState::controls_minimized. `None` falls back to not
+    /// minimized.
+    #[serde(default)]
+    pub controls_minimized: Option<bool>,
     /// RIT / XIT -- see ConnectedState::rit_enabled/xit_enabled's doc
     /// comments (main.rs). `None`/missing falls back to off with a
     /// zero offset, same "a config saved before this existed shouldn't

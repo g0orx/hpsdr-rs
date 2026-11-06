@@ -232,6 +232,17 @@ VFO B's frequency if it's inside the new range, otherwise moves it to the
 middle of the range. Lock LNB corrections only move VFO B if it's on the
 same transverter as VFO A.
 
+## Minimizing the control rows
+
+The **«** button at the start of the band row folds every row from the
+band buttons down to rigctl/TCI/CAT -- bands, modes and filter width, the
+gains, the noise/AGC row and the status row -- into a single line, giving
+the spectrum and waterfall that room. The line shows what's set (band,
+mode, filter width, and the audio gain, or **Audio muted** in red); click
+**»** to bring the rows back. Everything keeps working while they're
+folded away, including MIDI and rigctl/TCI/CAT, and whether they're
+minimized is remembered.
+
 ## Bands and modes
 
 One row of band buttons -- **160m, 80m, 60m, 40m, 30m, 20m, 17m, 15m, 12m,
