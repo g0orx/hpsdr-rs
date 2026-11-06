@@ -2,7 +2,9 @@
 
 # Main Window
 
-![Main window overview](images/02-main-window-overview.png)
+![Main window overview: QO-100's narrowband transponder through a Pluto,
+with a saved setup recalled (CTUN, Split, SAT and Duplex on, VFO B on the
+2400 MHz uplink) and the PSK Beacon panel open](images/02-main-window-overview.png)
 
 ## Frequency display and tuning
 
@@ -424,7 +426,9 @@ shows the **Mic level** and **ALC** readouts.
 into a real antenna.** See the [top-level README](../../README.md) for the
 project's current TX verification status.
 
-![Transmit controls active](images/02-tx-active.png)
+![Transmitting in Duplex on QO-100: MOX ON and TUNE ON, VFO B (the uplink)
+in red, the receive spectrum still live on the downlink, and the TX inset
+showing Tune's tone in the middle of the TX filter](images/02-tx-active.png)
 
 ## Spectrum and waterfall
 
