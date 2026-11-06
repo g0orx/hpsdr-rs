@@ -48,6 +48,12 @@ the waterfall (click or scroll to tune, same conventions as the main
 window, though Ctrl+scroll's 10kHz-step tuning gesture isn't available
 here), and its own S-meter with a **Settings...** button.
 
+Its control rows, from the band row down to the NB/NR/AGC row, fold into
+one line with the **«** button at the start of the band row, the same as
+the [main window's](02-main-window.md#minimizing-the-control-rows), so
+the window can be made shorter; **»** brings them back. Each receiver
+remembers its own.
+
 **Record** here works exactly like the main window's own [Record
 button](02-main-window.md#record) -- its own independent recording of
 this receiver's RX audio, landing in the same `recordings` folder,

@@ -722,6 +722,9 @@ pub struct ExtraReceiverConfig {
     /// receiver's own.
     #[serde(default)]
     pub cw_decode_enabled: Option<bool>,
+    /// See Config::controls_minimized -- same thing, this receiver's own.
+    #[serde(default)]
+    pub controls_minimized: Option<bool>,
     /// See Config::spectrum_zoom/spectrum_pan's doc comments -- same
     /// thing, this receiver's own.
     #[serde(default = "default_spectrum_zoom")]

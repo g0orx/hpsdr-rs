@@ -1805,6 +1805,9 @@ struct ExtraReceiver {
     /// panel -- see ConnectedState::cw_decode_enabled's doc comment for
     /// the full reasoning (same thing, per receiver instead of shared).
     cw_decode_enabled: bool,
+    /// This window's control rows folded to one line -- see
+    /// ConnectedState::controls_minimized (same thing, per receiver).
+    controls_minimized: bool,
     /// RIT ("Receiver Incremental Tuning") -- see ConnectedState::rit_enabled's
     /// doc comment for the full explanation; same behavior here, just
     /// per extra receiver instead of shared. No XIT here -- extra
@@ -11078,6 +11081,7 @@ impl eframe::App for HpsdrApp {
                                 ctun_frequency_hz: rx.ctun_frequency_hz,
                                 vfo_b_frequency_hz: Some(rx.vfo_b_frequency_hz),
                                 cw_decode_enabled: Some(rx.cw_decode_enabled),
+                                controls_minimized: Some(rx.controls_minimized),
                                 spectrum_zoom: rx.spectrum_zoom,
                                 spectrum_pan: rx.spectrum_pan,
                                 db_low_auto: rx.db_low_auto,
@@ -12267,27 +12271,35 @@ fn controls_strip(ui: &mut egui::Ui, connected: &mut ConnectedState) -> bool {
         .filter(|name| !name.is_empty())
         .or_else(|| band_for_frequency(dial).map(|b| b.name.to_string()))
         .unwrap_or_else(|| "Gen".to_string());
-    let mode = connected.spectrum.mode();
-    let summary = format!("{band}   {}   {:.0} Hz", mode.label(), connected.spectrum.width_hz());
-    let mut expanded = false;
+    let expanded = controls_strip_line(
+        ui,
+        &band,
+        &connected.spectrum,
+        "Show the control rows (bands, modes, gains, noise/AGC, rigctl)",
+    );
+    if expanded {
+        connected.controls_minimized = false;
+    }
+    expanded
+}
+
+/// The minimized control rows' line, for the main window and the extra
+/// receivers alike: an expand button, then `band`, the mode and filter
+/// width, and the audio gain (red "Audio muted" while muted). Returns true
+/// if the button was clicked.
+fn controls_strip_line(ui: &mut egui::Ui, band: &str, spectrum: &SpectrumHandle, hover: &str) -> bool {
+    let summary = format!("{band}   {}   {:.0} Hz", spectrum.mode().label(), spectrum.width_hz());
     ui.horizontal(|ui| {
-        if ui
-            .button("»")
-            .on_hover_text("Show the control rows (bands, modes, gains, noise/AGC, rigctl)")
-            .clicked()
-        {
-            connected.controls_minimized = false;
-            expanded = true;
-        }
+        let clicked = ui.button("»").on_hover_text(hover).clicked();
         ui.weak(summary);
-        let gain_db = 20.0 * connected.spectrum.gain().max(1e-9).log10();
-        if connected.spectrum.muted() {
+        if spectrum.muted() {
             ui.colored_label(egui::Color32::from_rgb(220, 60, 60), "Audio muted");
         } else {
-            ui.weak(format!("Audio {gain_db:.0} dB"));
+            ui.weak(format!("Audio {:.0} dB", 20.0 * spectrum.gain().max(1e-9).log10()));
         }
-    });
-    expanded
+        clicked
+    })
+    .inner
 }
 
 /// The minimized PSK beacon panel. Returns true if it was expanded.
@@ -13624,7 +13636,24 @@ fn render_extra_receiver_ui(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceiver>>) {
         }
     });
 
+    // The control rows, bands to noise/AGC, can be folded to one line --
+    // see ExtraReceiver::controls_minimized.
+    if rx.controls_minimized {
+        let band = band_for_frequency(dial_freq_hz).map(|b| b.name).unwrap_or("Gen");
+        if controls_strip_line(ui, band, &rx.spectrum, "Show the control rows (bands, modes, gains, noise/AGC)") {
+            rx.controls_minimized = false;
+            rx.settings_dirty.store(true, Ordering::Relaxed);
+        }
+    } else {
     ui.horizontal_wrapped(|ui| {
+        if ui
+            .button("«")
+            .on_hover_text("Minimize the control rows (bands to noise/AGC), giving the spectrum more room")
+            .clicked()
+        {
+            rx.controls_minimized = true;
+            rx.settings_dirty.store(true, Ordering::Relaxed);
+        }
         // Falls back to "Gen" the same way the main receiver's own
         // band row does -- see that block's doc comment.
         let current_band = Some(band_for_frequency(dial_freq_hz).map(|b| b.name).unwrap_or("Gen"));
@@ -13825,6 +13854,7 @@ fn render_extra_receiver_ui(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceiver>>) {
             rx.settings_dirty.store(true, Ordering::Relaxed);
         }
     });
+    }
 
     ui.add_space(4.0);
     // Split the window's remaining vertical space between the spectrum
@@ -13835,8 +13865,10 @@ fn render_extra_receiver_ui(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceiver>>) {
     // (unlike a plain no-reserve version, which would let the split
     // claim all available height and push Zoom/Pan below the window).
     let zoom_pan_reserve = ui.spacing().interact_size.y + 8.0 + SPECTRUM_WATERFALL_DIVIDER_HEIGHT;
+    // 120, not 200 -- the main window's reasoning: a short window, with
+    // the control rows folded, still shows Zoom/Pan.
     let spectrum_waterfall_height =
-        (ui.available_height() - zoom_pan_reserve).max(200.0);
+        (ui.available_height() - zoom_pan_reserve).max(120.0);
     // Waterfall disabled (Settings -> Spectrum): give the spectrum trace
     // the FULL combined height -- see the main receiver's identical
     // treatment for the full reasoning.
@@ -14900,6 +14932,7 @@ fn spawn_extra_receiver(
     // comment (same "never leave it at a meaningless 0" reasoning).
     let vfo_b_frequency_hz = saved.and_then(|s| s.vfo_b_frequency_hz).unwrap_or(initial_frequency_hz);
     let cw_decode_enabled = saved.and_then(|s| s.cw_decode_enabled).unwrap_or(true);
+    let controls_minimized = saved.and_then(|s| s.controls_minimized).unwrap_or(false);
 
     Some(Arc::new(Mutex::new(ExtraReceiver {
         ddc_index: idx,
@@ -14943,6 +14976,7 @@ fn spawn_extra_receiver(
         ctun_frequency_hz,
         vfo_b_frequency_hz,
         cw_decode_enabled,
+        controls_minimized,
         rit_enabled,
         rit_offset_hz,
         rit_scroll_accum: 0.0,
