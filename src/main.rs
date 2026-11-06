@@ -7237,6 +7237,15 @@ impl eframe::App for HpsdrApp {
                 for rx in connected.extra_receivers.clone() {
                     let ddc_index = rx.lock().unwrap().ddc_index;
                     let viewport_id = egui::ViewportId::from_hash_of(("extra_receiver", ddc_index));
+                    // Keep its window redrawing from here too. REAL REPORT
+                    // (2026-11-06, Windows 10): with the main window
+                    // focused, an extra receiver's window stopped updating
+                    // (focused, both did; on Linux both always did) -- its
+                    // own request_repaint_after evidently isn't acted on
+                    // there while another of the app's windows has focus.
+                    // Timed, not immediate, so it can't loop with that
+                    // window's own requests: at most its usual ~30 Hz.
+                    ui.ctx().request_repaint_after_for(Duration::from_millis(33), viewport_id);
                     let title = format!("{} - RX {}", base_title, ddc_index + 1);
                     let rx_for_closure = Arc::clone(&rx);
                     // Position/size seed from this radio's saved config --
@@ -14240,15 +14249,6 @@ fn render_extra_receiver_ui(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceiver>>) {
     // Bounded rather than unconditional -- see the same call in the
     // main receiver's update loop for why.
     ui.ctx().request_repaint_after(Duration::from_millis(33));
-    // And keep the main window going too. REAL REPORT (2026-11-06,
-    // Windows 10): with an extra receiver's window focused, the main
-    // window stopped updating; with the main one focused both did (its
-    // frames show the extra viewports, so redraw them), and on Linux both
-    // always did. Its own request_repaint_after evidently doesn't fire
-    // there while another of the app's windows has focus. Timed, not
-    // immediate: an immediate request would loop -- the main window's
-    // frame redraws this one, which would ask again at once.
-    ui.ctx().request_repaint_after_for(Duration::from_millis(33), egui::ViewportId::ROOT);
 }
 
 /// Content of an extra receiver's own "AGC / Level Settings" popup --
