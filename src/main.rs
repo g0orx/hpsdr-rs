@@ -6352,7 +6352,12 @@ impl eframe::App for HpsdrApp {
                             egui::Color32::from_rgb(100, 180, 255),
                         )
                     };
-                    let (pb_low, pb_high) = passband;
+                    // While transmitting this is tx_spectrum, centred on
+                    // the TX carrier: in CW that's already the dial +/- the
+                    // pitch, so the filter is shifted back as in the Duplex
+                    // inset (tx_inset_filter).
+                    let (pb_low, pb_high) =
+                        if transmitting { tx_inset_filter(current_mode, passband) } else { passband };
                     let x_low = x_for_offset(pb_low + ctun_offset_hz);
                     let x_high = x_for_offset(pb_high + ctun_offset_hz);
                     ui.painter().rect_filled(

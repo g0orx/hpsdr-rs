@@ -466,6 +466,8 @@ struct TxProcessor {
     last_mode: Option<Mode>,
     last_gain: Option<f32>,
     last_passband: Option<(f64, f64)>,
+    /// The Tune tone's frequency as last set -- see process().
+    last_tune_hz: Option<f64>,
     last_eq: Option<EqualizerParams>,
     /// (compressor_enabled, compressor_gain_db, cessb_enabled) as last
     /// applied -- bundled as one tuple (not three separate last_*
@@ -869,8 +871,10 @@ impl TxProcessor {
             // carrier on the TX frequency itself, outside the filter.
             // REAL REPORT (2026-10-20, ANAN-8000DLE, seen on Duplex's TX
             // inset); reproduced with this real TXA chain feeding the TX
-            // analyzer (tx_inset_probe below).
+            // analyzer (tx_inset_probe below). The tone now has its own
+            // last_tune_hz, None for the same reason.
             last_passband: None,
+            last_tune_hz: None,
             last_eq: None,
             last_compressor: None,
             last_post_gen: None,
@@ -934,16 +938,26 @@ impl TxProcessor {
         if self.last_passband != Some(passband) {
             unsafe {
                 wdsp::SetTXABandpassFreqs(self.channel, passband.0, passband.1);
-                // Tune tone frequency tracks the SAME passband as the
-                // bandpass filter -- its midpoint is the right tone
-                // for every mode (including CW, which centers on the
-                // configured CW pitch via passband_for's own offset --
-                // see spectrum::cw_pitch_hz), with no mode-specific
-                // sign handling needed unlike rustyHPSDR's set_tuning,
-                // since passband_for already encodes that convention.
-                wdsp::SetTXAPostGenToneFreq(self.channel, (passband.0 + passband.1) / 2.0);
             }
             self.last_passband = Some(passband);
+        }
+        // Tune tone: the passband's midpoint -- except in CW, where it's
+        // 0 Hz, on the carrier. CW's TX frequency is already moved to the
+        // dial +/- the CW pitch (main.rs, the zero-beat convention) and its
+        // carrier generated at 0 Hz, while passband_for's CW passband sits
+        // at +/- the pitch: its midpoint put Tune TWO pitches from the dial.
+        // REAL REPORT (2026-11-05): in CWU/CWL with Duplex, Tune never
+        // showed in the TX inset, which is zoomed to the CW carrier.
+        // PostGen runs after the TX bandpass, so 0 Hz isn't filtered out.
+        let tune_hz = match mode {
+            Mode::Cwu | Mode::Cwl => 0.0,
+            _ => (passband.0 + passband.1) / 2.0,
+        };
+        if self.last_tune_hz != Some(tune_hz) {
+            unsafe {
+                wdsp::SetTXAPostGenToneFreq(self.channel, tune_hz);
+            }
+            self.last_tune_hz = Some(tune_hz);
         }
 
         // Tune/Two-Tone: WDSP's PostGen generator runs AFTER the
@@ -2676,7 +2690,30 @@ mod tune_tone_tests {
         tune_tone_check(22, 23, 1, 48_000.0);
     }
 
+    /// In CWU, Duplex's TX inset (zoomed to the CW carrier, which the TX
+    /// frequency already puts at the dial + pitch) must show Tune's tone
+    /// on the carrier, 0 Hz. It was at the CW passband's midpoint, +pitch
+    /// -- two pitches from the dial, off the inset.
+    #[test]
+    #[ignore]
+    fn tune_tone_is_on_the_carrier_in_cw() {
+        tune_tone_check_in(24, 25, 1, 48_000.0, Mode::Cwu, 250.0, Some(0.0));
+    }
+
     fn tune_tone_check(txa_channel: i32, analyzer_channel: i32, protocol: u8, rate: f64) {
+        tune_tone_check_in(txa_channel, analyzer_channel, protocol, rate, Mode::Usb, 2700.0, None);
+    }
+
+    /// `tone_hz` from the TX carrier, or None for the passband's midpoint.
+    fn tune_tone_check_in(
+        txa_channel: i32,
+        analyzer_channel: i32,
+        protocol: u8,
+        rate: f64,
+        mode: Mode,
+        width_hz: f64,
+        tone_hz: Option<f64>,
+    ) {
         let iq_buf = Arc::new(Mutex::new(VecDeque::new()));
         let analyzer = SpectrumHandle::start(
             analyzer_channel,
@@ -2690,15 +2727,15 @@ mod tune_tone_tests {
         // the TXA channel must not open before it.
         std::thread::sleep(Duration::from_secs(2));
         let mut processor = TxProcessor::open(txa_channel, protocol, 48_000, rate as i32, None);
-        let passband = crate::spectrum::passband_for(Mode::Usb, 2700.0);
-        let filter = crate::tx_inset_filter(Mode::Usb, passband);
+        let passband = crate::spectrum::passband_for(mode, width_hz);
+        let filter = crate::tx_inset_filter(mode, passband);
         let (zoom, pan, shown) = crate::tx_inset_zoom_pan(crate::tx_inset_window(filter), rate);
         analyzer.set_zoom_pan(zoom, pan);
         let mic = vec![0.0f32; TX_BUFFER_SIZE];
         for _ in 0..8 {
             for _ in 0..(12_000 / TX_BUFFER_SIZE) {
                 let (iq, _) =
-                    processor.process(&mic, Mode::Usb, 1.0, 2700.0, true, false, EqualizerParams::default(), false, 0.0, false);
+                    processor.process(&mic, mode, 1.0, width_hz, true, false, EqualizerParams::default(), false, 0.0, false);
                 let mut q = iq_buf.lock().unwrap();
                 for pair in iq.chunks_exact(2) {
                     q.push_back(IqSample { i: (pair[0] * PS_IQ_NORM) as i32, q: (pair[1] * PS_IQ_NORM) as i32 });
@@ -2708,7 +2745,7 @@ mod tune_tone_tests {
         }
         let row = analyzer.display.lock().unwrap().spectrum.clone();
         let peak = row.iter().enumerate().fold((0, f32::MIN), |a, (i, &v)| if v > a.1 { (i, v) } else { a }).0;
-        let tone_hz = (passband.0 + passband.1) / 2.0;
+        let tone_hz = tone_hz.unwrap_or((passband.0 + passband.1) / 2.0);
         let expected = (tone_hz - shown.0) / (shown.1 - shown.0) * (row.len() - 1) as f64;
         assert!((peak as f64 - expected).abs() <= 2.0, "peak at pixel {peak}, expected {expected:.1}");
     }
