@@ -2183,6 +2183,8 @@ struct ConnectedState {
     /// When the main window next asks the extra receivers' windows for a
     /// redraw -- see the extra-receiver loop in ui().
     next_extra_repaint: Instant,
+    /// The main window's title as last set -- see where it's set in ui().
+    window_title: String,
     /// "CW Decode" toggle (button next to CTUN) -- controls both
     /// whether main.rs draws the decoder panel AND (pushed to
     /// spectrum.rs every frame via set_cw_decode_enabled) whether the
@@ -3399,6 +3401,7 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                 setups: cfg.setups.clone(),
                 setup_name: String::new(),
                 next_extra_repaint: Instant::now(),
+                window_title: String::new(),
                 sat_last: None,
                 cw_decode_enabled,
                 psk_beacon_enabled,
@@ -3688,7 +3691,18 @@ impl eframe::App for HpsdrApp {
                     connected.device.version % 10,
                     connected.device.address.ip()
                 );
-                ui.ctx().send_viewport_cmd(egui::ViewportCommand::Title(base_title.clone()));
+                // Only when it changes: egui's send_viewport_cmd asks for an
+                // immediate repaint every time, so sending it each frame
+                // kept the main window repainting flat out (~60 Hz, past
+                // the 33 ms throttle below) on every platform. REAL REPORT
+                // (2026-11-06, Windows 10, eframe trace log): that also
+                // kept the event loop so busy that an extra receiver's
+                // window never got its WM_PAINT while the main window had
+                // focus -- it froze.
+                if connected.window_title != base_title {
+                    ui.ctx().send_viewport_cmd(egui::ViewportCommand::Title(base_title.clone()));
+                    connected.window_title = base_title.clone();
+                }
                 // None = not running, Some(false) = listening/idle,
                 // Some(true) = a client is currently connected. Drives
                 // the gray/green/red status text in the main panel.
