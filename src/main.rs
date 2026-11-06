@@ -5101,9 +5101,13 @@ impl eframe::App for HpsdrApp {
                             });
                         });
 
+                        });
+                        // The transmit controls get their own row under
+                        // Audio gain/Mute/SQL (real request), wrapping the
+                        // same way; none at all with transmit off.
                         if connected.tx_enabled {
+                        ui.horizontal_wrapped(|ui| {
                             if connected.tx_handle.is_some() {
-                                ui.add_space(12.0);
                                 ui.horizontal(|ui| {
                                     ui.label("Mic gain:");
                                     let mut mic_gain = connected.mic_gain;
@@ -5237,8 +5241,8 @@ impl eframe::App for HpsdrApp {
                                     }
                                 }
                             });
-                        }
                         });
+                        }
                     });
 
                     // Moved here from Settings -> TX (still shown there

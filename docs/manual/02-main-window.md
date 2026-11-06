@@ -398,10 +398,10 @@ The controls themselves:
 - **Spacebar** is a hold-to-talk shortcut for MOX, active whenever no text
   field has keyboard focus.
 
-While transmitting, a line beneath the gain controls shows **Mic level**
-and **ALC** readouts, and Mic gain / TCI TX gain / TX Power (TX Drive, in dB, on a
-[Pluto](24-pluto.md#transmit)) sliders appear
-alongside Audio gain.
+With transmit enabled, the **Mic gain**, **TCI TX gain** and **TX Power**
+(**TX Drive**, in dB, on a [Pluto](24-pluto.md#transmit)) sliders have
+their own row under Audio gain, Mute and SQL, and a line beneath them
+shows the **Mic level** and **ALC** readouts.
 
 **Always bench-test into a dummy load at reduced drive before transmitting
 into a real antenna.** See the [top-level README](../../README.md) for the
