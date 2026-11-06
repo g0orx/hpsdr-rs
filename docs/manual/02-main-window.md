@@ -141,6 +141,11 @@ The panel beside the spectrum/waterfall shows:
 - **Frames**: pages received with a good checksum. A page arrives about
   every 25 seconds; each page letter (K, L, M, N, ...) shows its latest
   version, newest first. **Clear** empties the list.
+- **CRC errors** (shown once there are any): pages that arrived but
+  failed their checksum. On a signal good enough to decode at all these
+  should be rare; many of them point at a weak or interrupted signal --
+  the [SNR](#s-meter--power-meter) readout under the S-meter, with the
+  beacon in the passband, shows how strong it is.
 - **»** (top right) minimizes the panel to a narrow strip, giving the
   spectrum and waterfall their width back. The beacon monitor and Lock
   LNB keep running. The strip's dot is green while the beacon is found;
@@ -387,7 +392,8 @@ The controls themselves:
 - **MOX** -- toggles transmit on/off. While active it turns red and reads
   **MOX ON**, and a red **TRANSMITTING** label appears.
 - **TUNE** -- transmits a steady test tone, centered in the current filter
-  passband, at the reduced **Tune Power %** set in Settings → TX (not full
+  passband (in CW, on the CW transmit frequency -- the dial plus or
+  minus the CW pitch, where keyed CW goes), at the reduced **Tune Power %** set in Settings → TX (not full
   TX Power) -- for safely tuning an antenna or amplifier.
 - **TWO TONE** -- transmits a two-tone test signal instead of a steady
   tone, also at Tune Power. This is required (not just an alternative) for

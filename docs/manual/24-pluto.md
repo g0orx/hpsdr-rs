@@ -49,8 +49,27 @@ at most about 11 MB/s, so on one of those use the normal stream, and
 expect transmitting while receiving to be marginal. With a gigabit
 adapter on the OTG port, a Pluto clone streamed the wide stream without
 loss and topped out at about 29 MB/s -- the Pluto's own USB port is the
-limit then, much as over USB. If samples go missing, hpsdr-rs says so
-in the terminal.
+limit then, much as over USB.
+
+If samples go missing, hpsdr-rs prints a line in the terminal, every 10
+seconds that it happens, starting with the time (UTC), e.g.
+`2026-11-04T09:15:30Z Pluto: received 58.0% of the expected samples over
+10.0 s -- some were lost`. The share and the times tell you the kind of
+problem:
+
+- **A steady, large shortfall** (the same 50-60% every time): the link
+  can't carry the stream. On the Pluto's console, `cat
+  /sys/class/net/eth0/speed` shows the speed it connected at; 100 instead
+  of 1000 means a fault in the cable or something on the way. A long
+  outdoor run that came up at 100 Mbit/s was cured by replacing the
+  cable.
+- **Occasional small losses**, scattered over hours: look at power. A
+  Pluto and its USB-Ethernet adapter together need more than many small
+  supplies give; at the dish, a stronger supply (through a fused 5 V
+  converter) stopped them.
+
+To keep a record over a long run, start hpsdr-rs with
+`hpsdr-rs 2>&1 | tee ~/pluto-log.txt`.
 
 The adapter has to be on the OTG port with a true OTG cable or adapter
 (one that grounds the ID pin), which puts the port into USB host mode.

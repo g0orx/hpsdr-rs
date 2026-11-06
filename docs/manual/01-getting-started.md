@@ -11,6 +11,25 @@ and instructions. Once built:
 cargo run --release
 ```
 
+### On Windows
+
+Install the `.msi`; hpsdr-rs is then in the Start Menu. It has no console
+window, so everything it would print -- status lines, warnings, and the
+reason if it stops -- goes to a log file instead:
+`%APPDATA%\hpsdr-rs\hpsdr-rs.log` (type that into the Win+R box to open
+the folder). The previous run's log is kept as `hpsdr-rs.prev.log`. The
+log only gets its first lines once you connect to a radio, so an empty
+one means hpsdr-rs stopped before then.
+
+hpsdr-rs draws with DirectX 12, falling back to OpenGL. If it won't start
+at all, look in Event Viewer (Windows Logs, then Application) for an
+**Application Error** from `hpsdr-rs.exe`: a faulting module that's a
+graphics driver points at that driver. One older Intel driver crashed
+just by Vulkan being started (it no longer is), and updating the graphics
+driver is the general cure. To choose the graphics API yourself, set
+`WGPU_BACKEND` to `dx12`, `vulkan` or `gl` -- e.g. `setx WGPU_BACKEND gl`
+in a Command Prompt, which takes effect for programs started afterwards.
+
 ## Discovering your radio
 
 On launch, the **Discover HPSDR Radios** list opens automatically and
@@ -80,6 +99,16 @@ between radios doesn't mix up their settings.
 
 To disconnect, use the **Stop** button at the bottom of the main window.
 This returns you to the discovery window.
+
+If the spectrum stays blank with **Waiting for samples from the
+radio...**, hpsdr-rs is connected but no receive data is arriving. The
+usual cause is the network: check the cable and its connectors (a
+reseated plug has fixed this), and that nothing between the PC and the
+radio is dropping traffic. For a Protocol 2 radio, starting hpsdr-rs with
+`HPSDR_P2_DEBUG=1` set prints the first packet from each of the radio's
+ports: status (1025) and microphone (1026) packets arriving with no IQ
+(1035 and up) means the radio hears hpsdr-rs but its receive data isn't
+getting back.
 
 ---
 

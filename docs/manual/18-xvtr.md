@@ -46,6 +46,12 @@ Use LO Error to correct for your LNB's actual LO error. To follow its
 drift automatically, use [PSK Beacon](02-main-window.md#psk-beacon-qo-100)'s
 **Lock LNB**, which measures it from the middle beacon at 10489.750 MHz.
 
+Once the downlink (VFO A), uplink (VFO B, e.g. through a 2400 MHz
+transverter or none), CTUN, Split, SAT and Duplex are set the way you
+like them, save the lot as a named setup with
+[**Setups**](02-main-window.md#vfo-a--vfo-b--split) and recall it with one
+click next time.
+
 ## Using a configured transverter
 
 A configured, in-range slot appears as an extra button alongside the
