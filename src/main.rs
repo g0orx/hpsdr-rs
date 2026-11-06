@@ -15564,6 +15564,19 @@ fn main() -> eframe::Result<()> {
     redirect_stdio_to_log_file();
     // After the redirect, so on Windows its output lands in the log too.
     init_env_logger();
+    // Which build this is and which diagnostic switches it can see, so a
+    // log answers both (REAL REPORT: a Windows test's log had no sign of
+    // HPSDR_LOG, and no way to tell whether the switch hadn't reached the
+    // program or the build predated it).
+    let env = |name: &str| std::env::var(name).unwrap_or_else(|_| "unset".to_string());
+    eprintln!(
+        "hpsdr-rs {} ({}): HPSDR_LOG={} HPSDR_PRESENT_MODE={} WGPU_BACKEND={}",
+        env!("CARGO_PKG_VERSION"),
+        env!("HPSDR_GIT_COMMIT"),
+        env("HPSDR_LOG"),
+        env("HPSDR_PRESENT_MODE"),
+        env("WGPU_BACKEND"),
+    );
 
     // Native Wayland is the default; HPSDR_FORCE_X11=1 (any value but
     // "0") forces winit's X11 backend via XWayland instead, by clearing

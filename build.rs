@@ -40,6 +40,22 @@
 */
 
 fn main() {
+    // The commit this was built from, for the start-up line in main.rs
+    // (so a log says which build produced it -- REAL REPORT, 2026-11-06:
+    // a Windows test couldn't tell whether its build had a change in it).
+    // "unknown" without git or a checkout.
+    let commit = std::process::Command::new("git")
+        .args(["rev-parse", "--short", "HEAD"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "unknown".to_string());
+    println!("cargo:rustc-env=HPSDR_GIT_COMMIT={commit}");
+    println!("cargo:rerun-if-changed=.git/HEAD");
+    println!("cargo:rerun-if-changed=.git/index");
     // ROOT CAUSE FIX for a real report ("cannot open input file
     // Packet.lib" persisting even after correctly setting
     // NPCAP_SDK_DIR): once a build script emits ANY `rerun-if-changed`
