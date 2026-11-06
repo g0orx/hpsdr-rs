@@ -1229,6 +1229,7 @@ dependencies = [
  "cpal",
  "eframe",
  "egui",
+ "log",
  "midir",
  "network-interface",
  "nusb",

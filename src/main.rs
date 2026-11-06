@@ -15496,12 +15496,74 @@ fn wgpu_backends() -> eframe::wgpu::Backends {
     Backends::from_env().unwrap_or(if cfg!(windows) { Backends::DX12 | Backends::GL } else { Backends::PRIMARY | Backends::GL })
 }
 
+/// wgpu's present mode: egui-wgpu's default (AutoVsync), unless
+/// HPSDR_PRESENT_MODE asks for `novsync` (AutoNoVsync), `fifo`,
+/// `mailbox` or `immediate`. For diagnosing, not tuning -- REAL REPORT
+/// (2026-11-06, Windows 10): an extra receiver's window doesn't update
+/// while the main one has focus, and a present waiting on vsync is one
+/// candidate (see the NOTE in main's wgpu_options for an earlier one).
+fn wgpu_present_mode() -> eframe::wgpu::PresentMode {
+    use eframe::wgpu::PresentMode;
+    match std::env::var("HPSDR_PRESENT_MODE").as_deref() {
+        Ok("novsync") => PresentMode::AutoNoVsync,
+        Ok("fifo") => PresentMode::Fifo,
+        Ok("mailbox") => PresentMode::Mailbox,
+        Ok("immediate") => PresentMode::Immediate,
+        _ => PresentMode::AutoVsync,
+    }
+}
+
+/// Library log messages (eframe, egui, wgpu, winit use the `log` crate)
+/// printed to stderr -- so on Windows, to hpsdr-rs.log -- when HPSDR_LOG
+/// is set: `HPSDR_LOG=eframe=trace` for one crate at a level, or just a
+/// level (`debug`) for everything. Off otherwise. For diagnosing, e.g.
+/// eframe's "RedrawRequested is overdue" when a window isn't being
+/// painted (the Windows extra-receiver report above).
+struct EnvLogger {
+    target: Option<String>,
+    level: log::LevelFilter,
+}
+
+impl log::Log for EnvLogger {
+    fn enabled(&self, metadata: &log::Metadata) -> bool {
+        metadata.level() <= self.level && self.target.as_deref().is_none_or(|t| metadata.target().starts_with(t))
+    }
+
+    fn log(&self, record: &log::Record) {
+        if self.enabled(record.metadata()) {
+            eprintln!(
+                "{} {} {}: {}",
+                iq_recorder::iso8601_now(),
+                record.level(),
+                record.target(),
+                record.args()
+            );
+        }
+    }
+
+    fn flush(&self) {}
+}
+
+fn init_env_logger() {
+    let Ok(spec) = std::env::var("HPSDR_LOG") else { return };
+    let (target, level) = match spec.split_once('=') {
+        Some((target, level)) => (Some(target.to_string()), level),
+        None => (None, spec.as_str()),
+    };
+    let level = level.parse().unwrap_or(log::LevelFilter::Debug);
+    if log::set_boxed_logger(Box::new(EnvLogger { target, level })).is_ok() {
+        log::set_max_level(level);
+    }
+}
+
 fn main() -> eframe::Result<()> {
     // See the crate-level `windows_subsystem` attribute above for why
     // this matters: with no console auto-allocated on Windows release
     // builds, println!/eprintln! output would otherwise go nowhere.
     #[cfg(all(windows, not(debug_assertions)))]
     redirect_stdio_to_log_file();
+    // After the redirect, so on Windows its output lands in the log too.
+    init_env_logger();
 
     // Native Wayland is the default; HPSDR_FORCE_X11=1 (any value but
     // "0") forces winit's X11 backend via XWayland instead, by clearing
@@ -15566,6 +15628,10 @@ fn main() -> eframe::Result<()> {
             .with_min_inner_size([900.0, 360.0])
             .with_icon(icon),
         wgpu_options: eframe::egui_wgpu::WgpuConfiguration {
+            surface: eframe::egui_wgpu::SurfaceConfig {
+                present_mode: wgpu_present_mode(),
+                ..eframe::egui_wgpu::SurfaceConfig::HIGH_THROUGHPUT
+            },
             // NOTE: this used to override `surface` to force
             // PresentMode::Fifo (true vsync), added 2026-09-11 on
             // suspicion it was the source of a Raspberry Pi 5 Mesa V3D

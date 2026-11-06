@@ -35,6 +35,9 @@ eframe = { version = "0.37", default-features = false, features = [
     "x11",
 ] }
 egui = "0.37"
+# Already in the tree through eframe/wgpu/winit; used directly only for
+# main.rs's HPSDR_LOG diagnostic logger.
+log = "0.4"
 network-interface = "1"
 socket2 = { version = "0.5", features = ["all"] }
 serde = { version = "1", features = ["derive"] }
