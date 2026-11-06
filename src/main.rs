@@ -2180,6 +2180,9 @@ struct ConnectedState {
     /// typed there to save the current one under.
     setups: Vec<config::SavedSetup>,
     setup_name: String,
+    /// When the main window next asks the extra receivers' windows for a
+    /// redraw -- see the extra-receiver loop in ui().
+    next_extra_repaint: Instant,
     /// "CW Decode" toggle (button next to CTUN) -- controls both
     /// whether main.rs draws the decoder panel AND (pushed to
     /// spectrum.rs every frame via set_cw_decode_enabled) whether the
@@ -3395,6 +3398,7 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                 duplex: cfg.duplex.unwrap_or(false),
                 setups: cfg.setups.clone(),
                 setup_name: String::new(),
+                next_extra_repaint: Instant::now(),
                 sat_last: None,
                 cw_decode_enabled,
                 psk_beacon_enabled,
@@ -7234,18 +7238,32 @@ impl eframe::App for HpsdrApp {
                     .session
                     .active_receiver_count
                     .store(active_count as u32, Ordering::Relaxed);
+                // Keep the extra receivers' windows redrawing from here, at
+                // ~30 Hz. REAL REPORT (2026-11-06, Windows 10): with the
+                // main window focused, an extra receiver's window stopped
+                // updating (focused, both did; on Linux both always did).
+                // eframe's trace log showed no repaint requests for it at
+                // all then. egui only passes a request on if it's sooner
+                // than the one already pending (ContextImpl::
+                // request_repaint_after), and that's only cleared when the
+                // window redraws -- so once one 33 ms request's redraw was
+                // lost (Windows: an "outdated" or overdue paint), every
+                // later 33 ms request, its own and a request_repaint_after_
+                // for(33 ms) from here alike, was dropped, until focus or
+                // input made it redraw. An immediate request (delay 0) is
+                // always sooner, so always goes through; the 33 ms spacing
+                // is kept here instead. Windows only: egui makes each
+                // immediate request two redraws, and Linux never needed it.
+                let repaint_extras = cfg!(windows) && Instant::now() >= connected.next_extra_repaint;
+                if repaint_extras {
+                    connected.next_extra_repaint = Instant::now() + Duration::from_millis(33);
+                }
                 for rx in connected.extra_receivers.clone() {
                     let ddc_index = rx.lock().unwrap().ddc_index;
                     let viewport_id = egui::ViewportId::from_hash_of(("extra_receiver", ddc_index));
-                    // Keep its window redrawing from here too. REAL REPORT
-                    // (2026-11-06, Windows 10): with the main window
-                    // focused, an extra receiver's window stopped updating
-                    // (focused, both did; on Linux both always did) -- its
-                    // own request_repaint_after evidently isn't acted on
-                    // there while another of the app's windows has focus.
-                    // Timed, not immediate, so it can't loop with that
-                    // window's own requests: at most its usual ~30 Hz.
-                    ui.ctx().request_repaint_after_for(Duration::from_millis(33), viewport_id);
+                    if repaint_extras {
+                        ui.ctx().request_repaint_of(viewport_id);
+                    }
                     let title = format!("{} - RX {}", base_title, ddc_index + 1);
                     let rx_for_closure = Arc::clone(&rx);
                     // Position/size seed from this radio's saved config --
