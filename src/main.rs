@@ -14240,6 +14240,15 @@ fn render_extra_receiver_ui(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceiver>>) {
     // Bounded rather than unconditional -- see the same call in the
     // main receiver's update loop for why.
     ui.ctx().request_repaint_after(Duration::from_millis(33));
+    // And keep the main window going too. REAL REPORT (2026-11-06,
+    // Windows 10): with an extra receiver's window focused, the main
+    // window stopped updating; with the main one focused both did (its
+    // frames show the extra viewports, so redraw them), and on Linux both
+    // always did. Its own request_repaint_after evidently doesn't fire
+    // there while another of the app's windows has focus. Timed, not
+    // immediate: an immediate request would loop -- the main window's
+    // frame redraws this one, which would ask again at once.
+    ui.ctx().request_repaint_after_for(Duration::from_millis(33), egui::ViewportId::ROOT);
 }
 
 /// Content of an extra receiver's own "AGC / Level Settings" popup --
