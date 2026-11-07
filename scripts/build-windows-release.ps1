@@ -24,6 +24,29 @@ if (-not (Get-Command cargo-wix -ErrorAction SilentlyContinue)) {
     exit 1
 }
 
+# The web client first, so hpsdr-rs has it built in (Settings -> Network
+# -> Web client; see build.rs) -- the PowerShell version of
+# crates/hpsdr-remote/build-web.sh: the wasm32 target, wasm-bindgen-cli at
+# the version in Cargo.lock (they must match), then the build.
+Write-Host "Building the web client..."
+rustup target add wasm32-unknown-unknown
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+$lock = Get-Content Cargo.lock
+$i = [Array]::IndexOf($lock, 'name = "wasm-bindgen"')
+$bindgen = $lock[$i + 1] -replace '^version = "(.*)"$', '$1'
+$have = ""
+if (Get-Command wasm-bindgen -ErrorAction SilentlyContinue) { $have = (wasm-bindgen --version) }
+if ($have -ne "wasm-bindgen $bindgen") {
+    Write-Host "Installing wasm-bindgen-cli $bindgen (to match Cargo.lock)"
+    cargo install wasm-bindgen-cli --version $bindgen --locked
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+}
+cargo build -p hpsdr-remote --release --target wasm32-unknown-unknown
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+wasm-bindgen --target web --no-typescript --out-dir crates/hpsdr-remote/web/pkg `
+    target/wasm32-unknown-unknown/release/hpsdr-remote.wasm
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
 Write-Host "Building .msi with cargo wix..."
 cargo wix @args
 if ($LASTEXITCODE -ne 0) {

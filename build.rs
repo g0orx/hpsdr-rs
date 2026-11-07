@@ -62,9 +62,10 @@ fn main() {
     println!("cargo:rustc-check-cfg=cfg(remote_web)");
     let web = std::path::Path::new("crates/hpsdr-remote/web");
     let web_files = ["index.html", "pkg/hpsdr-remote.js", "pkg/hpsdr-remote_bg.wasm"];
-    for f in &web_files {
-        println!("cargo:rerun-if-changed={}", web.join(f).display());
-    }
+    // The directory, not the files: Cargo reruns a build script every time
+    // if a file it watches doesn't exist, which would rebuild WDSP on every
+    // build without the web client.
+    println!("cargo:rerun-if-changed={}", web.display());
     if web_files.iter().all(|f| web.join(f).exists()) {
         println!("cargo:rustc-cfg=remote_web");
     }

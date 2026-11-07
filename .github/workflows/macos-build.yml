@@ -12,6 +12,7 @@ on:
     paths:
       - "src/**"
       - "vendor/**"
+      - "crates/**"
       - "build.rs"
       - "Cargo.toml"
       - "Cargo.lock"
@@ -20,6 +21,7 @@ on:
     paths:
       - "src/**"
       - "vendor/**"
+      - "crates/**"
       - "build.rs"
       - "Cargo.toml"
       - "Cargo.lock"
@@ -45,6 +47,11 @@ jobs:
       # already present on GitHub's macos-latest runners by default.
       - name: Install fftw3 via Homebrew
         run: brew install fftw pkg-config
+
+      # Before hpsdr-rs, which then has the web client built in (see
+      # build.rs). Installs the wasm32 target and wasm-bindgen-cli itself.
+      - name: Build web client
+        run: crates/hpsdr-remote/build-web.sh
 
       - name: cargo build --release
         run: cargo build --release

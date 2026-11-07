@@ -39,6 +39,12 @@ jobs:
           cargo install cargo-generate-rpm --locked
           cargo install cargo-deb --locked
 
+      # Before any hpsdr-rs build: hpsdr-rs then has the web client built
+      # in (Settings -> Network -> Web client; see build.rs). Installs the
+      # wasm32 target and the matching wasm-bindgen-cli itself.
+      - name: Build web client
+        run: crates/hpsdr-remote/build-web.sh
+
       - name: Build AppImage
         run: scripts/build-appimage.sh
 
