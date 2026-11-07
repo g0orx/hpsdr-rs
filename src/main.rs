@@ -978,6 +978,13 @@ fn save_setup(connected: &mut ConnectedState, name: &str) {
     }
 }
 
+/// Right-click on a VFO: opens the keypad for VFO A or B -- or, if it's
+/// already open, starts it afresh for that VFO. It's a window inside the
+/// main one (see where it's drawn), so it's always in front there.
+fn open_frequency_entry(connected: &mut ConnectedState, vfo_b: bool) {
+    connected.frequency_entry = Some(FrequencyEntry { vfo_b, digits: String::new() });
+}
+
 /// Linearly maps a 7-bit MIDI knob value (0-127) onto `lo..=hi`.
 fn midi_knob_range(value: u8, lo: f64, hi: f64) -> f64 {
     lo + (value as f64 / 127.0) * (hi - lo)
@@ -4505,8 +4512,7 @@ impl eframe::App for HpsdrApp {
                                         // Right-click -> keypad frequency
                                         // entry popup, real request.
                                         if resp.secondary_clicked() {
-                                            connected.frequency_entry =
-                                                Some(FrequencyEntry { vfo_b: false, digits: String::new() });
+                                            open_frequency_entry(connected, false);
                                         }
                                         resp
                                     })
@@ -4767,8 +4773,7 @@ impl eframe::App for HpsdrApp {
                                                 "Scroll to tune -- Alt: 10 Hz, Shift: 100 Hz, none: 1 kHz -- right-click to type a frequency",
                                             );
                                         if resp.secondary_clicked() {
-                                            connected.frequency_entry =
-                                                Some(FrequencyEntry { vfo_b: true, digits: String::new() });
+                                            open_frequency_entry(connected, true);
                                         }
                                         resp
                                     })
@@ -4971,21 +4976,26 @@ impl eframe::App for HpsdrApp {
                     // Right-click VFO -> keypad frequency-entry popup --
                     // real request. Opened by freq_label/vfo_b_label's
                     // own secondary_clicked() handling above.
+                    //
+                    // A window drawn inside the main one, not its own OS
+                    // window. REAL REPORT (2026-11-07): as its own window it
+                    // could end up behind the main window or an extra
+                    // receiver's, and on Linux (native Wayland) nothing can
+                    // bring it back -- Wayland ignores a program raising or
+                    // focusing its own windows (ViewportCommand::Focus did
+                    // nothing). Inside the main window egui always draws it
+                    // on top, and right-clicking a VFO brings the main
+                    // window, and it, forward.
                     if connected.frequency_entry.is_some() {
                         let mut close_now = false;
-                        ui.ctx().show_viewport_immediate(
-                            egui::ViewportId::from_hash_of("frequency_entry_window"),
-                            egui::ViewportBuilder::default()
-                                .with_title("Enter Frequency")
-                                .with_inner_size([260.0, 360.0])
-                                .with_resizable(false)
-                                .with_active(true),
-                            |ui, _class| {
-                                if ui.input(|i| i.viewport().close_requested()) {
-                                    close_now = true;
-                                    return;
-                                }
-                                egui::CentralPanel::default().show(ui, |ui| {
+                        let mut open = true;
+                        egui::Window::new("Enter Frequency")
+                            .open(&mut open)
+                            .collapsible(false)
+                            .resizable(false)
+                            .default_pos(egui::pos2(240.0, 90.0))
+                            .show(ui.ctx(), |ui| {
+                                {
                                     // Pulled out as plain locals rather
                                     // than held as a live borrow of
                                     // connected.frequency_entry for the
@@ -5139,10 +5149,9 @@ impl eframe::App for HpsdrApp {
                                         }
                                         close_now = true;
                                     }
-                                });
-                            },
-                        );
-                        if close_now {
+                                }
+                            });
+                        if close_now || !open {
                             connected.frequency_entry = None;
                         }
                     }
@@ -6068,7 +6077,11 @@ impl eframe::App for HpsdrApp {
                             // then releasing it will still unkey,
                             // though; a minor interaction edge case,
                             // not a general PTT-conflict resolver.
-                            let editing_text = ui.ctx().memory(|m| m.focused().is_some());
+                            // The frequency keypad counts too: it's inside the
+                            // main window, so a space typed there would
+                            // otherwise key the transmitter.
+                            let editing_text = ui.ctx().memory(|m| m.focused().is_some())
+                                || connected.frequency_entry.is_some();
                             let space_down = !editing_text && ui.input(|i| i.key_down(egui::Key::Space));
                             // Real request -- see tx_frequency_allowed's
                             // own doc comment. No on-screen feedback

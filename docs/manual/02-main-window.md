@@ -38,6 +38,11 @@ that VFO is the one actually transmitting (see
   Backspace/Enter/Escape input) to type an exact frequency directly,
   rather than scrolling or clicking a spot on the spectrum. Retunes as
   soon as you press **Enter**, clamped to the radio's own tunable range.
+  The keypad opens inside the main window, on top of everything there, so
+  it can't get lost behind it; drag it by its title, and close it with
+  **Cancel**, Escape or its **x**. Right-clicking a VFO while it's open
+  starts it afresh for that VFO. While it's open the spacebar doesn't
+  key the transmitter.
 - **Click and drag** across the spectrum or waterfall: retunes by however
   far you've dragged, in whichever direction, rather than jumping straight
   to wherever the cursor ends up. With [CTUN](#ctun-click-to-tune) off,
