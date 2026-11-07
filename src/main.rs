@@ -935,6 +935,7 @@ fn start_web_server(
     https: bool,
     password: &str,
     tci_addr: &Arc<Mutex<String>>,
+    log: &debug_log::DebugLog,
 ) -> Result<web_server::WebServer, String> {
     let tls = if https {
         let dir = config::settings_dir().ok_or("no settings folder to keep the HTTPS certificate in")?;
@@ -943,7 +944,7 @@ fn start_web_server(
     } else {
         None
     };
-    web_server::WebServer::start(addr, tls, password.to_string(), Arc::clone(tci_addr))
+    web_server::WebServer::start(addr, tls, password.to_string(), Arc::clone(tci_addr), log.clone())
         .map_err(|e| format!("couldn't listen on {addr}: {e}"))
 }
 
@@ -2408,6 +2409,8 @@ struct ConnectedState {
     rigctl_debug_log: debug_log::DebugLog,
     tci_debug_log: debug_log::DebugLog,
     cat_debug_log: debug_log::DebugLog,
+    /// The web client server's connections (web_log.txt).
+    web_debug_log: debug_log::DebugLog,
     /// Set when a manual Start from the Network tab fails (e.g. port
     /// already in use); cleared on the next Start attempt. rigctl/TCI/CAT
     /// no longer auto-start on connect, so there's no "unavailable at
@@ -3068,6 +3071,10 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                 debug_log::log_path("cat_log.txt").unwrap_or_else(|| "cat_log.txt".into()),
             );
             cat_debug_log.set_enabled(cfg.cat_logging_enabled.unwrap_or(false));
+            let web_debug_log = debug_log::DebugLog::new(
+                debug_log::log_path("web_log.txt").unwrap_or_else(|| "web_log.txt".into()),
+            );
+            web_debug_log.set_enabled(cfg.web_logging_enabled.unwrap_or(false));
 
             // CW keyer send (CAT "KY" / rigctl "send_morse") -- see
             // tx::TxHandle::queue_cw_text's, cat.rs's, and rigctl.rs's
@@ -3134,7 +3141,7 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
             let web_tci_addr = Arc::new(Mutex::new(tci_addr.clone()));
             let mut web_error: Option<String> = None;
             let web_server = if cfg.web_running.unwrap_or(false) {
-                match start_web_server(&web_addr, web_https, &web_password, &web_tci_addr) {
+                match start_web_server(&web_addr, web_https, &web_password, &web_tci_addr, &web_debug_log) {
                     Ok(s) => Some(s),
                     Err(msg) => {
                         eprintln!("web client: {msg}");
@@ -3592,6 +3599,7 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                 rigctl_debug_log,
                 tci_debug_log,
                 cat_debug_log,
+                web_debug_log,
                 rigctl_error,
                 tci_error,
                 cat_error,
@@ -7920,6 +7928,7 @@ impl eframe::App for HpsdrApp {
                                                 connected.web_https,
                                                 &connected.web_password,
                                                 &connected.web_tci_addr,
+                                                &connected.web_debug_log,
                                             ) {
                                                 Ok(s) => Some(s),
                                                 Err(msg) => {
@@ -7996,6 +8005,24 @@ impl eframe::App for HpsdrApp {
                                     }
                                     if let Some(err) = &connected.web_error {
                                         ui.colored_label(egui::Color32::from_rgb(220, 60, 60), err);
+                                    }
+                                    {
+                                        let mut logging = connected.web_debug_log.is_enabled();
+                                        if ui
+                                            .checkbox(&mut logging, "Log connections to file (web_log.txt)")
+                                            .on_hover_text(
+                                                "Logs each connection: who, whether the HTTPS handshake \
+                                                 worked (a browser that hasn't accepted the certificate \
+                                                 shows here), each page fetched, and for the client's \
+                                                 radio connection why it was refused or how long it \
+                                                 lasted. Never the password. Saved alongside this radio's \
+                                                 settings.",
+                                            )
+                                            .changed()
+                                        {
+                                            connected.web_debug_log.set_enabled(logging);
+                                            settings_changed = true;
+                                        }
                                     }
                                     ui.weak(if connected.web_password.is_empty() {
                                         "No password: anyone who can reach this port can control the radio, \
@@ -11564,6 +11591,7 @@ impl eframe::App for HpsdrApp {
                         rigctl_logging_enabled: Some(connected.rigctl_debug_log.is_enabled()),
                         tci_logging_enabled: Some(connected.tci_debug_log.is_enabled()),
                         cat_logging_enabled: Some(connected.cat_debug_log.is_enabled()),
+                        web_logging_enabled: Some(connected.web_debug_log.is_enabled()),
                         extra_receivers,
                         allow_out_of_band_tx: Some(
                             connected.allow_out_of_band_tx.load(std::sync::atomic::Ordering::Relaxed),

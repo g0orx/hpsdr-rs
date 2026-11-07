@@ -144,6 +144,9 @@ pub struct Config {
     pub tci_logging_enabled: Option<bool>,
     #[serde(default)]
     pub cat_logging_enabled: Option<bool>,
+    /// The web client server's connection log, web_log.txt.
+    #[serde(default)]
+    pub web_logging_enabled: Option<bool>,
     /// Noise blanker (NB/NB2, mutually exclusive) and noise reduction
     /// (NR/NR2, mutually exclusive) state -- see the field docs on
     /// spectrum::DemodParams and the NoiseBlanker/NoiseReduction enums

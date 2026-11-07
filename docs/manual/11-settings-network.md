@@ -153,6 +153,15 @@ internet forward only this port; TCI's address can then be
 `127.0.0.1:50001`, which the web client still reaches through here. A VPN
 (WireGuard, Tailscale) or an SSH tunnel is safer still.
 
+**Log connections to file** writes `web_log.txt`, kept with the settings,
+one line per event with the connecting address: whether the HTTPS
+handshake worked (a browser that hasn't yet accepted the certificate shows
+up as a failed handshake), each page it fetched, and for the client's radio
+connection whether it was refused -- wrong or missing password, TCI server
+not running -- or how long it stayed open. The password itself is never
+written. Like the other logs, it starts a fresh file each time it's
+ticked, and it can be ticked while the server is running.
+
 The web client is built into hpsdr-rs when it's built from source with the
 web client built first (`crates/hpsdr-remote/build-web.sh`); without it,
 the page says so.
