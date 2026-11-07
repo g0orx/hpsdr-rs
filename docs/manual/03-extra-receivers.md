@@ -31,7 +31,8 @@ PureSignal and reconnect to get those two receivers back.
 It behaves like a scaled-down version of the main window: VFO-A/VFO-B
 boxes with **A>B**/**B>A**/**A<>B** buttons (same as the main window's own
 -- see [Frequency display and tuning](02-main-window.md#frequency-display-and-tuning)
--- but no **Split** button, since extra receivers never transmit), with
+-- but no **Split** button, since extra receivers never transmit; right-click
+either VFO for the frequency keypad, which opens inside this window), with
 **CTUN** and, while in CW mode, **CW Decode** (see
 [CW decoder](02-main-window.md#cw-decode)) in the row underneath, band
 and mode rows, **Filter width** and **Audio gain** sliders (with
