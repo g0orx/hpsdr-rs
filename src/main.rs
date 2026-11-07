@@ -3844,6 +3844,10 @@ impl eframe::App for HpsdrApp {
                 let rigctl_status: Option<bool> = connected.rigctl_server.as_ref().map(|s| s.is_connected());
                 let tci_status: Option<bool> = connected.tci_server.as_ref().map(|s| s.is_connected());
                 let cat_status: Option<bool> = connected.cat_server.as_ref().map(|s| s.is_connected());
+                // The web client server: running, and whether a remote
+                // client is connected -- through TCI, which it uses.
+                let remote_clients = connected.tci_server.as_ref().map_or(0, |s| s.remote_clients());
+                let web_status: Option<bool> = connected.web_server.as_ref().map(|_| remote_clients > 0);
                 let freq_hz = connected
                     .session
                     .frequency_hz
@@ -5708,6 +5712,9 @@ impl eframe::App for HpsdrApp {
                         ui.add_space(12.0);
                         ui.colored_label(network_status_color(cat_status), "CAT")
                             .on_hover_text(network_status_hover("CAT", cat_status, &connected.cat_addr));
+                        ui.add_space(12.0);
+                        ui.colored_label(network_status_color(web_status), "Web")
+                            .on_hover_text(web_status_hover(web_status, &connected.web_addr, remote_clients));
                         // PureSignal: only shown when actually enabled for
                         // this session (see ConnectedState::puresignal_enabled's
                         // doc comment -- a connect-time setting, not live).
@@ -12809,6 +12816,21 @@ fn network_status_hover(name: &str, status: Option<bool>, addr: &str) -> String 
         None => format!("{name}: not running"),
         Some(false) => format!("{name}: listening on {addr}, no client connected"),
         Some(true) => format!("{name}: client connected on {addr}"),
+    };
+    format!("{state}\n(start/stop in Settings -> Network)")
+}
+
+/// Same as network_status_hover, for the web client server: its clients
+/// connect to TCI, not to it (it only serves the page), so "connected"
+/// counts hpsdr-remote clients, web or native, on the TCI server.
+fn web_status_hover(status: Option<bool>, addr: &str, clients: usize) -> String {
+    let state = match status {
+        None => "Web client: not running".to_string(),
+        Some(false) => format!("Web client: serving on {addr}, no remote client connected"),
+        Some(true) => format!(
+            "Web client: serving on {addr}, {clients} remote client{} connected (through TCI)",
+            if clients == 1 { "" } else { "s" }
+        ),
     };
     format!("{state}\n(start/stop in Settings -> Network)")
 }

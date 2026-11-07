@@ -595,6 +595,11 @@ impl TciServer {
         self.band_share.take_request()
     }
 
+    /// hpsdr-remote clients (web or native) connected now.
+    pub fn remote_clients(&self) -> usize {
+        self.band_share.clients()
+    }
+
     /// Same idea as set_demod_params, for the streaming taps -- a
     /// SpectrumHandle recreated on a sample-rate change (main.rs's
     /// change_sample_rate) hands out entirely new audio_out/iq_out
@@ -1006,6 +1011,9 @@ fn handle_client(
     // hpsdr-rs's remote extensions, if this client asks for them -- see
     // remote.rs and docs/remote-protocol.md.
     let mut remote = crate::remote::RemoteStreams::default();
+    // Counts this client as a remote client once it says hpsdr_hello, until
+    // it goes -- see remote::ClientCount.
+    let mut remote_count: Option<crate::remote::ClientCount> = None;
     let mut iq_streaming = false;
     // ROOT CAUSE INVESTIGATION continued: a real Windows report's
     // connections never logged a read error either (see "connection
@@ -1145,6 +1153,9 @@ fn handle_client(
                         // instead of TCI's float stream.
                         if remote.hello {
                             audio_streaming = false;
+                            if remote_count.is_none() {
+                                remote_count = Some(crate::remote::ClientCount::new(Arc::clone(&band_share)));
+                            }
                         }
                         continue;
                     }
@@ -2454,6 +2465,15 @@ mod remote_tests {
             }
             display.lock().unwrap().revision += 1;
         }
+        // Counted as a remote client (the main window's Web indicator)
+        // while connected, and not once it's gone.
+        assert_eq!(server.remote_clients(), 1);
+        drop(ws);
+        let gone = Instant::now();
+        while server.remote_clients() != 0 && gone.elapsed() < Duration::from_secs(2) {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(server.remote_clients(), 0);
         server.stop();
         println!("spectrum {spectrum}, adpcm {adpcm}, float audio {float_audio}");
         assert!(hello);

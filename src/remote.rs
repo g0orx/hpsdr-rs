@@ -16,7 +16,8 @@ use hpsdr_proto::state::{self as dsp, DspState};
 use hpsdr_proto::tci::{Command, AUDIO, AUDIO_RATES, FEATURE_ADPCM, FEATURE_SPECTRUM, HELLO, SPECTRUM};
 use hpsdr_proto::{Header, CODEC_IMA_ADPCM, FORMAT_ADPCM, PROTOCOL_VERSION, TYPE_ADPCM_AUDIO};
 
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use crate::spectrum::{Agc, DemodParams, NoiseBlanker, NoiseReduction, SpectrumDisplay};
 
@@ -41,11 +42,32 @@ pub struct RemoteStreams {
 /// The radio's band buttons, shared between main.rs and the TCI clients'
 /// threads: main.rs sets the list every frame (it only becomes "new" when
 /// it changes), clients send it as hpsdr_bands, and a client's hpsdr_band
-/// waits here until main.rs applies it -- as its band buttons do.
+/// waits here until main.rs applies it -- as its band buttons do. Also
+/// counts the remote clients connected, for the main window's Web
+/// indicator (see ClientCount).
 #[derive(Default)]
 pub struct BandShare {
     list: Mutex<(u64, Vec<BandInfo>)>,
     requested: Mutex<Option<String>>,
+    clients: AtomicUsize,
+}
+
+/// One connected remote client (one that said hpsdr_hello), counted in
+/// BandShare for as long as this lives -- the client's thread holds it,
+/// so however it ends, the count comes down.
+pub struct ClientCount(Arc<BandShare>);
+
+impl ClientCount {
+    pub fn new(share: Arc<BandShare>) -> Self {
+        share.clients.fetch_add(1, Ordering::Relaxed);
+        Self(share)
+    }
+}
+
+impl Drop for ClientCount {
+    fn drop(&mut self) {
+        self.0.clients.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 impl BandShare {
@@ -64,6 +86,11 @@ impl BandShare {
 
     pub fn take_request(&self) -> Option<String> {
         self.requested.lock().unwrap().take()
+    }
+
+    /// Remote clients connected now.
+    pub fn clients(&self) -> usize {
+        self.clients.load(Ordering::Relaxed)
     }
 }
 

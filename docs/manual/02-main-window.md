@@ -361,17 +361,22 @@ A row of buttons and two sliders:
 
 ![Noise and AGC toggle row](images/02-toggle-row.png)
 
-## rigctl / TCI / CAT status badges
+## rigctl / TCI / CAT / Web status badges
 
 Small colored badges show whether the rigctl, TCI, and CAT control servers
-(configured in Settings → Network) are running:
+and the web client server (configured in Settings → Network) are running:
 
 - Gray -- not running.
 - Green -- listening, no client connected (or a PureSignal-specific state
   for the **PS** badge -- see below).
 - Red -- a client is currently connected.
 
-Hovering a badge shows its address and current state in a tooltip.
+**Web** is red while an hpsdr-remote client is connected -- in a browser or
+the native client. Those clients connect through TCI, so **TCI** is red as
+well.
+
+Hovering a badge shows its address and current state in a tooltip, and for
+**Web**, how many remote clients are connected.
 
 If PureSignal is enabled for the session, a **PS** badge also appears: gray
 while enabled but not yet correcting, green while actively correcting, with
