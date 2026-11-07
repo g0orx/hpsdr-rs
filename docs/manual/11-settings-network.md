@@ -103,6 +103,32 @@ On a microwave band such as QO-100, TCI Remote may show **OUT OF BAND**
 over its waterfall. That comes from TCI Remote's own band plan, not from
 hpsdr-rs -- the frequency, spectrum and tuning are all still correct.
 
+## Web client
+
+hpsdr-remote, hpsdr-rs's own remote client, in a web browser -- on a phone,
+a tablet (iPhone and iPad included) or another computer, with nothing to
+install. Enter the address to listen on (default `0.0.0.0:8080`) and click
+**Start**; the line below then gives the address to open, e.g.
+`http://192.168.1.122:8080`. It needs the **TCI** server running too, and
+suggests the TCI port you've set. Like the other servers here it starts
+again automatically next time if it was running.
+
+The client shows the radio's spectrum and waterfall, its band buttons, the
+VFO, mode, filter, AGC and noise controls, the S-meter, and the receive
+audio (which starts when you press **Connect** -- browsers only start audio
+after a tap). Tune by tapping or sliding on the spectrum or waterfall, by
+sliding on the frequency, or with **-** and **+** and a chosen step. It
+uses about 150 kbit/s, compressed, rather than the several Mbit/s of
+standard TCI audio and IQ. Receive only, for now.
+
+There's no password, as with TCI itself: anyone who can reach these ports
+can control the radio. Keep it on your own network, or reach it through a
+VPN (WireGuard, Tailscale) or an SSH tunnel.
+
+The web client is built into hpsdr-rs when it's built from source with the
+web client built first (`crates/hpsdr-remote/build-web.sh`); without it,
+the page says so.
+
 ## CAT (Kenwood TS-2000 emulation)
 
 A plain-ASCII, semicolon-terminated command set for logging/rig-control

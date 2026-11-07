@@ -1,0 +1,31 @@
+[package]
+name = "hpsdr-remote"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-2.0-or-later"
+authors = ["John Melton <john.d.melton@googlemail.com>"]
+description = "Thin remote client for hpsdr-rs, over TCI with hpsdr-rs's remote extensions -- native and in a web browser"
+repository = "https://github.com/g0orx/hpsdr-rs"
+
+# One codebase, two builds: native (Linux, Windows, macOS, later Android)
+# and WebAssembly for a browser (iPhone/iPad and anything else). Nothing
+# radio-specific here -- no WDSP, FFTW or USB -- so it stays small.
+[dependencies]
+hpsdr-proto = { path = "../hpsdr-proto" }
+# glow (OpenGL / WebGL) rather than hpsdr-rs's wgpu: it runs everywhere
+# here, browsers included, and is lighter.
+eframe = { version = "0.37", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
+egui = "0.37"
+# A WebSocket client by egui's author: tungstenite in a thread natively,
+# the browser's WebSocket on the web, one API.
+ewebsock = "0.8"
+log = "0.4"
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+cpal = "0.17"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+cpal = { version = "0.17", features = ["wasm-bindgen"] }
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+web-sys = { version = "0.3", features = ["Window", "Document", "Element", "Location", "HtmlCanvasElement"] }

@@ -5,3 +5,4 @@
 
 # AppImage builds (packaging/appimage/build-appimage.sh)
 /*.AppImage
+crates/hpsdr-remote/web/pkg/

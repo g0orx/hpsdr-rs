@@ -1,0 +1,12 @@
+[package]
+name = "hpsdr-proto"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-2.0-or-later"
+authors = ["John Melton <john.d.melton@googlemail.com>"]
+description = "Wire encoding shared by hpsdr-rs and hpsdr-remote: TCI framing plus hpsdr-rs's remote extensions"
+repository = "https://github.com/g0orx/hpsdr-rs"
+
+# No dependencies, on purpose: it builds for desktop, Android and
+# WebAssembly alike. See docs/remote-protocol.md.
+[dependencies]

@@ -176,6 +176,12 @@ const PROTOCOL_MESSAGE: &str = "protocol:ExpertSDR3,2.0;";
 /// this indirection exists.
 type DemodParamsCell = Arc<Mutex<Arc<Mutex<DemodParams>>>>;
 
+/// The main receiver's display (its spectrum row and S-meter), for the
+/// remote extensions' spectrum stream (remote.rs) -- swapped like
+/// DemodParamsCell when a sample-rate change rebuilds it (set_display).
+/// None until main.rs sets it.
+type DisplayCell = Arc<Mutex<Option<Arc<Mutex<crate::spectrum::SpectrumDisplay>>>>>;
+
 /// The two dedicated streaming taps a SpectrumHandle exposes for TCI
 /// specifically (spectrum.rs's tci_audio_out/iq_out -- NOT the same
 /// queues local playback/other consumers use, see that module's doc
@@ -346,6 +352,9 @@ fn spawn_audio_iq_broadcaster(
 
 pub struct TciServer {
     demod_params: DemodParamsCell,
+    display: DisplayCell,
+    /// See remote::BandShare.
+    band_share: Arc<crate::remote::BandShare>,
     audio_iq: AudioIqCell,
     stop: Arc<AtomicBool>,
     /// Count of currently-connected clients -- genuinely N now (see
@@ -458,6 +467,8 @@ impl TciServer {
         println!("tci: listening on {addr}");
 
         let demod_params: DemodParamsCell = Arc::new(Mutex::new(demod_params));
+        let display: DisplayCell = Arc::new(Mutex::new(None));
+        let band_share = Arc::new(crate::remote::BandShare::default());
         let audio_iq: AudioIqCell = Arc::new(Mutex::new(AudioIqTaps { audio: tci_audio_out, iq: iq_out }));
         let stop = Arc::new(AtomicBool::new(false));
         let connected = Arc::new(AtomicU32::new(0));
@@ -475,6 +486,8 @@ impl TciServer {
         let accept_local_addrs = Arc::clone(&local_addrs);
         let accept_client_threads = Arc::clone(&client_threads);
         let accept_demod_params = Arc::clone(&demod_params);
+        let accept_display = Arc::clone(&display);
+        let accept_band_share = Arc::clone(&band_share);
         let accept_audio_iq_registry = Arc::clone(&audio_iq_registry);
         let accept_tci_tx_audio = Arc::clone(&tci_tx_audio);
         let accept_tci_tx_gain = Arc::clone(&tci_tx_gain);
@@ -495,6 +508,8 @@ impl TciServer {
                         let conn_vfo_b = Arc::clone(&vfo_b);
                         let rate = Arc::clone(&sample_rate);
                         let params = Arc::clone(&accept_demod_params);
+                        let conn_display = Arc::clone(&accept_display);
+                        let conn_band_share = Arc::clone(&accept_band_share);
                         let conn_audio_iq_registry = Arc::clone(&accept_audio_iq_registry);
                         let tx_audio = Arc::clone(&accept_tci_tx_audio);
                         let tx_gain = Arc::clone(&accept_tci_tx_gain);
@@ -516,7 +531,7 @@ impl TciServer {
                                 conn_local_addrs.lock().unwrap().push(addr);
                             }
                             handle_client(
-                                stream, freq, rx_freq, hw_freq, rf_offset, conn_vfo_b, rate, params, conn_audio_iq_registry, tx_audio,
+                                stream, freq, rx_freq, hw_freq, rf_offset, conn_vfo_b, rate, params, conn_display, conn_band_share, conn_audio_iq_registry, tx_audio,
                                 tx_gain, wants_mic, conn_mox, conn_tx_frequency_hz, conn_allow_out_of_band_tx,
                                 conn_rit_enabled, conn_rit_offset_hz, conn_xit_enabled, conn_xit_offset_hz,
                                 conn_stop, conn_board_name, conn_logging,
@@ -543,6 +558,8 @@ impl TciServer {
 
         Ok(Self {
             demod_params,
+            display,
+            band_share,
             audio_iq,
             stop,
             broadcaster_thread: Some(broadcaster_thread),
@@ -560,6 +577,22 @@ impl TciServer {
     /// TCI clients too).
     pub fn set_demod_params(&self, new_demod_params: Arc<Mutex<DemodParams>>) {
         *self.demod_params.lock().unwrap() = new_demod_params;
+    }
+
+    /// The display the remote extensions' spectrum stream reads -- see
+    /// DisplayCell. Set after start, and again whenever it's rebuilt.
+    pub fn set_display(&self, display: Arc<Mutex<crate::spectrum::SpectrumDisplay>>) {
+        *self.display.lock().unwrap() = Some(display);
+    }
+
+    /// The radio's band buttons, for remote clients -- see remote::BandShare.
+    pub fn set_bands(&self, bands: Vec<hpsdr_proto::bands::BandInfo>) {
+        self.band_share.set(bands);
+    }
+
+    /// A band a remote client has asked for, for main.rs to apply.
+    pub fn take_band_request(&self) -> Option<String> {
+        self.band_share.take_request()
     }
 
     /// Same idea as set_demod_params, for the streaming taps -- a
@@ -669,6 +702,8 @@ fn handle_client(
     vfo_b: Arc<crate::radio::VfoBShared>,
     sample_rate: Arc<AtomicU32>,
     demod_params: DemodParamsCell,
+    display: DisplayCell,
+    band_share: Arc<crate::remote::BandShare>,
     // See ClientAudioIqSink's doc comment -- this client registers its
     // own sink into the registry below rather than draining a queue
     // shared with every other connected client.
@@ -968,6 +1003,9 @@ fn handle_client(
     // them -- harmless either way, and keeps this spec-compliant for
     // any other TCI client that relies on that gate.
     let mut audio_streaming = true;
+    // hpsdr-rs's remote extensions, if this client asks for them -- see
+    // remote.rs and docs/remote-protocol.md.
+    let mut remote = crate::remote::RemoteStreams::default();
     let mut iq_streaming = false;
     // ROOT CAUSE INVESTIGATION continued: a real Windows report's
     // connections never logged a read error either (see "connection
@@ -1092,6 +1130,24 @@ fn handle_client(
                         continue;
                     }
                     logging.log(&format!("<< {cmd};"));
+                    if cmd.to_ascii_lowercase().starts_with("hpsdr_") {
+                        let current_params = demod_params.lock().unwrap().clone();
+                        for c in hpsdr_proto::tci::parse(cmd) {
+                            if let Some(reply) = remote.handle(&c, &current_params, &band_share) {
+                                logging.log(&format!(">> {reply}"));
+                                let result = ws.send(Message::Text(reply.into()));
+                                if send_is_fatal(&result) {
+                                    return;
+                                }
+                            }
+                        }
+                        // It takes the extensions' compressed audio
+                        // instead of TCI's float stream.
+                        if remote.hello {
+                            audio_streaming = false;
+                        }
+                        continue;
+                    }
                     // Resolved fresh on every command (not once per
                     // connection) so a sample-rate change mid-session --
                     // see set_demod_params -- takes effect immediately
@@ -1404,6 +1460,65 @@ fn handle_client(
                     if result.is_ok() && !audio_first_sent {
                         audio_first_sent = true;
                         logging.log("first audio data sent");
+                    }
+                }
+            }
+        }
+
+        // hpsdr-rs's remote extensions: compressed audio from this
+        // client's own sink (filled whether or not TCI's float audio is
+        // on), and spectrum rows from the main receiver's display.
+        if remote.audio_on() {
+            let stereo: Vec<(f32, f32)> = sink.audio.lock().unwrap().drain(..).collect();
+            for msg in remote.audio_messages(&stereo) {
+                let result = ws.send(Message::Binary(msg.into()));
+                if send_is_fatal(&result) {
+                    logging.log(&format!("remote audio send failed, closing: {:?}", result.unwrap_err()));
+                    return;
+                }
+            }
+        }
+        // Its DSP settings (hpsdr_state): every second, and straight after
+        // a change from anywhere.
+        let state = if remote.hello {
+            let params = demod_params.lock().unwrap().clone();
+            let p = params.lock().unwrap();
+            remote.state_message(&p)
+        } else {
+            None
+        };
+        if let Some(bands) = remote.bands_message(&band_share) {
+            let result = ws.send(Message::Text(bands.into()));
+            if send_is_fatal(&result) {
+                return;
+            }
+        }
+        if let Some(state) = state {
+            let result = ws.send(Message::Text(state.into()));
+            if send_is_fatal(&result) {
+                return;
+            }
+        }
+        if remote.spectrum_on() {
+            let display = display.lock().unwrap().clone();
+            if let Some(display) = display {
+                // What the row covers: the radio's span at its zoom,
+                // around the hardware frequency plus pan (spectrum.rs's
+                // set_zoom_pan), in RF terms like dds.
+                let rate = sample_rate.load(Ordering::Relaxed) as f64;
+                let (zoom, pan) = {
+                    let params = demod_params.lock().unwrap().clone();
+                    let p = params.lock().unwrap();
+                    (p.zoom.max(1) as f64, p.pan as f64)
+                };
+                let dds = hw_frequency_hz.load(Ordering::Relaxed) as f64 + rx_rf_offset_hz.load(Ordering::Relaxed) as f64;
+                let centre = (dds + pan * (rate / 2.0) * (1.0 - 1.0 / zoom)).max(0.0) as u64;
+                let msg = remote.spectrum_message(&display.lock().unwrap(), centre, (rate / zoom) as u32);
+                if let Some(msg) = msg {
+                    let result = ws.send(Message::Binary(msg.into()));
+                    if send_is_fatal(&result) {
+                        logging.log(&format!("remote spectrum send failed, closing: {:?}", result.unwrap_err()));
+                        return;
                     }
                 }
             }
@@ -2252,4 +2367,98 @@ fn agc_to_tci(agc: Agc) -> &'static str {
 /// gain.
 fn gain_to_tci_db(gain: f32) -> f32 {
     if gain <= 0.0001 { -100.0 } else { 20.0 * gain.log10() }
+}
+
+#[cfg(test)]
+mod remote_tests {
+    use super::*;
+    use crate::spectrum::SpectrumDisplay;
+
+    /// A real TCI server and a WebSocket client asking for the remote
+    /// extensions (docs/remote-protocol.md): the hello reply, spectrum
+    /// rows and IMA-ADPCM audio arrive, and TCI's float audio doesn't.
+    #[test]
+    fn a_client_gets_the_extension_streams() {
+        let port = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let tci_audio_out = Arc::new(Mutex::new(VecDeque::new()));
+        let mut server = TciServer::start(
+            &format!("127.0.0.1:{port}"),
+            Arc::new(AtomicU64::new(7_100_000)),
+            Arc::new(AtomicU64::new(7_100_000)),
+            Arc::new(AtomicU32::new(7_100_000)),
+            Arc::new(AtomicI64::new(0)),
+            Arc::new(crate::radio::VfoBShared::default()),
+            Arc::new(AtomicU32::new(192_000)),
+            Arc::new(Mutex::new(DemodParams::default())),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicU32::new(7_100_000)),
+            Arc::new(AtomicBool::new(false)),
+            Arc::clone(&tci_audio_out),
+            Arc::new(Mutex::new(VecDeque::new())),
+            Arc::new(Mutex::new(VecDeque::new())),
+            Arc::new(Mutex::new(1.0)),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicI32::new(0)),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicI32::new(0)),
+            "Test".to_string(),
+            DebugLog::new(std::env::temp_dir().join("hpsdr-rs-tci-remote-test.log")),
+        )
+        .unwrap();
+        let display = Arc::new(Mutex::new(SpectrumDisplay {
+            spectrum: (0..1024).map(|i| -120.0 + (i % 50) as f32).collect(),
+            meter_db: -73.0,
+            revision: 1,
+            ..Default::default()
+        }));
+        server.set_display(Arc::clone(&display));
+
+        let (mut ws, _) = tungstenite::connect(format!("ws://127.0.0.1:{port}")).unwrap();
+        if let tungstenite::stream::MaybeTlsStream::Plain(s) = ws.get_ref() {
+            s.set_read_timeout(Some(Duration::from_millis(200))).unwrap();
+        }
+        ws.send(Message::Text("hpsdr_hello:1;hpsdr_spectrum:256,10;hpsdr_audio:adpcm,24000;".into())).unwrap();
+
+        let (mut hello, mut spectrum, mut adpcm, mut float_audio) = (false, 0, 0, 0);
+        let start = Instant::now();
+        while start.elapsed() < Duration::from_secs(3) {
+            match ws.read() {
+                Ok(Message::Text(t)) if t.contains("hpsdr_hello:1,spectrum,adpcm") => {
+                    hello = true;
+                    // Now the client is set up: a second of audio, and a
+                    // newer display row every so often.
+                    let tone = (0..48_000).map(|i| {
+                        let v = 0.2 * (2.0 * std::f32::consts::PI * 800.0 * i as f32 / 48_000.0).sin();
+                        (v, v)
+                    });
+                    tci_audio_out.lock().unwrap().extend(tone);
+                }
+                Ok(Message::Binary(b)) => {
+                    let (header, payload) = hpsdr_proto::Header::decode(&b).unwrap();
+                    match header.msg_type {
+                        hpsdr_proto::TYPE_SPECTRUM => {
+                            let f = hpsdr_proto::spectrum::SpectrumFrame::decode(&header, payload).unwrap();
+                            assert_eq!((f.points.len(), f.centre_hz, f.span_hz, f.meter_dbm), (256, 7_100_000, 192_000, -73.0));
+                            spectrum += 1;
+                        }
+                        hpsdr_proto::TYPE_ADPCM_AUDIO => {
+                            assert_eq!((header.sample_rate, header.length), (24_000, 480));
+                            adpcm += 1;
+                        }
+                        hpsdr_proto::TYPE_RX_AUDIO => float_audio += 1,
+                        _ => {}
+                    }
+                }
+                _ => {}
+            }
+            display.lock().unwrap().revision += 1;
+        }
+        server.stop();
+        println!("spectrum {spectrum}, adpcm {adpcm}, float audio {float_audio}");
+        assert!(hello);
+        assert!(spectrum >= 5, "{spectrum} spectrum rows");
+        assert!(adpcm >= 45, "{adpcm} audio blocks of the 50 in a second");
+        assert_eq!(float_audio, 0);
+    }
 }

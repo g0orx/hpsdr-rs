@@ -116,6 +116,12 @@ pub struct Config {
     pub rigctl_running: Option<bool>,
     #[serde(default)]
     pub tci_running: Option<bool>,
+    /// The web client server (Settings -> Network -> Web client; see
+    /// web_server.rs): its address, and whether it was running.
+    #[serde(default)]
+    pub web_addr: Option<String>,
+    #[serde(default)]
+    pub web_running: Option<bool>,
     #[serde(default)]
     pub cat_running: Option<bool>,
     /// Debug logging to rigctl_log.txt/tci_log.txt/cat_log.txt (Settings

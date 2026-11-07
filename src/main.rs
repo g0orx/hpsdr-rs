@@ -30,6 +30,7 @@ mod ozy;
 mod pluto;
 mod psk_beacon;
 mod radio;
+mod remote;
 mod rigctl;
 mod rtlsdr;
 mod rx888;
@@ -38,6 +39,7 @@ mod tci;
 mod transponder;
 mod tx;
 mod usb_port;
+mod web_server;
 mod wdsp_sys;
 
 use audio::{AudioOutput, MicInput};
@@ -829,6 +831,93 @@ fn apply_mode(connected: &mut ConnectedState, mode: spectrum::Mode, dial_freq_hz
         connected.waterfall_db_high,
         mode,
     );
+}
+
+/// Selects transverter band `xvtr` -- its band button: the transverter, its
+/// remembered frequency (if still in range), display levels and mode, or
+/// its lowest frequency and default mode the first time.
+fn apply_xvtr_band(connected: &mut ConnectedState, xvtr: &Xvtr) {
+    let offset = xvtr_rf_offset(xvtr);
+    let if_low = xvtr.frequency_min_hz as i64 - offset;
+    let if_high = xvtr.frequency_max_hz as i64 - offset;
+    // Explicit selection -- see ConnectedState::active_xvtr's doc comment.
+    connected.active_xvtr = Some(xvtr.name.clone());
+    let saved = connected.band_memory.get(&xvtr_memory_key(&xvtr.name)).copied();
+    // A remembered IF outside the current range (the transverter was
+    // reconfigured since) is ignored.
+    let target = saved
+        .map(|s| s.frequency_hz as i64)
+        .filter(|f| (if_low..=if_high).contains(f))
+        .unwrap_or(if_low)
+        .clamp(0, u32::MAX as i64) as u32;
+    connected.session.set_frequency(target);
+    connected.ctun_frequency_hz = target;
+    if let Some(s) = saved {
+        connected.db_low = s.db_low;
+        connected.db_high = s.db_high;
+        connected.waterfall_db_low = s.waterfall_db_low;
+        connected.waterfall_db_high = s.waterfall_db_high;
+    }
+    let resolved_mode = saved.and_then(|s| s.mode).unwrap_or(xvtr.default_mode);
+    connected.spectrum.set_mode(resolved_mode);
+    let resolved_width_hz = width_for_mode(&connected.width_memory, resolved_mode);
+    connected.spectrum.set_width_hz(resolved_width_hz);
+    if let Some(tx) = &connected.tx_handle {
+        tx.set_mode(resolved_mode);
+        tx.set_width_hz(resolved_width_hz);
+    }
+}
+
+/// The band buttons the main window shows, in its order, with their RF
+/// edges -- for remote clients (TciServer::set_bands): the standard bands
+/// this radio can tune, Gen, and each transverter it can reach.
+fn visible_bands(connected: &ConnectedState) -> Vec<hpsdr_proto::bands::BandInfo> {
+    use hpsdr_proto::bands::BandInfo;
+    let (min, max) = (connected.device.frequency_min, connected.device.frequency_max);
+    let mut bands: Vec<BandInfo> = BANDS
+        .iter()
+        .filter(|b| b.low_hz as u64 >= min && b.high_hz as u64 <= max)
+        .map(|b| BandInfo { name: b.name.to_string(), low_hz: b.low_hz as u64, high_hz: b.high_hz as u64 })
+        .collect();
+    bands.push(BandInfo { name: "Gen".to_string(), low_hz: min, high_hz: max });
+    for x in connected.xvtrs.iter().filter(|x| !x.name.is_empty()) {
+        let offset = xvtr_rf_offset(x);
+        if x.frequency_min_hz as i64 - offset >= min as i64 && x.frequency_max_hz as i64 - offset <= max as i64 {
+            bands.push(BandInfo { name: x.name.clone(), low_hz: x.frequency_min_hz, high_hz: x.frequency_max_hz });
+        }
+    }
+    bands
+}
+
+/// Selects the band button called `name`, as a click on it would -- a
+/// remote client's hpsdr_band. Unknown names do nothing.
+fn select_band_by_name(connected: &mut ConnectedState, name: &str) {
+    let clean = hpsdr_proto::bands::clean_name;
+    if let Some(band) = BANDS.iter().find(|b| clean(b.name) == name) {
+        if band.low_hz as u64 >= connected.device.frequency_min && band.high_hz as u64 <= connected.device.frequency_max {
+            apply_band(connected, band);
+        }
+    } else if name == "Gen" {
+        let gen = gen_band(connected.device.frequency_min, connected.device.frequency_max);
+        apply_band(connected, &gen);
+    } else if let Some(x) = connected.xvtrs.iter().find(|x| !x.name.is_empty() && clean(&x.name) == name).cloned() {
+        apply_xvtr_band(connected, &x);
+    }
+}
+
+/// http://<address>:<port> for each of this machine's IPv4 addresses a
+/// phone could reach -- for the Network tab's Web client line.
+fn web_client_urls(port: u16) -> Vec<String> {
+    use network_interface::{Addr, NetworkInterface, NetworkInterfaceConfig};
+    NetworkInterface::show()
+        .unwrap_or_default()
+        .iter()
+        .flat_map(|i| i.addr.iter())
+        .filter_map(|a| match a {
+            Addr::V4(v4) if !v4.ip.is_loopback() && !v4.ip.is_link_local() => Some(format!("http://{}:{port}", v4.ip)),
+            _ => None,
+        })
+        .collect()
 }
 
 /// The main receiver's current VFOs and their buttons, as a named setup
@@ -2270,6 +2359,13 @@ struct ConnectedState {
     xit_scroll_accum: f32,
     rigctl_addr: String,
     tci_addr: String,
+    /// The web client server (Settings -> Network -> Web client): its
+    /// address, the server while running, why it last failed to start, and
+    /// the TCI port it tells the page (kept current from tci_addr).
+    web_addr: String,
+    web_server: Option<web_server::WebServer>,
+    web_error: Option<String>,
+    web_tci_port: Arc<std::sync::atomic::AtomicU16>,
     cat_addr: String,
     /// Debug logging toggles (Settings -> Network) -- see
     /// debug_log.rs's own doc comment. Constructed once per connection
@@ -2998,6 +3094,23 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                     }
                 };
             }
+            // The web client server -- see web_server.rs.
+            let web_addr = cfg.web_addr.clone().unwrap_or_else(|| web_server::DEFAULT_ADDR.to_string());
+            let web_tci_port = Arc::new(std::sync::atomic::AtomicU16::new(web_server::port_of(&tci_addr)));
+            let mut web_error: Option<String> = None;
+            let web_server = if cfg.web_running.unwrap_or(false) {
+                match web_server::WebServer::start(&web_addr, Arc::clone(&web_tci_port)) {
+                    Ok(s) => Some(s),
+                    Err(e) => {
+                        let msg = format!("couldn't listen on {web_addr}: {e}");
+                        eprintln!("web client: {msg}");
+                        web_error = Some(msg);
+                        None
+                    }
+                }
+            } else {
+                None
+            };
             let mut tci_server: Option<TciServer> = None;
             let mut tci_error: Option<String> = None;
             if cfg.tci_running.unwrap_or(false) {
@@ -3025,7 +3138,10 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                     format!("{:?}", device.board),
                     tci_debug_log.clone(),
                 ) {
-                    Ok(s) => Some(s),
+                    Ok(s) => {
+                        s.set_display(Arc::clone(&spectrum.display));
+                        Some(s)
+                    }
                     Err(e) => {
                         let msg = format!("couldn't listen on {tci_addr}: {e}");
                         eprintln!("tci: {msg}");
@@ -3431,6 +3547,10 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                 xit_scroll_accum: 0.0,
                 rigctl_addr,
                 tci_addr,
+                web_addr,
+                web_server,
+                web_error,
+                web_tci_port,
                 cat_addr,
                 rigctl_debug_log,
                 tci_debug_log,
@@ -3858,6 +3978,23 @@ impl eframe::App for HpsdrApp {
                 // overlay drawn below -- computed once here rather than
                 // separately in both places.
                 let passband = spectrum::passband_for(current_mode, current_width);
+
+                connected
+                    .web_tci_port
+                    .store(web_server::port_of(&connected.tci_addr), std::sync::atomic::Ordering::Relaxed);
+                // Remote clients: keep their band list current, and apply a
+                // band one of them has asked for, as its button here would.
+                if connected.tci_server.is_some() {
+                    let bands = visible_bands(connected);
+                    let request = connected.tci_server.as_ref().and_then(|s| {
+                        s.set_bands(bands);
+                        s.take_band_request()
+                    });
+                    if let Some(name) = request {
+                        select_band_by_name(connected, &name);
+                        connected.settings_dirty.store(true, Ordering::Relaxed);
+                    }
+                }
 
                 // See RadioSession::requested_frequency_hz's doc comment.
                 // A network client (rigctl/CAT/TCI) requesting a new
@@ -4942,6 +5079,7 @@ impl eframe::App for HpsdrApp {
                         // (band_memory under xvtr_memory_key), falling
                         // back to the bottom of its range and its
                         // default mode the first time (issue #4).
+                        let mut selected_xvtr: Option<Xvtr> = None;
                         for xvtr in &connected.xvtrs {
                             if xvtr.name.is_empty() {
                                 continue;
@@ -4956,37 +5094,13 @@ impl eframe::App for HpsdrApp {
                             }
                             let selected = active_xvtr_name.as_deref() == Some(xvtr.name.as_str());
                             if ui.add(egui::Button::selectable(selected, &xvtr.name)).clicked() && !selected {
-                                // Explicit selection -- see
-                                // ConnectedState::active_xvtr's doc
-                                // comment.
-                                connected.active_xvtr = Some(xvtr.name.clone());
-                                let saved = connected.band_memory.get(&xvtr_memory_key(&xvtr.name)).copied();
-                                // A remembered IF outside the current range
-                                // (the transverter was reconfigured since) is
-                                // ignored.
-                                let target = saved
-                                    .map(|s| s.frequency_hz as i64)
-                                    .filter(|f| (if_low..=if_high).contains(f))
-                                    .unwrap_or(if_low)
-                                    .clamp(0, u32::MAX as i64) as u32;
-                                connected.session.set_frequency(target);
-                                connected.ctun_frequency_hz = target;
-                                if let Some(s) = saved {
-                                    connected.db_low = s.db_low;
-                                    connected.db_high = s.db_high;
-                                    connected.waterfall_db_low = s.waterfall_db_low;
-                                    connected.waterfall_db_high = s.waterfall_db_high;
-                                }
-                                let resolved_mode = saved.and_then(|s| s.mode).unwrap_or(xvtr.default_mode);
-                                connected.spectrum.set_mode(resolved_mode);
-                                let resolved_width_hz = width_for_mode(&connected.width_memory, resolved_mode);
-                                connected.spectrum.set_width_hz(resolved_width_hz);
-                                if let Some(tx) = &connected.tx_handle {
-                                    tx.set_mode(resolved_mode);
-                                    tx.set_width_hz(resolved_width_hz);
-                                }
-                                settings_changed = true;
+                                selected_xvtr = Some(xvtr.clone());
                             }
+                        }
+                        // Applied after the loop, which borrows the list.
+                        if let Some(xvtr) = selected_xvtr {
+                            apply_xvtr_band(connected, &xvtr);
+                            settings_changed = true;
                         }
                     });
                     }
@@ -7644,7 +7758,10 @@ impl eframe::App for HpsdrApp {
                                                 format!("{:?}", connected.device.board),
                                                 connected.tci_debug_log.clone(),
                                             ) {
-                                                Ok(s) => Some(s),
+                                                Ok(s) => {
+                                                    s.set_display(Arc::clone(&connected.spectrum.display));
+                                                    Some(s)
+                                                }
                                                 Err(e) => {
                                                     let msg = format!(
                                                         "couldn't listen on {}: {e}",
@@ -7700,6 +7817,61 @@ impl eframe::App for HpsdrApp {
                                             settings_changed = true;
                                         }
                                     }
+
+                                    ui.add_space(4.0);
+                                    ui.separator();
+                                    ui.add_space(4.0);
+                                    ui.strong("Web client (hpsdr-remote in a browser -- phone, tablet or computer):");
+                                    ui.horizontal(|ui| {
+                                        let running = connected.web_server.is_some();
+                                        ui.add_enabled(!running, egui::TextEdit::singleline(&mut connected.web_addr));
+                                        if running {
+                                            if start_stop_button(ui, true) {
+                                                connected.web_server = None;
+                                                settings_changed = true;
+                                            }
+                                        } else if start_stop_button(ui, false) {
+                                            connected.web_error = None;
+                                            connected.web_server = match web_server::WebServer::start(
+                                                &connected.web_addr,
+                                                Arc::clone(&connected.web_tci_port),
+                                            ) {
+                                                Ok(s) => Some(s),
+                                                Err(e) => {
+                                                    let msg = format!("couldn't listen on {}: {e}", connected.web_addr);
+                                                    eprintln!("web client: {msg}");
+                                                    connected.web_error = Some(msg);
+                                                    None
+                                                }
+                                            };
+                                            settings_changed = true;
+                                        }
+                                    });
+                                    if connected.web_server.is_some() {
+                                        let port = web_server::port_of(&connected.web_addr);
+                                        let urls = web_client_urls(port);
+                                        ui.weak(format!(
+                                            "Running -- open {} in a browser. It uses the TCI server, which must be \
+                                             running too.",
+                                            if urls.is_empty() { format!("http://<this computer>:{port}") } else { urls.join(" or ") }
+                                        ));
+                                    } else {
+                                        ui.weak("Stopped");
+                                    }
+                                    if !web_server::HAS_CLIENT {
+                                        ui.colored_label(
+                                            egui::Color32::from_rgb(220, 160, 60),
+                                            "This build doesn't include the web client: build it \
+                                             (crates/hpsdr-remote/build-web.sh), then rebuild hpsdr-rs.",
+                                        );
+                                    }
+                                    if let Some(err) = &connected.web_error {
+                                        ui.colored_label(egui::Color32::from_rgb(220, 60, 60), err);
+                                    }
+                                    ui.weak(
+                                        "No password, like TCI itself: anyone who can reach these ports can control \
+                                         the radio. Keep it on your own network, or use a VPN or SSH tunnel.",
+                                    );
 
                                     ui.add_space(4.0);
                                     ui.separator();
@@ -11248,6 +11420,8 @@ impl eframe::App for HpsdrApp {
                         mute_local_audio_during_tci: Some(connected.mute_local_audio_during_tci),
                         rigctl_running: Some(connected.rigctl_server.is_some()),
                         tci_running: Some(connected.tci_server.is_some()),
+                        web_addr: Some(connected.web_addr.clone()),
+                        web_running: Some(connected.web_server.is_some()),
                         cat_running: Some(connected.cat_server.is_some()),
                         rigctl_logging_enabled: Some(connected.rigctl_debug_log.is_enabled()),
                         tci_logging_enabled: Some(connected.tci_debug_log.is_enabled()),
@@ -15129,6 +15303,7 @@ fn change_sample_rate(connected: &mut ConnectedState, new_rate: u32) {
         // comment for why this can't be skipped the same way
         // set_demod_params can't be.
         s.set_audio_iq(Arc::clone(&spectrum.tci_audio_out), Arc::clone(&spectrum.iq_out));
+        s.set_display(Arc::clone(&spectrum.display));
     }
     if let Some(s) = &connected.cat_server {
         s.set_demod_params(spectrum.demod_params_handle());

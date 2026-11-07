@@ -35,6 +35,9 @@ eframe = { version = "0.37", default-features = false, features = [
     "x11",
 ] }
 egui = "0.37"
+# The remote-operation wire encoding, shared with hpsdr-remote
+# (docs/remote-protocol.md).
+hpsdr-proto = { path = "crates/hpsdr-proto" }
 # Already in the tree through eframe/wgpu/winit; used directly only for
 # main.rs's HPSDR_LOG diagnostic logger.
 log = "0.4"
@@ -231,3 +234,10 @@ assets = [
     { source = "assets/ozy/*", dest = "/usr/share/hpsdr-rs/ozy/", mode = "644" },
     { source = "assets/rx888/*", dest = "/usr/share/hpsdr-rs/rx888/", mode = "644" },
 ]
+
+# hpsdr-rs itself, plus the remote-operation pieces (docs/remote-protocol.md).
+# default-members keeps a plain `cargo build`/`cargo test` here (and the
+# packaging scripts, CI and the Windows MSI build) to hpsdr-rs alone.
+[workspace]
+members = [".", "crates/hpsdr-proto", "crates/hpsdr-remote"]
+default-members = ["."]

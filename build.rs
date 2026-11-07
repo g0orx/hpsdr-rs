@@ -56,6 +56,18 @@ fn main() {
     println!("cargo:rustc-env=HPSDR_GIT_COMMIT={commit}");
     println!("cargo:rerun-if-changed=.git/HEAD");
     println!("cargo:rerun-if-changed=.git/index");
+    // hpsdr-remote's web client, served by web_server.rs: compiled in if
+    // it's been built (crates/hpsdr-remote/build-web.sh), so hpsdr-rs stays
+    // one file; without it the server says the client isn't included.
+    println!("cargo:rustc-check-cfg=cfg(remote_web)");
+    let web = std::path::Path::new("crates/hpsdr-remote/web");
+    let web_files = ["index.html", "pkg/hpsdr-remote.js", "pkg/hpsdr-remote_bg.wasm"];
+    for f in &web_files {
+        println!("cargo:rerun-if-changed={}", web.join(f).display());
+    }
+    if web_files.iter().all(|f| web.join(f).exists()) {
+        println!("cargo:rustc-cfg=remote_web");
+    }
     // ROOT CAUSE FIX for a real report ("cannot open input file
     // Packet.lib" persisting even after correctly setting
     // NPCAP_SDK_DIR): once a build script emits ANY `rerun-if-changed`
