@@ -41,7 +41,8 @@ All start `hpsdr_`.
   to client, after `hpsdr_hello`: the receiver's DSP settings, every second
   and straight after any change (from the client, the radio, or anyone):
   filter width in Hz; AGC `off`/`long`/`slow`/`medium`/`fast`; AGC gain in
-  dB; noise blanker `off`/`nb`/`nb2`; noise reduction `off`/`nr`/`nr2`/`nr3`;
+  dB; noise blanker `off`/`nb`/`nb2`; noise reduction `off`/`nr`/`nr2`/`nr3`
+  (`nr3` is WDSP's NNR, shown as NNR on the radio);
   ANF and SNB `true`/`false`. These are the extensions' own rather than TCI's
   filter and NB/NR commands, whose filter edges and stage numbers don't map
   cleanly onto hpsdr-rs.

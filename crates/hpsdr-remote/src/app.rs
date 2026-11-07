@@ -456,7 +456,8 @@ impl App {
                 }
             }
             ui.add_space(12.0);
-            for (mode, label) in dsp::NR_MODES.iter().zip(["NR Off", "NR", "NR2", "NR3"]) {
+            // Labels as hpsdr-rs's own NR menu: its third, "nr3" here, is NNR.
+            for (mode, label) in dsp::NR_MODES.iter().zip(["NR Off", "NR", "NR2", "NNR"]) {
                 if ui.add(egui::Button::selectable(d.nr == *mode, label)).clicked() {
                     d.nr = mode.to_string();
                     changes.push((dsp::SET_NR, mode.to_string()));
