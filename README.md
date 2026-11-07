@@ -354,6 +354,14 @@ cargo install cargo-wix   # one-time
 .\scripts\build-windows-release.ps1
 ```
 
+If PowerShell says running scripts is disabled, run it once with
+`powershell -ExecutionPolicy Bypass -File scripts\build-windows-release.ps1`,
+or allow your own scripts for good with
+`Set-ExecutionPolicy -Scope CurrentUser RemoteSigned` (no administrator
+rights needed). The script builds the web client first (so the installed
+hpsdr-rs has it built in), then the installer with `cargo wix -p hpsdr-rs` --
+the `-p` is needed because the repository is a Cargo workspace.
+
 This produces `target\wix\hpsdr-rs-<version>-x86_64.msi`, which installs `hpsdr-rs.exe` (icon embedded, via `winresource` in `build.rs`) under `Program Files\hpsdr-rs\bin`, adds that folder to `PATH`, and bundles the `LICENSE` file. The installer/uninstaller icon and WiX packaging config live in `wix/main.wxs` (generated once via `cargo wix init`, then hand-edited — see its own comments for how to further customize the install UI). Unlike the `.deb` case above, there's no local revision counter needed: WiX's `<MajorUpgrade>` element already reinstalls cleanly over an older version, so between releases just bump Cargo.toml's `version` like any other platform. **Not yet confirmed on real Windows hardware** — the MSI itself was authored and generated from Linux (WiX's `candle.exe`/`light.exe` are Windows-only, so the actual `.msi` build has to happen on a real Windows box); report back if `cargo wix` or the resulting installer misbehaves.
 
 ## PureSignal calibration

@@ -48,7 +48,9 @@ wasm-bindgen --target web --no-typescript --out-dir crates/hpsdr-remote/web/pkg 
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
 Write-Host "Building .msi with cargo wix..."
-cargo wix @args
+# -p: the repository is a workspace (hpsdr-rs plus hpsdr-proto and
+# hpsdr-remote), and cargo wix won't guess which package to package.
+cargo wix -p hpsdr-rs @args
 if ($LASTEXITCODE -ne 0) {
     exit $LASTEXITCODE
 }
