@@ -7498,7 +7498,15 @@ impl eframe::App for HpsdrApp {
                     // user dragging/resizing the window themselves.
                     let seed_geometry = rx_for_closure.lock().unwrap().initial_window_geometry;
                     let mut viewport_builder =
-                        egui::ViewportBuilder::default().with_title(title).with_inner_size([1024.0, 500.0]);
+                        egui::ViewportBuilder::default()
+                            .with_title(title)
+                            .with_inner_size([1024.0, 500.0])
+                            // REAL REPORT (2026-11-07): with no minimum
+                            // the window could be shrunk to just its
+                            // title bar. Room for the VFO row and, with
+                            // the control rows folded, a usable
+                            // spectrum and waterfall.
+                            .with_min_inner_size([700.0, 320.0]);
                     if let Some(g) = seed_geometry {
                         viewport_builder =
                             viewport_builder.with_position([g.x, g.y]).with_inner_size([g.width, g.height]);
