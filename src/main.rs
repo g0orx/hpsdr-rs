@@ -3890,6 +3890,16 @@ impl eframe::App for HpsdrApp {
                         resolve_tune(connected.ctun, freq_hz, sample_rate, passband, requested_if_hz);
                     if let Some(lo) = retune {
                         connected.session.set_frequency(lo);
+                    } else if effective_freq != requested_if_hz {
+                        // CTUN on, and the request is outside what it can
+                        // reach in the current span: a jump (a band change),
+                        // so retune the hardware there, as the band buttons
+                        // do, rather than clamping it to the span's edge.
+                        // REAL REPORT (2026-11-07, hpsdr-remote over TCI):
+                        // a band button's new frequency showed for a moment,
+                        // then the next status update put it back.
+                        connected.session.set_frequency(requested_if_hz);
+                        connected.ctun_frequency_hz = requested_if_hz;
                     } else {
                         connected.ctun_frequency_hz = effective_freq;
                     }
