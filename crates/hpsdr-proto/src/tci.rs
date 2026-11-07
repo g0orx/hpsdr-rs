@@ -7,10 +7,15 @@
 pub const HELLO: &str = "hpsdr_hello";
 pub const SPECTRUM: &str = "hpsdr_spectrum";
 pub const AUDIO: &str = "hpsdr_audio";
+/// `hpsdr_notice:<text>;` server to client: something to tell the
+/// operator, e.g. why it didn't key. Text without `:` `,` `;`.
+pub const NOTICE: &str = "hpsdr_notice";
 
 /// Features the server lists in its `hpsdr_hello` reply.
 pub const FEATURE_SPECTRUM: &str = "spectrum";
 pub const FEATURE_ADPCM: &str = "adpcm";
+/// The server takes hpsdr_mox and TX audio (tx.rs).
+pub const FEATURE_TX: &str = "tx";
 
 /// Audio rates `hpsdr_audio` accepts.
 pub const AUDIO_RATES: [u32; 5] = [8_000, 12_000, 16_000, 24_000, 48_000];

@@ -6,8 +6,21 @@ which hpsdr-rs already serves on port 50001 -- plus a few extensions for
 running over slow links. Standard TCI clients (WSJT-X, TCI Remote) never
 send the extension commands, so they never see the extension streams.
 
-Status: **phase 1** (receive only, LAN). The shared encoding lives in the
-`hpsdr-proto` crate, used by both ends.
+Status: **phase 2** (receive and transmit; HTTPS and a password through
+hpsdr-rs's web server). The shared encoding lives in the `hpsdr-proto`
+crate, used by both ends.
+
+## Connecting
+
+Either straight to the TCI server (`ws://<host>:50001`), or through
+hpsdr-rs's web server (Settings -> Network -> Web client) at
+`wss://<host>:<port>/tci` -- the same port that serves the web client.
+That path passes the connection through to the TCI server unchanged, so
+everything below is the same either way. With a password set, it's given
+as `/tci?password=<%-encoded password>`; a wrong or missing one gets HTTP
+401 before the WebSocket opens. Plain TCI has no password: for use over
+the internet, make only the web server's port reachable, and the TCI
+server can listen on `127.0.0.1` only.
 
 ## Why extensions
 
@@ -32,8 +45,11 @@ All start `hpsdr_`.
 
 - `hpsdr_hello:<version>;` -- client to server, first. The server answers
   `hpsdr_hello:<version>,<feature>,<feature>...;` with its own protocol
-  version (1) and what it offers: `spectrum`, `adpcm`. A server without the
-  extensions ignores the command; the client then has plain TCI only.
+  version (1) and what it offers: `spectrum`, `adpcm`, `tx`. A server
+  without the extensions ignores the command; the client then has plain
+  TCI only.
+- `hpsdr_notice:<text>;` -- server to client: something to tell the
+  operator, such as why it didn't key.
 - `hpsdr_spectrum:<points>,<fps>;` -- start the spectrum stream: `points`
   per row (64-4096), at most `fps` rows a second (1-30). `hpsdr_spectrum:0,0;`
   stops it.
@@ -60,6 +76,30 @@ All start `hpsdr_`.
 - `hpsdr_audio:<codec>,<rate>;` -- start compressed RX audio: `adpcm` at
   `rate` samples a second (8000, 12000, 16000, 24000 or 48000). `hpsdr_audio:off,0;`
   stops it. A client using this should not also send `audio_start`.
+
+## Transmitting
+
+- `hpsdr_mox:<true|false>;` -- client to server: key or unkey. The server
+  keys only where the radio itself would -- in band, unless out-of-band TX
+  is allowed -- and not in CW (no remote keying yet), answering
+  `hpsdr_notice` with the reason if it doesn't. Any client can unkey.
+- TX audio -- client to server, while keyed: binary type 101 (the same
+  IMA-ADPCM blocks as RX audio, mono), 20 ms each, at the rate in the
+  header (the client uses 16000). The server feeds it to the transmitter
+  in place of the radio's microphone, keeping ~100 ms in hand against
+  network jitter.
+- **A keyed client that goes away, or sends no TX audio for one second,
+  is unkeyed** -- a dropped connection or a phone put to sleep can't leave
+  the radio transmitting.
+- `hpsdr_tx:<available>,<mox>,<power>,<max>,<forward>,<swr>;` -- server to
+  client after `hpsdr_hello`: whether this radio can transmit at all (also
+  false while remote transmit is turned off at the radio -- turning it off
+  unkeys a remote client that's transmitting),
+  keyed or not, the TX power setting and its maximum (W), and the
+  measured forward power (W) and SWR -- five times a second while
+  transmitting, once a second otherwise, and at once when they change.
+- `hpsdr_set:power,<watts>;` -- client to server: the TX power setting, as
+  the radio's own TX Power slider.
 
 ## Binary streams
 

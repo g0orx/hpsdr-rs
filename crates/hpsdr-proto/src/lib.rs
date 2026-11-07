@@ -12,6 +12,7 @@ pub mod bands;
 pub mod spectrum;
 pub mod state;
 pub mod tci;
+pub mod tx;
 
 /// This protocol's version, sent in `hpsdr_hello`.
 pub const PROTOCOL_VERSION: u32 = 1;

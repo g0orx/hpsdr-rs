@@ -13,13 +13,17 @@ use hpsdr_proto::adpcm;
 use hpsdr_proto::bands::{self, BandInfo};
 use hpsdr_proto::spectrum::SpectrumFrame;
 use hpsdr_proto::state::{self as dsp, DspState};
-use hpsdr_proto::tci::{Command, AUDIO, AUDIO_RATES, FEATURE_ADPCM, FEATURE_SPECTRUM, HELLO, SPECTRUM};
+use hpsdr_proto::tci::{
+    Command, AUDIO, AUDIO_RATES, FEATURE_ADPCM, FEATURE_SPECTRUM, FEATURE_TX, HELLO, NOTICE, SPECTRUM,
+};
+use hpsdr_proto::tx::{self, TxState};
 use hpsdr_proto::{Header, CODEC_IMA_ADPCM, FORMAT_ADPCM, PROTOCOL_VERSION, TYPE_ADPCM_AUDIO};
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use crate::spectrum::{Agc, DemodParams, NoiseBlanker, NoiseReduction, SpectrumDisplay};
+use crate::spectrum::{Agc, DemodParams, Mode, NoiseBlanker, NoiseReduction, SpectrumDisplay};
 
 /// The rate RX audio arrives at (tci.rs's TCI_AUDIO_SAMPLE_RATE).
 const INPUT_RATE: u32 = 48_000;
@@ -35,30 +39,121 @@ pub struct RemoteStreams {
     audio: Option<AudioStream>,
     /// The DSP settings last sent (hpsdr_state), and when.
     last_state: Option<(DspState, Instant)>,
-    /// The BandShare version last sent (hpsdr_bands); 0 = none yet.
+    /// The RemoteShare version last sent (hpsdr_bands); 0 = none yet.
     bands_sent: u64,
+    /// Set while this client has the radio keyed (hpsdr_mox) -- see Keyed.
+    keyed: Option<Keyed>,
+    /// The TX state last sent (hpsdr_tx), and when.
+    last_tx: Option<(TxState, Instant)>,
 }
 
-/// The radio's band buttons, shared between main.rs and the TCI clients'
-/// threads: main.rs sets the list every frame (it only becomes "new" when
-/// it changes), clients send it as hpsdr_bands, and a client's hpsdr_band
-/// waits here until main.rs applies it -- as its band buttons do. Also
-/// counts the remote clients connected, for the main window's Web
-/// indicator (see ClientCount).
+/// The transmitter state a client's thread keys and feeds: the same TCI's
+/// own trx and TX audio use (tci.rs's handle_client).
+pub struct TxLink<'a> {
+    pub mox: &'a Arc<AtomicBool>,
+    pub tx_frequency_hz: &'a AtomicU32,
+    pub allow_out_of_band: &'a AtomicBool,
+    /// RadioSession::tci_wants_mic: false takes TX audio from TCI.
+    pub wants_mic: &'a AtomicBool,
+    /// RadioSession::tci_tx_audio: 48 kHz mono, which the transmitter
+    /// takes in preference to the mic while it has any.
+    pub audio: &'a Mutex<VecDeque<f32>>,
+}
+
+/// A client's transmission. Unkeys if the client stops sending TX audio
+/// (TX_AUDIO_TIMEOUT -- a phone put to sleep, a stalled link) or goes away
+/// (RemoteStreams' Drop), so a lost remote can't leave the radio keyed.
+struct Keyed {
+    mox: Arc<AtomicBool>,
+    last_audio: Instant,
+    upsampler: Upsampler,
+}
+
+/// No TX audio from a keyed client for this long unkeys it.
+const TX_AUDIO_TIMEOUT: Duration = Duration::from_secs(1);
+/// The rate the transmitter takes TX audio at (tci.rs's
+/// TCI_AUDIO_SAMPLE_RATE).
+const TX_RATE: u32 = 48_000;
+/// Silence queued at key-up, so network jitter doesn't empty the queue.
+const TX_PRIME: usize = TX_RATE as usize / 10;
+/// Below this the queue is topped up with silence: an empty queue makes
+/// the transmitter take the radio's own mic instead (tx.rs's Auto source).
+const TX_LOW: usize = TX_RATE as usize / 100;
+/// Above this (the client's clock running fast against the radio's), the
+/// queue is cut back to TX_TARGET, so the delay can't keep growing.
+const TX_HIGH: usize = TX_RATE as usize * 3 / 10;
+const TX_TARGET: usize = TX_RATE as usize * 3 / 20;
+
+impl Drop for RemoteStreams {
+    fn drop(&mut self) {
+        if let Some(k) = &self.keyed {
+            k.mox.store(false, Ordering::Relaxed);
+            eprintln!("remote: client went while transmitting -- unkeyed");
+        }
+    }
+}
+
+/// Linear interpolation up to TX_RATE, carrying its place across blocks.
+/// Plenty here: WDSP's TX filter removes the images above the voice band.
 #[derive(Default)]
-pub struct BandShare {
+struct Upsampler {
+    prev: f32,
+    pos: f64,
+}
+
+impl Upsampler {
+    fn push(&mut self, input: &[f32], rate: u32, out: &mut Vec<f32>) {
+        let step = rate as f64 / TX_RATE as f64;
+        for &x in input {
+            while self.pos < 1.0 {
+                out.push(self.prev + (x - self.prev) * self.pos as f32);
+                self.pos += step;
+            }
+            self.pos -= 1.0;
+            self.prev = x;
+        }
+    }
+}
+
+/// What main.rs and the TCI clients' threads share for remote clients.
+/// The radio's band buttons: main.rs sets the list every frame (it only
+/// becomes "new" when it changes), clients send it as hpsdr_bands, and a
+/// client's hpsdr_band waits here until main.rs applies it -- as its band
+/// buttons do. The same for the transmitter: main.rs sets what hpsdr_tx
+/// reports (TxInfo), and a client's power setting waits for it. Also counts
+/// the remote clients connected, for the main window's Web indicator (see
+/// ClientCount).
+#[derive(Default)]
+pub struct RemoteShare {
     list: Mutex<(u64, Vec<BandInfo>)>,
     requested: Mutex<Option<String>>,
     clients: AtomicUsize,
+    tx: Mutex<TxInfo>,
+    power_request: Mutex<Option<u32>>,
+}
+
+/// The transmitter as main.rs sees it, for hpsdr_tx.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct TxInfo {
+    /// This radio can transmit (not a receive-only one, and TX not off).
+    pub available: bool,
+    /// Remote clients may transmit (Settings -> Network -> Web client ->
+    /// Allow transmit). Off, they're told TX isn't available.
+    pub remote_allowed: bool,
+    pub power_w: u32,
+    pub max_power_w: u32,
+    /// Measured, while transmitting; 0 and 1 otherwise.
+    pub forward_w: f32,
+    pub swr: f32,
 }
 
 /// One connected remote client (one that said hpsdr_hello), counted in
-/// BandShare for as long as this lives -- the client's thread holds it,
+/// RemoteShare for as long as this lives -- the client's thread holds it,
 /// so however it ends, the count comes down.
-pub struct ClientCount(Arc<BandShare>);
+pub struct ClientCount(Arc<RemoteShare>);
 
 impl ClientCount {
-    pub fn new(share: Arc<BandShare>) -> Self {
+    pub fn new(share: Arc<RemoteShare>) -> Self {
         share.clients.fetch_add(1, Ordering::Relaxed);
         Self(share)
     }
@@ -70,7 +165,7 @@ impl Drop for ClientCount {
     }
 }
 
-impl BandShare {
+impl RemoteShare {
     pub fn set(&self, bands: Vec<BandInfo>) {
         let mut list = self.list.lock().unwrap();
         if list.1 != bands {
@@ -92,6 +187,19 @@ impl BandShare {
     pub fn clients(&self) -> usize {
         self.clients.load(Ordering::Relaxed)
     }
+
+    pub fn set_tx(&self, info: TxInfo) {
+        *self.tx.lock().unwrap() = info;
+    }
+
+    fn tx(&self) -> TxInfo {
+        *self.tx.lock().unwrap()
+    }
+
+    /// A TX power setting a remote client has asked for, W.
+    pub fn take_power_request(&self) -> Option<u32> {
+        self.power_request.lock().unwrap().take()
+    }
 }
 
 struct SpectrumStream {
@@ -105,21 +213,39 @@ struct SpectrumStream {
 impl RemoteStreams {
     /// Handles an `hpsdr_*` command, returning the reply to send, if any.
     /// Commands that aren't extensions return None and change nothing.
-    pub fn handle(&mut self, cmd: &Command, params: &Mutex<DemodParams>, band_share: &BandShare) -> Option<String> {
+    pub fn handle(
+        &mut self,
+        cmd: &Command,
+        params: &Mutex<DemodParams>,
+        share: &RemoteShare,
+        tx: &TxLink,
+    ) -> Option<String> {
         match cmd.name.as_str() {
             bands::BAND => {
                 if let Some(name) = cmd.args.first().filter(|n| !n.is_empty()) {
-                    *band_share.requested.lock().unwrap() = Some(name.clone());
+                    *share.requested.lock().unwrap() = Some(name.clone());
                 }
+                None
+            }
+            dsp::SET if cmd.args.first().map(String::as_str) == Some(tx::SET_POWER) => {
+                *share.power_request.lock().unwrap() = cmd.arg(1);
                 None
             }
             dsp::SET => {
                 apply_set(cmd, &mut params.lock().unwrap());
                 None
             }
+            tx::MOX => {
+                let on = cmd.args.first().is_some_and(|a| a == "true");
+                let mode = params.lock().unwrap().mode;
+                self.set_mox(on, mode, share, tx).map(|why| Command::new(NOTICE, &[why]).to_string())
+            }
             HELLO => {
                 self.hello = true;
-                let reply = Command::new(HELLO, &[&PROTOCOL_VERSION.to_string(), FEATURE_SPECTRUM, FEATURE_ADPCM]);
+                let reply = Command::new(
+                    HELLO,
+                    &[&PROTOCOL_VERSION.to_string(), FEATURE_SPECTRUM, FEATURE_ADPCM, FEATURE_TX],
+                );
                 Some(reply.to_string())
             }
             SPECTRUM => {
@@ -170,13 +296,128 @@ impl RemoteStreams {
 
     /// `hpsdr_bands` to send, if this client has said hello and hasn't had
     /// the current list.
-    pub fn bands_message(&mut self, band_share: &BandShare) -> Option<String> {
+    pub fn bands_message(&mut self, share: &RemoteShare) -> Option<String> {
         if !self.hello {
             return None;
         }
-        let (version, list) = band_share.newer_than(self.bands_sent)?;
+        let (version, list) = share.newer_than(self.bands_sent)?;
         self.bands_sent = version;
         Some(bands::to_command(&list).to_string())
+    }
+
+    /// Keys or unkeys for this client; returns why not, if it couldn't key.
+    /// Anyone may unkey, whoever keyed.
+    fn set_mox(&mut self, on: bool, mode: Mode, share: &RemoteShare, tx: &TxLink) -> Option<&'static str> {
+        if !on {
+            tx.mox.store(false, Ordering::Relaxed);
+            self.keyed = None;
+            return None;
+        }
+        let info = share.tx();
+        if !info.available {
+            return Some("This radio can't transmit");
+        }
+        if !info.remote_allowed {
+            return Some("Transmitting from remote clients is turned off at the radio");
+        }
+        if matches!(mode, Mode::Cwl | Mode::Cwu) {
+            return Some("No remote CW yet - choose a voice or data mode to transmit");
+        }
+        if !crate::tx_frequency_allowed(
+            tx.tx_frequency_hz.load(Ordering::Relaxed),
+            tx.allow_out_of_band.load(Ordering::Relaxed),
+        ) {
+            return Some("Out of band - not keyed");
+        }
+        tx.wants_mic.store(false, Ordering::Relaxed);
+        {
+            let mut q = tx.audio.lock().unwrap();
+            q.clear();
+            q.extend(std::iter::repeat_n(0.0, TX_PRIME));
+        }
+        tx.mox.store(true, Ordering::Relaxed);
+        self.keyed = Some(Keyed { mox: Arc::clone(tx.mox), last_audio: Instant::now(), upsampler: Upsampler::default() });
+        None
+    }
+
+    /// A binary message from the client: TX audio (IMA-ADPCM), taken only
+    /// while it has the radio keyed. Anything else is ignored.
+    pub fn tx_audio(&mut self, data: &[u8], tx: &TxLink) {
+        let Some(k) = self.keyed.as_mut() else { return };
+        let Some((header, payload)) = Header::decode(data) else { return };
+        if header.msg_type != TYPE_ADPCM_AUDIO || !AUDIO_RATES.contains(&header.sample_rate) {
+            return;
+        }
+        let Some(samples) = adpcm::decode(payload, header.length as usize) else { return };
+        k.last_audio = Instant::now();
+        let input: Vec<f32> = samples.iter().map(|&s| s as f32 / 32768.0).collect();
+        let mut out = Vec::with_capacity(input.len() * (TX_RATE / header.sample_rate) as usize + 2);
+        k.upsampler.push(&input, header.sample_rate, &mut out);
+        let mut q = tx.audio.lock().unwrap();
+        q.extend(out);
+        if q.len() > TX_HIGH {
+            let excess = q.len() - TX_TARGET;
+            q.drain(..excess);
+        }
+    }
+
+    /// Called every pass of the client's loop: ends this client's
+    /// transmission if the radio was unkeyed elsewhere, if remote transmit
+    /// was turned off, or if its TX audio has stopped (returning why, to
+    /// log); otherwise keeps the TX queue from running empty (see TX_LOW).
+    pub fn tx_tick(&mut self, share: &RemoteShare, tx: &TxLink) -> Option<&'static str> {
+        let k = self.keyed.as_ref()?;
+        if !k.mox.load(Ordering::Relaxed) {
+            self.keyed = None;
+            return None;
+        }
+        let info = share.tx();
+        if !info.available || !info.remote_allowed {
+            k.mox.store(false, Ordering::Relaxed);
+            self.keyed = None;
+            return Some("remote transmit turned off while a remote client was transmitting -- unkeyed");
+        }
+        if k.last_audio.elapsed() >= TX_AUDIO_TIMEOUT {
+            k.mox.store(false, Ordering::Relaxed);
+            self.keyed = None;
+            return Some("no TX audio from the remote client for a second -- unkeyed");
+        }
+        let mut q = tx.audio.lock().unwrap();
+        if q.len() < TX_LOW {
+            q.extend(std::iter::repeat_n(0.0, TX_LOW));
+        }
+        None
+    }
+
+    /// `hpsdr_tx` to send, if this client has said hello and it's due:
+    /// five times a second while transmitting, once a second otherwise, and
+    /// straight away when keying or the settings change.
+    pub fn tx_message(&mut self, share: &RemoteShare, mox: &AtomicBool) -> Option<String> {
+        if !self.hello {
+            return None;
+        }
+        let info = share.tx();
+        let on = mox.load(Ordering::Relaxed);
+        let state = TxState {
+            // Off for remote clients is, to them, a radio that can't.
+            available: info.available && info.remote_allowed,
+            mox: on,
+            power_w: info.power_w,
+            max_power_w: info.max_power_w,
+            forward_w: if on { info.forward_w } else { 0.0 },
+            swr: if on { info.swr } else { 1.0 },
+        };
+        let interval = Duration::from_millis(if on { 200 } else { 1000 });
+        let due = self.last_tx.as_ref().is_none_or(|(last, at)| {
+            (last.available, last.mox, last.power_w, last.max_power_w)
+                != (state.available, state.mox, state.power_w, state.max_power_w)
+                || at.elapsed() >= interval
+        });
+        if !due {
+            return None;
+        }
+        self.last_tx = Some((state, Instant::now()));
+        Some(state.to_command().to_string())
     }
 
     pub fn spectrum_on(&self) -> bool {
@@ -370,8 +611,107 @@ mod tests {
     use super::*;
     use hpsdr_proto::tci::parse;
 
+    /// A transmitter for TxLink to point at.
+    #[derive(Default)]
+    struct Tx {
+        mox: Arc<AtomicBool>,
+        tx_frequency_hz: AtomicU32,
+        allow_out_of_band: AtomicBool,
+        wants_mic: AtomicBool,
+        audio: Mutex<VecDeque<f32>>,
+    }
+
+    impl Tx {
+        fn link(&self) -> TxLink<'_> {
+            TxLink {
+                mox: &self.mox,
+                tx_frequency_hz: &self.tx_frequency_hz,
+                allow_out_of_band: &self.allow_out_of_band,
+                wants_mic: &self.wants_mic,
+                audio: &self.audio,
+            }
+        }
+    }
+
     fn handle(r: &mut RemoteStreams, text: &str) -> Option<String> {
-        r.handle(&parse(text)[0], &Mutex::new(DemodParams::default()), &BandShare::default())
+        let tx = Tx::default();
+        r.handle(&parse(text)[0], &Mutex::new(DemodParams::default()), &RemoteShare::default(), &tx.link())
+    }
+
+    /// Keying: refused (with the reason) where the radio wouldn't key;
+    /// otherwise TX audio goes into the transmitter's queue, and the
+    /// transmission ends if that audio stops or the client goes.
+    #[test]
+    fn transmitting() {
+        let tx = Tx::default();
+        tx.allow_out_of_band.store(true, Ordering::Relaxed);
+        let share = RemoteShare::default();
+        let params = Mutex::new(DemodParams::default());
+        let mut r = RemoteStreams::default();
+        let mut send = |r: &mut RemoteStreams, text: &str| r.handle(&parse(text)[0], &params, &share, &tx.link());
+        assert!(send(&mut r, "hpsdr_hello:1;").unwrap().contains(",tx;"));
+
+        assert_eq!(send(&mut r, "hpsdr_mox:true;").as_deref(), Some("hpsdr_notice:This radio can't transmit;"));
+        let allowed = TxInfo { available: true, remote_allowed: true, power_w: 50, max_power_w: 100, forward_w: 0.0, swr: 1.0 };
+        share.set_tx(TxInfo { remote_allowed: false, ..allowed });
+        assert!(send(&mut r, "hpsdr_mox:true;").unwrap().contains("turned off at the radio"));
+        assert!(r.tx_message(&share, &tx.mox).unwrap().starts_with("hpsdr_tx:false,"), "shown as unavailable");
+        share.set_tx(allowed);
+        params.lock().unwrap().mode = Mode::Cwu;
+        assert!(send(&mut r, "hpsdr_mox:true;").unwrap().contains("No remote CW"));
+        assert!(!tx.mox.load(Ordering::Relaxed));
+        assert_eq!(r.tx_message(&share, &tx.mox).as_deref(), Some("hpsdr_tx:true,false,50,100,0.0,1.00;"));
+
+        params.lock().unwrap().mode = Mode::Usb;
+        tx.wants_mic.store(true, Ordering::Relaxed);
+        assert!(send(&mut r, "hpsdr_mox:true;").is_none());
+        assert!(tx.mox.load(Ordering::Relaxed) && !tx.wants_mic.load(Ordering::Relaxed));
+        assert_eq!(tx.audio.lock().unwrap().len(), TX_PRIME);
+        assert!(r.tx_message(&share, &tx.mox).unwrap().starts_with("hpsdr_tx:true,true,"), "sent at once on keying");
+
+        // 20 ms at 16 kHz becomes 20 ms at 48 kHz.
+        let block = adpcm::Encoder::new().encode(&[1000; 320]);
+        let header = Header {
+            sample_rate: 16_000,
+            format: FORMAT_ADPCM,
+            codec: CODEC_IMA_ADPCM,
+            length: 320,
+            msg_type: TYPE_ADPCM_AUDIO,
+            channels: 1,
+            ..Default::default()
+        };
+        let mut msg = Vec::new();
+        header.encode(&mut msg);
+        msg.extend(block);
+        r.tx_audio(&msg, &tx.link());
+        let queued = tx.audio.lock().unwrap().len() - TX_PRIME;
+        assert!((958..=962).contains(&queued), "{queued}");
+
+        // Kept from running dry while the audio arrives...
+        tx.audio.lock().unwrap().clear();
+        assert!(r.tx_tick(&share, &tx.link()).is_none());
+        assert_eq!(tx.audio.lock().unwrap().len(), TX_LOW);
+        // ...and unkeyed once it has stopped for a second.
+        r.keyed.as_mut().unwrap().last_audio = Instant::now() - Duration::from_secs(2);
+        assert!(r.tx_tick(&share, &tx.link()).is_some());
+        assert!(!tx.mox.load(Ordering::Relaxed));
+
+        // Turning remote transmit off at the radio unkeys at once.
+        assert!(send(&mut r, "hpsdr_mox:true;").is_none());
+        share.set_tx(TxInfo { remote_allowed: false, ..allowed });
+        assert!(r.tx_tick(&share, &tx.link()).is_some());
+        assert!(!tx.mox.load(Ordering::Relaxed));
+        share.set_tx(allowed);
+
+        // A client that goes while keyed unkeys.
+        assert!(send(&mut r, "hpsdr_mox:true;").is_none());
+        drop(r);
+        assert!(!tx.mox.load(Ordering::Relaxed));
+
+        // A power setting waits for main.rs.
+        let mut r = RemoteStreams::default();
+        send(&mut r, "hpsdr_set:power,30;");
+        assert_eq!(share.take_power_request(), Some(30));
     }
 
     /// The band list goes once after hello and again when it changes; a
@@ -379,18 +719,19 @@ mod tests {
     #[test]
     fn bands_are_sent_and_selected() {
         let mut r = RemoteStreams::default();
-        let share = BandShare::default();
+        let share = RemoteShare::default();
         let params = Mutex::new(DemodParams::default());
         share.set(vec![BandInfo { name: "40m".into(), low_hz: 7_000_000, high_hz: 7_300_000 }]);
         assert!(r.bands_message(&share).is_none(), "not before hello");
-        r.handle(&parse("hpsdr_hello:1;")[0], &params, &share);
+        let tx = Tx::default();
+        r.handle(&parse("hpsdr_hello:1;")[0], &params, &share, &tx.link());
         assert_eq!(r.bands_message(&share).as_deref(), Some("hpsdr_bands:40m,7000000,7300000;"));
         assert!(r.bands_message(&share).is_none(), "already sent");
         share.set(vec![BandInfo { name: "40m".into(), low_hz: 7_000_000, high_hz: 7_300_000 }]);
         assert!(r.bands_message(&share).is_none(), "the same list isn't new");
         share.set(vec![]);
         assert_eq!(r.bands_message(&share).as_deref(), Some("hpsdr_bands;"));
-        r.handle(&parse("hpsdr_band:QO-100;")[0], &params, &share);
+        r.handle(&parse("hpsdr_band:QO-100;")[0], &params, &share, &tx.link());
         assert_eq!(share.take_request().as_deref(), Some("QO-100"));
         assert!(share.take_request().is_none());
     }
@@ -402,13 +743,14 @@ mod tests {
         let mut r = RemoteStreams::default();
         let params = Mutex::new(DemodParams::default());
         assert!(r.state_message(&params.lock().unwrap()).is_none(), "not before hello");
-        r.handle(&parse("hpsdr_hello:1;")[0], &params, &BandShare::default());
+        let tx = Tx::default();
+        r.handle(&parse("hpsdr_hello:1;")[0], &params, &RemoteShare::default(), &tx.link());
         let first = r.state_message(&params.lock().unwrap()).unwrap();
         assert!(first.starts_with("hpsdr_state:"));
         assert!(r.state_message(&params.lock().unwrap()).is_none(), "unchanged, under a second");
         for text in ["hpsdr_set:width,1800;", "hpsdr_set:agc,slow;", "hpsdr_set:agc_gain,70;", "hpsdr_set:nb,nb2;",
                      "hpsdr_set:nr,nr3;", "hpsdr_set:anf,true;", "hpsdr_set:snb,true;", "hpsdr_set:nr,bogus;"] {
-            r.handle(&parse(text)[0], &params, &BandShare::default());
+            r.handle(&parse(text)[0], &params, &RemoteShare::default(), &tx.link());
         }
         let state = r.state_message(&params.lock().unwrap()).unwrap();
         assert_eq!(state, "hpsdr_state:1800,slow,70,nb2,nr3,true,true;");
@@ -417,7 +759,7 @@ mod tests {
     #[test]
     fn hello_and_stream_commands() {
         let mut r = RemoteStreams::default();
-        assert_eq!(handle(&mut r, "hpsdr_hello:1;").as_deref(), Some("hpsdr_hello:1,spectrum,adpcm;"));
+        assert_eq!(handle(&mut r, "hpsdr_hello:1;").as_deref(), Some("hpsdr_hello:1,spectrum,adpcm,tx;"));
         assert!(r.hello);
         assert!(handle(&mut r, "hpsdr_audio:adpcm,24000;").is_none());
         assert!(r.audio_on());

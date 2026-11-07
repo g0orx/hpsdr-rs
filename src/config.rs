@@ -122,6 +122,15 @@ pub struct Config {
     pub web_addr: Option<String>,
     #[serde(default)]
     pub web_running: Option<bool>,
+    /// HTTPS (default) or plain HTTP, and the password clients must give
+    /// (empty or missing: none). Kept as typed, like the rest of this file.
+    #[serde(default)]
+    pub web_https: Option<bool>,
+    #[serde(default)]
+    pub web_password: Option<String>,
+    /// Remote clients may transmit (default yes).
+    #[serde(default)]
+    pub web_allow_tx: Option<bool>,
     #[serde(default)]
     pub cat_running: Option<bool>,
     /// Debug logging to rigctl_log.txt/tci_log.txt/cat_log.txt (Settings

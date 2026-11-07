@@ -5,8 +5,10 @@
   <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
   <meta name="apple-mobile-web-app-capable" content="yes">
   <title>hpsdr-remote</title>
-  <!-- hpsdr-rs's own web server fills in its TCI port here (web_server.rs). -->
-  <meta name="hpsdr-tci-port" content="__TCI_PORT__">
+  <!-- hpsdr-rs's own web server fills in the path it passes the client's
+       connection through to TCI at (web_server.rs); left as is, the page
+       wasn't served by hpsdr-rs. -->
+  <meta name="hpsdr-tci-path" content="__HPSDR_SERVED__">
   <style>
     html, body { margin: 0; padding: 0; height: 100%; overflow: hidden; background: #1b1b1b; }
     canvas { display: block; width: 100%; height: 100%; touch-action: none; }

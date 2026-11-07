@@ -1,8 +1,9 @@
 /*
     hpsdr-remote's window: connect to an hpsdr-rs TCI server, then its VFO,
     band and mode buttons, S-meter and audio gain, and the spectrum and
-    waterfall it streams -- click or scroll them to tune. Phase 1: receive
-    only (docs/remote-protocol.md).
+    waterfall it streams -- click or scroll them to tune -- and transmit:
+    MOX, the microphone, power and the power/SWR meter
+    (docs/remote-protocol.md).
 */
 
 use std::collections::{HashMap, VecDeque};
@@ -11,11 +12,15 @@ use egui::{Color32, ColorImage, Pos2, Rect, Stroke, TextureHandle, TextureOption
 use hpsdr_proto::bands::{self, BandInfo};
 use hpsdr_proto::spectrum::SpectrumFrame;
 use hpsdr_proto::state::{self as dsp, DspState};
-use hpsdr_proto::tci::{Command, AUDIO, HELLO, SPECTRUM};
-use hpsdr_proto::{adpcm, Header, PROTOCOL_VERSION, TYPE_ADPCM_AUDIO, TYPE_SPECTRUM};
+use hpsdr_proto::tci::{Command, AUDIO, FEATURE_TX, HELLO, NOTICE, SPECTRUM};
+use hpsdr_proto::tx::{self, TxState, TX_AUDIO_RATE};
+use hpsdr_proto::{
+    adpcm, Header, CODEC_IMA_ADPCM, FORMAT_ADPCM, PROTOCOL_VERSION, TYPE_ADPCM_AUDIO, TYPE_SPECTRUM,
+};
 
 use crate::audio::Player;
 use crate::link::{Incoming, Link, Status};
+use crate::mic::Mic;
 
 /// What's asked of the server: points a row, rows a second, audio rate.
 const SPECTRUM_POINTS: usize = 1024;
@@ -69,6 +74,17 @@ struct Radio {
     dsp: Option<DspState>,
     /// Its band buttons (hpsdr_bands): None from a server without them.
     bands: Option<Vec<BandInfo>>,
+    /// Its transmitter (hpsdr_tx): None until the first report.
+    tx: Option<TxState>,
+}
+
+impl Radio {
+    /// The server can take this client's transmissions, and the radio
+    /// can transmit.
+    fn can_transmit(&self) -> bool {
+        self.extensions.as_ref().is_some_and(|e| e.iter().any(|f| f == FEATURE_TX))
+            && self.tx.is_some_and(|t| t.available)
+    }
 }
 
 impl Radio {
@@ -121,8 +137,9 @@ pub struct App {
     db_low: f32,
     db_range: f32,
     band_memory: HashMap<&'static str, u64>,
-    /// Data rate for the status line: bytes at the last sample, when, rate.
-    rate_sample: (u64, f64, f64),
+    /// Data rates for the status line: bytes in and out at the last
+    /// sample, when, and the rates in and out (kbit/s).
+    rate_sample: (u64, u64, f64, f64, f64),
     /// The step for the frequency display's slide, the - and + buttons,
     /// and a plain scroll.
     step_hz: u64,
@@ -141,7 +158,32 @@ pub struct App {
     /// When a DSP setting was last changed here -- the server's
     /// hpsdr_state is ignored briefly after, as with tuning.
     dsp_set_at: f64,
+    /// Sent with the connection, if the server asks for one.
+    password: String,
+    /// Transmitting: the microphone (opened on the first MOX press) or why
+    /// it couldn't be; its gain and recent level; whether this client
+    /// keyed (it sends audio only then), and when MOX was last pressed --
+    /// the server's state is ignored just after, as with tuning; the TX
+    /// audio encoder and samples not yet a whole block; the power setting
+    /// shown, and when it was last changed here.
+    mic: Option<Mic>,
+    mic_error: Option<String>,
+    mic_gain_db: f32,
+    mic_level: f32,
+    keyed_here: bool,
+    mox_pressed_at: f64,
+    tx_encoder: adpcm::Encoder,
+    tx_pending: Vec<i16>,
+    power_w: u32,
+    power_set_at: f64,
+    /// The server's last hpsdr_notice, and when it came.
+    notice: Option<(String, f64)>,
 }
+
+/// TX audio goes in blocks this long (20 ms).
+const TX_BLOCK: usize = TX_AUDIO_RATE as usize / 50;
+/// How long a notice stays in the status line.
+const NOTICE_S: f64 = 8.0;
 
 /// Slide this far on the frequency display for one step.
 const VFO_SLIDE_PX_PER_STEP: f32 = 12.0;
@@ -166,7 +208,7 @@ impl App {
             db_low: -130.0,
             db_range: 60.0,
             band_memory: HashMap::new(),
-            rate_sample: (0, 0.0, 0.0),
+            rate_sample: (0, 0, 0.0, 0.0, 0.0),
             step_hz: 1_000,
             vfo_slide_px: 0.0,
             span_slide_hz: 0.0,
@@ -175,6 +217,18 @@ impl App {
             sent_at: f64::NEG_INFINITY,
             unsent: false,
             dsp_set_at: f64::NEG_INFINITY,
+            password: String::new(),
+            mic: None,
+            mic_error: None,
+            mic_gain_db: 0.0,
+            mic_level: 0.0,
+            keyed_here: false,
+            mox_pressed_at: f64::NEG_INFINITY,
+            tx_encoder: adpcm::Encoder::new(),
+            tx_pending: Vec::new(),
+            power_w: 0,
+            power_set_at: f64::NEG_INFINITY,
+            notice: None,
         }
     }
 
@@ -183,7 +237,9 @@ impl App {
         self.spectrum = None;
         self.waterfall.rows.clear();
         self.waterfall.dirty = true;
-        self.link = match Link::connect(&self.url, ctx.clone()) {
+        self.keyed_here = false;
+        self.notice = None;
+        self.link = match Link::connect(&with_password(&self.url, &self.password), ctx.clone()) {
             Ok(link) => Some(link),
             Err(e) => {
                 self.radio.device = format!("couldn't connect: {e}");
@@ -256,7 +312,26 @@ impl App {
                         self.radio.filter = Some((self.radio.mode.clone(), low, high));
                     }
                 }
-                "trx" => self.radio.mox = cmd.args.get(1).is_some_and(|v| v == "true"),
+                "trx" => self.server_mox(cmd.args.get(1).is_some_and(|v| v == "true")),
+                tx::TX => {
+                    if let Some(state) = TxState::from_command(&cmd) {
+                        self.server_mox(state.mox);
+                        if self.now - self.power_set_at >= TUNE_HOLD_S {
+                            self.power_w = state.power_w;
+                        }
+                        self.radio.tx = Some(state);
+                    }
+                }
+                NOTICE => {
+                    // Just after pressing MOX, a notice is the server
+                    // saying why it didn't key: show it unkeyed at once.
+                    if self.keyed_here && self.now - self.mox_pressed_at < TUNE_HOLD_S {
+                        self.keyed_here = false;
+                        self.radio.mox = false;
+                        self.mox_pressed_at = f64::NEG_INFINITY;
+                    }
+                    self.notice = Some((cmd.args.join(", "), self.now));
+                }
                 "device" => self.radio.device = cmd.args.first().cloned().unwrap_or_default(),
                 HELLO => self.radio.extensions = Some(cmd.args.iter().skip(1).cloned().collect()),
                 bands::BANDS => self.radio.bands = bands::from_command(&cmd),
@@ -291,6 +366,136 @@ impl App {
         }
     }
 
+    /// The server says the radio is (or isn't) transmitting. Not just after
+    /// MOX was pressed here, when a report sent before the press can still
+    /// arrive; after that, unkeyed there means stop sending audio here.
+    fn server_mox(&mut self, on: bool) {
+        if self.now - self.mox_pressed_at < TUNE_HOLD_S {
+            return;
+        }
+        self.radio.mox = on;
+        if !on {
+            self.keyed_here = false;
+        }
+    }
+
+    /// MOX pressed: key (opening the microphone the first time -- in the
+    /// click, as browsers want) or unkey.
+    fn set_mox(&mut self, on: bool) {
+        if on && self.mic.is_none() {
+            match Mic::open() {
+                Ok(m) => {
+                    self.mic = Some(m);
+                    self.mic_error = None;
+                }
+                Err(e) => {
+                    self.mic_error = Some(e);
+                    return;
+                }
+            }
+        }
+        if on {
+            // Start fresh: nothing captured before the press.
+            if let Some(m) = &self.mic {
+                m.take();
+            }
+            self.tx_encoder = adpcm::Encoder::new();
+            self.tx_pending.clear();
+        }
+        self.keyed_here = on;
+        self.radio.mox = on;
+        self.mox_pressed_at = self.now;
+        self.send(tx::mox(on));
+    }
+
+    /// Sends what the microphone has captured, in 20 ms ADPCM blocks,
+    /// while this client has the radio keyed; otherwise just keeps it
+    /// drained, and the level meter moving.
+    fn send_tx_audio(&mut self) {
+        let Some(mic) = &self.mic else { return };
+        if let Some(e) = mic.error() {
+            self.mic_error = Some(e);
+        }
+        let samples = mic.take();
+        let gain = 10f32.powf(self.mic_gain_db / 20.0);
+        self.mic_level = (self.mic_level * 0.8).max(mic.take_peak() * gain);
+        if !self.keyed_here {
+            return;
+        }
+        self.tx_pending.extend(samples.iter().map(|&s| (s * gain * 32767.0).clamp(-32767.0, 32767.0) as i16));
+        while self.tx_pending.len() >= TX_BLOCK {
+            let block: Vec<i16> = self.tx_pending.drain(..TX_BLOCK).collect();
+            let header = Header {
+                sample_rate: TX_AUDIO_RATE,
+                format: FORMAT_ADPCM,
+                codec: CODEC_IMA_ADPCM,
+                length: TX_BLOCK as u32,
+                msg_type: TYPE_ADPCM_AUDIO,
+                channels: 1,
+                ..Default::default()
+            };
+            let mut msg = Vec::new();
+            header.encode(&mut msg);
+            msg.extend(self.tx_encoder.encode(&block));
+            if let Some(link) = &mut self.link {
+                link.send_binary(msg);
+            }
+        }
+    }
+
+    /// MOX, the microphone's gain and level, the power setting, and the
+    /// power/SWR meter -- once the server says this radio can transmit.
+    fn tx_controls(&mut self, ui: &mut egui::Ui) {
+        if !self.radio.can_transmit() {
+            return;
+        }
+        let tx = self.radio.tx.unwrap_or_default();
+        ui.horizontal_wrapped(|ui| {
+            let cw = self.radio.mode == "cw";
+            let (fill, text) = if self.radio.mox {
+                (Color32::from_rgb(200, 30, 30), Color32::WHITE)
+            } else {
+                (ui.visuals().widgets.inactive.bg_fill, ui.visuals().text_color())
+            };
+            let mox = ui
+                .add_enabled(
+                    !cw || self.radio.mox,
+                    egui::Button::new(egui::RichText::new("MOX").strong().size(18.0).color(text))
+                        .fill(fill)
+                        .min_size(Vec2::new(72.0, 32.0)),
+                )
+                .on_hover_text("Transmit from this microphone; press again to stop")
+                .on_disabled_hover_text("No remote CW yet: choose a voice or data mode to transmit");
+            if mox.clicked() {
+                self.set_mox(!self.radio.mox);
+            }
+            ui.add_space(12.0);
+            ui.label("Mic:");
+            ui.add(egui::Slider::new(&mut self.mic_gain_db, -20.0..=30.0).suffix(" dB"));
+            let (rect, _) = ui.allocate_exact_size(Vec2::new(80.0, 10.0), egui::Sense::hover());
+            ui.painter().rect_filled(rect, 2.0, Color32::from_gray(40));
+            let level = self.mic_level.min(1.0);
+            let colour = if level > 0.9 { Color32::from_rgb(230, 60, 60) } else { Color32::from_rgb(60, 200, 60) };
+            ui.painter().rect_filled(
+                Rect::from_min_size(rect.min, Vec2::new(rect.width() * level, rect.height())),
+                2.0,
+                colour,
+            );
+            ui.add_space(12.0);
+            ui.label("Power:");
+            let max = tx.max_power_w.max(1);
+            if ui.add(egui::Slider::new(&mut self.power_w, 0..=max).suffix(" W")).changed() {
+                self.power_set_at = self.now;
+                let watts = self.power_w.to_string();
+                self.send(Command::new(dsp::SET, &[tx::SET_POWER, &watts]));
+            }
+            if self.radio.mox {
+                ui.add_space(12.0);
+                ui.strong(format!("{:.1} W   SWR {:.2}", tx.forward_w, tx.swr));
+            }
+        });
+    }
+
     fn add_waterfall_row(&mut self, frame: &SpectrumFrame) {
         let row = frame.db().iter().map(|&db| waterfall_colour((db - self.db_low) / self.db_range)).collect();
         self.waterfall.rows.push_front(row);
@@ -302,12 +507,19 @@ impl App {
         ui.horizontal(|ui| {
             ui.label("Server:");
             ui.add(egui::TextEdit::singleline(&mut self.url).desired_width(220.0));
+            ui.label("Password:");
+            let password = ui.add(egui::TextEdit::singleline(&mut self.password).password(true).desired_width(100.0));
+            let enter = password.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
             let connected = self.link.as_ref().is_some_and(|l| !matches!(l.status, Status::Closed(_)));
             if connected {
                 if ui.button("Disconnect").clicked() {
+                    if self.keyed_here {
+                        self.set_mox(false);
+                    }
                     self.link = None;
+                    self.keyed_here = false;
                 }
-            } else if ui.button("Connect").clicked() {
+            } else if ui.button("Connect").clicked() || enter {
                 self.connect(ui.ctx());
             }
             let status = match &self.link {
@@ -414,6 +626,7 @@ impl App {
             ui.add(egui::Slider::new(&mut self.db_range, 20.0..=120.0).suffix(" dB"));
         });
         self.dsp_controls(ui);
+        self.tx_controls(ui);
     }
 
     /// Filter, AGC and noise controls, once the server has reported them.
@@ -630,20 +843,35 @@ impl App {
     fn status_line(&mut self, ui: &mut egui::Ui) {
         let now = ui.input(|i| i.time);
         if let Some(link) = &self.link {
-            let (bytes, at, _) = self.rate_sample;
+            let (bytes_in, bytes_out, at, ..) = self.rate_sample;
             if now - at >= 1.0 {
-                let rate = (link.bytes_in.saturating_sub(bytes)) as f64 * 8.0 / (now - at) / 1000.0;
-                self.rate_sample = (link.bytes_in, now, rate);
+                let kbits = |bytes: u64| bytes as f64 * 8.0 / (now - at) / 1000.0;
+                let rate_in = kbits(link.bytes_in.saturating_sub(bytes_in));
+                let rate_out = kbits(link.bytes_out.saturating_sub(bytes_out));
+                self.rate_sample = (link.bytes_in, link.bytes_out, now, rate_in, rate_out);
             }
         }
-        let mut text = format!("built {}   {:.0} kbit/s", built_at(), self.rate_sample.2);
+        let mut text = format!("built {}   {:.0} kbit/s in", built_at(), self.rate_sample.3);
+        if self.rate_sample.4 >= 1.0 {
+            text.push_str(&format!(", {:.0} out", self.rate_sample.4));
+        }
         if let Some(p) = &self.player {
             text.push_str(&format!("   audio buffer {:.0} ms", p.buffered_s() * 1000.0));
         }
         if let Some(e) = &self.audio_error {
             text.push_str(&format!("   {e}"));
         }
-        ui.weak(text);
+        ui.horizontal(|ui| {
+            ui.weak(text);
+            if let Some(e) = &self.mic_error {
+                ui.colored_label(Color32::from_rgb(230, 80, 80), e);
+            }
+            if let Some((notice, at)) = &self.notice {
+                if now - at < NOTICE_S {
+                    ui.colored_label(Color32::from_rgb(230, 180, 60), notice);
+                }
+            }
+        });
     }
 }
 
@@ -654,6 +882,15 @@ impl eframe::App for App {
         let incoming = self.link.as_mut().map(|l| l.poll()).unwrap_or_default();
         for i in incoming {
             self.handle(i);
+        }
+        // Lost the connection: nothing to send to.
+        if self.link.as_ref().is_none_or(|l| l.status != Status::Open) {
+            self.keyed_here = false;
+        }
+        self.send_tx_audio();
+        if self.keyed_here {
+            // Audio goes out in 20 ms blocks: keep coming back for it.
+            ui.ctx().request_repaint_after(std::time::Duration::from_millis(10));
         }
         egui::Panel::top("top").show(ui, |ui| {
             self.top_bar(ui);
@@ -728,25 +965,48 @@ fn waterfall_colour(v: f32) -> Color32 {
     Color32::from_rgb(255, 40, 40)
 }
 
-/// The server's address to offer first: on the web, the host that served
-/// the page, at the TCI port hpsdr-rs's web server put in the page
-/// (`hpsdr-tci-port`; 50001 if it wasn't served by hpsdr-rs); natively,
-/// this machine.
+/// The server's address to offer first. On the web: served by hpsdr-rs
+/// (which puts the path in the page's `hpsdr-tci-path`), back to that same
+/// address and port -- wss on an HTTPS page; served some other way, the
+/// TCI port on the same host. Natively, this machine's TCI port.
 fn default_url() -> String {
     #[cfg(target_arch = "wasm32")]
     {
-        let document = web_sys::window().and_then(|w| w.document());
-        let port = document
+        let window = web_sys::window();
+        let path = window
             .as_ref()
-            .and_then(|d| d.query_selector("meta[name=hpsdr-tci-port]").ok().flatten())
+            .and_then(|w| w.document())
+            .and_then(|d| d.query_selector("meta[name=hpsdr-tci-path]").ok().flatten())
             .and_then(|m| m.get_attribute("content"))
-            .and_then(|p| p.parse::<u16>().ok())
-            .unwrap_or(50001);
-        if let Some(host) = web_sys::window().and_then(|w| w.location().hostname().ok()).filter(|h| !h.is_empty()) {
-            return format!("ws://{host}:{port}");
+            .filter(|p| p.starts_with('/'));
+        if let Some(location) = window.map(|w| w.location()) {
+            let secure = location.protocol().is_ok_and(|p| p == "https:");
+            let scheme = if secure { "wss" } else { "ws" };
+            match (path, location.host(), location.hostname()) {
+                (Some(path), Ok(host), _) if !host.is_empty() => return format!("{scheme}://{host}{path}"),
+                (None, _, Ok(host)) if !host.is_empty() => return format!("{scheme}://{host}:50001"),
+                _ => {}
+            }
         }
     }
     "ws://127.0.0.1:50001".to_string()
+}
+
+/// `url` with `password` added as hpsdr-rs's web server expects it
+/// (`?password=`, %-encoded); unchanged if there's no password.
+fn with_password(url: &str, password: &str) -> String {
+    if password.is_empty() {
+        return url.to_string();
+    }
+    let encoded: String = password
+        .bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => (b as char).to_string(),
+            _ => format!("%{b:02X}"),
+        })
+        .collect();
+    let separator = if url.contains('?') { '&' } else { '?' };
+    format!("{url}{separator}password={encoded}")
 }
 
 #[cfg(test)]
@@ -755,6 +1015,8 @@ mod tests {
 
     #[test]
     fn helpers() {
+        assert_eq!(with_password("wss://h:8080/tci", ""), "wss://h:8080/tci");
+        assert_eq!(with_password("wss://h:8080/tci", "p@ss word!"), "wss://h:8080/tci?password=p%40ss%20word%21");
         assert_eq!(format_frequency(7_100_000), "7.100000");
         assert_eq!(format_frequency(10_489_750_000), "10489.750000");
         assert_eq!(nice_step(23_000.0), 50_000.0);

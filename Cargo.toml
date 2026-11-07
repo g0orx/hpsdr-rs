@@ -47,6 +47,12 @@ serde = { version = "1", features = ["derive"] }
 cpal = "0.17"
 serde_json = "1"
 tungstenite = "0.29"
+# HTTPS for the web client server (web_server.rs): browsers only let a
+# page use the microphone over HTTPS. ring, not rustls's default aws-lc,
+# which needs CMake and NASM to build on Windows. rcgen makes the
+# self-signed certificate.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+rcgen = { version = "0.14", default-features = false, features = ["ring", "pem"] }
 # Raw Ethernet send/receive for the P1 bootloader-mode firmware-upload
 # protocol (see bootloader.rs's own doc comment) -- NOT the same thing as
 # ordinary UDP discovery/radio traffic elsewhere in this project. Chosen

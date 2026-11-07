@@ -107,11 +107,21 @@ hpsdr-rs -- the frequency, spectrum and tuning are all still correct.
 
 hpsdr-remote, hpsdr-rs's own remote client, in a web browser -- on a phone,
 a tablet (iPhone and iPad included) or another computer, with nothing to
-install. Enter the address to listen on (default `0.0.0.0:8080`) and click
-**Start**; the line below then gives the address to open, e.g.
-`http://192.168.1.122:8080`. It needs the **TCI** server running too, and
-suggests the TCI port you've set. Like the other servers here it starts
-again automatically next time if it was running.
+install. Enter the address to listen on (default `0.0.0.0:8080`), choose
+**HTTPS** and a **Password**, and click **Start**; the line below then
+gives the address to open, e.g. `https://192.168.1.122:8080`. The client
+connects back through this same port to the **TCI** server, which must be
+running too. Like the other servers here it starts again automatically
+next time if it was running.
+
+**HTTPS** (on by default) is needed to transmit: browsers only let a page
+use the microphone over HTTPS. hpsdr-rs makes its own certificate the first
+time (`web-cert.pem` and `web-key.pem`, kept with its settings), so the
+first visit from each browser shows a warning that the connection isn't
+private -- choose to continue (on Chrome: **Advanced**, then **Proceed**;
+on Safari: **Show Details**, then **visit this website**). If you have a
+certificate of your own for this computer's name, put it in those two
+files instead.
 
 The client shows the radio's spectrum and waterfall, its band buttons, the
 VFO, mode, filter, AGC and noise controls, the S-meter, and the receive
@@ -119,11 +129,29 @@ audio (which starts when you press **Connect** -- browsers only start audio
 after a tap). Tune by tapping or sliding on the spectrum or waterfall, by
 sliding on the frequency, or with **-** and **+** and a chosen step. It
 uses about 150 kbit/s, compressed, rather than the several Mbit/s of
-standard TCI audio and IQ. Receive only, for now.
+standard TCI audio and IQ, plus about 70 kbit/s more while transmitting.
 
-There's no password, as with TCI itself: anyone who can reach these ports
-can control the radio. Keep it on your own network, or reach it through a
-VPN (WireGuard, Tailscale) or an SSH tunnel.
+To transmit, press **MOX**: the first time, the browser asks to use the
+microphone. Press **MOX** again to stop. **Mic** sets its level (keep the
+meter beside it out of the red), **Power** is the radio's TX power
+setting, and the power and SWR show while transmitting. The radio
+transmits only where it would from its own MOX button (in band, unless
+out-of-band TX is allowed in Settings -> TX), not in CW for now, and with
+**TX Audio Source** left at **Auto**. If the connection drops, or the
+client stops sending audio for a second -- a phone locked, a browser tab
+put in the background -- the radio unkeys by itself.
+
+Untick **Allow transmit** to let remote clients listen and tune but not
+transmit: their **MOX** button disappears, and one already transmitting is
+unkeyed at once. It takes effect straight away, without stopping the
+server.
+
+Set a **password** before making this port reachable from outside your own
+network: without one, anyone who can reach it can control the radio,
+transmitting included. TCI itself has no password, so for use over the
+internet forward only this port; TCI's address can then be
+`127.0.0.1:50001`, which the web client still reaches through here. A VPN
+(WireGuard, Tailscale) or an SSH tunnel is safer still.
 
 The web client is built into hpsdr-rs when it's built from source with the
 web client built first (`crates/hpsdr-remote/build-web.sh`); without it,

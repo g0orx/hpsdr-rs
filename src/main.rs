@@ -905,19 +905,46 @@ fn select_band_by_name(connected: &mut ConnectedState, name: &str) {
     }
 }
 
-/// http://<address>:<port> for each of this machine's IPv4 addresses a
-/// phone could reach -- for the Network tab's Web client line.
-fn web_client_urls(port: u16) -> Vec<String> {
+/// This machine's IPv4 addresses a phone could reach (not loopback or
+/// link-local).
+fn local_ipv4_addresses() -> Vec<std::net::Ipv4Addr> {
     use network_interface::{Addr, NetworkInterface, NetworkInterfaceConfig};
     NetworkInterface::show()
         .unwrap_or_default()
         .iter()
         .flat_map(|i| i.addr.iter())
         .filter_map(|a| match a {
-            Addr::V4(v4) if !v4.ip.is_loopback() && !v4.ip.is_link_local() => Some(format!("http://{}:{port}", v4.ip)),
+            Addr::V4(v4) if !v4.ip.is_loopback() && !v4.ip.is_link_local() => Some(v4.ip),
             _ => None,
         })
         .collect()
+}
+
+/// The web client's address on each of those -- for the Network tab's Web
+/// client line.
+fn web_client_urls(port: u16, https: bool) -> Vec<String> {
+    let scheme = if https { "https" } else { "http" };
+    local_ipv4_addresses().iter().map(|ip| format!("{scheme}://{ip}:{port}")).collect()
+}
+
+/// Starts the web client server (Settings -> Network -> Web client):
+/// HTTPS with the certificate kept with the settings (made the first time,
+/// naming this machine's addresses), or plain HTTP.
+fn start_web_server(
+    addr: &str,
+    https: bool,
+    password: &str,
+    tci_addr: &Arc<Mutex<String>>,
+) -> Result<web_server::WebServer, String> {
+    let tls = if https {
+        let dir = config::settings_dir().ok_or("no settings folder to keep the HTTPS certificate in")?;
+        let names: Vec<String> = local_ipv4_addresses().iter().map(|ip| ip.to_string()).collect();
+        Some(web_server::tls_config(&dir, &names).map_err(|e| format!("HTTPS certificate: {e}"))?)
+    } else {
+        None
+    };
+    web_server::WebServer::start(addr, tls, password.to_string(), Arc::clone(tci_addr))
+        .map_err(|e| format!("couldn't listen on {addr}: {e}"))
 }
 
 /// The main receiver's current VFOs and their buttons, as a named setup
@@ -2360,12 +2387,17 @@ struct ConnectedState {
     rigctl_addr: String,
     tci_addr: String,
     /// The web client server (Settings -> Network -> Web client): its
-    /// address, the server while running, why it last failed to start, and
-    /// the TCI port it tells the page (kept current from tci_addr).
+    /// address, HTTPS or not, its password (empty: none), the server while
+    /// running, why it last failed to start, and the TCI address it passes
+    /// clients through to (kept current from tci_addr).
     web_addr: String,
+    web_https: bool,
+    web_password: String,
+    /// Remote clients (web or native) may transmit -- see remote::TxInfo.
+    web_allow_tx: bool,
     web_server: Option<web_server::WebServer>,
     web_error: Option<String>,
-    web_tci_port: Arc<std::sync::atomic::AtomicU16>,
+    web_tci_addr: Arc<Mutex<String>>,
     cat_addr: String,
     /// Debug logging toggles (Settings -> Network) -- see
     /// debug_log.rs's own doc comment. Constructed once per connection
@@ -3096,13 +3128,15 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
             }
             // The web client server -- see web_server.rs.
             let web_addr = cfg.web_addr.clone().unwrap_or_else(|| web_server::DEFAULT_ADDR.to_string());
-            let web_tci_port = Arc::new(std::sync::atomic::AtomicU16::new(web_server::port_of(&tci_addr)));
+            let web_https = cfg.web_https.unwrap_or(true);
+            let web_password = cfg.web_password.clone().unwrap_or_default();
+            let web_allow_tx = cfg.web_allow_tx.unwrap_or(true);
+            let web_tci_addr = Arc::new(Mutex::new(tci_addr.clone()));
             let mut web_error: Option<String> = None;
             let web_server = if cfg.web_running.unwrap_or(false) {
-                match web_server::WebServer::start(&web_addr, Arc::clone(&web_tci_port)) {
+                match start_web_server(&web_addr, web_https, &web_password, &web_tci_addr) {
                     Ok(s) => Some(s),
-                    Err(e) => {
-                        let msg = format!("couldn't listen on {web_addr}: {e}");
+                    Err(msg) => {
                         eprintln!("web client: {msg}");
                         web_error = Some(msg);
                         None
@@ -3548,9 +3582,12 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                 rigctl_addr,
                 tci_addr,
                 web_addr,
+                web_https,
+                web_password,
+                web_allow_tx,
                 web_server,
                 web_error,
-                web_tci_port,
+                web_tci_addr,
                 cat_addr,
                 rigctl_debug_log,
                 tci_debug_log,
@@ -3983,9 +4020,12 @@ impl eframe::App for HpsdrApp {
                 // separately in both places.
                 let passband = spectrum::passband_for(current_mode, current_width);
 
-                connected
-                    .web_tci_port
-                    .store(web_server::port_of(&connected.tci_addr), std::sync::atomic::Ordering::Relaxed);
+                {
+                    let mut web_tci_addr = connected.web_tci_addr.lock().unwrap();
+                    if *web_tci_addr != connected.tci_addr {
+                        *web_tci_addr = connected.tci_addr.clone();
+                    }
+                }
                 // Remote clients: keep their band list current, and apply a
                 // band one of them has asked for, as its button here would.
                 if connected.tci_server.is_some() {
@@ -3996,6 +4036,42 @@ impl eframe::App for HpsdrApp {
                     });
                     if let Some(name) = request {
                         select_band_by_name(connected, &name);
+                        connected.settings_dirty.store(true, Ordering::Relaxed);
+                    }
+                    // The transmitter, for their hpsdr_tx: the power setting
+                    // and the meter's own smoothed power and SWR. And a
+                    // power setting one of them has asked for, applied as
+                    // the TX Power slider here does.
+                    let (forward_w, _, swr) = if connected.session.mox_active() {
+                        power_watts_and_swr(
+                            connected.smoothed_fwd_power as u32,
+                            connected.smoothed_rev_power as u32,
+                            connected.device.board,
+                        )
+                    } else {
+                        (0.0, 0.0, 1.0)
+                    };
+                    let info = remote::TxInfo {
+                        // No TxHandle on a receive-only radio.
+                        available: connected.tx_enabled && connected.tx_handle.is_some(),
+                        remote_allowed: connected.web_allow_tx,
+                        power_w: connected.session.tx_power_watts.load(Ordering::Relaxed),
+                        max_power_w: connected.max_tx_power_watts,
+                        forward_w,
+                        swr,
+                    };
+                    let power_request = connected.tci_server.as_ref().and_then(|s| {
+                        s.set_tx_info(info);
+                        s.take_power_request()
+                    });
+                    if let Some(watts) = power_request.filter(|_| connected.tx_enabled) {
+                        connected
+                            .session
+                            .tx_power_watts
+                            .store(watts.min(connected.max_tx_power_watts), Ordering::Relaxed);
+                        if connected.tune_active || connected.two_tone_active {
+                            connected.pre_tune_power_watts = None;
+                        }
                         connected.settings_dirty.store(true, Ordering::Relaxed);
                     }
                 }
@@ -7839,13 +7915,14 @@ impl eframe::App for HpsdrApp {
                                             }
                                         } else if start_stop_button(ui, false) {
                                             connected.web_error = None;
-                                            connected.web_server = match web_server::WebServer::start(
+                                            connected.web_server = match start_web_server(
                                                 &connected.web_addr,
-                                                Arc::clone(&connected.web_tci_port),
+                                                connected.web_https,
+                                                &connected.web_password,
+                                                &connected.web_tci_addr,
                                             ) {
                                                 Ok(s) => Some(s),
-                                                Err(e) => {
-                                                    let msg = format!("couldn't listen on {}: {e}", connected.web_addr);
+                                                Err(msg) => {
                                                     eprintln!("web client: {msg}");
                                                     connected.web_error = Some(msg);
                                                     None
@@ -7854,13 +7931,58 @@ impl eframe::App for HpsdrApp {
                                             settings_changed = true;
                                         }
                                     });
+                                    ui.add_enabled_ui(connected.web_server.is_none(), |ui| {
+                                        if ui
+                                            .checkbox(&mut connected.web_https, "HTTPS")
+                                            .on_hover_text(
+                                                "Needed for the microphone: browsers only allow it on HTTPS \
+                                                 pages. Uses a certificate made for this computer \
+                                                 (web-cert.pem / web-key.pem with the settings), which a \
+                                                 browser warns about the first time -- accept it to go on, \
+                                                 or replace the two files with a real certificate.",
+                                            )
+                                            .changed()
+                                        {
+                                            settings_changed = true;
+                                        }
+                                        ui.horizontal(|ui| {
+                                            ui.label("Password:");
+                                            if ui
+                                                .add(
+                                                    egui::TextEdit::singleline(&mut connected.web_password)
+                                                        .password(true)
+                                                        .desired_width(160.0),
+                                                )
+                                                .on_hover_text("Asked for by the client before it connects. Empty: none.")
+                                                .changed()
+                                            {
+                                                settings_changed = true;
+                                            }
+                                        });
+                                    });
+                                    if ui
+                                        .checkbox(&mut connected.web_allow_tx, "Allow transmit")
+                                        .on_hover_text(
+                                            "Lets remote clients (web or native) key the radio. Off, they can \
+                                             still listen and tune but get no MOX button, and one already \
+                                             transmitting is unkeyed at once. Takes effect immediately.",
+                                        )
+                                        .changed()
+                                    {
+                                        settings_changed = true;
+                                    }
                                     if connected.web_server.is_some() {
                                         let port = web_server::port_of(&connected.web_addr);
-                                        let urls = web_client_urls(port);
+                                        let urls = web_client_urls(port, connected.web_https);
+                                        let scheme = if connected.web_https { "https" } else { "http" };
                                         ui.weak(format!(
-                                            "Running -- open {} in a browser. It uses the TCI server, which must be \
-                                             running too.",
-                                            if urls.is_empty() { format!("http://<this computer>:{port}") } else { urls.join(" or ") }
+                                            "Running -- open {} in a browser. It connects through here to the TCI \
+                                             server, which must be running too. Stop to change these settings.",
+                                            if urls.is_empty() {
+                                                format!("{scheme}://<this computer>:{port}")
+                                            } else {
+                                                urls.join(" or ")
+                                            }
                                         ));
                                     } else {
                                         ui.weak("Stopped");
@@ -7875,10 +7997,16 @@ impl eframe::App for HpsdrApp {
                                     if let Some(err) = &connected.web_error {
                                         ui.colored_label(egui::Color32::from_rgb(220, 60, 60), err);
                                     }
-                                    ui.weak(
-                                        "No password, like TCI itself: anyone who can reach these ports can control \
-                                         the radio. Keep it on your own network, or use a VPN or SSH tunnel.",
-                                    );
+                                    ui.weak(if connected.web_password.is_empty() {
+                                        "No password: anyone who can reach this port can control the radio, \
+                                         transmitting included. Set one before making it reachable from outside."
+                                    } else if !connected.web_https {
+                                        "Without HTTPS the password crosses the network readable, and browsers \
+                                         won't allow the microphone."
+                                    } else {
+                                        "From the internet, make only this port reachable: TCI itself has no \
+                                         password (its address can be 127.0.0.1:50001 -- this still reaches it)."
+                                    });
 
                                     ui.add_space(4.0);
                                     ui.separator();
@@ -11428,6 +11556,9 @@ impl eframe::App for HpsdrApp {
                         rigctl_running: Some(connected.rigctl_server.is_some()),
                         tci_running: Some(connected.tci_server.is_some()),
                         web_addr: Some(connected.web_addr.clone()),
+                        web_https: Some(connected.web_https),
+                        web_password: Some(connected.web_password.clone()),
+                        web_allow_tx: Some(connected.web_allow_tx),
                         web_running: Some(connected.web_server.is_some()),
                         cat_running: Some(connected.cat_server.is_some()),
                         rigctl_logging_enabled: Some(connected.rigctl_debug_log.is_enabled()),

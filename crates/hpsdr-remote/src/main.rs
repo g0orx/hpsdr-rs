@@ -9,6 +9,7 @@
 mod app;
 mod audio;
 mod link;
+mod mic;
 
 #[cfg(not(target_arch = "wasm32"))]
 fn main() -> eframe::Result<()> {

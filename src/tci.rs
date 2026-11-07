@@ -353,8 +353,8 @@ fn spawn_audio_iq_broadcaster(
 pub struct TciServer {
     demod_params: DemodParamsCell,
     display: DisplayCell,
-    /// See remote::BandShare.
-    band_share: Arc<crate::remote::BandShare>,
+    /// See remote::RemoteShare.
+    remote_share: Arc<crate::remote::RemoteShare>,
     audio_iq: AudioIqCell,
     stop: Arc<AtomicBool>,
     /// Count of currently-connected clients -- genuinely N now (see
@@ -468,7 +468,7 @@ impl TciServer {
 
         let demod_params: DemodParamsCell = Arc::new(Mutex::new(demod_params));
         let display: DisplayCell = Arc::new(Mutex::new(None));
-        let band_share = Arc::new(crate::remote::BandShare::default());
+        let remote_share = Arc::new(crate::remote::RemoteShare::default());
         let audio_iq: AudioIqCell = Arc::new(Mutex::new(AudioIqTaps { audio: tci_audio_out, iq: iq_out }));
         let stop = Arc::new(AtomicBool::new(false));
         let connected = Arc::new(AtomicU32::new(0));
@@ -487,7 +487,7 @@ impl TciServer {
         let accept_client_threads = Arc::clone(&client_threads);
         let accept_demod_params = Arc::clone(&demod_params);
         let accept_display = Arc::clone(&display);
-        let accept_band_share = Arc::clone(&band_share);
+        let accept_remote_share = Arc::clone(&remote_share);
         let accept_audio_iq_registry = Arc::clone(&audio_iq_registry);
         let accept_tci_tx_audio = Arc::clone(&tci_tx_audio);
         let accept_tci_tx_gain = Arc::clone(&tci_tx_gain);
@@ -509,7 +509,7 @@ impl TciServer {
                         let rate = Arc::clone(&sample_rate);
                         let params = Arc::clone(&accept_demod_params);
                         let conn_display = Arc::clone(&accept_display);
-                        let conn_band_share = Arc::clone(&accept_band_share);
+                        let conn_remote_share = Arc::clone(&accept_remote_share);
                         let conn_audio_iq_registry = Arc::clone(&accept_audio_iq_registry);
                         let tx_audio = Arc::clone(&accept_tci_tx_audio);
                         let tx_gain = Arc::clone(&accept_tci_tx_gain);
@@ -531,7 +531,7 @@ impl TciServer {
                                 conn_local_addrs.lock().unwrap().push(addr);
                             }
                             handle_client(
-                                stream, freq, rx_freq, hw_freq, rf_offset, conn_vfo_b, rate, params, conn_display, conn_band_share, conn_audio_iq_registry, tx_audio,
+                                stream, freq, rx_freq, hw_freq, rf_offset, conn_vfo_b, rate, params, conn_display, conn_remote_share, conn_audio_iq_registry, tx_audio,
                                 tx_gain, wants_mic, conn_mox, conn_tx_frequency_hz, conn_allow_out_of_band_tx,
                                 conn_rit_enabled, conn_rit_offset_hz, conn_xit_enabled, conn_xit_offset_hz,
                                 conn_stop, conn_board_name, conn_logging,
@@ -559,7 +559,7 @@ impl TciServer {
         Ok(Self {
             demod_params,
             display,
-            band_share,
+            remote_share,
             audio_iq,
             stop,
             broadcaster_thread: Some(broadcaster_thread),
@@ -585,19 +585,30 @@ impl TciServer {
         *self.display.lock().unwrap() = Some(display);
     }
 
-    /// The radio's band buttons, for remote clients -- see remote::BandShare.
+    /// The radio's band buttons, for remote clients -- see remote::RemoteShare.
     pub fn set_bands(&self, bands: Vec<hpsdr_proto::bands::BandInfo>) {
-        self.band_share.set(bands);
+        self.remote_share.set(bands);
     }
 
     /// A band a remote client has asked for, for main.rs to apply.
     pub fn take_band_request(&self) -> Option<String> {
-        self.band_share.take_request()
+        self.remote_share.take_request()
     }
 
     /// hpsdr-remote clients (web or native) connected now.
     pub fn remote_clients(&self) -> usize {
-        self.band_share.clients()
+        self.remote_share.clients()
+    }
+
+    /// The transmitter as remote clients see it -- see remote::TxInfo.
+    pub fn set_tx_info(&self, info: crate::remote::TxInfo) {
+        self.remote_share.set_tx(info);
+    }
+
+    /// A TX power setting (W) a remote client has asked for, for main.rs
+    /// to apply as its own slider would.
+    pub fn take_power_request(&self) -> Option<u32> {
+        self.remote_share.take_power_request()
     }
 
     /// Same idea as set_demod_params, for the streaming taps -- a
@@ -708,7 +719,7 @@ fn handle_client(
     sample_rate: Arc<AtomicU32>,
     demod_params: DemodParamsCell,
     display: DisplayCell,
-    band_share: Arc<crate::remote::BandShare>,
+    remote_share: Arc<crate::remote::RemoteShare>,
     // See ClientAudioIqSink's doc comment -- this client registers its
     // own sink into the registry below rather than draining a queue
     // shared with every other connected client.
@@ -1014,6 +1025,15 @@ fn handle_client(
     // Counts this client as a remote client once it says hpsdr_hello, until
     // it goes -- see remote::ClientCount.
     let mut remote_count: Option<crate::remote::ClientCount> = None;
+    // The transmitter, for a remote client's hpsdr_mox and TX audio --
+    // the same state trx and TxAudioStream below use.
+    let tx_link = crate::remote::TxLink {
+        mox: &mox,
+        tx_frequency_hz: &tx_frequency_hz,
+        allow_out_of_band: &allow_out_of_band_tx,
+        wants_mic: &tci_wants_mic,
+        audio: &tci_tx_audio,
+    };
     let mut iq_streaming = false;
     // ROOT CAUSE INVESTIGATION continued: a real Windows report's
     // connections never logged a read error either (see "connection
@@ -1141,7 +1161,7 @@ fn handle_client(
                     if cmd.to_ascii_lowercase().starts_with("hpsdr_") {
                         let current_params = demod_params.lock().unwrap().clone();
                         for c in hpsdr_proto::tci::parse(cmd) {
-                            if let Some(reply) = remote.handle(&c, &current_params, &band_share) {
+                            if let Some(reply) = remote.handle(&c, &current_params, &remote_share, &tx_link) {
                                 logging.log(&format!(">> {reply}"));
                                 let result = ws.send(Message::Text(reply.into()));
                                 if send_is_fatal(&result) {
@@ -1154,7 +1174,7 @@ fn handle_client(
                         if remote.hello {
                             audio_streaming = false;
                             if remote_count.is_none() {
-                                remote_count = Some(crate::remote::ClientCount::new(Arc::clone(&band_share)));
+                                remote_count = Some(crate::remote::ClientCount::new(Arc::clone(&remote_share)));
                             }
                         }
                         continue;
@@ -1195,6 +1215,8 @@ fn handle_client(
                 logging.log("client closed the connection");
                 break;
             }
+            // A remote client's TX audio: its own ADPCM blocks (remote.rs).
+            Ok(Message::Binary(data)) if remote.hello => remote.tx_audio(&data, &tx_link),
             Ok(Message::Binary(data)) => {
                 // A client sending TX audio -- see decode_binary_message's
                 // doc comment for the confidence caveat on this whole
@@ -1498,8 +1520,18 @@ fn handle_client(
         } else {
             None
         };
-        if let Some(bands) = remote.bands_message(&band_share) {
+        if let Some(why) = remote.tx_tick(&remote_share, &tx_link) {
+            logging.log(why);
+            eprintln!("remote: {why}");
+        }
+        if let Some(bands) = remote.bands_message(&remote_share) {
             let result = ws.send(Message::Text(bands.into()));
+            if send_is_fatal(&result) {
+                return;
+            }
+        }
+        if let Some(tx_state) = remote.tx_message(&remote_share, &mox) {
+            let result = ws.send(Message::Text(tx_state.into()));
             if send_is_fatal(&result) {
                 return;
             }
@@ -1617,7 +1649,9 @@ fn handle_client(
             last_tx_chrono_activity = Instant::now();
         }
         mox_was_active = mox_active;
-        if mox_active {
+        // A remote client (remote.rs) sends its TX audio as it goes, not on
+        // request, so it gets no TxChrono.
+        if mox_active && !remote.hello {
             // Staleness reset -- if WSJT-X stops replying entirely
             // (connection hiccup, client-side stall), outstanding would
             // otherwise sit stuck at whatever count it last reached,
@@ -2480,5 +2514,92 @@ mod remote_tests {
         assert!(spectrum >= 5, "{spectrum} spectrum rows");
         assert!(adpcm >= 45, "{adpcm} audio blocks of the 50 in a second");
         assert_eq!(float_audio, 0);
+    }
+
+    /// A remote client keys, its microphone's ADPCM blocks reach the
+    /// transmitter's audio queue at 48 kHz, and going away unkeys.
+    #[test]
+    fn a_client_transmits_and_unkeys_when_it_goes() {
+        let port = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let mox = Arc::new(AtomicBool::new(false));
+        let tci_tx_audio = Arc::new(Mutex::new(VecDeque::with_capacity(24_000)));
+        let mut server = TciServer::start(
+            &format!("127.0.0.1:{port}"),
+            Arc::new(AtomicU64::new(14_200_000)),
+            Arc::new(AtomicU64::new(14_200_000)),
+            Arc::new(AtomicU32::new(14_200_000)),
+            Arc::new(AtomicI64::new(0)),
+            Arc::new(crate::radio::VfoBShared::default()),
+            Arc::new(AtomicU32::new(192_000)),
+            Arc::new(Mutex::new(DemodParams::default())),
+            Arc::clone(&mox),
+            Arc::new(AtomicU32::new(14_200_000)),
+            // Allowed anywhere, so the test doesn't depend on band tables.
+            Arc::new(AtomicBool::new(true)),
+            Arc::new(Mutex::new(VecDeque::new())),
+            Arc::new(Mutex::new(VecDeque::new())),
+            Arc::clone(&tci_tx_audio),
+            Arc::new(Mutex::new(1.0)),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicI32::new(0)),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicI32::new(0)),
+            "Test".to_string(),
+            DebugLog::new(std::env::temp_dir().join("hpsdr-rs-tci-remote-tx-test.log")),
+        )
+        .unwrap();
+        server.set_tx_info(crate::remote::TxInfo {
+            available: true,
+            remote_allowed: true,
+            power_w: 10,
+            max_power_w: 100,
+            forward_w: 0.0,
+            swr: 1.0,
+        });
+
+        let (mut ws, _) = tungstenite::connect(format!("ws://127.0.0.1:{port}")).unwrap();
+        if let tungstenite::stream::MaybeTlsStream::Plain(s) = ws.get_ref() {
+            s.set_read_timeout(Some(Duration::from_millis(20))).unwrap();
+        }
+        ws.send(Message::Text("hpsdr_hello:1;hpsdr_mox:true;".into())).unwrap();
+        let keyed_by = Instant::now() + Duration::from_secs(2);
+        while !mox.load(Ordering::Relaxed) && Instant::now() < keyed_by {
+            let _ = ws.read();
+        }
+        assert!(mox.load(Ordering::Relaxed), "keyed");
+
+        // Half a second of 16 kHz microphone audio, as the client sends it.
+        let mut encoder = hpsdr_proto::adpcm::Encoder::new();
+        for _ in 0..25 {
+            let header = hpsdr_proto::Header {
+                sample_rate: 16_000,
+                format: hpsdr_proto::FORMAT_ADPCM,
+                codec: hpsdr_proto::CODEC_IMA_ADPCM,
+                length: 320,
+                msg_type: hpsdr_proto::TYPE_ADPCM_AUDIO,
+                channels: 1,
+                ..Default::default()
+            };
+            let mut msg = Vec::new();
+            header.encode(&mut msg);
+            msg.extend(encoder.encode(&[8000; 320]));
+            ws.send(Message::Binary(msg.into())).unwrap();
+        }
+        let filled_by = Instant::now() + Duration::from_secs(2);
+        let has_audio = || tci_tx_audio.lock().unwrap().iter().any(|&s| (s - 8000.0 / 32768.0).abs() < 0.02);
+        while !has_audio() && Instant::now() < filled_by {
+            let _ = ws.read();
+        }
+        assert!(has_audio(), "the microphone's audio reached the TX queue");
+        assert!(mox.load(Ordering::Relaxed), "still keyed while audio comes");
+
+        drop(ws);
+        let gone_by = Instant::now() + Duration::from_secs(2);
+        while mox.load(Ordering::Relaxed) && Instant::now() < gone_by {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(!mox.load(Ordering::Relaxed), "unkeyed once the client went");
+        server.stop();
     }
 }
