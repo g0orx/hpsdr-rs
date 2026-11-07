@@ -1289,13 +1289,25 @@ fn dispatch_midi_event(connected: &mut ConnectedState, ev: RawMidiEvent, freq_hz
             // comment. Only gates the transition TO keyed; unkeying
             // (ev.off / already-on -> off) always goes through.
             let want_on = if binding.momentary { !ev.off } else { !connected.session.mox_active() };
-            if !want_on
-                || tx_frequency_allowed(
-                    connected.session.tx_frequency_hz.load(Ordering::Relaxed),
-                    connected.allow_out_of_band_tx.load(Ordering::Relaxed),
-                )
-            {
+            let tx_hz = connected.session.tx_frequency_hz.load(Ordering::Relaxed);
+            // Said on stderr either way, one line per press -- REAL REPORT
+            // (issue #15): a note bound to MOX didn't seem to key, with
+            // nothing to show whether it matched, keyed, or was refused.
+            if !want_on || tx_frequency_allowed(tx_hz, connected.allow_out_of_band_tx.load(Ordering::Relaxed)) {
+                eprintln!(
+                    "midi: MOX {} ({:?} channel={} number={}{})",
+                    if want_on { "on" } else { "off" },
+                    ev.kind,
+                    ev.channel,
+                    ev.number,
+                    if ev.off { " off" } else { "" }
+                );
                 connected.session.set_mox(want_on);
+            } else {
+                eprintln!(
+                    "midi: MOX refused -- TX frequency {tx_hz} Hz is outside the ham bands \
+                     (Settings -> TX -> Allow TX outside ham bands)"
+                );
             }
         }
         // Mirrors the TUNE button handler -- see its own comments for why
