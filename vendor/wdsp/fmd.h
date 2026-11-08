@@ -53,14 +53,23 @@ extern void setFMDRun (int channel, int run);
 
 // RXA Properties
 
-extern __declspec (dllexport) void SetRXAFMDeviation (int channel, double deviation);
+// [Exported (PORT) functions of this module that nothing else in WDSP, nor
+// ChannelMaster, calls are declared only in wdsp.h, the public header.  Those
+// declared here are called by other modules or by ChannelMaster.]
 
-extern __declspec (dllexport) void SetRXAFMNCde (int channel, int nc);
+// [PORT is defined in wdsp_platform.h, which comm.h includes ahead of the module
+// headers.  Some WDSP headers are also included on their own, ahead of comm.h
+// (ChannelMaster includes resample.h this way), so a header that uses PORT
+// includes wdsp_platform.h itself.  It also supplies the types, CRITICAL_SECTION
+// and HANDLE, that some of these headers use.]
+#include "wdsp_platform.h"
 
-extern __declspec (dllexport) void SetRXAFMMPde (int channel, int mp);
+extern PORT void SetRXAFMNCde (int channel, int nc);
 
-extern __declspec (dllexport) void SetRXAFMNCaud (int channel, int nc);
+extern PORT void SetRXAFMMPde (int channel, int mp);
 
-extern __declspec (dllexport) void SetRXAFMMPaud (int channel, int mp);
+extern PORT void SetRXAFMNCaud (int channel, int nc);
+
+extern PORT void SetRXAFMMPaud (int channel, int mp);
 
 #endif

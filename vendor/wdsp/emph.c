@@ -34,6 +34,24 @@ warren@pratt.one
 
 #include "firmin.h"
 
+typedef struct _emph
+{
+	int run;
+	int position;
+	int size;
+	double* in;
+	double* out;
+	int ctype;
+	double f_low;
+	double f_high;
+	double* infilt;
+	double* product;
+	double* mults;
+	double rate;
+	fftw_plan CFor;
+	fftw_plan CRev;
+} emph, *EMPH;
+
 typedef struct _emphp
 {
 	int run;
@@ -196,7 +214,7 @@ void SetTXAFMPreEmphRun(int channel, int run)
 *																										*
 ********************************************************************************************************/
 
-void calc_emph (EMPH a)
+static void calc_emph (EMPH a)
 {
 	a->infilt = (double *)malloc0(2 * a->size * sizeof(complex));
 	a->product = (double *)malloc0(2 * a->size * sizeof(complex));
@@ -205,7 +223,7 @@ void calc_emph (EMPH a)
 	a->CRev = fftw_plan_dft_1d(2 * a->size, (fftw_complex *)a->product, (fftw_complex *)a->out, FFTW_BACKWARD, FFTW_PATIENT);
 }
 
-void decalc_emph (EMPH a)
+static void decalc_emph (EMPH a)
 {
 	fftw_destroy_plan(a->CRev);
 	fftw_destroy_plan(a->CFor);

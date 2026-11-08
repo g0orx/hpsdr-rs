@@ -26,7 +26,31 @@ warren@pratt.one
 
 #include "comm.h"
 
-void build_window (SIPHON a)
+typedef struct _siphon
+{
+	int run;
+	int position;
+	int mode;
+	int disp;
+	int insize;
+	double* in;
+	int sipsize;	// NOTE:  sipsize MUST BE A POWER OF TWO!!
+	double* sipbuff;
+	int outsize;
+	int idx;
+	double* sipout;
+	int fftsize;
+	double* specout;
+	volatile long specmode;
+	fftw_plan sipplan;
+	double* window;
+	CRITICAL_SECTION update;
+	int n_alloc_disps;			// number of additional allocated displays for this channel
+	int* alloc_run;				// vector of corresponding 'run' variables for the additional allocated disps
+	int* alloc_disp;			// vector of 'disp' identifiers for the additional allocated disps
+} siphon, *SIPHON;
+
+static void build_window (SIPHON a)
 {
 	int i;
 	double arg0, cosphi;
@@ -152,7 +176,7 @@ void setSize_siphon (SIPHON a, int size)
 	flush_siphon (a);
 }
 
-void suck (SIPHON a)
+static void suck (SIPHON a)
 {
 	if (a->outsize <= a->sipsize)
 	{
@@ -169,7 +193,7 @@ void suck (SIPHON a)
 	}
 }
 
-void sip_spectrum (SIPHON a)
+static void sip_spectrum (SIPHON a)
 {
 	int i;
 	for (i = 0; i < a->fftsize; i++)
@@ -366,7 +390,7 @@ void TXASetSipAllocDisps (int channel, int n_alloc_disps, int* alloc_run, int* a
 ********************************************************************************************************/
 
 #define MAX_EXT_SIPHONS	(2)									// maximum number of Siphons called from outside wdsp
-__declspec (align (16)) SIPHON psiphon[MAX_EXT_SIPHONS];	// array of pointers for Siphons used EXTERNAL to wdsp
+static __declspec (align (16)) SIPHON psiphon[MAX_EXT_SIPHONS];	// array of pointers for Siphons used EXTERNAL to wdsp
 
 
 PORT

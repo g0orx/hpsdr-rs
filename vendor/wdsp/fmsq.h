@@ -29,49 +29,7 @@ warren@pratt.one
 #include "eq.h"
 #include "fir.h"
 #include "firmin.h"
-typedef struct _fmsq
-{
-	int run;							// 0 if squelch system is OFF; 1 if it's ON
-	int size;							// size of input/output buffers
-	double* insig;						// squelch input signal buffer
-	double* outsig;						// squelch output signal buffer
-	double* trigger;					// buffer used to trigger mute/unmute (may be same as input; matches timing of input buffer)
-	double rate;						// sample rate
-	double* noise;
-	double fc;							// corner frequency for sig / noise detection
-	double* pllpole;					// pointer to pole frequency of the fm demodulator pll
-	double F[4];
-	double G[4];
-	double avtau;						// time constant for averaging noise
-	double avm;						
-	double onem_avm;
-	double avnoise;
-	double longtau;						// time constant for long averaging
-	double longavm;
-	double onem_longavm;
-	double longnoise;
-	int state;							// state machine control
-	int count;
-	double tup;
-	double tdown;
-	int ntup;
-	int ntdown;
-	double* cup;
-	double* cdown;
-	double tail_thresh;
-	double unmute_thresh;
-	double min_tail;
-	double max_tail;
-	int ready;
-	double ramp;
-	double rstep;
-	double tdelay;
-	int nc;
-	int mp;
-	FIRCORE p;
-	EQIMP peqimp;
-	double* impulse;
-} fmsq, *FMSQ;
+typedef struct _fmsq* FMSQ;
 
 extern FMSQ create_fmsq (int run, int size, double* insig, double* outsig, double* trigger, int rate, double fc, 
 	double* pllpole, double tdelay, double avtau, double longtau, double tup, double tdown, double tail_thresh, 
@@ -91,10 +49,19 @@ extern void setSize_fmsq (FMSQ a, int size);
 
 // RXA Properties
 
-extern __declspec (dllexport) void SetRXAFMSQThreshold (int channel, double threshold);
+// [Exported (PORT) functions of this module that nothing else in WDSP, nor
+// ChannelMaster, calls are declared only in wdsp.h, the public header.  Those
+// declared here are called by other modules or by ChannelMaster.]
 
-extern __declspec (dllexport) void SetRXAFMSQNC (int channel, int nc);
+// [PORT is defined in wdsp_platform.h, which comm.h includes ahead of the module
+// headers.  Some WDSP headers are also included on their own, ahead of comm.h
+// (ChannelMaster includes resample.h this way), so a header that uses PORT
+// includes wdsp_platform.h itself.  It also supplies the types, CRITICAL_SECTION
+// and HANDLE, that some of these headers use.]
+#include "wdsp_platform.h"
 
-extern __declspec (dllexport) void SetRXAFMSQMP (int channel, int mp);
+extern PORT void SetRXAFMSQNC (int channel, int nc);
+
+extern PORT void SetRXAFMSQMP (int channel, int mp);
 
 #endif

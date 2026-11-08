@@ -27,26 +27,7 @@ warren@wpratt.com
 #ifndef _meter_h
 #define _meter_h
 
-typedef struct _meter
-{
-	int run;
-	int* prun;
-	int size;
-	double* buff;
-	double rate;
-	double tau_average;
-	double tau_peak_decay;
-	double mult_average;
-	double mult_peak;
-	double* result;
-	int enum_av;
-	int enum_pk;
-	int enum_gain;
-	double* pgain;
-	double avg;
-	double peak;
-	CRITICAL_SECTION mtupdate;
-} meter, *METER;
+typedef struct _meter* METER;
 
 extern METER create_meter (int run, int* prun, int size, double* buff, int rate, double tau_av, double tau_decay, double* result, CRITICAL_SECTION** pmtupdate, int enum_av, int enum_pk, int enum_gain, double* pgain);
 
@@ -64,10 +45,7 @@ extern void setSize_meter (METER a, int size);
 
 // RXA Properties
 
-extern __declspec (dllexport) double GetRXAMeter (int channel, int mt);
-
-// TXA Properties
-
-extern __declspec (dllexport) double GetTXAMeter (int channel, int mt);
+// [Exported (PORT) functions of this module that nothing else in WDSP, nor
+// ChannelMaster, calls are declared only in wdsp.h, the public header.]
 
 #endif

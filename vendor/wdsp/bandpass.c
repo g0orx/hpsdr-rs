@@ -26,13 +26,49 @@ warren@wpratt.com
 
 #include "comm.h"
 
+typedef struct _bps
+{
+	int run;
+	int position;
+	int size;
+	double* in;
+	double* out;
+	double f_low;
+	double f_high;
+	double* infilt;
+	double* product;
+	double* mults;
+	double samplerate;
+	int wintype;
+	double gain;
+	fftw_plan CFor;
+	fftw_plan CRev;
+}bps, *BPS;
+
+typedef struct _bandpass
+{
+	int run;
+	int position;
+	int size;
+	int nc;
+	int mp;
+	double* in;
+	double* out;
+	double f_low;
+	double f_high;
+	double samplerate;
+	int wintype;
+	double gain;
+	FIRCORE p;
+}bandpass, *BANDPASS;
+
 /********************************************************************************************************
 *																										*
 *										Overlap-Save Bandpass											*
 *																										*
 ********************************************************************************************************/
 
-void calc_bps (BPS a)
+static void calc_bps (BPS a)
 {
 	double* impulse;
 	a->infilt = (double *)malloc0(2 * a->size * sizeof(complex));
@@ -44,7 +80,7 @@ void calc_bps (BPS a)
 	_aligned_free(impulse);
 }
 
-void decalc_bps (BPS a)
+static void decalc_bps (BPS a)
 {
 	fftw_destroy_plan(a->CRev);
 	fftw_destroy_plan(a->CFor);
@@ -132,6 +168,36 @@ void setFreqs_bps (BPS a, double f_low, double f_high)
 	a->f_low = f_low;
 	a->f_high = f_high;
 	calc_bps (a);
+}
+
+double getGain_bandpass (BANDPASS a)
+{
+	return a->gain;
+}
+
+int getRun_bandpass (BANDPASS a)
+{
+	return a->run;
+}
+
+void setRun_bandpass (BANDPASS a, int run)
+{
+	a->run = run;
+}
+
+int getPosition_bandpass (BANDPASS a)
+{
+	return a->position;
+}
+
+void setPosition_bandpass (BANDPASS a, int position)
+{
+	a->position = position;
+}
+
+void setUpdate_bandpass (BANDPASS a)
+{
+	setUpdate_fircore (a->p);
 }
 
 /********************************************************************************************************

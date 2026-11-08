@@ -141,8 +141,6 @@ NF_Point2 nf_eval(const NF_Curve *c, double t);
 
 void nf_curve_free(NF_Curve *c);
  
-double nf_spearman(NF_WS ws, const NF_Point2 *pts, int n);
-
 double nf_compute_rms(const NF_Curve *c,
                       const NF_Point2 *pts, int n_pts,
                       const double *t_params);   

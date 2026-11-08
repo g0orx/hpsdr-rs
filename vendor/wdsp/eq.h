@@ -44,27 +44,7 @@ warren@pratt.one
 // forward definitions
 typedef struct _eqimp* EQIMP;
 
-typedef struct _eqp
-{
-	int run;
-	int size;
-	int nc;
-	int mp;
-	double* in;
-	double* out;
-	int nfreqs;
-	int max_freqs;
-	double* F;
-	double* G;
-	int ctfmode;
-	int wintype;
-	double samplerate;
-	EQIMP peqimp;
-	double* impulse;
-	FIRCORE p;
-	int deg;
-	CRITICAL_SECTION csEQ;
-} eqp, *EQP;
+typedef struct _eqp* EQP;
 
 extern EQIMP create_eqimp(int nfreqs, int nc, int wintype, int max_freqs);
 
@@ -89,13 +69,8 @@ extern void setSamplerate_eqp (EQP a, int rate);
 
 extern void setSize_eqp (EQP a, int size);
 
-__declspec (dllexport) void SetRXAEQNC (int channel, int nc);
-
-__declspec (dllexport) void SetRXAEQMP (int channel, int mp);
-
-__declspec (dllexport) void SetTXAEQNC (int channel, int nc);
-
-__declspec (dllexport) void SetTXAEQMP (int channel, int mp);
+// [Exported (PORT) functions of this module that nothing else in WDSP, nor
+// ChannelMaster, calls are declared only in wdsp.h, the public header.]
 
 #endif
 
@@ -110,31 +85,7 @@ __declspec (dllexport) void SetTXAEQMP (int channel, int mp);
 #ifndef _eq_h
 #define _eq_h
 
-typedef struct _eq
-{
-	int run;				
-	int size;
-	double* in;
-	double* out;
-	int nfreqs;
-	double* F;
-	double* G;
-	double* infilt;
-	double* product;
-	double* mults;
-	double scale;
-	int ctfmode;
-	int wintype;
-	double samplerate;
-	fftw_plan CFor;
-	fftw_plan CRev;
-	int deg;
-	EQIMP peqimp;
-	double* impulse;
-}eq, *EQ;
-
-extern double* eq_mults(EQIMP peqimp, int size, int nfreqs, double* F, double* G, double samplerate,
-	double scale, int ctfmode, int wintype, int deg, double* impulse);
+typedef struct _eq* EQ;
 
 extern EQ create_eq (int run, int size, double *in, double *out, int nfreqs, 
 	double* F, double* G, int ctfmode, int wintype, int samplerate);
@@ -150,5 +101,7 @@ extern void setBuffers_eq (EQ a, double* in, double* out);
 extern void setSamplerate_eq (EQ a, int rate);
 
 extern void setSize_eq (EQ a, int size);
+
+extern int* getRunPtr_eqp (EQP a);
 
 #endif

@@ -171,7 +171,7 @@ void exec_fcimp (FCIMP a, double f0, double f1, double g0, double g1,
 	// if (samplerate == 48000) print_impulse ("emphr.txt", a->nc, a->impulse, 1, 0);
 }
 
-double* fc_impulse (int nc, double f0, double f1, double g0, double g1, int curve, double samplerate, double scale, int ctfmode, int wintype)
+static double* fc_impulse (int nc, double f0, double f1, double g0, double g1, int curve, double samplerate, double scale, int ctfmode, int wintype)
 {
 	// check for previous in the cache
 	struct Params 

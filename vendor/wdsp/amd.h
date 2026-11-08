@@ -36,44 +36,7 @@ warren@wpratt.com
 #define OUT_IDX		(3 * STAGES)
 #endif
 
-typedef struct _amd
-{
-	int run;
-	int buff_size;						// buffer size
-	double *in_buff;					// pointer to input buffer
-	double *out_buff;					// pointer to output buffer
-	int mode;							// demodulation mode
-	double sample_rate;					// sample rate
-	double dc;							// dc component in demodulated output
-	double fmin;						// pll - minimum carrier freq to lock
-	double fmax;						// pll - maximum carrier freq to lock
-	double omega_min;					// pll - minimum lock check parameter
-	double omega_max;					// pll - maximum lock check parameter
-	double zeta;						// pll - damping factor; as coded, must be <=1.0
-	double omegaN;						// pll - natural frequency
-	double phs;							// pll - phase accumulator
-	double omega;						// pll - locked pll frequency
-	double fil_out;						// pll - filter output
-	double g1, g2;						// pll - filter gain parameters
-	double tauR;						// carrier removal time constant
-	double tauI;						// carrier insertion time constant
-	double mtauR;						// carrier removal multiplier
-	double onem_mtauR;					// 1.0 - carrier_removal_multiplier
-	double mtauI;						// carrier insertion multiplier
-	double onem_mtauI;					// 1.0 - carrier_insertion_multiplier
-	double a[3 * STAGES + 3];			// Filter a variables
-	double b[3 * STAGES + 3];			// Filter b variables
-	double c[3 * STAGES + 3];			// Filter c variables
-	double d[3 * STAGES + 3];			// Filter d variables
-	double c0[STAGES];					// Filter coefficients - path 0
-	double c1[STAGES];					// Filter coefficients - path 1
-	double dsI;							// delayed sample, I path
-	double dsQ;							// delayed sample, Q path
-	double dc_insert;					// dc component to insert in output
-	int sbmode;							// sideband mode
-	int levelfade;						// Fade Leveler switch
-
-}amd, *AMD;
+typedef struct _amd* AMD;
 
 extern AMD create_amd 
 	(
@@ -93,8 +56,6 @@ extern AMD create_amd
 	double tauI
 	);
 
-extern void init_amd (AMD a);
-
 extern void destroy_amd (AMD a);
 
 extern void flush_amd (AMD a);
@@ -107,12 +68,15 @@ extern void setSamplerate_amd (AMD a, int rate);
 
 extern void setSize_amd (AMD a, int size);
 
+extern int getRun_amd (AMD a);
+
+extern void setRun_amd (AMD a, int run);
+
+extern void setMode_amd (AMD a, int mode);
+
 // RXA Properties
 
-extern __declspec (dllexport) void SetRXAAMDRun(int channel, int run);
-
-extern __declspec (dllexport) void SetRXAAMDSBMode(int channel, int sbmode);
-
-extern __declspec (dllexport) void SetRXAAMDFadeLevel(int channel, int levelfade);
+// [Exported (PORT) functions of this module that nothing else in WDSP, nor
+// ChannelMaster, calls are declared only in wdsp.h, the public header.]
 
 #endif

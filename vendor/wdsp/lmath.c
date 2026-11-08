@@ -26,7 +26,41 @@ warren@wpratt.com
 
 #include "comm.h"
 
-void dR (int n, double* r, double* y, double* z)
+typedef struct _bldr
+{
+	double* catxy;
+	double* sx;
+	double* sy;
+	double* h;
+	int* p;
+	int* np;
+	double* taa;
+	double* tab;
+	double* tag;
+	double* tad;
+	double* tbb;
+	double* tbg;
+	double* tbd;
+	double* tgg;
+	double* tgd;
+	double* tdd;
+	double* A;
+	double* B;
+	double* C;
+	double* D;
+	double* E;
+	double* F;
+	double* G;
+	double* MAT;
+	double* RHS;
+	double* SLN;
+	double* z;
+	double* zp;
+	double* wrk;
+	int* ipiv;
+} bldr, *BLDR;
+
+static void dR (int n, double* r, double* y, double* z)
 {
 	int i, j, k;
     double alpha, beta, gamma;
@@ -263,7 +297,7 @@ void destroy_builder(BLDR a)
 	_aligned_free(a);
 }
 
-void flush_builder(BLDR a, int points, int ints)
+static void flush_builder(BLDR a, int points, int ints)
 {
 	memset(a->catxy, 0, 2 * points * sizeof(double));
 	memset(a->sx,    0, points * sizeof(double));
@@ -300,7 +334,7 @@ void flush_builder(BLDR a, int points, int ints)
 	memset(a->ipiv,  0, nsize * sizeof(int));
 }
 
-int fcompare(const void* a, const void* b)
+static int fcompare(const void* a, const void* b)
 {
 	if (*(double*)a < *(double*)b)
 		return -1;
@@ -310,7 +344,7 @@ int fcompare(const void* a, const void* b)
 		return 1;
 }
 
-void decomp(int n, double* a, int* piv, int* info, double* wrk)
+static void decomp(int n, double* a, int* piv, int* info, double* wrk)
 {
 	int i, j, k;
 	int t_piv;
@@ -369,7 +403,7 @@ cleanup:
 	return;
 }
 
-void dsolve(int n, double* a, int* piv, double* b, double* x)
+static void dsolve(int n, double* a, int* piv, double* b, double* x)
 {
 	int j, k;
 	double sum;
@@ -391,7 +425,7 @@ void dsolve(int n, double* a, int* piv, double* b, double* x)
 	}
 }
 
-void cull(int* n, int ints, double* x, double* t, double ptol)
+static void cull(int* n, int ints, double* x, double* t, double ptol)
 {
 	int k = 0;
 	int i = *n;

@@ -28,6 +28,180 @@ warren@wpratt.com
 #include "calculus.h"
 #include "zetaHat.h"
 
+typedef struct _emnr
+{
+	int run;
+	int position;
+	int bsize;
+	double* in;
+	double* out;
+	int fsize;
+	int ovrlp;
+	int incr;
+	double* window;
+	int iasize;
+	double* inaccum;
+	double* forfftin;
+	double* forfftout;
+	int msize;
+	double* mask;
+	double* revfftin;
+	double* revfftout;
+	double** save;
+	int oasize;
+	double* outaccum;
+	double rate;
+	int wintype;
+	double ogain;
+	double gain;
+	int nsamps;
+	int iainidx;
+	int iaoutidx;
+	int init_oainidx;
+	int oainidx;
+	int oaoutidx;
+	int saveidx;
+	fftw_plan Rfor;
+	fftw_plan Rrev;
+	struct _g
+	{
+		int gain_method;
+		int npe_method;
+		int ae_run;
+		double msize;
+		double* mask;
+		double* y;
+		double* lambda_y;
+		double* lambda_d;
+		double* prev_mask;
+		double* prev_gamma;
+		double gf1p5;
+		double alpha;
+		double eps_floor;
+		double gamma_max;
+		double xi_min;
+		double q;
+		double gmax;
+		//
+		double* GG;
+		double* GGS;
+		FILE* fileb;
+		//
+		int dim_zeta;
+		double* zeta_hat;
+		int* zeta_true;
+		double z_gamma_min;
+		double z_gamma_max;
+		double z_xihat_min;
+		double z_xihat_max;
+		double zeta_thresh;
+	} g;
+	struct _npest
+	{
+		int incr;
+		double rate;
+		int msize;
+		double* lambda_y;
+		double* lambda_d;
+		double* p;
+		double* alphaOptHat;
+		double alphaC;
+		double alphaCsmooth;
+		double alphaCmin;
+		double* alphaHat;
+		double alphaMax;
+		double* sigma2N;
+		double alphaMin_max_value;
+		double snrq;
+		double betamax;
+		double* pbar;
+		double* p2bar;
+		double invQeqMax;
+		double av;
+		double* Qeq;
+		int U;
+		double Dtime;
+		int V;
+		int D;
+		double MofD;
+		double MofV;
+		double* bmin;
+		double* bmin_sub;
+		int* k_mod;
+		double* actmin;
+		double* actmin_sub;
+		int subwc;
+		int* lmin_flag;
+		double* pmin_u;
+		double invQbar_points[4];
+		double nsmax[4];
+		double** actminbuff;
+		int amb_idx;
+	} np;
+	struct _npests
+	{
+		int incr;
+		double rate;
+		int msize;
+		double* lambda_y;
+		double* lambda_d;
+		
+		double alpha_pow;
+		double alpha_Pbar;
+		double epsH1;
+		double epsH1r;
+
+		double* sigma2N;
+		double* PH1y;
+		double* Pbar;
+		double* EN2y;
+	} nps;
+	struct _npestl
+	{
+		double rate;
+		int msize;
+		int incr;
+		double* Ysq;
+		double* P;
+		double* Pmin;
+		double* p;
+		double* D;
+		double* lambda_d;
+
+		double eta;
+		double gamma;
+		double beta;
+		double delta_LF;
+		double delta_MF;
+		double delta_0;
+		double delta_1;
+		double delta_2;
+		double alpha_d;
+		double alpha_p;
+	} npl;
+	struct _ae
+	{
+		int msize;
+		double* lambda_y;
+		double zetaThresh;
+		double psi;
+		double* nmask;
+		double t2;
+	} ae;
+	struct _post2
+	{
+		int run;
+		double nlevel;
+		double factor;
+		double taper;
+		double tc_decay;
+		double rate_decay;
+		double* w;
+		unsigned int rngstate;
+		double olddmag;
+	} post2;
+}emnr, *EMNR;
+
 /********************************************************************************************************
 *																										*
 *											Special Functions											*
@@ -40,7 +214,7 @@ warren@wpratt.com
 // Shanjie Zhang and Jianming Jin, "Computation of Special Functions."  New York, NY, John Wiley and Sons,
 //      Inc., 1996.  [Sample code given in FORTRAN]
 
-double bessI0 (double x)
+static double bessI0 (double x)
 {
 	double res, p;
 	if (x == 0.0)
@@ -78,7 +252,7 @@ double bessI0 (double x)
 	return res;
 }
 
-double bessI1 (double x)
+static double bessI1 (double x)
 {
 	
 	double res, p;
@@ -124,7 +298,7 @@ double bessI1 (double x)
 // Shanjie Zhang and Jianming Jin, "Computation of Special Functions."  New York, NY, John Wiley and Sons,
 //      Inc., 1996.  [Sample code given in FORTRAN]
 
-double e1xb (double x)
+static double e1xb (double x)
 {
 	double e1, ga, r, t, t0;
 	int k, m;
@@ -164,7 +338,7 @@ double e1xb (double x)
 *																										*
 ********************************************************************************************************/
 
-void calc_window (EMNR a)
+static void calc_window (EMNR a)
 {
 	int i;
 	double arg, sum, inv_coherent_gain;
@@ -185,7 +359,7 @@ void calc_window (EMNR a)
 	}
 }
 
-void interpM (double* res, double x, int nvals, double* xvals, double* yvals)
+static void interpM (double* res, double x, int nvals, double* xvals, double* yvals)
 {
 	if (x <= xvals[0])
 		*res = yvals[0];
@@ -203,7 +377,7 @@ void interpM (double* res, double x, int nvals, double* xvals, double* yvals)
 	}
 }
 
-int readZetaHat(const char* zeta_file, int* rows, int* cols,
+static int readZetaHat(const char* zeta_file, int* rows, int* cols,
 	double* gmin, double* gmax, double* ximin, double* ximax, double* zetaHat, int* zetaValid)
 {
 	char zetaBinary[256];
@@ -295,10 +469,10 @@ void CwriteZetaHat(const char* cfile, int zetaHat_rows, int zetaHat_cols,
 		fclose(pcfile);
 	}
 }
-void post2_calc_w(EMNR a);
-void post2_init_table(void);
+static void post2_calc_w(EMNR a);
+static void post2_init_table(void);
 
-void calc_emnr(EMNR a)
+static void calc_emnr(EMNR a)
 {
 	int i;
 	double Dvals[18] = { 1.0, 2.0, 5.0, 8.0, 10.0, 15.0, 20.0, 30.0, 40.0,
@@ -574,7 +748,7 @@ void calc_emnr(EMNR a)
 	post2_calc_w(a);
 }
 
-void decalc_emnr(EMNR a)
+static void decalc_emnr(EMNR a)
 {
 	int i;
 	// post2
@@ -677,7 +851,7 @@ void destroy_emnr (EMNR a)
 	_aligned_free (a);
 }
 
-void LambdaD(EMNR a)
+static void LambdaD(EMNR a)
 {
 	int k;
 	double f0, f1, f2, f3;
@@ -802,7 +976,7 @@ void LambdaD(EMNR a)
 	memcpy (a->np.lambda_d, a->np.sigma2N, a->np.msize * sizeof (double));
 }
 
-void LambdaDs (EMNR a)
+static void LambdaDs (EMNR a)
 {
 	int k;
 	for (k = 0; k < a->nps.msize; k++)
@@ -817,7 +991,7 @@ void LambdaDs (EMNR a)
 	memcpy (a->nps.lambda_d, a->nps.sigma2N, a->nps.msize * sizeof (double));
 }
 
-void LambdaDl (EMNR a)
+static void LambdaDl (EMNR a)
 {
 	double P_old, c, Sr, delta, I, alpha_s;
 	c = (1.0 - a->npl.gamma) / (1.0 - a->npl.beta);
@@ -846,7 +1020,7 @@ void LambdaDl (EMNR a)
 *										Begin Post-Processing Functions									*
 ********************************************************************************************************/
 
-void aepf(EMNR a)
+static void aepf(EMNR a)
 {
 	int k, m;
 	int N, n;
@@ -902,7 +1076,7 @@ static double post2_cs[POST2_NTAB];
 static double post2_sn[POST2_NTAB];
 static int post2_tab_ready = 0;
 
-void post2_init_table (void)
+static void post2_init_table (void)
 {
 	int i;
 	if (post2_tab_ready) return;
@@ -925,7 +1099,7 @@ static unsigned int post2_rand (EMNR a)
 	return x;
 }
 
-void post2_calc_w(EMNR a)
+static void post2_calc_w(EMNR a)
 {
 	int i;
 	int ilim = (int)(a->post2.taper * a->msize);
@@ -936,7 +1110,7 @@ void post2_calc_w(EMNR a)
 	}
 }
 
-void post2(EMNR a)
+static void post2(EMNR a)
 {
 	if (a->post2.run)
 	{
@@ -1026,7 +1200,7 @@ void SetRXAEMNRpost2Rate(int channel, double tc)
 *										End Post-Processing Functions									*
 ********************************************************************************************************/
 
-double getKey(double* type, double gamma, double xi)
+static double getKey(double* type, double gamma, double xi)
 {
 	int ngamma1, ngamma2, nxi1, nxi2;
 	double tg, tx, dg, dx;
@@ -1072,7 +1246,7 @@ double getKey(double* type, double gamma, double xi)
 		+         dg   *        dx  * type[241 * nxi2 + ngamma2];
 }
 
-int getZeta( EMNR a, double gamma, double eps, double* zeta)
+static int getZeta( EMNR a, double gamma, double eps, double* zeta)
 {
 	int index, i_gamma, i_xi;
 	double gamma_dB, xi_dB, gamma_per_cell, xi_per_cell;
@@ -1094,7 +1268,7 @@ int getZeta( EMNR a, double gamma, double eps, double* zeta)
 	return 0;
 }
 
-void calc_gain (EMNR a)
+static void calc_gain (EMNR a)
 {
 	int k;
 	for (k = 0; k < a->g.msize; k++)
@@ -1301,6 +1475,16 @@ void setSize_emnr (EMNR a, int size)
 	calc_emnr (a);
 }
 
+int getRun_emnr (EMNR a)
+{
+	return a->run;
+}
+
+int getPosition_emnr (EMNR a)
+{
+	return a->position;
+}
+
 /********************************************************************************************************
 *																										*
 *											RXA Properties												*
@@ -1313,9 +1497,9 @@ void SetRXAEMNRRun (int channel, int run)
 	EMNR a = rxa[channel].emnr.p;
 	if (a->run != run)
 	{
-		RXAbp1Check (channel, rxa[channel].amd.p->run, rxa[channel].snba.p->run,
+		RXAbp1Check (channel, getRun_amd (rxa[channel].amd.p), getRun_snba (rxa[channel].snba.p),
 			run, getRun_nnrbypass (rxa[channel].nnrbypass.p), 
-			rxa[channel].anf.p->run, rxa[channel].anr.p->run);
+			getRun_anf (rxa[channel].anf.p), getRun_anr (rxa[channel].anr.p));
 		EnterCriticalSection (&ch[channel].csDSP);
 		a->run = run;
 		RXAbp1Set (channel);

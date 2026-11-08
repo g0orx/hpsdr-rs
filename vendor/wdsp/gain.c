@@ -26,6 +26,18 @@ warren@wpratt.com
 
 #include "comm.h"
 
+typedef struct _gain
+{
+	int run;
+	int* prun;
+	int size;
+	double* in;
+	double* out;
+	double Igain;
+	double Qgain;
+	CRITICAL_SECTION cs_update;
+}gain, *GAIN;
+
 PORT
 GAIN create_gain (int run, int* prun, int size, double* in, double* out, double Igain, double Qgain)
 {

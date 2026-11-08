@@ -27,33 +27,7 @@ warren@wpratt.com
 #ifndef _fmmod_h
 #define _fmmod_h
 #include "firmin.h"
-typedef struct _fmmod
-{
-	int run;
-	int size;
-	double* in;
-	double* out;
-	double samplerate;
-	double deviation;
-	double f_low;
-	double f_high;
-	int ctcss_run;
-	double ctcss_level;
-	double ctcss_freq;
-	// for ctcss gen
-	double tscale;
-	double tphase;
-	double tdelta;
-	// mod
-	double sphase;
-	double sdelta;
-	// bandpass
-	int bp_run;
-	double bp_fc;
-	int nc;
-	int mp;
-	FIRCORE p;
-}fmmod, *FMMOD;
+typedef struct _fmmod* FMMOD;
 
 extern FMMOD create_fmmod (int run, int size, double* in, double* out, int rate, double dev, double f_low, double f_high, 
 	int ctcss_run, double ctcss_level, double ctcss_freq, int bp_run, int nc, int mp);
@@ -70,18 +44,27 @@ extern void setSamplerate_fmmod (FMMOD a, int rate);
 
 extern void setSize_fmmod (FMMOD a, int size);
 
+extern int getRun_fmmod (FMMOD a);
+
+extern void setRun_fmmod (FMMOD a, int run);
+
 // TXA Properties
 
-extern __declspec (dllexport) void SetTXAFMDeviation (int channel, double deviation);
+// [Exported (PORT) functions of this module that nothing else in WDSP, nor
+// ChannelMaster, calls are declared only in wdsp.h, the public header.  Those
+// declared here are called by other modules or by ChannelMaster.]
 
-extern __declspec (dllexport) void SetTXACTCSSFreq (int channel, double freq);
+// [PORT is defined in wdsp_platform.h, which comm.h includes ahead of the module
+// headers.  Some WDSP headers are also included on their own, ahead of comm.h
+// (ChannelMaster includes resample.h this way), so a header that uses PORT
+// includes wdsp_platform.h itself.  It also supplies the types, CRITICAL_SECTION
+// and HANDLE, that some of these headers use.]
+#include "wdsp_platform.h"
 
-extern __declspec (dllexport) void SetTXACTCSSRun (int channel, int run);
+extern PORT void SetTXAFMMP (int channel, int mp);
 
-extern __declspec (dllexport) void SetTXAFMMP (int channel, int mp);
+extern PORT void SetTXAFMNC (int channel, int nc);
 
-extern __declspec (dllexport) void SetTXAFMNC (int channel, int nc);
-
-extern __declspec (dllexport) void SetTXAFMAFFreqs (int channel, double low, double high);
+extern PORT void SetTXAFMAFFreqs (int channel, double low, double high);
 
 #endif

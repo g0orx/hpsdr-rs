@@ -24,26 +24,13 @@ warren@wpratt.com
 
 */
 
-#if defined(linux) || defined(__APPLE__)
-  #include <stdlib.h>
-  #include <pthread.h>
-  #include <semaphore.h>
-  #include <string.h>
-  #include "linux_port.h"
-#endif
-
-#ifdef _WIN32
-  #include <Windows.h>
-  #include <process.h>
-  #include <intrin.h>
-#endif
-#include <math.h>
-#include <stdint.h>
-#include <time.h>
-#ifdef _WIN32
-  #include <avrt.h>
-#endif
-#include <assert.h>
+// The system headers, and PORT (which marks a function that the library exports),
+// come from wdsp_platform.h, the one place where WDSP chooses the operating system.
+// [On Windows it includes the same headers, in the same order, that comm.h included
+// through 2.11.  PORT is defined there, ahead of the module headers, because some
+// of them declare exported functions that other modules call.  Through 2.11 it was
+// defined further down, after the module headers.]
+#include "wdsp_platform.h"
 #include "fftw3.h"
 
 #include "amd.h"
@@ -151,7 +138,6 @@ warren@wpratt.com
 
 // miscellaneous
 typedef double complex[2];
-#define PORT							__declspec( dllexport )
 #ifndef M_PI
 #  define M_PI 3.14159265358979323846
 #endif

@@ -127,6 +127,8 @@ typedef struct _nnr
 	int nover;
 } nnr, * NNR;
 
+static int setModel_nnr (NNR a, int slot);
+
 static double nnr_i0 (double x)
 {
 	double sum = 1.0, t = 1.0, xh = 0.5 * x, t2;
@@ -646,7 +648,7 @@ void setSize_nnr (NNR a, int size)
 			if ((a)->nets[_k]) { NNET n = (a)->nets[_k]; call; }           \
 	} while (0)
 
-int setModel_nnr (NNR a, int slot)
+static int setModel_nnr (NNR a, int slot)
 {
 	if (slot < 0 || slot >= NNET_NSLOTS || a->nets[slot] == 0
 		|| !a->st[slot].valid)
@@ -671,7 +673,7 @@ int setModel_nnr (NNR a, int slot)
 	return a->model;
 }
 
-int getModel_nnr (NNR a)
+static int getModel_nnr (NNR a)
 {
 	return a->model;
 }
@@ -681,7 +683,7 @@ int getDelay_nnr (NNR a)
 	return a->delay;
 }
 
-int getRun_nnr (NNR a)
+static int getRun_nnr (NNR a)
 {
 	return a->run;
 }
@@ -691,7 +693,7 @@ int getPosition_nnr (NNR a)
 	return a->position;
 }
 
-int getNNRTrainingBand (NNR a, double* band_low, double* band_high)
+static int getNNRTrainingBand (NNR a, double* band_low, double* band_high)
 {
 	NNET n = a->nets[a->model];
 	*band_low = *band_high = 0.0;
@@ -739,9 +741,9 @@ void setNNRbypassRun (int channel)
 		flush_bpsnba(rxa[channel].bpsnba.p);
 		flush_snba(rxa[channel].snba.p);
 		flush_eqp(rxa[channel].eqp.p);
-		if (rxa[channel].anf.p->position == 0) flush_anf(rxa[channel].anf.p);
-		if (rxa[channel].anr.p->position == 0) flush_anr(rxa[channel].anr.p);
-		if (rxa[channel].emnr.p->position == 0) flush_emnr(rxa[channel].emnr.p);
+		if (getPosition_anf (rxa[channel].anf.p) == 0) flush_anf(rxa[channel].anf.p);
+		if (getPosition_anr (rxa[channel].anr.p) == 0) flush_anr(rxa[channel].anr.p);
+		if (getPosition_emnr (rxa[channel].emnr.p) == 0) flush_emnr(rxa[channel].emnr.p);
 	}
 
 	{
@@ -754,9 +756,9 @@ void setNNRbypassRun (int channel)
 	}
 
 	RXAbp1Check (channel, 
-		rxa[channel].amd.p->run, rxa[channel].snba.p->run,
-		rxa[channel].emnr.p->run, getRun_nnrbypass (b), 
-		rxa[channel].anf.p->run, rxa[channel].anr.p->run);
+		getRun_amd (rxa[channel].amd.p), getRun_snba (rxa[channel].snba.p),
+		getRun_emnr (rxa[channel].emnr.p), getRun_nnrbypass (b), 
+		getRun_anf (rxa[channel].anf.p), getRun_anr (rxa[channel].anr.p));
 	RXAbp1Set (channel);
 }
 

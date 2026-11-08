@@ -183,9 +183,8 @@ extern void setDSPBuffsize_txa (int channel);
 
 // TXA Properties
 
-extern __declspec (dllexport) void SetTXAMode (int channel, int mode);
-
-extern void TXAResCheck (int channel);
+// [Exported (PORT) functions of this module that nothing else in WDSP, nor
+// ChannelMaster, calls are declared only in wdsp.h, the public header.]
 
 extern void TXASetupBPFilters (int channel);
 

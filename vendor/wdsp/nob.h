@@ -27,42 +27,16 @@ warren@wpratt.com
 #ifndef _anb_h
 #define _anb_h
 
-typedef struct _anb
-{
-	int run;
-	int buffsize;					// size of input/output buffer
-	double* in;						// input buffer
-	double* out;					// output buffer
-	int dline_size;					// length of delay line which is 'double dline[length][2]'
-	double *dline;					// pointer to delay line
-	double samplerate;				// samplerate, used to convert times into sample counts
-	double tau;						// transition time, signal<->zero
-	double hangtime;				// time to stay at zero after noise is no longer detected
-	double advtime;					// deadtime (zero output) in advance of detected noise
-	double backtau;					// time constant used in averaging the magnitude of the input signal
-	double threshold;				// triggers if (noise > threshold * average_signal_magnitude)
-    double *wave;                   // pointer to array holding transition waveform
-    int state;                      // state of the state machine
-    double avg;                     // average value of the signal magnitude
-    int dtime;                      // count when decreasing the signal magnitude
-    int htime;                      // count when hanging
-    int itime;                      // count when increasing the signal magnitude
-    int atime;                      // count at zero before the noise burst (advance count)
-    double coef;					// parameter in calculating transition waveform
-    int trans_count;                // number of samples to equal 'tau' time
-    int hang_count;                 // number of samples to equal 'hangtime' time
-    int adv_count;                  // number of samples to equal 'advtime' time
-    int in_idx;                     // ring buffer position into which new samples are inserted
-    int out_idx;                    // ring buffer position from which delayed samples are pulled
-    double power;					// level at which signal was increasing when a new decrease is started
-    int count;						// set each time a noise sample is detected, counts down
-    double backmult;				// multiplier for waveform averaging
-    double ombackmult;				// multiplier for waveform averaging
-	CRITICAL_SECTION cs_update;
-	double *legacy;																										////////////  legacy interface - remove
-} anb, *ANB;
+typedef struct _anb* ANB;
 
-__declspec (dllexport) ANB create_anb	(
+// [PORT is defined in wdsp_platform.h, which comm.h includes ahead of the module
+// headers.  Some WDSP headers are also included on their own, ahead of comm.h
+// (ChannelMaster includes resample.h this way), so a header that uses PORT
+// includes wdsp_platform.h itself.  It also supplies the types, CRITICAL_SECTION
+// and HANDLE, that some of these headers use.]
+#include "wdsp_platform.h"
+
+PORT ANB create_anb	(
 	int run,
 	int buffsize,
 	double* in,
@@ -75,29 +49,13 @@ __declspec (dllexport) ANB create_anb	(
 	double threshold
 						);
 
-__declspec (dllexport) void destroy_anb (ANB a);
+PORT void destroy_anb (ANB a);
 
-__declspec (dllexport) void flush_anb (ANB a);
+// [Exported (PORT) functions of this module that nothing else in WDSP, nor
+// ChannelMaster, calls are declared only in wdsp.h, the public header.  Those
+// declared here are called by other modules or by ChannelMaster.]
 
-__declspec (dllexport) void xanb (ANB a);
-
-extern __declspec (dllexport) void create_anbEXT	(
-	int id,
-	int run,
-	int buffsize,
-	double samplerate,
-	double tau,
-	double hangtime,
-	double advtime,
-	double backtau,
-	double threshold
-					);
-
-extern __declspec (dllexport) void destroy_anbEXT (int id);
-
-extern __declspec (dllexport) void flush_anbEXT (int id);
-
-extern __declspec (dllexport) void xanbEXT (int id, double* in, double* out);
+PORT void xanb (ANB a);
 
 extern void setBuffers_anb (ANB a, double* in, double* out);
 
@@ -106,20 +64,20 @@ extern void setSamplerate_anb (ANB a, int rate);
 extern void setSize_anb (ANB a, int size);
 
 
-extern __declspec (dllexport) void pSetRCVRANBRun (ANB a, int run);
+extern PORT void pSetRCVRANBRun (ANB a, int run);
 
-extern __declspec (dllexport) void pSetRCVRANBBuffsize (ANB a, int size);
+extern PORT void pSetRCVRANBBuffsize (ANB a, int size);
 
-extern __declspec (dllexport) void pSetRCVRANBSamplerate (ANB a, int rate);
+extern PORT void pSetRCVRANBSamplerate (ANB a, int rate);
 
-extern __declspec (dllexport) void pSetRCVRANBTau (ANB a, double tau);
+extern PORT void pSetRCVRANBTau (ANB a, double tau);
 
-extern __declspec (dllexport) void pSetRCVRANBHangtime (ANB a, double time);
+extern PORT void pSetRCVRANBHangtime (ANB a, double time);
 
-extern __declspec (dllexport) void pSetRCVRANBAdvtime (ANB a, double time);
+extern PORT void pSetRCVRANBAdvtime (ANB a, double time);
 
-extern __declspec (dllexport) void pSetRCVRANBBacktau (ANB a, double tau);
+extern PORT void pSetRCVRANBBacktau (ANB a, double tau);
 
-extern __declspec (dllexport) void pSetRCVRANBThreshold (ANB a, double thresh);
+extern PORT void pSetRCVRANBThreshold (ANB a, double thresh);
 
 #endif

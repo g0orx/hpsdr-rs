@@ -545,7 +545,7 @@ static int find_seg(const double *xs, int n, double x)
     return lo;
 }
 
-double ns_eval(const NS_Spline *s, double x)
+static double ns_eval(const NS_Spline *s, double x)
 {
     if (!s || s->n_branches == 0) return NAN;
     if (s->n_branches == 1) {
@@ -585,7 +585,7 @@ double ns_eval(const NS_Spline *s, double x)
     return best_y;
 }
 
-double ns_eval_near(const NS_Spline *s, double x, double prev_y)
+static double ns_eval_near(const NS_Spline *s, double x, double prev_y)
 {
     if (!s || s->n_branches == 0) return NAN;
     if (s->n_branches == 1) {
@@ -685,7 +685,7 @@ int ns_eval_all(const NS_Spline *s, double x,
     return found;
 }
 
-void ns_x_range(const NS_Spline *s, double *x_min, double *x_max)
+static void ns_x_range(const NS_Spline *s, double *x_min, double *x_max)
 {
     double lo=DBL_MAX, hi=-DBL_MAX;
     if (s) {                                            

@@ -26,7 +26,28 @@ warren@wpratt.com
 
 #include "comm.h"
 
-void calc_meter (METER a)
+typedef struct _meter
+{
+	int run;
+	int* prun;
+	int size;
+	double* buff;
+	double rate;
+	double tau_average;
+	double tau_peak_decay;
+	double mult_average;
+	double mult_peak;
+	double* result;
+	int enum_av;
+	int enum_pk;
+	int enum_gain;
+	double* pgain;
+	double avg;
+	double peak;
+	CRITICAL_SECTION mtupdate;
+} meter, *METER;
+
+static void calc_meter (METER a)
 {
 	a->mult_average = exp(-1.0 / (a->rate * a->tau_average));
 	a->mult_peak = exp(-1.0 / (a->rate * a->tau_peak_decay));

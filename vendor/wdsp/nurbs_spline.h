@@ -79,18 +79,12 @@ int ns_extend_left(NS_WS ws,
                    double y_lo_clamp,
                    double y_hi_clamp);
 
-double ns_eval(const NS_Spline *s, double x);
-
-double ns_eval_near(const NS_Spline *s, double x, double prev_y);
-
 double ns_eval_near_clamped(const NS_Spline *s, double x, double prev_y);
 
 double ns_eval_left_edge(const NS_Spline *s);
 
 int ns_eval_all(const NS_Spline *s, double x,
                 double *y_out, int max_out);
-
-void ns_x_range(const NS_Spline *s, double *x_min, double *x_max);
 
 double ns_accuracy_check(const NS_Spline *s, const NF_Curve *curve,
                           int n_check,

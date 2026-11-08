@@ -26,6 +26,20 @@ warren@wpratt.com
 
 #include "comm.h"
 
+typedef struct _patchpanel
+{
+	int channel;
+	int run;
+	int size;
+	double* in;
+	double* out;
+	double gain1;
+	double gain2I;
+	double gain2Q;
+	int inselect;
+	int copy;
+} panel, *PANEL;
+
 PANEL create_panel (int channel, int run, int size, double* in, double* out, double gain1, double gain2I, double gain2Q, int inselect, int copy)
 {
 	PANEL a = (PANEL) malloc0 (sizeof (panel));
@@ -124,6 +138,11 @@ void setSamplerate_panel (PANEL a, int rate)
 void setSize_panel (PANEL a, int size)
 {
 	a->size = size;
+}
+
+void setRun_patchpanel (PANEL a, int run)
+{
+	a->run = run;
 }
 
 /********************************************************************************************************

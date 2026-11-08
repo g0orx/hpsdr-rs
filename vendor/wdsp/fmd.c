@@ -83,7 +83,7 @@ typedef struct _fmd
 	double lim_pre_gain;
 } fmd, * FMD;
 
-void calc_fmd (FMD a)
+static void calc_fmd (FMD a)
 {
 	// pll
 	a->omega_min = TWOPI * a->fmin / a->rate;
@@ -129,7 +129,7 @@ void calc_fmd (FMD a)
 		0.100);										// tau_hang_decay
 }
 
-void decalc_fmd (FMD a)
+static void decalc_fmd (FMD a)
 {
 	destroy_wcpagc(a->plim);
 	destroy_snotch(a->sntch);

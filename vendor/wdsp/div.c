@@ -26,9 +26,23 @@ warren@wpratt.com
 
 #include "comm.h"
 
+typedef struct _div
+{
+	int run;
+	int nr;							// number of receivers to mix
+	int size;						// size of input/output buffers
+	double **in;					// input buffers
+	double *out;					// output buffer
+	int output;						// which rcvr to output; ==nr for mix
+	double *Irotate;
+	double *Qrotate;
+	CRITICAL_SECTION cs_update;
+	double *legacy[4];																	///////////// legacy interface - remove
+} mdiv, *MDIV;
+
 #define MAX_NR	(8)		// maximum number of receivers to mix
 
-MDIV create_div (int run, int nr, int size, double **in, double *out)
+static MDIV create_div (int run, int nr, int size, double **in, double *out)
 {
 	int i;
 	MDIV a = (MDIV) malloc0 (sizeof (mdiv));
@@ -47,7 +61,7 @@ MDIV create_div (int run, int nr, int size, double **in, double *out)
 	return a;
 }
 
-void destroy_div (MDIV a)
+static void destroy_div (MDIV a)
 {
 	int i;																									///////////// legacy interface - remove
 	DeleteCriticalSection (&a->cs_update);
@@ -59,12 +73,12 @@ void destroy_div (MDIV a)
 	_aligned_free (a);
 }
 
-void flush_div (MDIV a)
+static void flush_div (MDIV a)
 {
 
 }
 
-void xdiv (MDIV a)
+static void xdiv (MDIV a)
 {
 	if (a->run)
 	{
@@ -102,7 +116,7 @@ void xdiv (MDIV a)
 ********************************************************************************************************/
 
 #define MAX_EXT_DIVS	(2)							// maximum number of DIVs called from outside wdsp
-__declspec (align (16)) MDIV pdiv[MAX_EXT_DIVS];	// array of pointers for DIVs used EXTERNAL to wdsp
+static __declspec (align (16)) MDIV pdiv[MAX_EXT_DIVS];	// array of pointers for DIVs used EXTERNAL to wdsp
 
 PORT
 void create_divEXT (int id, int run, int nr, int size)

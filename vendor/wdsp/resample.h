@@ -57,16 +57,23 @@ typedef struct _resample
 	int phnum;			// phase number
 } resample, *RESAMPLE;
 
-__declspec (dllexport)
+// [PORT is defined in wdsp_platform.h, which comm.h includes ahead of the module
+// headers.  Some WDSP headers are also included on their own, ahead of comm.h
+// (ChannelMaster includes resample.h this way), so a header that uses PORT
+// includes wdsp_platform.h itself.  It also supplies the types, CRITICAL_SECTION
+// and HANDLE, that some of these headers use.]
+#include "wdsp_platform.h"
+
+PORT
 RESAMPLE create_resample (int run, int size, double* in, double* out, int in_rate, int out_rate, double fc, int ncoef, double gain);
 
-__declspec (dllexport)
+PORT
 void destroy_resample (RESAMPLE a);
 
-__declspec (dllexport)
+PORT
 void flush_resample (RESAMPLE a);
 
-__declspec (dllexport)
+PORT
 int xresample (RESAMPLE a);
 
 extern void setBuffers_resample (RESAMPLE a, double* in, double* out);
@@ -92,29 +99,8 @@ extern void setBandwidth_resample (RESAMPLE a, double fc_low, double fc_high);
 #ifndef _resampleF_h
 #define _resampleF_h
 
-typedef struct _resampleF
-{
-	int run;			// run
-	int size;			// number of input samples per buffer
-	float* in;			// input buffer for resampler
-	float* out;			// output buffer for resampler
-	int idx_in;			// index for input into ring
-	int ncoef;			// number of coefficients
-	int L;				// interpolation factor
-	int M;				// decimation factor
-	double* h;			// coefficients
-	int ringsize;		// number of values the ring buffer holds
-	double* ring;		// ring buffer
-	int cpp;			// coefficients of the phase
-	int phnum;			// phase number
-} resampleF, *RESAMPLEF;
-
-extern RESAMPLEF create_resampleF (int run, int size, float* in, float* out, int in_rate, int out_rate);
-
-extern void destroy_resampleF (RESAMPLEF a);
+typedef struct _resampleF* RESAMPLEF;
 
 extern void flush_resampleF (RESAMPLEF a);
-
-extern int xresampleF (RESAMPLEF a);
 
 #endif

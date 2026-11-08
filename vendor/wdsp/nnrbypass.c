@@ -24,16 +24,13 @@ warren@pratt.one
 
 */
 
+// [Through 2.11 these were <malloc.h> and <Windows.h>.  wdsp_align.h declares
+// _aligned_malloc () and _aligned_free () on every platform (macOS has no
+// <malloc.h>), and wdsp_platform.h supplies what Windows.h did (CRITICAL_SECTION,
+// for fir.h).]
+#include "wdsp_align.h"
 #include <string.h>
-#ifdef _WIN32
-#include <malloc.h>
-#include <Windows.h>
-#else
-#include <stdlib.h>
-#include <pthread.h>
-#include <semaphore.h>
-#include "linux_port.h"
-#endif
+#include "wdsp_platform.h"
 typedef double complex[2];
 #include "fftw3.h"
 #include "fir.h"

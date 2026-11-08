@@ -27,23 +27,7 @@ warren@wpratt.com
 #ifndef _slew_h
 #define _slew_h
 
-typedef struct _uslew
-{
-	int channel;
-	volatile long *ch_upslew;
-	int size;
-	double* in;
-	double* out;
-	double rate;
-	double tdelay;
-	double tupslew;
-	int runmode;
-	int state;
-	int count;
-	int ndelup;
-	int ntup;
-	double* cup;
-} uslew, *USLEW;
+typedef struct _uslew* USLEW;
 
 extern USLEW create_uslew (int channel, volatile long *ch_upslew, int size, double* in, double* out, double rate, double tdelay, double tupslew);
 

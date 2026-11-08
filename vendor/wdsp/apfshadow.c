@@ -25,6 +25,15 @@ warren@pratt.one
 
 #include "comm.h"
 
+typedef struct _apfshadow
+{
+	int selection;
+	int run;
+	double f_center;
+	double bandwidth;
+	double gain;
+} apfshadow, *APFSHADOW;
+
 APFSHADOW create_apfshadow (int selection, int run, double f_center, double bandwidth, double gain)
 {
 	APFSHADOW a = (APFSHADOW)malloc0 (sizeof (apfshadow));

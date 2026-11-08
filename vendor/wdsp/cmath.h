@@ -28,8 +28,6 @@ warren@pratt.one
 
 extern double mag (double* value);
 
-extern void cadd (double* a, double* b, double* sum);
-
 extern void csub (double* a, double* b, double* diff);
 
 extern void cmult (double* a, double* b, double* product);

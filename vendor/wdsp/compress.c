@@ -29,6 +29,15 @@ in the January 2010 issue of RadCom magazine.
 
 #include "comm.h"
 
+typedef struct _compressor
+{
+	int run;
+	int buffsize;
+	double *inbuff;
+	double *outbuff;
+	double gain;
+} compressor, *COMPRESSOR;
+
 COMPRESSOR create_compressor (
 				int run,
 				int buffsize,
@@ -88,6 +97,16 @@ void setSamplerate_compressor (COMPRESSOR a, int rate)
 void setSize_compressor (COMPRESSOR a, int size)
 {
 	a->buffsize = size;
+}
+
+int getRun_compressor (COMPRESSOR a)
+{
+	return a->run;
+}
+
+int* getRunPtr_compressor (COMPRESSOR a)
+{
+	return &a->run;
 }
 
 /********************************************************************************************************

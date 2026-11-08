@@ -26,7 +26,35 @@ warren@wpratt.com
 
 #include "comm.h"
 
-void calc_fmmod (FMMOD a)
+typedef struct _fmmod
+{
+	int run;
+	int size;
+	double* in;
+	double* out;
+	double samplerate;
+	double deviation;
+	double f_low;
+	double f_high;
+	int ctcss_run;
+	double ctcss_level;
+	double ctcss_freq;
+	// for ctcss gen
+	double tscale;
+	double tphase;
+	double tdelta;
+	// mod
+	double sphase;
+	double sdelta;
+	// bandpass
+	int bp_run;
+	double bp_fc;
+	int nc;
+	int mp;
+	FIRCORE p;
+}fmmod, *FMMOD;
+
+static void calc_fmmod (FMMOD a)
 {
 	// ctcss gen
 	a->tscale = 1.0 / (1.0 + a->ctcss_level);
@@ -136,6 +164,16 @@ void setSize_fmmod (FMMOD a, int size)
 	impulse = fir_bandpass(a->nc, -a->bp_fc, +a->bp_fc, a->samplerate, 0, 1, 1.0 / (2 * a->size));
 	setImpulse_fircore (a->p, impulse, 1);
 	_aligned_free (impulse);
+}
+
+int getRun_fmmod (FMMOD a)
+{
+	return a->run;
+}
+
+void setRun_fmmod (FMMOD a, int run)
+{
+	a->run = run;
 }
 
 /********************************************************************************************************

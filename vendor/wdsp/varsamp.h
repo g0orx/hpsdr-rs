@@ -27,43 +27,12 @@ warren@wpratt.com
 #ifndef _varsamp_h
 #define _varsamp_h
 
-typedef struct _varsamp
-{
-	int run;
-	int size;
-	double* in;
-	double* out;
-	int in_rate;
-	int out_rate;
-	double fcin;
-	double fc;
-	double fc_low;
-	double gain;
-	int idx_in;
-	int ncoef;
-	double* h;
-	int rsize;
-	double* ring;
-	double var;
-	int varmode;
-	double cvar;
-	double inv_cvar;
-	double old_inv_cvar;
-	double dicvar;
-	double delta;
-	double* hs;
-	int R;
-	double h_offset;
-	double isamps;
-	double nom_ratio;
-} varsamp, *VARSAMP;
+typedef struct _varsamp* VARSAMP;
 
 extern VARSAMP create_varsamp ( int run, int size, double* in, double* out,  
 	int in_rate, int out_rate, double fc, double fc_low, int R, double gain, double var, int varmode);
 
 extern void destroy_varsamp (VARSAMP a);
-
-extern void flush_varsamp (VARSAMP a);
 
 extern int xvarsamp (VARSAMP a, double var);
 
@@ -78,5 +47,7 @@ extern void setOutRate_varsamp (VARSAMP a, int rate);
 extern void setFCLow_varsamp (VARSAMP a, double fc_low);
 
 extern void setBandwidth_varsamp (VARSAMP a, double fc_low, double fc_high);
+
+extern void setIn_varsamp (VARSAMP a, double* in);
 
 #endif

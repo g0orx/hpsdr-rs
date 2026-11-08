@@ -27,6 +27,19 @@ warren@wpratt.com
 #define _CRT_SECURE_NO_WARNINGS
 #include "comm.h"
 
+typedef struct _bfcu
+{
+	int id;
+	int min_size;
+	int max_size;
+	double rate;
+	double corner;
+	int points;
+	double* dataset[16];
+	int i_lower_corner;
+	int i_upper_corner;
+}bfcu, * BFCU;
+
 /********************************************************************************************************
 *																										*
 *											Required Utilities											*
@@ -44,7 +57,6 @@ void *malloc0 (int size)
 
 // Exported calls
 
-#ifdef _WIN32
 PORT void
 *NewCriticalSection()
 {	// used by VAC
@@ -58,7 +70,6 @@ DestroyCriticalSection (LPCRITICAL_SECTION cs_ptr)
 {	// used by VAC
 	free ((char *)cs_ptr);
 }
-#endif
 
 
 /********************************************************************************************************
@@ -281,12 +292,12 @@ void print_deviation (const char* filename, double dpmax, double rate)
 
 // Audacity:  Import Raw Data, Signed 32-bit PCM, Little-endian, Mono/Stereo per mode selection, 48K rate
 
-int audiocount = 0;
-int* data = 0;
-int ready = 0;
-int done = 0;
+static int audiocount = 0;
+static int* data = 0;
+static int ready = 0;
+static int done = 0;
 
-void WriteAudioFile(void* arg)
+static void WriteAudioFile(void* arg)
 {
 	byte* dat = (byte *)arg;
 	FILE* file;
@@ -365,7 +376,7 @@ void WriteAudioWDSP (double seconds, int rate, int size, double* indata, int mod
 	}
 }
 
-void WriteScaledAudioFile (void* arg)
+static void WriteScaledAudioFile (void* arg)
 {
 	typedef struct
 	{
@@ -446,7 +457,7 @@ void WriteScaledAudio (
 *																										*
 ********************************************************************************************************/
 
-double* model_bandpass(int nc, double f_low, double f_high, double rate, int wtype, int points)
+static double* model_bandpass(int nc, double f_low, double f_high, double rate, int wtype, int points)
 {
 	double* h = fir_bandpass(nc, f_low, f_high, rate, wtype, 1, 1.0 / (double)nc);
 	double* in = (double*)malloc0(points * sizeof(complex));
@@ -476,7 +487,7 @@ double* model_bandpass(int nc, double f_low, double f_high, double rate, int wty
 	return magrev;
 }
 
-void print_bandpass_response (const char* filename, int points, double* response)
+static void print_bandpass_response (const char* filename, int points, double* response)
 {
 	int i;
 	FILE* file;
@@ -489,7 +500,7 @@ void print_bandpass_response (const char* filename, int points, double* response
 	}
 }
 
-BFCU pbfcu[4];
+static BFCU pbfcu[4];
 
 PORT
 int create_bfcu(int id, int min_size, int max_size, double rate, double corner, int points)
@@ -586,7 +597,6 @@ void test_bfcu()
 
 // Prints to the Visual Studio Debug Window; works like printf(...)
 #include <stdarg.h>
-#ifdef _WIN32
 void dprintf(const char* format, ...) 
 {
 	char buffer[512];
@@ -598,7 +608,6 @@ void dprintf(const char* format, ...)
 	// Send to Visual Studio Output window
 	OutputDebugStringA(buffer);
 }
-#endif
 // Usage example:
 // dprintf("Error Code: %d at %s\n", 404, "main.cpp");
 

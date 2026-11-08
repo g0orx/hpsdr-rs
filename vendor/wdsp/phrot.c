@@ -36,6 +36,46 @@ The author can be reached by email at  warren@pratt.one
 
 #include "comm.h"
 
+typedef struct _phrot
+{
+    int     reverse;
+    int     run;
+    int     size;
+    double *in;
+    double *out;
+    int     rate;
+    double  fc;
+    int     nstages;
+    double  b0, b1, a1;
+    double *x0, *x1;
+    double *y0, *y1;
+    CRITICAL_SECTION cs_update;
+    int     optim_interval;
+    int     optim_samp_count;
+    double  coeff_attack;
+    double  coeff_decay;
+    double  coeff_asym;
+    double  coeff_asym_fast;
+    double  env_pos;
+    double  env_neg;
+    double  asym_metric;
+    double  asym_fast;
+    double  in_env_pos;
+    double  in_env_neg;
+    double  in_asym_metric;
+    int     autoMode;
+    double  auto_fc;
+    double  auto_asym_best;
+    double  auto_step;
+    int     auto_direction;
+    int     auto_reject_count;
+    int     auto_converged;
+    int     ab_phase;
+    double  fc_A;
+    double  fc_B;
+    double  asym_A;
+} phrot, *PHROT;
+
 #define PHROT_FC_MIN        50.0
 #define PHROT_FC_MAX      2000.0
 #define PHROT_FC_DEFAULT   338.0
@@ -53,7 +93,7 @@ The author can be reached by email at  warren@pratt.one
 
 #define PHROT_OPTIM_SECS    15.0
 
-void calc_phrot(PHROT a)
+static void calc_phrot(PHROT a)
 {
     double g, dt;
     a->x0 = (double*)malloc0(a->nstages * sizeof(double));
@@ -75,7 +115,7 @@ void calc_phrot(PHROT a)
     a->coeff_asym_fast = exp(-dt / PHROT_ASYM_FAST_SECS);
 }
 
-void decalc_phrot(PHROT a)
+static void decalc_phrot(PHROT a)
 {
     _aligned_free(a->y1);
     _aligned_free(a->y0);

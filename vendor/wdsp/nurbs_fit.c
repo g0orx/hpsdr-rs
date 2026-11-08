@@ -329,7 +329,7 @@ static void order_points_nn(NF_WS ws, const NF_Point2 *pts, int n, int *order)
 
 #define NF_SPEARMAN_SAMPLE 512
 
-double nf_spearman(NF_WS ws, const NF_Point2 *pts, int n)
+static double nf_spearman(NF_WS ws, const NF_Point2 *pts, int n)
 {
     int m = (n <= NF_SPEARMAN_SAMPLE) ? n : NF_SPEARMAN_SAMPLE;
 

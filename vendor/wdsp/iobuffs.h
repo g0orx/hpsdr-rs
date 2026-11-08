@@ -86,6 +86,13 @@ extern void destroy_iobuffs (int channel);
 
 extern void flush_iobuffs (int channel);
 
+// [PORT is defined in wdsp_platform.h, which comm.h includes ahead of the module
+// headers.  Some WDSP headers are also included on their own, ahead of comm.h
+// (ChannelMaster includes resample.h this way), so a header that uses PORT
+// includes wdsp_platform.h itself.  It also supplies the types, CRITICAL_SECTION
+// and HANDLE, that some of these headers use.]
+#include "wdsp_platform.h"
+
 PORT	// double, interleaved I/Q
 void fexchange0 (int channel, double* in, double* out, int* error);	
 

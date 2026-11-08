@@ -28,6 +28,8 @@ warren@pratt.one
 
 struct _rxa rxa[MAX_CHANNELS];
 
+static void RXAResCheck (int channel);
+
 void create_rxa (int channel)
 {
 	rxa[channel].mode = RXA_LSB;
@@ -398,7 +400,7 @@ void create_rxa (int channel)
 		RXA_AGC_AV,										// index for average value
 		RXA_AGC_PK,										// index for peak value
 		RXA_AGC_GAIN,									// index for gain value
-		&rxa[channel].agc.p->gain);						// pointer for gain computation
+		getGainPtr_wcpagc (rxa[channel].agc.p));		// pointer for gain computation
 
 	// bandpass filter
 	rxa[channel].bp1.p = create_bandpass (
@@ -875,40 +877,40 @@ void SetRXAMode (int channel, int mode)
 	if (rxa[channel].mode != mode)
 	{
 		int amd_run = (mode == RXA_AM) || (mode == RXA_SAM);
-		RXAbpsnbaCheck (channel, mode, rxa[channel].ndb.p->master_run);
-		RXAbp1Check (channel, amd_run, rxa[channel].snba.p->run, rxa[channel].emnr.p->run, 
+		RXAbpsnbaCheck (channel, mode, getMasterRun_notchdb (rxa[channel].ndb.p));
+		RXAbp1Check (channel, amd_run, getRun_snba (rxa[channel].snba.p), getRun_emnr (rxa[channel].emnr.p), 
 			getRun_nnrbypass (rxa[channel].nnrbypass.p), 
-			rxa[channel].anf.p->run, rxa[channel].anr.p->run);
+			getRun_anf (rxa[channel].anf.p), getRun_anr (rxa[channel].anr.p));
 		EnterCriticalSection (&ch[channel].csDSP);
 		rxa[channel].mode = mode;
-		rxa[channel].amd.p->run   = 0;
-		rxa[channel].wbfm.p->run  = 0;
+		setRun_amd (rxa[channel].amd.p, 0);
+		setRun_wbfm (rxa[channel].wbfm.p, 0);
 		setFMDRun (channel, 0);
-		rxa[channel].agc.p->run   = 1;
-		rxa[channel].nbp0.p->run  = 1;
-		rxa[channel].panel.p->run = 1;
+		setRun_wcpagc (rxa[channel].agc.p, 1);
+		setRun_nbp (rxa[channel].nbp0.p, 1);
+		setRun_patchpanel (rxa[channel].panel.p, 1);
 		switch (mode)
 		{
 		case RXA_AM:
-			rxa[channel].amd.p->run  = 1;
-			rxa[channel].amd.p->mode = 0;
+			setRun_amd (rxa[channel].amd.p, 1);
+			setMode_amd (rxa[channel].amd.p, 0);
 			break;
 		case RXA_SAM:
-			rxa[channel].amd.p->run  = 1;
-			rxa[channel].amd.p->mode = 1;
+			setRun_amd (rxa[channel].amd.p, 1);
+			setMode_amd (rxa[channel].amd.p, 1);
 			break;
 		case RXA_DSB:
 		
 			break;
 		case RXA_FM:
 			setFMDRun (channel, 1);
-			rxa[channel].agc.p->run  = 0;
+			setRun_wcpagc (rxa[channel].agc.p, 0);
 			break;
 		case RXA_WBFM:
-			rxa[channel].wbfm.p->run  = 1;
-			rxa[channel].agc.p->run   = 0;
-			rxa[channel].nbp0.p->run  = 0;
-			rxa[channel].panel.p->run = 0;
+			setRun_wbfm (rxa[channel].wbfm.p, 1);
+			setRun_wcpagc (rxa[channel].agc.p, 0);
+			setRun_nbp (rxa[channel].nbp0.p, 0);
+			setRun_patchpanel (rxa[channel].panel.p, 0);
 			break;
 		default:
 
@@ -921,7 +923,7 @@ void SetRXAMode (int channel, int mode)
 	}
 }
 
-void RXAResCheck (int channel)
+static void RXAResCheck (int channel)
 {	
 	// HBResampler (rsmpin) turns OFF/ON automatically for this situation.
 	RESAMPLE b = rxa[channel].rsmpout.p;
@@ -941,20 +943,20 @@ void RXAbp1Check (int channel, int amd_run, int snba_run,
 		anf_run        ||
 		anr_run)	gain = 2.0;
 	else			gain = 1.0;
-	if (a->gain != gain)
+	if (getGain_bandpass (a) != gain)
 		setGain_bandpass (a, gain, 0);
 }
 
-int RXAbp1Position(int channel)
+static int RXAbp1Position(int channel)
 {
 	int position = 0;
 	int run_nnrbypass = getRun_nnrbypass(rxa[channel].nnrbypass.p);
-	int run_emnr = rxa[channel].emnr.p->run;
-	int pos_emnr = rxa[channel].emnr.p->position;
-	int run_anr = rxa[channel].anr.p->run;
-	int pos_anr = rxa[channel].anr.p->position;
-	int run_anf = rxa[channel].anf.p->run;
-	int pos_anf = rxa[channel].anf.p->position;
+	int run_emnr = getRun_emnr (rxa[channel].emnr.p);
+	int pos_emnr = getPosition_emnr (rxa[channel].emnr.p);
+	int run_anr = getRun_anr (rxa[channel].anr.p);
+	int pos_anr = getPosition_anr (rxa[channel].anr.p);
+	int run_anf = getRun_anf (rxa[channel].anf.p);
+	int pos_anf = getPosition_anf (rxa[channel].anf.p);
 
 	if (!run_nnrbypass)
 	{
@@ -970,20 +972,20 @@ int RXAbp1Position(int channel)
 void RXAbp1Set (int channel)
 {
 	BANDPASS a = rxa[channel].bp1.p;
-	int old_run = a->run;
-	int old_pos = a->position;
+	int old_run = getRun_bandpass (a);
+	int old_pos = getPosition_bandpass (a);
 	int run_nnrbypass = getRun_nnrbypass (rxa[channel].nnrbypass.p);
-	if (rxa[channel].amd.p->run     ||
-		rxa[channel].snba.p->run    ||
-		rxa[channel].emnr.p->run    ||
-		run_nnrbypass               ||
-		rxa[channel].anf.p->run     ||
-		rxa[channel].anr.p->run)	a->run = 1;
-	else							a->run = 0;
+	if (getRun_amd (rxa[channel].amd.p)   ||
+		getRun_snba (rxa[channel].snba.p) ||
+		getRun_emnr (rxa[channel].emnr.p) ||
+		run_nnrbypass                     ||
+		getRun_anf (rxa[channel].anf.p)   ||
+		getRun_anr (rxa[channel].anr.p))	setRun_bandpass (a, 1);
+	else							setRun_bandpass (a, 0);
 	int position = RXAbp1Position (channel);
-	a->position = position;
-	if ((!old_run && a->run) || (old_pos != position)) flush_bandpass (a);
-	setUpdate_fircore (a->p);
+	setPosition_bandpass (a, position);
+	if ((!old_run && getRun_bandpass (a)) || (old_pos != position)) flush_bandpass (a);
+	setUpdate_bandpass (a);
 }
 
 void RXAbpsnbaCheck (int channel, int mode, int notch_run)
@@ -998,28 +1000,28 @@ void RXAbpsnbaCheck (int channel, int mode, int notch_run)
 		case RXA_LSB:
 		case RXA_CWL:
 		case RXA_DIGL:
-			f_low  = -a->abs_high_freq;
-			f_high = -a->abs_low_freq;
+			f_low  = -getAbsHighFreq_bpsnba (a);
+			f_high = -getAbsLowFreq_bpsnba (a);
 			run_notches = notch_run;
 			break;
 		case RXA_USB:
 		case RXA_CWU:
 		case RXA_DIGU:
-			f_low  = +a->abs_low_freq;
-			f_high = +a->abs_high_freq;
+			f_low  = +getAbsLowFreq_bpsnba (a);
+			f_high = +getAbsHighFreq_bpsnba (a);
 			run_notches = notch_run;
 			break;
 		case RXA_AM:
 		case RXA_SAM:
 		case RXA_DSB:
-			f_low  = +a->abs_low_freq;
-			f_high = +a->abs_high_freq;
+			f_low  = +getAbsLowFreq_bpsnba (a);
+			f_high = +getAbsHighFreq_bpsnba (a);
 			run_notches = 0;
 			break;
 		case RXA_FM:
 		case RXA_WBFM:
-			f_low  = +a->abs_low_freq;
-			f_high = +a->abs_high_freq;
+			f_low  = +getAbsLowFreq_bpsnba (a);
+			f_high = +getAbsHighFreq_bpsnba (a);
 			run_notches = 0;
 			break;
 		case RXA_DRM:
@@ -1029,13 +1031,13 @@ void RXAbpsnbaCheck (int channel, int mode, int notch_run)
 	}
 	// 'run' and 'position' are examined at run time; no filter changes required.
 	// Recalculate filter if frequencies OR 'run_notches' changed.
-	if ((a->f_low       != f_low      ) ||
-		(a->f_high      != f_high     ) ||
-		(a->run_notches != run_notches))	
+	if ((getFLow_bpsnba (a)       != f_low      ) ||
+		(getFHigh_bpsnba (a)      != f_high     ) ||
+		(getRunNotches_bpsnba (a) != run_notches))	
 	{
-		a->f_low  = f_low;
-		a->f_high = f_high;
-		a->run_notches = run_notches;
+		setFLow_bpsnba (a, f_low);
+		setFHigh_bpsnba (a, f_high);
+		setRunNotches_bpsnba (a, run_notches);
 		// f_low, f_high, run_notches are needed for the filter recalculation
 		recalc_bpsnba_filter (a, 0);
 	}
@@ -1051,31 +1053,31 @@ void RXAbpsnbaSet (int channel)
 		case RXA_LSB:
 		case RXA_CWL:
 		case RXA_DIGL:
-			a->run = rxa[channel].snba.p->run;
-			a->position = 0;
+			setRun_bpsnba (a, getRun_snba (rxa[channel].snba.p));
+			setPosition_bpsnba (a, 0);
 			break;
 		case RXA_USB:
 		case RXA_CWU:
 		case RXA_DIGU:
-			a->run = rxa[channel].snba.p->run;
-			a->position = 0;
+			setRun_bpsnba (a, getRun_snba (rxa[channel].snba.p));
+			setPosition_bpsnba (a, 0);
 			break;
 		case RXA_AM:
 		case RXA_SAM:
 		case RXA_DSB:
-			a->run = rxa[channel].snba.p->run;
-			a->position = 1;
+			setRun_bpsnba (a, getRun_snba (rxa[channel].snba.p));
+			setPosition_bpsnba (a, 1);
 			break;
 		case RXA_FM:
-			a->run = rxa[channel].snba.p->run;
-			a->position = 1;
+			setRun_bpsnba (a, getRun_snba (rxa[channel].snba.p));
+			setPosition_bpsnba (a, 1);
 			break;
 		case RXA_DRM:
 		case RXA_SPEC:
-			a->run = 0;
+			setRun_bpsnba (a, 0);
 			break;
 	}
-	setUpdate_fircore (a->bpsnba->p);
+	setUpdate_bpsnba (a);
 }
 
 

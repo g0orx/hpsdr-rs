@@ -26,7 +26,52 @@ warren@pratt.one
 
 #include "comm.h"
 
-int fEQcompare (const void * a, const void * b)
+typedef struct _eqp
+{
+	int run;
+	int size;
+	int nc;
+	int mp;
+	double* in;
+	double* out;
+	int nfreqs;
+	int max_freqs;
+	double* F;
+	double* G;
+	int ctfmode;
+	int wintype;
+	double samplerate;
+	EQIMP peqimp;
+	double* impulse;
+	FIRCORE p;
+	int deg;
+	CRITICAL_SECTION csEQ;
+} eqp, *EQP;
+
+typedef struct _eq
+{
+	int run;				
+	int size;
+	double* in;
+	double* out;
+	int nfreqs;
+	double* F;
+	double* G;
+	double* infilt;
+	double* product;
+	double* mults;
+	double scale;
+	int ctfmode;
+	int wintype;
+	double samplerate;
+	fftw_plan CFor;
+	fftw_plan CRev;
+	int deg;
+	EQIMP peqimp;
+	double* impulse;
+}eq, *EQ;
+
+static int fEQcompare (const void * a, const void * b)
 {
 	if (*(double*)a < *(double*)b)
 		return -1;
@@ -81,7 +126,7 @@ void destroy_eqimp(EQIMP a)
 	_aligned_free(a);
 }
 
-void setWintype_eqimp (EQIMP a, int wintype)
+static void setWintype_eqimp (EQIMP a, int wintype)
 {
 	destroy_fsamp (a->pfsamp);
 	a->wintype = wintype;
@@ -337,6 +382,11 @@ void setSize_eqp (EQP a, int size)
 		a->impulse);
 	setImpulse_fircore (a->p, a->impulse, 1);
 	LeaveCriticalSection (&a->csEQ);
+}
+
+int* getRunPtr_eqp (EQP a)
+{
+	return &a->run;
 }
 
 /********************************************************************************************************
@@ -776,7 +826,7 @@ void GetTXAEQDraw (int channel, double* X, double* Y)
 ********************************************************************************************************/
 
 
-double* eq_mults (EQIMP peqimp, int size, int nfreqs, double* F, double* G, double samplerate, 
+static double* eq_mults (EQIMP peqimp, int size, int nfreqs, double* F, double* G, double samplerate, 
 	double scale, int ctfmode, int wintype, int deg, double* impulse)
 {
 	eq_impulse (peqimp, size, nfreqs, F, G, samplerate, scale, ctfmode, wintype, deg, impulse);
@@ -784,7 +834,7 @@ double* eq_mults (EQIMP peqimp, int size, int nfreqs, double* F, double* G, doub
 	return mults;
 }
 
-void calc_eq (EQ a)
+static void calc_eq (EQ a)
 {
 	a->scale = 1.0 / (double)(2 * a->size);
 	a->infilt = (double *)malloc0 (2 * a->size * sizeof(complex));
@@ -795,7 +845,7 @@ void calc_eq (EQ a)
 		a->impulse);
 }
 
-void decalc_eq (EQ a)
+static void decalc_eq (EQ a)
 {
 	fftw_destroy_plan (a->CRev);
 	fftw_destroy_plan (a->CFor);

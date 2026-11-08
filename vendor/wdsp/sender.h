@@ -32,20 +32,7 @@ warren@wpratt.com
 #ifndef _sender_h
 #define _sender_h
 
-typedef struct _sender
-{
-	int run;			// 0 = send OFF, 1 = send ON
-	int flag;			// secondary 'run'; AND'd with 'run'
-	int mode;			// selects the specific processing and function call
-	int size;			// size of the data buffer (complex samples)
-	double* in;			// buffer from which to take the data
-	int arg0;			// parameters that can be passed to the function called
-	int arg1;
-	int arg2;
-	int arg3;
-	double* out;		// internally created buffer into which processed data is placed
-						// a pointer to *out is passed to the external function that is called
-} sender, *SENDER;
+typedef struct _sender* SENDER;
 
 extern SENDER create_sender (int run, int flag, int mode, int size, double* in, int arg0, int arg1, int arg2, int arg3);
 
@@ -63,7 +50,8 @@ extern void setSize_sender (SENDER a, int size);
 
 // RXA Properties
 
-extern __declspec (dllexport) void SetRXASpectrum (int channel, int flag, int disp, int ss, int LO);
+// [Exported (PORT) functions of this module that nothing else in WDSP, nor
+// ChannelMaster, calls are declared only in wdsp.h, the public header.]
 
 // TXA Properties
 

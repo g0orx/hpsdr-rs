@@ -306,7 +306,7 @@ WDSP_API void SetPSLoopDelay (int channel, double delay);
 WDSP_API void SetPSMancal (int channel, int mancal);
 WDSP_API void SetPSMox (int channel, int mox);
 WDSP_API void SetPSMoxDelay (int channel, double delay);
-WDSP_API void SetPSDeadlockMinFrac (int channel, double frac);
+WDSP_API void SetPSDeadlockMinFrac (int channel, double frac);	// hpsdr-rs port
 WDSP_API void SetPSReset (int channel, int reset);
 WDSP_API void SetPSRunCal (int channel, int run);
 WDSP_API double SetPSTXDelay (int channel, double delay);
@@ -847,6 +847,9 @@ WDSP_API void SetRXASSQLThreshold (int channel, double threshold);
 
 #if defined(_WIN32) || defined(_WIN64)
 WDSP_API void DestroyCriticalSection (void* cs_ptr);
+#endif
+#if defined(_WIN32) || defined(_WIN64)
+WDSP_API void * NewCriticalSection (void);
 #endif
 WDSP_API int create_bfcu (int id, int min_size, int max_size, double rate, double corner, int points);
 WDSP_API void destroy_bfcu (int id);

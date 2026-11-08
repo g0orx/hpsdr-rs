@@ -30,7 +30,26 @@ warren@wpratt.com
 
 #include "comm.h"
 
-void calc_osctrl (OSCTRL a)
+typedef struct _osctrl
+{
+	int run;						// 1 to run; 0 otherwise
+	int size;						// buffer size
+	double *inbuff;					// input buffer
+	double *outbuff;				// output buffer
+	int rate;						// sample rate
+	double osgain;					// gain applied to overshoot "clippings"
+	double bw;						// bandwidth
+	int pn;							// "peak stretcher" window, samples
+	int dl_len;						// delay line length, samples
+	double* dl;						// delay line for complex samples
+	double* dlenv;					// delay line for envelope values
+	int in_idx;						// input index for dl
+	int out_idx;					// output index for dl
+	double max_env;					// maximum env value in env delay line
+	double env_out;
+} osctrl, *OSCTRL;
+
+static void calc_osctrl (OSCTRL a)
 {
 	a->pn = (int)((0.3 / a->bw) * a->rate + 0.5);
 	if ((a->pn & 1) == 0) a->pn += 1;
@@ -43,7 +62,7 @@ void calc_osctrl (OSCTRL a)
 	a->max_env = 0.0;
 }
 
-void decalc_osctrl (OSCTRL a)
+static void decalc_osctrl (OSCTRL a)
 {
 	_aligned_free (a->dlenv);
 	_aligned_free (a->dl);
@@ -130,6 +149,11 @@ void setSize_osctrl (OSCTRL a, int size)
 {
 	a->size = size;
 	flush_osctrl (a);
+}
+
+int getRun_osctrl (OSCTRL a)
+{
+	return a->run;
 }
 
 /********************************************************************************************************

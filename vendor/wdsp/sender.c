@@ -26,12 +26,27 @@ warren@wpratt.com
 
 #include "comm.h"
 
-void calc_sender (SENDER a)
+typedef struct _sender
+{
+	int run;			// 0 = send OFF, 1 = send ON
+	int flag;			// secondary 'run'; AND'd with 'run'
+	int mode;			// selects the specific processing and function call
+	int size;			// size of the data buffer (complex samples)
+	double* in;			// buffer from which to take the data
+	int arg0;			// parameters that can be passed to the function called
+	int arg1;
+	int arg2;
+	int arg3;
+	double* out;		// internally created buffer into which processed data is placed
+						// a pointer to *out is passed to the external function that is called
+} sender, *SENDER;
+
+static void calc_sender (SENDER a)
 {
 	a->out = (double *) malloc0 (a->size * sizeof (complex));
 }
 
-void decalc_sender (SENDER a)
+static void decalc_sender (SENDER a)
 {
 	_aligned_free (a->out);
 }

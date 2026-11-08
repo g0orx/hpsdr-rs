@@ -27,19 +27,7 @@ warren@wpratt.com
 #ifndef _shift_h
 #define _shift_h
 
-typedef struct _shift
-{
-	int run;
-	int size;
-	double* in;
-	double* out;
-	double rate;
-	double shift;
-	double phase;
-	double delta;
-	double cos_delta;
-	double sin_delta;
-} shift, *SHIFT;
+typedef struct _shift* SHIFT;
 
 extern SHIFT create_shift (int run, int size, double* in, double* out, int rate, double fshift);
 
@@ -57,8 +45,7 @@ extern void setSize_shift (SHIFT a, int size);
 
 // RXA Properties
 
-extern __declspec (dllexport) void SetRXAShiftRun (int channel, int run);
-
-extern __declspec (dllexport) void SetRXAShiftFreq (int channel, double fshift);
+// [Exported (PORT) functions of this module that nothing else in WDSP, nor
+// ChannelMaster, calls are declared only in wdsp.h, the public header.]
 
 #endif

@@ -111,6 +111,8 @@ typedef struct _gru
 	double* gh;
 } gru;				/* GRU is typedef'd in nnet.h */
 
+static void flush_cond (COND c);
+
 static double gru_sigmoid (double x)
 {
 	if (x >= 0.0) return 1.0 / (1.0 + exp (-x));
@@ -121,7 +123,7 @@ static double gru_sigmoid (double x)
 	}
 }
 
-GRU create_gru
+static GRU create_gru
 	(
 	int nin,
 	int nhidden,
@@ -144,7 +146,7 @@ GRU create_gru
 	return g;
 }
 
-void destroy_gru (GRU g)
+static void destroy_gru (GRU g)
 {
 	_aligned_free (g->gh);
 	_aligned_free (g->gi);
@@ -152,12 +154,12 @@ void destroy_gru (GRU g)
 	_aligned_free (g);
 }
 
-void flush_gru (GRU g)
+static void flush_gru (GRU g)
 {
 	memset (g->h, 0, g->nhidden * sizeof (double));
 }
 
-const double* run_gru_dbg
+static const double* run_gru_dbg
 	(
 	GRU g,
 	const double* x,
@@ -210,7 +212,7 @@ const double* run_gru_dbg
 	return h;
 }
 
-const double* run_gru (GRU g, const double* x)
+static const double* run_gru (GRU g, const double* x)
 {
 	return run_gru_dbg (g, x, 0, 0, 0);
 }
@@ -243,7 +245,7 @@ typedef struct _conv2d
 	double* y;
 } conv2d;				/* CONV2D is typedef'd in nnet.h */
 
-CONV2D create_conv2d
+static CONV2D create_conv2d
 	(
 	int cin,
 	int cout,
@@ -280,20 +282,20 @@ CONV2D create_conv2d
 	return c;
 }
 
-void destroy_conv2d (CONV2D c)
+static void destroy_conv2d (CONV2D c)
 {
 	_aligned_free (c->y);
 	_aligned_free (c->ring);
 	_aligned_free (c);
 }
 
-void flush_conv2d (CONV2D c)
+static void flush_conv2d (CONV2D c)
 {
 	memset (c->ring, 0, (size_t)c->kt * c->cin * c->slotw * sizeof (double));
 	c->head = 0;
 }
 
-const double* run_conv2d (CONV2D c, const double* x)
+static const double* run_conv2d (CONV2D c, const double* x)
 {
 	const int Cin = c->cin, Cout = c->cout;
 	const int Fin = c->fin, Fout = c->fout;
@@ -336,7 +338,7 @@ const double* run_conv2d (CONV2D c, const double* x)
 	return c->y;
 }
 
-int getFout_conv2d (CONV2D c)
+static int getFout_conv2d (CONV2D c)
 {
 	return c->fout;
 }
@@ -346,7 +348,7 @@ int getCout_conv2d (CONV2D c)
 	return c->cout;
 }
 
-void run_prelu (double* x, const double* slope, int nch, int nfreq)
+static void run_prelu (double* x, const double* slope, int nch, int nfreq)
 {
 	int k, f;
 	for (k = 0; k < nch; k++)
@@ -382,7 +384,7 @@ typedef struct _convt2d
 	double* y;
 } convt2d;				/* CONVT2D is typedef'd in nnet.h */
 
-CONVT2D create_convt2d
+static CONVT2D create_convt2d
 	(
 	int cin,
 	int cout,
@@ -455,7 +457,7 @@ CONVT2D create_convt2d
 	return c;
 }
 
-void destroy_convt2d (CONVT2D c)
+static void destroy_convt2d (CONVT2D c)
 {
 	_aligned_free (c->y);
 	_aligned_free (c->ring);
@@ -467,13 +469,13 @@ void destroy_convt2d (CONVT2D c)
 	_aligned_free (c);
 }
 
-void flush_convt2d (CONVT2D c)
+static void flush_convt2d (CONVT2D c)
 {
 	memset (c->ring, 0, (size_t)c->kt * c->cin * c->fin * sizeof (double));
 	c->head = 0;
 }
 
-const double* run_convt2d (CONVT2D c, const double* x)
+static const double* run_convt2d (CONVT2D c, const double* x)
 {
 	const int Cin = c->cin, Cout = c->cout;
 	const int Fin = c->fin, Fout = c->fout;
@@ -515,7 +517,7 @@ const double* run_convt2d (CONVT2D c, const double* x)
 	return c->y;
 }
 
-int getFout_convt2d (CONVT2D c)
+static int getFout_convt2d (CONVT2D c)
 {
 	return c->fout;
 }
@@ -541,7 +543,7 @@ typedef struct _dfhead
 	int head;
 } dfhead;				/* DFHEAD is typedef'd in nnet.h */
 
-DFHEAD create_dfhead (int nbins, int order, double gmin_db, double gmax_db)
+static DFHEAD create_dfhead (int nbins, int order, double gmin_db, double gmax_db)
 {
 	int i;
 	DFHEAD d = (DFHEAD) malloc0 (sizeof (dfhead));
@@ -561,7 +563,7 @@ DFHEAD create_dfhead (int nbins, int order, double gmin_db, double gmax_db)
 	return d;
 }
 
-void destroy_dfhead (DFHEAD d)
+static void destroy_dfhead (DFHEAD d)
 {
 	_aligned_free (d->gprev);
 	_aligned_free (d->ring_im);
@@ -569,7 +571,7 @@ void destroy_dfhead (DFHEAD d)
 	_aligned_free (d);
 }
 
-void flush_dfhead (DFHEAD d)
+static void flush_dfhead (DFHEAD d)
 {
 	if (d->gprev)
 	{
@@ -581,7 +583,7 @@ void flush_dfhead (DFHEAD d)
 	d->head = 0;
 }
 
-void run_dfhead
+static void run_dfhead
 	(
 	DFHEAD d,
 	const double* xre,
@@ -683,37 +685,37 @@ void run_dfhead
 	}
 }
 
-void setGains_dfhead (DFHEAD d, double gmin_db, double gmax_db)
+static void setGains_dfhead (DFHEAD d, double gmin_db, double gmax_db)
 {
 	d->gmin = pow (10.0, gmin_db / 20.0);
 	d->gmax = pow (10.0, gmax_db / 20.0);
 }
 
-void setAlpha_dfhead (DFHEAD d, double alpha)
+static void setAlpha_dfhead (DFHEAD d, double alpha)
 {
 	if (alpha < 0.0) alpha = 0.0;
 	if (alpha > 4.0) alpha = 4.0;
 	d->alpha = alpha;
 }
 
-double getAlpha_dfhead (DFHEAD d)
+static double getAlpha_dfhead (DFHEAD d)
 {
 	return d->alpha;
 }
 
-void setKnee_dfhead (DFHEAD d, double knee_db)
+static void setKnee_dfhead (DFHEAD d, double knee_db)
 {
 	if (knee_db < 0.0)  knee_db = 0.0;
 	if (knee_db > 40.0) knee_db = 40.0;
 	d->knee = pow (10.0, -knee_db / 20.0);
 }
 
-double getKnee_dfhead (DFHEAD d)
+static double getKnee_dfhead (DFHEAD d)
 {
 	return -20.0 * log10 (d->knee);
 }
 
-void setSmooth_dfhead (DFHEAD d, double att_ms, double rel_ms,
+static void setSmooth_dfhead (DFHEAD d, double att_ms, double rel_ms,
 	double frame_rate)
 {
 	if (att_ms < 0.0) att_ms = 0.0;
@@ -752,7 +754,7 @@ static void calc_cond (COND c)
 	c->alpha = exp (-1.0 / (c->tau * c->frame_rate));
 }
 
-COND create_cond
+static COND create_cond
 	(
 	int nbins,
 	double cexp,
@@ -773,13 +775,13 @@ COND create_cond
 	return c;
 }
 
-void destroy_cond (COND c)
+static void destroy_cond (COND c)
 {
 	_aligned_free (c->out);
 	_aligned_free (c);
 }
 
-void flush_cond (COND c)
+static void flush_cond (COND c)
 {
 	c->pstate = 0.0;
 	c->wstate = 0.0;
@@ -787,7 +789,7 @@ void flush_cond (COND c)
 	memset (c->out, 0, 2 * (size_t)c->nbins * sizeof (double));
 }
 
-const double* run_cond (COND c, const double* xre, const double* xim)
+static const double* run_cond (COND c, const double* xre, const double* xim)
 {
 	const int K = c->nbins;
 	double* orr = c->out;
@@ -837,7 +839,7 @@ double getGain_cond (COND c)
 	return c->gain;
 }
 
-void setTau_cond (COND c, double tau)
+static void setTau_cond (COND c, double tau)
 {
 	c->tau = tau;
 	calc_cond (c);
@@ -897,7 +899,7 @@ static const double* dp_get (NNIO f, const char* prefix, const char* suffix,
 	return p;
 }
 
-DPRNN create_dprnn (NNIO f, const char* prefix, int nch, int nfreq, int hid)
+static DPRNN create_dprnn (NNIO f, const char* prefix, int nch, int nfreq, int hid)
 {
 	DPRNN d = (DPRNN) malloc0 (sizeof (dprnn));
 	const double *fw, *fu, *fbi, *fbh;
@@ -950,7 +952,7 @@ DPRNN create_dprnn (NNIO f, const char* prefix, int nch, int nfreq, int hid)
 	return d;
 }
 
-void destroy_dprnn (DPRNN d)
+static void destroy_dprnn (DPRNN d)
 {
 	int i;
 	if (d->ok)
@@ -967,7 +969,7 @@ void destroy_dprnn (DPRNN d)
 	_aligned_free (d);
 }
 
-void flush_dprnn (DPRNN d)
+static void flush_dprnn (DPRNN d)
 {
 	int i;
 	if (!d->ok) return;
@@ -976,7 +978,7 @@ void flush_dprnn (DPRNN d)
 	flush_gru (d->ibwd);
 }
 
-const double* run_dprnn (DPRNN d, const double* x)
+static const double* run_dprnn (DPRNN d, const double* x)
 {
 	const int C = d->nch;
 	const int F = d->nfreq;
@@ -1028,7 +1030,7 @@ const double* run_dprnn (DPRNN d, const double* x)
 	return d->y;
 }
 
-int ok_dprnn (DPRNN d)
+static int ok_dprnn (DPRNN d)
 {
 	return d->ok;
 }
@@ -1455,7 +1457,7 @@ void report_profile_nnet (void)
 #endif
 
 
-void runCore_nnet (NNET n, const double* x)
+static void runCore_nnet (NNET n, const double* x)
 {
 	NNP_START (NNP_TOTAL);
 	const double* y;

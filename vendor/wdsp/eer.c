@@ -128,7 +128,7 @@ void xeer (EER a)
 ********************************************************************************************************/
 
 #define MAX_EXT_EERS	(2)							// maximum number of EERs called from outside wdsp
-__declspec (align (16)) EER peer[MAX_EXT_EERS];		// array of pointers for EERs used EXTERNAL to wdsp
+static __declspec (align (16)) EER peer[MAX_EXT_EERS];		// array of pointers for EERs used EXTERNAL to wdsp
 
 
 PORT

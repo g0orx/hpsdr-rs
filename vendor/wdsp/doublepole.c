@@ -27,6 +27,23 @@ warren@pratt.one
 
 #include "comm.h"
 
+typedef struct _doublepole
+{
+	int run;					// 0 - filter is OFF; 1 - filter is ON
+	int position;				// position in sequence in which to execute the filter
+	int size;					// input/output buffer size
+	int nc;						// number of impulse response coefficients
+	double* in;					// pointer to input buffer
+	double* out;				// pointer to output buffer
+	double f_center;			// filter center frequency (Hz)
+	double bandwidth;			// filter bandwidth (Hz)
+	double samplerate;			// sample_rate (samples/sec)
+	double gain;				// gain to be applied to filter output
+	double scale;				// internal filter scale factor based upon gain
+	int mode;					// Mode to get output:  0 => CWL; 1 => CWU; 2 => CWL + CWU
+	FIRCORE p;
+} doublepole, *DOUBLEPOLE;
+
 static int calc_dpole_nc (double rate, double bandwidth)
 {
 	int nc = 0;
@@ -139,7 +156,7 @@ double* build_doublepole_2sided (int nc, double rate, double fcenter, double ban
 	return h_i;
 }
 
-double* build_doublepole_1eff (int nc, double rate, double fcenter, double bandwidth, double scale)
+static double* build_doublepole_1eff (int nc, double rate, double fcenter, double bandwidth, double scale)
 {
 	// nc - number of impulse response values, POWER OF TWO
 	// rate - sample_rate (samples/second)
@@ -258,7 +275,7 @@ void setGain_doublepole (DOUBLEPOLE a, double gain)
 	_aligned_free (impulse);
 }
 
-void CalcDoublepoleFilter (DOUBLEPOLE a, double f_center, double bandwidth, double gain)
+static void CalcDoublepoleFilter (DOUBLEPOLE a, double f_center, double bandwidth, double gain)
 {
 	if ((a->f_center != f_center) || (a->bandwidth != bandwidth) || (a->gain != gain))
 	{

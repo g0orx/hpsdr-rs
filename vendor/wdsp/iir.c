@@ -26,13 +26,115 @@ warren@wpratt.com
 
 #include "comm.h"
 
+typedef struct _snotch
+{
+	int run;
+	int size;
+	double* in;
+	double* out;
+	double rate;
+	double f;
+	double bw;
+	double a0, a1, a2, b1, b2;
+	double x0, x1, x2, y1, y2;
+	CRITICAL_SECTION cs_update;
+} snotch, *SNOTCH;
+
+typedef struct _speak
+{
+	int run;
+	int size;
+	double* in;
+	double* out;
+	double rate;
+	double f;
+	double bw;
+	double cbw;
+	double gain;
+	double fgain;
+	int nstages;
+	int design;
+	double a0, a1, a2, b1, b2;
+	double *x0, *x1, *x2, *y0, *y1, *y2;
+	CRITICAL_SECTION cs_update;
+} speak, *SPEAK;
+
+typedef struct _mpeak
+{
+	int run;
+	int size;
+	double* in;
+	double* out;
+	int rate;
+	int npeaks;
+	int* enable;
+	double* f;
+	double* bw;
+	double* gain;
+	int nstages;
+	SPEAK* pfil;
+	double* tmp;
+	double* mix;
+	CRITICAL_SECTION cs_update;
+} mpeak, *MPEAK;
+
+typedef struct _bqlp
+{
+	int run;
+	int size;
+	double* in;
+	double* out;
+	double rate;
+	double fc;
+	double Q;
+	double gain;
+	int nstages;
+	double a0, a1, a2, b1, b2;
+	double* x0, * x1, * x2, * y0, * y1, * y2;
+	CRITICAL_SECTION cs_update;
+} bqlp, *BQLP;
+
+typedef struct _bqbp
+{
+	int run;
+	int size;
+	double* in;
+	double* out;
+	double rate;
+	double f_low;
+	double f_high;
+	double gain;
+	int nstages;
+	double a0, a1, a2, b1, b2;
+	double* x0, * x1, * x2, * y0, * y1, * y2;
+	CRITICAL_SECTION cs_update;
+} bqbp, * BQBP;
+
+typedef struct _sphp
+{
+	int run;
+	int size;
+	double* in;
+	double* out;
+	double rate;
+	double fc;
+	int nstages;
+	double a1, b0, b1;
+	double* x0, * x1, * y0, * y1;
+	CRITICAL_SECTION cs_update;
+} sphp, * SPHP;
+
 /********************************************************************************************************
 *																										*
 *											Bi-Quad Notch												*
 *																										*
 ********************************************************************************************************/
 
-void calc_snotch (SNOTCH a)
+static void flush_bqbp(BQBP a);
+static void flush_bqlp(BQLP a);
+static void flush_dbqbp(BQBP a);
+
+static void calc_snotch (SNOTCH a)
 {
 	double fn, qk, qr, csn;
 	fn = a->f / (double)a->rate;
@@ -140,7 +242,7 @@ void SetSNCTCSSRun (SNOTCH a, int run)
 *																										*
 ********************************************************************************************************/
 
-void calc_speak (SPEAK a)
+static void calc_speak (SPEAK a)
 {
 	double ratio;	
 	double f_corr, g_corr, bw_corr, bw_parm, A, f_min;
@@ -363,7 +465,7 @@ void SetRXABiQuadGain (int channel, double gain)
 *																										*
 ********************************************************************************************************/
 
-void calc_mpeak (MPEAK a)
+static void calc_mpeak (MPEAK a)
 {
 	int i;
 	a->tmp = (double *) malloc0 (a->size * sizeof (complex));
@@ -383,7 +485,7 @@ void calc_mpeak (MPEAK a)
 	}
 }
 
-void decalc_mpeak (MPEAK a)
+static void decalc_mpeak (MPEAK a)
 {
 	int i;
 	for (i = 0; i < a->npeaks; i++)
@@ -553,7 +655,7 @@ void SetRXAmpeakFilGain (int channel, int fil, double gain)
 *																										*
 ********************************************************************************************************/
 
-void calc_bqlp(BQLP a)
+static void calc_bqlp(BQLP a)
 {
 	double w0, cs, c, den;
 	w0 = TWOPI * a->fc / (double)a->rate;
@@ -603,7 +705,7 @@ void destroy_bqlp(BQLP a)
 	_aligned_free(a);
 }
 
-void flush_bqlp(BQLP a)
+static void flush_bqlp(BQLP a)
 {
 	int i;
 	for (i = 0; i < a->nstages; i++)
@@ -670,7 +772,7 @@ void setSize_bqlp(BQLP a, int size)
 *																										*
 ********************************************************************************************************/
 
-void calc_dbqlp(BQLP a)
+static void calc_dbqlp(BQLP a)
 {
 	double w0, cs, c, den;
 	w0 = TWOPI * a->fc / (double)a->rate;
@@ -784,7 +886,7 @@ void setSize_dbqlp(BQLP a, int size)
 *																										*
 ********************************************************************************************************/
 
-void calc_bqbp(BQBP a)
+static void calc_bqbp(BQBP a)
 {
 	double f0, w0, bw, q, sn, cs, c, den;
 	bw = a->f_high - a->f_low;
@@ -838,7 +940,7 @@ void destroy_bqbp(BQBP a)
 	_aligned_free(a);
 }
 
-void flush_bqbp(BQBP a)
+static void flush_bqbp(BQBP a)
 {
 	int i;
 	for (i = 0; i < a->nstages; i++)
@@ -905,7 +1007,7 @@ void setSize_bqbp(BQBP a, int size)
 *																										*
 ********************************************************************************************************/
 
-void calc_dbqbp(BQBP a)
+static void calc_dbqbp(BQBP a)
 {
 	double f0, w0, bw, q, sn, cs, c, den;
 	bw = a->f_high - a->f_low;
@@ -959,7 +1061,7 @@ void destroy_dbqbp(BQBP a)
 	_aligned_free(a);
 }
 
-void flush_dbqbp(BQBP a)
+static void flush_dbqbp(BQBP a)
 {
 	int i;
 	for (i = 0; i < a->nstages; i++)
@@ -1022,7 +1124,7 @@ void setSize_dbqbp(BQBP a, int size)
 *																										*
 ********************************************************************************************************/
 
-void calc_sphp(SPHP a)
+static void calc_sphp(SPHP a)
 {
 	double g;
 	a->x0 = (double*)malloc0(a->nstages * sizeof(complex));
@@ -1050,7 +1152,7 @@ SPHP create_sphp(int run, int size, double* in, double* out, double rate, double
 	return a;
 }
 
-void decalc_sphp(SPHP a)
+static void decalc_sphp(SPHP a)
 {
 	_aligned_free(a->y1);
 	_aligned_free(a->y0);
@@ -1065,7 +1167,7 @@ void destroy_sphp(SPHP a)
 	_aligned_free(a);
 }
 
-void flush_sphp(SPHP a)
+static void flush_sphp(SPHP a)
 {
 	memset(a->x0, 0, a->nstages * sizeof(complex));
 	memset(a->x1, 0, a->nstages * sizeof(complex));
@@ -1127,7 +1229,7 @@ void setSize_sphp(SPHP a, int size)
 *																										*
 ********************************************************************************************************/
 
-void calc_dsphp(SPHP a)
+static void calc_dsphp(SPHP a)
 {
 	double g;
 	a->x0 = (double*)malloc0(a->nstages * sizeof(double));
@@ -1155,7 +1257,7 @@ SPHP create_dsphp(int run, int size, double* in, double* out, double rate, doubl
 	return a;
 }
 
-void decalc_dsphp(SPHP a)
+static void decalc_dsphp(SPHP a)
 {
 	_aligned_free(a->y1);
 	_aligned_free(a->y0);
@@ -1170,7 +1272,7 @@ void destroy_dsphp(SPHP a)
 	_aligned_free(a);
 }
 
-void flush_dsphp(SPHP a)
+static void flush_dsphp(SPHP a)
 {
 	memset(a->x0, 0, a->nstages * sizeof(double));
 	memset(a->x1, 0, a->nstages * sizeof(double));

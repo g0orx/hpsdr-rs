@@ -24,6 +24,26 @@ warren@pratt.one
 
 */
 
+/*  TRAINING DATA ATTRIBUTION
+
+	The clean speech used to train this model is from the LibriSpeech ASR corpus:
+
+	    LibriSpeech ASR corpus, Copyright (C) 2014 Vassil Panayotov.
+	    https://www.openslr.org/12/
+
+	    V. Panayotov, G. Chen, D. Povey, and S. Khudanpur, "Librispeech:  An ASR
+	    corpus based on public domain audio books," Proc. IEEE International
+	    Conference on Acoustics, Speech and Signal Processing (ICASSP), 2015,
+	    pp. 5206-5210.
+
+	LibriSpeech is licensed under the Creative Commons Attribution 4.0
+	International License (CC BY 4.0), https://creativecommons.org/licenses/by/4.0/,
+	and is provided by its licensor as-is, without warranties of any kind.
+
+	This file holds only the trained model weights.  It contains no LibriSpeech
+	audio or text.
+*/
+
 /*  The built-in neural noise reduction model.
 
 	GENERATED FILE - do not edit.  Produced by:

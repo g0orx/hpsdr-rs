@@ -26,6 +26,57 @@ warren@wpratt.com
 
 #include "comm.h"
 
+typedef struct _nob
+{
+	int run;
+	int buffsize;					// size of input/output buffer
+	double* in;						// input buffer
+	double* out;					// output buffer
+	int mode;
+	int dline_size;					// length of delay line which is 'double dline[length][2]'
+	double *dline;					// pointer to delay line
+	int *imp;
+	double samplerate;				// samplerate, used to convert times into sample counts
+	double advslewtime;						// transition time, signal<->zero
+	double advtime;					// deadtime (zero output) in advance of detected noise
+	double hangslewtime;
+	double hangtime;				// time to stay at zero after noise is no longer detected
+	double max_imp_seq_time;
+	int filterlen;
+	double *fcoefs;
+	double *bfbuff;
+	int bfb_in_idx;
+	double *ffbuff;
+	int ffb_in_idx;
+	double backtau;					// time constant used in averaging the magnitude of the input signal
+	double threshold;				// triggers if (noise > threshold * average_signal_magnitude)
+    double *awave;                   // pointer to array holding transition waveform
+	double *hwave;
+    int state;                      // state of the state machine
+    double avg;                     // average value of the signal magnitude
+    int time;                       // count when decreasing the signal magnitude
+	int adv_slew_count;
+    int adv_count;                  // number of samples to equal 'tau' time
+    int hang_count;                 // number of samples to equal 'hangtime' time
+    int hang_slew_count;            // number of samples to equal 'advtime' time
+	int max_imp_seq;
+	int blank_count;
+    int in_idx;                     // ring buffer position into which new samples are inserted
+	int scan_idx;
+    int out_idx;                    // ring buffer position from which delayed samples are pulled
+    double backmult;				// multiplier for waveform averaging
+    double ombackmult;				// multiplier for waveform averaging
+	double I1, Q1;
+	double I2, Q2;
+	double I, Q;
+	double Ilast, Qlast;
+	double deltaI, deltaQ;
+	double Inext, Qnext;
+	int overflow;
+	CRITICAL_SECTION cs_update;
+	double *legacy;																										////////////  legacy interface - remove
+} nob, *NOB;
+
 #define MAX_ADV_SLEW_TIME			(0.002)
 #define MAX_ADV_TIME				(0.002)
 #define MAX_HANG_SLEW_TIME			(0.002)
@@ -33,7 +84,7 @@ warren@wpratt.com
 #define MAX_SEQ_TIME				(0.025)
 #define MAX_SAMPLERATE				(1536000.0)
 
-void init_nob (NOB a)
+static void init_nob (NOB a)
 {
 	int i;
 	double coef;
@@ -602,7 +653,7 @@ void pSetRCVRNOBThreshold (NOB a, double thresh)
 ********************************************************************************************************/
 
 #define MAX_EXT_NOBS	(32)						// maximum number of NOBs called from outside wdsp
-__declspec (align (16)) NOB pnob[MAX_EXT_NOBS];		// array of pointers for NOBs used EXTERNAL to wdsp
+static __declspec (align (16)) NOB pnob[MAX_EXT_NOBS];		// array of pointers for NOBs used EXTERNAL to wdsp
 
 PORT
 void create_nobEXT	(

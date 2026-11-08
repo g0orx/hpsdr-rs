@@ -26,7 +26,45 @@ warren@pratt.one
 
 #include "comm.h"
 
-void start_syncbthread (SYNCB a)
+typedef struct _syncb
+{
+	void (*exf)(void);							// pointer to function to execute after output buffer is filled
+	double** out;								// pointer to array of output buffers
+	int nstreams;								// number of streams of data being buffered
+	int   max_in_size;							// max input number of complex samples
+	int   max_outsize;							// max output number of complex samples
+	int   r1_outsize;							// number of complex samples taken out of the ring for processing 
+
+	int   r1_size;								// size of a single maximum sized transfer
+	int   r1_active_buffsize;					// size of ring (in complex samples)
+	
+	double** r1_baseptr;						// array of pointers, one to each ring
+	int   r1_inidx;								// in 'double', actual index into the buffer is 2 times this
+	int   r1_outidx;							// in 'double', actual index into the buffer is 2 times this
+	int   r1_unqueuedsamps;						// number of input samples not yet queued/released for execution
+	volatile long run;							// when 1, thread loops; when 0, thread terminates
+	volatile long accept;						// flag indicating whether accepting input data
+	HANDLE Sem_BuffReady;						// count = number of output-sized buffers queued for processing
+	CRITICAL_SECTION csOUT;						// used to block output while parameters are updated or buffers flushed
+	CRITICAL_SECTION csIN;						// used to block input while parameters are updated or buffers flushed
+} syncb, *SYNCB;
+
+typedef struct _dumfilt
+{
+	int run;									// run flag
+	int rsize;									// ring size (complex samples)
+	int delay;									// delay (complex samples)
+	int opsize;									// number of complex samples exchanged per call
+	int inidx;									// input index into ring (complex samples)
+	int outidx;									// output index from ring (complex samples)
+	double* in;									// pointer to input buffer  (may be same as output buffer)
+	double* out;								// pointer to output buffer  (may be same as input buffer)
+	double* ring;								// pointer to ring buffer
+} dumfilt, *DUMFILT;
+
+static void syncb_main (void *p);
+
+static void start_syncbthread (SYNCB a)
 {
 	HANDLE handle = (HANDLE) _beginthread(syncb_main, 0, (void *)a);
 	SetThreadPriority (handle, THREAD_PRIORITY_HIGHEST);
@@ -83,7 +121,7 @@ void destroy_syncbuffs (SYNCB a)
 	_aligned_free (a);
 }
 
-void flush_syncbuffs (SYNCB a)
+static void flush_syncbuffs (SYNCB a)
 {
 	int i;
 	for (i = 0; i < a->nstreams; i++)
@@ -129,7 +167,7 @@ void Syncbound (SYNCB a, int nsamples, double** in)
 	}
 }
 
-void syncbdata (SYNCB a)
+static void syncbdata (SYNCB a)
 {
 	int i;
 	int first, second;
@@ -159,7 +197,7 @@ void syncbdata (SYNCB a)
 	LeaveCriticalSection (&a->csOUT);
 }
 
-void syncb_main (void *p)
+static void syncb_main (void *p)
 {
 	SYNCB a = (SYNCB)p;
 	

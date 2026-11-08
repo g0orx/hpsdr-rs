@@ -26,6 +26,18 @@ warren@wpratt.com
 
 #include "comm.h"
 
+typedef struct _ammod
+{
+	int run;
+	int mode;
+	int size;
+	double* in;
+	double* out;
+	double c_level;
+	double a_level;
+	double mult;
+}ammod, *AMMOD;
+
 AMMOD create_ammod (int run, int mode, int size, double* in, double* out, double c_level)
 {
 	AMMOD a = (AMMOD) malloc0 (sizeof (ammod));
@@ -92,6 +104,21 @@ void setSamplerate_ammod (AMMOD a, int rate)
 void setSize_ammod (AMMOD a, int size)
 {
 	a->size = size;
+}
+
+int getRun_ammod (AMMOD a)
+{
+	return a->run;
+}
+
+void setRun_ammod (AMMOD a, int run)
+{
+	a->run = run;
+}
+
+void setMode_ammod (AMMOD a, int mode)
+{
+	a->mode = mode;
 }
 
 /********************************************************************************************************

@@ -60,10 +60,10 @@ typedef struct _icfir
 	FIRCORE p;
 } icfir, * ICFIR;
 
-void icfir_impulse(ICFIRIMP a, int N, int DD, int R, int Pairs, double runrate, double cicrate, 
+static void icfir_impulse(ICFIRIMP a, int N, int DD, int R, int Pairs, double runrate, double cicrate, 
 	double cutoff, int xtype, double xbw, int rtype, double scale, int wintype);
 
-ICFIRIMP build_icfir_impulse(int nc, int wintype)
+static ICFIRIMP build_icfir_impulse(int nc, int wintype)
 {
 	ICFIRIMP s = (ICFIRIMP)malloc0(sizeof(icfirimp));
 	s->nc = nc;
@@ -75,7 +75,7 @@ ICFIRIMP build_icfir_impulse(int nc, int wintype)
 	return s;
 }
 
-void teardown_icfir_impulse(ICFIRIMP s)
+static void teardown_icfir_impulse(ICFIRIMP s)
 {
 	destroy_fsamp(s->pfsamp);
 	_aligned_free(s->impulse);
@@ -84,7 +84,7 @@ void teardown_icfir_impulse(ICFIRIMP s)
 	_aligned_free(s);
 }
 
-void calc_icfir (ICFIR a)
+static void calc_icfir (ICFIR a)
 {
 	a->picfirimp = build_icfir_impulse(a->nc, a->wintype);
 	a->scale = 1.0 / (double)(2 * a->size);
@@ -93,7 +93,7 @@ void calc_icfir (ICFIR a)
 	a->p = create_fircore (a->size, a->in, a->out, a->nc, a->mp, 16, a->picfirimp->impulse);
 }
 
-void decalc_icfir (ICFIR a)
+static void decalc_icfir (ICFIR a)
 {
 	destroy_fircore (a->p);
 	teardown_icfir_impulse(a->picfirimp);
@@ -183,7 +183,7 @@ void setOutRate_icfir (ICFIR a, int rate)
 	calc_icfir (a);
 }
 
-void icfir_impulse (ICFIRIMP a, int N, int DD, int R, int Pairs, double runrate, double cicrate, 
+static void icfir_impulse (ICFIRIMP a, int N, int DD, int R, int Pairs, double runrate, double cicrate, 
 	double cutoff, int xtype, double xbw, int rtype, double scale, int wintype)
 {
 	// N:		number of impulse response samples

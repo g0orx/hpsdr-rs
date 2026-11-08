@@ -94,7 +94,7 @@ static void* zmalloc(int size)
     return p;
 }
 
-STLOWESS build_lowess(int n)
+static STLOWESS build_lowess(int n)
 {
     STLOWESS s = (STLOWESS)zmalloc(sizeof(stlowess));
     s->rw = (double*)zmalloc(n * sizeof(double));
@@ -127,7 +127,7 @@ EXTRAP0 build_extrap0(int n)
     return a;
 }
 
-void teardown_lowess(STLOWESS s)
+static void teardown_lowess(STLOWESS s)
 {
     _aligned_free(s->resid_sorted);
     _aligned_free(s->resid);

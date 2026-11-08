@@ -28,9 +28,141 @@ warren@wpratt.com
 
 #include "comm.h"
 
-DP pdisp[dMAX_DISPLAYS];
+typedef struct _dp
+{
+	int max_size;											// maximum fft size to be used
+	int max_num_fft;										// maximum number of LO positions per sub-span to be used
+	int max_stitch;											// maximum number of sub-spans to be concatenated
+															//		NOTE:  max_size, max_num_fft, and max_stitch MUST BE <= THE
+															//		CORRESPONDING VALUES IN <analyzer.h>!!
+	int num_fft;											// current number of ffts in use
+	int num_pixout;											// current number of detector/averages/pixel value outputs
+	int size;												// current size of fft input sample vector
+	int out_size;											// current size of fft output vector
+	int window_type;										// type of the window function to be applied
+	int overlap;											// number of samples re-used per fft, range 0 to size-1
+	int flip[dMAX_NUM_FFT];									// 0 for low-side LO => do NOT flip; 1 for high-side LO => FLIP
+	int clip;												// number of bins to clip off on EACH end of the sub-span fft
+															//		ASSUMES size/2 IS AN EVEN NUMBER!!!
+	double fsclipL;											// number of intervals to clip off the lower end of the TOTAL SPAN
+	double fsclipH;											// number of intervals to clip off the upper end of the TOTAL SPAN
+	int fscL;												// fsclipL modulo (out_size - 2 * clip)
+	int fscH;												// fsclipH modulo (out_size - 2 * clip)
+	int begin_ss;											// number of first sub-span that is NOT completely clipped off
+	int end_ss;												// number of last sub-span that is NOT completely clipped off
+	int ss_bins[dMAX_STITCH];								// number of bins delivered by eliminate()/Celiminate in each sub-span
+	volatile LONG input_busy[dMAX_STITCH][dMAX_NUM_FFT];
+	int num_pixels;											// number of pixels requested
+	int num_stitch;											// number of results to be stitched together to generate the pixel frame
+	unsigned long long stitch_flag;
+	int spec_flag[dMAX_STITCH];								// flags showing if all ffts for a sub-span are done so elimination can proceed
+	double pix_per_bin;										// number of pixels per fft bin, note that this is fractional, not integral
+	double det_offset;										// offset needed in detector
+	double bin_per_pix;										// number of fft bins per pixel, this is fractional and != 1.0/pix_per_bin
+	double scale;											// output amplitude scale factor
+	double PiAlpha;											// parameter for Kaiser window function
 
-double bessi0(double x)
+	int cal_set;											// specifies which set of calibration data to use
+	double f_min;											// frequency at first pixel (for calibration)
+	double f_max;											// frequency at last pixel (for calibration)
+	int cal_changed;										// flag to indicate that the calibration data has changed
+
+	double *window;											// pointer to buffer to hold window coefficients	
+	double *result[dMAX_STITCH];							// pointers to buffer to hold elimination results for each sub-span
+	dOUTREAL *pixels[dMAX_PIXOUTS][dNUM_PIXEL_BUFFS];		// pointers pixel output buffers
+	double *t_pixels[dMAX_PIXOUTS];							// pointer to temporary pixel buffer									//pointer to temporary pixel buffer for non-averaged data
+	int w_pix_buff[dMAX_PIXOUTS];							// number of pixel buffer owned by writing process
+	int r_pix_buff[dMAX_PIXOUTS];							// number of pixel buffer owned by reading process
+	int last_pix_buff[dMAX_PIXOUTS];						// number of the last pixel buffer written
+	volatile LONG pb_ready[dMAX_PIXOUTS][dNUM_PIXEL_BUFFS];	// if value is 0, this data has already been read; 1 = fresh data to read
+	int num_average[dMAX_PIXOUTS];							// number of spans to average to create the pixels
+	int avail_frames[dMAX_PIXOUTS];							// number of pixel frames currently available to average
+	int av_in_idx[dMAX_PIXOUTS];							// input index in averaging pixel buffer ring
+	int av_out_idx[dMAX_PIXOUTS];							// output index in averaging pixel buffer ring
+	double *av_sum[dMAX_PIXOUTS];							// pointer to sum buffer for averaging
+	double *av_buff[dMAX_PIXOUTS][dMAX_AVERAGE];			// pointers to ring of buffers to hold pixel frames for averaging
+	double *pre_av_out;
+	int av_mode[dMAX_PIXOUTS];
+	double av_backmult[dMAX_PIXOUTS];						// back multiplier for weighted averaging
+	double *cd;												// pointer to amplitude calibration buffer
+	int n_freqs[dMAX_CAL_SETS];								// number of frequencies in each calibration set
+	double *freqs[dMAX_CAL_SETS];							// pointers to vectors of calibration frequencies
+	double (*ac3[dMAX_CAL_SETS][dMAX_M]);					// pointers to amplitude interpolant coefficients
+	double (*ac2[dMAX_CAL_SETS][dMAX_M]);
+	double (*ac1[dMAX_CAL_SETS][dMAX_M]);
+	double (*ac0[dMAX_CAL_SETS][dMAX_M]);
+
+	fftw_plan plan[dMAX_STITCH][dMAX_NUM_FFT];				// fftw plans
+	fftw_plan Cplan[dMAX_STITCH][dMAX_NUM_FFT];
+	double *fft_in[dMAX_STITCH][dMAX_NUM_FFT];				// pointers to fftw real input vectors
+	fftw_complex *Cfft_in[dMAX_STITCH][dMAX_NUM_FFT];		// pointers to fftw complex input vectors
+	fftw_complex *fft_out[dMAX_STITCH][dMAX_NUM_FFT];		// pointers to fftw complex output vectors
+	volatile LONG *pnum_threads;							// pointer to current number of active worker threads
+	// [stop and end_dispatcher are written by one thread and read by others, so, like
+	// dispatcher, they are set, cleared and read with the Interlocked functions.
+	// Through 2.11 they were plain int.]
+	volatile LONG stop;										// when set, fft threads will be returned to the pool
+	volatile LONG end_dispatcher;							// set this flag to one to destroy the dispatcher thread
+	volatile int dispatcher;								// one if the dispatcher thread is alive & active
+	int ss;													// sub-span being processed
+	int LO;													// LO (within current sub-span) being processed 
+	int flag;
+	int have_samples[dMAX_STITCH][dMAX_NUM_FFT];			// number of unused samples remaining in a buffer
+	int type;												// 0 for REAL, 1 for COMPLEX
+	int incr;												// size - overlap
+	int buff_size;											// amount of data to be stored each time an input buffer is opened and closed = JanusAudio/BlockSize
+	dINREAL* I_samples[dMAX_STITCH][dMAX_NUM_FFT];			// pointers to current input position in I/Q buffers
+	dINREAL* Q_samples[dMAX_STITCH][dMAX_NUM_FFT];
+	int bsize;												// size of I_samples[][] and Q_samples[][] (number of samples they hold)
+	int IQout_index[dMAX_STITCH][dMAX_NUM_FFT];				// current output index for I_samples[ss][LO] and Q_samples[ss][LO]
+	int IQO_idx[dMAX_STITCH][dMAX_NUM_FFT];
+	int IQin_index[dMAX_STITCH][dMAX_NUM_FFT];				// current input index for I_samples[ss][LO] and Q_samples[ss][LO]
+	volatile LONG buff_ready[dMAX_STITCH][dMAX_NUM_FFT];	// 1 if buffer ready to read; 0 if needs to be filled
+	int max_writeahead;										// max allowed input samples ahead of where reading output samples
+
+	volatile LONG snap[dMAX_STITCH][dMAX_NUM_FFT];			// set to 1 to allow a snap of raw spectrum data
+	HANDLE hSnapEvent[dMAX_STITCH][dMAX_NUM_FFT];			// mutex handles; mutexes will be used to signal a snap is complete
+	double *snap_buff[dMAX_STITCH][dMAX_NUM_FFT];			// pointers to buffers for the snap
+
+	CRITICAL_SECTION PB_ControlsSection[dMAX_PIXOUTS];
+	CRITICAL_SECTION SetAnalyzerSection;
+	CRITICAL_SECTION BufferControlSection[dMAX_STITCH][dMAX_NUM_FFT];
+	CRITICAL_SECTION StitchSection;
+	CRITICAL_SECTION EliminateSection[dMAX_STITCH];
+	CRITICAL_SECTION ResampleSection;
+
+	int det_type[dMAX_PIXOUTS];								// detector type
+	double inv_coherent_gain;
+	double inherent_power_gain;
+	double inv_enb;
+	double norm_oneHz;										// dB factor to normalize to one Hz bandwidth
+	int sample_rate;										// sample rate; used for normalization calculations
+	int normalize[dMAX_PIXOUTS];
+
+	// BEGIN CODE TO GET MAX FFT_BIN WITHIN A FREQUENCY RANGE
+	int dmb_run;
+	int dmb_disp;
+	int dmb_ss;
+	int dmb_LO;
+	double dmb_rate;
+	double dmb_fLow;
+	double dmb_fHigh;
+	double dmb_tau;
+	int dmb_frame_rate;
+	int dmb_begin0;
+	int dmb_end0;
+	int dmb_begin1;
+	int dmb_end1;
+	double dmb_decay;
+	double dmb_max_dB;
+	CRITICAL_SECTION cs_dmb;
+	// END CODE TO GET MAX FFT_BIN WITHIN A FREQUENCY RANGE
+
+}  dp, *DP;
+
+static DP pdisp[dMAX_DISPLAYS];
+
+static double bessi0(double x)
 {
 	double ax,ans;
 	double y;
@@ -49,7 +181,7 @@ double bessi0(double x)
 	return ans;
 }
 
-void new_window(int disp, int type, int size, double PiAlpha)
+static void new_window(int disp, int type, int size, double PiAlpha)
 {
 	DP a = pdisp[disp];
 	int i;
@@ -177,7 +309,7 @@ void new_window(int disp, int type, int size, double PiAlpha)
 }
 
 // spur elimination, REAL input data
-void eliminate(int disp, int ss, int LO)
+static void eliminate(int disp, int ss, int LO)
 {
 	DP a = pdisp[disp];
 	int i, k, begin, end, ilim;
@@ -212,7 +344,7 @@ void eliminate(int disp, int ss, int LO)
 }
 
 // spur elimination, COMPLEX input data
-void Celiminate(int disp, int ss, int LO)
+static void Celiminate(int disp, int ss, int LO)
 {
 	DP a = pdisp[disp];
 	int i, k, begin0, end0, begin1, end1, ilim;
@@ -280,7 +412,7 @@ void Celiminate(int disp, int ss, int LO)
 	a->ss_bins[ss] = k;
 }
 
-void detector (	int det_type,			// detector type
+static void detector (	int det_type,			// detector type
 				int m,					// number of bins
 				int num_pixels,			// number of output pixels
 				double pix_per_bin,		// pixels per bin
@@ -461,7 +593,7 @@ void detector (	int det_type,			// detector type
 	
 }
 
-void avenger (  int av_mode,				// averaging mode
+static void avenger (  int av_mode,				// averaging mode
 				int num_pixels,				// number of pixels
 				int* avail_frames,			// number of available frames for window averaging
 				int num_average,			// number of frames to average within a window
@@ -553,7 +685,7 @@ void avenger (  int av_mode,				// averaging mode
 			pixels[i] += (dOUTREAL)norm_oneHz;
 }
 
-void stitch(int disp)
+static void stitch(int disp)
 {
 	DP a = pdisp[disp];
 	int i, j, k, n, m;
@@ -600,7 +732,7 @@ void stitch(int disp)
 	}
 }
 
-DWORD WINAPI spectra (void *pargs)
+static DWORD WINAPI spectra (void *pargs)
 {
 	int i, j;
 	int disp = ((int)(uintptr_t)pargs) >> 12;
@@ -608,7 +740,7 @@ DWORD WINAPI spectra (void *pargs)
 	int LO = ((int)(uintptr_t)pargs) & 15;
 	DP a = pdisp[disp];
 
-	if (a->stop)
+	if (_InterlockedAnd (&a->stop, 1))
 	{
 		InterlockedDecrement(a->pnum_threads);
 		return 0;
@@ -623,14 +755,14 @@ DWORD WINAPI spectra (void *pargs)
 				 a->IQO_idx[ss][LO] -= a->bsize;
 		}
 
-		if (a->stop)
+		if (_InterlockedAnd (&a->stop, 1))
 		{
 			InterlockedDecrement(a->pnum_threads);
 			return 0;
 		}
 		fftw_execute (a->plan[ss][LO]);
 	}
-	if (a->stop)
+	if (_InterlockedAnd (&a->stop, 1))
 	{
 		InterlockedDecrement(a->pnum_threads);
 		return 0;
@@ -653,10 +785,15 @@ DWORD WINAPI spectra (void *pargs)
 		{
 			a->stitch_flag = 0;
 			LeaveCriticalSection(&a->StitchSection);
+			stitch(disp);
+			// [2026-11:  'input_busy' is now cleared AFTER stitch(), not before it.  Clearing it
+			// first let sendbuf() dispatch the next frame's work items while stitch() was still
+			// reading result[] and ss_bins[]; their (C)eliminate() could then overwrite those
+			// arrays mid-copy (a display frame mixing two FFTs), and two stitch() calls could
+			// overlap on the pixel buffers.  The next frame's FFTs now start one stitch() later.]
 			for (j = 0; j < dMAX_STITCH; j++)
 				for (i = 0; i < dMAX_NUM_FFT; i++)
 					InterlockedBitTestAndReset(&(a->input_busy[j][i]), 0);
-			stitch(disp);
 		}
 		else
 			LeaveCriticalSection(&a->StitchSection);
@@ -676,7 +813,7 @@ DWORD WINAPI spectra (void *pargs)
 
 // Call in XCreateAnalyzer(...)
 // This gets initialized for each 'disp' that is set up.
-void Init_DetectMaxBin(int disp)
+static void Init_DetectMaxBin(int disp)
 {
 	DP a = pdisp[disp];
 	InitializeCriticalSectionAndSpinCount(&a->cs_dmb, 2500);
@@ -695,14 +832,14 @@ void Init_DetectMaxBin(int disp)
 }
 
 // Call in DestroyAnalyzer(...)
-void Destroy_DetectMaxBin(int disp)
+static void Destroy_DetectMaxBin(int disp)
 {
 	DP a = pdisp[disp];
 	DeleteCriticalSection(&a->cs_dmb);
 }
 
 // Called from SetupDetectMaxBin(...) AND anytime 'size' changes, e.g., in SetAnalyzer(...)
-void calc_dmb(int disp, int size)
+static void calc_dmb(int disp, int size)
 {
 	DP a = pdisp[disp];
 	double bin_spacing, min_freq, max_freq;
@@ -783,7 +920,7 @@ void SetupDetectMaxBin(int run, int disp, int ss, int LO, double rate,
 }
 
 // Call this function in 'Cspectra(...)', after the FFT.
-void DetectMaxBin(int disp, int ss, int LO)
+static void DetectMaxBin(int disp, int ss, int LO)
 {
 	DP a = pdisp[disp];
 	int i;
@@ -834,7 +971,7 @@ double GetDetectMaxBin(int disp)
 *																										*
 ********************************************************************************************************/
 
-DWORD WINAPI Cspectra (void *pargs)
+static DWORD WINAPI Cspectra (void *pargs)
 {
 	int i, j;
 	int disp = ((int)(uintptr_t)pargs) >> 12;
@@ -843,7 +980,7 @@ DWORD WINAPI Cspectra (void *pargs)
 	DP a = pdisp[disp];
 	int trans_size = a->size * sizeof(double);
 
-	if (a->stop)
+	if (_InterlockedAnd (&a->stop, 1))
 	{
 		InterlockedDecrement(a->pnum_threads);
 		return 0;
@@ -859,7 +996,7 @@ DWORD WINAPI Cspectra (void *pargs)
 				 a->IQO_idx[ss][LO] -= a->bsize;
 		}
 
-		if (a->stop)
+		if (_InterlockedAnd (&a->stop, 1))
 		{
 			InterlockedDecrement(a->pnum_threads);
 			return 0;
@@ -872,7 +1009,7 @@ DWORD WINAPI Cspectra (void *pargs)
 
 	}
 
-	if (a->stop)
+	if (_InterlockedAnd (&a->stop, 1))
 	{
 		InterlockedDecrement(a->pnum_threads);
 		return 0;
@@ -902,10 +1039,15 @@ DWORD WINAPI Cspectra (void *pargs)
 		{
 			a->stitch_flag = 0;
 			LeaveCriticalSection(&a->StitchSection);
+			stitch(disp);
+			// [2026-11:  'input_busy' is now cleared AFTER stitch(), not before it.  Clearing it
+			// first let sendbuf() dispatch the next frame's work items while stitch() was still
+			// reading result[] and ss_bins[]; their (C)eliminate() could then overwrite those
+			// arrays mid-copy (a display frame mixing two FFTs), and two stitch() calls could
+			// overlap on the pixel buffers.  The next frame's FFTs now start one stitch() later.]
 			for (j = 0; j < dMAX_STITCH; j++)
 				for (i = 0; i < dMAX_NUM_FFT; i++)
 					InterlockedBitTestAndReset(&(a->input_busy[j][i]), 0);
-			stitch(disp);
 		}
 		else
 			LeaveCriticalSection(&a->StitchSection);
@@ -917,7 +1059,7 @@ DWORD WINAPI Cspectra (void *pargs)
 	return 1;
 }
 
-void interpolate(int disp, int set, double fmin, double fmax, int num_pixels)
+static void interpolate(int disp, int set, double fmin, double fmax, int num_pixels)
 {
 	DP a = pdisp[disp];
 	int i; 
@@ -929,6 +1071,19 @@ void interpolate(int disp, int set, double fmin, double fmax, int num_pixels)
 	int kdelta;
 	double dx;
 	double mag;
+
+	if (n < 3)
+	{	// [2026-11:  this calibration set has no interpolants.  Either SetCalibration () has
+		// not been called for it yet (n = 0), or it was given fewer than three distinct
+		// frequencies, which build_interpolants () rejects.  Use no correction, a factor of
+		// 1.0 as XCreateAnalyzer () sets it, until SetCalibration () supplies the set; its
+		// 'cal_changed' makes the next SetAnalyzer () interpolate again.  Through 2.11 the
+		// code below ran with n = 0, reading freqs[n - 1] and the coefficients at k = n - 2,
+		// both outside their arrays, when SetAnalyzer () came before SetCalibration ().]
+		for (i = 0; i < num_pixels; i++)
+			a->cd[i] = 1.0;
+		return;
+	}
 
 	for (i = 0; i < num_pixels; i++)
     {
@@ -971,7 +1126,7 @@ void interpolate(int disp, int set, double fmin, double fmax, int num_pixels)
 	return;
 }
 
-int build_interpolants(int disp, int set, int n, int m, double *x, double (*y)[dMAX_M])
+static int build_interpolants(int disp, int set, int n, int m, double *x, double (*y)[dMAX_M])
 {
 	DP a = pdisp[disp];
 	double dx[dMAX_N];
@@ -1055,10 +1210,32 @@ int build_interpolants(int disp, int set, int n, int m, double *x, double (*y)[d
     return 0;
 }
 
-void __cdecl sendbuf(void *arg)
+// The work items that sendbuf() queues.  Each runs spectra() or Cspectra() with
+// flush-to-zero on, so denormal results become zero (see wdsp_platform.h).  [A work
+// item runs on a thread that belongs to the system's thread pool, not to WDSP, so it
+// turns the mode off again afterwards if it was off before, and leaves the thread as
+// it found it.  Doing it here, rather than in spectra() and Cspectra(), covers their
+// early returns.]
+static DWORD WINAPI spectra_item (void *pargs)
+{
+	int was_on = flush_to_zero_on ();
+	DWORD rtn = spectra (pargs);
+	if (!was_on) flush_to_zero_off ();
+	return rtn;
+}
+
+static DWORD WINAPI Cspectra_item (void *pargs)
+{
+	int was_on = flush_to_zero_on ();
+	DWORD rtn = Cspectra (pargs);
+	if (!was_on) flush_to_zero_off ();
+	return rtn;
+}
+
+static void __cdecl sendbuf(void *arg)
 {
 	DP a = pdisp[(int)(uintptr_t)arg];
-	while(!a->end_dispatcher)
+	while (!_InterlockedAnd (&a->end_dispatcher, 1))
 	{
 		for (a->ss = 0; a->ss < a->num_stitch; a->ss++)
 			for (a->LO = 0; a->LO < a->num_fft; a->LO++)
@@ -1067,21 +1244,26 @@ void __cdecl sendbuf(void *arg)
 				{
 					InterlockedBitTestAndSet(&(a->input_busy[a->ss][a->LO]), 0);
 
+					// [2026-11:  the read index is now taken and advanced under BufferControlSection,
+					// together with the 'have_samples' decrement, and before the work item is queued.
+					// Spectrum(), Spectrum0(), Spectrum2() and CloseBuffer() move 'IQout_index' under
+					// that lock when they skip ahead on an overrun; reading and advancing it here
+					// without the lock could lose one of the two updates and point an FFT at the
+					// wrong span of the sample buffer.  Through 2.11 the index was read and advanced
+					// outside the lock, after the work item had been queued.]
+					EnterCriticalSection(&(a->BufferControlSection[a->ss][a->LO]));
 					a->IQO_idx[a->ss][a->LO] = a->IQout_index[a->ss][a->LO];
-					
-					InterlockedIncrement(a->pnum_threads);
-					if (a->type == 0)
-						QueueUserWorkItem(spectra, (void *)(((uintptr_t)arg << 12) + (a->ss << 4) + a->LO), 0);
-					else
-						QueueUserWorkItem(Cspectra, (void *)(((uintptr_t)arg << 12) + (a->ss << 4) + a->LO), 0);
-
 					if((a->IQout_index[a->ss][a->LO] += a->incr) >= a->bsize)
 						a->IQout_index[a->ss][a->LO] -= a->bsize;
-
-					EnterCriticalSection(&(a->BufferControlSection[a->ss][a->LO]));
 					if ((a->have_samples[a->ss][a->LO] -= a->incr) < a->size)
 						InterlockedBitTestAndReset(&(a->buff_ready[a->ss][a->LO]), 0);
 					LeaveCriticalSection(&(a->BufferControlSection[a->ss][a->LO]));
+
+					InterlockedIncrement(a->pnum_threads);
+					if (a->type == 0)
+						QueueUserWorkItem(spectra_item, (void *)(((uintptr_t)arg << 12) + (a->ss << 4) + a->LO), 0);
+					else
+						QueueUserWorkItem(Cspectra_item, (void *)(((uintptr_t)arg << 12) + (a->ss << 4) + a->LO), 0);
 				}
 			}
 		Sleep(1);
@@ -1090,7 +1272,7 @@ void __cdecl sendbuf(void *arg)
 	_endthread();
 }
 
-void CalcBandwidthNormalization (DP a)
+static void CalcBandwidthNormalization (DP a)
 {
 	double bin_width;
 	bin_width = (double)a->sample_rate / (double)a->size;
@@ -1195,10 +1377,10 @@ void SetAnalyzer (	int disp,			// display identifier
 	int i, j;
 
 	EnterCriticalSection(&a->SetAnalyzerSection);
-	a->end_dispatcher = 1;
+	InterlockedBitTestAndSet (&a->end_dispatcher, 0);
 	while (InterlockedAnd(&a->dispatcher, 1))
 		Sleep(1);
-	a->stop = 1;
+	InterlockedBitTestAndSet (&a->stop, 0);
 	while (_InterlockedAnd(a->pnum_threads, 1023))
 		Sleep(1);
 	a->num_pixout = n_pixout;
@@ -1310,8 +1492,8 @@ void SetAnalyzer (	int disp,			// display identifier
 			a->IQout_index[i][j] = 0;
 		}
 
-	a->stop = 0;
-	a->end_dispatcher = 0;
+	InterlockedBitTestAndReset (&a->stop, 0);
+	InterlockedBitTestAndReset (&a->end_dispatcher, 0);
 	LeaveCriticalSection(&a->SetAnalyzerSection);
 }
 
@@ -1338,7 +1520,11 @@ void XCreateAnalyzer(	int disp,
 	for (i = 0; i < a->max_stitch; i++)
 		for (j = 0; j < a->max_num_fft; j++)
 		{
-			a->hSnapEvent[i][j] = CreateEvent(NULL, FALSE, FALSE, TEXT("snap"));
+			// [Unnamed:  each sub-span and FFT of each analyzer gets its own event.  Through
+			// 2.11 every one was named "snap", and Windows gives every event of the same
+			// name the same kernel object, so a snapshot finishing on one display or
+			// sub-span could release a SnapSpectrum() wait on another.]
+			a->hSnapEvent[i][j] = CreateEvent(NULL, FALSE, FALSE, NULL);
 			a->snap[i][j] = 0;
 		}
 	InitializeCriticalSectionAndSpinCount(&a->ResampleSection, 0);
@@ -1427,9 +1613,20 @@ void DestroyAnalyzer(int disp)
 	DP a = pdisp[disp];
 	int i, j;
 
-	a->end_dispatcher = 1;
+	// Stop the dispatcher, then wait until every work item it queued (spectra() or
+	// Cspectra()) has finished, before freeing anything they use.  [The same sequence as
+	// SetAnalyzer().  Through 2.11 only the dispatcher was waited for, so a work item still
+	// running could use the buffers after they were freed.  The work items don't take
+	// SetAnalyzerSection, so waiting while holding it can't deadlock;  holding it keeps
+	// Spectrum0() and its relatives from restarting the dispatcher meanwhile.]
+	EnterCriticalSection(&a->SetAnalyzerSection);
+	InterlockedBitTestAndSet (&a->end_dispatcher, 0);
 	while (InterlockedAnd(&a->dispatcher, 1))
 		Sleep(1);
+	InterlockedBitTestAndSet (&a->stop, 0);
+	while (_InterlockedAnd(a->pnum_threads, 1023))
+		Sleep(1);
+	LeaveCriticalSection(&a->SetAnalyzerSection);
 
 	for (i = 0; i < a->max_stitch; i++)
 		for (j = 0; j < a->max_num_fft; j++)
@@ -1556,7 +1753,7 @@ void SnapSpectrumTimeout(	int disp,
 	}
 }
 
-int calcompare (const void * a, const void * b)
+static int calcompare (const void * a, const void * b)
 {
 	if (*(double*)a < *(double*)b)
 		return -1;

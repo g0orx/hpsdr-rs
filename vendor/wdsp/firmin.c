@@ -26,13 +26,86 @@ warren@wpratt.com
 
 #include "comm.h"
 
+typedef struct _firmin
+{
+	int run;				// run control
+	int position;			// position at which to execute
+	int size;				// input/output buffer size, power of two
+	double* in;				// input buffer
+	double* out;			// output buffer, can be same as input
+	int nc;					// number of filter coefficients, power of two
+	double f_low;			// low cutoff frequency
+	double f_high;			// high cutoff frequency
+	double* ring;			// internal complex ring buffer
+	double* h;				// complex filter coefficients
+	int rsize;				// ring size, number of complex samples, power of two
+	int mask;				// mask to update indexes
+	int idx;				// ring input/output index
+	double samplerate;		// sample rate
+	int wintype;			// filter window type
+	double gain;			// filter gain
+}firmin, *FIRMIN;
+
+typedef struct _firopt
+{
+	int run;				// run control
+	int position;			// position at which to execute
+	int size;				// input/output buffer size, power of two
+	double* in;				// input buffer
+	double* out;			// output buffer, can be same as input
+	int nc;					// number of filter coefficients, power of two, >= size
+	double f_low;			// low cutoff frequency
+	double f_high;			// high cutoff frequency
+	double samplerate;		// sample rate
+	int wintype;			// filter window type
+	double gain;			// filter gain
+	int nfor;				// number of buffers in delay line
+	double* fftin;			// fft input buffer
+	double** fmask;			// frequency domain masks
+	double** fftout;		// fftout delay line
+	double* accum;			// frequency domain accumulator
+	int buffidx;			// fft out buffer index
+	int idxmask;			// mask for index computations
+	double* maskgen;		// input for mask generation FFT
+	fftw_plan* pcfor;		// array of forward FFT plans
+	fftw_plan crev;			// reverse fft plan
+	fftw_plan* maskplan;	// plans for frequency domain masks
+} firopt, *FIROPT;
+
+typedef struct _fircore
+{
+	int size;				// input/output buffer size, power of two
+	double* in;				// input buffer
+	double* out;			// output buffer, can be same as input
+	int nc;					// number of filter coefficients, power of two, >= size
+	double* impulse;		// impulse response of filter
+	double* imp;
+	int nfor;				// number of buffers in delay line
+	double* fftin;			// fft input buffer
+	double*** fmask;		// frequency domain masks
+	double** fftout;		// fftout delay line
+	double* accum;			// frequency domain accumulator
+	int buffidx;			// fft out buffer index
+	int idxmask;			// mask for index computations
+	double* maskgen;		// input for mask generation FFT
+	fftw_plan* pcfor;		// array of forward FFT plans
+	fftw_plan crev;			// reverse fft plan
+	fftw_plan** maskplan;	// plans for frequency domain masks
+	CRITICAL_SECTION update;
+	int cset;
+	int mp;
+	int masks_ready;
+	int pfactor;
+	MINPHASE pminphase;
+} fircore, *FIRCORE;
+
 /********************************************************************************************************
 *																										*
 *											Time-Domain FIR												*
 *																										*
 ********************************************************************************************************/
 
-void calc_firmin (FIRMIN a)
+static void calc_firmin (FIRMIN a)
 {
 	a->h = fir_bandpass (a->nc, a->f_low, a->f_high, a->samplerate, a->wintype, 1, a->gain);
 	a->rsize = a->nc;
@@ -128,7 +201,7 @@ void setFreqs_firmin (FIRMIN a, double f_low, double f_high)
 *																										*
 ********************************************************************************************************/
 
-void plan_firopt (FIROPT a)
+static void plan_firopt (FIROPT a)
 {
 	// must call for change in 'nc', 'size', 'out'
 	int i;
@@ -152,7 +225,7 @@ void plan_firopt (FIROPT a)
 	a->crev = fftw_plan_dft_1d(2 * a->size, (fftw_complex *)a->accum, (fftw_complex *)a->out, FFTW_BACKWARD, FFTW_PATIENT);
 }
 
-void calc_firopt (FIROPT a)
+static void calc_firopt (FIROPT a)
 {
 	// call for change in frequency, rate, wintype, gain
 	// must also call after a call to plan_firopt()
@@ -189,7 +262,7 @@ FIROPT create_firopt (int run, int position, int size, double* in, double* out,
 	return a;
 }
 
-void deplan_firopt (FIROPT a)
+static void deplan_firopt (FIROPT a)
 {
 	int i;
 	fftw_destroy_plan (a->crev);
@@ -287,7 +360,7 @@ void setFreqs_firopt (FIROPT a, double f_low, double f_high)
 ********************************************************************************************************/
 
 
-void plan_fircore (FIRCORE a)
+static void plan_fircore (FIRCORE a)
 {
 	// must call for change in 'nc', 'size', 'out', 'pfactor'
 	int i;
@@ -320,7 +393,7 @@ void plan_fircore (FIRCORE a)
 	a->pminphase = create_minphase (a->nc, a->pfactor);
 }
 
-void calc_fircore (FIRCORE a, int flip)
+static void calc_fircore (FIRCORE a, int flip)
 {
 	// call for change in frequency, rate, wintype, gain
 	// must also call after a call to plan_firopt()
@@ -365,7 +438,7 @@ FIRCORE create_fircore (int size, double* in, double* out, int nc,
 	return a;
 }
 
-void deplan_fircore (FIRCORE a)
+static void deplan_fircore (FIRCORE a)
 {
 	destroy_minphase(a->pminphase);
 	fftw_destroy_plan (a->crev);

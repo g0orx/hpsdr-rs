@@ -22,7 +22,7 @@ typedef struct _snoop
 	double old_Q;
 } snoop, *SNOOP;
 
-SNOOP create_snoop(double* inbuff, int size, int rate, int ringtime)
+static SNOOP create_snoop(double* inbuff, int size, int rate, int ringtime)
 {
 	SNOOP a = (SNOOP)malloc0(sizeof(snoop));
 	a->detect_mode = 1;
@@ -46,6 +46,9 @@ SNOOP create_snoop(double* inbuff, int size, int rate, int ringtime)
 	return a;
 }
 
+// [Through 2.11 the parameter was declared as 'xsnoop(channel)', an old-style
+// definition with an implicit int.  MSVC accepts that; C99 and later do not,
+// and Clang and GCC 14 reject it.]
 void xsnoop(int channel)
 {
 	static int created;

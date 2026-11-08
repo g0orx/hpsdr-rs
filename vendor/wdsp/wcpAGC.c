@@ -32,7 +32,75 @@ Santa Cruz, CA  95060
 
 #include "comm.h"
 
-void calc_wcpagc (WCPAGC a)
+typedef struct _wcpagc
+{
+	int run;
+	int mode;
+	int pmode;
+	double* in;
+	double* out;
+	int io_buffsize;
+	double sample_rate;
+
+	double tau_attack;
+	double tau_decay;
+	int n_tau;
+	double max_gain;
+	double var_gain;
+	double fixed_gain;
+	double min_volts;
+	double max_input;
+	double out_targ;
+	double out_target;
+	double inv_max_input;
+	double slope_constant;
+
+	double gain;
+	double inv_out_target;
+
+	int out_index;
+	int in_index;
+	int attack_buffsize;
+
+	double* ring;
+	double* abs_ring;
+	int ring_buffsize;
+	double ring_max;
+
+	double attack_mult;
+	double decay_mult;
+	double volts;
+	double save_volts;
+	double out_sample[2];
+	double abs_out_sample;
+	int state;
+
+	double tau_fast_backaverage;
+	double fast_backmult;
+	double onemfast_backmult;
+	double fast_backaverage;
+	double tau_fast_decay;
+	double fast_decay_mult;
+	double pop_ratio;
+
+	int hang_enable;
+	double hang_backaverage;
+	double tau_hang_backmult;
+	double hang_backmult;
+	double onemhang_backmult;
+	int hang_counter;
+	double hangtime;
+	double hang_thresh;
+	double hang_level;
+
+	double tau_hang_decay;
+	double hang_decay_mult;
+	int decay_type;
+} wcpagc, *WCPAGC;
+
+static void loadWcpAGC (WCPAGC a);
+
+static void calc_wcpagc (WCPAGC a)
 {
 	//assign constants
 	a->ring_buffsize = RB_SIZE;
@@ -51,7 +119,7 @@ void calc_wcpagc (WCPAGC a)
 	loadWcpAGC(a);
 }
 
-void decalc_wcpagc (WCPAGC a)
+static void decalc_wcpagc (WCPAGC a)
 {
 	_aligned_free(a->abs_ring);
 	_aligned_free(a->ring);
@@ -112,7 +180,7 @@ WCPAGC create_wcpagc (	int run,
 	return a;
 }
 
-void loadWcpAGC (WCPAGC a)
+static void loadWcpAGC (WCPAGC a)
 {
 	double tmp;
 	//calculate internal parameters
@@ -365,6 +433,21 @@ void setSize_wcpagc (WCPAGC a, int size)
 	calc_wcpagc (a);
 }
 
+void setRun_wcpagc (WCPAGC a, int run)
+{
+	a->run = run;
+}
+
+int* getRunPtr_wcpagc (WCPAGC a)
+{
+	return &a->run;
+}
+
+double* getGainPtr_wcpagc (WCPAGC a)
+{
+	return &a->gain;
+}
+
 /********************************************************************************************************
 *																										*
 *											RXA Properties												*
@@ -490,7 +573,7 @@ SetRXAAGCHangThreshold (int channel, int hangthreshold)
 
 static double agc_noise_bw (int channel)
 {
-	return rxa[channel].nbp0.p->fhigh - rxa[channel].nbp0.p->flow;
+	return getFhigh_nbp (rxa[channel].nbp0.p) - getFlow_nbp (rxa[channel].nbp0.p);
 }
 
 PORT void				

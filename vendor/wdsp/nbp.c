@@ -26,6 +26,47 @@ warren@wpratt.com
 
 #include "comm.h"
 
+typedef struct _notchdb
+{
+	int master_run;
+	double tunefreq;
+	double shift;
+	int nn;
+	int* active;
+	double* fcenter;
+	double* fwidth;
+	double* nlow;
+	double* nhigh;
+	int maxnotches;
+} notchdb, *NOTCHDB;
+
+typedef struct _nbp
+{
+	int run;				// run the filter
+	int fnfrun;				// use the notches
+	int position;			// position in processing pipeline
+	int size;				// buffer size
+	int nc;					// number of filter coefficients
+	int mp;					// minimum phase flag
+	double* in;				// input buffer
+	double* out;			// output buffer
+	double flow;			// low bandpass cutoff freq
+	double fhigh;			// high bandpass cutoff freq
+	double* impulse;		// filter impulse response
+	double rate;			// sample rate
+	int wintype;			// filter window type
+	double gain;			// filter gain
+	int autoincr;			// auto-increment notch width
+	int maxpb;				// maximum number of passbands
+	NOTCHDB* ptraddr;		// ptr to addr of notch-database data structure
+	double* bplow;			// array of passband lows
+	double* bphigh;			// array of passband highs
+	int numpb;				// number of passbands
+	FIRCORE p;
+	int havnotch;
+	int hadnotch;
+} nbp, *NBP;
+
 /********************************************************************************************************
 *																										*
 *											Notch Database												*
@@ -53,6 +94,7 @@ void destroy_notchdb (NOTCHDB b)
 	_aligned_free (b->nlow);
 	_aligned_free (b->fwidth);
 	_aligned_free (b->fcenter);
+	_aligned_free (b);		// [the structure itself;  through 2.11 it was never freed]
 }
 
 /********************************************************************************************************
@@ -61,7 +103,7 @@ void destroy_notchdb (NOTCHDB b)
 *																										*
 ********************************************************************************************************/
 
-double* fir_mbandpass (int N, int nbp, double* flow, double* fhigh, double rate, double scale, int wintype)
+static double* fir_mbandpass (int N, int nbp, double* flow, double* fhigh, double rate, double scale, int wintype)
 {
 	int i, k;
 	double* impulse = (double *) malloc0 (N * sizeof (complex));
@@ -79,7 +121,7 @@ double* fir_mbandpass (int N, int nbp, double* flow, double* fhigh, double rate,
 	return impulse;
 }
 
-double min_notch_width (NBP a)
+static double min_notch_width (NBP a)
 {
 	double min_width;
 	switch (a->wintype)
@@ -97,7 +139,7 @@ double min_notch_width (NBP a)
 	return min_width;
 }
 
-int make_nbp (int nn, int* active, double* center, double* width, double* nlow, double* nhigh, 
+static int make_nbp (int nn, int* active, double* center, double* width, double* nlow, double* nhigh, 
 	double minwidth, int autoincr, double flow, double fhigh, double* bplow, double* bphigh, int* havnotch)
 {
 	int nbp;
@@ -181,7 +223,7 @@ int make_nbp (int nn, int* active, double* center, double* width, double* nlow, 
 	return nbp;
 }
 
-void calc_nbp_lightweight (NBP a)
+static void calc_nbp_lightweight (NBP a)
 {	// calculate and set new impulse response; used when changing tune freq or shift freq
 	int i;
 	double fl, fh;
@@ -214,7 +256,7 @@ void calc_nbp_lightweight (NBP a)
 		a->hadnotch = 1;
 }
 
-void calc_nbp_impulse (NBP a)
+static void calc_nbp_impulse (NBP a)
 {	// calculates impulse response; for create_fircore() and parameter changes
 	int i;
 	double fl, fh;
@@ -316,16 +358,80 @@ void setSize_nbp (NBP a, int size)
 	_aligned_free (a->impulse);
 }
 
-void setNc_nbp (NBP a)
+void setNc_nbp (NBP a, int nc)
 {
+	a->nc = nc;
 	calc_nbp_impulse (a);
 	setNc_fircore (a->p, a->nc, a->impulse);
 	_aligned_free (a->impulse);
 }
 
-void setMp_nbp (NBP a)
+void setMp_nbp (NBP a, int mp)
 {
+	a->mp = mp;
 	setMp_fircore (a->p, a->mp);
+}
+
+int getMasterRun_notchdb (NOTCHDB a)
+{
+	return a->master_run;
+}
+
+void setRun_nbp (NBP a, int run)
+{
+	a->run = run;
+}
+
+double getFlow_nbp (NBP a)
+{
+	return a->flow;
+}
+
+double getFhigh_nbp (NBP a)
+{
+	return a->fhigh;
+}
+
+void setFnfrun_nbp (NBP a, int fnfrun)
+{
+	a->fnfrun = fnfrun;
+}
+
+void setFlow_nbp (NBP a, double flow)
+{
+	a->flow = flow;
+}
+
+void setFhigh_nbp (NBP a, double fhigh)
+{
+	a->fhigh = fhigh;
+}
+
+void setWintype_nbp (NBP a, int wintype)
+{
+	a->wintype = wintype;
+}
+
+void setGain_nbp (NBP a, double gain)
+{
+	a->gain = gain;
+}
+
+void setAutoincr_nbp (NBP a, int autoincr)
+{
+	a->autoincr = autoincr;
+}
+
+void setImpulse_nbp (NBP a, int update)
+{
+	calc_nbp_impulse (a);
+	setImpulse_fircore (a->p, a->impulse, update);
+	_aligned_free (a->impulse);
+}
+
+void setUpdate_nbp (NBP a)
+{
+	setUpdate_fircore (a->p);
 }
 
 /********************************************************************************************************
@@ -336,13 +442,13 @@ void setMp_nbp (NBP a)
 
 // DATABASE PROPERTIES
 
-void UpdateNBPFiltersLightWeight (int channel)
+static void UpdateNBPFiltersLightWeight (int channel)
 {	// called when setting tune freq or shift freq
 	calc_nbp_lightweight (rxa[channel].nbp0.p);
-	calc_nbp_lightweight (rxa[channel].bpsnba.p->bpsnba);
+	calc_nbp_lightweight (getNbp_bpsnba (rxa[channel].bpsnba.p));
 }
 
-void UpdateNBPFilters(int channel)
+static void UpdateNBPFilters(int channel)
 {
 	NBP a = rxa[channel].nbp0.p;
 	BPSNBA b = rxa[channel].bpsnba.p;
@@ -352,7 +458,7 @@ void UpdateNBPFilters(int channel)
 		setImpulse_fircore (a->p, a->impulse, 1);
 		_aligned_free (a->impulse);
 	}
-	if (b->bpsnba->fnfrun)
+	if (getNbp_bpsnba (b)->fnfrun)
 	{
 		recalc_bpsnba_filter (b, 1);
 	}
@@ -556,9 +662,9 @@ void RXANBPSetWindow (int channel, int wintype)
 		setImpulse_fircore (a->p, a->impulse, 1);
 		_aligned_free (a->impulse);
 	}
-	if ((b->wintype != wintype))
+	if ((getWintype_bpsnba (b) != wintype))
 	{
-		b->wintype = wintype;
+		setWintype_bpsnba (b, wintype);
 		recalc_bpsnba_filter (b, 1);
 	}
 }
@@ -572,8 +678,7 @@ void RXANBPSetNC (int channel, int nc)
 	a = rxa[channel].nbp0.p;
 	if (a->nc != nc)
 	{
-		a->nc = nc;
-		setNc_nbp (a);
+		setNc_nbp (a, nc);
 	}
 	LeaveCriticalSection (&ch[channel].csDSP);
 }
@@ -585,8 +690,7 @@ void RXANBPSetMP (int channel, int mp)
 	a = rxa[channel].nbp0.p;
 	if (a->mp != mp)
 	{
-		a->mp = mp;
-		setMp_nbp (a);
+		setMp_nbp (a, mp);
 	}
 }
 
@@ -614,9 +718,9 @@ void RXANBPSetAutoIncrease (int channel, int autoincr)
 		setImpulse_fircore (a->p, a->impulse, 1);
 		_aligned_free (a->impulse);
 	}
-	if ((b->autoincr != autoincr))
+	if ((getAutoincr_bpsnba (b) != autoincr))
 	{
-		b->autoincr = autoincr;
+		setAutoincr_bpsnba (b, autoincr);
 		recalc_bpsnba_filter (b, 1);
 	}
 }

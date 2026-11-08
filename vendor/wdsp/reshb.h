@@ -34,32 +34,7 @@ typedef struct
     double q;
 } complex_t;
 
-typedef struct _hbres
-{
-    int N;
-    double* h;
-    complex_t* ring;
-    int ring_ptr;
-    complex_t* in;
-    complex_t* out;
-    int size;
-} hbres, * HBRES;
-
-struct HBRESdata 
-{
-    uint32_t run;
-    complex_t* in;
-    complex_t* out;
-    uint32_t insize;
-    uint32_t inrate;
-    uint32_t outrate;
-    uint32_t nStages;
-    uint32_t taps[10];
-    uint32_t nBuffs;
-    uint32_t bsize[10];
-    complex_t* buff[10];
-    hbres rsmps[10];
-};
+typedef struct _hbres* HBRES;
 
 typedef struct HBRESdata* HBResampler;
 

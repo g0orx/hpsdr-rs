@@ -26,13 +26,30 @@ warren@wpratt.com
 
 #include "comm.h"
 
+typedef struct _resampleF
+{
+	int run;			// run
+	int size;			// number of input samples per buffer
+	float* in;			// input buffer for resampler
+	float* out;			// output buffer for resampler
+	int idx_in;			// index for input into ring
+	int ncoef;			// number of coefficients
+	int L;				// interpolation factor
+	int M;				// decimation factor
+	double* h;			// coefficients
+	int ringsize;		// number of values the ring buffer holds
+	double* ring;		// ring buffer
+	int cpp;			// coefficients of the phase
+	int phnum;			// phase number
+} resampleF, *RESAMPLEF;
+
 /************************************************************************************************
 *																								*
 *							  VERSION FOR COMPLEX DOUBLE-PRECISION								*
 *																								*
 ************************************************************************************************/
 
-void calc_resample (RESAMPLE a)
+static void calc_resample (RESAMPLE a)
 {
 	int x, y, z;
 	int i, j, k;
@@ -77,7 +94,7 @@ void calc_resample (RESAMPLE a)
 	_aligned_free(impulse);
 }
 
-void decalc_resample (RESAMPLE a)
+static void decalc_resample (RESAMPLE a)
 {
 	_aligned_free(a->ring);
 	_aligned_free(a->h);
@@ -240,7 +257,7 @@ void destroy_resampleV (void* ptr)
 *																								*
 ************************************************************************************************/
 
-RESAMPLEF create_resampleF ( int run, int size, float* in, float* out, int in_rate, int out_rate)
+static RESAMPLEF create_resampleF ( int run, int size, float* in, float* out, int in_rate, int out_rate)
 {
 	RESAMPLEF a = (RESAMPLEF) malloc0 (sizeof (resampleF));
 	int x, y, z;
@@ -286,7 +303,7 @@ RESAMPLEF create_resampleF ( int run, int size, float* in, float* out, int in_ra
 	return a;
 }
 
-void destroy_resampleF (RESAMPLEF a)
+static void destroy_resampleF (RESAMPLEF a)
 {
 	_aligned_free (a->ring);
 	_aligned_free (a->h);
@@ -300,7 +317,7 @@ void flush_resampleF (RESAMPLEF a)
 	a->phnum = 0;
 }
 
-int xresampleF (RESAMPLEF a)
+static int xresampleF (RESAMPLEF a)
 {
 	int outsamps = 0;
 	if (a->run)

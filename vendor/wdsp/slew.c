@@ -26,6 +26,24 @@ warren@wpratt.com
 
 #include "comm.h"
 
+typedef struct _uslew
+{
+	int channel;
+	volatile long *ch_upslew;
+	int size;
+	double* in;
+	double* out;
+	double rate;
+	double tdelay;
+	double tupslew;
+	int runmode;
+	int state;
+	int count;
+	int ndelup;
+	int ntup;
+	double* cup;
+} uslew, *USLEW;
+
 enum _USLEW
 {
 	BEGIN,
@@ -34,7 +52,7 @@ enum _USLEW
 	ON
 };
 
-void calc_uslew (USLEW a)
+static void calc_uslew (USLEW a)
 {
 	int i;
 	double delta, theta;
@@ -54,7 +72,7 @@ void calc_uslew (USLEW a)
 	InterlockedBitTestAndReset (a->ch_upslew, 0);
 }
 
-void decalc_uslew (USLEW a)
+static void decalc_uslew (USLEW a)
 {
 	_aligned_free (a->cup);
 }

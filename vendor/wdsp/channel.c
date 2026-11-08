@@ -28,13 +28,14 @@ warren@pratt.one
 
 struct _ch ch[MAX_CHANNELS];
 
-void start_thread (int channel)
+static void start_thread (int channel)
 {
+	InterlockedBitTestAndSet (&ch[channel].main_alive, 0);
 	HANDLE handle = (HANDLE) _beginthread(wdspmain, 0, (void *)(uintptr_t)channel);
 	//SetThreadPriority(handle, THREAD_PRIORITY_HIGHEST);
 }
 
-void pre_main_build (int channel)
+static void pre_main_build (int channel)
 {
 	if (ch[channel].in_rate  >= ch[channel].dsp_rate)
 		ch[channel].dsp_insize  = ch[channel].dsp_size * (ch[channel].in_rate  / ch[channel].dsp_rate);
@@ -57,7 +58,7 @@ void pre_main_build (int channel)
 	create_iobuffs (channel);
 }
 
-void post_main_build (int channel)
+static void post_main_build (int channel)
 {
 	InterlockedBitTestAndSet (&ch[channel].run, 0);
 	start_thread (channel);
@@ -65,7 +66,7 @@ void post_main_build (int channel)
 	 	InterlockedBitTestAndSet (&ch[channel].exchange, 0);
 }
 
-void build_channel (int channel)
+static void build_channel (int channel)
 {
 	pre_main_build (channel);
 	create_main (channel);
@@ -97,12 +98,13 @@ void OpenChannel (int channel, int in_size, int dsp_size, int input_samplerate, 
 		InterlockedBitTestAndReset (&ch[channel].iob.pc->exec_bypass, 0);
 		InterlockedBitTestAndSet (&ch[channel].exchange, 0);
 	}
-#ifdef _WIN32
-	_MM_SET_FLUSH_ZERO_MODE (_MM_FLUSH_ZERO_ON);
-#endif
+	// [Through 2.11, _MM_SET_FLUSH_ZERO_MODE (_MM_FLUSH_ZERO_ON) was here.  The mode is
+	// a per-thread setting, so it affected only the thread that called OpenChannel (),
+	// not the DSP threads.  Each DSP thread now turns it on for itself;  see
+	// flush_to_zero_on () in wdsp_platform.h.]
 }
 
-void pre_main_destroy (int channel)
+static void pre_main_destroy (int channel)
 {
 	IOB a = ch[channel].iob.pc;
 	InterlockedBitTestAndReset (&ch[channel].exchange, 0);
@@ -110,9 +112,31 @@ void pre_main_destroy (int channel)
 	InterlockedBitTestAndSet (&ch[channel].iob.pc->exec_bypass, 0);
 	ReleaseSemaphore (a->Sem_BuffReady, 1, 0);
 	Sleep (25);
+	// wait for the main dsp thread to exit
+	int count = 0;
+	const int timeout = 1000;
+	while (_InterlockedAnd (&ch[channel].main_alive, 1) && count < timeout)
+	{
+		// [2026-11:  Sem_BuffReady is released again on each pass.  flush_iobuffs () drains
+		// this semaphore, so a flush running at this moment (one begun by a recent
+		// SetChannelState (ch, 0, 0), not waited for here by SetInputBuffsize () and the
+		// other rebuilds that don't call SetChannelState (ch, 0, 1) first) can take the
+		// single release above.  The DSP thread would then stay blocked in
+		// WaitForSingleObject (), this wait would time out, and destroy_iobuffs () would
+		// close the semaphore while the thread still waited on it.  The extra releases are
+		// harmless:  the thread exits on 'run' == 0 however many there are, and the
+		// semaphore is destroyed right afterwards, in post_main_destroy ().]
+		ReleaseSemaphore (a->Sem_BuffReady, 1, 0);
+		Sleep (1);
+		count++;
+	}
+	// stop the flush thread before main is destroyed; a flush already under way completes first
+	InterlockedBitTestAndSet (&a->flush_bypass, 0);
+	ReleaseSemaphore (a->Sem_Flush, 1, 0);
+	while (InterlockedAnd (&a->flush_bypass, 0xffffffff)) Sleep (1);
 }
 
-void post_main_destroy (int channel)
+static void post_main_destroy (int channel)
 {
 	destroy_iobuffs (channel);
 	DeleteCriticalSection ( &ch[channel].csEXCH  );

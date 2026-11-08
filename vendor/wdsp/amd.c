@@ -26,6 +26,47 @@ warren@wpratt.com
 
 #include "comm.h"
 
+typedef struct _amd
+{
+	int run;
+	int buff_size;						// buffer size
+	double *in_buff;					// pointer to input buffer
+	double *out_buff;					// pointer to output buffer
+	int mode;							// demodulation mode
+	double sample_rate;					// sample rate
+	double dc;							// dc component in demodulated output
+	double fmin;						// pll - minimum carrier freq to lock
+	double fmax;						// pll - maximum carrier freq to lock
+	double omega_min;					// pll - minimum lock check parameter
+	double omega_max;					// pll - maximum lock check parameter
+	double zeta;						// pll - damping factor; as coded, must be <=1.0
+	double omegaN;						// pll - natural frequency
+	double phs;							// pll - phase accumulator
+	double omega;						// pll - locked pll frequency
+	double fil_out;						// pll - filter output
+	double g1, g2;						// pll - filter gain parameters
+	double tauR;						// carrier removal time constant
+	double tauI;						// carrier insertion time constant
+	double mtauR;						// carrier removal multiplier
+	double onem_mtauR;					// 1.0 - carrier_removal_multiplier
+	double mtauI;						// carrier insertion multiplier
+	double onem_mtauI;					// 1.0 - carrier_insertion_multiplier
+	double a[3 * STAGES + 3];			// Filter a variables
+	double b[3 * STAGES + 3];			// Filter b variables
+	double c[3 * STAGES + 3];			// Filter c variables
+	double d[3 * STAGES + 3];			// Filter d variables
+	double c0[STAGES];					// Filter coefficients - path 0
+	double c1[STAGES];					// Filter coefficients - path 1
+	double dsI;							// delayed sample, I path
+	double dsQ;							// delayed sample, Q path
+	double dc_insert;					// dc component to insert in output
+	int sbmode;							// sideband mode
+	int levelfade;						// Fade Leveler switch
+
+}amd, *AMD;
+
+static void init_amd (AMD a);
+
 AMD create_amd
 	(
 	int run,
@@ -69,7 +110,7 @@ void destroy_amd(AMD a)
 	_aligned_free (a);
 }
 
-void init_amd(AMD a)
+static void init_amd(AMD a)
 {
 	//pll
 	a->omega_min = TWOPI * a->fmin / a->sample_rate;
@@ -129,6 +170,9 @@ void xamd (AMD a)
 		{
 
 			case 0:		//AM Demodulator
+			default:	// [any other 'mode' gets the envelope demodulator.  Through
+						// 2.11 there was no default, and an unrecognized 'mode'
+						// left out_buff unwritten.]
 				{
 					for (i = 0; i < a->buff_size; i++)
 					{
@@ -194,6 +238,10 @@ void xamd (AMD a)
 						switch(a->sbmode)
 						{
 						case 0:	//both sidebands
+						default:	// [any other 'sbmode' gets both sidebands.
+									// Through 2.11 there was no default, and an
+									// unrecognized 'sbmode' left 'audio'
+									// uninitialized.]
 							{
 								audio = corr[0];
 								break;
@@ -255,6 +303,21 @@ void setSize_amd (AMD a, int size)
 	a->buff_size = size;
 }
 
+int getRun_amd (AMD a)
+{
+	return a->run;
+}
+
+void setRun_amd (AMD a, int run)
+{
+	a->run = run;
+}
+
+void setMode_amd (AMD a, int mode)
+{
+	a->mode = mode;
+}
+
 /********************************************************************************************************
 *																										*
 *											RXA Properties												*
@@ -267,9 +330,9 @@ SetRXAAMDRun(int channel, int run)
 	AMD a = rxa[channel].amd.p;
 	if (a->run != run)
 	{
-		RXAbp1Check (channel, run, rxa[channel].snba.p->run, rxa[channel].emnr.p->run, 
+		RXAbp1Check (channel, run, getRun_snba (rxa[channel].snba.p), getRun_emnr (rxa[channel].emnr.p), 
 			getRun_nnrbypass (rxa[channel].nnrbypass.p), 
-			rxa[channel].anf.p->run, rxa[channel].anr.p->run);
+			getRun_anf (rxa[channel].anf.p), getRun_anr (rxa[channel].anr.p));
 		EnterCriticalSection (&ch[channel].csDSP);
 		a->run = run;
 		RXAbp1Set (channel);

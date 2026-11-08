@@ -92,7 +92,7 @@ static void nurbs_basis_funs(int s, int p, const double* U,
  * OUTPUTS
  *   *x, *y — Cartesian coordinates of the curve point
  */
-void NURBSpoint(int n, int p, int r,
+static void NURBSpoint(int n, int p, int r,
 	double* U, double* CP, double* W, double u,
 	double* x, double* y)
 {
@@ -127,7 +127,7 @@ void NURBSpoint(int n, int p, int r,
 }
 
 
-void Space (int inpoints, int outpoints, double* Xin, double* Yin, double* Xout, double* Yout)
+static void Space (int inpoints, int outpoints, double* Xin, double* Yin, double* Xout, double* Yout)
 {
 	double Xrange = Xin[inpoints - 1] - Xin[0];
 	if (Xrange < 1e-300) 
@@ -164,7 +164,7 @@ void Space (int inpoints, int outpoints, double* Xin, double* Yin, double* Xout,
 	}
 }
 
-void Ucalc (int n, int p, int umethod, double* U, double* CP)
+static void Ucalc (int n, int p, int umethod, double* U, double* CP)
 {
 	int m = n + p + 1;
 	int total_knots = m + 1;
@@ -310,5 +310,6 @@ void destroy_nurbs (NURBS a)
 	_aligned_free (a->W);
 	_aligned_free (a->CP);
 	_aligned_free (a->U);
+	_aligned_free (a);		// [the structure itself;  through 2.11 it was never freed]
 }
 

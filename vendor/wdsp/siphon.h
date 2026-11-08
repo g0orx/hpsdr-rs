@@ -30,29 +30,7 @@ warren@pratt.one
 #ifndef _siphon_h
 #define _siphon_h
 
-typedef struct _siphon
-{
-	int run;
-	int position;
-	int mode;
-	int disp;
-	int insize;
-	double* in;
-	int sipsize;	// NOTE:  sipsize MUST BE A POWER OF TWO!!
-	double* sipbuff;
-	int outsize;
-	int idx;
-	double* sipout;
-	int fftsize;
-	double* specout;
-	volatile long specmode;
-	fftw_plan sipplan;
-	double* window;
-	CRITICAL_SECTION update;
-	int n_alloc_disps;			// number of additional allocated displays for this channel
-	int* alloc_run;				// vector of corresponding 'run' variables for the additional allocated disps
-	int* alloc_disp;			// vector of 'disp' identifiers for the additional allocated disps
-} siphon, *SIPHON;
+typedef struct _siphon* SIPHON;
 
 extern SIPHON create_siphon (int run, int position, int mode, int disp, int insize, double* in, int sipsize, 
 	int fftsize, int specmode);
@@ -69,30 +47,29 @@ extern void setSamplerate_siphon (SIPHON a, int rate);
 
 extern void setSize_siphon (SIPHON a, int size);
 
-extern __declspec (dllexport) void TXASetSipAllocDisps (int channel, int n_alloc_disps, int* alloc_run, int* alloc_disp);
+// [PORT is defined in wdsp_platform.h, which comm.h includes ahead of the module
+// headers.  Some WDSP headers are also included on their own, ahead of comm.h
+// (ChannelMaster includes resample.h this way), so a header that uses PORT
+// includes wdsp_platform.h itself.  It also supplies the types, CRITICAL_SECTION
+// and HANDLE, that some of these headers use.]
+#include "wdsp_platform.h"
+
+extern PORT void TXASetSipAllocDisps (int channel, int n_alloc_disps, int* alloc_run, int* alloc_disp);
 
 // RXA Properties
 
-extern __declspec (dllexport) void RXAGetaSipF  (int channel, float* out, int size);
-
-extern __declspec (dllexport) void RXAGetaSipF1 (int channel, float* out, int size);
-
-// TXA Properties
-
-extern __declspec (dllexport) void TXAGetaSipF  (int channel, float* out, int size);
-
-extern __declspec (dllexport) void TXAGetaSipF1 (int channel, float* out, int size);
-
-extern __declspec (dllexport) void TXAGetSpecF1 (int channel, float* out);
+// [Exported (PORT) functions of this module that nothing else in WDSP, nor
+// ChannelMaster, calls are declared only in wdsp.h, the public header.  Those
+// declared here are called by other modules or by ChannelMaster.]
 
 // Calls for External Use
 
-extern __declspec (dllexport) void create_siphonEXT (int id, int run, int insize, int sipsize, int fftsize, int specmode);
+extern PORT void create_siphonEXT (int id, int run, int insize, int sipsize, int fftsize, int specmode);
 
-extern __declspec (dllexport) void destroy_siphonEXT (int id);
+extern PORT void destroy_siphonEXT (int id);
 
-extern __declspec (dllexport) void xsiphonEXT (int id, double* buff);
+extern PORT void xsiphonEXT (int id, double* buff);
 
-extern __declspec (dllexport) void SetSiphonInsize (int id, int size);
+extern PORT void SetSiphonInsize (int id, int size);
 
 #endif

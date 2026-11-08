@@ -27,26 +27,7 @@ warren@pratt.one
 #ifndef _iqc_h
 #define _iqc_h
 #include "nurbs_spline.h"
-typedef struct _iqc
-{
-	NS_Spline   *m_spline[2], *c_spline[2], *s_spline[2];
-	CurveEMA    m_calavg[2], c_calavg[2], s_calavg[2];
-	double      m_prev_y[2], c_prev_y[2], s_prev_y[2];
-
-	volatile long run;
-	volatile long busy;
-	int size;
-	double* in;
-	double* out;
-	double rate;
-	int cset;
-	double tup;
-	double* cup;
-	int count;
-	int ntup;
-	int state;
-	
-} iqc, *IQC;
+typedef struct _iqc* IQC;
 
 extern IQC create_iqc(int run, int size, double* in, double* out, double rate, double tup);
 
@@ -61,6 +42,8 @@ extern void setBuffers_iqc (IQC a, double* in, double* out);
 extern void setSamplerate_iqc (IQC a, int rate);
 
 extern void setSize_iqc (IQC a, int size);
+
+extern void clearBusy_iqc (IQC a);
 
 // TXA Properties
 

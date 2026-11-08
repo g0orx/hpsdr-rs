@@ -26,6 +26,35 @@ warren@wpratt.com
 
 #include "comm.h"
 
+typedef struct _delay
+{
+	int run;			// run
+	int size;			// number of input samples per buffer
+	double* in;			// input buffer
+	double* out;		// output buffer
+	int rate;			// samplerate
+	double tdelta;		// delay increment required (seconds)
+	double tdelay;		// delay requested (seconds)
+
+	int L;				// interpolation factor
+	int ncoef;			// number of coefficients
+	int cpp;			// coefficients per phase
+	double ft;			// normalized cutoff frequency
+	double* h;			// coefficients
+	int snum;			// starting sample number (0 for sub-sample delay)
+	int phnum;			// phase number
+
+	int idx_in;			// index for input into ring
+	int rsize;			// ring size in complex samples
+	double* ring;		// ring buffer
+
+	double adelta;		// actual delay increment
+	double adelay;		// actual delay
+
+	CRITICAL_SECTION cs_update;
+
+} delay, *DELAY;
+
 DELAY create_delay (int run, int size, double* in, double* out, int rate, double tdelta, double tdelay)
 {
 	DELAY a = (DELAY) malloc0 (sizeof (delay));
@@ -123,6 +152,11 @@ double SetDelayValue (DELAY a, double tdelay)
 	adelay = a->adelay;
 	LeaveCriticalSection (&a->cs_update);
 	return adelay;
+}
+
+double GetDelayValue (DELAY a)
+{
+	return a->tdelay;
 }
 
 void SetDelayBuffs (DELAY a, int size, double* in, double* out)

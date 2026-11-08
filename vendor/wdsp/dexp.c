@@ -26,9 +26,83 @@ warren@wpratt.com
 
 #include "comm.h"
 
-DEXP pdexp[4];
+typedef struct _delring
+{
+	int rsize;							// ringsize (measured in complex samples)
+	double* ring;						// ring buffer
+	int inptr;							// ring input pointer (counts in complex samples)
+	int outptr;							// ring output pointer (counts in complex samples)
+	int rdelay;							// ring delay (measured in complex samples)
+	int size;							// input/output size in complex samples
+	double* in;							// source buffer
+	double* out;						// destination buffer
+} delring, *DELRING;
 
-DELRING calc_delring (int rsize, int size, int delay, double* in, double* out)
+typedef struct _dexp
+{
+	int id;								// 'id' for this dexp
+	int run_dexp;						// 0 if dexp is OFF; 1 if it's ON
+	int size;							// size of input/output buffers
+	double* in;							// audio input buffer
+	double* out;						// audio output buffer; can be same as 'in'
+	double rate;						// sample rate
+	double dettau;						// detection averaging time constant
+	double avm;							// averaging multiplier
+	double onem_avm;					// one minus averaging multiplier
+	double avsig;						// averaged detection signal
+	int state;							// state machine control
+	int count;							// count variable used within a state
+	double tattack;						// attack time
+	double tdecay;						// decay time
+	int nattack;						// one less than total number of attack multipliers
+	int ndecay;							// one less than total number of decay multipliers
+	double* cattack;					// attack curve multipliers
+	double* cdecay;						// decay curve multipliers
+	double attack_thresh;				// attack threshold
+	double hold_thresh;					// hold & decay threshold
+	double thold;						// hold time
+	int nhold;							// hold count
+	double exp_ratio;					// expander ratio (high-gain to low-gain)
+	double hysteresis_ratio;			// ratio hold_thresh/attack_thresh.  0.0 < ratio < 1.0
+	double low_gain;					// gain when gate is closed
+	double* trigsig;					// buffer for trigger signal (signal after side-channel filter)
+	double* delsig;						// buffer for signal delayed to match trigger signal
+	double peak;						// peak signal value to return to console
+	// side-channel bandpass filter & and buffer for compensating delay
+	int run_filt;						// 1 = side-channel filter and compensating delay are ON, 0 = OFF
+	int nc;								// number of coefficients
+	int wintype;						// window type
+	double low_cut;						// low cutoff frequency
+	double high_cut;					// high cutoff frequency
+	FIRCORE p;							// filter structure
+	DELRING scdring;					// delay ring for side channel
+	// output audio delay to cover RF_Delay + Xmtr_delay_and_upslew
+	double* audbuffer;					// buffer to serve as input to audring
+	int run_audelay;					// 'run' variable for audio delay ring
+	double audelay;						// audio output delay in seconds
+	DELRING audring;					// audio delay ring
+	// vox
+	int run_vox;
+	void (__stdcall *pushvox)(int channel, int active);
+	int vox_count;
+	// update critical section
+	CRITICAL_SECTION cs_update;
+	// anti-vox
+	int antivox_run;					// 'run' for anti-vox
+	int antivox_new;					// internal variable indicating new anti-vox data is available
+	int antivox_size;					// size of anti-vox data buffer
+	double antivox_rate;				// sample-rate of anti-vox data
+	double antivox_tau;					// time-constant of anti-vox smoothing
+	double antivox_gain;				// anti-vox gain factor
+	double antivox_mult;				// multiplier for anti-vox smoothing
+	double antivox_onemmult;			// one minus antivox_mult
+	double antivox_level;				// current anti-vox smoothed signal level
+	double* antivox_data;				// buffer to hold new anti-vox data
+} dexp, *DEXP;
+
+static DEXP pdexp[4];
+
+static DELRING calc_delring (int rsize, int size, int delay, double* in, double* out)
 {
 	DELRING a = (DELRING) malloc0 (sizeof (delring));
 	a->rsize = rsize;
@@ -42,20 +116,20 @@ DELRING calc_delring (int rsize, int size, int delay, double* in, double* out)
 	return a;
 }
 
-void decalc_delring (DELRING a)
+static void decalc_delring (DELRING a)
 {
 	_aligned_free (a->ring);
 	_aligned_free (a);
 }
 
-void flush_delring (DELRING a)
+static void flush_delring (DELRING a)
 {
 	memset (a->ring, 0, a->rsize * sizeof (complex));
 	a->inptr = a->rdelay;
 	a->outptr = 0;
 }
 
-void xdelring (DELRING a)
+static void xdelring (DELRING a)
 {
 	int first, second;
 	// copy in
@@ -88,7 +162,7 @@ void xdelring (DELRING a)
 	a->outptr = (a->outptr + a->size) % a->rsize;
 }
 
-void calc_slews (DEXP a)
+static void calc_slews (DEXP a)
 {
 	int i;
 	double delta, theta;
@@ -108,21 +182,21 @@ void calc_slews (DEXP a)
 	}
 }
 
-void calc_buffs (DEXP a)
+static void calc_buffs (DEXP a)
 {
 	a->trigsig   = (double *)malloc0 (2 * a->size * sizeof(complex));	// allow for double-sized output of filter
 	a->delsig    = (double *)malloc0 (    a->size * sizeof(complex));
 	a->audbuffer = (double *)malloc0 (    a->size * sizeof(complex));
 }
 
-void decalc_buffs (DEXP a)
+static void decalc_buffs (DEXP a)
 {
 	_aligned_free (a->audbuffer);
 	_aligned_free (a->delsig);
 	_aligned_free (a->trigsig);
 }
 
-void calc_dexp (DEXP a)
+static void calc_dexp (DEXP a)
 {
 	// trigger signal preparation
 	a->avm = exp(-1.0 / (a->rate * a->dettau));
@@ -146,14 +220,14 @@ void calc_dexp (DEXP a)
 	a->audring = calc_delring ((int)a->rate, a->size, (int)(a->audelay * a->rate), a->audbuffer, a->out);
 }
 
-void decalc_dexp (DEXP a)
+static void decalc_dexp (DEXP a)
 {
 	decalc_delring (a->audring);
 	_aligned_free (a->cdecay);
 	_aligned_free (a->cattack);
 }
 
-void calc_filter (DEXP a)
+static void calc_filter (DEXP a)
 {
 	double* impulse;
 	// 2.0 gain on filter is somewhat arbitrarily chosen to get trigger input similar to that without the filter, knowing
@@ -165,20 +239,20 @@ void calc_filter (DEXP a)
 	a->scdring = calc_delring (a->size + a->nc / 2, a->size, a->nc / 64, a->in, a->delsig);
 }
 
-void decalc_filter (DEXP a)
+static void decalc_filter (DEXP a)
 {
 	destroy_fircore (a->p);
 	decalc_delring (a->scdring);
 }
 
-void calc_antivox(DEXP a)
+static void calc_antivox(DEXP a)
 {
 	a->antivox_mult = exp(-1.0 / (a->antivox_rate * a->antivox_tau));
 	a->antivox_onemmult = 1.0 - a->antivox_mult;
 	a->antivox_data = (double *) malloc0 (a->antivox_size * sizeof (complex));
 }
 
-void decalc_antivox(DEXP a)
+static void decalc_antivox(DEXP a)
 {
 	_aligned_free (a->antivox_data);
 }

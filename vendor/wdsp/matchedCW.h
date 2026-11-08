@@ -33,22 +33,7 @@ warren@pratt.one
 #ifndef _matchedCW_h
 #define _matchedCW_h
 #include "firmin.h"
-typedef struct _matchedCW
-{
-	int run;					// 0 - filter is OFF; 1 - filter is ON
-	int position;				// position in sequence in which to execute the filter
-	int size;					// input/output buffer size
-	int nc;						// number of impulse response coefficients
-	double* in;					// pointer to input buffer
-	double* out;				// pointer to output buffer
-	double f_center;			// filter center frequency (Hz)
-	double bandwidth;			// filter bandwidth (Hz)
-	double samplerate;			// sample_rate (samples/sec)
-	double gain;				// gain to be applied to filter output
-	double scale;				// internal filter scale factor based upon gain
-	int mode;					// Mode to get output:  0 => CWL; 1 => CWU; 2 => CWL + CWU
-	FIRCORE p;
-} matched, *MATCHED;
+typedef struct _matchedCW* MATCHED;
 
 extern MATCHED create_matched (int run, int position, int size, double* in, double* out,
 	double f_center, double bandwidth, int samplerate, double gain, int mode);
@@ -67,12 +52,17 @@ extern void setSize_matched (MATCHED a, int size);
 
 extern void setGain_matched (MATCHED a, double gain);
 
-extern void CalcMatchedFilter(MATCHED a, double f_center, double bandwidth, double gain);
+// [PORT is defined in wdsp_platform.h, which comm.h includes ahead of the module
+// headers.  Some WDSP headers are also included on their own, ahead of comm.h
+// (ChannelMaster includes resample.h this way), so a header that uses PORT
+// includes wdsp_platform.h itself.  It also supplies the types, CRITICAL_SECTION
+// and HANDLE, that some of these headers use.]
+#include "wdsp_platform.h"
 
-extern __declspec (dllexport) void SetRXAMatchedRun (int channel, int run);
+extern PORT void SetRXAMatchedRun (int channel, int run);
 
-extern __declspec (dllexport) void SetRXAMatchedFreqs (int channel, double f_center, double bandwidth);
+extern PORT void SetRXAMatchedFreqs (int channel, double f_center, double bandwidth);
 
-extern __declspec (dllexport) void SetRXAMatchedGain (int channel, double gain);
+extern PORT void SetRXAMatchedGain (int channel, double gain);
 
 #endif

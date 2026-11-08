@@ -26,7 +26,92 @@ warren@wpratt.com
 
 #include "comm.h"
 
-MAV create_mav (int ringmin, int ringmax, double nom_value)
+typedef struct _mav
+{
+	int ringmin;
+	int ringmax;		// must be a power of two
+	int* ring;
+	int mask;
+	int i;
+	int load;
+	int sum;
+	double nom_value;
+} mav, *MAV;
+
+typedef struct _aamav
+{
+	int ringmin;
+	int ringmax;		// must be a power of two
+	int* ring;
+	int mask;
+	int i;
+	int load;
+	int pos;
+	int neg;
+	double nom_ratio;
+} aamav, *AAMAV;
+
+typedef struct _rmatch
+{
+	volatile long run;
+	double* in;
+	double* out;
+	int insize;
+	int outsize;
+	double* resout;
+	int nom_inrate;
+	int nom_outrate;
+	double nom_ratio;
+	double inv_nom_ratio;
+	double fc_high;
+	double fc_low;
+	double gain;
+	double startup_delay;
+	int auto_ringsize;
+	int ringsize;
+	int rsize;
+	double* ring;
+	int n_ring;
+	int iin;
+	int iout;
+	double var;
+	int R;
+	AAMAV ffmav;
+	MAV propmav;
+	int ff_ringmin;
+	int ff_ringmax;			// must be a power of two
+	double ff_alpha;
+	double feed_forward;
+	int prop_ringmin;
+	int prop_ringmax;		// must be a power of two
+	double prop_gain;
+	double pr_gain;
+	double av_deviation;
+	VARSAMP v;
+	int varmode;
+	CRITICAL_SECTION cs_ring;
+	CRITICAL_SECTION cs_var;
+	// blend / slew
+	double tslew;
+	int ntslew;
+	double* cslew;
+	double* baux;
+	double dlast[2];
+	int ucnt;
+	// variables to check start-up time for control to become active
+	unsigned int readsamps;
+	unsigned int writesamps;
+	unsigned int read_startup;
+	unsigned int write_startup;
+	int control_flag;
+	// diagnostics
+	volatile long underflows;
+	volatile long overflows;
+	int force;
+	double fvar;
+} rmatch, *RMATCH;
+
+static MAV create_mav (int ringmin, int ringmax, double nom_value)
 {
 	MAV a = (MAV) malloc0 (sizeof (mav));
 	a->ringmin = ringmin;
@@ -40,7 +125,7 @@ MAV create_mav (int ringmin, int ringmax, double nom_value)
 	return a;
 }
 
-void destroy_mav (MAV a)
+static void destroy_mav (MAV a)
 {
 	_aligned_free (a->ring);
 	_aligned_free (a);
@@ -53,7 +138,7 @@ void flush_mav (MAV a)
 	a->load = 0;
 	a->sum = 0;
 }
-void xmav (MAV a, int input, double* output)
+static void xmav (MAV a, int input, double* output)
 {
 	if (a->load >= a->ringmax)
 		a->sum -= a->ring[a->i];
@@ -68,7 +153,7 @@ void xmav (MAV a, int input, double* output)
     a->i = (a->i + 1) & a->mask;
 }
 
-AAMAV create_aamav (int ringmin, int ringmax, double nom_ratio)
+static AAMAV create_aamav (int ringmin, int ringmax, double nom_ratio)
 {
 	AAMAV a = (AAMAV) malloc0 (sizeof (aamav));
 	a->ringmin = ringmin;
@@ -83,7 +168,7 @@ AAMAV create_aamav (int ringmin, int ringmax, double nom_ratio)
 	return a;
 }
 
-void destroy_aamav (AAMAV a)
+static void destroy_aamav (AAMAV a)
 {
 	_aligned_free (a->ring);
 	_aligned_free (a);
@@ -98,7 +183,7 @@ void flush_aamav (AAMAV a)
 	a->neg = 0;
 }
 
-void xaamav (AAMAV a, int input, double* output)
+static void xaamav (AAMAV a, int input, double* output)
 {
 	if (a->load >= a->ringmax)
     {
@@ -125,7 +210,7 @@ void xaamav (AAMAV a, int input, double* output)
     a->i = (a->i + 1) & a->mask;
 }
 
-void calc_rmatch (RMATCH a)
+static void calc_rmatch (RMATCH a)
 {
 	int m;
 	double theta, dtheta;
@@ -171,7 +256,7 @@ void calc_rmatch (RMATCH a)
 	a->overflows = 0;
 }
 
-void decalc_rmatch (RMATCH a)
+static void decalc_rmatch (RMATCH a)
 {
 	_aligned_free (a->baux);
 	_aligned_free (a->cslew);
@@ -184,7 +269,7 @@ void decalc_rmatch (RMATCH a)
 	_aligned_free (a->ring);
 }
 
-RMATCH create_rmatch (
+static RMATCH create_rmatch (
 	int run,				// 0 - input and output calls do nothing; 1 - operates normally
 	double* in,				// pointer to input buffer
 	double* out,			// pointer to output buffer
@@ -238,7 +323,7 @@ RMATCH create_rmatch (
 	return a;
 }
 
-void destroy_rmatch (RMATCH a)
+static void destroy_rmatch (RMATCH a)
 {
 	decalc_rmatch (a);
 	_aligned_free (a);
@@ -253,7 +338,7 @@ void reset_rmatch (RMATCH a)
 	InterlockedBitTestAndSet (&a->run, 0);
 }
 
-void control (RMATCH a, int change)
+static void control (RMATCH a, int change)
 {
 	{
 		double current_ratio;
@@ -272,7 +357,7 @@ void control (RMATCH a, int change)
 	LeaveCriticalSection (&a->cs_var);
 }
 
-void blend (RMATCH a)
+static void blend (RMATCH a)
 {
 	int i, j;
 	for (i = 0, j = a->iout; i <= a->ntslew; i++, j = (j + 1) % a->rsize)
@@ -282,7 +367,7 @@ void blend (RMATCH a)
 	}
 }
 
-void upslew (RMATCH a, int newsamps)
+static void upslew (RMATCH a, int newsamps)
 {
 	int i, j;
 	i = 0;
@@ -305,7 +390,8 @@ void xrmatchIN (void* b, double* in)
 	{
 		int newsamps, first, second, ovfl;
 		double var;
-		a->v->in = a->in = in;
+		a->in = in;
+		setIn_varsamp (a->v, in);
 		EnterCriticalSection (&a->cs_var);
 		if (!a->force)
 			var = a->var;
@@ -361,7 +447,7 @@ void xrmatchIN (void* b, double* in)
 	}
 }
 
-void dslew (RMATCH a)
+static void dslew (RMATCH a)
 {
 	int i, j, k, n;
 	int zeros, first, second;

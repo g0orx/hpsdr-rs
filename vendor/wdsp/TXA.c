@@ -28,6 +28,8 @@ warren@wpratt.com
 
 struct _txa txa[MAX_CHANNELS];
 
+static void TXAResCheck (int channel);
+
 void create_txa (int channel)
 {
 	txa[channel].mode   = TXA_LSB;
@@ -129,7 +131,7 @@ void create_txa (int channel)
 
 	txa[channel].eqmeter.p = create_meter (	
 		1,											// run
-		&(txa[channel].eqp.p->run),					// pointer to eqp 'run'
+		getRunPtr_eqp (txa[channel].eqp.p),			// pointer to eqp 'run'
 		ch[channel].dsp_size,						// size
 		txa[channel].midbuff,						// pointer to buffer
 		ch[channel].dsp_rate,						// samplerate
@@ -182,7 +184,7 @@ void create_txa (int channel)
 
 	txa[channel].lvlrmeter.p = create_meter (
 		1,											// run
-		&(txa[channel].leveler.p->run),				// pointer to leveler 'run'
+		getRunPtr_wcpagc (txa[channel].leveler.p),	// pointer to leveler 'run'
 		ch[channel].dsp_size,						// size
 		txa[channel].midbuff,						// pointer to buffer
 		ch[channel].dsp_rate,						// samplerate
@@ -193,7 +195,7 @@ void create_txa (int channel)
 		TXA_LVLR_AV,								// index for average value
 		TXA_LVLR_PK,								// index for peak value
 		TXA_LVLR_GAIN,								// index for gain value
-		&txa[channel].leveler.p->gain);				// pointer for gain computation
+		getGainPtr_wcpagc (txa[channel].leveler.p));	// pointer for gain computation
 
 	{
 	double default_F[5] = {200.0, 1000.0, 2000.0, 3000.0, 4000.0};
@@ -225,7 +227,7 @@ void create_txa (int channel)
 
 	txa[channel].cfcmeter.p = create_meter (	
 		1,											// run
-		&(txa[channel].cfcomp.p->run),				// pointer to eqp 'run'
+		getRunPtr_cfcomp (txa[channel].cfcomp.p),	// pointer to eqp 'run'
 		ch[channel].dsp_size,						// size
 		txa[channel].midbuff,						// pointer to buffer
 		ch[channel].dsp_rate,						// samplerate
@@ -236,7 +238,7 @@ void create_txa (int channel)
 		TXA_CFC_AV,									// index for average value
 		TXA_CFC_PK,									// index for peak value
 		TXA_CFC_GAIN,								// index for gain value
-		&txa[channel].cfcomp.p->gain);				// pointer for gain computation
+		getGainPtr_cfcomp (txa[channel].cfcomp.p));	// pointer for gain computation
 
 	txa[channel].bp0.p = create_bandpass (
 		1,											// always runs
@@ -297,7 +299,7 @@ void create_txa (int channel)
 
 	txa[channel].compmeter.p = create_meter (
 		1,											// run
-		&(txa[channel].compressor.p->run),			// pointer to compressor 'run'
+		getRunPtr_compressor (txa[channel].compressor.p),	// pointer to compressor 'run'
 		ch[channel].dsp_size,						// size
 		txa[channel].midbuff,						// pointer to buffer
 		ch[channel].dsp_rate,						// samplerate
@@ -391,7 +393,7 @@ void create_txa (int channel)
 		TXA_ALC_AV,									// index for average value
 		TXA_ALC_PK,									// index for peak value
 		TXA_ALC_GAIN,								// index for gain value
-		&txa[channel].alc.p->gain);					// pointer for gain computation
+		getGainPtr_wcpagc (txa[channel].alc.p));	// pointer for gain computation
 
 	txa[channel].sip1.p = create_siphon (
 		1,											// run
@@ -749,27 +751,27 @@ void SetTXAMode (int channel, int mode)
 	{
 		EnterCriticalSection (&ch[channel].csDSP);
 		txa[channel].mode = mode;
-		txa[channel].ammod.p->run   = 0;
-		txa[channel].fmmod.p->run   = 0;
+		setRun_ammod (txa[channel].ammod.p, 0);
+		setRun_fmmod (txa[channel].fmmod.p, 0);
 		SetTXAFMPreEmphRun (channel, 0);
 		switch (mode)
 		{
 		case TXA_AM:
 		case TXA_SAM:
-			txa[channel].ammod.p->run   = 1;
-			txa[channel].ammod.p->mode  = 0;
+			setRun_ammod (txa[channel].ammod.p, 1);
+			setMode_ammod (txa[channel].ammod.p, 0);
 			break;
 		case TXA_DSB:
-			txa[channel].ammod.p->run   = 1;
-			txa[channel].ammod.p->mode  = 1;
+			setRun_ammod (txa[channel].ammod.p, 1);
+			setMode_ammod (txa[channel].ammod.p, 1);
 			break;
 		case TXA_AM_LSB:
 		case TXA_AM_USB:
-			txa[channel].ammod.p->run   = 1;
-			txa[channel].ammod.p->mode  = 2;
+			setRun_ammod (txa[channel].ammod.p, 1);
+			setMode_ammod (txa[channel].ammod.p, 2);
 			break;
 		case TXA_FM:
-			txa[channel].fmmod.p->run   = 1;
+			setRun_fmmod (txa[channel].fmmod.p, 1);
 			SetTXAFMPreEmphRun (channel, 1);
 			break;
 		default:
@@ -786,9 +788,17 @@ void SetTXABandpassFreqs (int channel, double f_low, double f_high)
 {
 	if ((txa[channel].f_low != f_low) || (txa[channel].f_high != f_high))
 	{
+		// [csDSP added 2026-11, as in SetTXAMode (), SetTXACompressorRun () and SetTXAosctrlRun (),
+		// the other callers of TXASetupBPFilters ().  TXASetupBPFilters () first clears 'run' for
+		// bp1 and bp2, then sets it again after the new filters are designed.  Without the lock, a
+		// filter change during transmit could let the DSP thread process blocks in between, with
+		// the post-compressor and CESSB bandpass filters switched off.  csDSP is recursive, so a
+		// caller that already holds it is unaffected.]
+		EnterCriticalSection (&ch[channel].csDSP);
 		txa[channel].f_low = f_low;
 		txa[channel].f_high = f_high;
 		TXASetupBPFilters (channel);
+		LeaveCriticalSection (&ch[channel].csDSP);
 	}
 }
 
@@ -799,7 +809,7 @@ void SetTXABandpassFreqs (int channel, double f_low, double f_high)
 *																										*
 ********************************************************************************************************/
 
-void TXAResCheck (int channel)
+static void TXAResCheck (int channel)
 {
 	RESAMPLE a = txa[channel].rsmpin.p;
 	if (ch[channel].in_rate  != ch[channel].dsp_rate)	a->run = 1;
@@ -811,17 +821,17 @@ void TXAResCheck (int channel)
 
 int TXAUslewCheck (int channel)
 {
-	return	(txa[channel].ammod.p->run == 1) ||
-			(txa[channel].fmmod.p->run == 1) ||
-			(txa[channel].gen0.p->run  == 1) ||
-			(txa[channel].gen1.p->run  == 1);
+	return	(getRun_ammod (txa[channel].ammod.p) == 1) ||
+			(getRun_fmmod (txa[channel].fmmod.p) == 1) ||
+			(getRun_gen (txa[channel].gen0.p)    == 1) ||
+			(getRun_gen (txa[channel].gen1.p)    == 1);
 }
 
 void TXASetupBPFilters (int channel)
 {
-	txa[channel].bp0.p->run = 1;
-	txa[channel].bp1.p->run = 0;
-	txa[channel].bp2.p->run = 0;
+	setRun_bandpass (txa[channel].bp0.p, 1);
+	setRun_bandpass (txa[channel].bp1.p, 0);
+	setRun_bandpass (txa[channel].bp2.p, 0);
 	switch (txa[channel].mode)
 	{
 	case TXA_LSB:
@@ -833,14 +843,14 @@ void TXASetupBPFilters (int channel)
 	case TXA_SPEC:
 	case TXA_DRM:
 		CalcBandpassFilter (txa[channel].bp0.p, txa[channel].f_low, txa[channel].f_high, 2.0);
-		if (txa[channel].compressor.p->run)
+		if (getRun_compressor (txa[channel].compressor.p))
 		{
 			CalcBandpassFilter (txa[channel].bp1.p, txa[channel].f_low, txa[channel].f_high, 2.0);
-			txa[channel].bp1.p->run = 1;
-			if (txa[channel].osctrl.p->run)
+			setRun_bandpass (txa[channel].bp1.p, 1);
+			if (getRun_osctrl (txa[channel].osctrl.p))
 			{
 				CalcBandpassFilter (txa[channel].bp2.p, txa[channel].f_low, txa[channel].f_high, 1.0);
-				txa[channel].bp2.p->run = 1;
+				setRun_bandpass (txa[channel].bp2.p, 1);
 			}
 		}
 		break;
@@ -848,15 +858,15 @@ void TXASetupBPFilters (int channel)
 	case TXA_AM:
 	case TXA_SAM:
 	case TXA_FM:
-		if (txa[channel].compressor.p->run)
+		if (getRun_compressor (txa[channel].compressor.p))
 		{
 			CalcBandpassFilter (txa[channel].bp0.p, 0.0, txa[channel].f_high, 2.0);
 			CalcBandpassFilter (txa[channel].bp1.p, 0.0, txa[channel].f_high, 2.0);
-			txa[channel].bp1.p->run = 1;
-			if (txa[channel].osctrl.p->run)
+			setRun_bandpass (txa[channel].bp1.p, 1);
+			if (getRun_osctrl (txa[channel].osctrl.p))
 			{
 				CalcBandpassFilter (txa[channel].bp2.p, 0.0, txa[channel].f_high, 1.0);
-				txa[channel].bp2.p->run = 1;
+				setRun_bandpass (txa[channel].bp2.p, 1);
 			}
 		}
 		else
@@ -866,27 +876,27 @@ void TXASetupBPFilters (int channel)
 		break;
 	case TXA_AM_LSB:
 		CalcBandpassFilter (txa[channel].bp0.p, -txa[channel].f_high, 0.0, 2.0);
-		if (txa[channel].compressor.p->run)
+		if (getRun_compressor (txa[channel].compressor.p))
 		{
 			CalcBandpassFilter (txa[channel].bp1.p, -txa[channel].f_high, 0.0, 2.0);
-			txa[channel].bp1.p->run = 1;
-			if (txa[channel].osctrl.p->run)
+			setRun_bandpass (txa[channel].bp1.p, 1);
+			if (getRun_osctrl (txa[channel].osctrl.p))
 			{
 				CalcBandpassFilter (txa[channel].bp2.p, -txa[channel].f_high, 0.0, 1.0);
-				txa[channel].bp2.p->run = 1;
+				setRun_bandpass (txa[channel].bp2.p, 1);
 			}
 		}
 		break;
 	case TXA_AM_USB:
 		CalcBandpassFilter (txa[channel].bp0.p, 0.0, txa[channel].f_high, 2.0);
-		if (txa[channel].compressor.p->run)
+		if (getRun_compressor (txa[channel].compressor.p))
 		{
 			CalcBandpassFilter (txa[channel].bp1.p, 0.0, txa[channel].f_high, 2.0);
-			txa[channel].bp1.p->run = 1;
-			if (txa[channel].osctrl.p->run)
+			setRun_bandpass (txa[channel].bp1.p, 1);
+			if (getRun_osctrl (txa[channel].osctrl.p))
 			{
 				CalcBandpassFilter (txa[channel].bp2.p, 0.0, txa[channel].f_high, 1.0);
-				txa[channel].bp2.p->run = 1;
+				setRun_bandpass (txa[channel].bp2.p, 1);
 			}
 		}
 		break;

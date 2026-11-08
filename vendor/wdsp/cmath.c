@@ -32,7 +32,7 @@ double mag(double* value)
 }
 
 // function to perform a Complex Add, a+b; it returns a complex value, 'sum'
-void cadd(double* a, double* b, double* sum)
+static void cadd(double* a, double* b, double* sum)
 {
 	sum[0] = a[0] + b[0];
 	sum[1] = a[1] + b[1];

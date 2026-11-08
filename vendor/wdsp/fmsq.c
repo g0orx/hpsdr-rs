@@ -26,7 +26,51 @@ warren@pratt.one
 
 #include "comm.h"
 
-void calc_fmsq (FMSQ a)
+typedef struct _fmsq
+{
+	int run;							// 0 if squelch system is OFF; 1 if it's ON
+	int size;							// size of input/output buffers
+	double* insig;						// squelch input signal buffer
+	double* outsig;						// squelch output signal buffer
+	double* trigger;					// buffer used to trigger mute/unmute (may be same as input; matches timing of input buffer)
+	double rate;						// sample rate
+	double* noise;
+	double fc;							// corner frequency for sig / noise detection
+	double* pllpole;					// pointer to pole frequency of the fm demodulator pll
+	double F[4];
+	double G[4];
+	double avtau;						// time constant for averaging noise
+	double avm;						
+	double onem_avm;
+	double avnoise;
+	double longtau;						// time constant for long averaging
+	double longavm;
+	double onem_longavm;
+	double longnoise;
+	int state;							// state machine control
+	int count;
+	double tup;
+	double tdown;
+	int ntup;
+	int ntdown;
+	double* cup;
+	double* cdown;
+	double tail_thresh;
+	double unmute_thresh;
+	double min_tail;
+	double max_tail;
+	int ready;
+	double ramp;
+	double rstep;
+	double tdelay;
+	int nc;
+	int mp;
+	FIRCORE p;
+	EQIMP peqimp;
+	double* impulse;
+} fmsq, *FMSQ;
+
+static void calc_fmsq (FMSQ a)
 {
 	double delta, theta;
 	int i;
@@ -78,7 +122,7 @@ void calc_fmsq (FMSQ a)
 	a->rstep = 1.0 / a->rate;
 }
 
-void decalc_fmsq (FMSQ a)
+static void decalc_fmsq (FMSQ a)
 {
 	_aligned_free(a->cdown);
 	_aligned_free(a->cup);

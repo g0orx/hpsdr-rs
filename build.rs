@@ -4,31 +4,22 @@
     from rustyHPSDR's own build.rs, which built the same source tree on
     both Linux and Windows (MSYS2/MinGW-w64).
 
-    vendor/wdsp is upstream WDSP 2.11 (OpenHPSDR-wdsp, Warren Pratt
-    NR0V) plus the Linux/macOS port: comm.h's platform branch,
-    linux_port.c/.h, _WIN32 guards around Windows-only calls, and
-    SetPSDeadlockMinFrac carried over from deskHPSDR. The RNNoise-
-    and libspecbleach-backed NR3/NR4 stages (rnnr.c/sbnr.c, never
-    part of upstream) are gone; WDSP's own neural-net stage ("NNR")
-    is what the UI uses -- see spectrum.rs's NoiseReduction doc
-    comment.
+    vendor/wdsp is upstream WDSP (OpenHPSDR-wdsp, Warren Pratt NR0V):
+    the 2.11 test drop of 2026-11-04, which builds natively on Linux and
+    macOS through its own platform layer (wdsp_platform.h, plus
+    wdsp_platform_posix.c on those two), replacing the earlier
+    linux_port.c/.h. Its CMakeLists.txt is kept for reference; this file
+    builds the same sources with cc instead. The one local change is
+    SetPSDeadlockMinFrac (calcc.c, declared in wdsp.h), carried over from
+    deskHPSDR. WDSP's own neural-net stage ("NNR") is what the UI uses
+    for NR3/NR4 -- see spectrum.rs's NoiseReduction doc comment.
 
-    Confirmed viable cross-platform by reading the vendored source
-    directly: wdsp/comm.h and wdsp/linux_port.h branch on
-    `#if defined(linux) || defined(__APPLE__)` vs `#ifdef _WIN32` --  the
-    Windows branch just pulls in the real <Windows.h>/<avrt.h>/<intrin.h>
-    and uses real Win32 types (CRITICAL_SECTION, HANDLE, etc.) directly.
-    That's WDSP's original Windows-native code path (Thetis's own
-    platform); linux_port.c's pthread-based shims exist to fake that same
-    Win32-shaped API on Linux/macOS, not the other way around -- so
-    building under MinGW-w64 (which defines _WIN32, not linux) takes the
-    same real-Windows-API path MSVC would, no extra porting needed here.
-    Confirmed this ALSO means real MSVC (not just MinGW-w64) needs no C
-    source changes at all -- MSVC defines _WIN32 exactly the same way,
-    so it takes the identical code path. The only actual MSVC-specific
-    work in this file is (1) compiler-flag selection, since the GCC-style
-    flags below aren't understood by cl.exe, and (2) fftw3 discovery,
-    since pkg-config isn't a native Windows tool -- see both below.
+    On Windows (MSVC or MinGW-w64, both define _WIN32) wdsp_platform.h
+    uses the real Win32 API, WDSP's original code path, so no extra file
+    is built. The MSVC-specific work in this file is (1) compiler-flag
+    selection, since the GCC-style flags below aren't understood by
+    cl.exe, and (2) fftw3 discovery, since pkg-config isn't a native
+    Windows tool -- see both below.
 
     NOTE on a bug this replaced: the three vendor .a files this used to
     link were confirmed (via `md5sum`/`nm`) to be three byte-identical
@@ -217,7 +208,6 @@ fn main() {
         "vendor/wdsp/amsq.c",
         "vendor/wdsp/cmath.c",
         "vendor/wdsp/firmin.c",
-        "vendor/wdsp/linux_port.c",
         "vendor/wdsp/osctrl.c",
         "vendor/wdsp/syncbuffs.c",
         "vendor/wdsp/analyzer.c",
@@ -280,6 +270,15 @@ fn main() {
         "vendor/wdsp/reshb.c",
     ]);
 
+    // The platform layer (WDSP after 2.11's CMake build): wdsp_platform.h
+    // maps WDSP's Win32 vocabulary onto POSIX threads on Linux/macOS, with
+    // wdsp_platform_posix.c holding the few that need code -- built only
+    // there, as WDSP's own CMakeLists.txt does. On Windows the header uses
+    // the real Win32 API and needs no extra file.
+    if target_os != "windows" {
+        build.file("vendor/wdsp/wdsp_platform_posix.c");
+    }
+
     build.include("vendor/wdsp");
 
     // Same flags rustyHPSDR's own build.rs uses -- MinGW-w64's GCC
@@ -305,6 +304,10 @@ fn main() {
     build.flag_if_supported("-pthread");
     build.flag_if_supported("-D_GNU_SOURCE");
     build.flag_if_supported("-Wno-parentheses");
+    // As WDSP's own CMakeLists.txt: WDSP is written for MSVC, which never
+    // assumes pointers of different types can't alias; some code relies on
+    // that (varsamp.c reads a double through a uint64_t pointer).
+    build.flag_if_supported("-fno-strict-aliasing");
     // HPSDR_PORTABLE=1 (set by scripts/build-appimage.sh)
     // drops -march=native: a binary handed to other machines must
     // not use instructions only the build machine's CPU has.

@@ -26,7 +26,38 @@ warren@wpratt.com
 
 #include "comm.h"
 
-void calc_varsamp (VARSAMP a)
+typedef struct _varsamp
+{
+	int run;
+	int size;
+	double* in;
+	double* out;
+	int in_rate;
+	int out_rate;
+	double fcin;
+	double fc;
+	double fc_low;
+	double gain;
+	int idx_in;
+	int ncoef;
+	double* h;
+	int rsize;
+	double* ring;
+	double var;
+	int varmode;
+	double cvar;
+	double inv_cvar;
+	double old_inv_cvar;
+	double dicvar;
+	double delta;
+	double* hs;
+	int R;
+	double h_offset;
+	double isamps;
+	double nom_ratio;
+} varsamp, *VARSAMP;
+
+static void calc_varsamp (VARSAMP a)
 {
 	double min_rate, norm_rate;
 	// double max_rate;
@@ -69,7 +100,7 @@ void calc_varsamp (VARSAMP a)
 	a->isamps = 0.0;
 }
 
-void decalc_varsamp (VARSAMP a)
+static void decalc_varsamp (VARSAMP a)
 {
 	_aligned_free (a->hs);
 	_aligned_free (a->ring);
@@ -103,7 +134,7 @@ void destroy_varsamp (VARSAMP a)
 	_aligned_free (a);
 }
 
-void flush_varsamp (VARSAMP a)
+static void flush_varsamp (VARSAMP a)
 {
 	memset (a->ring, 0, a->rsize * sizeof (complex));
 	a->idx_in = a->rsize - 1;
@@ -111,7 +142,7 @@ void flush_varsamp (VARSAMP a)
 	a->isamps = 0.0;
 }
 
-void hshift (VARSAMP a)
+static void hshift (VARSAMP a)
 {
 	int i, j, k;
 	int hidx;
@@ -249,4 +280,9 @@ PORT
 void destroy_varsampV (void* ptr)
 {
 	destroy_varsamp ( (VARSAMP)ptr );
+}
+
+void setIn_varsamp (VARSAMP a, double* in)
+{
+	a->in = in;
 }

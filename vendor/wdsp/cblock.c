@@ -42,7 +42,7 @@ typedef struct _cbl
 	double mtau;						//carrier removal multiplier
 } cbl, * CBL;
 
-void calc_cbl (CBL a)
+static void calc_cbl (CBL a)
 {
 	a->prevIin  = 0.0;
 	a->prevQin  = 0.0;

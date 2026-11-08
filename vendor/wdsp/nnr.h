@@ -43,10 +43,6 @@ extern NNR create_nnr
 
 extern void destroy_nnr (NNR a);
 
-extern int setModel_nnr (NNR a, int slot);
-
-extern int getModel_nnr (NNR a);
-
 extern void flush_nnr (NNR a);
 
 extern void xnnr (NNR a, int pos);
@@ -59,39 +55,14 @@ extern void setSize_nnr (NNR a, int size);
 
 extern int getDelay_nnr (NNR a);
 
-extern int getRun_nnr (NNR a);
-
 extern int getPosition_nnr(NNR a);
-
-extern int getNNRTrainingBand (NNR a, double* band_low, double* band_high);
 
 extern void setNNRbypassRun(int channel);
 
 
 // RXA Properties
 
-extern __declspec (dllexport) void SetRXANNRRun (int channel, int setit);
-
-extern __declspec (dllexport) void SetRXANNRPosition (int channel, int position);
-
-extern __declspec (dllexport) void SetRXANNRMaskFloor (int channel, double floor_db);
-
-extern __declspec (dllexport) void SetRXANNRcmode (int channel, int cmode);
-
-extern __declspec (dllexport) void SetRXANNRTestMode (int channel, int mode);
-
-extern __declspec (dllexport) void SetRXANNRAlpha (int channel, double alpha);
-
-extern __declspec (dllexport) void SetRXANNRAlphaKnee (int channel, double knee_db);
-
-extern __declspec (dllexport) void SetRXANNRTau (int channel, double tau);
-
-extern __declspec (dllexport) void SetRXANNRMaxGain (int channel, double gmax_db);
-
-extern __declspec (dllexport) void SetRXANNRSmooth (int channel, double att_ms, double rel_ms);
-
-extern __declspec (dllexport) int SetRXANNRModel (int channel, int slot);
-
-extern __declspec (dllexport) int GetRXANNRModel (int channel);
+// [Exported (PORT) functions of this module that nothing else in WDSP, nor
+// ChannelMaster, calls are declared only in wdsp.h, the public header.]
 
 #endif

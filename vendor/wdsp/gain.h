@@ -27,25 +27,10 @@ warren@wpratt.com
 #ifndef _gain_h
 #define _gain_h
 
-typedef struct _gain
-{
-	int run;
-	int* prun;
-	int size;
-	double* in;
-	double* out;
-	double Igain;
-	double Qgain;
-	CRITICAL_SECTION cs_update;
-}gain, *GAIN;
+typedef struct _gain* GAIN;
 
-__declspec (dllexport) GAIN create_gain (int run, int* prun, int size, double* in, double* out, double Igain, double Qgain);
-
-__declspec (dllexport) void destroy_gain (GAIN a);
-
-__declspec (dllexport) void flush_gain (GAIN a);
-
-__declspec (dllexport) void xgain (GAIN a);
+// [Exported (PORT) functions of this module that nothing else in WDSP, nor
+// ChannelMaster, calls are declared only in wdsp.h, the public header.]
 
 extern void setBuffers_gain (GAIN a, double* in, double* out);
 
@@ -54,13 +39,5 @@ extern void setSamplerate_gain (GAIN a, int rate);
 extern void setSize_gain (GAIN a, int size);
 
 // TXA Properties
-
-// POINTER-BASED Properties
-
-__declspec (dllexport) void pSetTXOutputLevel (GAIN a, double level);
-
-__declspec (dllexport) void pSetTXOutputLevelRun (GAIN a, int run);
-
-__declspec (dllexport) void pSetTXOutputLevelSize (GAIN a, int size);
 
 #endif

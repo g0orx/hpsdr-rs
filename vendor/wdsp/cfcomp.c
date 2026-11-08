@@ -26,7 +26,88 @@ warren@pratt.one
 
 #include "comm.h"
 
-void calc_cfcwindow (CFCOMP a)
+typedef struct _cfcomp
+{
+	int run;
+	int position;
+	int bsize;
+	double* in;
+	double* out;
+	int fsize;
+	int ovrlp;
+	int incr;
+	double* window;
+	int iasize;
+	double* inaccum;
+	double* forfftin;
+	double* forfftout;
+	int msize;
+	double* cmask;
+	double* mask;
+	int mask_ready;
+	double* cfc_gain;
+	double* revfftin;
+	double* revfftout;
+	double** save;
+	int oasize;
+	double* outaccum;
+	double rate;
+	int wintype;
+	double pregain;
+	double postgain;
+	int nsamps;
+	int iainidx;
+	int iaoutidx;
+	int init_oainidx;
+	int oainidx;
+	int oaoutidx;
+	int saveidx;
+	fftw_plan Rfor;
+	fftw_plan Rrev;
+
+	// G/g refer to compressor; E/e refer to equalizer
+	int comp_method;
+	int max_freqs;
+	int nfreqsG;
+	int nfreqsE;
+	double* Fg;
+	double* Fe;
+	double* G;
+	double* E;
+	double* fpG;
+	double* fpE;
+	double* gp;
+	double* ep;
+	double* comp;
+	double precomp;
+	double precomplin;
+	double* peq;
+	int peq_run;
+	double prepeq;
+	double prepeqlin;
+	double winfudge;
+	double* saryG;
+	double* saryE;
+
+	double gain;
+	double mtau;
+	double mmult;
+	// display stuff
+	double dtau;
+	double dmult;
+	double* delta;
+	double* delta_copy;
+	double* cfc_gain_copy;
+
+	// nurbs stuff
+	int gdeg;
+	int edeg;
+	NURBS png;
+	NURBS pne;
+
+}cfcomp, *CFCOMP;
+
+static void calc_cfcwindow (CFCOMP a)
 {
 	int i;
 	double arg0, arg1, cgsum, igsum, coherent_gain, inherent_power_gain, wmult;
@@ -73,7 +154,7 @@ void calc_cfcwindow (CFCOMP a)
 	}
 }
 
-int fCOMPcompare (const void * a, const void * b)
+static int fCOMPcompare (const void * a, const void * b)
 {
 	if (*(double*)a < *(double*)b)
 		return -1;
@@ -87,7 +168,7 @@ int fCOMPcompare (const void * a, const void * b)
 #define M_LN2_10 3.32192809488736234787
 #endif
 
-void calc_compG (CFCOMP a)
+static void calc_compG (CFCOMP a)
 {
 	int i, j;
 	double f, frac, fincr, fmax;
@@ -176,7 +257,7 @@ void calc_compG (CFCOMP a)
 	// print_impulse ("comp.txt", a->msize, a->cfc_gain, 0, 0);
 }
 
-void calc_compE(CFCOMP a)
+static void calc_compE(CFCOMP a)
 {
 	int i, j;
 	double f, frac, fincr, fmax;
@@ -261,7 +342,7 @@ void calc_compE(CFCOMP a)
 }
 
 
-void calc_cfcomp(CFCOMP a)
+static void calc_cfcomp(CFCOMP a)
 {
 	int i;
 	a->incr = a->fsize / a->ovrlp;
@@ -325,7 +406,7 @@ void calc_cfcomp(CFCOMP a)
 	a->cfc_gain_copy = (double*)malloc0 (a->msize * sizeof(double));
 }
 
-void decalc_cfcomp(CFCOMP a)
+static void decalc_cfcomp(CFCOMP a)
 {
 	int i;
 	_aligned_free (a->cfc_gain_copy);
@@ -437,7 +518,7 @@ void destroy_cfcomp (CFCOMP a)
 }
 
 
-void calc_mask (CFCOMP a)
+static void calc_mask (CFCOMP a)
 {
 	int i;
 	double comp, mask, delta;
@@ -551,6 +632,16 @@ void setSize_cfcomp (CFCOMP a, int size)
 	decalc_cfcomp (a);
 	a->bsize = size;
 	calc_cfcomp (a);
+}
+
+int* getRunPtr_cfcomp (CFCOMP a)
+{
+	return &a->run;
+}
+
+double* getGainPtr_cfcomp (CFCOMP a)
+{
+	return &a->gain;
 }
 
 /********************************************************************************************************

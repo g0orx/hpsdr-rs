@@ -1,0 +1,6 @@
+# EditorConfig for WDSP:  keep LF line endings in the C sources.
+# Visual Studio reads this file, as do most other editors.  [There is no
+# "root = true", so settings from folders above this one still apply.]
+
+[*.{c,h}]
+end_of_line = lf

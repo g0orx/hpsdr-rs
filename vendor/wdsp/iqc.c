@@ -26,7 +26,28 @@ warren@pratt.one
 
 #include "comm.h"
 
-void calc_iqc (IQC a)
+typedef struct _iqc
+{
+	NS_Spline   *m_spline[2], *c_spline[2], *s_spline[2];
+	CurveEMA    m_calavg[2], c_calavg[2], s_calavg[2];
+	double      m_prev_y[2], c_prev_y[2], s_prev_y[2];
+
+	volatile long run;
+	volatile long busy;
+	int size;
+	double* in;
+	double* out;
+	double rate;
+	int cset;
+	double tup;
+	double* cup;
+	int count;
+	int ntup;
+	int state;
+	
+} iqc, *IQC;
+
+static void calc_iqc (IQC a)
 {
 	a->cset = 0;
 	a->count = 0;
@@ -186,6 +207,11 @@ void setSamplerate_iqc (IQC a, int rate)
 void setSize_iqc (IQC a, int size)
 {
 	a->size = size;
+}
+
+void clearBusy_iqc (IQC a)
+{
+	InterlockedBitTestAndReset (&a->busy, 0);
 }
 
 /********************************************************************************************************

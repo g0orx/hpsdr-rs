@@ -27,50 +27,13 @@ warren@wpratt.com
 #ifndef _nbp_h
 #define _nbp_h
 #include "firmin.h"
-typedef struct _notchdb
-{
-	int master_run;
-	double tunefreq;
-	double shift;
-	int nn;
-	int* active;
-	double* fcenter;
-	double* fwidth;
-	double* nlow;
-	double* nhigh;
-	int maxnotches;
-} notchdb, *NOTCHDB;
+typedef struct _notchdb* NOTCHDB;
 
 extern NOTCHDB create_notchdb (int master_run, int maxnotches);
 
 extern void destroy_notchdb (NOTCHDB b);
 
-typedef struct _nbp
-{
-	int run;				// run the filter
-	int fnfrun;				// use the notches
-	int position;			// position in processing pipeline
-	int size;				// buffer size
-	int nc;					// number of filter coefficients
-	int mp;					// minimum phase flag
-	double* in;				// input buffer
-	double* out;			// output buffer
-	double flow;			// low bandpass cutoff freq
-	double fhigh;			// high bandpass cutoff freq
-	double* impulse;		// filter impulse response
-	double rate;			// sample rate
-	int wintype;			// filter window type
-	double gain;			// filter gain
-	int autoincr;			// auto-increment notch width
-	int maxpb;				// maximum number of passbands
-	NOTCHDB* ptraddr;		// ptr to addr of notch-database data structure
-	double* bplow;			// array of passband lows
-	double* bphigh;			// array of passband highs
-	int numpb;				// number of passbands
-	FIRCORE p;
-	int havnotch;
-	int hadnotch;
-} nbp, *NBP;
+typedef struct _nbp* NBP;
 
 extern NBP create_nbp(int run, int fnfrun, int position, int size, int nc, int mp, double* in, double* out, 
 	double flow, double fhigh, int rate, int wintype, double gain, int autoincr, int maxpb, NOTCHDB* ptraddr);
@@ -87,16 +50,45 @@ extern void setSamplerate_nbp (NBP a, int rate);
 
 extern void setSize_nbp (NBP a, int size);
 
-extern void calc_nbp_impulse (NBP a);
+extern void setNc_nbp (NBP a, int nc);
 
-extern void setNc_nbp (NBP a);
+extern void setMp_nbp (NBP a, int mp);
 
-extern void setMp_nbp (NBP a);
+// [PORT is defined in wdsp_platform.h, which comm.h includes ahead of the module
+// headers.  Some WDSP headers are also included on their own, ahead of comm.h
+// (ChannelMaster includes resample.h this way), so a header that uses PORT
+// includes wdsp_platform.h itself.  It also supplies the types, CRITICAL_SECTION
+// and HANDLE, that some of these headers use.]
+#include "wdsp_platform.h"
 
-__declspec (dllexport) void RXANBPSetFreqs (int channel, double flow, double fhigh);
+PORT void RXANBPSetFreqs (int channel, double flow, double fhigh);
 
-__declspec (dllexport) void RXANBPSetNC (int channel, int nc);
+PORT void RXANBPSetNC (int channel, int nc);
 
-__declspec (dllexport) void RXANBPSetMP (int channel, int mp);
+PORT void RXANBPSetMP (int channel, int mp);
+
+extern int getMasterRun_notchdb (NOTCHDB a);
+
+extern void setRun_nbp (NBP a, int run);
+
+extern double getFlow_nbp (NBP a);
+
+extern double getFhigh_nbp (NBP a);
+
+extern void setFnfrun_nbp (NBP a, int fnfrun);
+
+extern void setFlow_nbp (NBP a, double flow);
+
+extern void setFhigh_nbp (NBP a, double fhigh);
+
+extern void setWintype_nbp (NBP a, int wintype);
+
+extern void setGain_nbp (NBP a, double gain);
+
+extern void setAutoincr_nbp (NBP a, int autoincr);
+
+extern void setImpulse_nbp (NBP a, int update);
+
+extern void setUpdate_nbp (NBP a);
 
 #endif

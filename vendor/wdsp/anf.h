@@ -29,31 +29,7 @@ warren@wpratt.com
 
 #define ANF_DLINE_SIZE 2048
 
-typedef struct _anf
-{
-	int run;
-	int position;
-	int buff_size;
-	double *in_buff;
-	double *out_buff;
-	int dline_size;
-	int mask;
-	int n_taps;
-	int delay;
-	double two_mu;
-	double gamma;
-	double d [ANF_DLINE_SIZE];
-	double w [ANF_DLINE_SIZE];
-	int in_idx;
-
-	double lidx;
-	double lidx_min;
-	double lidx_max;
-	double ngamma;
-	double den_mult;
-	double lincr;
-	double ldecr;
-} anf, *ANF;
+typedef struct _anf* ANF;
 
 extern ANF create_anf	(
 				int run,
@@ -88,20 +64,13 @@ extern void setSamplerate_anf (ANF a, int rate);
 
 extern void setSize_anf (ANF a, int size);
 
+extern int getRun_anf (ANF a);
+
+extern int getPosition_anf (ANF a);
+
 // RXA Properties
 
-extern __declspec (dllexport) void SetRXAANFRun (int channel, int setit);
-
-extern __declspec (dllexport) void SetRXAANFVals (int channel, int taps, int delay, double gain, double leakage);
-
-extern __declspec (dllexport) void SetRXAANFTaps (int channel, int taps);
-
-extern __declspec (dllexport) void SetRXAANFDelay (int channel, int delay);
-
-extern __declspec (dllexport) void SetRXAANFGain (int channel, double gain);
-
-extern __declspec (dllexport) void SetRXAANFLeakage (int channel, double leakage);
-
-extern __declspec (dllexport) void SetRXAANFPosition (int channel, int position);
+// [Exported (PORT) functions of this module that nothing else in WDSP, nor
+// ChannelMaster, calls are declared only in wdsp.h, the public header.]
 
 #endif

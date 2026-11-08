@@ -26,7 +26,21 @@ warren@wpratt.com
 
 #include "comm.h"
 
-void calc_shift (SHIFT a)
+typedef struct _shift
+{
+	int run;
+	int size;
+	double* in;
+	double* out;
+	double rate;
+	double shift;
+	double phase;
+	double delta;
+	double cos_delta;
+	double sin_delta;
+} shift, *SHIFT;
+
+static void calc_shift (SHIFT a)
 {
 	a->delta = TWOPI * a->shift / a->rate;
 	a->cos_delta = cos (a->delta);

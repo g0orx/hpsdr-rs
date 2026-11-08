@@ -26,6 +26,32 @@ warren@wpratt.com
 
 #include "comm.h"
 
+typedef struct _anf
+{
+	int run;
+	int position;
+	int buff_size;
+	double *in_buff;
+	double *out_buff;
+	int dline_size;
+	int mask;
+	int n_taps;
+	int delay;
+	double two_mu;
+	double gamma;
+	double d [ANF_DLINE_SIZE];
+	double w [ANF_DLINE_SIZE];
+	int in_idx;
+
+	double lidx;
+	double lidx_min;
+	double lidx_max;
+	double ngamma;
+	double den_mult;
+	double lincr;
+	double ldecr;
+} anf, *ANF;
+
 ANF create_anf	(
 				int run,
 				int position,
@@ -157,6 +183,16 @@ void setSize_anf (ANF a, int size)
 	flush_anf (a);
 }
 
+int getRun_anf (ANF a)
+{
+	return a->run;
+}
+
+int getPosition_anf (ANF a)
+{
+	return a->position;
+}
+
 /********************************************************************************************************
 *																										*
 *											RXA Properties												*
@@ -169,9 +205,9 @@ SetRXAANFRun (int channel, int run)
 	ANF a = rxa[channel].anf.p;
 	if (a->run != run)
 	{
-		RXAbp1Check (channel, rxa[channel].amd.p->run, rxa[channel].snba.p->run, 
-			rxa[channel].emnr.p->run, getRun_nnrbypass (rxa[channel].nnrbypass.p), 
-			run, rxa[channel].anr.p->run);
+		RXAbp1Check (channel, getRun_amd (rxa[channel].amd.p), getRun_snba (rxa[channel].snba.p), 
+			getRun_emnr (rxa[channel].emnr.p), getRun_nnrbypass (rxa[channel].nnrbypass.p), 
+			run, getRun_anr (rxa[channel].anr.p));
 		EnterCriticalSection (&ch[channel].csDSP);
 		a->run = run;
 		RXAbp1Set (channel);

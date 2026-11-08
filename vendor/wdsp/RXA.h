@@ -219,9 +219,8 @@ extern void setDSPBuffsize_rxa (int channel);
 
 // RXA Properties
 
-extern __declspec (dllexport) void SetRXAMode (int channel, int mode);
-
-extern void RXAResCheck (int channel);
+// [Exported (PORT) functions of this module that nothing else in WDSP, nor
+// ChannelMaster, calls are declared only in wdsp.h, the public header.]
 
 extern void RXAbp1Check (int channel, int amd_run, int snba_run, 
 	int emnr_run, int nnrbypass_run, int anf_run, int anr_run);

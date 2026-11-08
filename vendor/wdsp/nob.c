@@ -26,11 +26,46 @@ warren@wpratt.com
 
 #include "comm.h"
 
+typedef struct _anb
+{
+	int run;
+	int buffsize;					// size of input/output buffer
+	double* in;						// input buffer
+	double* out;					// output buffer
+	int dline_size;					// length of delay line which is 'double dline[length][2]'
+	double *dline;					// pointer to delay line
+	double samplerate;				// samplerate, used to convert times into sample counts
+	double tau;						// transition time, signal<->zero
+	double hangtime;				// time to stay at zero after noise is no longer detected
+	double advtime;					// deadtime (zero output) in advance of detected noise
+	double backtau;					// time constant used in averaging the magnitude of the input signal
+	double threshold;				// triggers if (noise > threshold * average_signal_magnitude)
+    double *wave;                   // pointer to array holding transition waveform
+    int state;                      // state of the state machine
+    double avg;                     // average value of the signal magnitude
+    int dtime;                      // count when decreasing the signal magnitude
+    int htime;                      // count when hanging
+    int itime;                      // count when increasing the signal magnitude
+    int atime;                      // count at zero before the noise burst (advance count)
+    double coef;					// parameter in calculating transition waveform
+    int trans_count;                // number of samples to equal 'tau' time
+    int hang_count;                 // number of samples to equal 'hangtime' time
+    int adv_count;                  // number of samples to equal 'advtime' time
+    int in_idx;                     // ring buffer position into which new samples are inserted
+    int out_idx;                    // ring buffer position from which delayed samples are pulled
+    double power;					// level at which signal was increasing when a new decrease is started
+    int count;						// set each time a noise sample is detected, counts down
+    double backmult;				// multiplier for waveform averaging
+    double ombackmult;				// multiplier for waveform averaging
+	CRITICAL_SECTION cs_update;
+	double *legacy;																										////////////  legacy interface - remove
+} anb, *ANB;
+
 #define MAX_TAU			(0.002)		// maximum transition time, signal<->zero
 #define MAX_ADVTIME		(0.002)		// maximum deadtime (zero output) in advance of detected noise
 #define MAX_SAMPLERATE  (1536000)
 
-void initBlanker(ANB a)
+static void initBlanker(ANB a)
 {
     int i;
     a->trans_count = (int)(a->tau * a->samplerate);
@@ -305,7 +340,7 @@ void pSetRCVRANBThreshold (ANB a, double thresh)
 ********************************************************************************************************/
 
 #define MAX_EXT_ANBS	(32)						// maximum number of NOBs called from outside wdsp
-__declspec (align (16)) ANB panb[MAX_EXT_ANBS];		// array of pointers for NOBs used EXTERNAL to wdsp
+static __declspec (align (16)) ANB panb[MAX_EXT_ANBS];		// array of pointers for NOBs used EXTERNAL to wdsp
 
 PORT
 void create_anbEXT	(

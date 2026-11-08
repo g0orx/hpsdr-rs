@@ -27,19 +27,7 @@ warren@wpratt.com
 #ifndef _patchpanel_h
 #define _patchpanel_h
 
-typedef struct _patchpanel
-{
-	int channel;
-	int run;
-	int size;
-	double* in;
-	double* out;
-	double gain1;
-	double gain2I;
-	double gain2Q;
-	int inselect;
-	int copy;
-} panel, *PANEL;
+typedef struct _patchpanel* PANEL;
 
 extern PANEL create_panel (int channel, int run, int size, double* in, double* out, double gain1, double gain2I, double gain2Q, int inselect, int copy);
 
@@ -55,22 +43,11 @@ extern void setSamplerate_panel (PANEL a, int rate);
 
 extern void setSize_panel (PANEL a, int size);
 
+extern void setRun_patchpanel (PANEL a, int run);
+
 // RXA Properties
 
-extern __declspec (dllexport) void SetRXAPanelRun (int channel, int run);
-
-extern __declspec (dllexport) void SetRXAPanelGain1 (int channel, double gain);
-
-extern __declspec (dllexport) void SetRXAPanelGain2 (int channel, double gainI, double gainQ);
-
-extern __declspec (dllexport) void SetRXAPanelPan (int channel, double pan);
-
-extern __declspec (dllexport) void SetRXAPanelCopy (int channel, int copy);
-
-extern __declspec (dllexport) void SetRXAPanelBinaural (int channel, int bin);
-
-// TXA Properties
-
-extern __declspec (dllexport) void SetTXAPanelRun (int channel, int run);
+// [Exported (PORT) functions of this module that nothing else in WDSP, nor
+// ChannelMaster, calls are declared only in wdsp.h, the public header.]
 
 #endif

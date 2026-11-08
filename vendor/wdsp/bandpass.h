@@ -33,24 +33,7 @@ warren@wpratt.com
 #ifndef _bps_h
 #define _bps_h
 
-typedef struct _bps
-{
-	int run;
-	int position;
-	int size;
-	double* in;
-	double* out;
-	double f_low;
-	double f_high;
-	double* infilt;
-	double* product;
-	double* mults;
-	double samplerate;
-	int wintype;
-	double gain;
-	fftw_plan CFor;
-	fftw_plan CRev;
-}bps, *BPS;
+typedef struct _bps* BPS;
 
 extern BPS create_bps (int run, int position, int size, double* in, double* out, 
 	double f_low, double f_high, int samplerate, int wintype, double gain);
@@ -94,22 +77,7 @@ extern void setFreqs_bps (BPS a, double f_low, double f_high);
 #ifndef _bandpass_h
 #define _bandpass_h
 #include "firmin.h"
-typedef struct _bandpass
-{
-	int run;
-	int position;
-	int size;
-	int nc;
-	int mp;
-	double* in;
-	double* out;
-	double f_low;
-	double f_high;
-	double samplerate;
-	int wintype;
-	double gain;
-	FIRCORE p;
-}bandpass, *BANDPASS;
+typedef struct _bandpass* BANDPASS;
 
 extern BANDPASS create_bandpass (int run, int position, int size, int nc, int mp, double* in, double* out, 
 	double f_low, double f_high, int samplerate, int wintype, double gain);
@@ -130,14 +98,33 @@ extern void setGain_bandpass (BANDPASS a, double gain, int update);
 
 extern void CalcBandpassFilter (BANDPASS a, double f_low, double f_high, double gain);
 
-extern __declspec (dllexport) void SetRXABandpassFreqs (int channel, double f_low, double f_high);
+// [PORT is defined in wdsp_platform.h, which comm.h includes ahead of the module
+// headers.  Some WDSP headers are also included on their own, ahead of comm.h
+// (ChannelMaster includes resample.h this way), so a header that uses PORT
+// includes wdsp_platform.h itself.  It also supplies the types, CRITICAL_SECTION
+// and HANDLE, that some of these headers use.]
+#include "wdsp_platform.h"
 
-extern __declspec (dllexport) void SetRXABandpassNC (int channel, int nc);
+extern PORT void SetRXABandpassFreqs (int channel, double f_low, double f_high);
 
-extern __declspec (dllexport) void SetRXABandpassMP (int channel, int mp);
+extern PORT void SetRXABandpassNC (int channel, int nc);
 
-extern __declspec (dllexport) void SetTXABandpassNC (int channel, int nc);
+extern PORT void SetRXABandpassMP (int channel, int mp);
 
-extern __declspec (dllexport) void SetTXABandpassMP (int channel, int mp);
+extern PORT void SetTXABandpassNC (int channel, int nc);
+
+extern PORT void SetTXABandpassMP (int channel, int mp);
+
+extern double getGain_bandpass (BANDPASS a);
+
+extern int getRun_bandpass (BANDPASS a);
+
+extern void setRun_bandpass (BANDPASS a, int run);
+
+extern int getPosition_bandpass (BANDPASS a);
+
+extern void setPosition_bandpass (BANDPASS a, int position);
+
+extern void setUpdate_bandpass (BANDPASS a);
 
 #endif

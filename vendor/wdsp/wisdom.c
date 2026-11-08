@@ -53,10 +53,8 @@ int WDSPwisdom (char* directory)
 	{
 		fftin =  (double *) malloc0 (maxsize * sizeof (complex));
 		fftout = (double *) malloc0 (maxsize * sizeof (complex));
-#ifdef _WIN32
 		AllocConsole();								// create console
 	    freopen_s(&stream, "conout$", "w", stdout); // redirect output to console
-#endif
 		fprintf(stdout, "Optimizing FFT sizes through %d\n\n", maxsize);
 		fprintf(stdout, "Please do not close this window until wisdom plans are completed.\n\n");
 		sprintf(status, "Optimizing FFT sizes through %d", maxsize);
@@ -106,9 +104,7 @@ int WDSPwisdom (char* directory)
 		fftw_export_wisdom_to_filename(wisdom_file);
 		_aligned_free (fftout);
 		_aligned_free (fftin);
-#ifdef _WIN32
 		FreeConsole();							// dismiss console
-#endif
 		wisdom_return = 1;
 	}
 	return wisdom_return;

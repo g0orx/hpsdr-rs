@@ -26,7 +26,35 @@ warren@wpratt.com
 
 #include "comm.h"
 
-void compute_slews(AMSQ a)
+typedef struct _amsq
+{
+	int run;							// 0 if squelch system is OFF; 1 if it's ON
+	int size;							// size of input/output buffers
+	double* in;							// squelch input signal buffer
+	double* out;						// squelch output signal buffer
+	double* trigger;					// pointer to trigger data source
+	double* trigsig;					// buffer containing trigger signal
+	double rate;						// sample rate
+	double avtau;						// time constant for averaging noise
+	double avm;						
+	double onem_avm;
+	double avsig;
+	int state;							// state machine control
+	int count;
+	double tup;
+	double tdown;
+	int ntup;
+	int ntdown;
+	double* cup;
+	double* cdown;
+	double tail_thresh;
+	double unmute_thresh;
+	double min_tail;
+	double max_tail;
+	double muted_gain;
+} amsq, *AMSQ;
+
+static void compute_slews(AMSQ a)
 {
 	int i;
 	double delta, theta;
@@ -46,7 +74,7 @@ void compute_slews(AMSQ a)
 	}
 }
 
-void calc_amsq(AMSQ a)
+static void calc_amsq(AMSQ a)
 {
 	// signal averaging
 	a->trigsig = (double *)malloc0(a->size * sizeof(complex));
@@ -63,7 +91,7 @@ void calc_amsq(AMSQ a)
 	a->state = 0;
 }
 
-void decalc_amsq (AMSQ a)
+static void decalc_amsq (AMSQ a)
 {
 	_aligned_free (a->cdown);
 	_aligned_free (a->cup);

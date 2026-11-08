@@ -27,14 +27,7 @@ warren@wpratt.com
 #ifndef _compressor_h
 #define _compressor_h
 
-typedef struct _compressor
-{
-	int run;
-	int buffsize;
-	double *inbuff;
-	double *outbuff;
-	double gain;
-} compressor, *COMPRESSOR;
+typedef struct _compressor* COMPRESSOR;
 
 extern void xcompressor (COMPRESSOR a);
 
@@ -55,10 +48,13 @@ extern void setSamplerate_compressor (COMPRESSOR a, int rate);
 
 extern void setSize_compressor (COMPRESSOR a, int size);
 
+extern int getRun_compressor (COMPRESSOR a);
+
+extern int* getRunPtr_compressor (COMPRESSOR a);
+
 // TXA Properties
 
-extern __declspec (dllexport) void SetTXACompressorRun (int channel, int run);
-
-extern __declspec (dllexport) void SetTXACompressorGain (int channel, double gain);
+// [Exported (PORT) functions of this module that nothing else in WDSP, nor
+// ChannelMaster, calls are declared only in wdsp.h, the public header.]
 
 #endif

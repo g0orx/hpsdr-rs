@@ -29,80 +29,7 @@ warren@wpratt.com
 
 #include "resample.h"
 
-typedef struct _snba
-{
-	int run;
-	double* in;
-	double* out;
-	int inrate;
-	int internalrate;
-	int bsize;
-	int xsize;
-	int ovrlp;
-	int incr;
-	int iasize;
-	int iainidx;
-	int iaoutidx;
-	double* inaccum;
-	double* xbase;
-	double* xaux;
-	int nsamps;
-	int oasize;
-	int oainidx;
-	int oaoutidx;
-	int init_oaoutidx;
-	double* outaccum;
-
-	int resamprun;
-	int isize;
-	RESAMPLE inresamp;
-	RESAMPLE outresamp;
-	double* inbuff;
-	double* outbuff;
-	struct _exec
-	{
-		int asize;
-		double* a;
-		double* v;
-		int* detout;
-		double* savex;
-		double* xHout;
-		int* unfixed;
-		int npasses;
-	} exec;
-	struct _det
-	{
-		double k1;
-		double k2;
-		int b;
-		int pre;
-		int post;
-		double* vp;
-		double* vpwr;
-	} sdet;
-	struct _scan
-	{
-		double pmultmin;
-	} scan;
-	struct _wrk
-	{
-		int xHat_a1rows_max;
-		int xHat_a2cols_max;
-		double* xHat_r;
-		double* xHat_ATAI;
-		double* xHat_A1;
-		double* xHat_A2;
-		double* xHat_P1;
-		double* xHat_P2;
-		double* trI_y;
-		double* trI_v;
-		double* dR_z;
-		double* asolve_r;
-		double* asolve_z;
-	} wrk;
-	double out_low_cut;
-	double out_high_cut;
-} snba, *SNBA;
+typedef struct _snba* SNBA;
 
 extern SNBA create_snba (int run, double* in, double* out, int inrate, int internalrate, int bsize, int ovrlp, int xsize,
 	int asize, int npasses, double k1, double k2, int b, int pre, int post, double pmultmin, double out_low_cut, double out_high_cut);
@@ -119,35 +46,16 @@ extern void setSamplerate_snba (SNBA a, int rate);
 
 extern void setSize_snba (SNBA a, int size);
 
-__declspec (dllexport) void SetRXASNBAOutputBandwidth (int channel, double flow, double fhigh);
+// [PORT is defined in wdsp_platform.h, which comm.h includes ahead of the module
+// headers.  Some WDSP headers are also included on their own, ahead of comm.h
+// (ChannelMaster includes resample.h this way), so a header that uses PORT
+// includes wdsp_platform.h itself.  It also supplies the types, CRITICAL_SECTION
+// and HANDLE, that some of these headers use.]
+#include "wdsp_platform.h"
 
-typedef struct _bpsnba
-{
-		int run;						// run the filter
-		int run_notches;				// use the notches, vs straight bandpass
-		int position;					// position in the processing pipeline
-		int size;						// buffer size
-		int nc;							// number of filter coefficients
-		int mp;							// minimum phase flag
-		double* in;						// input buffer
-		double* out;					// output buffer
-		int rate;						// sample rate
-		double* buff;					// internal buffer
-		NBP bpsnba;						// pointer to the notched bandpass filter, nbp
-		double f_low;					// low cutoff frequency
-		double f_high;					// high cutoff frequency
-		double abs_low_freq;			// lowest positive freq supported by SNB
-		double abs_high_freq;			// highest positive freq supported by SNG
-		int wintype;					// filter window type
-		double gain;					// filter gain
-		int autoincr;					// use auto increment for notch width
-		int maxpb;						// maximum passband segments supported
-		NOTCHDB* ptraddr;				// pointer to address of NOTCH DATABASE
-} bpsnba, *BPSNBA;
+PORT void SetRXASNBAOutputBandwidth (int channel, double flow, double fhigh);
 
-extern void calc_bpsnba (BPSNBA a);
-
-extern void decalc_bpsnba (BPSNBA a);
+typedef struct _bpsnba* BPSNBA;
 
 extern BPSNBA create_bpsnba (int run, int run_notches, int position, int size, int nc, int mp, double* in, double* out, int rate,  
 	double abs_low_freq, double abs_high_freq, double f_low, double f_high, int wintype, double gain, int autoincr, 
@@ -169,8 +77,42 @@ extern void xbpsnbaout (BPSNBA a, int position);
 
 extern void recalc_bpsnba_filter (BPSNBA a, int update);
 
-__declspec (dllexport) void RXABPSNBASetNC (int channel, int nc);
+PORT void RXABPSNBASetNC (int channel, int nc);
 
-__declspec (dllexport) void RXABPSNBASetMP (int channel, int mp);
+PORT void RXABPSNBASetMP (int channel, int mp);
+
+extern int getRun_snba (SNBA a);
+
+extern double getAbsLowFreq_bpsnba (BPSNBA a);
+
+extern double getAbsHighFreq_bpsnba (BPSNBA a);
+
+extern double getFLow_bpsnba (BPSNBA a);
+
+extern void setFLow_bpsnba (BPSNBA a, double f_low);
+
+extern double getFHigh_bpsnba (BPSNBA a);
+
+extern void setFHigh_bpsnba (BPSNBA a, double f_high);
+
+extern int getRunNotches_bpsnba (BPSNBA a);
+
+extern void setRunNotches_bpsnba (BPSNBA a, int run_notches);
+
+extern void setRun_bpsnba (BPSNBA a, int run);
+
+extern void setPosition_bpsnba (BPSNBA a, int position);
+
+extern void setUpdate_bpsnba (BPSNBA a);
+
+extern NBP getNbp_bpsnba (BPSNBA a);
+
+extern int getWintype_bpsnba (BPSNBA a);
+
+extern void setWintype_bpsnba (BPSNBA a, int wintype);
+
+extern int getAutoincr_bpsnba (BPSNBA a);
+
+extern void setAutoincr_bpsnba (BPSNBA a, int autoincr);
 
 #endif

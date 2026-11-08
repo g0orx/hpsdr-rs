@@ -26,9 +26,108 @@ warren@wpratt.com
 
 #include "comm.h"
 
+typedef struct _snba
+{
+	int run;
+	double* in;
+	double* out;
+	int inrate;
+	int internalrate;
+	int bsize;
+	int xsize;
+	int ovrlp;
+	int incr;
+	int iasize;
+	int iainidx;
+	int iaoutidx;
+	double* inaccum;
+	double* xbase;
+	double* xaux;
+	int nsamps;
+	int oasize;
+	int oainidx;
+	int oaoutidx;
+	int init_oaoutidx;
+	double* outaccum;
+
+	int resamprun;
+	int isize;
+	RESAMPLE inresamp;
+	RESAMPLE outresamp;
+	double* inbuff;
+	double* outbuff;
+	struct _exec
+	{
+		int asize;
+		double* a;
+		double* v;
+		int* detout;
+		double* savex;
+		double* xHout;
+		int* unfixed;
+		int npasses;
+	} exec;
+	struct _det
+	{
+		double k1;
+		double k2;
+		int b;
+		int pre;
+		int post;
+		double* vp;
+		double* vpwr;
+	} sdet;
+	struct _scan
+	{
+		double pmultmin;
+	} scan;
+	struct _wrk
+	{
+		int xHat_a1rows_max;
+		int xHat_a2cols_max;
+		double* xHat_r;
+		double* xHat_ATAI;
+		double* xHat_A1;
+		double* xHat_A2;
+		double* xHat_P1;
+		double* xHat_P2;
+		double* trI_y;
+		double* trI_v;
+		double* dR_z;
+		double* asolve_r;
+		double* asolve_z;
+	} wrk;
+	double out_low_cut;
+	double out_high_cut;
+} snba, *SNBA;
+
+typedef struct _bpsnba
+{
+		int run;						// run the filter
+		int run_notches;				// use the notches, vs straight bandpass
+		int position;					// position in the processing pipeline
+		int size;						// buffer size
+		int nc;							// number of filter coefficients
+		int mp;							// minimum phase flag
+		double* in;						// input buffer
+		double* out;					// output buffer
+		int rate;						// sample rate
+		double* buff;					// internal buffer
+		NBP bpsnba;						// pointer to the notched bandpass filter, nbp
+		double f_low;					// low cutoff frequency
+		double f_high;					// high cutoff frequency
+		double abs_low_freq;			// lowest positive freq supported by SNB
+		double abs_high_freq;			// highest positive freq supported by SNG
+		int wintype;					// filter window type
+		double gain;					// filter gain
+		int autoincr;					// use auto increment for notch width
+		int maxpb;						// maximum passband segments supported
+		NOTCHDB* ptraddr;				// pointer to address of NOTCH DATABASE
+} bpsnba, *BPSNBA;
+
 #define MAXIMP			256
 
-void calc_snba (SNBA d)
+static void calc_snba (SNBA d)
 {
 	if (d->inrate >= d->internalrate)
 		d->isize = d->bsize / (d->inrate / d->internalrate);
@@ -118,7 +217,7 @@ SNBA create_snba (int run, double* in, double* out, int inrate, int internalrate
 	return d;
 }
 
-void decalc_snba (SNBA d)
+static void decalc_snba (SNBA d)
 {
 	destroy_resample (d->outresamp);
 	destroy_resample (d->inresamp);
@@ -206,7 +305,7 @@ void setSize_snba (SNBA a, int size)
 	calc_snba (a);
 }
 
-void ATAc0 (int n, int nr, double* A, double* r)
+static void ATAc0 (int n, int nr, double* A, double* r)
 {
     int i, j;
 	memset(r, 0, n * sizeof (double));
@@ -215,7 +314,7 @@ void ATAc0 (int n, int nr, double* A, double* r)
             r[i] += A[j * n + i] * A[j * n + 0];
 }
 
-void multA1TA2(double* a1, double* a2, int m, int n, int q, double* c)
+static void multA1TA2(double* a1, double* a2, int m, int n, int q, double* c)
 {
 	int i, j, k;
     int p = q - m;
@@ -238,7 +337,7 @@ void multA1TA2(double* a1, double* a2, int m, int n, int q, double* c)
     }
 }
 
-void multXKE(double* a, double* xk, int m, int q, int p, double* vout)
+static void multXKE(double* a, double* xk, int m, int q, int p, double* vout)
 {
     int i, k;
 	memset (vout, 0, m * sizeof (double));
@@ -251,7 +350,7 @@ void multXKE(double* a, double* xk, int m, int q, int p, double* vout)
     }
 }
 
-void multAv(double* a, double* v, int m, int q, double* vout)
+static void multAv(double* a, double* v, int m, int q, double* vout)
 {
 	int i, k;
 	memset (vout, 0, m * sizeof (double));
@@ -262,7 +361,7 @@ void multAv(double* a, double* v, int m, int q, double* vout)
     }
 }
 
-void xHat(int xusize, int asize, double* xk, double* a, double* xout,
+static void xHat(int xusize, int asize, double* xk, double* a, double* xout,
 	double* r, double* ATAI, double* A1, double* A2, double* P1, double* P2,
 	double* trI_y, double* trI_v, double* dR_z)
 {
@@ -303,7 +402,7 @@ void xHat(int xusize, int asize, double* xk, double* a, double* xout,
     multAv(ATAI, P2, xusize, xusize, xout);
 }
 
-void invf(int xsize, int asize, double* a, double* x, double* v)
+static void invf(int xsize, int asize, double* a, double* x, double* v)
 {
     int i, j;
 	memset (v, 0, xsize * sizeof (double));
@@ -321,7 +420,7 @@ void invf(int xsize, int asize, double* a, double* x, double* v)
     }
 }
 
-void det(SNBA d, int asize, double* v, int* detout)
+static void det(SNBA d, int asize, double* v, int* detout)
 {
     int i, j;
     double medpwr, t1, t2;
@@ -401,7 +500,7 @@ void det(SNBA d, int asize, double* v, int* detout)
     }
 }
 
-int scanFrame(int xsize, int pval, double pmultmin, int* det, int* bimp, int* limp, 
+static int scanFrame(int xsize, int pval, double pmultmin, int* det, int* bimp, int* limp, 
             int* befimp, int* aftimp, int* p_opt, int* next)
 {
     int inflag = 0;
@@ -489,7 +588,7 @@ int scanFrame(int xsize, int pval, double pmultmin, int* det, int* bimp, int* li
     return nimp;
 }
 
-void execFrame(SNBA d, double* x)
+static void execFrame(SNBA d, double* x)
 {
 	int i, k;
     int pass;
@@ -570,6 +669,91 @@ void xsnba (SNBA d)
 		memcpy (d->out, d->in, d->bsize * sizeof (complex));
 }
 
+int getRun_snba (SNBA a)
+{
+	return a->run;
+}
+
+double getAbsLowFreq_bpsnba (BPSNBA a)
+{
+	return a->abs_low_freq;
+}
+
+double getAbsHighFreq_bpsnba (BPSNBA a)
+{
+	return a->abs_high_freq;
+}
+
+double getFLow_bpsnba (BPSNBA a)
+{
+	return a->f_low;
+}
+
+void setFLow_bpsnba (BPSNBA a, double f_low)
+{
+	a->f_low = f_low;
+}
+
+double getFHigh_bpsnba (BPSNBA a)
+{
+	return a->f_high;
+}
+
+void setFHigh_bpsnba (BPSNBA a, double f_high)
+{
+	a->f_high = f_high;
+}
+
+int getRunNotches_bpsnba (BPSNBA a)
+{
+	return a->run_notches;
+}
+
+void setRunNotches_bpsnba (BPSNBA a, int run_notches)
+{
+	a->run_notches = run_notches;
+}
+
+void setRun_bpsnba (BPSNBA a, int run)
+{
+	a->run = run;
+}
+
+void setPosition_bpsnba (BPSNBA a, int position)
+{
+	a->position = position;
+}
+
+void setUpdate_bpsnba (BPSNBA a)
+{
+	setUpdate_nbp (a->bpsnba);
+}
+
+NBP getNbp_bpsnba (BPSNBA a)
+{
+	return a->bpsnba;
+}
+
+int getWintype_bpsnba (BPSNBA a)
+{
+	return a->wintype;
+}
+
+void setWintype_bpsnba (BPSNBA a, int wintype)
+{
+	a->wintype = wintype;
+}
+
+int getAutoincr_bpsnba (BPSNBA a)
+{
+	return a->autoincr;
+}
+
+void setAutoincr_bpsnba (BPSNBA a, int autoincr)
+{
+	a->autoincr = autoincr;
+}
+
 /********************************************************************************************************
 *																										*
 *											RXA Properties												*
@@ -581,10 +765,10 @@ PORT void SetRXASNBARun (int channel, int run)
 	SNBA a = rxa[channel].snba.p;
 	if (a->run != run)
 	{
-		RXAbpsnbaCheck (channel, rxa[channel].mode, rxa[channel].ndb.p->master_run);
-		RXAbp1Check (channel, rxa[channel].amd.p->run, run, rxa[channel].emnr.p->run, 
+		RXAbpsnbaCheck (channel, rxa[channel].mode, getMasterRun_notchdb (rxa[channel].ndb.p));
+		RXAbp1Check (channel, getRun_amd (rxa[channel].amd.p), run, getRun_emnr (rxa[channel].emnr.p), 
 			getRun_nnrbypass (rxa[channel].nnrbypass.p), 
-			rxa[channel].anf.p->run, rxa[channel].anr.p->run);
+			getRun_anf (rxa[channel].anf.p), getRun_anr (rxa[channel].anr.p));
 		EnterCriticalSection (&ch[channel].csDSP);
 		a->run = run;
 		RXAbp1Set (channel);
@@ -709,7 +893,7 @@ PORT void SetRXASNBAOutputBandwidth (int channel, double flow, double fhigh)
 // for its input and output to happen at different points in the processing pipeline.  This means it must 
 // include a buffer, 'buff'.  Its input and output are done via functions xbpshbain() and xbpshbaout().
 
-void calc_bpsnba (BPSNBA a)
+static void calc_bpsnba (BPSNBA a)
 {
 	a->buff = (double *) malloc0 (a->size * sizeof (complex));
 	a->bpsnba = create_nbp (
@@ -758,7 +942,7 @@ BPSNBA create_bpsnba (int run, int run_notches, int position, int size, int nc, 
 	return a;
 }
 
-void decalc_bpsnba (BPSNBA a)
+static void decalc_bpsnba (BPSNBA a)
 {
 	destroy_nbp (a->bpsnba);
 	_aligned_free (a->buff);
@@ -815,15 +999,13 @@ void recalc_bpsnba_filter (BPSNBA a, int update)
 	// Call anytime one of the parameters listed below has been changed in
 	// the BPSNBA struct.
 	NBP b = a->bpsnba;
-	b->fnfrun = a->run_notches;
-	b->flow = a->f_low;
-	b->fhigh = a->f_high;
-	b->wintype = a->wintype;
-	b->gain = a->gain;
-	b->autoincr = a->autoincr;
-	calc_nbp_impulse (b);
-	setImpulse_fircore (b->p, b->impulse, update);
-	_aligned_free (b->impulse);
+	setFnfrun_nbp (b, a->run_notches);
+	setFlow_nbp (b, a->f_low);
+	setFhigh_nbp (b, a->f_high);
+	setWintype_nbp (b, a->wintype);
+	setGain_nbp (b, a->gain);
+	setAutoincr_nbp (b, a->autoincr);
+	setImpulse_nbp (b, update);
 }
 
 /********************************************************************************************************
@@ -841,8 +1023,7 @@ void RXABPSNBASetNC (int channel, int nc)
 	if (a->nc != nc)
 	{
 		a->nc = nc;
-		a->bpsnba->nc = a->nc;
-		setNc_nbp (a->bpsnba);
+		setNc_nbp (a->bpsnba, a->nc);
 	}
 	LeaveCriticalSection (&ch[channel].csDSP);
 }
@@ -855,7 +1036,6 @@ void RXABPSNBASetMP (int channel, int mp)
 	if (a->mp != mp)
 	{
 		a->mp = mp;
-		a->bpsnba->mp = a->mp;
-		setMp_nbp (a->bpsnba);
+		setMp_nbp (a->bpsnba, a->mp);
 	}
 }

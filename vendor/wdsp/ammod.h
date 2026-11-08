@@ -27,17 +27,7 @@ warren@wpratt.com
 #ifndef _ammod_h
 #define _ammod_h
 
-typedef struct _ammod
-{
-	int run;
-	int mode;
-	int size;
-	double* in;
-	double* out;
-	double c_level;
-	double a_level;
-	double mult;
-}ammod, *AMMOD;
+typedef struct _ammod* AMMOD;
 
 extern AMMOD create_ammod (int run, int mode, int size, double* in, double* out, double c_level);
 
@@ -53,8 +43,15 @@ extern void setSamplerate_ammod (AMMOD a, int rate);
 
 extern void setSize_ammod (AMMOD a, int size);
 
+extern int getRun_ammod (AMMOD a);
+
+extern void setRun_ammod (AMMOD a, int run);
+
+extern void setMode_ammod (AMMOD a, int mode);
+
 // TXA Properties
 
-extern __declspec (dllexport) void SetTXAAMCarrierLevel (int channel, double c_level);
+// [Exported (PORT) functions of this module that nothing else in WDSP, nor
+// ChannelMaster, calls are declared only in wdsp.h, the public header.]
 
 #endif

@@ -90,7 +90,7 @@ static CRITICAL_SECTION _cs_use_cache;
 static int _run = 0;
 static int _use_cache = 1;
 
-void remove_impulse_cache_tail(size_t bucket)
+static void remove_impulse_cache_tail(size_t bucket)
 {
 	if (bucket >= CACHE_BUCKETS) return;
 
@@ -110,7 +110,7 @@ void remove_impulse_cache_tail(size_t bucket)
 	}
 }
 
-void free_impulse_cache(void)
+static void free_impulse_cache(void)
 {
 	for (size_t b = 0; b < CACHE_BUCKETS; ++b) {
 		cache_entry* e = _cache_heads[b];
