@@ -945,7 +945,28 @@ fn start_web_server(
         None
     };
     web_server::WebServer::start(addr, tls, password.to_string(), Arc::clone(tci_addr), log.clone())
-        .map_err(|e| format!("couldn't listen on {addr}: {e}"))
+        .map_err(|e| {
+            if e.kind() == std::io::ErrorKind::AddrInUse {
+                format!(
+                    "couldn't listen on {addr}: the port is already in use (another copy of hpsdr-rs?). \
+                     Change the port in the address, e.g. to {}, and press Start.",
+                    suggest_next_port(addr)
+                )
+            } else {
+                format!("couldn't listen on {addr}: {e}")
+            }
+        })
+}
+
+/// `addr` with its port one higher, for the "port already in use" hint.
+fn suggest_next_port(addr: &str) -> String {
+    match addr.rsplit_once(':') {
+        Some((host, port)) => match port.parse::<u16>() {
+            Ok(p) => format!("{host}:{}", p.wrapping_add(1)),
+            Err(_) => addr.to_string(),
+        },
+        None => addr.to_string(),
+    }
 }
 
 /// The main receiver's current VFOs and their buttons, as a named setup
@@ -7920,7 +7941,24 @@ impl eframe::App for HpsdrApp {
                                     ui.strong("Web client (hpsdr-remote in a browser -- phone, tablet or computer):");
                                     ui.horizontal(|ui| {
                                         let running = connected.web_server.is_some();
-                                        ui.add_enabled(!running, egui::TextEdit::singleline(&mut connected.web_addr));
+                                        // REAL REQUEST (2026-11-08): two copies of hpsdr-rs on
+                                        // one computer each need their own port, and this field
+                                        // (unlabelled then) didn't look like where to set it.
+                                        ui.label("Address:");
+                                        if ui
+                                            .add_enabled(
+                                                !running,
+                                                egui::TextEdit::singleline(&mut connected.web_addr).desired_width(140.0),
+                                            )
+                                            .on_hover_text(
+                                                "host:port to listen on. Change the port (e.g. 0.0.0.0:8081) to \
+                                                 run a second copy of hpsdr-rs on this computer -- give its TCI \
+                                                 server its own port too. Stop the server to change it.",
+                                            )
+                                            .changed()
+                                        {
+                                            settings_changed = true;
+                                        }
                                         if running {
                                             if start_stop_button(ui, true) {
                                                 connected.web_server = None;

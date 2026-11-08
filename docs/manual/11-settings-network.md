@@ -112,7 +112,10 @@ install. Enter the address to listen on (default `0.0.0.0:8080`), choose
 gives the address to open, e.g. `https://192.168.1.122:8080`. The client
 connects back through this same port to the **TCI** server, which must be
 running too. Like the other servers here it starts again automatically
-next time if it was running.
+next time if it was running. To run two copies of hpsdr-rs on one
+computer, give each its own port here (e.g. `0.0.0.0:8081` for the
+second), and its own TCI port; if the port is already taken, the error
+below the button says so and suggests the next one.
 
 **HTTPS** (on by default) is needed to transmit: browsers only let a page
 use the microphone over HTTPS. hpsdr-rs makes its own certificate the first
