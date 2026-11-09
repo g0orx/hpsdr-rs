@@ -460,6 +460,9 @@ impl TciServer {
         // detected board (e.g. "Orion2"), not this project's own name.
         // See handle_client's doc comment on why this matters.
         board_name: String,
+        // RadioSession::cw_keyer: the CW hang time, and live keying from
+        // remote clients (radio::CwLive).
+        cw_keyer: Arc<crate::radio::CwKeyerAtomics>,
         logging: DebugLog,
     ) -> std::io::Result<Self> {
         let listener = TcpListener::bind(addr)?;
@@ -525,6 +528,7 @@ impl TciServer {
                         let conn_connected = Arc::clone(&accept_connected);
                         let conn_logging = accept_logging.clone();
                         let conn_board_name = board_name.clone();
+                        let conn_cw_keyer = Arc::clone(&cw_keyer);
                         let handle = thread::spawn(move || {
                             conn_connected.fetch_add(1, Ordering::Relaxed);
                             if let Some(addr) = local_addr {
@@ -534,7 +538,7 @@ impl TciServer {
                                 stream, freq, rx_freq, hw_freq, rf_offset, conn_vfo_b, rate, params, conn_display, conn_remote_share, conn_audio_iq_registry, tx_audio,
                                 tx_gain, wants_mic, conn_mox, conn_tx_frequency_hz, conn_allow_out_of_band_tx,
                                 conn_rit_enabled, conn_rit_offset_hz, conn_xit_enabled, conn_xit_offset_hz,
-                                conn_stop, conn_board_name, conn_logging,
+                                conn_stop, conn_board_name, conn_cw_keyer, conn_logging,
                             );
                             conn_connected.fetch_sub(1, Ordering::Relaxed);
                             if let Some(addr) = local_addr {
@@ -609,6 +613,22 @@ impl TciServer {
     /// to apply as its own slider would.
     pub fn take_power_request(&self) -> Option<u32> {
         self.remote_share.take_power_request()
+    }
+
+    /// CW text, a stop and a speed TCI clients have asked for (cw_macros
+    /// and its kin), for main.rs to apply -- see remote::CwRequests.
+    pub fn take_cw(&self) -> crate::remote::CwRequests {
+        self.remote_share.take_cw()
+    }
+
+    /// The saved CW messages, shown to hpsdr-remote clients.
+    pub fn set_cw_messages(&self, list: &[String]) {
+        self.remote_share.set_cw_messages(list);
+    }
+
+    /// The keys a paddle plugged into an hpsdr-remote client types.
+    pub fn set_paddle_keys(&self, keys: (char, char)) {
+        self.remote_share.set_paddle_keys(keys);
     }
 
     /// Same idea as set_demod_params, for the streaming taps -- a
@@ -745,6 +765,7 @@ fn handle_client(
     // device: field -- see that field's own doc comment for why this
     // shouldn't just be this project's own name.
     board_name: String,
+    cw_keyer: Arc<crate::radio::CwKeyerAtomics>,
     logging: DebugLog,
 ) {
     let _ = stream.set_nodelay(true);
@@ -1033,6 +1054,7 @@ fn handle_client(
         allow_out_of_band: &allow_out_of_band_tx,
         wants_mic: &tci_wants_mic,
         audio: &tci_tx_audio,
+        cw: &cw_keyer,
     };
     let mut iq_streaming = false;
     // ROOT CAUSE INVESTIGATION continued: a real Windows report's
@@ -1175,6 +1197,27 @@ fn handle_client(
                             audio_streaming = false;
                             if remote_count.is_none() {
                                 remote_count = Some(crate::remote::ClientCount::new(Arc::clone(&remote_share)));
+                            }
+                        }
+                        continue;
+                    }
+                    // TCI's CW text commands (cw_macros, cw_macros_stop,
+                    // cw_macros_speed) -- see remote::RemoteStreams::cw_command.
+                    let lower = cmd.to_ascii_lowercase();
+                    if lower.starts_with("cw_macros") || lower.starts_with("keyer:") {
+                        let mode = demod_params.lock().unwrap().lock().unwrap().mode;
+                        for c in hpsdr_proto::tci::parse(cmd) {
+                            let reply = if c.name == hpsdr_proto::cw::KEYER {
+                                remote.keyer(&c, mode, &remote_share, &tx_link)
+                            } else {
+                                remote.cw_command(&c, mode, &remote_share, &tx_link)
+                            };
+                            if let Some(reply) = reply {
+                                logging.log(&format!(">> {reply}"));
+                                let result = ws.send(Message::Text(reply.into()));
+                                if send_is_fatal(&result) {
+                                    return;
+                                }
                             }
                         }
                         continue;
@@ -1524,6 +1567,10 @@ fn handle_client(
             logging.log(why);
             eprintln!("remote: {why}");
         }
+        if let Some(why) = remote.key_tick(&remote_share) {
+            logging.log(why);
+            eprintln!("remote: {why}");
+        }
         if let Some(bands) = remote.bands_message(&remote_share) {
             let result = ws.send(Message::Text(bands.into()));
             if send_is_fatal(&result) {
@@ -1532,6 +1579,13 @@ fn handle_client(
         }
         if let Some(tx_state) = remote.tx_message(&remote_share, &mox) {
             let result = ws.send(Message::Text(tx_state.into()));
+            if send_is_fatal(&result) {
+                return;
+            }
+        }
+        for cw in remote.cw_messages(&remote_share) {
+            logging.log(&format!(">> {cw}"));
+            let result = ws.send(Message::Text(cw.into()));
             if send_is_fatal(&result) {
                 return;
             }
@@ -2448,6 +2502,7 @@ mod remote_tests {
             Arc::new(AtomicBool::new(false)),
             Arc::new(AtomicI32::new(0)),
             "Test".to_string(),
+            Arc::new(crate::radio::CwKeyerAtomics::default()),
             DebugLog::new(std::env::temp_dir().join("hpsdr-rs-tci-remote-test.log")),
         )
         .unwrap();
@@ -2523,6 +2578,9 @@ mod remote_tests {
         let port = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
         let mox = Arc::new(AtomicBool::new(false));
         let tci_tx_audio = Arc::new(Mutex::new(VecDeque::with_capacity(24_000)));
+        let cw_keyer = Arc::new(crate::radio::CwKeyerAtomics::default());
+        cw_keyer.live.rate.store(48_000, Ordering::Relaxed);
+        cw_keyer.hang_time_ms.store(0, Ordering::Relaxed);
         let mut server = TciServer::start(
             &format!("127.0.0.1:{port}"),
             Arc::new(AtomicU64::new(14_200_000)),
@@ -2546,6 +2604,7 @@ mod remote_tests {
             Arc::new(AtomicBool::new(false)),
             Arc::new(AtomicI32::new(0)),
             "Test".to_string(),
+            Arc::clone(&cw_keyer),
             DebugLog::new(std::env::temp_dir().join("hpsdr-rs-tci-remote-tx-test.log")),
         )
         .unwrap();
@@ -2556,6 +2615,8 @@ mod remote_tests {
             max_power_w: 100,
             forward_w: 0.0,
             swr: 1.0,
+            cw_sending: false,
+            cw_speed_wpm: 20,
         });
 
         let (mut ws, _) = tungstenite::connect(format!("ws://127.0.0.1:{port}")).unwrap();
@@ -2600,6 +2661,53 @@ mod remote_tests {
             std::thread::sleep(Duration::from_millis(20));
         }
         assert!(!mox.load(Ordering::Relaxed), "unkeyed once the client went");
+
+        // CW text from a plain TCI client (no hpsdr_hello): told the
+        // speed, and its text queued for main.rs, reserved characters
+        // restored.
+        let (mut ws, _) = tungstenite::connect(format!("ws://127.0.0.1:{port}")).unwrap();
+        if let tungstenite::stream::MaybeTlsStream::Plain(s) = ws.get_ref() {
+            s.set_read_timeout(Some(Duration::from_millis(20))).unwrap();
+        }
+        ws.send(Message::Text("modulation:0,cw;cw_macros:0,TEST~ 73;".into())).unwrap();
+        let by = Instant::now() + Duration::from_secs(2);
+        let mut speed_told = false;
+        let mut queued = Vec::new();
+        while (!speed_told || queued.is_empty()) && Instant::now() < by {
+            if let Ok(Message::Text(t)) = ws.read() {
+                speed_told |= t.contains("cw_macros_speed:20;");
+            }
+            queued.extend(server.take_cw().text);
+        }
+        assert!(speed_told, "told the CW speed");
+        assert_eq!(queued, vec!["TEST, 73".to_string()]);
+        drop(ws);
+
+        // Live keying from an hpsdr-remote client, in CW: the first
+        // key-down keys the radio and is scheduled the delay ahead on the
+        // transmitter's clock, the release 60 ms (2,880 samples) after it;
+        // with no hang time the radio unkeys once the clock passes it.
+        let (mut ws, _) = tungstenite::connect(format!("ws://127.0.0.1:{port}")).unwrap();
+        if let tungstenite::stream::MaybeTlsStream::Plain(s) = ws.get_ref() {
+            s.set_read_timeout(Some(Duration::from_millis(20))).unwrap();
+        }
+        let live = &cw_keyer.live;
+        live.clock.store(1_000, Ordering::Relaxed);
+        ws.send(Message::Text("hpsdr_hello:1;modulation:0,cw;hpsdr_key:5000,true,100;hpsdr_key:5060,false,100;".into()))
+            .unwrap();
+        let by = Instant::now() + Duration::from_secs(2);
+        while live.events.lock().unwrap().len() < 2 && Instant::now() < by {
+            let _ = ws.read();
+        }
+        let start = 1_000 + 100 * 48;
+        assert_eq!(live.events.lock().unwrap().iter().copied().collect::<Vec<_>>(), vec![(start, true), (start + 2_880, false)]);
+        assert!(mox.load(Ordering::Relaxed) && live.active.load(Ordering::Relaxed), "keyed");
+        live.clock.store(start + 2_880 + 10 * 48, Ordering::Relaxed);
+        let by = Instant::now() + Duration::from_secs(2);
+        while mox.load(Ordering::Relaxed) && Instant::now() < by {
+            let _ = ws.read();
+        }
+        assert!(!mox.load(Ordering::Relaxed) && !live.active.load(Ordering::Relaxed), "unkeyed after the release");
         server.stop();
     }
 }

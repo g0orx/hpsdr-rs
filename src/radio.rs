@@ -449,6 +449,27 @@ pub struct CwKeyerAtomics {
     pub sidetone_volume: AtomicU32,
     pub sidetone_freq_hz: AtomicU32,
     pub hang_time_ms: AtomicU32,
+    /// Live keying from a remote client -- see CwLive.
+    pub live: CwLive,
+}
+
+/// Live CW keying from a remote client's key or paddles: remote.rs's
+/// client thread schedules key transitions on the transmitter's own CW
+/// sample clock, and tx.rs's CwLiveGen plays them -- a shaped carrier, as
+/// for CW text. Straight from the network thread to the transmitter, so
+/// keying doesn't wait on the UI.
+#[derive(Default)]
+pub struct CwLive {
+    /// Transitions to play, in order: (sample on `clock`, key down).
+    pub events: Mutex<VecDeque<(u64, bool)>>,
+    /// Samples the transmitter has generated on this clock so far. It
+    /// only advances while keying, which is all the scheduling needs.
+    pub clock: AtomicU64,
+    /// The clock's rate (the DUC rate), set by the transmitter; 0 until
+    /// it starts.
+    pub rate: AtomicU32,
+    /// A client is keying: the transmitter plays `events`.
+    pub active: AtomicBool,
 }
 
 /// 0 = Straight, 1 = Iambic A, 2 = Iambic B -- matches piHPSDR's
@@ -469,6 +490,7 @@ impl Default for CwKeyerAtomics {
             sidetone_volume: AtomicU32::new(50),
             sidetone_freq_hz: AtomicU32::new(800),
             hang_time_ms: AtomicU32::new(500),
+            live: CwLive::default(),
         }
     }
 }

@@ -5,6 +5,10 @@
     TARGET_S of it before starting, and drops back to that if bursts pile
     it past MAX_S -- a little latency for no gaps. Resampled to whatever
     rate the device runs at.
+
+    Also the CW sidetone while keying from the on-screen key or paddles:
+    made here, straight into the output, so it follows the key with no
+    network delay.
 */
 
 use std::collections::VecDeque;
@@ -24,6 +28,35 @@ struct Jitter {
     pos: f64,
     playing: bool,
     gain: f32,
+    sidetone: Sidetone,
+}
+
+/// A tone at SIDETONE_HZ while the key is down, with 5 ms ramps so it
+/// doesn't click.
+#[derive(Default)]
+struct Sidetone {
+    on: bool,
+    level: f32,
+    gain: f32,
+    phase: f32,
+}
+
+const SIDETONE_HZ: f32 = 600.0;
+
+impl Sidetone {
+    fn next(&mut self, device_rate: u32) -> f32 {
+        let target = if self.on { 1.0 } else { 0.0 };
+        if self.gain == 0.0 && target == 0.0 {
+            return 0.0;
+        }
+        let step = 1.0 / (0.005 * device_rate as f32).max(1.0);
+        self.gain = if self.gain < target { (self.gain + step).min(target) } else { (self.gain - step).max(target) };
+        self.phase += 2.0 * std::f32::consts::PI * SIDETONE_HZ / device_rate as f32;
+        if self.phase >= 2.0 * std::f32::consts::PI {
+            self.phase -= 2.0 * std::f32::consts::PI;
+        }
+        self.level * self.gain * self.phase.sin()
+    }
 }
 
 impl Jitter {
@@ -85,6 +118,7 @@ impl Player {
             pos: 0.0,
             playing: false,
             gain: 1.0,
+            sidetone: Sidetone::default(),
         }));
         let feed = Arc::clone(&jitter);
         let stream = device
@@ -92,8 +126,9 @@ impl Player {
                 &config,
                 move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
                     let mut j = feed.lock().unwrap();
+                    let rate = j.device_rate;
                     for frame in data.chunks_mut(channels) {
-                        let v = j.next();
+                        let v = j.next() + j.sidetone.next(rate);
                         frame.fill(v);
                     }
                 },
@@ -113,6 +148,13 @@ impl Player {
         self.jitter.lock().unwrap().gain = gain;
     }
 
+    /// The CW sidetone: on while the key is down, at `level` (0-1).
+    pub fn set_sidetone(&self, on: bool, level: f32) {
+        let mut j = self.jitter.lock().unwrap();
+        j.sidetone.on = on;
+        j.sidetone.level = level;
+    }
+
     /// Seconds buffered, for the status line.
     pub fn buffered_s(&self) -> f32 {
         let j = self.jitter.lock().unwrap();
@@ -129,7 +171,15 @@ mod tests {
     use super::*;
 
     fn jitter(device_rate: u32) -> Jitter {
-        Jitter { buf: VecDeque::new(), rate: 0, device_rate, pos: 0.0, playing: false, gain: 1.0 }
+        Jitter {
+            buf: VecDeque::new(),
+            rate: 0,
+            device_rate,
+            pos: 0.0,
+            playing: false,
+            gain: 1.0,
+            sidetone: Sidetone::default(),
+        }
     }
 
     #[test]

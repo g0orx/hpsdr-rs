@@ -11,10 +11,12 @@ use std::time::{Duration, Instant};
 
 use hpsdr_proto::adpcm;
 use hpsdr_proto::bands::{self, BandInfo};
+use hpsdr_proto::cw;
 use hpsdr_proto::spectrum::SpectrumFrame;
 use hpsdr_proto::state::{self as dsp, DspState};
 use hpsdr_proto::tci::{
-    Command, AUDIO, AUDIO_RATES, FEATURE_ADPCM, FEATURE_SPECTRUM, FEATURE_TX, HELLO, NOTICE, SPECTRUM,
+    Command, AUDIO, AUDIO_RATES, FEATURE_ADPCM, FEATURE_CW, FEATURE_KEY, FEATURE_SPECTRUM, FEATURE_TX, HELLO, NOTICE,
+    SPECTRUM,
 };
 use hpsdr_proto::tx::{self, TxState};
 use hpsdr_proto::{Header, CODEC_IMA_ADPCM, FORMAT_ADPCM, PROTOCOL_VERSION, TYPE_ADPCM_AUDIO};
@@ -45,6 +47,57 @@ pub struct RemoteStreams {
     keyed: Option<Keyed>,
     /// The TX state last sent (hpsdr_tx), and when.
     last_tx: Option<(TxState, Instant)>,
+    /// CW text sending, as last told to this client: the speed
+    /// (cw_macros_speed), whether text was being sent (for
+    /// cw_macros_empty), and the saved messages' version
+    /// (hpsdr_cw_messages; 0 = none yet), and the paddle keys' version
+    /// (hpsdr_paddle_keys; 0 = none yet).
+    cw_speed_sent: Option<u32>,
+    cw_was_sending: bool,
+    cw_messages_sent: u64,
+    paddle_keys_sent: u64,
+    /// Live keying (hpsdr_key, or TCI's keyer): this client's burst of
+    /// keying in progress, if any -- see LiveKey.
+    live: Option<LiveKey>,
+    /// Its last key-down was refused (the reason already told): the rest
+    /// of that burst is ignored until the key comes up.
+    key_refused: bool,
+    /// TCI's keyer: when its key went down, ms on this thread's clock.
+    keyer_down_ms: Option<u64>,
+    /// This thread's clock for TCI's keyer, which has no times of its own.
+    epoch: Option<Instant>,
+}
+
+/// A client keying the transmitter live (radio::CwLive). Its first key-down
+/// of a burst is played `delay` after it arrives; every later transition at
+/// the same offset from the first as on the client's clock -- so the
+/// client's timing survives network jitter up to the delay. The burst ends,
+/// and the radio unkeys, when the key has been up for the CW hang time.
+struct LiveKey {
+    /// The burst's first transition: its time on the client's clock (ms)
+    /// and the sample it was scheduled for on the transmitter's.
+    anchor_ms: u64,
+    anchor_sample: u64,
+    rate: u64,
+    /// The last transition scheduled, and whether the key is down.
+    last_sample: u64,
+    down: bool,
+    last_heard: Instant,
+    mox: Arc<AtomicBool>,
+    cw: Arc<crate::radio::CwKeyerAtomics>,
+}
+
+impl LiveKey {
+    /// Lets go: the key up now, and the transmitter told keying is over --
+    /// it plays out the release and unkeys with MOX.
+    fn end(&self) {
+        let live = &self.cw.live;
+        if self.down {
+            live.events.lock().unwrap().push_back((live.clock.load(Ordering::Relaxed), false));
+        }
+        live.active.store(false, Ordering::Relaxed);
+        self.mox.store(false, Ordering::Relaxed);
+    }
 }
 
 /// The transmitter state a client's thread keys and feeds: the same TCI's
@@ -58,6 +111,8 @@ pub struct TxLink<'a> {
     /// RadioSession::tci_tx_audio: 48 kHz mono, which the transmitter
     /// takes in preference to the mic while it has any.
     pub audio: &'a Mutex<VecDeque<f32>>,
+    /// RadioSession::cw_keyer: the hang time, and live keying (CwLive).
+    pub cw: &'a Arc<crate::radio::CwKeyerAtomics>,
 }
 
 /// A client's transmission. Unkeys if the client stops sending TX audio
@@ -90,8 +145,19 @@ impl Drop for RemoteStreams {
             k.mox.store(false, Ordering::Relaxed);
             eprintln!("remote: client went while transmitting -- unkeyed");
         }
+        if let Some(k) = &self.live {
+            k.end();
+            eprintln!("remote: client went while keying CW -- unkeyed");
+        }
     }
 }
+
+/// Live keying: once the key is up, the radio stays keyed this much
+/// longer than the CW hang time, for the release's ramp to play out.
+const KEY_RAMP_MS: u64 = 10;
+/// TCI's keyer commands carry no times of their own: played this long
+/// after they arrive.
+const KEYER_DELAY_MS: u32 = 100;
 
 /// Linear interpolation up to TX_RATE, carrying its place across blocks.
 /// Plenty here: WDSP's TX filter removes the images above the voice band.
@@ -120,7 +186,9 @@ impl Upsampler {
 /// becomes "new" when it changes), clients send it as hpsdr_bands, and a
 /// client's hpsdr_band waits here until main.rs applies it -- as its band
 /// buttons do. The same for the transmitter: main.rs sets what hpsdr_tx
-/// reports (TxInfo), and a client's power setting waits for it. Also counts
+/// reports (TxInfo), and a client's power setting waits for it -- and CW
+/// text to send (CwRequests), which main.rs feeds to the same queue as
+/// CAT's KY, and the saved CW messages it shows clients. Also counts
 /// the remote clients connected, for the main window's Web indicator (see
 /// ClientCount).
 #[derive(Default)]
@@ -130,6 +198,18 @@ pub struct RemoteShare {
     clients: AtomicUsize,
     tx: Mutex<TxInfo>,
     power_request: Mutex<Option<u32>>,
+    cw: Mutex<CwRequests>,
+    cw_messages: Mutex<(u64, Vec<String>)>,
+    paddle_keys: Mutex<(u64, (char, char))>,
+}
+
+/// CW text clients have asked to send (TCI's cw_macros), a stop
+/// (cw_macros_stop), and a speed (cw_macros_speed), waiting for main.rs.
+#[derive(Debug, Default, PartialEq)]
+pub struct CwRequests {
+    pub text: Vec<String>,
+    pub stop: bool,
+    pub speed_wpm: Option<u32>,
 }
 
 /// The transmitter as main.rs sees it, for hpsdr_tx.
@@ -145,6 +225,10 @@ pub struct TxInfo {
     /// Measured, while transmitting; 0 and 1 otherwise.
     pub forward_w: f32,
     pub swr: f32,
+    /// CW text is being sent (the Send CW button, CAT's KY, or a client's
+    /// cw_macros), and the CW speed, WPM.
+    pub cw_sending: bool,
+    pub cw_speed_wpm: u32,
 }
 
 /// One connected remote client (one that said hpsdr_hello), counted in
@@ -200,6 +284,31 @@ impl RemoteShare {
     pub fn take_power_request(&self) -> Option<u32> {
         self.power_request.lock().unwrap().take()
     }
+
+    /// CW text, a stop and a speed clients have asked for since the last
+    /// call.
+    pub fn take_cw(&self) -> CwRequests {
+        std::mem::take(&mut *self.cw.lock().unwrap())
+    }
+
+    /// The saved CW messages, for hpsdr_cw_messages: "new" only when they
+    /// change.
+    pub fn set_cw_messages(&self, list: &[String]) {
+        let mut m = self.cw_messages.lock().unwrap();
+        if m.1 != list {
+            *m = (m.0 + 1, list.to_vec());
+        }
+    }
+
+    /// The keys a paddle plugged into a client as a keyboard types --
+    /// (dit, dah) -- for hpsdr_paddle_keys: "new" the first time and when
+    /// they change.
+    pub fn set_paddle_keys(&self, keys: (char, char)) {
+        let mut m = self.paddle_keys.lock().unwrap();
+        if m.0 == 0 || m.1 != keys {
+            *m = (m.0 + 1, keys);
+        }
+    }
 }
 
 struct SpectrumStream {
@@ -235,6 +344,11 @@ impl RemoteStreams {
                 apply_set(cmd, &mut params.lock().unwrap());
                 None
             }
+            cw::KEY => {
+                let (time_ms, down, delay_ms) = cw::key_from(cmd)?;
+                let mode = params.lock().unwrap().mode;
+                self.key(time_ms, down, delay_ms, mode, share, tx)
+            }
             tx::MOX => {
                 let on = cmd.args.first().is_some_and(|a| a == "true");
                 let mode = params.lock().unwrap().mode;
@@ -244,7 +358,7 @@ impl RemoteStreams {
                 self.hello = true;
                 let reply = Command::new(
                     HELLO,
-                    &[&PROTOCOL_VERSION.to_string(), FEATURE_SPECTRUM, FEATURE_ADPCM, FEATURE_TX],
+                    &[&PROTOCOL_VERSION.to_string(), FEATURE_SPECTRUM, FEATURE_ADPCM, FEATURE_TX, FEATURE_CW, FEATURE_KEY],
                 );
                 Some(reply.to_string())
             }
@@ -321,7 +435,7 @@ impl RemoteStreams {
             return Some("Transmitting from remote clients is turned off at the radio");
         }
         if matches!(mode, Mode::Cwl | Mode::Cwu) {
-            return Some("No remote CW yet - choose a voice or data mode to transmit");
+            return Some("In CW, send text with the CW controls - MOX is for voice and data");
         }
         if !crate::tx_frequency_allowed(
             tx.tx_frequency_hz.load(Ordering::Relaxed),
@@ -418,6 +532,197 @@ impl RemoteStreams {
         }
         self.last_tx = Some((state, Instant::now()));
         Some(state.to_command().to_string())
+    }
+
+    /// TCI's CW text commands (cw_macros, cw_macros_stop, cw_macros_speed)
+    /// from any client, standard TCI or hpsdr-remote: queued for main.rs,
+    /// which sends the text as the Send CW button does (in CW mode, not
+    /// while otherwise transmitting, in band). Text that can't be sent now
+    /// is dropped here rather than left to go out later -- with the reason,
+    /// to a client that said hpsdr_hello. Returns the reply, if any.
+    pub fn cw_command(&mut self, cmd: &Command, mode: Mode, share: &RemoteShare, tx: &TxLink) -> Option<String> {
+        let notice = |why: &str| self.hello.then(|| Command::new(NOTICE, &[why]).to_string());
+        match cmd.name.as_str() {
+            cw::MACROS_STOP => {
+                share.cw.lock().unwrap().stop = true;
+                None
+            }
+            cw::MACROS_SPEED => {
+                let wpm: u32 = cmd.arg(0)?;
+                share.cw.lock().unwrap().speed_wpm = Some(wpm.clamp(cw::SPEED_MIN, cw::SPEED_MAX));
+                None
+            }
+            cw::MACROS => {
+                let text = cw::macros_text(cmd)?;
+                let info = share.tx();
+                if !info.available {
+                    return notice("This radio can't transmit");
+                }
+                if self.hello && !info.remote_allowed {
+                    return notice("Transmitting from remote clients is turned off at the radio");
+                }
+                if !matches!(mode, Mode::Cwl | Mode::Cwu) {
+                    return notice("Choose CW to send CW");
+                }
+                if !crate::tx_frequency_allowed(
+                    tx.tx_frequency_hz.load(Ordering::Relaxed),
+                    tx.allow_out_of_band.load(Ordering::Relaxed),
+                ) {
+                    return notice("Out of band - not sent");
+                }
+                share.cw.lock().unwrap().text.push(text);
+                None
+            }
+            _ => None,
+        }
+    }
+
+    /// A live key transition (hpsdr_key, or TCI's keyer): `time_ms` on the
+    /// client's clock. The first key-down of a burst keys the radio -- only
+    /// where CW text could be sent (see cw_command), and not while anything
+    /// else is transmitting -- and is played `delay_ms` later; each later
+    /// transition keeps its spacing from the first. A repeat of the key's
+    /// state just shows the client is still there. Returns a notice if the
+    /// key-down was refused (once a burst).
+    pub fn key(&mut self, time_ms: u64, down: bool, delay_ms: u32, mode: Mode, share: &RemoteShare, tx: &TxLink) -> Option<String> {
+        let live = &tx.cw.live;
+        if let Some(k) = self.live.as_mut() {
+            k.last_heard = Instant::now();
+            if down == k.down {
+                return None;
+            }
+            let offset = time_ms.saturating_sub(k.anchor_ms) * k.rate / 1000;
+            let at = (k.anchor_sample + offset).max(k.last_sample).max(live.clock.load(Ordering::Relaxed));
+            live.events.lock().unwrap().push_back((at, down));
+            k.last_sample = at;
+            k.down = down;
+            return None;
+        }
+        if !down {
+            self.key_refused = false;
+            return None;
+        }
+        if self.key_refused {
+            return None;
+        }
+        let info = share.tx();
+        let rate = live.rate.load(Ordering::Relaxed) as u64;
+        let why = if !info.available || rate == 0 {
+            Some("This radio can't transmit")
+        } else if self.hello && !info.remote_allowed {
+            Some("Transmitting from remote clients is turned off at the radio")
+        } else if !matches!(mode, Mode::Cwl | Mode::Cwu) {
+            Some("Choose CW to key CW")
+        } else if !crate::tx_frequency_allowed(
+            tx.tx_frequency_hz.load(Ordering::Relaxed),
+            tx.allow_out_of_band.load(Ordering::Relaxed),
+        ) {
+            Some("Out of band - not keyed")
+        } else if tx.mox.load(Ordering::Relaxed) || info.cw_sending || live.active.load(Ordering::Relaxed) {
+            Some("The radio is already transmitting")
+        } else {
+            None
+        };
+        if let Some(why) = why {
+            self.key_refused = true;
+            return self.hello.then(|| Command::new(NOTICE, &[why]).to_string());
+        }
+        let at = live.clock.load(Ordering::Relaxed) + delay_ms as u64 * rate / 1000;
+        {
+            let mut events = live.events.lock().unwrap();
+            events.clear();
+            events.push_back((at, true));
+        }
+        live.active.store(true, Ordering::Relaxed);
+        tx.mox.store(true, Ordering::Relaxed);
+        self.live = Some(LiveKey {
+            anchor_ms: time_ms,
+            anchor_sample: at,
+            rate,
+            last_sample: at,
+            down: true,
+            last_heard: Instant::now(),
+            mox: Arc::clone(tx.mox),
+            cw: Arc::clone(tx.cw),
+        });
+        None
+    }
+
+    /// Called every pass of the client's loop: ends this client's burst of
+    /// live keying once the key has been up for the hang time, or at once
+    /// if the radio was unkeyed elsewhere, remote transmit was turned off,
+    /// or the client has gone quiet with the key down (returning why, to
+    /// log).
+    pub fn key_tick(&mut self, share: &RemoteShare) -> Option<&'static str> {
+        let k = self.live.as_mut()?;
+        let live = &k.cw.live;
+        let why = if !k.mox.load(Ordering::Relaxed) {
+            Some("radio unkeyed elsewhere while a remote client was keying CW")
+        } else if !share.tx().available || (self.hello && !share.tx().remote_allowed) {
+            Some("remote transmit turned off while a remote client was keying CW -- unkeyed")
+        } else if k.down && k.last_heard.elapsed() >= Duration::from_millis(cw::KEY_TIMEOUT_MS as u64) {
+            Some("nothing from the remote client keying CW for 1.5 s -- key released, unkeyed")
+        } else {
+            None
+        };
+        let hang_ms = k.cw.hang_time_ms.load(Ordering::Relaxed) as u64 + KEY_RAMP_MS;
+        let hung = !k.down && live.clock.load(Ordering::Relaxed) >= k.last_sample + hang_ms * k.rate / 1000;
+        if why.is_some() || hung {
+            k.end();
+            self.live = None;
+        }
+        why
+    }
+
+    /// TCI's own `keyer:<rx>,<true|false>[,<ms>];` from another TCI
+    /// program: down as it arrives, up `ms` after it went down (or as it
+    /// arrives, with no `ms`), played KEYER_DELAY_MS later.
+    pub fn keyer(&mut self, cmd: &Command, mode: Mode, share: &RemoteShare, tx: &TxLink) -> Option<String> {
+        let down = matches!(cmd.args.get(1).map(String::as_str), Some("true") | Some("1"));
+        let now_ms = self.epoch.get_or_insert_with(Instant::now).elapsed().as_millis() as u64;
+        let time_ms = if down {
+            self.keyer_down_ms = Some(now_ms);
+            now_ms
+        } else {
+            let held: u64 = cmd.arg(2).unwrap_or(0);
+            match self.keyer_down_ms.take() {
+                Some(at) if held > 0 => at + held,
+                _ => now_ms,
+            }
+        };
+        self.key(time_ms, down, KEYER_DELAY_MS, mode, share, tx)
+    }
+
+    /// TCI's CW reports due to this client: the speed when it changes (and
+    /// at first), cw_macros_empty when sending ends, and -- to one that
+    /// said hpsdr_hello -- the saved messages when they change.
+    pub fn cw_messages(&mut self, share: &RemoteShare) -> Vec<String> {
+        let mut out = Vec::new();
+        let info = share.tx();
+        if !info.available {
+            return out;
+        }
+        if self.cw_speed_sent != Some(info.cw_speed_wpm) {
+            self.cw_speed_sent = Some(info.cw_speed_wpm);
+            out.push(cw::speed(info.cw_speed_wpm).to_string());
+        }
+        if self.cw_was_sending && !info.cw_sending {
+            out.push(cw::empty().to_string());
+        }
+        self.cw_was_sending = info.cw_sending;
+        if self.hello {
+            let m = share.cw_messages.lock().unwrap();
+            if m.0 > self.cw_messages_sent {
+                self.cw_messages_sent = m.0;
+                out.push(cw::messages(&m.1).to_string());
+            }
+            let k = share.paddle_keys.lock().unwrap();
+            if k.0 > self.paddle_keys_sent {
+                self.paddle_keys_sent = k.0;
+                out.push(cw::paddle_keys(k.1.0, k.1.1).to_string());
+            }
+        }
+        out
     }
 
     pub fn spectrum_on(&self) -> bool {
@@ -619,6 +924,7 @@ mod tests {
         allow_out_of_band: AtomicBool,
         wants_mic: AtomicBool,
         audio: Mutex<VecDeque<f32>>,
+        cw: Arc<crate::radio::CwKeyerAtomics>,
     }
 
     impl Tx {
@@ -629,6 +935,7 @@ mod tests {
                 allow_out_of_band: &self.allow_out_of_band,
                 wants_mic: &self.wants_mic,
                 audio: &self.audio,
+                cw: &self.cw,
             }
         }
     }
@@ -636,6 +943,122 @@ mod tests {
     fn handle(r: &mut RemoteStreams, text: &str) -> Option<String> {
         let tx = Tx::default();
         r.handle(&parse(text)[0], &Mutex::new(DemodParams::default()), &RemoteShare::default(), &tx.link())
+    }
+
+    /// CW text (TCI's cw_macros): queued for main.rs only where it can be
+    /// sent, with the reason to an hpsdr-remote client where it can't, and
+    /// the speed, end of sending and saved messages reported back.
+    #[test]
+    fn cw_text() {
+        let tx = Tx::default();
+        tx.allow_out_of_band.store(true, Ordering::Relaxed);
+        let share = RemoteShare::default();
+        let mut r = RemoteStreams::default();
+        let send = |r: &mut RemoteStreams, text: &str, mode: Mode| r.cw_command(&parse(text)[0], mode, &share, &tx.link());
+
+        // A plain TCI client is told nothing; nothing is queued.
+        assert_eq!(send(&mut r, "cw_macros:0,CQ;", Mode::Cwu), None);
+        assert_eq!(share.take_cw(), CwRequests::default());
+        assert!(r.cw_messages(&share).is_empty(), "no CW reports from a radio that can't transmit");
+
+        let info = TxInfo { available: true, remote_allowed: false, cw_speed_wpm: 22, ..Default::default() };
+        share.set_tx(info);
+        // remote_allowed is the web client's setting: plain TCI isn't held by it.
+        assert_eq!(send(&mut r, "cw_macros:0,CQ DE G0ORX~ K;", Mode::Cwu), None);
+        assert_eq!(share.take_cw().text, vec!["CQ DE G0ORX, K".to_string()]);
+        r.hello = true;
+        assert!(send(&mut r, "cw_macros:0,CQ;", Mode::Cwu).unwrap().contains("turned off at the radio"));
+        share.set_tx(TxInfo { remote_allowed: true, ..info });
+        assert!(send(&mut r, "cw_macros:0,CQ;", Mode::Usb).unwrap().contains("Choose CW"));
+        tx.allow_out_of_band.store(false, Ordering::Relaxed);
+        tx.tx_frequency_hz.store(15_000_000, Ordering::Relaxed);
+        assert!(send(&mut r, "cw_macros:0,CQ;", Mode::Cwu).unwrap().contains("Out of band"));
+        tx.tx_frequency_hz.store(14_030_000, Ordering::Relaxed);
+        assert_eq!(send(&mut r, "cw_macros:0,TEST;", Mode::Cwl), None);
+        assert_eq!(send(&mut r, "cw_macros_speed:99;", Mode::Cwl), None);
+        assert_eq!(send(&mut r, "cw_macros_stop;", Mode::Cwl), None);
+        assert_eq!(
+            share.take_cw(),
+            CwRequests { text: vec!["TEST".to_string()], stop: true, speed_wpm: Some(cw::SPEED_MAX) }
+        );
+
+        // Reports: the speed at first and on change, the end of sending,
+        // and the saved messages when they change.
+        share.set_cw_messages(&["CQ TEST".to_string(), String::new()]);
+        share.set_paddle_keys(('[', ']'));
+        assert_eq!(
+            r.cw_messages(&share),
+            vec!["cw_macros_speed:22;", "hpsdr_cw_messages:CQ TEST,;", "hpsdr_paddle_keys:[,];"]
+        );
+        assert!(r.cw_messages(&share).is_empty());
+        share.set_paddle_keys(('[', ']'));
+        assert!(r.cw_messages(&share).is_empty());
+        share.set_paddle_keys((',', '.'));
+        assert_eq!(r.cw_messages(&share), vec!["hpsdr_paddle_keys:~,.;"]);
+        share.set_tx(TxInfo { cw_sending: true, cw_speed_wpm: 25, ..share.tx() });
+        assert_eq!(r.cw_messages(&share), vec!["cw_macros_speed:25;"]);
+        share.set_tx(TxInfo { cw_sending: false, ..share.tx() });
+        share.set_cw_messages(&["CQ TEST".to_string(), String::new()]);
+        assert_eq!(r.cw_messages(&share), vec!["cw_macros_empty:0;"]);
+    }
+
+    /// Live keying: the first key-down of a burst keys the radio and is
+    /// scheduled the delay ahead on the transmitter's clock; later
+    /// transitions keep their spacing from it on the client's clock (or go
+    /// at once if they arrive too late); the burst ends after the hang
+    /// time, and at once if the client goes quiet or goes away.
+    #[test]
+    fn live_keying() {
+        let tx = Tx::default();
+        tx.allow_out_of_band.store(true, Ordering::Relaxed);
+        let live = &tx.cw.live;
+        live.rate.store(48_000, Ordering::Relaxed);
+        live.clock.store(1_000, Ordering::Relaxed);
+        tx.cw.hang_time_ms.store(100, Ordering::Relaxed);
+        let share = RemoteShare::default();
+        share.set_tx(TxInfo { available: true, remote_allowed: true, ..Default::default() });
+        let mut r = RemoteStreams::default();
+        r.hello = true;
+        let key = |r: &mut RemoteStreams, t: u64, down: bool, mode: Mode| r.key(t, down, 150, mode, &share, &tx.link());
+
+        assert!(key(&mut r, 10_000, true, Mode::Usb).unwrap().contains("Choose CW"));
+        assert!(key(&mut r, 10_050, true, Mode::Cwu).is_none(), "rest of a refused burst ignored");
+        assert!(key(&mut r, 10_060, false, Mode::Cwu).is_none());
+        assert!(!tx.mox.load(Ordering::Relaxed));
+
+        assert!(key(&mut r, 20_000, true, Mode::Cwu).is_none());
+        assert!(tx.mox.load(Ordering::Relaxed) && live.active.load(Ordering::Relaxed));
+        assert!(key(&mut r, 20_000, true, Mode::Cwu).is_none(), "a repeat is just a keep-alive");
+        assert!(key(&mut r, 20_060, false, Mode::Cwu).is_none());
+        assert!(key(&mut r, 20_120, true, Mode::Cwu).is_none());
+        let start = 1_000 + 150 * 48;
+        let expect = vec![(start, true), (start + 60 * 48, false), (start + 120 * 48, true)];
+        assert_eq!(live.events.lock().unwrap().iter().copied().collect::<Vec<_>>(), expect);
+        // Late: the transmitter has already passed where it belonged.
+        live.events.lock().unwrap().clear();
+        live.clock.store(start + 400 * 48, Ordering::Relaxed);
+        assert!(key(&mut r, 20_180, false, Mode::Cwu).is_none());
+        assert_eq!(live.events.lock().unwrap().front(), Some(&(start + 400 * 48, false)));
+
+        // Held for the hang time (+ the ramp) after the last release.
+        assert!(r.key_tick(&share).is_none());
+        assert!(tx.mox.load(Ordering::Relaxed));
+        live.clock.store(start + 400 * 48 + 110 * 48, Ordering::Relaxed);
+        assert!(r.key_tick(&share).is_none());
+        assert!(!tx.mox.load(Ordering::Relaxed) && !live.active.load(Ordering::Relaxed), "burst over");
+
+        // Quiet with the key down: released and unkeyed.
+        assert!(key(&mut r, 30_000, true, Mode::Cwu).is_none());
+        r.live.as_mut().unwrap().last_heard = Instant::now() - Duration::from_secs(2);
+        assert!(r.key_tick(&share).unwrap().contains("key released"));
+        assert!(!tx.mox.load(Ordering::Relaxed));
+        assert_eq!(live.events.lock().unwrap().back().map(|e| e.1), Some(false));
+
+        // Gone with the key down: the same.
+        assert!(key(&mut r, 40_000, true, Mode::Cwu).is_none());
+        assert!(tx.mox.load(Ordering::Relaxed));
+        drop(r);
+        assert!(!tx.mox.load(Ordering::Relaxed) && !live.active.load(Ordering::Relaxed));
     }
 
     /// Keying: refused (with the reason) where the radio wouldn't key;
@@ -649,16 +1072,24 @@ mod tests {
         let params = Mutex::new(DemodParams::default());
         let mut r = RemoteStreams::default();
         let mut send = |r: &mut RemoteStreams, text: &str| r.handle(&parse(text)[0], &params, &share, &tx.link());
-        assert!(send(&mut r, "hpsdr_hello:1;").unwrap().contains(",tx;"));
+        assert!(send(&mut r, "hpsdr_hello:1;").unwrap().contains(",tx,cw,key;"));
 
         assert_eq!(send(&mut r, "hpsdr_mox:true;").as_deref(), Some("hpsdr_notice:This radio can't transmit;"));
-        let allowed = TxInfo { available: true, remote_allowed: true, power_w: 50, max_power_w: 100, forward_w: 0.0, swr: 1.0 };
+        let allowed = TxInfo {
+            available: true,
+            remote_allowed: true,
+            power_w: 50,
+            max_power_w: 100,
+            forward_w: 0.0,
+            swr: 1.0,
+            ..Default::default()
+        };
         share.set_tx(TxInfo { remote_allowed: false, ..allowed });
         assert!(send(&mut r, "hpsdr_mox:true;").unwrap().contains("turned off at the radio"));
         assert!(r.tx_message(&share, &tx.mox).unwrap().starts_with("hpsdr_tx:false,"), "shown as unavailable");
         share.set_tx(allowed);
         params.lock().unwrap().mode = Mode::Cwu;
-        assert!(send(&mut r, "hpsdr_mox:true;").unwrap().contains("No remote CW"));
+        assert!(send(&mut r, "hpsdr_mox:true;").unwrap().contains("send text with the CW controls"));
         assert!(!tx.mox.load(Ordering::Relaxed));
         assert_eq!(r.tx_message(&share, &tx.mox).as_deref(), Some("hpsdr_tx:true,false,50,100,0.0,1.00;"));
 
@@ -759,7 +1190,7 @@ mod tests {
     #[test]
     fn hello_and_stream_commands() {
         let mut r = RemoteStreams::default();
-        assert_eq!(handle(&mut r, "hpsdr_hello:1;").as_deref(), Some("hpsdr_hello:1,spectrum,adpcm,tx;"));
+        assert_eq!(handle(&mut r, "hpsdr_hello:1;").as_deref(), Some("hpsdr_hello:1,spectrum,adpcm,tx,cw,key;"));
         assert!(r.hello);
         assert!(handle(&mut r, "hpsdr_audio:adpcm,24000;").is_none());
         assert!(r.audio_on());

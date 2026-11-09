@@ -247,6 +247,11 @@ pub struct Config {
     /// out-of-range falls back to 0.
     #[serde(default)]
     pub cw_text_selected: Option<usize>,
+    /// The keys a key or paddle plugged into a remote client as a
+    /// keyboard types: dit (or a straight key) and dah, each one of
+    /// hpsdr_proto::cw::PADDLE_KEY_CHOICES. Missing: `[` and `]`.
+    #[serde(default)]
+    pub cw_paddle_keys: Option<(char, char)>,
     /// Per-band PA gain (dB) entered via the PA Calibration sliders
     /// (Settings -> TX), keyed by band name (see main.rs's BANDS).
     /// Feeds radio::drive_byte_for_watts in place of the flat

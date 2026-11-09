@@ -2,23 +2,25 @@
     hpsdr-remote's window: connect to an hpsdr-rs TCI server, then its VFO,
     band and mode buttons, S-meter and audio gain, and the spectrum and
     waterfall it streams -- click or scroll them to tune -- and transmit:
-    MOX, the microphone, power and the power/SWR meter
-    (docs/remote-protocol.md).
+    MOX, the microphone, power and the power/SWR meter, and in CW, text
+    sent as CW and an on-screen key or paddles (docs/remote-protocol.md).
 */
 
 use std::collections::{HashMap, VecDeque};
 
 use egui::{Color32, ColorImage, Pos2, Rect, Stroke, TextureHandle, TextureOptions, Vec2};
 use hpsdr_proto::bands::{self, BandInfo};
+use hpsdr_proto::cw;
 use hpsdr_proto::spectrum::SpectrumFrame;
 use hpsdr_proto::state::{self as dsp, DspState};
-use hpsdr_proto::tci::{Command, AUDIO, FEATURE_TX, HELLO, NOTICE, SPECTRUM};
+use hpsdr_proto::tci::{Command, AUDIO, FEATURE_CW, FEATURE_KEY, FEATURE_TX, HELLO, NOTICE, SPECTRUM};
 use hpsdr_proto::tx::{self, TxState, TX_AUDIO_RATE};
 use hpsdr_proto::{
     adpcm, Header, CODEC_IMA_ADPCM, FORMAT_ADPCM, PROTOCOL_VERSION, TYPE_ADPCM_AUDIO, TYPE_SPECTRUM,
 };
 
 use crate::audio::Player;
+use crate::keyer::{self, Keyer};
 use crate::link::{Incoming, Link, Status};
 use crate::mic::Mic;
 
@@ -76,6 +78,11 @@ struct Radio {
     bands: Option<Vec<BandInfo>>,
     /// Its transmitter (hpsdr_tx): None until the first report.
     tx: Option<TxState>,
+    /// Its saved CW messages (hpsdr_cw_messages).
+    cw_messages: Vec<String>,
+    /// The keys a paddle plugged in as a keyboard types (dit, dah), as
+    /// set at the radio (hpsdr_paddle_keys); None until it says.
+    paddle_keys: Option<(char, char)>,
 }
 
 impl Radio {
@@ -84,6 +91,24 @@ impl Radio {
     fn can_transmit(&self) -> bool {
         self.extensions.as_ref().is_some_and(|e| e.iter().any(|f| f == FEATURE_TX))
             && self.tx.is_some_and(|t| t.available)
+    }
+
+    /// In CW, with a server that sends text as CW: the CW controls take
+    /// MOX's place.
+    fn sends_cw(&self) -> bool {
+        self.mode == "cw"
+            && self.can_transmit()
+            && self.extensions.as_ref().is_some_and(|e| e.iter().any(|f| f == FEATURE_CW))
+    }
+
+    /// In CW, with a server that takes live keying: the key or paddles too.
+    fn keys_cw(&self) -> bool {
+        self.sends_cw() && self.extensions.as_ref().is_some_and(|e| e.iter().any(|f| f == FEATURE_KEY))
+    }
+
+    /// The paddle keys (dit, dah): the radio's, or `[` and `]`.
+    fn paddle_keys(&self) -> (char, char) {
+        self.paddle_keys.unwrap_or((cw::PADDLE_DIT_DEFAULT, cw::PADDLE_DAH_DEFAULT))
     }
 }
 
@@ -127,6 +152,7 @@ enum Section {
     Filter,
     Noise,
     Audio,
+    Key,
     Tx,
 }
 
@@ -139,6 +165,7 @@ impl Section {
             Section::Filter => "Filter",
             Section::Noise => "Noise",
             Section::Audio => "Audio",
+            Section::Key => "Key",
             Section::Tx => "TX",
         }
     }
@@ -211,6 +238,24 @@ pub struct App {
     tx_pending: Vec<i16>,
     power_w: u32,
     power_set_at: f64,
+    /// CW: the text being typed, and the speed (WPM) with when it was last
+    /// changed here.
+    cw_text: String,
+    cw_speed_wpm: u32,
+    cw_speed_set_at: f64,
+    /// Live keying: the keyer, the playout delay asked of the server (ms),
+    /// the sidetone level; the pads pressed this frame (None if not shown);
+    /// the key state last sent and when, for the repeats while it's down;
+    /// and the fingers on the screen (for squeezing both paddles).
+    keyer: Keyer,
+    key_delay_ms: u32,
+    sidetone_level: f32,
+    pads: Option<(bool, bool)>,
+    /// A key or paddle plugged in as a keyboard (a microcontroller that
+    /// types the radio's paddle keys): dit and dah held now.
+    paddle_keys: (bool, bool),
+    key_sent: (bool, f64),
+    touches: HashMap<u64, Pos2>,
     /// The server's last hpsdr_notice, and when it came.
     notice: Option<(String, f64)>,
     /// The section of controls open on a narrow screen, if any.
@@ -265,6 +310,16 @@ impl App {
             tx_pending: Vec::new(),
             power_w: 0,
             power_set_at: f64::NEG_INFINITY,
+            cw_text: String::new(),
+            cw_speed_wpm: 20,
+            cw_speed_set_at: f64::NEG_INFINITY,
+            keyer: Keyer::new(keyer::Mode::IambicA),
+            key_delay_ms: cw::KEY_DELAY_DEFAULT_MS,
+            sidetone_level: 0.3,
+            pads: None,
+            paddle_keys: (false, false),
+            key_sent: (false, f64::NEG_INFINITY),
+            touches: HashMap::new(),
             notice: None,
             section: Some(Section::Band),
         }
@@ -369,6 +424,19 @@ impl App {
                         self.mox_pressed_at = f64::NEG_INFINITY;
                     }
                     self.notice = Some((cmd.args.join(", "), self.now));
+                }
+                cw::MACROS_SPEED => {
+                    if let Some(wpm) = cmd.arg::<u32>(0).filter(|_| self.now - self.cw_speed_set_at >= TUNE_HOLD_S) {
+                        self.cw_speed_wpm = wpm;
+                    }
+                }
+                cw::MESSAGES => self.radio.cw_messages = cw::messages_from(&cmd).unwrap_or_default(),
+                cw::PADDLE_KEYS => {
+                    let keys = cw::paddle_keys_from(&cmd);
+                    if keys.is_some() && keys != self.radio.paddle_keys {
+                        self.radio.paddle_keys = keys;
+                        self.paddle_keys = (false, false);
+                    }
                 }
                 "device" => self.radio.device = cmd.args.first().cloned().unwrap_or_default(),
                 HELLO => self.radio.extensions = Some(cmd.args.iter().skip(1).cloned().collect()),
@@ -497,7 +565,7 @@ impl App {
                     .min_size(Vec2::new(72.0, 32.0)),
             )
             .on_hover_text("Transmit from this microphone; press again to stop")
-            .on_disabled_hover_text("No remote CW yet: choose a voice or data mode to transmit");
+            .on_disabled_hover_text("In CW, this server can't send CW from here: choose a voice or data mode to transmit");
         if mox.clicked() {
             self.set_mox(!self.radio.mox);
         }
@@ -508,6 +576,24 @@ impl App {
     /// when `narrow`, as audio_controls.
     fn tx_settings(&mut self, ui: &mut egui::Ui, narrow: bool) {
         let tx = self.radio.tx.unwrap_or_default();
+        if !self.radio.sends_cw() {
+            self.mic_settings(ui, narrow);
+        }
+        ui.label("Power:");
+        let max = tx.max_power_w.max(1);
+        if ui.add(egui::Slider::new(&mut self.power_w, 0..=max).suffix(" W")).changed() {
+            self.power_set_at = self.now;
+            let watts = self.power_w.to_string();
+            self.send(Command::new(dsp::SET, &[tx::SET_POWER, &watts]));
+        }
+        if self.radio.mox {
+            ui.add_space(12.0);
+            ui.strong(format!("{:.1} W   SWR {:.2}", tx.forward_w, tx.swr));
+        }
+    }
+
+    /// The microphone's gain and level meter.
+    fn mic_settings(&mut self, ui: &mut egui::Ui, narrow: bool) {
         ui.label("Mic:");
         ui.add(egui::Slider::new(&mut self.mic_gain_db, -20.0..=30.0).suffix(" dB"));
         let (rect, _) = ui.allocate_exact_size(Vec2::new(80.0, 10.0), egui::Sense::hover());
@@ -524,16 +610,312 @@ impl App {
         } else {
             ui.add_space(12.0);
         }
-        ui.label("Power:");
-        let max = tx.max_power_w.max(1);
-        if ui.add(egui::Slider::new(&mut self.power_w, 0..=max).suffix(" W")).changed() {
-            self.power_set_at = self.now;
-            let watts = self.power_w.to_string();
-            self.send(Command::new(dsp::SET, &[tx::SET_POWER, &watts]));
+    }
+
+    /// Sends text as CW (TCI's cw_macros), after anything already going.
+    fn send_cw(&mut self, text: &str) {
+        if !text.trim().is_empty() {
+            self.send(cw::macros(text));
         }
-        if self.radio.mox {
+    }
+
+    /// CW: Stop, red while the radio is sending -- in MOX's place.
+    fn cw_stop_button(&mut self, ui: &mut egui::Ui) {
+        let (fill, text) = if self.radio.mox {
+            (Color32::from_rgb(200, 30, 30), Color32::WHITE)
+        } else {
+            (ui.visuals().widgets.inactive.bg_fill, ui.visuals().text_color())
+        };
+        let stop = ui
+            .add(
+                egui::Button::new(egui::RichText::new("Stop").strong().size(18.0).color(text))
+                    .fill(fill)
+                    .min_size(Vec2::new(72.0, 32.0)),
+            )
+            .on_hover_text("Stop sending CW at once");
+        if stop.clicked() {
+            self.send(cw::stop());
+        }
+    }
+
+    /// CW: a line of text to send (Enter or Send), and Stop unless
+    /// `narrow`, where it's already on the line above.
+    fn cw_send_row(&mut self, ui: &mut egui::Ui, narrow: bool) {
+        let width = if narrow { (ui.available_width() - 80.0).max(120.0) } else { 280.0 };
+        let edit = ui.add(
+            egui::TextEdit::singleline(&mut self.cw_text).hint_text("Text to send as CW").desired_width(width),
+        );
+        let entered = edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+        if ui.add(egui::Button::new(egui::RichText::new("Send").strong()).min_size(Vec2::new(60.0, 30.0))).clicked()
+            || entered
+        {
+            let text = std::mem::take(&mut self.cw_text);
+            self.send_cw(&text);
+            if entered {
+                edit.request_focus();
+            }
+        }
+        if !narrow {
+            self.cw_stop_button(ui);
+        }
+    }
+
+    /// Live keying's settings: the keyer's mode, the delay asked of the
+    /// server, and the sidetone -- on lines of their own when `narrow`.
+    fn key_settings(&mut self, ui: &mut egui::Ui, narrow: bool) {
+        for mode in keyer::Mode::ALL {
+            if ui.add(egui::Button::selectable(self.keyer.mode == mode, mode.label())).clicked() && self.keyer.mode != mode {
+                self.release_key();
+                self.keyer.mode = mode;
+            }
+        }
+        if narrow {
+            ui.end_row();
+        } else {
             ui.add_space(12.0);
-            ui.strong(format!("{:.1} W   SWR {:.2}", tx.forward_w, tx.swr));
+        }
+        ui.label("Delay:").on_hover_text(
+            "How far behind your keying the radio sends, so the network's ups and downs \
+             don't change your timing: more for a slower or busier connection",
+        );
+        ui.add(
+            egui::Slider::new(&mut self.key_delay_ms, cw::KEY_DELAY_MIN_MS..=500)
+                .suffix(" ms")
+                .logarithmic(true),
+        );
+        if narrow {
+            ui.end_row();
+        } else {
+            ui.add_space(12.0);
+        }
+        ui.label("Sidetone:");
+        ui.add(egui::Slider::new(&mut self.sidetone_level, 0.0..=1.0).show_value(false));
+    }
+
+    /// The on-screen key -- one pad -- or paddles -- dit and dah side by
+    /// side -- noting what's pressed for run_keyer. Fingers on a touch
+    /// screen count (both paddles at once squeezes them); otherwise the
+    /// mouse.
+    fn key_pads(&mut self, ui: &mut egui::Ui, narrow: bool) {
+        let straight = self.keyer.mode == keyer::Mode::Straight;
+        let height = if narrow { 90.0 } else { 70.0 };
+        let gap = ui.spacing().item_spacing.x;
+        let width = if straight {
+            if narrow { ui.available_width() } else { 240.0 }
+        } else if narrow {
+            (ui.available_width() - gap) / 2.0
+        } else {
+            140.0
+        };
+        let labels: &[&str] = if straight { &["KEY"] } else { &["dit", "dah"] };
+        let mut pressed = [false; 2];
+        ui.horizontal(|ui| {
+            for (i, label) in labels.iter().enumerate() {
+                let (rect, _) = ui.allocate_exact_size(Vec2::new(width, height), egui::Sense::click_and_drag());
+                pressed[i] = self.pad_pressed(ui, rect);
+                let keyed = if straight {
+                    self.paddle_keys.0 || self.paddle_keys.1
+                } else if i == 0 {
+                    self.paddle_keys.0
+                } else {
+                    self.paddle_keys.1
+                };
+                let fill = if pressed[i] || keyed { Color32::from_rgb(200, 30, 30) } else { ui.visuals().widgets.inactive.bg_fill };
+                ui.painter().rect_filled(rect, 8.0, fill);
+                ui.painter().text(
+                    rect.center() - Vec2::new(0.0, 9.0),
+                    egui::Align2::CENTER_CENTER,
+                    label,
+                    egui::FontId::proportional(22.0),
+                    ui.visuals().strong_text_color(),
+                );
+                // The key a paddle plugged in as a keyboard types for it.
+                let (dit_key, dah_key) = self.radio.paddle_keys();
+                let key_text = if straight {
+                    format!("{dit_key} or {dah_key}")
+                } else if i == 0 {
+                    dit_key.to_string()
+                } else {
+                    dah_key.to_string()
+                };
+                ui.painter().text(
+                    rect.center() + Vec2::new(0.0, 16.0),
+                    egui::Align2::CENTER_CENTER,
+                    key_text,
+                    egui::FontId::monospace(15.0),
+                    ui.visuals().weak_text_color(),
+                );
+            }
+        });
+        self.pads = Some((pressed[0], pressed[1]));
+    }
+
+    fn pad_pressed(&self, ui: &egui::Ui, rect: Rect) -> bool {
+        if !self.touches.is_empty() {
+            return self.touches.values().any(|p| rect.contains(*p));
+        }
+        ui.input(|i| i.pointer.primary_down() && i.pointer.interact_pos().is_some_and(|p| rect.contains(p)))
+    }
+
+    /// Keeps track of the fingers on the screen, for the pads.
+    fn track_touches(&mut self, ui: &egui::Ui) {
+        ui.input(|i| {
+            for e in &i.events {
+                if let egui::Event::Touch { id, phase, pos, .. } = e {
+                    match phase {
+                        egui::TouchPhase::Start | egui::TouchPhase::Move => {
+                            self.touches.insert(id.0, *pos);
+                        }
+                        egui::TouchPhase::End | egui::TouchPhase::Cancel => {
+                            self.touches.remove(&id.0);
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    fn can_key(&self) -> bool {
+        self.radio.keys_cw() && self.link.as_ref().is_some_and(|l| l.status == Status::Open)
+    }
+
+    /// Before the controls are drawn: a key or paddle plugged in as a
+    /// keyboard. While it can key, its two keys are taken out of the input
+    /// -- they key, rather than typing into the CW text -- and what's held
+    /// is noted for run_keyer. The keyboard's own repeats are ignored, and
+    /// everything's let go if the page loses focus (no key-up comes then).
+    fn take_paddle_keys(&mut self, ctx: &egui::Context) {
+        if !self.can_key() {
+            self.paddle_keys = (false, false);
+            return;
+        }
+        let mut keys = self.paddle_keys;
+        // Matched by where the key is on a US keyboard (what a
+        // microcontroller sends), so a phone set to another layout still
+        // sees it.
+        let (dit_char, dah_char) = self.radio.paddle_keys();
+        let dit_key = egui::Key::from_name(&dit_char.to_string());
+        let dah_key = egui::Key::from_name(&dah_char.to_string());
+        let is_paddle_text = |t: &str| {
+            let t = t.to_lowercase();
+            t == dit_char.to_string() || t == dah_char.to_string()
+        };
+        ctx.input_mut(|i| {
+            i.events.retain(|e| match e {
+                egui::Event::Key { key, physical_key, pressed, .. } => {
+                    let k = Some(physical_key.unwrap_or(*key));
+                    if k == dit_key {
+                        keys.0 = *pressed;
+                        false
+                    } else if k == dah_key {
+                        keys.1 = *pressed;
+                        false
+                    } else {
+                        true
+                    }
+                }
+                egui::Event::Text(t) => !is_paddle_text(t),
+                egui::Event::WindowFocused(false) => {
+                    keys = (false, false);
+                    true
+                }
+                _ => true,
+            })
+        });
+        self.paddle_keys = keys;
+    }
+
+    /// After the controls are drawn: runs the keyer on the pads and a key
+    /// or paddle plugged in as a keyboard, and sends its transitions,
+    /// repeating a held key so the server knows this client is still there;
+    /// and the sidetone.
+    fn run_keyer(&mut self, ctx: &egui::Context) {
+        let now_ms = self.now * 1000.0;
+        if !self.can_key() {
+            self.pads = None;
+            if self.keyer.is_busy() || self.key_sent.0 {
+                self.release_key();
+            }
+            return;
+        }
+        let (pad_dit, pad_dah) = self.pads.take().unwrap_or_default();
+        let (key_dit, key_dah) = self.paddle_keys;
+        let (dit, dah) = if self.keyer.mode == keyer::Mode::Straight {
+            (pad_dit || key_dit || key_dah, false)
+        } else {
+            (pad_dit || key_dit, pad_dah || key_dah)
+        };
+        let wpm = self.cw_speed_wpm;
+        let transitions = self.keyer.update(now_ms, dit, dah, wpm);
+        self.send_key(transitions);
+        if self.key_sent.0 && now_ms - self.key_sent.1 >= cw::KEY_REPEAT_MS as f64 {
+            self.send_key(vec![(now_ms, true)]);
+        }
+        let down = self.keyer.is_down(now_ms);
+        if let Some(p) = &self.player {
+            p.set_sidetone(down, self.sidetone_level);
+        }
+        if self.keyer.is_busy() || dit || dah {
+            ctx.request_repaint();
+        }
+    }
+
+    fn send_key(&mut self, transitions: Vec<(f64, bool)>) {
+        for (t, down) in transitions {
+            self.send(cw::key(t.max(0.0).round() as u64, down, self.key_delay_ms));
+            self.key_sent = (down, self.now * 1000.0);
+        }
+    }
+
+    /// Lets go of the key at once, and stops the sidetone.
+    fn release_key(&mut self) {
+        let now_ms = self.now * 1000.0;
+        let mut transitions = self.keyer.release(now_ms);
+        if transitions.is_empty() && self.key_sent.0 {
+            transitions.push((now_ms, false));
+        }
+        self.send_key(transitions);
+        self.key_sent.0 = false;
+        if let Some(p) = &self.player {
+            p.set_sidetone(false, self.sidetone_level);
+        }
+    }
+
+    /// CW: the radio's saved messages, one button each, and the speed --
+    /// on a line of its own when `narrow`.
+    fn cw_settings(&mut self, ui: &mut egui::Ui, narrow: bool) {
+        let messages: Vec<(usize, String)> = self
+            .radio
+            .cw_messages
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| !m.trim().is_empty())
+            .map(|(i, m)| (i, m.clone()))
+            .collect();
+        for (i, message) in messages {
+            let label: String = message.chars().take(10).collect();
+            let label = if message.chars().count() > 10 { format!("{}: {label}...", i + 1) } else { format!("{}: {label}", i + 1) };
+            if ui.button(label).on_hover_text(format!("Send \"{message}\"")).clicked() {
+                self.send_cw(&message);
+            }
+        }
+        if narrow {
+            ui.end_row();
+        } else {
+            ui.add_space(12.0);
+        }
+        ui.label("Speed:");
+        if ui
+            .add(egui::Slider::new(&mut self.cw_speed_wpm, cw::SPEED_MIN..=cw::SPEED_MAX).suffix(" WPM"))
+            .changed()
+        {
+            self.cw_speed_set_at = self.now;
+            self.send(cw::speed(self.cw_speed_wpm));
+        }
+        if narrow {
+            ui.end_row();
+        } else {
+            ui.add_space(12.0);
         }
     }
 
@@ -618,7 +1000,17 @@ impl App {
                 self.audio_controls(ui, false);
             });
             self.dsp_controls(ui, true, true);
-            if self.radio.can_transmit() {
+            if self.radio.sends_cw() {
+                ui.horizontal_wrapped(|ui| self.cw_send_row(ui, false));
+                ui.horizontal_wrapped(|ui| {
+                    self.cw_settings(ui, false);
+                    self.tx_settings(ui, false);
+                });
+                if self.radio.keys_cw() {
+                    ui.horizontal_wrapped(|ui| self.key_settings(ui, false));
+                    self.key_pads(ui, false);
+                }
+            } else if self.radio.can_transmit() {
                 ui.horizontal_wrapped(|ui| {
                     self.mox_button(ui);
                     ui.add_space(12.0);
@@ -628,7 +1020,10 @@ impl App {
             return;
         }
         ui.horizontal_wrapped(|ui| {
-            if self.radio.can_transmit() {
+            if self.radio.sends_cw() {
+                self.cw_stop_button(ui);
+                ui.add_space(8.0);
+            } else if self.radio.can_transmit() {
                 self.mox_button(ui);
                 ui.add_space(8.0);
             }
@@ -643,6 +1038,9 @@ impl App {
             sections.extend([Section::Filter, Section::Noise]);
         }
         sections.push(Section::Audio);
+        if self.radio.keys_cw() {
+            sections.push(Section::Key);
+        }
         if self.radio.can_transmit() {
             sections.push(Section::Tx);
         }
@@ -665,7 +1063,16 @@ impl App {
             Some(Section::Audio) => {
                 ui.horizontal_wrapped(|ui| self.audio_controls(ui, true));
             }
+            Some(Section::Key) if self.radio.keys_cw() => {
+                self.key_pads(ui, true);
+                ui.horizontal_wrapped(|ui| self.key_settings(ui, true));
+            }
+            Some(Section::Key) => {}
             Some(Section::Tx) => {
+                if self.radio.sends_cw() {
+                    ui.horizontal_wrapped(|ui| self.cw_send_row(ui, true));
+                    ui.horizontal_wrapped(|ui| self.cw_settings(ui, true));
+                }
                 ui.horizontal_wrapped(|ui| self.tx_settings(ui, true));
             }
             None => {}
@@ -1047,6 +1454,8 @@ impl eframe::App for App {
         if self.link.as_ref().is_none_or(|l| l.status != Status::Open) {
             self.keyed_here = false;
         }
+        self.track_touches(ui);
+        self.take_paddle_keys(ui.ctx());
         self.send_tx_audio();
         if self.keyed_here {
             // Audio goes out in 20 ms blocks: keep coming back for it.
@@ -1064,6 +1473,7 @@ impl eframe::App for App {
                 self.controls(ui, narrow);
             });
         });
+        self.run_keyer(ui.ctx());
         egui::Panel::bottom("status").show(ui, |ui| self.status_line(ui));
         egui::CentralPanel::default().show(ui, |ui| self.spectrum_and_waterfall(ui));
         // Keep the status line (data rate, buffer) moving.

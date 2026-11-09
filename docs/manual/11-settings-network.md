@@ -139,10 +139,43 @@ microphone. Press **MOX** again to stop. **Mic** sets its level (keep the
 meter beside it out of the red), **Power** is the radio's TX power
 setting, and the power and SWR show while transmitting. The radio
 transmits only where it would from its own MOX button (in band, unless
-out-of-band TX is allowed in Settings -> TX), not in CW for now, and with
-**TX Audio Source** left at **Auto**. If the connection drops, or the
+out-of-band TX is allowed in Settings -> TX), and with **TX Audio Source**
+left at **Auto**. If the connection drops, or the
 client stops sending audio for a second -- a phone locked, a browser tab
 put in the background -- the radio unkeys by itself.
+
+In CW, **MOX** gives way to sending text: type it and press **Send** (or
+Enter), or press one of your saved messages from Settings -> CW, shown
+as buttons; **Stop** (red while sending) stops at once, and **Speed** is
+the radio's own CW speed. The radio sends it exactly as its own **Send**
+CW button does -- keying itself, and unkeying when the text is done -- so
+network delays don't affect the timing. The same TCI commands work from
+other TCI programs too (`cw_macros`, `cw_macros_stop`, `cw_macros_speed`).
+
+You can also key live, with an on-screen key or paddles (**Key**, on a
+phone a section of its own): **Straight** gives one big pad, down while
+you hold it; **Iambic A** and **Iambic B** give **dit** and **dah** pads
+side by side -- squeeze both with two fingers -- keyed at the CW speed, as
+piHPSDR's keyer is (B adds one element when a squeeze is released during a
+dah). You hear your own keying straight away, as a sidetone made in the
+client (**Sidetone** sets its level). The radio sends it **Delay** later
+(150 ms to start with), keeping your timing exactly however unevenly the
+network delivers it -- raise it if the keying sounds broken up over a slow
+or busy connection. The radio keys itself on your first element and
+unkeys after the CW tab's **Break-in delay**; if the connection drops, or
+the client goes quiet with the key down, the key is let go and the radio
+unkeyed within a second and a half.
+
+A real key or paddle can be plugged in too, through anything that looks
+like a USB keyboard -- e.g. a small microcontroller, plugged into a phone
+with an OTG cable -- that holds a key down while the dit paddle is closed
+and another while the dah paddle is (a straight key: either): **[** and
+**]** unless you choose others in Settings -> CW,
+[Remote Paddle Keys](06-settings-cw.md#remote-paddle-keys). It's sent
+through the same keyer, with the mode, speed and sidetone set here, and
+lights the on-screen pads; it works whenever the client can key, with
+**Key** open or not. While it can key, those two keys key rather than
+type. Tap the client once first so the page has the keyboard.
 
 Untick **Allow transmit** to let remote clients listen and tune but not
 transmit: their **MOX** button disappears, and one already transmitting is

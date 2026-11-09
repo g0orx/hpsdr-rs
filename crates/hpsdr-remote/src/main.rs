@@ -8,6 +8,7 @@
 
 mod app;
 mod audio;
+mod keyer;
 mod link;
 mod mic;
 

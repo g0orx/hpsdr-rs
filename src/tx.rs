@@ -64,7 +64,7 @@
 */
 
 use crate::radio::{
-    CwKeyerAtomics, IqSample, TX_AUDIO_SOURCE_LOCAL_MIC, TX_AUDIO_SOURCE_RADIO_MIC,
+    CwKeyerAtomics, CwLive, IqSample, TX_AUDIO_SOURCE_LOCAL_MIC, TX_AUDIO_SOURCE_RADIO_MIC,
 };
 use crate::spectrum::{EqBandCount, EqualizerParams, Mode};
 use crate::wdsp_sys as wdsp;
@@ -1819,6 +1819,70 @@ impl CwTextGen {
     }
 }
 
+/// Live CW keying from a remote client's key or paddles (see
+/// radio::CwLive): plays the key transitions remote.rs schedules on the
+/// shared sample clock -- a carrier shaped like CwTextGen's (same 5 ms
+/// ramps, same sidetone monitor), but open-ended: the key stays down until
+/// a transition says up, however long that is.
+struct CwLiveGen {
+    down: bool,
+    gain: f32,
+    sidetone_phase: f32,
+}
+
+impl CwLiveGen {
+    fn new() -> Self {
+        Self { down: false, gain: 0.0, sidetone_phase: 0.0 }
+    }
+
+    /// Keying, or still ramping down from the last element.
+    fn is_active(&self, live: &CwLive) -> bool {
+        live.active.load(Ordering::Relaxed) || self.down || self.gain > 0.0
+    }
+
+    /// As CwTextGen::fill, playing `live`'s transitions as their samples
+    /// come round on its clock, which this advances.
+    #[allow(clippy::too_many_arguments)]
+    fn fill(
+        &mut self,
+        live: &CwLive,
+        count: usize,
+        rate: u32,
+        sidetone_freq_hz: f32,
+        sidetone_volume: f32,
+        iq: &mut Vec<f32>,
+        mono: &mut Vec<f32>,
+    ) {
+        iq.clear();
+        mono.clear();
+        let ramp_step = 1.0 / (0.005 * rate as f32).max(1.0);
+        let tone_step = 2.0 * std::f32::consts::PI * sidetone_freq_hz / rate as f32;
+        let mut clock = live.clock.load(Ordering::Relaxed);
+        let mut events = live.events.lock().unwrap();
+        for _ in 0..count {
+            while events.front().is_some_and(|&(at, _)| at <= clock) {
+                self.down = events.pop_front().unwrap().1;
+            }
+            let target = if self.down { 1.0 } else { 0.0 };
+            if self.gain < target {
+                self.gain = (self.gain + ramp_step).min(target);
+            } else if self.gain > target {
+                self.gain = (self.gain - ramp_step).max(target);
+            }
+            clock += 1;
+            iq.push(self.gain);
+            iq.push(0.0);
+            self.sidetone_phase += tone_step;
+            if self.sidetone_phase >= 2.0 * std::f32::consts::PI {
+                self.sidetone_phase -= 2.0 * std::f32::consts::PI;
+            }
+            mono.push(sidetone_volume * self.gain * self.sidetone_phase.sin());
+        }
+        drop(events);
+        live.clock.store(clock, Ordering::Relaxed);
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run(
     mic_buffer: Arc<Mutex<VecDeque<f32>>>,
@@ -1885,6 +1949,8 @@ fn run(
     let mut cw_text_gen = CwTextGen::new(Arc::clone(&cw_text_elements), Arc::clone(&cw_text_active), Arc::clone(&cw_text_busy));
     let mut cw_iq_scratch: Vec<f32> = Vec::new();
     let mut cw_mono_scratch: Vec<f32> = Vec::new();
+    let mut cw_live_gen = CwLiveGen::new();
+    cw_keyer.live.rate.store(duc_rate as u32, Ordering::Relaxed);
     let duc_ratio = ((duc_rate / mic_rate).max(1)) as usize;
     let out_iq_pairs = TX_BUFFER_SIZE * duc_ratio;
     let mut chunk = vec![0.0f32; TX_BUFFER_SIZE];
@@ -2011,6 +2077,11 @@ fn run(
                 cw_text_gen = CwTextGen::new(Arc::clone(&cw_text_elements), Arc::clone(&cw_text_active), Arc::clone(&cw_text_busy));
                 cw_text_busy.store(false, Ordering::Relaxed);
             }
+            // And live keying: nothing left to play once MOX is off.
+            if cw_live_gen.is_active(&cw_keyer.live) {
+                cw_keyer.live.events.lock().unwrap().clear();
+                cw_live_gen = CwLiveGen::new();
+            }
             mox_active_since = None;
             thread::sleep(Duration::from_millis(20));
             // Resync so the first chunk after PTT is produced against a
@@ -2019,7 +2090,8 @@ fn run(
             next_chunk = Instant::now();
             continue;
         }
-        if cw_text_gen.is_active() {
+        let cw_live_now = !cw_text_gen.is_active() && cw_live_gen.is_active(&cw_keyer.live);
+        if cw_text_gen.is_active() || cw_live_now {
             // See CwTextGen's own doc comment -- bypasses source
             // selection and WDSP entirely; a plain shaped on-frequency
             // carrier, not something fexchange0's SSB-modulation chain
@@ -2029,7 +2101,19 @@ fn run(
             // scalar as audio.rs's CwSidetone -- the Sidetone Level
             // slider governs this monitor tone too.
             let sidetone_volume = (cw_keyer.sidetone_volume.load(Ordering::Relaxed).min(255) as f32) / 255.0;
-            cw_text_gen.fill(out_iq_pairs, duc_rate as u32, sidetone_freq_hz, sidetone_volume, &mut cw_iq_scratch, &mut cw_mono_scratch);
+            if cw_live_now {
+                cw_live_gen.fill(
+                    &cw_keyer.live,
+                    out_iq_pairs,
+                    duc_rate as u32,
+                    sidetone_freq_hz,
+                    sidetone_volume,
+                    &mut cw_iq_scratch,
+                    &mut cw_mono_scratch,
+                );
+            } else {
+                cw_text_gen.fill(out_iq_pairs, duc_rate as u32, sidetone_freq_hz, sidetone_volume, &mut cw_iq_scratch, &mut cw_mono_scratch);
+            }
 
             {
                 let mut spec = tx_spectrum_iq.lock().unwrap();
@@ -2748,5 +2832,34 @@ mod tune_tone_tests {
         let tone_hz = tone_hz.unwrap_or((passband.0 + passband.1) / 2.0);
         let expected = (tone_hz - shown.0) / (shown.1 - shown.0) * (row.len() - 1) as f64;
         assert!((peak as f64 - expected).abs() <= 2.0, "peak at pixel {peak}, expected {expected:.1}");
+    }
+}
+
+#[cfg(test)]
+mod cw_live_tests {
+    use super::*;
+
+    /// Transitions play on exactly the samples they're scheduled for, across
+    /// fills, with 5 ms ramps, and the clock advances by what's generated.
+    #[test]
+    fn plays_transitions_on_their_samples() {
+        let live = CwLive::default();
+        let rate = 48_000;
+        live.events.lock().unwrap().extend([(100, true), (100 + 4_800, false)]);
+        let mut gen = CwLiveGen::new();
+        let (mut iq, mut mono) = (Vec::new(), Vec::new());
+        let mut envelope = Vec::new();
+        for _ in 0..10 {
+            gen.fill(&live, 1_024, rate, 800.0, 0.5, &mut iq, &mut mono);
+            envelope.extend(iq.chunks_exact(2).map(|p| p[0]));
+        }
+        assert_eq!(live.clock.load(Ordering::Relaxed), 10_240);
+        assert!(envelope[..100].iter().all(|&g| g == 0.0), "silent before the key goes down");
+        assert!(envelope[100] > 0.0 && envelope[100] < 0.01, "ramps up from sample 100");
+        assert_eq!(envelope[100 + 240], 1.0, "full after 5 ms");
+        assert_eq!(envelope[4_899], 1.0, "still down just before the release");
+        assert!(envelope[4_900] < 1.0, "ramps down from the release");
+        assert!(envelope[4_900 + 241..].iter().all(|&g| g == 0.0), "silent 5 ms later");
+        assert!(!gen.is_active(&live));
     }
 }

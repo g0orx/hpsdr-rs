@@ -9,6 +9,7 @@
 
 pub mod adpcm;
 pub mod bands;
+pub mod cw;
 pub mod spectrum;
 pub mod state;
 pub mod tci;

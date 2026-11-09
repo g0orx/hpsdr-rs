@@ -56,6 +56,17 @@ Kenwood CAT's `KY` command and rigctl's `send_morse`/`stop_morse` also
 send real CW this way, at the same Speed/Weight configured here, though
 neither has any control of its own on this tab.
 
+## Remote Paddle Keys
+
+For a real key or paddle plugged into the
+[web client](11-settings-network.md#web-client) as a keyboard -- e.g. a
+small microcontroller on a phone's USB port: **Dit** is the key it holds
+down while the dit paddle (or a straight key) is closed, **Dah** the one
+for the dah paddle. They're `[` and `]` to start with; the choice is
+letters, digits and the punctuation typed without Shift (a shifted one
+could leave the key stuck down if Shift came up first). Connected clients
+pick up a change straight away.
+
 ---
 
 [← Audio](05-settings-audio.md) | [Index](README.md) | [Diversity →](07-diversity.md)

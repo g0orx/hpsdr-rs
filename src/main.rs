@@ -2793,6 +2793,9 @@ struct ConnectedState {
     /// Which of cw_text_messages the main window's dropdown currently
     /// has selected (0-4) -- see Config::cw_text_selected's doc comment.
     cw_text_selected: usize,
+    /// The keys a paddle plugged into a remote client types -- see
+    /// Config::cw_paddle_keys.
+    cw_paddle_keys: (char, char),
     /// Whether a "send CW text" is currently in flight -- set true the
     /// instant the Send button is clicked (mirrors tx_handle's own
     /// cw_text_busy() immediately, rather than waiting a frame to
@@ -3307,6 +3310,7 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                     Arc::clone(&session.xit_enabled),
                     Arc::clone(&session.xit_offset_hz),
                     format!("{:?}", device.board),
+                    Arc::clone(&session.cw_keyer),
                     tci_debug_log.clone(),
                 ) {
                     Ok(s) => {
@@ -3832,6 +3836,14 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                 cw_stuck_key_lockout: false,
                 cw_text_messages: cfg.cw_text_messages.clone().map(|m| m.unwrap_or_default()),
                 cw_text_selected: cfg.cw_text_selected.filter(|&i| i < 5).unwrap_or(0),
+                cw_paddle_keys: cfg
+                    .cw_paddle_keys
+                    .filter(|(dit, dah)| {
+                        dit != dah
+                            && hpsdr_proto::cw::PADDLE_KEY_CHOICES.contains(*dit)
+                            && hpsdr_proto::cw::PADDLE_KEY_CHOICES.contains(*dah)
+                    })
+                    .unwrap_or((hpsdr_proto::cw::PADDLE_DIT_DEFAULT, hpsdr_proto::cw::PADDLE_DAH_DEFAULT)),
                 cw_text_sending: false,
                 smoothed_fwd_power: 0.0,
                 smoothed_rev_power: 0.0,
@@ -4197,11 +4209,34 @@ impl eframe::App for HpsdrApp {
                         max_power_w: connected.max_tx_power_watts,
                         forward_w,
                         swr,
+                        cw_sending: connected.cw_text_sending,
+                        cw_speed_wpm: connected.session.cw_keyer.speed_wpm.load(Ordering::Relaxed),
                     };
                     let power_request = connected.tci_server.as_ref().and_then(|s| {
                         s.set_tx_info(info);
                         s.take_power_request()
                     });
+                    // CW text from TCI clients (cw_macros): into the same
+                    // queue as CAT's KY, so it's sent -- and the radio
+                    // unkeyed after -- by the same code further down (see
+                    // cw_remote_pending). The speed is the CW tab's own.
+                    let cw = connected.tci_server.as_ref().map(|s| {
+                        s.set_cw_messages(&connected.cw_text_messages);
+                        s.set_paddle_keys(connected.cw_paddle_keys);
+                        s.take_cw()
+                    });
+                    if let Some(cw) = cw {
+                        if let Some(wpm) = cw.speed_wpm {
+                            connected.session.cw_keyer.speed_wpm.store(wpm, Ordering::Relaxed);
+                            connected.settings_dirty.store(true, Ordering::Relaxed);
+                        }
+                        if cw.stop {
+                            connected.cw_remote_stop.store(true, Ordering::Relaxed);
+                        }
+                        if !cw.text.is_empty() && connected.tx_enabled {
+                            connected.cw_remote_pending.lock().unwrap().extend(cw.text);
+                        }
+                    }
                     if let Some(watts) = power_request.filter(|_| connected.tx_enabled) {
                         connected
                             .session
@@ -7873,6 +7908,7 @@ impl eframe::App for HpsdrApp {
                                                 Arc::clone(&connected.session.xit_enabled),
                                                 Arc::clone(&connected.session.xit_offset_hz),
                                                 format!("{:?}", connected.device.board),
+                                                Arc::clone(&connected.session.cw_keyer),
                                                 connected.tci_debug_log.clone(),
                                             ) {
                                                 Ok(s) => {
@@ -8990,6 +9026,39 @@ impl eframe::App for HpsdrApp {
                                             }
                                         });
                                     }
+
+                                    ui.separator();
+                                    ui.label("Remote Paddle Keys:").on_hover_text(
+                                        "For a key or paddle plugged into a web or thin client as a \
+                                         keyboard (e.g. a small microcontroller on a phone's USB \
+                                         port): the key it holds down while the dit paddle -- or a \
+                                         straight key -- is closed, and the one for the dah paddle. \
+                                         Only keys typed without Shift are offered.",
+                                    );
+                                    ui.horizontal(|ui| {
+                                        let (dit, dah) = connected.cw_paddle_keys;
+                                        for (label, id, key, other) in [("Dit:", "paddle_dit", dit, dah), ("Dah:", "paddle_dah", dah, dit)] {
+                                            ui.label(label);
+                                            let mut chosen = key;
+                                            egui::ComboBox::from_id_salt(id)
+                                                .selected_text(egui::RichText::new(key.to_string()).monospace())
+                                                .width(40.0)
+                                                .show_ui(ui, |ui| {
+                                                    for c in hpsdr_proto::cw::PADDLE_KEY_CHOICES.chars().filter(|&c| c != other) {
+                                                        ui.selectable_value(&mut chosen, c, egui::RichText::new(c.to_string()).monospace());
+                                                    }
+                                                });
+                                            if chosen != key {
+                                                if id == "paddle_dit" {
+                                                    connected.cw_paddle_keys.0 = chosen;
+                                                } else {
+                                                    connected.cw_paddle_keys.1 = chosen;
+                                                }
+                                                settings_changed = true;
+                                            }
+                                            ui.add_space(12.0);
+                                        }
+                                    });
                                 }
 
                                 SettingsTab::Agc => {
@@ -11567,6 +11636,7 @@ impl eframe::App for HpsdrApp {
                         cw_pc_sidetone_enabled: Some(connected.cw_sidetone.enabled.load(Ordering::Relaxed)),
                         cw_text_messages: connected.cw_text_messages.clone().map(|m| if m.is_empty() { None } else { Some(m) }),
                         cw_text_selected: Some(connected.cw_text_selected),
+                        cw_paddle_keys: Some(connected.cw_paddle_keys),
                         db_low: Some(connected.db_low),
                         db_low_auto: Some(connected.db_low_auto),
                         db_high: Some(connected.db_high),
