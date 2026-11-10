@@ -72,6 +72,41 @@ streaming), both directly and through TCI Remote Compactor.
   (`dds`) and the offset of the listening frequency from it (`if`) are
   reported in the same RF terms, so a client's own spectrum display lines
   up with a transverter band too.
+- **A second receiver**, as Thetis's RX2: TCI receiver 1 is your first
+  extra receiver (the **RX 2** window, or the lowest-numbered one open).
+  Clients see two receivers, and `rx_enable:1` says whether there's one
+  open now. Receiver 1 has its own frequency (VFO A and B), mode,
+  filter, RIT, CTUN, AGC, volume, noise and squelch settings, audio
+  (`audio_start:1`) and S-meter (`rx_sensors:1`), all reported as they
+  change; transmitting stays with receiver 0. Not its IQ: TCI has one
+  IQ rate for every receiver, and an extra receiver can run at its own.
+- **CW is CWL or CWU**, as Thetis reports it, not plain CW. A client
+  that sends plain `cw` gets the usual sideband for the frequency (CWL
+  below 10 MHz, CWU above), and `cwr` the other one.
+- **Changes reach clients at once:** keying MOX, Tune, tuning, changing
+  mode, filter, RIT/XIT, split, AGC, volume, squelch, the noise controls,
+  TX power or Tune power -- from hpsdr-rs's
+  own window, MIDI, CAT or another client -- is sent to every TCI client
+  as it happens, within a few milliseconds. A value a client has just
+  set itself isn't echoed back to it for half a second, so a client
+  that's still tuning doesn't jump back. TX power goes as TCI's `drive`,
+  a percentage of the radio's maximum; squelch as `sql_level`, its 0-100
+  setting scaled to TCI's -140 to 0 dB.
+- **Clients can set** Tune (`tune`, with the same checks as the TUNE
+  button), TX power (`drive`, a percentage of the radio's maximum), Tune
+  Power (`tune_drive`), the filter (`rx_filter_band`), volume (`volume`
+  or `rx_volume`, dB from -60 to 0), AGC (`agc_mode`, `agc_gain`) and
+  squelch (`sql_enable`, `sql_level`), as in Thetis; sending one with
+  only the receiver asks for its current value. hpsdr-rs's filters are a
+  width placed by the mode, so `rx_filter_band` sets the width nearest
+  the passband asked for (e.g. `-2400,-150` in LSB is 2.4 kHz).
+- **Sensors** (`rx_sensors_enable` / `tx_sensors_enable`, as Thetis):
+  while receiving, the S-meter level, its running average and the
+  strongest spectrum bin (`rx_sensors`, `rx_channel_sensors`,
+  `rx_channel_sensors_ex`); while transmitting, the mic level, power and
+  SWR (`tx_sensors`) -- every 200 ms, or the interval the client asks
+  for (30 to 1000 ms). The receive readings are only as fresh as the
+  spectrum, about 10 a second.
 - **Audio block size** follows the client, as in Thetis: 2048 samples
   (about 43 ms at 48 kHz) unless the client asks for a smaller size
   with `audio_stream_samples` (100 to 2048, e.g. 960 for 20 ms), used

@@ -50,10 +50,11 @@ const FALLBACK_BANDS: [(&str, u64, u64, u64); 14] = [
 ];
 
 /// TCI mode names and their buttons.
-const MODES: [(&str, &str); 8] = [
+const MODES: [(&str, &str); 9] = [
     ("lsb", "LSB"),
     ("usb", "USB"),
-    ("cw", "CW"),
+    ("cwl", "CWL"),
+    ("cwu", "CWU"),
     ("am", "AM"),
     ("sam", "SAM"),
     ("nfm", "FM"),
@@ -96,7 +97,7 @@ impl Radio {
     /// In CW, with a server that sends text as CW: the CW controls take
     /// MOX's place.
     fn sends_cw(&self) -> bool {
-        self.mode == "cw"
+        self.is_cw()
             && self.can_transmit()
             && self.extensions.as_ref().is_some_and(|e| e.iter().any(|f| f == FEATURE_CW))
     }
@@ -104,6 +105,11 @@ impl Radio {
     /// In CW, with a server that takes live keying: the key or paddles too.
     fn keys_cw(&self) -> bool {
         self.sends_cw() && self.extensions.as_ref().is_some_and(|e| e.iter().any(|f| f == FEATURE_KEY))
+    }
+
+    /// CW, either sideband (or plain "cw", from an older hpsdr-rs).
+    fn is_cw(&self) -> bool {
+        matches!(self.mode.as_str(), "cw" | "cwl" | "cwu")
     }
 
     /// The paddle keys (dit, dah): the radio's, or `[` and `]`.
@@ -126,7 +132,8 @@ impl Radio {
                 "lsb" => (-w, -low_cut),
                 "digl" => (-w, 0),
                 "digu" => (0, w),
-                "cw" => (600 - w / 2, 600 + w / 2),
+                "cwl" => (-600 - w / 2, -600 + w / 2),
+                "cw" | "cwu" => (600 - w / 2, 600 + w / 2),
                 "am" | "sam" | "nfm" | "dsb" => (-w, w),
                 _ => (low_cut, w),
             };
@@ -135,7 +142,8 @@ impl Radio {
             Some((mode, low, high)) if *mode == self.mode => (*low, *high),
             _ => match self.mode.as_str() {
                 "lsb" | "digl" => (-2700, -150),
-                "cw" => (-250, 250),
+                "cwl" => (-850, -350),
+                "cw" | "cwu" => (350, 850),
                 "am" | "sam" | "nfm" => (-4000, 4000),
                 _ => (150, 2700),
             },
@@ -388,6 +396,11 @@ impl App {
                 self.send(Command::new(SPECTRUM, &[&SPECTRUM_POINTS.to_string(), &SPECTRUM_FPS.to_string()]));
                 self.send(Command::new(AUDIO, &["adpcm", &AUDIO_RATE.to_string()]));
             }
+            // Receiver 0 only: hpsdr-rs reports its second receiver (an
+            // extra receiver) as receiver 1, as Thetis does its RX2.
+            Incoming::Command(cmd)
+                if matches!(cmd.name.as_str(), "vfo" | "modulation" | "rx_filter_band")
+                    && cmd.arg::<u32>(0) != Some(0) => {}
             Incoming::Command(cmd) => match cmd.name.as_str() {
                 "vfo" if cmd.arg::<u32>(1) == Some(0) => {
                     // Not just after tuning here -- see tuned_at.
@@ -551,7 +564,7 @@ impl App {
 
     /// MOX -- shown once the server says this radio can transmit.
     fn mox_button(&mut self, ui: &mut egui::Ui) {
-        let cw = self.radio.mode == "cw";
+        let cw = self.radio.is_cw();
         let (fill, text) = if self.radio.mox {
             (Color32::from_rgb(200, 30, 30), Color32::WHITE)
         } else {
@@ -1198,7 +1211,7 @@ impl App {
             ui.horizontal_wrapped(|ui| {
                 ui.label("Filter:");
                 let presets: &[u32] = match self.radio.mode.as_str() {
-                    "cw" => &[100, 250, 500, 1000],
+                    "cw" | "cwl" | "cwu" => &[100, 250, 500, 1000],
                     "am" | "sam" | "dsb" => &[3000, 4000, 5000],
                     "nfm" => &[],
                     _ => &[1800, 2100, 2400, 2700, 3000],
@@ -1385,7 +1398,7 @@ impl App {
         if let Some(pos) = resp.interact_pointer_pos().filter(|_| resp.clicked()) {
             let rect = resp.rect;
             let hz = low_hz + ((pos.x - rect.left()) / rect.width()) as f64 * span_hz as f64;
-            let step = if self.radio.mode == "cw" { 10.0 } else { 100.0 };
+            let step = if self.radio.is_cw() { 10.0 } else { 100.0 };
             self.tune(((hz / step).round() * step).max(0.0) as u64);
         }
         if resp.hovered() {
@@ -1616,9 +1629,11 @@ mod tests {
             snb: false,
         });
         assert_eq!(r.passband(), (-1800, -150), "from the reported width");
-        r.mode = "cw".into();
+        r.mode = "cwu".into();
         r.dsp.as_mut().unwrap().width_hz = 500;
         assert_eq!(r.passband(), (350, 850));
+        r.mode = "cwl".into();
+        assert_eq!(r.passband(), (-850, -350));
         assert_eq!((format_hz(2700), format_hz(3000), format_hz(500)), ("2.7k".into(), "3k".into(), "500".into()));
         let list = vec![
             BandInfo { name: "70cm".into(), low_hz: 420_000_000, high_hz: 450_000_000 },

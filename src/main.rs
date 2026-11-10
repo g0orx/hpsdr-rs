@@ -1556,37 +1556,7 @@ fn dispatch_midi_event(connected: &mut ConnectedState, ev: RawMidiEvent, freq_hz
         // Mirrors the TUNE button handler -- see its own comments for why
         // tune_may_start excludes Two-Tone/CW-text-sending and an
         // externally-keyed transmission.
-        MidiAction::Tune => {
-            if connected.tune_active {
-                connected.session.set_mox(false);
-                if let Some(tx) = &connected.tx_handle {
-                    tx.set_tune(false);
-                }
-                if let Some(prev) = connected.pre_tune_power_watts.take() {
-                    connected.session.tx_power_watts.store(prev, Ordering::Relaxed);
-                }
-                connected.tune_active = false;
-            } else {
-                let tune_may_start = !connected.session.mox_active()
-                    && !connected.two_tone_active
-                    && !connected.cw_text_sending
-                    && tx_frequency_allowed(
-                        connected.session.tx_frequency_hz.load(Ordering::Relaxed),
-                        connected.allow_out_of_band_tx.load(Ordering::Relaxed),
-                    );
-                if tune_may_start {
-                    let current_watts = connected.session.tx_power_watts.load(Ordering::Relaxed);
-                    connected.pre_tune_power_watts = Some(current_watts);
-                    let tune_watts = tune_power_level(connected, current_watts);
-                    connected.session.tx_power_watts.store(tune_watts, Ordering::Relaxed);
-                    if let Some(tx) = &connected.tx_handle {
-                        tx.set_tune(true);
-                    }
-                    connected.session.set_mox(true);
-                    connected.tune_active = true;
-                }
-            }
-        }
+        MidiAction::Tune => toggle_tune(connected),
         MidiAction::Split => {
             connected.split = !connected.split;
             connected.duplex &= connected.split;
@@ -4211,7 +4181,57 @@ impl eframe::App for HpsdrApp {
                         swr,
                         cw_sending: connected.cw_text_sending,
                         cw_speed_wpm: connected.session.cw_keyer.speed_wpm.load(Ordering::Relaxed),
+                        tune: connected.tune_active,
+                        tune_power_percent: connected.tune_power_percent,
+                        split: connected.split,
+                        mic_db: match &connected.tx_handle {
+                            Some(tx) if connected.session.mox_active() => tx.display.lock().unwrap().mic_pk as f32,
+                            _ => -200.0,
+                        },
                     };
+                    // TCI's receiver 1 -- the first extra receiver, as
+                    // Thetis's RX2 (see tci::Rx2Share): what clients asked
+                    // of it, applied as its own window would, and its state
+                    // for them.
+                    if let Some(s) = connected.tci_server.as_ref() {
+                        let first = connected
+                            .extra_receivers
+                            .iter()
+                            .min_by_key(|rx| rx.lock().unwrap().ddc_index)
+                            .cloned();
+                        match first {
+                            Some(rx) => {
+                                let mut rx = rx.lock().unwrap();
+                                if apply_tci_rx2_requests(&mut rx, s.take_rx2_requests()) {
+                                    // Its window applies RIT and CTUN to the DSP
+                                    // when it draws: draw it now.
+                                    ui.ctx().request_repaint_of(egui::ViewportId::from_hash_of((
+                                        "extra_receiver",
+                                        rx.ddc_index,
+                                    )));
+                                }
+                                let ddc_hz = rx.frequency_hz.load(Ordering::Relaxed) as u64;
+                                let state = tci::Rx2State {
+                                    frequency_hz: if rx.ctun { rx.ctun_frequency_hz as u64 } else { ddc_hz },
+                                    dds_hz: ddc_hz,
+                                    vfo_b_hz: rx.vfo_b_frequency_hz as u64,
+                                    rit_enabled: rx.rit_enabled,
+                                    rit_offset_hz: rx.rit_offset_hz.round() as i32,
+                                    ctun: rx.ctun,
+                                };
+                                let taps = tci::Rx2Taps {
+                                    demod_params: rx.spectrum.demod_params_handle(),
+                                    audio: Arc::clone(&rx.spectrum.tci_audio_out),
+                                    display: Arc::clone(&rx.spectrum.display),
+                                };
+                                s.set_rx2(Some((taps, state)));
+                            }
+                            None => {
+                                s.set_rx2(None);
+                                s.take_rx2_requests();
+                            }
+                        }
+                    }
                     let power_request = connected.tci_server.as_ref().and_then(|s| {
                         s.set_tx_info(info);
                         s.take_power_request()
@@ -4235,6 +4255,25 @@ impl eframe::App for HpsdrApp {
                         }
                         if !cw.text.is_empty() && connected.tx_enabled {
                             connected.cw_remote_pending.lock().unwrap().extend(cw.text);
+                        }
+                    }
+                    // TCI's tune and tune_drive, as the TUNE button and
+                    // Settings -> TX -> Tune Power.
+                    let control = connected.tci_server.as_ref().map(|s| s.take_control()).unwrap_or_default();
+                    if let Some(percent) = control.tune_power_percent {
+                        connected.tune_power_percent = percent.min(100);
+                        if connected.tune_active {
+                            let base = connected
+                                .pre_tune_power_watts
+                                .unwrap_or_else(|| connected.session.tx_power_watts.load(Ordering::Relaxed));
+                            let watts = tune_power_level(connected, base);
+                            connected.session.tx_power_watts.store(watts, Ordering::Relaxed);
+                        }
+                        connected.settings_dirty.store(true, Ordering::Relaxed);
+                    }
+                    if let Some(on) = control.tune {
+                        if on != connected.tune_active && (connected.tx_enabled || !on) {
+                            toggle_tune(connected);
                         }
                     }
                     if let Some(watts) = power_request.filter(|_| connected.tx_enabled) {
@@ -13489,6 +13528,81 @@ fn default_max_tx_power_watts(board: Boards) -> u32 {
 /// pluto::tx_drive_db), so the percentage is taken as a power ratio and
 /// subtracted in dB -- 20% is 7 dB below the drive, not the bottom of
 /// the scale.
+/// What TCI clients asked of receiver 1 (an extra receiver -- see
+/// tci::Rx2Share), applied as its own window would: a frequency as its
+/// keypad does, CTUN as its CTUN button, RIT as its RIT controls. True
+/// if anything changed.
+fn apply_tci_rx2_requests(rx: &mut ExtraReceiver, req: tci::Rx2Requests) -> bool {
+    let clamp = |hz: u64| hz.clamp(rx.frequency_min, rx.frequency_max).min(u32::MAX as u64) as u32;
+    let mut changed = false;
+    if let Some(hz) = req.frequency_hz {
+        let hz = clamp(hz);
+        rx.frequency_hz.store(hz, Ordering::Relaxed);
+        rx.ctun_frequency_hz = hz;
+        changed = true;
+    }
+    if let Some(hz) = req.vfo_b_hz {
+        rx.vfo_b_frequency_hz = clamp(hz);
+        changed = true;
+    }
+    if let Some(on) = req.ctun.filter(|on| *on != rx.ctun) {
+        if rx.ctun {
+            rx.frequency_hz.store(rx.ctun_frequency_hz, Ordering::Relaxed);
+        } else {
+            rx.ctun_frequency_hz = rx.frequency_hz.load(Ordering::Relaxed);
+        }
+        rx.ctun = on;
+        changed = true;
+    }
+    if let Some(on) = req.rit_enabled {
+        rx.rit_enabled = on;
+        changed = true;
+    }
+    if let Some(hz) = req.rit_offset_hz {
+        rx.rit_offset_hz = hz as f64;
+        changed = true;
+    }
+    if changed {
+        rx.settings_dirty.store(true, Ordering::Relaxed);
+    }
+    changed
+}
+
+/// Tune on or off, as the TUNE button: MIDI's Tune and TCI's tune. See
+/// the button's own comments for why tune_may_start excludes
+/// Two-Tone/CW-text-sending and an externally-keyed transmission.
+fn toggle_tune(connected: &mut ConnectedState) {
+        if connected.tune_active {
+            connected.session.set_mox(false);
+            if let Some(tx) = &connected.tx_handle {
+                tx.set_tune(false);
+            }
+            if let Some(prev) = connected.pre_tune_power_watts.take() {
+                connected.session.tx_power_watts.store(prev, Ordering::Relaxed);
+            }
+            connected.tune_active = false;
+        } else {
+            let tune_may_start = !connected.session.mox_active()
+                && !connected.two_tone_active
+                && !connected.cw_text_sending
+                && tx_frequency_allowed(
+                    connected.session.tx_frequency_hz.load(Ordering::Relaxed),
+                    connected.allow_out_of_band_tx.load(Ordering::Relaxed),
+                );
+            if tune_may_start {
+                let current_watts = connected.session.tx_power_watts.load(Ordering::Relaxed);
+                connected.pre_tune_power_watts = Some(current_watts);
+                let tune_watts = tune_power_level(connected, current_watts);
+                connected.session.tx_power_watts.store(tune_watts, Ordering::Relaxed);
+                if let Some(tx) = &connected.tx_handle {
+                    tx.set_tune(true);
+                }
+                connected.session.set_mox(true);
+                connected.tune_active = true;
+            }
+        }
+}
+
 fn tune_power_level(connected: &ConnectedState, current: u32) -> u32 {
     let percent = connected.tune_power_percent;
     if connected.device.board != Boards::Pluto {

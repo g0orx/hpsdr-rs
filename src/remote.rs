@@ -198,6 +198,9 @@ pub struct RemoteShare {
     clients: AtomicUsize,
     tx: Mutex<TxInfo>,
     power_request: Mutex<Option<u32>>,
+    control: Mutex<ControlRequests>,
+    /// TCI's receiver 1 -- see crate::tci::Rx2Share.
+    pub rx2: crate::tci::Rx2Share,
     cw: Mutex<CwRequests>,
     cw_messages: Mutex<(u64, Vec<String>)>,
     paddle_keys: Mutex<(u64, (char, char))>,
@@ -210,6 +213,14 @@ pub struct CwRequests {
     pub text: Vec<String>,
     pub stop: bool,
     pub speed_wpm: Option<u32>,
+}
+
+/// TCI's tune and tune_drive, for main.rs to apply as the TUNE button and
+/// Settings -> TX -> Tune Power: the latest of each since it last looked.
+#[derive(Debug, Default, PartialEq)]
+pub struct ControlRequests {
+    pub tune: Option<bool>,
+    pub tune_power_percent: Option<u32>,
 }
 
 /// The transmitter as main.rs sees it, for hpsdr_tx.
@@ -229,6 +240,15 @@ pub struct TxInfo {
     /// cw_macros), and the CW speed, WPM.
     pub cw_sending: bool,
     pub cw_speed_wpm: u32,
+    /// The Tune button is on, at tune_power_percent (Settings -> TX,
+    /// Tune Power); split is on (TX on VFO B). For TCI's tune,
+    /// tune_drive and split_enable.
+    pub tune: bool,
+    pub tune_power_percent: u32,
+    pub split: bool,
+    /// The microphone's peak level, dB (WDSP's TXA mic peak meter), while
+    /// transmitting -- for TCI's tx_sensors.
+    pub mic_db: f32,
 }
 
 /// One connected remote client (one that said hpsdr_hello), counted in
@@ -276,13 +296,31 @@ impl RemoteShare {
         *self.tx.lock().unwrap() = info;
     }
 
-    fn tx(&self) -> TxInfo {
+    pub fn tx(&self) -> TxInfo {
         *self.tx.lock().unwrap()
     }
 
     /// A TX power setting a remote client has asked for, W.
     pub fn take_power_request(&self) -> Option<u32> {
         self.power_request.lock().unwrap().take()
+    }
+
+    /// A TX power setting a TCI client has asked for (drive), W.
+    pub fn request_power(&self, watts: u32) {
+        *self.power_request.lock().unwrap() = Some(watts);
+    }
+
+    /// Tune and Tune Power, as TCI clients have asked since the last call.
+    pub fn take_control(&self) -> ControlRequests {
+        std::mem::take(&mut *self.control.lock().unwrap())
+    }
+
+    pub fn request_tune(&self, on: bool) {
+        self.control.lock().unwrap().tune = Some(on);
+    }
+
+    pub fn request_tune_power(&self, percent: u32) {
+        self.control.lock().unwrap().tune_power_percent = Some(percent);
     }
 
     /// CW text, a stop and a speed clients have asked for since the last
