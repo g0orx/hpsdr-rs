@@ -2885,6 +2885,23 @@ struct HpsdrApp {
     /// already exists (it's also the Discovery screen) by the time a
     /// radio -- and so its saved geometry -- is even known.
     main_window_geometry: Option<WindowGeometry>,
+    /// The UI scale last saved to config::UiPrefs, to save it again only
+    /// when it changes.
+    saved_zoom: f32,
+}
+
+/// This viewport's window geometry to save: its content size always, its
+/// position only where the window system reports one (not on Wayland --
+/// see WindowGeometry). Both in egui points, zoom included, the units
+/// ViewportBuilder and ViewportCommand take them back in.
+fn window_geometry_of(ui: &egui::Ui) -> WindowGeometry {
+    let (outer, size) = ui.input(|i| (i.viewport().outer_rect, i.content_rect().size()));
+    WindowGeometry {
+        x: outer.map(|r| r.min.x),
+        y: outer.map(|r| r.min.y),
+        width: size.x,
+        height: size.y,
+    }
 }
 
 /// Orange (instead of egui's default blue) for every "active" widget --
@@ -2917,11 +2934,16 @@ impl HpsdrApp {
         ctx.style_mut_of(egui::Theme::Dark, |style| {
             style.visuals = with_orange_selection(style.visuals.clone());
         });
+        // The saved UI scale (see config::UiPrefs::zoom). egui applies it
+        // at the start of the first frame, before ui() reads it back.
+        let zoom = config::UiPrefs::load().zoom.unwrap_or(1.0).clamp(0.2, 5.0);
+        ctx.set_zoom_factor(zoom);
         Self {
             state: AppState::Discovering(DiscoveryWindow::new(ctx)),
             was_focused: true,
             ignore_interaction_until: None,
             main_window_geometry: None,
+            saved_zoom: zoom,
         }
     }
 }
@@ -3838,6 +3860,13 @@ impl eframe::App for HpsdrApp {
     // eframe 0.35 replaced `update(&Context)` with `ui(&mut Ui)` -- see
     // https://github.com/emilk/egui/blob/main/CHANGELOG.md (0.35.0).
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        // Keep the UI scale for next time, however it was changed:
+        // Settings -> Spectrum's UI Scale or Ctrl - / Ctrl + / Ctrl 0.
+        let zoom = ui.ctx().zoom_factor();
+        if zoom != self.saved_zoom {
+            self.saved_zoom = zoom;
+            config::UiPrefs { zoom: Some(zoom) }.save();
+        }
         // Track this window's current position/size every frame (cheap --
         // just copying floats already computed by egui-winit) so a final
         // value is always ready whenever the periodic per-radio Config
@@ -3850,16 +3879,9 @@ impl eframe::App for HpsdrApp {
         // below. Both are None on Wayland, but this app already forces
         // X11 (see main()'s WAYLAND_DISPLAY workaround), so that doesn't
         // apply here.
-        if let (Some(outer), Some(inner)) =
-            (ui.input(|i| i.viewport().outer_rect), ui.input(|i| i.viewport().inner_rect))
-        {
-            self.main_window_geometry = Some(WindowGeometry {
-                x: outer.min.x,
-                y: outer.min.y,
-                width: inner.width(),
-                height: inner.height(),
-            });
-        }
+        // On Wayland there's no position (see WindowGeometry), and
+        // inner_rect is None too, so the size comes from content_rect.
+        self.main_window_geometry = Some(window_geometry_of(ui));
         let root_close_requested = ui.input(|i| i.viewport().close_requested());
 
         // BUG FIX: clicking the main window while it's not the active/
@@ -3950,9 +3972,9 @@ impl eframe::App for HpsdrApp {
                     // re-applies every time it's sent, which would fight
                     // the user moving/resizing the window themselves.
                     if let Some(g) = cfg.window_geometry {
-                        ui.ctx().send_viewport_cmd(egui::ViewportCommand::OuterPosition(
-                            egui::pos2(g.x, g.y),
-                        ));
+                        if let (Some(x), Some(y)) = (g.x, g.y) {
+                            ui.ctx().send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(x, y)));
+                        }
                         ui.ctx().send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(
                             g.width, g.height,
                         )));
@@ -7626,8 +7648,10 @@ impl eframe::App for HpsdrApp {
                             // spectrum and waterfall.
                             .with_min_inner_size([700.0, 320.0]);
                     if let Some(g) = seed_geometry {
-                        viewport_builder =
-                            viewport_builder.with_position([g.x, g.y]).with_inner_size([g.width, g.height]);
+                        viewport_builder = viewport_builder.with_inner_size([g.width, g.height]);
+                        if let (Some(x), Some(y)) = (g.x, g.y) {
+                            viewport_builder = viewport_builder.with_position([x, y]);
+                        }
                     }
                     ui.ctx().show_viewport_deferred(
                         viewport_id,
@@ -7638,17 +7662,7 @@ impl eframe::App for HpsdrApp {
                             // reason as the main window's own geometry --
                             // see ExtraReceiver::window_geometry's doc
                             // comment.
-                            if let (Some(outer), Some(inner)) = (
-                                ui.input(|i| i.viewport().outer_rect),
-                                ui.input(|i| i.viewport().inner_rect),
-                            ) {
-                                rx_for_closure.lock().unwrap().window_geometry = Some(WindowGeometry {
-                                    x: outer.min.x,
-                                    y: outer.min.y,
-                                    width: inner.width(),
-                                    height: inner.height(),
-                                });
-                            }
+                            rx_for_closure.lock().unwrap().window_geometry = Some(window_geometry_of(ui));
 
                             if ui.input(|i| i.viewport().close_requested()) {
                                 let mut rx = rx_for_closure.lock().unwrap();
@@ -9608,6 +9622,29 @@ impl eframe::App for HpsdrApp {
                                 }
 
                                 SettingsTab::Spectrum => {
+                                    // See config::UiPrefs::zoom. Saved by
+                                    // HpsdrApp::ui when it changes.
+                                    ui.horizontal(|ui| {
+                                        let ctx = ui.ctx().clone();
+                                        ui.label("UI Scale:");
+                                        if ui.button("-").clicked() {
+                                            egui::gui_zoom::zoom_out(&ctx);
+                                        }
+                                        ui.label(format!("{:.0}%", ctx.zoom_factor() * 100.0));
+                                        if ui.button("+").clicked() {
+                                            egui::gui_zoom::zoom_in(&ctx);
+                                        }
+                                        if ui.button("Reset").clicked() {
+                                            ctx.set_zoom_factor(1.0);
+                                        }
+                                    })
+                                    .response
+                                    .on_hover_text(
+                                        "Makes text and everything else in every window smaller or \
+                                         larger, on top of the desktop's own display scale, and is \
+                                         kept for next time. Ctrl - , Ctrl + and Ctrl 0 do the same.",
+                                    );
+                                    ui.separator();
                                     ui.horizontal(|ui| {
                                         ui.label("Spectrum");
                                         ui.label("Low:");

@@ -820,10 +820,17 @@ pub(crate) fn settings_dir() -> Option<PathBuf> {
 /// A window's on-screen position and content size, in egui points
 /// (matches `egui::ViewportBuilder::with_position`/`with_inner_size`'s
 /// units -- see Config::window_geometry/ExtraReceiverConfig::window_geometry).
+/// The position is None on Wayland, which never tells an app where its
+/// window is nor lets it choose: the compositor places it. REAL REPORT
+/// (2026-11-10): with native Wayland the default (since f76d51b), no
+/// geometry was saved at all, size included, so windows always opened at
+/// their default size.
 #[derive(Serialize, Deserialize, Clone, Copy)]
 pub struct WindowGeometry {
-    pub x: f32,
-    pub y: f32,
+    #[serde(default)]
+    pub x: Option<f32>,
+    #[serde(default)]
+    pub y: Option<f32>,
     pub width: f32,
     pub height: f32,
 }
@@ -845,6 +852,46 @@ pub fn ps_corr_path(mac: [u8; 6]) -> Option<PathBuf> {
     let [a, b, c, d, e, f] = mac;
     path.push(format!("ps_corr-{a:02x}-{b:02x}-{c:02x}-{d:02x}-{e:02x}-{f:02x}.dat"));
     Some(path)
+}
+
+/// Settings for this computer rather than for one radio, in
+/// `ui_prefs.json` beside the per-radio configs (like the discovery
+/// window's manual_ips.json).
+#[derive(Serialize, Deserialize, Default)]
+pub struct UiPrefs {
+    /// egui's zoom factor: the whole interface, every window, scaled on
+    /// top of the desktop's own display scale. Set in Settings -> Spectrum
+    /// (UI Scale) or with Ctrl - / Ctrl + / Ctrl 0. REAL REPORT: on an RPi
+    /// whose desktop scaled everything up, text was so big that extra
+    /// receiver windows wouldn't fit on the screen, and egui's Ctrl -
+    /// zoom wasn't kept from one run to the next.
+    pub zoom: Option<f32>,
+}
+
+fn ui_prefs_path() -> Option<PathBuf> {
+    let mut path = settings_dir()?;
+    path.push("ui_prefs.json");
+    Some(path)
+}
+
+impl UiPrefs {
+    pub fn load() -> UiPrefs {
+        ui_prefs_path()
+            .and_then(|p| std::fs::read_to_string(p).ok())
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default()
+    }
+
+    pub fn save(&self) {
+        let Some(path) = ui_prefs_path() else {
+            return;
+        };
+        if let Ok(json) = serde_json::to_string_pretty(self) {
+            if let Err(e) = std::fs::write(&path, json) {
+                eprintln!("failed to save UI settings to {}: {e}", path.display());
+            }
+        }
+    }
 }
 
 impl Config {
@@ -882,6 +929,19 @@ fn default_squelch_level() -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A window's geometry saved with a position (X11, Windows, macOS)
+    /// still loads, and one saved without (Wayland) keeps its size.
+    #[test]
+    fn window_geometry_loads_with_or_without_a_position() {
+        let g: WindowGeometry = serde_json::from_str(r#"{"x":10.0,"y":20.0,"width":800.0,"height":400.0}"#).unwrap();
+        assert_eq!((g.x, g.y, g.width, g.height), (Some(10.0), Some(20.0), 800.0, 400.0));
+        let g: WindowGeometry = serde_json::from_str(r#"{"width":800.0,"height":400.0}"#).unwrap();
+        assert_eq!((g.x, g.y, g.width), (None, None, 800.0));
+        let json = serde_json::to_string(&g).unwrap();
+        let g: WindowGeometry = serde_json::from_str(&json).unwrap();
+        assert_eq!((g.x, g.height), (None, 400.0));
+    }
 
     /// A named setup survives a save and load, and a config written before
     /// setups existed still loads, with none.

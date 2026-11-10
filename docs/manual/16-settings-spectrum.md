@@ -6,6 +6,26 @@ Open **Settings...** from the main window, then the **Spectrum** tab.
 
 ![Spectrum settings tab](images/05-spectrum-tab.png)
 
+## UI Scale
+
+**UI Scale** makes the whole interface -- text, buttons, the spectrum and
+every window, extra receivers and Settings included -- smaller (**-**) or
+larger (**+**) in 10% steps, and **Reset** returns it to 100%. **Ctrl -**,
+**Ctrl +** and **Ctrl 0** do the same from any window. It applies on top of
+the desktop's own display scale, and is kept for next time on this computer
+(whichever radio you connect to).
+
+Use it when text is too big to fit several receivers on the screen, e.g. on
+a Raspberry Pi or a large monitor whose desktop scales everything up. If the
+interface ever gets too small to use, **Ctrl 0** puts it back to 100%.
+
+The main window and each extra receiver window also reopen at the size you
+left them, for each radio. Their position is restored too, except on a
+Wayland desktop (e.g. Raspberry Pi OS, most current Linux desktops), which
+doesn't let programs see or choose where their windows go: the desktop places
+them. To have positions restored there as well, start hpsdr-rs under X11
+with `HPSDR_FORCE_X11=1 hpsdr-rs`.
+
 ## Display range
 
 **Low** and **High** sliders (-180.0 to 0.0 dB) set the dB range the
