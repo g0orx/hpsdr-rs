@@ -4184,6 +4184,7 @@ impl eframe::App for HpsdrApp {
                         tune: connected.tune_active,
                         tune_power_percent: connected.tune_power_percent,
                         split: connected.split,
+                        tx_on_vfo_b: tx_on_vfo_b(connected),
                         mic_db: match &connected.tx_handle {
                             Some(tx) if connected.session.mox_active() => tx.display.lock().unwrap().mic_pk as f32,
                             _ => -200.0,
@@ -4302,6 +4303,13 @@ impl eframe::App for HpsdrApp {
                             let watts = tune_power_level(connected, base);
                             connected.session.tx_power_watts.store(watts, Ordering::Relaxed);
                         }
+                        connected.settings_dirty.store(true, Ordering::Relaxed);
+                    }
+                    // split_enable, as the Split button (Duplex goes with it
+                    // when Split goes off).
+                    if let Some(on) = control.split {
+                        connected.split = on;
+                        connected.duplex &= on;
                         connected.settings_dirty.store(true, Ordering::Relaxed);
                     }
                     if let Some(on) = control.tune {

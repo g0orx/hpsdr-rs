@@ -95,6 +95,13 @@ streaming), both directly and through TCI Remote Compactor.
   that's still tuning doesn't jump back. TX power goes as TCI's `drive`,
   a percentage of the radio's maximum; squelch as `sql_level`, its 0-100
   setting scaled to TCI's -140 to 0 dB.
+- **Split:** the transmit frequency is reported as Thetis does, at
+  connect and whenever it changes -- `tx_frequency` and
+  `tx_frequency_ex` (frequency, band such as `b40m`, whether receiver 1
+  is open, whether TX is on VFO B). It's VFO A, or VFO B with Split or
+  Duplex, as shown on screen (through its transverter), plus XIT. A
+  client can turn Split on and off with `split_enable`, as the Split
+  button does.
 - **Clients can set** Tune (`tune`, with the same checks as the TUNE
   button), TX power (`drive`, a percentage of the radio's maximum), Tune
   Power (`tune_drive`), the filter (`rx_filter_band`), volume (`volume`

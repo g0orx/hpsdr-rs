@@ -1116,7 +1116,15 @@ fn handle_client(
     // Receiver 1 itself, and its state, follow in the live notifications.
     send_logged(&mut ws, &logging, format!("rx_filter_band:0,{},{};", pb_low.round() as i64, pb_high.round() as i64).into());
     send_logged(&mut ws, &logging, format!("modulation:0,{};", mode_to_tci(mode)).into());
-    send_logged(&mut ws, &logging, format!("tx_frequency:{freq};").into());
+    for (_, msg) in tx_frequency_state(
+        &rx_frequency_hz,
+        &vfo_b,
+        &xit_enabled,
+        &xit_offset_hz,
+        &remote_share,
+    ) {
+        send_logged(&mut ws, &logging, msg);
+    }
     send_logged(&mut ws, &logging, format!("vfo:0,0,{freq};").into());
     send_logged(&mut ws, &logging, format!("if:0,0,{if_offset};").into());
     send_logged(&mut ws, &logging, format!("dds:0,{dds_freq};").into());
@@ -1290,7 +1298,7 @@ fn handle_client(
         &rit_offset_hz,
         &xit_enabled,
         &xit_offset_hz,
-        &remote_share.tx(),
+        &remote_share,
     )
     .into_iter()
     .collect();
@@ -2030,7 +2038,7 @@ fn handle_client(
                 &rit_offset_hz,
                 &xit_enabled,
                 &xit_offset_hz,
-                &remote_share.tx(),
+                &remote_share,
             );
             // Receiver 1 (see Rx2Share) -- not for an hpsdr-remote client,
             // which has only the one. Gone, it's forgotten, so all of it
@@ -2135,8 +2143,9 @@ fn live_state(
     rit_offset_hz: &AtomicI32,
     xit_enabled: &AtomicBool,
     xit_offset_hz: &AtomicI32,
-    tx: &crate::remote::TxInfo,
+    share: &crate::remote::RemoteShare,
 ) -> Vec<(String, String)> {
+    let tx = &share.tx();
     let dds_freq = (hw_frequency_hz.load(Ordering::Relaxed) as i64 + rx_rf_offset_hz.load(Ordering::Relaxed)).max(0);
     let mut out = receiver_live_state(
         0,
@@ -2164,7 +2173,42 @@ fn live_state(
         ]
         .map(|(k, m)| (k.to_string(), m)),
     );
+    out.extend(tx_frequency_state(rx_frequency_hz, vfo_b, xit_enabled, xit_offset_hz, share));
     out
+}
+
+/// Where hpsdr-rs transmits, as Thetis reports it (TCIServer.cs
+/// sendTXFrequencyChanged): `tx_frequency:<Hz>;` and
+/// `tx_frequency_ex:<Hz>,<band>,<RX2 on>,<TX on VFO B>;` -- VFO A, or
+/// VFO B with Split or Duplex, as shown on screen (through its
+/// transverter), with XIT. The dial, as Thetis's: not the CW pitch
+/// hpsdr-rs moves its carrier by. The band is Thetis's style (b40m), from
+/// the radio's band list (gen outside them); RX2 on is whether TCI's
+/// receiver 1 is there (see Rx2Share).
+fn tx_frequency_state(
+    rx_frequency_hz: &AtomicU64,
+    vfo_b: &crate::radio::VfoBShared,
+    xit_enabled: &AtomicBool,
+    xit_offset_hz: &AtomicI32,
+    share: &crate::remote::RemoteShare,
+) -> Vec<(String, String)> {
+    let tx = share.tx();
+    let vfo_b_hz = vfo_b.frequency_hz.load(Ordering::Relaxed);
+    let dial = if tx.tx_on_vfo_b && vfo_b_hz != 0 { vfo_b_hz } else { rx_frequency_hz.load(Ordering::Relaxed) };
+    let xit = if xit_enabled.load(Ordering::Relaxed) { xit_offset_hz.load(Ordering::Relaxed) as i64 } else { 0 };
+    let hz = (dial as i64 + xit).max(0) as u64;
+    let band = share
+        .band_name(hz)
+        .map(|n| format!("b{}", n.to_lowercase().chars().filter(char::is_ascii_alphanumeric).collect::<String>()))
+        .filter(|b| b.len() > 1)
+        .unwrap_or_else(|| "gen".to_string());
+    vec![
+        ("tx_frequency".to_string(), format!("tx_frequency:{hz};")),
+        (
+            "tx_frequency_ex".to_string(),
+            format!("tx_frequency_ex:{hz},{band},{},{};", share.rx2.get().is_some(), tx.tx_on_vfo_b),
+        ),
+    ]
 }
 
 /// One receiver's part of live_state: its frequencies, mode, filter,
@@ -2539,7 +2583,8 @@ fn control_command(cmd: &str, share: &crate::remote::RemoteShare, params: &Mutex
     let values = match name.as_str() {
         "volume" => &args[..],
         "rx_volume" => args.get(2..).unwrap_or(&[]),
-        "tune" | "drive" | "tune_drive" | "rx_filter_band" | "agc_mode" | "agc_gain" | "sql_enable" | "sql_level" => {
+        "tune" | "drive" | "tune_drive" | "split_enable" | "rx_filter_band" | "agc_mode" | "agc_gain" | "sql_enable"
+        | "sql_level" => {
             args.get(1..).unwrap_or(&[])
         }
         _ => return None,
@@ -2551,6 +2596,7 @@ fn control_command(cmd: &str, share: &crate::remote::RemoteShare, params: &Mutex
         let (pb_low, pb_high) = passband_for(p.mode, p.width_hz);
         return Some(Some(match name.as_str() {
             "tune" => format!("tune:{rx},{};", tx.tune),
+            "split_enable" => format!("split_enable:{rx},{};", tx.split),
             "drive" => format!("drive:{rx},{};", drive_percent(&tx)),
             "tune_drive" => format!("tune_drive:{rx},{};", tx.tune_power_percent),
             "rx_filter_band" => format!("rx_filter_band:{rx},{},{};", pb_low.round() as i64, pb_high.round() as i64),
@@ -2566,6 +2612,11 @@ fn control_command(cmd: &str, share: &crate::remote::RemoteShare, params: &Mutex
         "tune" => {
             if let Some(on) = boolean(0) {
                 share.request_tune(on);
+            }
+        }
+        "split_enable" => {
+            if let Some(on) = boolean(0) {
+                share.request_split(on);
             }
         }
         "drive" => {
@@ -2704,6 +2755,7 @@ fn live_families(name: &str) -> &'static [&'static str] {
         "agc_gain" => &["agc_gain"],
         "rx_volume" | "volume" => &["rx_volume", "volume"],
         "tune" => &["tune", "drive"],
+        "split_enable" => &["split_enable", "tx_frequency", "tx_frequency_ex"],
         "drive" => &["drive"],
         "tune_drive" => &["tune_drive", "drive"],
         "sql_enable" => &["sql_enable"],
@@ -4168,6 +4220,84 @@ mod remote_tests {
         server.set_rx2(None);
         let (got, _) = read_for(&mut ws, 700);
         assert!(got.contains(&"rx_enable:1,false".to_string()), "{got:?}");
+        server.stop();
+    }
+
+    /// Where it transmits, as Thetis reports it: tx_frequency and
+    /// tx_frequency_ex -- VFO A, or VFO B with Split, plus XIT, the band
+    /// Thetis-style -- live; and split_enable from a client.
+    #[test]
+    fn a_client_hears_the_tx_frequency() {
+        let port = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let vfo_b = Arc::new(crate::radio::VfoBShared::default());
+        let xit_on = Arc::new(AtomicBool::new(false));
+        let xit_hz = Arc::new(AtomicI32::new(500));
+        let mut server = TciServer::start(
+            &format!("127.0.0.1:{port}"),
+            Arc::new(AtomicU64::new(7_100_000)),
+            Arc::new(AtomicU64::new(7_100_000)),
+            Arc::new(AtomicU32::new(7_100_000)),
+            Arc::new(AtomicI64::new(0)),
+            Arc::clone(&vfo_b),
+            Arc::new(AtomicU32::new(192_000)),
+            Arc::new(Mutex::new(DemodParams::default())),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicU32::new(7_100_000)),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(Mutex::new(VecDeque::new())),
+            Arc::new(Mutex::new(VecDeque::new())),
+            Arc::new(Mutex::new(VecDeque::new())),
+            Arc::new(Mutex::new(1.0)),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicI32::new(0)),
+            Arc::clone(&xit_on),
+            Arc::clone(&xit_hz),
+            "Test".to_string(),
+            Arc::new(crate::radio::CwKeyerAtomics::default()),
+            DebugLog::new(std::env::temp_dir().join("hpsdr-rs-tci-txfreq-test.log")),
+        )
+        .unwrap();
+        server.set_bands(vec![hpsdr_proto::bands::BandInfo {
+            name: "40m".to_string(),
+            low_hz: 7_000_000,
+            high_hz: 7_300_000,
+        }]);
+        let (mut ws, _) = tungstenite::connect(format!("ws://127.0.0.1:{port}")).unwrap();
+        if let tungstenite::stream::MaybeTlsStream::Plain(s) = ws.get_ref() {
+            s.set_read_timeout(Some(Duration::from_millis(10))).unwrap();
+        }
+        let read_for = |ws: &mut tungstenite::WebSocket<tungstenite::stream::MaybeTlsStream<TcpStream>>, ms: u64| {
+            let mut got = Vec::new();
+            let start = Instant::now();
+            while start.elapsed() < Duration::from_millis(ms) {
+                if let Ok(Message::Text(t)) = ws.read() {
+                    got.extend(t.split(';').filter(|m| !m.is_empty()).map(str::to_string));
+                }
+            }
+            got
+        };
+        let got = read_for(&mut ws, 300);
+        for want in ["tx_frequency:7100000", "tx_frequency_ex:7100000,b40m,false,false"] {
+            assert!(got.contains(&want.to_string()), "no {want} in {got:?}");
+        }
+
+        // Split on, VFO B elsewhere in the band, then XIT.
+        vfo_b.frequency_hz.store(7_150_000, Ordering::Relaxed);
+        server.set_tx_info(crate::remote::TxInfo { split: true, tx_on_vfo_b: true, ..Default::default() });
+        let got = read_for(&mut ws, 100);
+        for want in ["split_enable:0,true", "tx_frequency:7150000", "tx_frequency_ex:7150000,b40m,false,true"] {
+            assert!(got.contains(&want.to_string()), "no {want} in {got:?}");
+        }
+        xit_on.store(true, Ordering::Relaxed);
+        let got = read_for(&mut ws, 100);
+        assert!(got.contains(&"tx_frequency:7150500".to_string()), "{got:?}");
+
+        // A client turns split off: passed on to main.rs.
+        ws.send(Message::Text("split_enable:0,false;split_enable:0;".into())).unwrap();
+        let got = read_for(&mut ws, 100);
+        assert_eq!(server.take_control().split, Some(false));
+        assert!(got.contains(&"split_enable:0,true".to_string()), "the question answered: {got:?}");
         server.stop();
     }
 }

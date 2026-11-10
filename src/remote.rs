@@ -225,6 +225,8 @@ pub struct CwRequests {
 pub struct ControlRequests {
     pub tune: Option<bool>,
     pub tune_power_percent: Option<u32>,
+    /// split_enable, as the Split button.
+    pub split: Option<bool>,
 }
 
 /// The transmitter as main.rs sees it, for hpsdr_tx.
@@ -250,6 +252,8 @@ pub struct TxInfo {
     pub tune: bool,
     pub tune_power_percent: u32,
     pub split: bool,
+    /// Transmitting on VFO B: Split, or Duplex -- for TCI's tx_frequency.
+    pub tx_on_vfo_b: bool,
     /// The microphone's peak level, dB (WDSP's TXA mic peak meter), while
     /// transmitting -- for TCI's tx_sensors.
     pub mic_db: f32,
@@ -279,6 +283,12 @@ impl RemoteShare {
         if list.1 != bands {
             *list = (list.0 + 1, bands);
         }
+    }
+
+    /// The band (its name) `hz` is in, from the same list, if any.
+    pub fn band_name(&self, hz: u64) -> Option<String> {
+        let list = self.list.lock().unwrap();
+        list.1.iter().find(|b| (b.low_hz..=b.high_hz).contains(&hz)).map(|b| b.name.clone())
     }
 
     /// The list and its version, if it's newer than `seen`.
@@ -328,6 +338,10 @@ impl RemoteShare {
     /// last call.
     pub fn take_filter_changed(&self) -> bool {
         self.filter_changed.swap(false, std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub fn request_split(&self, on: bool) {
+        self.control.lock().unwrap().split = Some(on);
     }
 
     pub fn request_tune(&self, on: bool) {
