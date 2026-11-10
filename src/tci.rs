@@ -280,7 +280,15 @@ const CLIENT_SINK_MAX_IQ_PAIRS: usize = 200_000;
 /// keeps every individual message the size a real client's own
 /// buffering/rendering is presumably already tuned for, instead of
 /// occasionally handing it an unusually large one.
+///
+/// Now a default and upper limit rather than fixed: a client can ask for
+/// smaller blocks with `audio_stream_samples` (AUDIO_STREAM_SAMPLES_MIN
+/// up to this), as Thetis allows (TCIServer.cs handleAudioStreamSamples
+/// -- e.g. 960 for 20 ms at 48 kHz). The size it asks for is used for
+/// both its RX audio messages and the TX audio it's asked for
+/// (TxChrono), as Thetis does.
 const MAX_AUDIO_SAMPLES_PER_MESSAGE: usize = 2048;
+const AUDIO_STREAM_SAMPLES_MIN: usize = 100;
 const MAX_IQ_PAIRS_PER_MESSAGE: usize = 256;
 
 /// The single reader of the real shared audio/IQ taps -- drains them
@@ -1040,6 +1048,9 @@ fn handle_client(
     // them -- harmless either way, and keeps this spec-compliant for
     // any other TCI client that relies on that gate.
     let mut audio_streaming = true;
+    // Samples per audio message, both ways -- MAX_AUDIO_SAMPLES_PER_MESSAGE
+    // unless the client asks otherwise (audio_stream_samples).
+    let mut audio_samples = MAX_AUDIO_SAMPLES_PER_MESSAGE;
     // hpsdr-rs's remote extensions, if this client asks for them -- see
     // remote.rs and docs/remote-protocol.md.
     let mut remote = crate::remote::RemoteStreams::default();
@@ -1101,8 +1112,8 @@ fn handle_client(
     // the underlying production isn't. Falls behind gracefully (resyncs
     // to now, matching the same fallback those references use) if the
     // queue can't keep up rather than bursting to catch up.
-    let audio_chunk_interval =
-        Duration::from_secs_f64(MAX_AUDIO_SAMPLES_PER_MESSAGE as f64 / TCI_AUDIO_SAMPLE_RATE as f64);
+    // (Worked out at each send, from the client's own block size --
+    // audio_samples.)
     let mut next_audio_send = Instant::now();
     // BUG FIX: a bad (garbage-value) pair used to be dropped outright
     // (`continue`, pushing nothing), which shortens tci_tx_audio's
@@ -1242,6 +1253,7 @@ fn handle_client(
                         &xit_offset_hz,
                         &tci_wants_mic,
                         &mut audio_streaming,
+                        &mut audio_samples,
                         &mut iq_streaming,
                         &sink,
                     ) {
@@ -1483,14 +1495,15 @@ fn handle_client(
             if now >= next_audio_send {
                 let stereo: Option<Vec<(f32, f32)>> = {
                     let mut q = sink.audio.lock().unwrap();
-                    if q.len() >= MAX_AUDIO_SAMPLES_PER_MESSAGE {
-                        Some(q.drain(..MAX_AUDIO_SAMPLES_PER_MESSAGE).collect())
+                    if q.len() >= audio_samples {
+                        Some(q.drain(..audio_samples).collect())
                     } else {
                         None
                     }
                 };
                 if let Some(stereo) = stereo {
-                    next_audio_send += audio_chunk_interval;
+                    next_audio_send +=
+                        Duration::from_secs_f64(audio_samples as f64 / TCI_AUDIO_SAMPLE_RATE as f64);
                     if next_audio_send < now {
                         next_audio_send = now; // fell behind -- resync, don't chase
                     }
@@ -1720,10 +1733,10 @@ fn handle_client(
                 tx_chrono_outstanding = 0;
             }
             let queued = tci_tx_audio.lock().unwrap().len();
-            let future = queued + tx_chrono_outstanding as usize * TCI_TX_AUDIO_CHUNK as usize;
+            let future = queued + tx_chrono_outstanding as usize * audio_samples;
             if future < TX_CHRONO_TARGET_BUFFER_SAMPLES {
                 let deficit = TX_CHRONO_TARGET_BUFFER_SAMPLES - future;
-                let requests_needed = deficit.div_ceil(TCI_TX_AUDIO_CHUNK as usize) as u32;
+                let requests_needed = deficit.div_ceil(audio_samples) as u32;
                 let requests_needed =
                     requests_needed.min(TX_CHRONO_MAX_OUTSTANDING.saturating_sub(tx_chrono_outstanding));
                 for _ in 0..requests_needed {
@@ -1731,7 +1744,7 @@ fn handle_client(
                         0,
                         TCI_AUDIO_SAMPLE_RATE,
                         BinaryMessageType::TxChrono,
-                        TCI_TX_AUDIO_CHUNK,
+                        audio_samples as u32,
                         &[],
                     );
                     let result = ws.send(Message::Binary(chrono.into()));
@@ -1844,6 +1857,10 @@ fn handle_client(
 /// this project can fix by tuning TCI_TX_AUDIO_CHUNK further. 2048 is
 /// kept because it's the best-evidenced value (matches a real working
 /// Thetis session), not because it resolved the underlying issue.
+///
+/// Now the default only, announced at connect: a client that sends
+/// audio_stream_samples gets TX audio asked for in blocks of its own
+/// size instead (see MAX_AUDIO_SAMPLES_PER_MESSAGE).
 const TCI_TX_AUDIO_CHUNK: u32 = 2048;
 
 /// Target amount of TX audio to keep pre-buffered in tci_tx_audio while
@@ -2039,6 +2056,7 @@ fn handle_command(
     xit_offset_hz: &Arc<AtomicI32>,
     tci_wants_mic: &Arc<AtomicBool>,
     audio_streaming: &mut bool,
+    audio_samples: &mut usize,
     iq_streaming: &mut bool,
     sink: &ClientAudioIqSink,
 ) -> Option<String> {
@@ -2341,6 +2359,17 @@ fn handle_command(
         "audio_stop" => {
             *audio_streaming = false;
             Some(format!("audio_stop:{};", args.first().unwrap_or(&"0")))
+        }
+        // audio_stream_samples:n; -- the samples per audio message, both
+        // RX audio and the TX audio asked for, AUDIO_STREAM_SAMPLES_MIN to
+        // MAX_AUDIO_SAMPLES_PER_MESSAGE. As Thetis: anything else is
+        // ignored, and the reply is the size in use either way.
+        "audio_stream_samples" => {
+            let n = args.first().and_then(|a| a.trim().parse::<usize>().ok());
+            if let Some(n) = n.filter(|n| (AUDIO_STREAM_SAMPLES_MIN..=MAX_AUDIO_SAMPLES_PER_MESSAGE).contains(n)) {
+                *audio_samples = n;
+            }
+            Some(format!("audio_stream_samples:{audio_samples};"))
         }
         // iq_start:receiver; / iq_stop:receiver; -- same reasoning as
         // audio_start/stop above.
@@ -2709,5 +2738,82 @@ mod remote_tests {
         }
         assert!(!mox.load(Ordering::Relaxed) && !live.active.load(Ordering::Relaxed), "unkeyed after the release");
         server.stop();
+    }
+
+    /// A plain TCI client asking for 20 ms audio blocks
+    /// (audio_stream_samples:960, as Thetis allows) gets RX audio in
+    /// blocks that size, and TX audio asked for in them; a size out of
+    /// range is ignored, the reply giving the one in use.
+    #[test]
+    fn a_client_chooses_its_audio_block_size() {
+        let port = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let tci_audio_out = Arc::new(Mutex::new(VecDeque::new()));
+        let mox = Arc::new(AtomicBool::new(false));
+        let mut server = TciServer::start(
+            &format!("127.0.0.1:{port}"),
+            Arc::new(AtomicU64::new(7_100_000)),
+            Arc::new(AtomicU64::new(7_100_000)),
+            Arc::new(AtomicU32::new(7_100_000)),
+            Arc::new(AtomicI64::new(0)),
+            Arc::new(crate::radio::VfoBShared::default()),
+            Arc::new(AtomicU32::new(192_000)),
+            Arc::new(Mutex::new(DemodParams::default())),
+            Arc::clone(&mox),
+            Arc::new(AtomicU32::new(7_100_000)),
+            Arc::new(AtomicBool::new(false)),
+            Arc::clone(&tci_audio_out),
+            Arc::new(Mutex::new(VecDeque::new())),
+            Arc::new(Mutex::new(VecDeque::new())),
+            Arc::new(Mutex::new(1.0)),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicI32::new(0)),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicI32::new(0)),
+            "Test".to_string(),
+            Arc::new(crate::radio::CwKeyerAtomics::default()),
+            DebugLog::new(std::env::temp_dir().join("hpsdr-rs-tci-block-test.log")),
+        )
+        .unwrap();
+        let (mut ws, _) = tungstenite::connect(format!("ws://127.0.0.1:{port}")).unwrap();
+        if let tungstenite::stream::MaybeTlsStream::Plain(s) = ws.get_ref() {
+            s.set_read_timeout(Some(Duration::from_millis(100))).unwrap();
+        }
+        ws.send(Message::Text("audio_stream_samples:960;audio_stream_samples:50;audio_start:0;".into())).unwrap();
+        let (mut replies, mut rx_blocks, mut chrono) = (Vec::new(), 0, 0);
+        let start = Instant::now();
+        while start.elapsed() < Duration::from_secs(2) {
+            match ws.read() {
+                Ok(Message::Text(t)) if t.starts_with("audio_stream_samples:") => {
+                    replies.push(t.to_string());
+                    if replies.len() == 2 {
+                        // Set up: half a second of audio, then key.
+                        tci_audio_out.lock().unwrap().extend(std::iter::repeat_n((0.1f32, 0.1f32), 24_000));
+                        mox.store(true, Ordering::Relaxed);
+                    }
+                }
+                Ok(Message::Binary(b)) => {
+                    let (header, payload) = hpsdr_proto::Header::decode(&b).unwrap();
+                    match header.msg_type {
+                        hpsdr_proto::TYPE_RX_AUDIO => {
+                            // length counts floats, both channels.
+                            assert_eq!((header.length, payload.len()), (960 * 2, 960 * 2 * 4));
+                            rx_blocks += 1;
+                        }
+                        hpsdr_proto::TYPE_TX_CHRONO => {
+                            assert_eq!(header.length, 960);
+                            chrono += 1;
+                        }
+                        _ => {}
+                    }
+                }
+                _ => {}
+            }
+        }
+        server.stop();
+        // The connect handshake announces the default first.
+        assert_eq!(&replies[replies.len() - 2..], ["audio_stream_samples:960;", "audio_stream_samples:960;"]);
+        assert!(rx_blocks >= 20, "{rx_blocks} RX audio blocks of 960");
+        assert!(chrono >= 5, "{chrono} TX audio requests");
     }
 }

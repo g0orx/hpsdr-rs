@@ -72,6 +72,10 @@ streaming), both directly and through TCI Remote Compactor.
   (`dds`) and the offset of the listening frequency from it (`if`) are
   reported in the same RF terms, so a client's own spectrum display lines
   up with a transverter band too.
+- **Audio block size** follows the client, as in Thetis: 2048 samples
+  (about 43 ms at 48 kHz) unless the client asks for a smaller size
+  with `audio_stream_samples` (100 to 2048, e.g. 960 for 20 ms), used
+  for both the receive audio it gets and the transmit audio asked of it.
 - **Mute local audio output while a TCI client is connected** -- hpsdr-rs normally
   streams RX audio to both its own local audio device and TCI at the same
   time. If that local device is *also* independently picked up by your TCI
