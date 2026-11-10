@@ -718,6 +718,12 @@ impl TciServer {
         std::mem::take(&mut *self.remote_share.rx2.requests.lock().unwrap())
     }
 
+    /// Whether a client has changed receiver 0's filter width since the
+    /// last call (see RemoteShare::filter_changed).
+    pub fn take_filter_changed(&self) -> bool {
+        self.remote_share.take_filter_changed()
+    }
+
     /// Tune and Tune Power, as TCI clients have asked (tune, tune_drive).
     pub fn take_control(&self) -> crate::remote::ControlRequests {
         self.remote_share.take_control()
@@ -2510,6 +2516,10 @@ fn control_command(cmd: &str, share: &crate::remote::RemoteShare, params: &Mutex
             if let (Some(low), Some(high)) = (number(0), number(1)) {
                 if let Some(width) = width_for_band(p.mode, low, high) {
                     p.width_hz = width.clamp(50.0, 20_000.0);
+                    // Receiver 0's: the TX filter follows (main.rs).
+                    if rx != "1" {
+                        share.filter_changed();
+                    }
                 }
             }
         }
@@ -3936,6 +3946,8 @@ mod remote_tests {
         assert_eq!((control.tune, control.tune_power_percent), (Some(true), Some(30)));
         let p = *params.lock().unwrap();
         assert_eq!(p.width_hz, 2400.0);
+        assert!(server.take_filter_changed(), "the TX filter to follow");
+        assert!(!server.take_filter_changed());
         assert!((p.gain - 0.1).abs() < 1e-6, "{}", p.gain);
         assert_eq!((p.agc, p.agc_top_db, p.squelch_enabled, p.squelch_level), (Agc::Fast, 90.0, true, 50.0));
         assert!(!soon.iter().any(|m| m.starts_with("agc_mode")), "not echoed at once: {soon:?}");
@@ -4028,7 +4040,9 @@ mod remote_tests {
 
         // Tuned, its mode and AGC changed, its audio and S-meter asked for.
         ws.send(Message::Text(
-            "vfo:1,0,14210000;modulation:1,cwu;agc_mode:1,fast;audio_start:1;rx_sensors_enable:true,100;".into(),
+            "vfo:1,0,14210000;modulation:1,cwu;agc_mode:1,fast;rx_filter_band:1,350,850;audio_start:1;\
+             rx_sensors_enable:true,100;"
+                .into(),
         ))
         .unwrap();
         taps.audio.lock().unwrap().extend(std::iter::repeat_n((0.1f32, 0.1f32), 4096 + 100));
@@ -4040,6 +4054,8 @@ mod remote_tests {
         let p1 = *taps.demod_params.lock().unwrap();
         assert_eq!((p1.mode, p1.agc), (Mode::Cwu, Agc::Fast));
         assert_eq!(params0.lock().unwrap().mode, Mode::Lsb, "receiver 0 untouched");
+        assert_eq!(p1.width_hz, 500.0);
+        assert!(!server.take_filter_changed(), "receiver 1's filter isn't the transmitter's");
         assert_eq!(audio1, vec![2048, 2048], "receiver 1's audio, in blocks, receiver 1 in the header");
 
         // Closed again.

@@ -4257,6 +4257,18 @@ impl eframe::App for HpsdrApp {
                             connected.cw_remote_pending.lock().unwrap().extend(cw.text);
                         }
                     }
+                    // A client's filter width (TCI's rx_filter_band, the web
+                    // client's filter control): the TX filter follows, and
+                    // it's remembered for the mode, as the width control
+                    // here does.
+                    if connected.tci_server.as_ref().is_some_and(|s| s.take_filter_changed()) {
+                        let width = connected.spectrum.width_hz();
+                        if let Some(tx) = &connected.tx_handle {
+                            tx.set_width_hz(width);
+                        }
+                        connected.width_memory.insert(connected.spectrum.mode().label().to_string(), width);
+                        connected.settings_dirty.store(true, Ordering::Relaxed);
+                    }
                     // TCI's tune and tune_drive, as the TUNE button and
                     // Settings -> TX -> Tune Power.
                     let control = connected.tci_server.as_ref().map(|s| s.take_control()).unwrap_or_default();

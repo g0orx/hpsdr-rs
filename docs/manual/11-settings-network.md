@@ -99,7 +99,9 @@ streaming), both directly and through TCI Remote Compactor.
   squelch (`sql_enable`, `sql_level`), as in Thetis; sending one with
   only the receiver asks for its current value. hpsdr-rs's filters are a
   width placed by the mode, so `rx_filter_band` sets the width nearest
-  the passband asked for (e.g. `-2400,-150` in LSB is 2.4 kHz).
+  the passband asked for (e.g. `-2400,-150` in LSB is 2.4 kHz). As with
+  the filter control here, the TX filter follows, and the width is
+  remembered for the mode.
 - **Sensors** (`rx_sensors_enable` / `tx_sensors_enable`, as Thetis):
   while receiving, the S-meter level, its running average and the
   strongest spectrum bin (`rx_sensors`, `rx_channel_sensors`,

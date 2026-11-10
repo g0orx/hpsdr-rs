@@ -199,6 +199,10 @@ pub struct RemoteShare {
     tx: Mutex<TxInfo>,
     power_request: Mutex<Option<u32>>,
     control: Mutex<ControlRequests>,
+    /// A client has changed receiver 0's filter width (TCI's
+    /// rx_filter_band, or an hpsdr-remote client's hpsdr_set width):
+    /// main.rs makes the TX filter follow, as its own width control does.
+    filter_changed: std::sync::atomic::AtomicBool,
     /// TCI's receiver 1 -- see crate::tci::Rx2Share.
     pub rx2: crate::tci::Rx2Share,
     cw: Mutex<CwRequests>,
@@ -315,6 +319,17 @@ impl RemoteShare {
         std::mem::take(&mut *self.control.lock().unwrap())
     }
 
+    /// See filter_changed.
+    pub fn filter_changed(&self) {
+        self.filter_changed.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Whether a client has changed receiver 0's filter width since the
+    /// last call.
+    pub fn take_filter_changed(&self) -> bool {
+        self.filter_changed.swap(false, std::sync::atomic::Ordering::Relaxed)
+    }
+
     pub fn request_tune(&self, on: bool) {
         self.control.lock().unwrap().tune = Some(on);
     }
@@ -380,6 +395,9 @@ impl RemoteStreams {
             }
             dsp::SET => {
                 apply_set(cmd, &mut params.lock().unwrap());
+                if cmd.args.first().map(String::as_str) == Some(dsp::SET_WIDTH) {
+                    share.filter_changed();
+                }
                 None
             }
             cw::KEY => {
