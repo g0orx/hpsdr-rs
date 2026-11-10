@@ -60,7 +60,7 @@ use radio::{
 use rigctl::RigctlServer;
 use spectrum::{SpectrumHandle, ALL_MODES};
 use std::collections::VecDeque;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tci::TciServer;
@@ -2885,9 +2885,104 @@ struct HpsdrApp {
     /// already exists (it's also the Discovery screen) by the time a
     /// radio -- and so its saved geometry -- is even known.
     main_window_geometry: Option<WindowGeometry>,
-    /// The UI scale last saved to config::UiPrefs, to save it again only
-    /// when it changes.
-    saved_zoom: f32,
+    /// The UI scale and theme last saved, to save them again only when
+    /// they change (see config::UiPrefs).
+    ui_prefs: config::UiPrefs,
+    /// The theme last given to egui, to set it again only when it changes.
+    applied_theme: Option<egui::ThemePreference>,
+}
+
+/// Settings -> Spectrum's Theme choice (config::ThemeChoice as a u8). A
+/// global, like the other settings the Settings window and HpsdrApp::ui
+/// both need: Settings sets it, HpsdrApp::ui applies and saves it.
+static THEME_CHOICE: AtomicU8 = AtomicU8::new(0);
+
+fn theme_choice() -> config::ThemeChoice {
+    match THEME_CHOICE.load(Ordering::Relaxed) {
+        1 => config::ThemeChoice::Light,
+        2 => config::ThemeChoice::System,
+        _ => config::ThemeChoice::Dark,
+    }
+}
+
+fn set_theme_choice(choice: config::ThemeChoice) {
+    let n = match choice {
+        config::ThemeChoice::Dark => 0,
+        config::ThemeChoice::Light => 1,
+        config::ThemeChoice::System => 2,
+    };
+    THEME_CHOICE.store(n, Ordering::Relaxed);
+}
+
+/// The theme for Follow system. On Windows and macOS egui follows the
+/// system itself (winit reports it, live). On Linux winit doesn't, on
+/// Wayland or X11, so a thread asks the desktop (the XDG portal's
+/// color-scheme, via dark-light) and is told of each change; until it
+/// answers, or with no portal, it's Dark.
+#[cfg(not(target_os = "linux"))]
+fn system_theme(_ctx: &egui::Context) -> egui::ThemePreference {
+    egui::ThemePreference::System
+}
+
+#[cfg(target_os = "linux")]
+fn system_theme(ctx: &egui::Context) -> egui::ThemePreference {
+    // 0 not known yet, 1 dark, 2 light.
+    static DESKTOP: AtomicU8 = AtomicU8::new(0);
+    static WATCH: std::sync::Once = std::sync::Once::new();
+    WATCH.call_once(|| {
+        let ctx = ctx.clone();
+        let set = move |mode: dark_light::Mode| {
+            // No preference (GNOME's "Default") is a light desktop.
+            let n = if mode == dark_light::Mode::Dark { 1 } else { 2 };
+            DESKTOP.store(n, Ordering::Relaxed);
+            ctx.request_repaint();
+        };
+        let spawned = std::thread::Builder::new().name("desktop-theme".into()).spawn(move || {
+            match dark_light::detect() {
+                Ok(mode) => set(mode),
+                Err(e) => eprintln!("desktop theme: {e}"),
+            }
+            match dark_light::subscribe() {
+                Ok(watcher) => {
+                    for mode in watcher.iter() {
+                        set(mode);
+                    }
+                }
+                Err(e) => eprintln!("desktop theme changes: {e}"),
+            }
+        });
+        if let Err(e) = spawned {
+            eprintln!("desktop theme: {e}");
+        }
+    });
+    match DESKTOP.load(Ordering::Relaxed) {
+        2 => egui::ThemePreference::Light,
+        _ => egui::ThemePreference::Dark,
+    }
+}
+
+/// Colour for text or marks drawn straight on the window's background:
+/// as given in dark mode, darker in light mode so it still reads against
+/// light grey. Not for anything on the spectrum, waterfall or meters,
+/// which stay dark in both.
+pub(crate) fn readable(ui: &egui::Ui, c: egui::Color32) -> egui::Color32 {
+    if ui.visuals().dark_mode {
+        return c;
+    }
+    let [r, g, b, a] = c.to_array();
+    let dim = |v: u8| (v as f32 * 0.6) as u8;
+    egui::Color32::from_rgba_premultiplied(dim(r), dim(g), dim(b), a)
+}
+
+/// Fill and text colour for a lit/unlit button such as MOX, TUNE or
+/// Record: `on` is its lit colour, None when it's off. Off is dark grey in
+/// dark mode, light grey in light mode.
+fn toggle_colours(ui: &egui::Ui, on: Option<egui::Color32>) -> (egui::Color32, egui::Color32) {
+    match on {
+        Some(c) => (c, egui::Color32::WHITE),
+        None if ui.visuals().dark_mode => (egui::Color32::from_gray(60), egui::Color32::WHITE),
+        None => (egui::Color32::from_gray(205), egui::Color32::from_gray(20)),
+    }
 }
 
 /// This viewport's window geometry to save: its content size always, its
@@ -2931,19 +3026,26 @@ impl HpsdrApp {
         // falling back to its own built-in dark default instead.
         ctx.set_theme(egui::ThemePreference::Dark);
         // See with_orange_selection's own doc comment.
-        ctx.style_mut_of(egui::Theme::Dark, |style| {
-            style.visuals = with_orange_selection(style.visuals.clone());
-        });
+        for theme in [egui::Theme::Dark, egui::Theme::Light] {
+            ctx.style_mut_of(theme, |style| {
+                style.visuals = with_orange_selection(style.visuals.clone());
+            });
+        }
         // The saved UI scale (see config::UiPrefs::zoom). egui applies it
         // at the start of the first frame, before ui() reads it back.
-        let zoom = config::UiPrefs::load().zoom.unwrap_or(1.0).clamp(0.2, 5.0);
+        let mut ui_prefs = config::UiPrefs::load();
+        let zoom = ui_prefs.zoom.unwrap_or(1.0).clamp(0.2, 5.0);
+        ui_prefs.zoom = Some(zoom);
         ctx.set_zoom_factor(zoom);
+        // The saved theme; HpsdrApp::ui applies it.
+        set_theme_choice(ui_prefs.theme);
         Self {
             state: AppState::Discovering(DiscoveryWindow::new(ctx)),
             was_focused: true,
             ignore_interaction_until: None,
             main_window_geometry: None,
-            saved_zoom: zoom,
+            ui_prefs,
+            applied_theme: Some(egui::ThemePreference::Dark),
         }
     }
 }
@@ -3863,9 +3965,21 @@ impl eframe::App for HpsdrApp {
         // Keep the UI scale for next time, however it was changed:
         // Settings -> Spectrum's UI Scale or Ctrl - / Ctrl + / Ctrl 0.
         let zoom = ui.ctx().zoom_factor();
-        if zoom != self.saved_zoom {
-            self.saved_zoom = zoom;
-            config::UiPrefs { zoom: Some(zoom) }.save();
+        let choice = theme_choice();
+        if Some(zoom) != self.ui_prefs.zoom || choice != self.ui_prefs.theme {
+            self.ui_prefs.zoom = Some(zoom);
+            self.ui_prefs.theme = choice;
+            self.ui_prefs.save();
+        }
+        // Dark, Light or the computer's own (Settings -> Spectrum's Theme).
+        let theme = match choice {
+            config::ThemeChoice::Dark => egui::ThemePreference::Dark,
+            config::ThemeChoice::Light => egui::ThemePreference::Light,
+            config::ThemeChoice::System => system_theme(ui.ctx()),
+        };
+        if Some(theme) != self.applied_theme {
+            self.applied_theme = Some(theme);
+            ui.ctx().set_theme(theme);
         }
         // Track this window's current position/size every frame (cheap --
         // just copying floats already computed by egui-winit) so a final
@@ -5012,7 +5126,7 @@ impl eframe::App for HpsdrApp {
                                                         .monospace()
                                                         .size(28.0)
                                                         .strong()
-                                                        .color(freq_a_color),
+                                                        .color(readable(ui, freq_a_color)),
                                                 )
                                                 // CLICK (not just hover) --
                                                 // needed for
@@ -5304,7 +5418,7 @@ impl eframe::App for HpsdrApp {
                                                     .monospace()
                                                     .size(28.0)
                                                     .strong()
-                                                    .color(freq_b_color),
+                                                    .color(readable(ui, freq_b_color)),
                                                 )
                                                 .sense(egui::Sense::click()),
                                             )
@@ -5921,20 +6035,20 @@ impl eframe::App for HpsdrApp {
 
                     ui.add_space(4.0);
                     ui.horizontal(|ui| {
-                        ui.colored_label(network_status_color(rigctl_status), "rigctl")
+                        ui.colored_label(network_status_color(ui, rigctl_status), "rigctl")
                             .on_hover_text(network_status_hover("rigctl", rigctl_status, &connected.rigctl_addr));
                         ui.add_space(12.0);
-                        ui.colored_label(network_status_color(tci_status), "TCI")
+                        ui.colored_label(network_status_color(ui, tci_status), "TCI")
                             .on_hover_text(tci_status_hover(
                                 tci_status,
                                 &connected.tci_addr,
                                 connected.tci_server.as_ref(),
                             ));
                         ui.add_space(12.0);
-                        ui.colored_label(network_status_color(cat_status), "CAT")
+                        ui.colored_label(network_status_color(ui, cat_status), "CAT")
                             .on_hover_text(network_status_hover("CAT", cat_status, &connected.cat_addr));
                         ui.add_space(12.0);
-                        ui.colored_label(network_status_color(web_status), "Web")
+                        ui.colored_label(network_status_color(ui, web_status), "Web")
                             .on_hover_text(web_status_hover(web_status, &connected.web_addr, remote_clients));
                         // PureSignal: only shown when actually enabled for
                         // this session (see ConnectedState::puresignal_enabled's
@@ -5980,7 +6094,7 @@ impl eframe::App for HpsdrApp {
                                 ),
                                 None => (egui::Color32::GRAY, "PureSignal: enabled".to_string()),
                             };
-                            ui.colored_label(color, "PS").on_hover_text(hover);
+                            ui.colored_label(readable(ui, color), "PS").on_hover_text(hover);
                         }
 
                         // Records exactly the audio the local speaker
@@ -5993,15 +6107,12 @@ impl eframe::App for HpsdrApp {
                         // audio_recorder::recording_path.
                         ui.add_space(12.0);
                         let recording = connected.spectrum.recorder.is_enabled();
-                        let (rec_label, rec_color) = if recording {
-                            ("Recording", egui::Color32::from_rgb(210, 50, 50))
-                        } else {
-                            ("Record", egui::Color32::from_gray(60))
-                        };
+                        let rec_label = if recording { "Recording" } else { "Record" };
+                        let (rec_color, rec_text) = toggle_colours(ui, recording.then_some(egui::Color32::from_rgb(210, 50, 50)));
                         let rec_resp = ui
                             .add(
                                 egui::Button::new(
-                                    egui::RichText::new(rec_label).strong().color(egui::Color32::WHITE),
+                                    egui::RichText::new(rec_label).strong().color(rec_text),
                                 )
                                 .fill(rec_color),
                             )
@@ -6051,11 +6162,7 @@ impl eframe::App for HpsdrApp {
                             // touched this button.
                             let mox_now = connected.session.mox_active();
                             let mox_label = if mox_now { "MOX ON" } else { "MOX" };
-                            let mox_color = if mox_now {
-                                egui::Color32::from_rgb(210, 50, 50)
-                            } else {
-                                egui::Color32::from_gray(60)
-                            };
+                            let (mox_color, mox_text) = toggle_colours(ui, mox_now.then_some(egui::Color32::from_rgb(210, 50, 50)));
                             // Real request: a safety default against
                             // accidentally transmitting outside the ham
                             // bands -- see tx_frequency_allowed's own doc
@@ -6084,7 +6191,7 @@ impl eframe::App for HpsdrApp {
                                 .add_enabled(
                                     mox_tx_allowed,
                                     egui::Button::new(
-                                        egui::RichText::new(mox_label).strong().color(egui::Color32::WHITE),
+                                        egui::RichText::new(mox_label).strong().color(mox_text),
                                     )
                                     .fill(mox_color)
                                     .min_size(egui::vec2(90.0, 32.0)),
@@ -6129,18 +6236,14 @@ impl eframe::App for HpsdrApp {
                                         connected.allow_out_of_band_tx.load(Ordering::Relaxed),
                                     ));
                             let tune_label = if connected.tune_active { "TUNE ON" } else { "TUNE" };
-                            let tune_color = if connected.tune_active {
-                                egui::Color32::from_rgb(230, 140, 20)
-                            } else {
-                                egui::Color32::from_gray(60)
-                            };
+                            let (tune_color, tune_text) = toggle_colours(ui, connected.tune_active.then_some(egui::Color32::from_rgb(230, 140, 20)));
                             let tune_resp = ui
                                 .add_enabled(
                                     tune_may_start,
                                     egui::Button::new(
                                         egui::RichText::new(tune_label)
                                             .strong()
-                                            .color(egui::Color32::WHITE),
+                                            .color(tune_text),
                                     )
                                     .fill(tune_color),
                                 )
@@ -6215,18 +6318,14 @@ impl eframe::App for HpsdrApp {
                                     ));
                             let two_tone_label =
                                 if connected.two_tone_active { "TWO TONE ON" } else { "TWO TONE" };
-                            let two_tone_color = if connected.two_tone_active {
-                                egui::Color32::from_rgb(230, 140, 20)
-                            } else {
-                                egui::Color32::from_gray(60)
-                            };
+                            let (two_tone_color, two_tone_text) = toggle_colours(ui, connected.two_tone_active.then_some(egui::Color32::from_rgb(230, 140, 20)));
                             let two_tone_resp = ui
                                 .add_enabled(
                                     two_tone_may_start,
                                     egui::Button::new(
                                         egui::RichText::new(two_tone_label)
                                             .strong()
-                                            .color(egui::Color32::WHITE),
+                                            .color(two_tone_text),
                                     )
                                     .fill(two_tone_color),
                                 )
@@ -6316,16 +6415,12 @@ impl eframe::App for HpsdrApp {
                                 .response
                                 .on_hover_text("Which of Settings -> CW's 5 saved messages to send");
                             let cw_text_label = if connected.cw_text_sending { "STOP" } else { "SEND CW" };
-                            let cw_text_color = if connected.cw_text_sending {
-                                egui::Color32::from_rgb(210, 50, 50)
-                            } else {
-                                egui::Color32::from_gray(60)
-                            };
+                            let (cw_text_color, cw_text_text) = toggle_colours(ui, connected.cw_text_sending.then_some(egui::Color32::from_rgb(210, 50, 50)));
                             let cw_text_resp = ui
                                 .add_enabled(
                                     cw_text_may_start,
                                     egui::Button::new(
-                                        egui::RichText::new(cw_text_label).strong().color(egui::Color32::WHITE),
+                                        egui::RichText::new(cw_text_label).strong().color(cw_text_text),
                                     )
                                     .fill(cw_text_color),
                                 )
@@ -6583,7 +6678,7 @@ impl eframe::App for HpsdrApp {
                             }
 
                             if mox_now {
-                                ui.colored_label(egui::Color32::from_rgb(210, 50, 50), "TRANSMITTING");
+                                ui.colored_label(readable(ui, egui::Color32::from_rgb(210, 50, 50)), "TRANSMITTING");
                             }
                         });
                     }
@@ -7370,7 +7465,7 @@ impl eframe::App for HpsdrApp {
                         // unlike status_message which persists until
                         // something else overwrites it.
                         if waterfall_texture_id.is_none() {
-                            ui.colored_label(egui::Color32::from_rgb(220, 60, 60), wisdom_status_text());
+                            ui.colored_label(readable(ui, egui::Color32::from_rgb(220, 60, 60)), wisdom_status_text());
                         } else if let Some(msg) = &connected.status_message {
                             ui.weak(msg);
                         }
@@ -7517,7 +7612,7 @@ impl eframe::App for HpsdrApp {
                                 egui::Align2::RIGHT_CENTER,
                                 format!("SNR {snr:.1} dB"),
                                 egui::TextStyle::Body.resolve(ui.style()),
-                                egui::Color32::from_gray(200),
+                                readable(ui, egui::Color32::from_gray(200)),
                             );
                         }
                         if adc0_ov || adc1_ov {
@@ -7533,7 +7628,7 @@ impl eframe::App for HpsdrApp {
                                 egui::Align2::LEFT_CENTER,
                                 text,
                                 egui::TextStyle::Body.resolve(ui.style()),
-                                egui::Color32::from_rgb(255, 60, 60),
+                                readable(ui, egui::Color32::from_rgb(255, 60, 60)),
                             );
                         }
 
@@ -7570,7 +7665,7 @@ impl eframe::App for HpsdrApp {
                                     egui::Align2::LEFT_CENTER,
                                     text,
                                     egui::TextStyle::Body.resolve(ui.style()),
-                                    egui::Color32::from_rgb(255, 60, 60),
+                                    readable(ui, egui::Color32::from_rgb(255, 60, 60)),
                                 );
                             } else {
                                 connected.tx_fifo_warning_until = None;
@@ -7693,16 +7788,9 @@ impl eframe::App for HpsdrApp {
                             if show_settings {
                                 // Own OS-level viewport, not nested inside
                                 // this receiver's window -- matches the
-                                // main Settings window's own treatment
-                                // (see its doc comment for why a light
-                                // theme override is needed) rather than
-                                // being confined to this receiver's own
-                                // viewport.
-                                let light_visuals = with_orange_selection(egui::Visuals::light());
-                                let light_style = egui::Style {
-                                    visuals: light_visuals.clone(),
-                                    ..Default::default()
-                                };
+                                // main Settings window's own treatment,
+                                // rather than being confined to this
+                                // receiver's own viewport.
                                 let settings_viewport_id = egui::ViewportId::from_hash_of((
                                     "extra_receiver_settings",
                                     ddc_index,
@@ -7719,12 +7807,9 @@ impl eframe::App for HpsdrApp {
                                             rx_for_settings.lock().unwrap().show_settings_window = false;
                                             return;
                                         }
-                                        egui::CentralPanel::default()
-                                            .frame(egui::Frame::central_panel(&light_style))
-                                            .show(ui, |ui| {
-                                                ui.visuals_mut().clone_from(&light_visuals);
-                                                render_extra_receiver_settings(ui, &rx_for_settings);
-                                            });
+                                        egui::CentralPanel::default().show(ui, |ui| {
+                                            render_extra_receiver_settings(ui, &rx_for_settings);
+                                        });
                                     },
                                 );
                             }
@@ -7733,19 +7818,10 @@ impl eframe::App for HpsdrApp {
                 }
 
                 if connected.show_settings_window {
-                    // Light theme for this window specifically (white
-                    // title bar/background, dark text) rather than the
-                    // app's normal dark theme -- egui only paints a
-                    // window's title bar in a distinct color while it's
-                    // focused/on top, and even then from the same
-                    // app-wide style used elsewhere, so there's no way
-                    // to whiten just the title strip on its own without
-                    // it flickering back dark whenever this window
-                    // isn't focused. Overriding the whole window's
-                    // visuals instead keeps it consistently white
-                    // regardless of focus.
-                    let light_visuals = with_orange_selection(egui::Visuals::light());
-                    let light_style = egui::Style { visuals: light_visuals.clone(), ..Default::default() };
+                    // This window, like every other, follows Settings ->
+                    // Spectrum's Theme. It used to be always light (white
+                    // background, dark text) whatever the main window's
+                    // theme was.
                     // Rendered in its own OS-level viewport (like the
                     // extra receiver windows) rather than an
                     // embedded egui::Window, so it can be dragged
@@ -7816,9 +7892,7 @@ impl eframe::App for HpsdrApp {
                                 return;
                             }
                             egui::CentralPanel::default()
-                                .frame(egui::Frame::central_panel(&light_style))
                                 .show(ui, |ui| {
-                            ui.visuals_mut().clone_from(&light_visuals);
                             // Wrapped (not a plain ui.horizontal) so a
                             // narrower window degrades to a second line
                             // of tabs instead of silently cutting the
@@ -7928,7 +8002,7 @@ impl eframe::App for HpsdrApp {
                                         "Stopped"
                                     });
                                     if let Some(err) = &connected.rigctl_error {
-                                        ui.colored_label(egui::Color32::from_rgb(220, 60, 60), err);
+                                        ui.colored_label(readable(ui, egui::Color32::from_rgb(220, 60, 60)), err);
                                     }
                                     {
                                         let mut logging = connected.rigctl_debug_log.is_enabled();
@@ -8010,7 +8084,7 @@ impl eframe::App for HpsdrApp {
                                         "Stopped"
                                     });
                                     if let Some(err) = &connected.tci_error {
-                                        ui.colored_label(egui::Color32::from_rgb(220, 60, 60), err);
+                                        ui.colored_label(readable(ui, egui::Color32::from_rgb(220, 60, 60)), err);
                                     }
                                     {
                                         let mut logging = connected.tci_debug_log.is_enabled();
@@ -8153,13 +8227,13 @@ impl eframe::App for HpsdrApp {
                                     }
                                     if !web_server::HAS_CLIENT {
                                         ui.colored_label(
-                                            egui::Color32::from_rgb(220, 160, 60),
+                                            readable(ui, egui::Color32::from_rgb(220, 160, 60)),
                                             "This build doesn't include the web client: build it \
                                              (crates/hpsdr-remote/build-web.sh), then rebuild hpsdr-rs.",
                                         );
                                     }
                                     if let Some(err) = &connected.web_error {
-                                        ui.colored_label(egui::Color32::from_rgb(220, 60, 60), err);
+                                        ui.colored_label(readable(ui, egui::Color32::from_rgb(220, 60, 60)), err);
                                     }
                                     {
                                         let mut logging = connected.web_debug_log.is_enabled();
@@ -8246,7 +8320,7 @@ impl eframe::App for HpsdrApp {
                                         "Stopped"
                                     });
                                     if let Some(err) = &connected.cat_error {
-                                        ui.colored_label(egui::Color32::from_rgb(220, 60, 60), err);
+                                        ui.colored_label(readable(ui, egui::Color32::from_rgb(220, 60, 60)), err);
                                     }
                                     {
                                         let mut logging = connected.cat_debug_log.is_enabled();
@@ -9220,7 +9294,7 @@ impl eframe::App for HpsdrApp {
                                             let running_wide = input_rate == mirisdr::WIDE_SAMPLE_RATE_HZ;
                                             if connected.mirisdr_wide != running_wide {
                                                 ui.colored_label(
-                                                    egui::Color32::from_rgb(220, 160, 40),
+                                                    readable(ui, egui::Color32::from_rgb(220, 160, 40)),
                                                     "Takes effect when you next connect.",
                                                 );
                                             }
@@ -9376,7 +9450,7 @@ impl eframe::App for HpsdrApp {
                                             || clock_10mhz == radio::OZY_10MHZ_PENELOPE;
                                         if penny_selected && !atlas.has_penny {
                                             ui.colored_label(
-                                                egui::Color32::from_rgb(220, 140, 60),
+                                                readable(ui, egui::Color32::from_rgb(220, 140, 60)),
                                                 "No Penelope answered at start-up, but it's selected as a clock source.",
                                             );
                                         }
@@ -9644,6 +9718,33 @@ impl eframe::App for HpsdrApp {
                                          larger, on top of the desktop's own display scale, and is \
                                          kept for next time. Ctrl - , Ctrl + and Ctrl 0 do the same.",
                                     );
+                                    // See config::UiPrefs::theme. Saved and
+                                    // applied by HpsdrApp::ui.
+                                    ui.horizontal(|ui| {
+                                        ui.label("Theme:");
+                                        let mut choice = theme_choice();
+                                        for (value, label, hover) in [
+                                            (config::ThemeChoice::Dark, "Dark", "Always dark"),
+                                            (config::ThemeChoice::Light, "Light", "Always light"),
+                                            (
+                                                config::ThemeChoice::System,
+                                                "Follow system",
+                                                "Dark or light as the computer is set, changing \
+                                                 when it does",
+                                            ),
+                                        ] {
+                                            ui.selectable_value(&mut choice, value, label).on_hover_text(hover);
+                                        }
+                                        if choice != theme_choice() {
+                                            set_theme_choice(choice);
+                                            ui.ctx().request_repaint_of(egui::ViewportId::ROOT);
+                                        }
+                                    })
+                                    .response
+                                    .on_hover_text(
+                                        "The look of the windows and controls. The spectrum, \
+                                         waterfall and meters stay dark.",
+                                    );
                                     ui.separator();
                                     ui.horizontal(|ui| {
                                         ui.label("Spectrum");
@@ -9843,7 +9944,7 @@ impl eframe::App for HpsdrApp {
 
                                 SettingsTab::Tx => {
                                     ui.colored_label(
-                                        egui::Color32::from_rgb(230, 150, 50),
+                                        readable(ui, egui::Color32::from_rgb(230, 150, 50)),
                                         "Transmit is unverified against your radio's actual protocol.",
                                     );
                                     ui.weak(
@@ -11004,7 +11105,7 @@ impl eframe::App for HpsdrApp {
                                     }
                                     if connected.puresignal_reserve != connected.puresignal_reserved {
                                         ui.colored_label(
-                                            egui::Color32::from_rgb(220, 160, 40),
+                                            readable(ui, egui::Color32::from_rgb(220, 160, 40)),
                                             "Takes effect when you next connect.",
                                         );
                                     }
@@ -11105,7 +11206,7 @@ impl eframe::App for HpsdrApp {
                                                 } else {
                                                     egui::Color32::from_rgb(220, 60, 60)
                                                 };
-                                                ui.colored_label(color, format!("{}", status.feedback_level));
+                                                ui.colored_label(readable(ui, color), format!("{}", status.feedback_level));
                                             });
                                             ui.horizontal(|ui| {
                                                 ui.label("Correcting:");
@@ -11114,7 +11215,7 @@ impl eframe::App for HpsdrApp {
                                                 } else {
                                                     ("no", egui::Color32::GRAY)
                                                 };
-                                                ui.colored_label(color, text);
+                                                ui.colored_label(readable(ui, color), text);
                                             });
                                             ui.horizontal(|ui| {
                                                 // WDSP's own calcc.c state-machine state
@@ -11137,7 +11238,7 @@ impl eframe::App for HpsdrApp {
                                             });
                                             if status.over_drive {
                                                 ui.colored_label(
-                                                    egui::Color32::from_rgb(220, 60, 60),
+                                                    readable(ui, egui::Color32::from_rgb(220, 60, 60)),
                                                     "WARNING: PROBABLE SEVERE OVER-DRIVE. CHECK YOUR \
                                                      DRIVE LEVEL! (WDSP is refusing to calibrate/stay \
                                                      corrected because too little of the collected \
@@ -11149,7 +11250,7 @@ impl eframe::App for HpsdrApp {
                                                     || status.solution_check != 0)
                                             {
                                                 ui.colored_label(
-                                                    egui::Color32::from_rgb(220, 160, 60),
+                                                    readable(ui, egui::Color32::from_rgb(220, 160, 60)),
                                                     format!(
                                                         "Curve fit status (rx/mag/cos/sin/sol): \
                                                          {:#04x} {:#04x} {:#04x} {:#04x} {:#04x}",
@@ -12313,7 +12414,7 @@ fn datv_controls(ui: &mut egui::Ui, connected: &mut ConnectedState) -> bool {
     let bandwidth = s.symbol_rate as f64 * (1.0 + s.rolloff as f64);
     if bandwidth > rate_hz as f64 * 0.85 {
         ui.colored_label(
-            egui::Color32::from_rgb(220, 160, 40),
+            readable(ui, egui::Color32::from_rgb(220, 160, 40)),
             format!(
                 "A {:.0} kHz wide signal won't fit the {} kHz stream{}.",
                 bandwidth / 1000.0,
@@ -12356,7 +12457,7 @@ fn datv_controls(ui: &mut egui::Ui, connected: &mut ConnectedState) -> bool {
         ui.weak(format!("Watch with: vlc udp://@:{port}  or  ffplay udp://127.0.0.1:{port}"));
     });
     if let Some(e) = &connected.datv_error {
-        ui.colored_label(egui::Color32::from_rgb(220, 60, 60), e);
+        ui.colored_label(readable(ui, egui::Color32::from_rgb(220, 60, 60)), e);
     }
 
     if let Some(r) = &connected.datv {
@@ -12370,7 +12471,7 @@ fn datv_controls(ui: &mut egui::Ui, connected: &mut ConnectedState) -> bool {
         };
         egui::Grid::new("datv_status").num_columns(2).spacing([12.0, 4.0]).show(ui, |ui| {
             ui.label("Signal:");
-            ui.colored_label(colour, text);
+            ui.colored_label(readable(ui, colour), text);
             ui.end_row();
             if let Some(pls) = d.pls.filter(|_| d.locked) {
                 ui.label("Mode:");
@@ -12610,13 +12711,16 @@ fn spectrum_waterfall_divider(
     if resp.hovered() || resp.dragged() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeVertical);
     }
-    let color = if resp.dragged() {
-        egui::Color32::from_gray(200)
-    } else if resp.hovered() {
-        egui::Color32::from_gray(150)
-    } else {
-        egui::Color32::from_gray(70)
-    };
+    let color = readable(
+        ui,
+        if resp.dragged() {
+            egui::Color32::from_gray(200)
+        } else if resp.hovered() {
+            egui::Color32::from_gray(150)
+        } else {
+            egui::Color32::from_gray(70)
+        },
+    );
     let mid_y = rect.center().y;
     ui.painter().line_segment(
         [egui::pos2(rect.left() + 4.0, mid_y), egui::pos2(rect.right() - 4.0, mid_y)],
@@ -12732,7 +12836,7 @@ fn render_psk_beacon_panel(ui: &mut egui::Ui, connected: &mut ConnectedState) ->
     let green = egui::Color32::from_rgb(80, 200, 80);
     if !status.in_span {
         ui.colored_label(
-            egui::Color32::GRAY,
+            readable(ui, egui::Color32::GRAY),
             "Beacon (10489.750 MHz) isn't in the received span -- select the QO-100 \
              transverter and tune near it (e.g. 768 kHz with CTUN on).",
         );
@@ -12740,7 +12844,7 @@ fn render_psk_beacon_panel(ui: &mut egui::Ui, connected: &mut ConnectedState) ->
         match (status.offset_hz, status.predicted_offset_hz) {
             (Some(_), Some(predicted)) => {
                 ui.colored_label(
-                    green,
+                    readable(ui, green),
                     format!("Beacon {predicted:+.0} Hz from expected, drifting {:+.1} Hz/s", status.drift_hz_per_s),
                 )
                 .on_hover_text(
@@ -12749,7 +12853,7 @@ fn render_psk_beacon_panel(ui: &mut egui::Ui, connected: &mut ConnectedState) ->
                 );
             }
             _ if status.pair_searching => {
-                ui.colored_label(egui::Color32::GRAY, "Looking for the lower and upper CW beacons (500 kHz apart)")
+                ui.colored_label(readable(ui, egui::Color32::GRAY), "Looking for the lower and upper CW beacons (500 kHz apart)")
                     .on_hover_text(
                         "With a span of 768 kHz or more, the CW beacons at 10489.500 and 10490.000 MHz -- \
                          500 kHz apart, with the PSK beacon midway -- show how far out your LNB is, even well \
@@ -12772,7 +12876,7 @@ fn render_psk_beacon_panel(ui: &mut egui::Ui, connected: &mut ConnectedState) ->
                             .to_string(),
                     ),
                 };
-                ui.colored_label(egui::Color32::GRAY, text).on_hover_text(hover);
+                ui.colored_label(readable(ui, egui::Color32::GRAY), text).on_hover_text(hover);
                 // What the search is seeing -- for working out why it
                 // isn't finding the beacon.
                 if let Some(c) = status.candidate {
@@ -12816,7 +12920,7 @@ fn render_psk_beacon_panel(ui: &mut egui::Ui, connected: &mut ConnectedState) ->
     ui.horizontal(|ui| {
         ui.label(format!("Frames {}", status.frames_ok));
         if status.frames_bad > 0 {
-            ui.colored_label(egui::Color32::from_rgb(220, 140, 60), format!("CRC errors {}", status.frames_bad));
+            ui.colored_label(readable(ui, egui::Color32::from_rgb(220, 140, 60)), format!("CRC errors {}", status.frames_bad));
         }
     });
     ui.separator();
@@ -12894,7 +12998,7 @@ fn controls_strip_line(ui: &mut egui::Ui, band: &str, spectrum: &SpectrumHandle,
         let clicked = ui.button("»").on_hover_text(hover).clicked();
         ui.weak(summary);
         if spectrum.muted() {
-            ui.colored_label(egui::Color32::from_rgb(220, 60, 60), "Audio muted");
+            ui.colored_label(readable(ui, egui::Color32::from_rgb(220, 60, 60)), "Audio muted");
         } else {
             ui.weak(format!("Audio {:.0} dB", 20.0 * spectrum.gain().max(1e-9).log10()));
         }
@@ -12929,7 +13033,7 @@ fn render_psk_beacon_strip(ui: &mut egui::Ui, connected: &mut ConnectedState) ->
         ui.add_space(4.0);
         let (dot, dot_resp) = ui.allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::hover());
         let colour = if found { egui::Color32::from_rgb(80, 200, 80) } else { egui::Color32::GRAY };
-        ui.painter().circle_filled(dot.center(), 5.0, colour);
+        ui.painter().circle_filled(dot.center(), 5.0, readable(ui, colour));
         dot_resp.on_hover_text(summary);
     });
     expanded
@@ -13174,12 +13278,12 @@ fn start_stop_button(ui: &mut egui::Ui, running: bool) -> bool {
     ui.add(egui::Button::new(egui::RichText::new(label).color(egui::Color32::WHITE)).fill(color)).clicked()
 }
 
-fn network_status_color(status: Option<bool>) -> egui::Color32 {
-    match status {
+fn network_status_color(ui: &egui::Ui, status: Option<bool>) -> egui::Color32 {
+    readable(ui, match status {
         None => egui::Color32::from_gray(120),
         Some(false) => egui::Color32::from_rgb(60, 190, 60),
         Some(true) => egui::Color32::from_rgb(220, 60, 60),
-    }
+    })
 }
 
 fn network_status_hover(name: &str, status: Option<bool>, addr: &str) -> String {
@@ -14170,7 +14274,7 @@ fn render_extra_receiver_ui(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceiver>>) {
                             .monospace()
                             .size(28.0)
                             .strong()
-                            .color(egui::Color32::GREEN),
+                            .color(readable(ui, egui::Color32::GREEN)),
                     )
                     // Click, not just hover, for secondary_clicked()
                     // below; it still senses hover for scroll-to-tune.
@@ -14261,14 +14365,11 @@ fn render_extra_receiver_ui(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceiver>>) {
                 // recording here doesn't affect the main receiver or
                 // any other extra receiver, and vice versa.
                 let recording = rx.spectrum.recorder.is_enabled();
-                let (rec_label, rec_color) = if recording {
-                    ("Recording", egui::Color32::from_rgb(210, 50, 50))
-                } else {
-                    ("Record", egui::Color32::from_gray(60))
-                };
+                let rec_label = if recording { "Recording" } else { "Record" };
+                let (rec_color, rec_text) = toggle_colours(ui, recording.then_some(egui::Color32::from_rgb(210, 50, 50)));
                 let rec_resp = ui
                     .add(
-                        egui::Button::new(egui::RichText::new(rec_label).strong().color(egui::Color32::WHITE))
+                        egui::Button::new(egui::RichText::new(rec_label).strong().color(rec_text))
                             .fill(rec_color),
                     )
                     .on_hover_text(if recording {
@@ -14317,7 +14418,7 @@ fn render_extra_receiver_ui(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceiver>>) {
                             .monospace()
                             .size(28.0)
                             .strong()
-                            .color(egui::Color32::GRAY),
+                            .color(readable(ui, egui::Color32::GRAY)),
                     )
                     .sense(egui::Sense::click()),
                 )

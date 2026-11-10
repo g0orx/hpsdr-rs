@@ -866,6 +866,21 @@ pub struct UiPrefs {
     /// receiver windows wouldn't fit on the screen, and egui's Ctrl -
     /// zoom wasn't kept from one run to the next.
     pub zoom: Option<f32>,
+    /// Dark, Light or following the computer's own setting (Settings ->
+    /// Spectrum). Missing in older files: Dark, as before.
+    #[serde(default)]
+    pub theme: ThemeChoice,
+}
+
+/// See UiPrefs::theme. Dark by default: hpsdr-rs was always dark, and
+/// following the system unasked turned it white on Windows (a real report,
+/// see HpsdrApp::new).
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Default, Debug)]
+pub enum ThemeChoice {
+    #[default]
+    Dark,
+    Light,
+    System,
 }
 
 fn ui_prefs_path() -> Option<PathBuf> {

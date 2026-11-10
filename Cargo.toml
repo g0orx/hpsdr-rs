@@ -103,6 +103,10 @@ midir = "0.11"
 # plain fallback frame with no title. Same winit as eframe pulls in.
 [target.'cfg(target_os = "linux")'.dependencies]
 winit = { version = "0.30", default-features = false, features = ["wayland-csd-adwaita"] }
+# The desktop's dark/light setting (the XDG desktop portal's color-scheme,
+# over D-Bus) for Theme: Follow system -- winit doesn't report it on Linux,
+# on Wayland or X11. Windows and macOS use egui's own detection.
+dark-light = "3"
 
 [target.'cfg(windows)'.dependencies]
 # SetStdHandle, used by main.rs's redirect_stdio_to_log_file() to send

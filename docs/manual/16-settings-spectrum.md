@@ -19,7 +19,20 @@ Use it when text is too big to fit several receivers on the screen, e.g. on
 a Raspberry Pi or a large monitor whose desktop scales everything up. If the
 interface ever gets too small to use, **Ctrl 0** puts it back to 100%.
 
-The main window and each extra receiver window also reopen at the size you
+## Theme
+
+**Theme** chooses **Dark** (the default), **Light**, or **Follow system**,
+which is dark or light as the computer is set and changes when it does
+(Windows, macOS, and Linux desktops that publish a dark/light setting, such
+as GNOME and KDE; on a Linux desktop that doesn't, it stays dark). It
+changes every window -- the main window, extra receivers, Settings and
+Discovery -- but the spectrum, waterfall and meters stay dark in both, so
+signals look the same.
+Like UI Scale, it's kept for next time on this computer.
+
+## Window sizes
+
+The main window and each extra receiver window reopen at the size you
 left them, for each radio. Their position is restored too, except on a
 Wayland desktop (e.g. Raspberry Pi OS, most current Linux desktops), which
 doesn't let programs see or choose where their windows go: the desktop places

@@ -17,9 +17,16 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-const WARNING_COLOR: egui::Color32 = egui::Color32::from_rgb(180, 90, 0);
-const ERROR_COLOR: egui::Color32 = egui::Color32::from_rgb(200, 40, 40);
-const OK_COLOR: egui::Color32 = egui::Color32::from_rgb(0, 130, 0);
+// Text colours that read in both themes (see crate::readable).
+fn warning_color(ui: &egui::Ui) -> egui::Color32 {
+    crate::readable(ui, egui::Color32::from_rgb(230, 150, 30))
+}
+fn error_color(ui: &egui::Ui) -> egui::Color32 {
+    crate::readable(ui, egui::Color32::from_rgb(235, 70, 70))
+}
+fn ok_color(ui: &egui::Ui) -> egui::Color32 {
+    crate::readable(ui, egui::Color32::from_rgb(60, 200, 60))
+}
 
 /// A one-shot background operation (sub-second to ~1s, e.g. Test for
 /// Bootloader/Read IP/Write IP) plus its polled result -- same "spawn a
@@ -174,8 +181,6 @@ impl FirmwareUpdateWindow {
     /// within the caller's own viewport closure (nested viewports are
     /// fine -- egui's per-receiver Settings sub-window already does this).
     pub fn show(&mut self, ui: &mut egui::Ui) {
-        let light_visuals = egui::Visuals::light();
-        let light_style = egui::Style { visuals: light_visuals.clone(), ..Default::default() };
         let mut still_open = self.open;
         ui.ctx().show_viewport_immediate(
             egui::ViewportId::from_hash_of("firmware_update_window"),
@@ -185,8 +190,7 @@ impl FirmwareUpdateWindow {
                     still_open = false;
                     return;
                 }
-                egui::CentralPanel::default().frame(egui::Frame::central_panel(&light_style)).show(ui, |ui| {
-                    ui.visuals_mut().clone_from(&light_visuals);
+                egui::CentralPanel::default().show(ui, |ui| {
                     self.show_contents(ui);
                 });
             },
@@ -198,7 +202,7 @@ impl FirmwareUpdateWindow {
         let uploading = self.upload.is_some() || self.pending_inapp_firmware.is_some();
 
         ui.colored_label(
-            WARNING_COLOR,
+            warning_color(ui),
             "Do not disconnect the radio or close this window during Erase/Program. If an \
              update is interrupted, the radio will need to be power-cycled before trying again.",
         );
@@ -245,13 +249,13 @@ impl FirmwareUpdateWindow {
         if let Some(path) = &self.firmware_path {
             if path.extension().and_then(|e| e.to_str()) != Some("rbf") {
                 ui.colored_label(
-                    WARNING_COLOR,
+                    warning_color(ui),
                     "This file doesn't have a .rbf extension -- double check it's the right firmware image.",
                 );
             }
         }
         if let Some(err) = &self.firmware_read_error {
-            ui.colored_label(ERROR_COLOR, err);
+            ui.colored_label(error_color(ui), err);
         }
 
         ui.add_space(8.0);
@@ -270,7 +274,7 @@ impl FirmwareUpdateWindow {
             }
         } else {
             ui.colored_label(
-                ERROR_COLOR,
+                error_color(ui),
                 "This will erase and reprogram the radio's firmware. This cannot be undone. Are you sure?",
             );
             ui.horizontal(|ui| {
@@ -299,7 +303,7 @@ impl FirmwareUpdateWindow {
         new_ip_text: &mut String,
     ) {
         ui.colored_label(
-            WARNING_COLOR,
+            warning_color(ui),
             "Before you begin: switch this radio into bootloader mode and power-cycle it \
              (see the radio's own documentation for how -- a jumper or slide switch, \
              board-dependent). It won't respond to anything below until you do.",
@@ -341,7 +345,7 @@ impl FirmwareUpdateWindow {
             match result {
                 Ok(mac) => {
                     ui.colored_label(
-                        OK_COLOR,
+                        ok_color(ui),
                         format!(
                             "Found a radio in bootloader mode (MAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}).",
                             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
@@ -349,7 +353,7 @@ impl FirmwareUpdateWindow {
                     );
                 }
                 Err(e) => {
-                    ui.colored_label(ERROR_COLOR, format!("No response: {e}"));
+                    ui.colored_label(error_color(ui), format!("No response: {e}"));
                 }
             }
         }
@@ -372,7 +376,7 @@ impl FirmwareUpdateWindow {
                     ui.label(format!("Current IP: {}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3]));
                 }
                 Err(e) => {
-                    ui.colored_label(ERROR_COLOR, format!("Read IP failed: {e}"));
+                    ui.colored_label(error_color(ui), format!("Read IP failed: {e}"));
                 }
             }
         }
@@ -396,10 +400,10 @@ impl FirmwareUpdateWindow {
         if let Some(result) = write_ip_op.peek() {
             match result {
                 Ok(()) => {
-                    ui.colored_label(OK_COLOR, "IP written -- use Read Current IP to confirm.");
+                    ui.colored_label(ok_color(ui), "IP written -- use Read Current IP to confirm.");
                 }
                 Err(e) => {
-                    ui.colored_label(ERROR_COLOR, format!("Write IP failed: {e}"));
+                    ui.colored_label(error_color(ui), format!("Write IP failed: {e}"));
                 }
             }
         }
@@ -414,12 +418,12 @@ impl FirmwareUpdateWindow {
         new_ip_text: &mut String,
     ) {
         ui.colored_label(
-            WARNING_COLOR,
+            warning_color(ui),
             "This update method is less thoroughly verified against real firmware than \
              bootloader-mode update -- prefer that when available.",
         );
         ui.colored_label(
-            WARNING_COLOR,
+            warning_color(ui),
             "Erase && Program will stop this radio's active session first (the radio needs \
              to be idle to actually respond) -- the rest of this window's Connected view will \
              go stale until you reconnect afterward.",
@@ -449,10 +453,10 @@ impl FirmwareUpdateWindow {
         if let Some(result) = write_ip_op.peek() {
             match result {
                 Ok(()) => {
-                    ui.colored_label(OK_COLOR, "IP change sent (no confirmation reply is expected).");
+                    ui.colored_label(ok_color(ui), "IP change sent (no confirmation reply is expected).");
                 }
                 Err(e) => {
-                    ui.colored_label(ERROR_COLOR, format!("Write IP failed: {e}"));
+                    ui.colored_label(error_color(ui), format!("Write IP failed: {e}"));
                 }
             }
         }
@@ -480,20 +484,20 @@ impl FirmwareUpdateWindow {
                 ui.add(egui::widgets::ProgressBar::new(frac).show_percentage());
             }
             UploadStage::Done => {
-                ui.colored_label(OK_COLOR, "Update complete.");
+                ui.colored_label(ok_color(ui), "Update complete.");
                 if matches!(self.target, Target::RawEthernet { .. }) {
                     ui.colored_label(
-                        WARNING_COLOR,
+                        warning_color(ui),
                         "Now switch the radio out of bootloader mode and power-cycle it before \
                          normal use.",
                     );
                 }
             }
             UploadStage::Failed { message, needs_power_cycle } => {
-                ui.colored_label(ERROR_COLOR, "Update failed.");
+                ui.colored_label(error_color(ui), "Update failed.");
                 ui.label(message);
                 if *needs_power_cycle {
-                    ui.colored_label(ERROR_COLOR, "Power-cycle the radio before trying again.");
+                    ui.colored_label(error_color(ui), "Power-cycle the radio before trying again.");
                 }
             }
         }
