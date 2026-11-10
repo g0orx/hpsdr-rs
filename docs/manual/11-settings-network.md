@@ -75,7 +75,9 @@ streaming), both directly and through TCI Remote Compactor.
 - **A second receiver**, as Thetis's RX2: TCI receiver 1 is your first
   extra receiver (the **RX 2** window, or the lowest-numbered one open).
   Clients see two receivers, and `rx_enable:1` says whether there's one
-  open now. Receiver 1 has its own frequency (VFO A and B), mode,
+  open now. A client can open one with `rx_enable:1,true` -- as **Add
+  Receiver** does, if a receiver is free -- and close it with
+  `rx_enable:1,false`, as closing its window does. Receiver 1 has its own frequency (VFO A and B), mode,
   filter, RIT, CTUN, AGC, volume, noise and squelch settings, audio
   (`audio_start:1`) and S-meter (`rx_sensors:1`), all reported as they
   change; transmitting stays with receiver 0. Not its IQ: TCI has one

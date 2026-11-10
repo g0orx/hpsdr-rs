@@ -4193,16 +4193,38 @@ impl eframe::App for HpsdrApp {
                     // Thetis's RX2 (see tci::Rx2Share): what clients asked
                     // of it, applied as its own window would, and its state
                     // for them.
+                    let rx2_requests = connected.tci_server.as_ref().map(|s| s.take_rx2_requests());
+                    // rx_enable:1 -- open an extra receiver, as Add Receiver
+                    // does, or close it, as its window's close button does.
+                    // An open one is opened, a closed one closed, only if
+                    // there isn't / is one; with no receiver free it stays
+                    // closed, and clients are told so.
+                    match rx2_requests.as_ref().and_then(|r| r.enable) {
+                        Some(true) if connected.extra_receivers.is_empty() => {
+                            add_extra_receiver(connected);
+                        }
+                        Some(false) => {
+                            if let Some(rx) =
+                                connected.extra_receivers.iter().min_by_key(|rx| rx.lock().unwrap().ddc_index)
+                            {
+                                let mut rx = rx.lock().unwrap();
+                                rx.open = false;
+                                rx.settings_dirty.store(true, Ordering::Relaxed);
+                            }
+                        }
+                        _ => {}
+                    }
                     if let Some(s) = connected.tci_server.as_ref() {
                         let first = connected
                             .extra_receivers
                             .iter()
+                            .filter(|rx| rx.lock().unwrap().open)
                             .min_by_key(|rx| rx.lock().unwrap().ddc_index)
                             .cloned();
                         match first {
                             Some(rx) => {
                                 let mut rx = rx.lock().unwrap();
-                                if apply_tci_rx2_requests(&mut rx, s.take_rx2_requests()) {
+                                if apply_tci_rx2_requests(&mut rx, rx2_requests.unwrap_or_default()) {
                                     // Its window applies RIT and CTUN to the DSP
                                     // when it draws: draw it now.
                                     ui.ctx().request_repaint_of(egui::ViewportId::from_hash_of((
@@ -4226,10 +4248,7 @@ impl eframe::App for HpsdrApp {
                                 };
                                 s.set_rx2(Some((taps, state)));
                             }
-                            None => {
-                                s.set_rx2(None);
-                                s.take_rx2_requests();
-                            }
+                            None => s.set_rx2(None),
                         }
                     }
                     let power_request = connected.tci_server.as_ref().and_then(|s| {
@@ -5294,25 +5313,7 @@ impl eframe::App for HpsdrApp {
                                 let max = connected.session.iq_buffers.len();
                                 if active < max {
                                     if ui.button(format!("Add Receiver ({active}/{max})")).clicked() {
-                                        if let Some(rx) = spawn_extra_receiver(
-                                            &connected.session,
-                                            connected.device.adcs,
-                                            connected.device.protocol,
-                                            connected.device.board,
-                                            connected.device.frequency_min,
-                                            connected.device.frequency_max,
-                                            Arc::clone(&connected.settings_dirty),
-                                            None,
-                                        ) {
-                                            connected.extra_receivers.push(rx);
-                                            // Without this, a freshly added
-                                            // receiver is only persisted if
-                                            // some other setting happens to
-                                            // change afterward -- closing the
-                                            // app right after adding one
-                                            // would silently lose it.
-                                            connected.settings_dirty.store(true, Ordering::Relaxed);
-                                        }
+                                        add_extra_receiver(connected);
                                     }
                                 } else {
                                     ui.weak(format!("All {max} receivers active"));
@@ -15514,6 +15515,30 @@ fn resolve_tune(
 /// saved=None, defaults -- and by auto-restoring from config on
 /// connect -- saved=Some(...)).
 #[allow(clippy::too_many_arguments)]
+/// Adds an extra receiver, as the Add Receiver button: its own window,
+/// on the next free receiver -- false if there isn't one. Also TCI's
+/// rx_enable:1,true (see tci::Rx2Share).
+fn add_extra_receiver(connected: &mut ConnectedState) -> bool {
+    let Some(rx) = spawn_extra_receiver(
+        &connected.session,
+        connected.device.adcs,
+        connected.device.protocol,
+        connected.device.board,
+        connected.device.frequency_min,
+        connected.device.frequency_max,
+        Arc::clone(&connected.settings_dirty),
+        None,
+    ) else {
+        return false;
+    };
+    connected.extra_receivers.push(rx);
+    // Without this, a freshly added receiver is only persisted if some
+    // other setting happens to change afterward -- closing the app right
+    // after adding one would silently lose it.
+    connected.settings_dirty.store(true, Ordering::Relaxed);
+    true
+}
+
 fn spawn_extra_receiver(
     session: &RadioSession,
     num_adcs: u8,

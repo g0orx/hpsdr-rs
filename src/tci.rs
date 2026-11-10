@@ -272,6 +272,8 @@ pub struct Rx2Requests {
     pub rit_enabled: Option<bool>,
     pub rit_offset_hz: Option<i32>,
     pub ctun: Option<bool>,
+    /// rx_enable:1,<bool> -- open or close it.
+    pub enable: Option<bool>,
 }
 
 impl Rx2Share {
@@ -2012,6 +2014,14 @@ fn handle_client(
                 if live_sent.get(&key) == Some(&msg) {
                     continue;
                 }
+                // Receiver 1's state only once the client's been told it's
+                // there (rx_enable:1,true comes first in `state`).
+                if is_rx1_key(&key)
+                    && key != "rx_enable:1"
+                    && live_sent.get("rx_enable:1").map(String::as_str) != Some("rx_enable:1,true;")
+                {
+                    continue;
+                }
                 let family = key.split(':').next().unwrap_or("");
                 if live_held.get(family).is_some_and(|t| t.elapsed() < LIVE_HOLD) {
                     continue;
@@ -2364,6 +2374,14 @@ fn rx2_command(
     if args.first() != Some(&"1") {
         return None;
     }
+    // rx_enable:1,<bool> opens or closes it (main.rs): not answered at
+    // once -- the client hears how it turned out once LIVE_HOLD is over.
+    if name == "rx_enable" {
+        if let Some(on) = args.get(1).and_then(|a| a.to_ascii_lowercase().parse::<bool>().ok()) {
+            share.rx2.requests.lock().unwrap().enable = Some(on);
+            return Some(None);
+        }
+    }
     let Some((taps, f)) = share.rx2.get() else {
         return Some((name == "rx_enable").then(|| "rx_enable:1,false;".to_string()));
     };
@@ -2640,6 +2658,7 @@ fn live_families(name: &str) -> &'static [&'static str] {
         "drive" => &["drive"],
         "tune_drive" => &["tune_drive", "drive"],
         "sql_enable" => &["sql_enable"],
+        "rx_enable" => &["rx_enable"],
         "sql_level" => &["sql_level"],
         "rx_anf_enable" => &["rx_anf_enable"],
         "rx_bin_enable" => &["rx_bin_enable"],
@@ -4020,6 +4039,13 @@ mod remote_tests {
         assert!(got.contains(&"trx_count:2".to_string()), "{got:?}");
         assert!(got.contains(&"rx_enable:1,false".to_string()), "{got:?}");
 
+        // The client asks for one: passed on to main.rs (which would open
+        // it, as Add Receiver does), and not answered at once.
+        ws.send(Message::Text("rx_enable:1,true;".into())).unwrap();
+        let (got, _) = read_for(&mut ws, 100);
+        assert_eq!(server.take_rx2_requests().enable, Some(true));
+        assert!(!got.iter().any(|m| m.starts_with("rx_enable:1")), "{got:?}");
+
         // An extra receiver is opened.
         let taps = Rx2Taps {
             demod_params: Arc::new(Mutex::new(DemodParams { mode: Mode::Usb, ..DemodParams::default() })),
@@ -4033,10 +4059,13 @@ mod remote_tests {
         };
         let state = Rx2State { frequency_hz: 14_200_000, dds_hz: 14_190_000, ..Default::default() };
         server.set_rx2(Some((taps.clone(), state)));
-        let (got, _) = read_for(&mut ws, 200);
+        // Past LIVE_HOLD, since the client's just sent rx_enable.
+        let (got, _) = read_for(&mut ws, 700);
         for want in ["rx_enable:1,true", "vfo:1,0,14200000", "dds:1,14190000", "if:1,0,10000", "modulation:1,usb"] {
             assert!(got.contains(&want.to_string()), "no {want} in {got:?}");
         }
+        let at = |m: &str| got.iter().position(|g| g == m).unwrap();
+        assert!(at("rx_enable:1,true") < at("vfo:1,0,14200000"), "told it's there first: {got:?}");
 
         // Tuned, its mode and AGC changed, its audio and S-meter asked for.
         ws.send(Message::Text(
@@ -4058,9 +4087,12 @@ mod remote_tests {
         assert!(!server.take_filter_changed(), "receiver 1's filter isn't the transmitter's");
         assert_eq!(audio1, vec![2048, 2048], "receiver 1's audio, in blocks, receiver 1 in the header");
 
-        // Closed again.
+        // Closed again -- asked for by the client, done by main.rs.
+        ws.send(Message::Text("rx_enable:1,false;".into())).unwrap();
+        read_for(&mut ws, 50);
+        assert_eq!(server.take_rx2_requests().enable, Some(false));
         server.set_rx2(None);
-        let (got, _) = read_for(&mut ws, 200);
+        let (got, _) = read_for(&mut ws, 700);
         assert!(got.contains(&"rx_enable:1,false".to_string()), "{got:?}");
         server.stop();
     }
