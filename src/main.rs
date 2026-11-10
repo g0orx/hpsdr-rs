@@ -4234,6 +4234,7 @@ impl eframe::App for HpsdrApp {
                                 }
                                 let ddc_hz = rx.frequency_hz.load(Ordering::Relaxed) as u64;
                                 let state = tci::Rx2State {
+                                    sample_rate_hz: rx.sample_rate_hz.load(Ordering::Relaxed),
                                     frequency_hz: if rx.ctun { rx.ctun_frequency_hz as u64 } else { ddc_hz },
                                     dds_hz: ddc_hz,
                                     vfo_b_hz: rx.vfo_b_frequency_hz as u64,
@@ -4244,6 +4245,7 @@ impl eframe::App for HpsdrApp {
                                 let taps = tci::Rx2Taps {
                                     demod_params: rx.spectrum.demod_params_handle(),
                                     audio: Arc::clone(&rx.spectrum.tci_audio_out),
+                                    iq: Arc::clone(&rx.spectrum.iq_out),
                                     display: Arc::clone(&rx.spectrum.display),
                                 };
                                 s.set_rx2(Some((taps, state)));

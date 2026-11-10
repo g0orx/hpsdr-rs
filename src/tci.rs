@@ -224,8 +224,9 @@ type AudioIqCell = Arc<Mutex<AudioIqTaps>>;
 struct ClientAudioIqSink {
     audio: Mutex<VecDeque<(f32, f32)>>,
     iq: Mutex<VecDeque<(f32, f32)>>,
-    /// Receiver 1's audio (see Rx2Share), filled the same way.
+    /// Receiver 1's audio and IQ (see Rx2Share), filled the same way.
     audio2: Mutex<VecDeque<(f32, f32)>>,
+    iq2: Mutex<VecDeque<(f32, f32)>>,
 }
 
 /// TCI's receiver 1, as Thetis's RX2: hpsdr-rs's first extra receiver
@@ -249,13 +250,15 @@ pub struct Rx2Share {
 pub struct Rx2Taps {
     pub demod_params: Arc<Mutex<DemodParams>>,
     pub audio: Arc<Mutex<VecDeque<(f32, f32)>>>,
+    pub iq: Arc<Mutex<VecDeque<(f32, f32)>>>,
     pub display: Arc<Mutex<crate::spectrum::SpectrumDisplay>>,
 }
 
 /// Receiver 1's frequencies: where it's listening, the centre of its
-/// spectrum (its DDC), its VFO B, RIT and CTUN.
+/// spectrum (its DDC), its VFO B, RIT and CTUN; and its IQ rate.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Rx2State {
+    pub sample_rate_hz: u32,
     pub frequency_hz: u64,
     pub dds_hz: u64,
     pub vfo_b_hz: u64,
@@ -387,17 +390,26 @@ fn spawn_audio_iq_broadcaster(
                 let mut q = taps.audio.lock().unwrap();
                 q.drain(..).collect()
             };
-            // Receiver 1's audio, when there is one (see Rx2Share).
-            let audio2_batch: Vec<(f32, f32)> = match remote_share.rx2.get() {
-                Some((rx2, _)) => rx2.audio.lock().unwrap().drain(..).collect(),
-                None => Vec::new(),
+            // Receiver 1's audio and IQ, when there is one (see Rx2Share).
+            let (audio2_batch, iq2_batch): (Vec<(f32, f32)>, Vec<(f32, f32)>) = match remote_share.rx2.get() {
+                Some((rx2, _)) => (
+                    rx2.audio.lock().unwrap().drain(..).collect(),
+                    rx2.iq.lock().unwrap().drain(..).collect(),
+                ),
+                None => (Vec::new(), Vec::new()),
             };
-            if !audio2_batch.is_empty() {
+            if !audio2_batch.is_empty() || !iq2_batch.is_empty() {
                 let mut clients = registry.lock().unwrap();
                 for sink in clients.iter().filter_map(|w| w.upgrade()) {
                     let mut q = sink.audio2.lock().unwrap();
                     q.extend(audio2_batch.iter().copied());
                     while q.len() > CLIENT_SINK_MAX_AUDIO_SAMPLES {
+                        q.pop_front();
+                    }
+                    drop(q);
+                    let mut q = sink.iq2.lock().unwrap();
+                    q.extend(iq2_batch.iter().copied());
+                    while q.len() > CLIENT_SINK_MAX_IQ_PAIRS {
                         q.pop_front();
                     }
                 }
@@ -941,6 +953,7 @@ fn handle_client(
         audio: Mutex::new(VecDeque::new()),
         iq: Mutex::new(VecDeque::new()),
         audio2: Mutex::new(VecDeque::new()),
+        iq2: Mutex::new(VecDeque::new()),
     });
     audio_iq_registry.lock().unwrap().push(Arc::downgrade(&sink));
 
@@ -1288,6 +1301,8 @@ fn handle_client(
     // for, unlike receiver 0's (see audio_streaming).
     let mut audio2_streaming = false;
     let mut next_audio2_send = Instant::now();
+    // Receiver 1's IQ (iq_start:1), off until asked for, as receiver 0's.
+    let mut iq2_streaming = false;
     // BUG FIX (round 2 -- replaced fixed-interval pacing entirely):
     // TxChrono used to be sent one-at-a-time, real-time paced (one
     // request roughly every TCI_TX_AUDIO_CHUNK/TCI_AUDIO_SAMPLE_RATE),
@@ -1344,7 +1359,7 @@ fn handle_client(
                     let families = live_families(&name);
                     live_sent.retain(|key, _| !families.contains(&key.split(':').next().unwrap_or("")));
                     // Receiver 1's own commands -- see Rx2Share.
-                    if let Some(reply) = rx2_command(cmd, &name, &remote_share, &mut audio2_streaming, &sink) {
+                    if let Some(reply) = rx2_command(cmd, &name, &remote_share, &mut audio2_streaming, &mut iq2_streaming, &sink) {
                         if let Some(reply) = reply {
                             logging.log(&format!(">> {reply}"));
                             if send_is_fatal(&ws.send(Message::Text(reply.into()))) {
@@ -1755,6 +1770,27 @@ fn handle_client(
             }
         }
 
+        // Receiver 1's IQ (iq_start:1), as receiver 0's, with receiver 1
+        // and its own rate in each message's header: an extra receiver
+        // can run at a rate of its own (Protocol 2), and TCI's
+        // iq_samplerate is receiver 0's.
+        if iq2_streaming {
+            let pairs: Vec<(f32, f32)> = sink.iq2.lock().unwrap().drain(..).collect();
+            let rate = remote_share.rx2.get().map_or(0, |(_, f)| f.sample_rate_hz);
+            if !pairs.is_empty() && rate != 0 {
+                let swapped: Vec<(f32, f32)> = pairs.into_iter().map(|(i, q)| (q, i)).collect();
+                for chunk in swapped.chunks(MAX_IQ_PAIRS_PER_MESSAGE) {
+                    let msg =
+                        encode_binary_message(1, rate, BinaryMessageType::IqStream, chunk.len() as u32 * 2, chunk);
+                    let result = ws.send(Message::Binary(msg.into()));
+                    if send_is_fatal(&result) {
+                        logging.log(&format!("receiver 1 IQ send failed, closing: {:?}", result.unwrap_err()));
+                        return;
+                    }
+                }
+            }
+        }
+
         // hpsdr-rs's remote extensions: compressed audio from this
         // client's own sink (filled whether or not TCI's float audio is
         // on), and spectrum rows from the main receiver's display.
@@ -2111,6 +2147,7 @@ fn live_state(
             rit_enabled: rit_enabled.load(Ordering::Relaxed),
             rit_offset_hz: rit_offset_hz.load(Ordering::Relaxed),
             ctun: params.ctun,
+            ..Default::default()
         },
         params,
     );
@@ -2356,15 +2393,15 @@ const RECEIVER_COMMANDS: &[&str] = &[
 /// receiver 0's, or one with no receiver -- else what to answer, if
 /// anything. Its frequencies, RIT and CTUN are asked of main.rs and
 /// echoed, as receiver 0's are; its audio is this client's
-/// audio2_streaming; its DSP settings are set as receiver 0's are, on
-/// its own. With no extra receiver behind it, it's ignored. Receiver 1's
-/// IQ isn't offered: TCI has one IQ rate for all receivers, and an extra
-/// receiver can run at its own.
+/// audio2_streaming and IQ iq2_streaming; its DSP settings are set as
+/// receiver 0's are, on its own. With no extra receiver behind it, it's
+/// ignored.
 fn rx2_command(
     cmd: &str,
     name: &str,
     share: &crate::remote::RemoteShare,
     audio2_streaming: &mut bool,
+    iq2_streaming: &mut bool,
     sink: &ClientAudioIqSink,
 ) -> Option<Option<String>> {
     if !RECEIVER_COMMANDS.contains(&name) {
@@ -2435,7 +2472,19 @@ fn rx2_command(
             *audio2_streaming = false;
             "audio_stop:1;".to_string()
         }
-        "iq_start" | "iq_stop" => return Some(None),
+        // As receiver 0's: what queued before it was asked for is dropped,
+        // so it starts from now -- only when it wasn't already on.
+        "iq_start" => {
+            if !*iq2_streaming {
+                sink.iq2.lock().unwrap().clear();
+            }
+            *iq2_streaming = true;
+            "iq_start:1;".to_string()
+        }
+        "iq_stop" => {
+            *iq2_streaming = false;
+            "iq_stop:1;".to_string()
+        }
         "rx_enable" => "rx_enable:1,true;".to_string(),
         _ => {
             drop(requests);
@@ -4050,6 +4099,7 @@ mod remote_tests {
         let taps = Rx2Taps {
             demod_params: Arc::new(Mutex::new(DemodParams { mode: Mode::Usb, ..DemodParams::default() })),
             audio: Arc::new(Mutex::new(VecDeque::new())),
+            iq: Arc::new(Mutex::new(VecDeque::new())),
             display: Arc::new(Mutex::new(SpectrumDisplay {
                 spectrum: vec![-120.0, -80.0],
                 meter_db: -91.0,
@@ -4057,7 +4107,8 @@ mod remote_tests {
                 ..Default::default()
             })),
         };
-        let state = Rx2State { frequency_hz: 14_200_000, dds_hz: 14_190_000, ..Default::default() };
+        let state =
+            Rx2State { sample_rate_hz: 96_000, frequency_hz: 14_200_000, dds_hz: 14_190_000, ..Default::default() };
         server.set_rx2(Some((taps.clone(), state)));
         // Past LIVE_HOLD, since the client's just sent rx_enable.
         let (got, _) = read_for(&mut ws, 700);
@@ -4086,6 +4137,29 @@ mod remote_tests {
         assert_eq!(p1.width_hz, 500.0);
         assert!(!server.take_filter_changed(), "receiver 1's filter isn't the transmitter's");
         assert_eq!(audio1, vec![2048, 2048], "receiver 1's audio, in blocks, receiver 1 in the header");
+
+        // Its IQ: receiver 1 and its own rate in the header, I and Q in
+        // TCI's order (as receiver 0's), none of what came before.
+        taps.iq.lock().unwrap().extend(std::iter::repeat_n((9.0f32, 9.0f32), 50));
+        std::thread::sleep(Duration::from_millis(50));
+        ws.send(Message::Text("iq_start:1;".into())).unwrap();
+        let (got, _) = read_for(&mut ws, 100);
+        assert!(got.contains(&"iq_start:1".to_string()), "{got:?}");
+        taps.iq.lock().unwrap().extend(std::iter::repeat_n((0.25f32, 0.5f32), 600));
+        let mut iq1 = Vec::new();
+        let start = Instant::now();
+        while start.elapsed() < Duration::from_millis(300) {
+            if let Ok(Message::Binary(b)) = ws.read() {
+                let (h, payload) = hpsdr_proto::Header::decode(&b).unwrap();
+                if h.msg_type == hpsdr_proto::TYPE_IQ {
+                    assert_eq!((h.receiver, h.sample_rate), (1, 96_000));
+                    iq1.extend(payload.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())));
+                }
+            }
+        }
+        assert_eq!(iq1.len(), 1200, "600 pairs");
+        assert!(iq1.chunks(2).all(|p| p == [0.5, 0.25]), "swapped as receiver 0's, nothing stale");
+        ws.send(Message::Text("iq_stop:1;".into())).unwrap();
 
         // Closed again -- asked for by the client, done by main.rs.
         ws.send(Message::Text("rx_enable:1,false;".into())).unwrap();

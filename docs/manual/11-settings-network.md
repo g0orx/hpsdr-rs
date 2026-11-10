@@ -80,8 +80,9 @@ streaming), both directly and through TCI Remote Compactor.
   `rx_enable:1,false`, as closing its window does. Receiver 1 has its own frequency (VFO A and B), mode,
   filter, RIT, CTUN, AGC, volume, noise and squelch settings, audio
   (`audio_start:1`) and S-meter (`rx_sensors:1`), all reported as they
-  change; transmitting stays with receiver 0. Not its IQ: TCI has one
-  IQ rate for every receiver, and an extra receiver can run at its own.
+  change, and IQ (`iq_start:1`), each message giving receiver 1's own
+  sample rate, which on Protocol 2 can differ from receiver 0's;
+  transmitting stays with receiver 0.
 - **CW is CWL or CWU**, as Thetis reports it, not plain CW. A client
   that sends plain `cw` gets the usual sideband for the frequency (CWL
   below 10 MHz, CWU above), and `cwr` the other one.
