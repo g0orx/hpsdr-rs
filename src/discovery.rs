@@ -133,7 +133,7 @@ impl Device {
         let version = buf[9];
         let board_id = buf[10];
         let (board, adcs, supported_receivers, supported_transmitters, frequency_min, frequency_max) =
-            board_info_p1(board_id, version, buf[19], buf[20]);
+            board_info_p1(board_id, version, buf[19], buf[20], buf[3..7] == HL2_MAC_PREFIX);
 
         Some(Device {
             address: src,
@@ -194,10 +194,22 @@ impl Device {
     }
 }
 
+/// The first four bytes of every Hermes-Lite 2's MAC address: each
+/// gateware variant sets 00:1C:C0:A2 and only the last two bytes differ
+/// (hermeslite_core.v, variants/*/hermeslite.v), even with an alternate MAC.
+const HL2_MAC_PREFIX: [u8; 4] = [0x00, 0x1C, 0xC0, 0xA2];
+
 /// Board characteristics for Protocol 1 board IDs.
 /// `buf19` is only meaningful for HermesLite2, which reports its receiver
 /// count in that byte (mirrors the original code's `buf[19]` lookup).
-fn board_info_p1(board_id: u8, version: u8, buf19: u8, buf20: u8) -> (Boards, u8, u8, u8, u64, u64) {
+/// `hl2_mac` says the MAC address starts with [`HL2_MAC_PREFIX`].
+fn board_info_p1(
+    board_id: u8,
+    version: u8,
+    buf19: u8,
+    buf20: u8,
+    hl2_mac: bool,
+) -> (Boards, u8, u8, u8, u64, u64) {
     match board_id {
         0 => (Boards::Metis, 1, 5, 1, 0, 61_440_000),
         // A Hermes-Lite 2 can say it's a Hermes: its gateware sends board
@@ -205,11 +217,14 @@ fn board_info_p1(board_id: u8, version: u8, buf19: u8, buf20: u8) -> (Boards, u8
         // reports version 54 whatever it is (usopenhpsdr1.v,
         // hermeslite_core.v). It still fills in byte 19 (its receiver
         // count) and byte 20 (its hardware revision, BOARD, in the low 6
-        // bits), which a real Hermes leaves at 0. REAL REPORT (issue #7,
-        // HL2b2 on 74p2 gateware shown as "Hermes v5.4"): taken for a
-        // Hermes, it never got the HL2's PA-enable bit (address 0x09 C2
-        // 0x08), so +VPA stayed off though the TX LED lit.
-        1 if (1..=31).contains(&(buf20 & 0x3F)) && (1..=12).contains(&buf19) => {
+        // bits). REAL REPORT (issue #7, HL2b2 on 74p2 gateware shown as
+        // "Hermes v5.4"): taken for a Hermes, it never got the HL2's
+        // PA-enable bit (address 0x09 C2 0x08), so +VPA stayed off though
+        // the TX LED lit. But Apache's Hermes gateware fills bytes 19 and
+        // 20 too (Thetis reads them as Metis version and receiver count),
+        // so those alone took an ANAN-10E for an HL2 (REAL REPORT, v0.12.0):
+        // the HL2's MAC prefix has to match as well.
+        1 if hl2_mac && (1..=31).contains(&(buf20 & 0x3F)) && (1..=12).contains(&buf19) => {
             (Boards::HermesLite2, 1, buf19, 1, 0, 38_400_000)
         }
         1 => (Boards::Hermes, 1, 5, 1, 0, 61_440_000),
@@ -772,8 +787,8 @@ mod tests {
 
     /// An HL2b2 on 74p2 gateware identifying as a Hermes (board id 1,
     /// version 54, per usopenhpsdr1.v): its receiver count (byte 19) and
-    /// hardware revision (byte 20) give it away, so it's a Hermes-Lite 2 --
-    /// while a real Hermes, with zeros there, stays a Hermes (issue #7).
+    /// hardware revision (byte 20) with its MAC prefix give it away, so it's
+    /// a Hermes-Lite 2 -- while a real Hermes stays a Hermes (issue #7).
     #[test]
     fn hl2_identifying_as_hermes_is_a_hermes_lite_2() {
         let mut reply = vec![0u8; 60];
@@ -788,6 +803,13 @@ mod tests {
         assert_eq!((hl2.board, hl2.supported_receivers), (Boards::HermesLite2, 4));
         reply[19] = 0;
         reply[20] = 0;
+        assert_eq!(Device::from_p1_reply(&reply, addr, addr).unwrap().board, Boards::Hermes);
+        // An ANAN-10E fills bytes 19 and 20 too, but isn't an HL2's MAC
+        // (REAL REPORT, v0.12.0 showed one as a Hermes-Lite 2).
+        reply[3..9].copy_from_slice(&[0x00, 0x04, 0xA3, 0x12, 0x34, 0x56]);
+        reply[9] = 31;
+        reply[19] = 4;
+        reply[20] = 4;
         assert_eq!(Device::from_p1_reply(&reply, addr, addr).unwrap().board, Boards::Hermes);
     }
 
