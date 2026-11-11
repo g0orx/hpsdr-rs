@@ -8063,7 +8063,7 @@ impl eframe::App for HpsdrApp {
                             // title bar. Room for the VFO row and, with
                             // the control rows folded, a usable
                             // spectrum and waterfall.
-                            .with_min_inner_size([700.0, 320.0]);
+                            .with_min_inner_size(extra_window_min_size(1.0, true));
                     if let Some(g) = seed_geometry {
                         viewport_builder = viewport_builder.with_inner_size([g.width, g.height]);
                         if let (Some(x), Some(y)) = (g.x, g.y) {
@@ -8080,6 +8080,16 @@ impl eframe::App for HpsdrApp {
                             // see ExtraReceiver::window_geometry's doc
                             // comment.
                             rx_for_closure.lock().unwrap().window_geometry = Some(window_geometry_of(ui));
+
+                            // See extra_window_min_size: re-sent when the
+                            // UI scale or the waterfall changes.
+                            let waterfall = rx_for_closure.lock().unwrap().waterfall_enabled;
+                            let min_size = extra_window_min_size(ui.ctx().zoom_factor(), waterfall);
+                            let min_id = egui::Id::new(("extra_min_size", ddc_index));
+                            if ui.data(|d| d.get_temp::<egui::Vec2>(min_id)) != Some(min_size) {
+                                ui.data_mut(|d| d.insert_temp(min_id, min_size));
+                                ui.ctx().send_viewport_cmd(egui::ViewportCommand::MinInnerSize(min_size));
+                            }
 
                             if ui.input(|i| i.viewport().close_requested()) {
                                 let mut rx = rx_for_closure.lock().unwrap();
@@ -13592,6 +13602,14 @@ fn main_window_min_size(zoom: f32, waterfall: bool) -> egui::Vec2 {
     egui::vec2(900.0, height) * zoom
 }
 
+/// An extra receiver window's minimum size, as main_window_min_size: 700 x
+/// 320 at 100% (REAL REPORT, 2026-11-07: with no minimum it shrank to its
+/// title bar), times the UI scale, and shorter with the waterfall off.
+fn extra_window_min_size(zoom: f32, waterfall: bool) -> egui::Vec2 {
+    let height = if waterfall { 320.0 } else { 320.0 - (120.0 - SPECTRUM_ONLY_MIN_HEIGHT) };
+    egui::vec2(700.0, height) * zoom
+}
+
 fn controls_strip(ui: &mut egui::Ui, connected: &mut ConnectedState) -> bool {
     let dial = if connected.ctun {
         connected.ctun_frequency_hz
@@ -15347,8 +15365,8 @@ fn render_extra_receiver_ui(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceiver>>) {
     let zoom_pan_reserve = ui.spacing().interact_size.y + 8.0 + SPECTRUM_WATERFALL_DIVIDER_HEIGHT;
     // 120, not 200 -- the main window's reasoning: a short window, with
     // the control rows folded, still shows Zoom/Pan.
-    let spectrum_waterfall_height =
-        (ui.available_height() - zoom_pan_reserve).max(120.0);
+    let spectrum_waterfall_height = (ui.available_height() - zoom_pan_reserve)
+        .max(if rx.waterfall_enabled { 120.0 } else { SPECTRUM_ONLY_MIN_HEIGHT });
     // Waterfall disabled (Settings -> Spectrum): give the spectrum trace
     // the FULL combined height -- see the main receiver's identical
     // treatment for the full reasoning.
