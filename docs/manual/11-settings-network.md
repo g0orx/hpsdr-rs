@@ -300,6 +300,27 @@ com0com connects it to hpsdr-rs).
   change, and once as soon as the port opens, without being asked. Tick it
   for a device that only listens; leave it off for one that polls (most
   amplifiers and programs send `FA;` or `IF;` themselves).
+- **TX frequency** (on by default) -- `FA` and `IF` report the frequency
+  you transmit on rather than the one you listen on: VFO B with **Split**
+  or **Duplex**, plus XIT. An amplifier is then on the band you transmit on,
+  e.g. working split across a band edge. Turn it off for a logger, which
+  expects `FA` to be the receive frequency. Through a transverter it's the
+  RF frequency, as for the TCP server.
+- **PTT out** -- **RTS** or **DTR** is raised while the radio transmits,
+  e.g. to key an amplifier through the serial adapter (as Thetis and
+  Hamlib do). The line follows within a few milliseconds plus the
+  adapter's own delay, so set **TX Delay** ([Settings: TX](17-settings-tx.md#tx-delay))
+  to hold RF back until the amplifier's relay has closed -- the line's
+  delay plus the amplifier's switching time, e.g. 30-50 ms.
+- **PTT in** -- the radio transmits while **CTS** or **DSR** is raised:
+  a footswitch wired to the port, or a program set to "PTT via RTS" or
+  "PTT via DTR" on the other end of a virtual serial pair (com0com and the
+  like cross the lines: its RTS arrives as CTS, its DTR as DSR). Raising
+  the line keys the radio, dropping it unkeys -- only if the line keyed it,
+  so it doesn't fight the **MOX** button or another client -- and it obeys
+  the same out-of-band check as every other PTT. If the port closes or is
+  unplugged mid-transmission, the radio is unkeyed. A line that's already
+  up when the port opens doesn't key the radio until it drops and rises.
 - **Start**/**Stop** -- the status shows **Open**, or **Not open
   (retrying)** with the reason when you hover over it (port in use by
   another program, no permission, unplugged). A port that can't be opened,

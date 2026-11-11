@@ -580,6 +580,10 @@ pub struct Config {
     /// (a config saved before this existed) falls back to 0 (off).
     #[serde(default)]
     pub tx_tail_delay_ms: Option<u32>,
+    /// See tx::TX_RF_DELAY_MS. `None` (a config saved before this
+    /// existed) means 0 (off).
+    #[serde(default)]
+    pub tx_rf_delay_ms: Option<u32>,
     /// Global Open Collector mask ORed into the active band's Tx mask
     /// while TUNE is active -- see main.rs's ConnectedState::oc_tune
     /// doc comment.
@@ -1011,11 +1015,48 @@ pub struct CatSerialConfig {
     pub baud: u32,
     #[serde(default)]
     pub auto_report: bool,
+    /// FA/IF report the TX frequency (default on) -- see
+    /// cat::SerialOptions::report_tx.
+    #[serde(default = "default_true")]
+    pub report_tx: bool,
+    #[serde(default)]
+    pub ptt_out: crate::cat::PttOut,
+    #[serde(default)]
+    pub ptt_in: crate::cat::PttIn,
     /// Running when last saved: started again on connecting.
     #[serde(default)]
     pub running: bool,
 }
 
+impl CatSerialConfig {
+    pub fn options(&self) -> crate::cat::SerialOptions {
+        crate::cat::SerialOptions {
+            port: self.port.clone(),
+            baud: self.baud,
+            auto_report: self.auto_report,
+            report_tx: self.report_tx,
+            ptt_out: self.ptt_out,
+            ptt_in: self.ptt_in,
+        }
+    }
+
+    pub fn from_options(o: &crate::cat::SerialOptions, running: bool) -> Self {
+        Self {
+            port: o.port.clone(),
+            baud: o.baud,
+            auto_report: o.auto_report,
+            report_tx: o.report_tx,
+            ptt_out: o.ptt_out,
+            ptt_in: o.ptt_in,
+            running,
+        }
+    }
+}
+
 fn default_cat_serial_baud() -> u32 {
     crate::cat::DEFAULT_SERIAL_BAUD
+}
+
+fn default_true() -> bool {
+    true
 }

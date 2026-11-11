@@ -72,7 +72,7 @@ use std::collections::VecDeque;
 use std::ffi::CString;
 use std::os::raw::c_int;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -1884,6 +1884,15 @@ impl CwLiveGen {
 }
 
 #[allow(clippy::too_many_arguments)]
+/// TX delay ("RF delay" in Thetis), in ms: after the radio is keyed,
+/// how long it sends silence before any RF -- time for an amplifier's
+/// or external relay's T/R switching (keyed by the radio's PTT output,
+/// or a CAT serial port's PTT out line) to close before power arrives.
+/// 0 = none (the default). Set from Settings -> TX (main.rs) and the
+/// radio's saved config. Only RF that hpsdr-rs makes is held back: a
+/// radio's own internal CW keyer makes its RF itself.
+pub static TX_RF_DELAY_MS: AtomicU32 = AtomicU32::new(0);
+
 fn run(
     mic_buffer: Arc<Mutex<VecDeque<f32>>>,
     tci_tx_audio: Arc<Mutex<VecDeque<f32>>>,
@@ -2016,6 +2025,8 @@ fn run(
     // PureSignal: when MOX went active most recently -- None while
     // idle. See below for why this matters.
     let mut mox_active_since: Option<Instant> = None;
+    // When MOX last went active, for TX_RF_DELAY_MS.
+    let mut keyed_since: Option<Instant> = None;
     // piHPSDR's transmitter.c documents a real ordering requirement
     // that isn't optional: "enabling should restart feedback streams
     // first, wait ~100ms, then turn PS on" -- ROOT CAUSE FIX for
@@ -2083,11 +2094,39 @@ fn run(
                 cw_live_gen = CwLiveGen::new();
             }
             mox_active_since = None;
+            keyed_since = None;
             thread::sleep(Duration::from_millis(20));
             // Resync so the first chunk after PTT is produced against a
             // fresh schedule, not delayed by however long MOX was off --
             // same reasoning as p2_tx_iq_loop's own resync here.
             next_chunk = Instant::now();
+            continue;
+        }
+        // TX delay (see TX_RF_DELAY_MS): the radio is keyed (its MOX
+        // bit, relays and PTT output, and a serial port's PTT out, all
+        // follow `mox` at once), but sends silence until the delay has
+        // passed. Nothing is consumed meanwhile -- mic/TCI audio waits
+        // in its queue and CW elements aren't started -- so the
+        // transmission is delayed, not cut short.
+        let keyed_at = *keyed_since.get_or_insert_with(Instant::now);
+        let rf_delay = Duration::from_millis(TX_RF_DELAY_MS.load(Ordering::Relaxed) as u64);
+        if keyed_at.elapsed() < rf_delay {
+            {
+                let mut out = tx_iq_out.lock().unwrap();
+                for _ in 0..out_iq_pairs * 2 {
+                    if out.len() >= TX_IQ_BUFFER_CAPACITY {
+                        out.pop_front();
+                    }
+                    out.push_back(0.0);
+                }
+            }
+            next_chunk += chunk_interval;
+            let now = Instant::now();
+            if next_chunk > now {
+                thread::sleep(next_chunk - now);
+            } else {
+                next_chunk = now;
+            }
             continue;
         }
         let cw_live_now = !cw_text_gen.is_active() && cw_live_gen.is_active(&cw_keyer.live);
@@ -2832,6 +2871,76 @@ mod tune_tone_tests {
         let tone_hz = tone_hz.unwrap_or((passband.0 + passband.1) / 2.0);
         let expected = (tone_hz - shown.0) / (shown.1 - shown.0) * (row.len() - 1) as f64;
         assert!((peak as f64 - expected).abs() <= 2.0, "peak at pixel {peak}, expected {expected:.1}");
+    }
+}
+
+#[cfg(test)]
+mod rf_delay_tests {
+    use super::*;
+
+    /// The real TX thread with Tune on: leading silence in what it hands
+    /// the radio, in ms, after MOX goes active. Needs WDSP (FFTW wisdom,
+    /// real-time threads), so on demand:
+    /// `cargo test --release rf_delay -- --ignored --test-threads=1`.
+    fn leading_silence_ms(channel: i32, delay_ms: u32) -> f64 {
+        TX_RF_DELAY_MS.store(delay_ms, Ordering::Relaxed);
+        let tx_iq_out = Arc::new(Mutex::new(VecDeque::new()));
+        let mox = Arc::new(AtomicBool::new(false));
+        let duc_rate = 48_000;
+        let handle = TxHandle::start(
+            Arc::new(Mutex::new(VecDeque::new())),
+            Arc::new(Mutex::new(VecDeque::new())),
+            Arc::new(Mutex::new(VecDeque::new())),
+            Arc::new(AtomicU8::new(0)),
+            Arc::new(AtomicBool::new(false)),
+            Arc::clone(&tx_iq_out),
+            Arc::new(Mutex::new(VecDeque::new())),
+            Arc::clone(&mox),
+            channel,
+            1,
+            48_000,
+            duc_rate,
+            false,
+            Arc::new(Mutex::new(VecDeque::new())),
+            Arc::new(Mutex::new(VecDeque::new())),
+            None,
+            Arc::new(crate::radio::CwKeyerAtomics::default()),
+        );
+        handle.set_tune(true);
+        thread::sleep(Duration::from_millis(500));
+        tx_iq_out.lock().unwrap().clear();
+        mox.store(true, Ordering::Relaxed);
+        thread::sleep(Duration::from_millis(delay_ms as u64 + 600));
+        mox.store(false, Ordering::Relaxed);
+        let out: Vec<f32> = tx_iq_out.lock().unwrap().iter().copied().collect();
+        drop(handle);
+        TX_RF_DELAY_MS.store(0, Ordering::Relaxed);
+        let first = out.chunks_exact(2).position(|p| p[0].abs() > 1e-4 || p[1].abs() > 1e-4);
+        let first = first.expect("Tune never produced RF");
+        first as f64 * 1000.0 / duc_rate as f64
+    }
+
+    #[test]
+    #[ignore]
+    fn tx_delay_holds_rf_back() {
+        // WDSP's one-time setup happens when the first analyzer opens;
+        // no TXA channel may open before it (see tune_tone_tests).
+        let _analyzer = crate::spectrum::SpectrumHandle::start(
+            28,
+            Arc::new(Mutex::new(VecDeque::new())),
+            48_000,
+            None,
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+        );
+        thread::sleep(Duration::from_secs(2));
+        let without = leading_silence_ms(26, 0);
+        let with = leading_silence_ms(27, 100);
+        println!("leading silence: {without:.1} ms without TX Delay, {with:.1} ms with 100 ms");
+        // TXA's own latency/ramp is there either way (~85 ms measured);
+        // the delay adds its 100 ms on top, give or take a chunk.
+        let added = with - without;
+        assert!((90.0..=125.0).contains(&added), "TX Delay added {added:.1} ms, not ~100");
     }
 }
 

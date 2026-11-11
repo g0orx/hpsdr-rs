@@ -53,6 +53,28 @@ already-tuned timing -- a generic tail here would hold MOX into the start
 of the next element at any real WPM) or to disarming **Enable Transmit**
 (which always drops MOX immediately, same as it always has).
 
+## TX Delay
+
+After keying, waits this many milliseconds (0-1000, default 0 = off)
+before sending any RF -- what Thetis calls RF delay. Everything that
+switches with PTT -- the radio's own PTT output and T/R relays, and a CAT
+serial port's **PTT out** line ([Settings: Network](11-settings-network.md#cat-on-serial-ports))
+-- changes over at once, so an amplifier or external relay keyed by them has
+time to close before power arrives, instead of switching with RF present
+("hot switching").
+
+Nothing is lost: speech, data-mode audio (WSJT-X etc.), Tune and CW sent
+by hpsdr-rs all start after the delay, rather than having their start cut
+off. The amplifier's manual gives its switching time; 20-50 ms is typical
+for a relay. The TX audio is handled in blocks of about 21 ms, so the
+delay is rounded up to the next block (100 ms gives about 107 ms). CW from the radio's own internal keyer is made inside the
+radio, so it isn't delayed -- use the radio's or amplifier's own settings
+for that.
+
+Saved per radio, like TX Tail Delay. **TX Tail Delay** above covers the
+other end: keeping the amplifier keyed until the transmission has
+finished.
+
 ## TX ADC0 Attenuation (standard boards only)
 
 Protects ADC0's front end from this radio's own TX leakage while
