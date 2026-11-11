@@ -1457,7 +1457,7 @@ fn midi_wheel_step_hz(ev: RawMidiEvent, binding: &MidiBinding) -> Option<i64> {
     if delta == 0 {
         return None;
     }
-    let direction = delta.signum();
+    let direction = if binding.reverse { -delta.signum() } else { delta.signum() };
     Some((MIDI_WHEEL_HZ_PER_MESSAGE as f64 * direction as f64 * binding.sensitivity as f64).round() as i64)
 }
 
@@ -1871,6 +1871,19 @@ fn dispatch_midi_event(connected: &mut ConnectedState, ev: RawMidiEvent, freq_hz
             let speed = 1 + (ev.value as u32 * 59) / 127;
             connected.session.cw_keyer.speed_wpm.store(speed, Ordering::Relaxed);
         }
+        // Same ranges as Settings -> CW's sliders.
+        MidiAction::CwSidetoneLevel => {
+            connected.session.cw_keyer.sidetone_volume.store(ev.value as u32, Ordering::Relaxed);
+        }
+        MidiAction::CwSidetoneFreq => {
+            let hz = midi_knob_range(ev.value, 100.0, 1000.0).round() as u32;
+            connected.session.cw_keyer.sidetone_freq_hz.store(hz, Ordering::Relaxed);
+        }
+        MidiAction::CwPitch => {
+            spectrum::set_cw_pitch_hz(midi_knob_range(ev.value, 300.0, 1000.0).round());
+        }
+        // Keyed on the MIDI thread (midi::MidiCwKey), never queued here.
+        MidiAction::CwKey => {}
         MidiAction::RitAdjust => {
             let Some(step) = midi_wheel_step_hz(ev, &binding) else { return };
             let new_offset = (connected.rit_offset_hz as i64 + step).clamp(-9_999, 9_999);
@@ -1885,7 +1898,98 @@ fn dispatch_midi_event(connected: &mut ConnectedState, ev: RawMidiEvent, freq_hz
         }
     }
 
+    // A control's own movement isn't sent back to it: note where the app
+    // now is for it (which can differ from the control's value by
+    // rounding).
+    if binding.kind == MidiBindingKind::Knob {
+        if let Some(v) = midi_knob_value(connected, binding.action) {
+            connected.midi_feedback_sent.insert((binding.event, binding.channel, binding.number), v);
+        }
+    }
+
     connected.settings_dirty.store(true, Ordering::Relaxed);
+}
+
+/// Where a Knob action's value is now, as the 0-127 a control would send
+/// for it -- the inverse of dispatch_midi_event's mapping. None when there's
+/// nothing to show (e.g. Mic Gain with transmit not armed).
+fn midi_knob_value(connected: &ConnectedState, action: MidiAction) -> Option<u8> {
+    let scale = |v: f64, lo: f64, hi: f64| -> u8 { (((v - lo) / (hi - lo)) * 127.0).round().clamp(0.0, 127.0) as u8 };
+    let db = |gain: f32| 20.0 * (gain.max(1e-9) as f64).log10();
+    Some(match action {
+        MidiAction::AfGain => scale(db(connected.spectrum.gain()), -100.0, 18.0),
+        MidiAction::AgcGain => scale(connected.spectrum.agc_params().agc_top_db, 0.0, 140.0),
+        MidiAction::MicGain => {
+            if !(connected.tx_enabled && connected.tx_handle.is_some()) {
+                return None;
+            }
+            scale(db(connected.mic_gain), -60.0, 6.0)
+        }
+        MidiAction::RfAttenuation => {
+            let v = connected.session.rx_attenuation.load(Ordering::Relaxed) as f64;
+            if connected.device.protocol == 1
+                && matches!(connected.device.board, Boards::HermesLite | Boards::HermesLite2)
+            {
+                scale(v - 12.0, -12.0, 48.0)
+            } else if connected.device.board == Boards::RtlSdr {
+                scale(v, 0.0, 50.0)
+            } else if connected.device.board == Boards::MsiSdr {
+                scale(v, 0.0, mirisdr::MAX_GAIN_DB as f64)
+            } else if connected.device.board == Boards::Pluto {
+                scale(v, 0.0, pluto::MAX_GAIN_DB as f64)
+            } else {
+                scale(v, 0.0, 31.0)
+            }
+        }
+        MidiAction::TxDrive => {
+            if !connected.tx_enabled || connected.max_tx_power_watts == 0 {
+                return None;
+            }
+            let watts = connected.session.tx_power_watts.load(Ordering::Relaxed) as f64;
+            scale(watts, 0.0, connected.max_tx_power_watts as f64)
+        }
+        MidiAction::CwSpeed => scale(connected.session.cw_keyer.speed_wpm.load(Ordering::Relaxed) as f64, 1.0, 60.0),
+        MidiAction::CwSidetoneLevel => connected.session.cw_keyer.sidetone_volume.load(Ordering::Relaxed).min(127) as u8,
+        MidiAction::CwSidetoneFreq => {
+            scale(connected.session.cw_keyer.sidetone_freq_hz.load(Ordering::Relaxed) as f64, 100.0, 1000.0)
+        }
+        MidiAction::CwPitch => scale(spectrum::cw_pitch_hz(), 300.0, 1000.0),
+        MidiAction::FilterWidth => scale(connected.spectrum.width_hz(), 50.0, 5000.0),
+        _ => return None,
+    })
+}
+
+/// MIDI feedback (issue #15; midi::MidiWorker::feedback): sends each Knob
+/// binding's control the app's value whenever it changes other than by
+/// that control -- the on-screen slider, a keyboard shortcut, CAT/TCI, a
+/// saved setting on connecting -- so a controller that shows or holds a
+/// position (motor faders, LED rings, a keyer's display, a pod that
+/// sends absolute values) stays in step instead of jumping the value when
+/// next touched. Everything is sent once on (re)connecting.
+fn midi_feedback(connected: &mut ConnectedState) {
+    if !connected.midi.feedback.load(Ordering::Relaxed) || !connected.midi.output_connected() {
+        return;
+    }
+    let generation = connected.midi.output_generation.load(Ordering::Relaxed);
+    if generation != connected.midi_feedback_generation {
+        connected.midi_feedback_generation = generation;
+        connected.midi_feedback_sent.clear();
+    }
+    for i in 0..connected.midi_bindings.len() {
+        let binding = connected.midi_bindings[i];
+        if binding.kind != MidiBindingKind::Knob {
+            continue;
+        }
+        let Some(value) = midi_knob_value(connected, binding.action) else { continue };
+        let key = (binding.event, binding.channel, binding.number);
+        if connected.midi_feedback_sent.get(&key) == Some(&value) {
+            continue;
+        }
+        if let Some(message) = midi::feedback_message(&binding, value) {
+            connected.midi.send(&message);
+        }
+        connected.midi_feedback_sent.insert(key, value);
+    }
 }
 
 #[derive(Copy, Clone, PartialEq, Eq)]
@@ -2111,6 +2215,8 @@ struct MidiLearnState {
     /// unlimited a loaded-from-disk binding predating this field gets),
     /// since 0 is exactly the behavior that prompted adding this.
     debounce_ms: u32,
+    /// Wheel bindings only -- see MidiBinding::reverse.
+    reverse: bool,
     /// `Some(i)` while editing `ConnectedState::midi_bindings[i]`, `None`
     /// while building a brand new binding from a fresh capture.
     edit_index: Option<usize>,
@@ -2127,6 +2233,7 @@ impl Default for MidiLearnState {
             momentary: false,
             sensitivity: 1.0,
             debounce_ms: 25,
+            reverse: false,
             edit_index: None,
         }
     }
@@ -2204,6 +2311,13 @@ struct ConnectedState {
     /// (a fresh one each connection is correct -- there's nothing to
     /// "resume" about a debounce timer).
     midi_wheel_last_step: std::collections::HashMap<(MidiEventKind, Option<u8>, u8), Instant>,
+    /// MIDI feedback (midi::MidiWorker::feedback): the value each Knob
+    /// binding's control was last sent or moved to, so only changes are
+    /// sent -- and a control's own movement isn't echoed back to it --
+    /// and the output connection it applies to (MidiWorker::
+    /// output_generation; a new connection sends everything afresh).
+    midi_feedback_sent: std::collections::HashMap<(MidiEventKind, Option<u8>, u8), u8>,
+    midi_feedback_generation: u32,
     audio_output: Option<AudioOutput>,
     /// Selected output device name for `audio_output` above (Settings ->
     /// Audio's "Output device" picker) -- see ExtraReceiver's identical
@@ -3808,8 +3922,16 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                 Arc::clone(&session.cw_keyer),
             );
             cw_sidetone.enabled.store(cfg.cw_pc_sidetone_enabled.unwrap_or(false), Ordering::Relaxed);
-            let midi = MidiWorker::start();
+            let midi = MidiWorker::start(midi::MidiCwTarget {
+                mox: Arc::clone(&session.mox),
+                cw: Arc::clone(&session.cw_keyer),
+                tx_frequency_hz: Arc::clone(&session.tx_frequency_hz),
+                allow_out_of_band_tx: Arc::clone(&allow_out_of_band_tx),
+                cw_mode: Arc::clone(&session.cw_mode_active),
+                tx_available: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            });
             midi.enabled.store(cfg.midi_enabled.unwrap_or(false), Ordering::Relaxed);
+            midi.feedback.store(cfg.midi_feedback.unwrap_or(false), Ordering::Relaxed);
             *midi.device_name.lock().unwrap() = cfg.midi_device_name.clone();
             let midi_bindings = cfg.midi_bindings.clone();
             Ok(ConnectedState {
@@ -3825,6 +3947,8 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                 midi_unmatched_last_logged: None,
                 midi_import_message: None,
                 midi_wheel_last_step: std::collections::HashMap::new(),
+                midi_feedback_sent: std::collections::HashMap::new(),
+                midi_feedback_generation: 0,
                 audio_output,
                 audio_output_device,
                 tx_audio_monitor_output: None,
@@ -4682,6 +4806,10 @@ impl eframe::App for HpsdrApp {
                 // button is active, the first event is captured for the
                 // binding-editor form instead of being dispatched --
                 // piHPSDR's own "MIDI Configure" behavior.
+                // The MIDI thread acts on a CW key itself (midi::MidiCwKey):
+                // tell it which controls are CW keys, and whether it may key.
+                connected.midi.cw_key.set_bindings(&connected.midi_bindings);
+                connected.midi.cw_key.set_tx_available(connected.tx_enabled && connected.tx_handle.is_some());
                 loop {
                     let ev = {
                         let mut events = connected.midi.events.lock().unwrap();
@@ -4695,6 +4823,7 @@ impl eframe::App for HpsdrApp {
                     }
                     dispatch_midi_event(connected, ev, freq_hz, sample_rate, passband);
                 }
+                midi_feedback(connected);
 
                 let current_gain = connected.spectrum.gain();
                 let current_agc = connected.spectrum.agc();
@@ -8744,6 +8873,31 @@ impl eframe::App for HpsdrApp {
                                         MidiStatus::Error(e) => format!("Error: {e}"),
                                     };
                                     ui.label(format!("Status: {status_text}"));
+                                    {
+                                        let mut feedback = connected.midi.feedback.load(Ordering::Relaxed);
+                                        if ui
+                                            .checkbox(&mut feedback, "Send changes back to the device")
+                                            .on_hover_text(
+                                                "When a value bound to a knob or slider (AF Gain, Mic Gain, \
+                                                 CW Speed, ...) changes in the app, send the control its new \
+                                                 position, so a controller that shows or holds one (motor \
+                                                 faders, LED rings, a keyer's display) stays in step and \
+                                                 doesn't jump the value when next touched. Sent to the \
+                                                 device's MIDI output of the same name.",
+                                            )
+                                            .changed()
+                                        {
+                                            connected.midi.feedback.store(feedback, Ordering::Relaxed);
+                                            settings_changed = true;
+                                        }
+                                        if feedback && matches!(*connected.midi.status.lock().unwrap(), MidiStatus::Connected(_)) {
+                                            ui.weak(if connected.midi.output_connected() {
+                                                "Sending to the device's MIDI output."
+                                            } else {
+                                                "The device has no MIDI output of the same name (yet) -- nothing sent."
+                                            });
+                                        }
+                                    }
 
                                     ui.add_space(8.0);
                                     ui.separator();
@@ -8882,6 +9036,20 @@ impl eframe::App for HpsdrApp {
                                                     connected.midi_learn.debounce_ms = debounce_ms as u32;
                                                 }
                                             });
+                                            ui.checkbox(&mut connected.midi_learn.reverse, "Reverse").on_hover_text(
+                                                "Turn the other way -- for an encoder that counts the \
+                                                 opposite way to what you want, without changing the \
+                                                 controller (which another program may need as it is).",
+                                            );
+                                        }
+                                        if binding_kind == MidiBindingKind::Key
+                                            && connected.midi_learn.selected_action == Some(MidiAction::CwKey)
+                                        {
+                                            ui.weak(
+                                                "Key down while the note is held. Keys the radio in CWL/CWU \
+                                                 with transmit armed, and unkeys once the key has been up \
+                                                 for the Break-in Delay (Settings -> CW).",
+                                            );
                                         }
 
                                         ui.horizontal(|ui| {
@@ -8908,6 +9076,7 @@ impl eframe::App for HpsdrApp {
                                                         momentary: connected.midi_learn.momentary,
                                                         sensitivity: connected.midi_learn.sensitivity,
                                                         debounce_ms: connected.midi_learn.debounce_ms,
+                                                        reverse: connected.midi_learn.reverse,
                                                     };
                                                     if let Some(i) = connected.midi_learn.edit_index {
                                                         connected.midi_bindings[i] = binding;
@@ -9026,6 +9195,7 @@ impl eframe::App for HpsdrApp {
                                                 ui.label("Momentary");
                                                 ui.label("Sensitivity");
                                                 ui.label("Rate Limit");
+                                                ui.label("Reverse");
                                                 ui.label("");
                                                 ui.end_row();
                                                 for (i, binding) in connected.midi_bindings.iter().enumerate() {
@@ -9059,6 +9229,7 @@ impl eframe::App for HpsdrApp {
                                                     } else {
                                                         String::new()
                                                     });
+                                                    ui.label(if binding.reverse { "Yes" } else { "" });
                                                     ui.horizontal(|ui| {
                                                         if ui.small_button("Edit").clicked() {
                                                             edit_request = Some((i, *binding));
@@ -9087,6 +9258,7 @@ impl eframe::App for HpsdrApp {
                                                 momentary: binding.momentary,
                                                 sensitivity: binding.sensitivity,
                                                 debounce_ms: binding.debounce_ms,
+                                                reverse: binding.reverse,
                                                 edit_index: Some(i),
                                             };
                                         }
@@ -12403,6 +12575,7 @@ impl eframe::App for HpsdrApp {
                         midi_enabled: Some(connected.midi.enabled.load(Ordering::Relaxed)),
                         midi_device_name: connected.midi.device_name.lock().unwrap().clone(),
                         midi_bindings: connected.midi_bindings.clone(),
+                        midi_feedback: Some(connected.midi.feedback.load(Ordering::Relaxed)),
                     }
                     .save(connected.device.mac);
                 }

@@ -612,6 +612,10 @@ pub struct Config {
     /// keyed list, same precedent as `xvtrs` above, not a flat field.
     #[serde(default)]
     pub midi_bindings: Vec<crate::midi::MidiBinding>,
+    /// Send control changes back to the MIDI device -- see
+    /// midi::MidiWorker::feedback. Missing = off.
+    #[serde(default)]
+    pub midi_feedback: Option<bool>,
 }
 
 fn default_nb_threshold() -> f64 {

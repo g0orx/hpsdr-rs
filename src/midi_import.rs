@@ -195,6 +195,7 @@ pub fn import_thetis_midi2cat(xml: &str) -> Result<ImportResult, String> {
                 momentary: false,
                 sensitivity: 1.0,
                 debounce_ms: 0,
+                reverse: false,
             }),
             None => Err(format!("CAT command id {} has no hpsdr-rs equivalent", record.cat_cmd_id)),
         };
