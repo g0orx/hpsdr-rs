@@ -1265,6 +1265,9 @@ pub struct RadioSession {
     /// spectrum when it goes up: lost packets are gaps in the audio and
     /// jumps in the spectrum together.
     pub lost_packets: Arc<AtomicU64>,
+    /// IQ packets received from the radio since the session started, to
+    /// set lost_packets against (Settings -> About). 0 for USB radios.
+    pub received_packets: Arc<AtomicU64>,
     stop_flag: Arc<AtomicBool>,
     sender_thread: Option<JoinHandle<()>>,
     receiver_thread: Option<JoinHandle<()>>,
@@ -2258,6 +2261,8 @@ fn start_protocol1(
     let receiver_hl2_io_board = Arc::clone(&hl2_io_board);
     let lost_packets = Arc::new(AtomicU64::new(0));
     let receiver_lost_packets = Arc::clone(&lost_packets);
+    let received_packets = Arc::new(AtomicU64::new(0));
+    let receiver_received_packets = Arc::clone(&received_packets);
     let receiver_thread = thread::spawn(move || {
         receiver_loop(
             receiver_socket,
@@ -2279,6 +2284,7 @@ fn start_protocol1(
             receiver_diversity_main_raw_iq,
             receiver_hl2_io_board,
             receiver_lost_packets,
+            receiver_received_packets,
             receiver_stop,
         );
     });
@@ -2355,6 +2361,7 @@ fn start_protocol1(
         tx_fifo_underrun,
         tx_fifo_overrun,
         lost_packets,
+        received_packets,
         stop_flag,
         sender_thread: Some(sender_thread),
         receiver_thread: Some(receiver_thread),
@@ -2651,6 +2658,7 @@ fn start_protocol1_ozy_usb(
 
     // See RadioSession::lost_packets: nothing counts them over USB.
     let lost_packets = Arc::new(AtomicU64::new(0));
+    let received_packets = Arc::new(AtomicU64::new(0));
     Ok(RadioSession {
         iq_buffers,
         frequency_hz,
@@ -2718,6 +2726,7 @@ fn start_protocol1_ozy_usb(
         tx_fifo_underrun,
         tx_fifo_overrun,
         lost_packets,
+        received_packets,
         stop_flag,
         sender_thread: Some(sender_thread),
         receiver_thread: Some(receiver_thread),
@@ -2927,6 +2936,7 @@ fn start_rx888_usb(
 
     // See RadioSession::lost_packets: nothing counts them over USB.
     let lost_packets = Arc::new(AtomicU64::new(0));
+    let received_packets = Arc::new(AtomicU64::new(0));
     Ok(RadioSession {
         iq_buffers,
         frequency_hz,
@@ -2994,6 +3004,7 @@ fn start_rx888_usb(
         tx_fifo_underrun,
         tx_fifo_overrun,
         lost_packets,
+        received_packets,
         stop_flag,
         sender_thread: None,
         receiver_thread: Some(receiver_thread),
@@ -3170,6 +3181,7 @@ fn start_usb_dongle(
 
     // See RadioSession::lost_packets: nothing counts them over USB.
     let lost_packets = Arc::new(AtomicU64::new(0));
+    let received_packets = Arc::new(AtomicU64::new(0));
     Ok(RadioSession {
         iq_buffers,
         frequency_hz,
@@ -3237,6 +3249,7 @@ fn start_usb_dongle(
         tx_fifo_underrun,
         tx_fifo_overrun,
         lost_packets,
+        received_packets,
         stop_flag,
         sender_thread: None,
         receiver_thread: Some(receiver_thread),
@@ -6340,6 +6353,7 @@ fn receiver_loop(
     diversity_main_raw_iq: Arc<Mutex<VecDeque<IqSample>>>,
     hl2_io_board: Arc<Hl2IoBoardShared>,
     lost_packets: Arc<AtomicU64>,
+    received_packets: Arc<AtomicU64>,
     stop: Arc<AtomicBool>,
 ) {
     let mut sequence = SequenceGaps::default();
@@ -6362,6 +6376,7 @@ fn receiver_loop(
         match socket.recv(&mut buf) {
             Ok(n) if n == PACKET_SIZE => {
                 if buf[0] == 0xEF && buf[1] == 0xFE && buf[2] == 0x01 && buf[3] == EP_IQ_DATA {
+                    received_packets.fetch_add(1, Ordering::Relaxed);
                     let seq = u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]);
                     let lost = sequence.lost_before(seq);
                     if lost > 0 {
@@ -7513,6 +7528,8 @@ fn start_protocol2(
     let receiver_puresignal_enabled = Arc::clone(&puresignal_enabled);
     let lost_packets = Arc::new(AtomicU64::new(0));
     let receiver_lost_packets = Arc::clone(&lost_packets);
+    let received_packets = Arc::new(AtomicU64::new(0));
+    let receiver_received_packets = Arc::clone(&received_packets);
     let receiver_thread = thread::spawn(move || {
         p2_receiver_loop(
             receiver_socket,
@@ -7535,6 +7552,7 @@ fn start_protocol2(
             receiver_diversity_enabled,
             receiver_diversity_main_raw_iq,
             receiver_lost_packets,
+            receiver_received_packets,
             receiver_stop,
         );
     });
@@ -7611,6 +7629,7 @@ fn start_protocol2(
         tx_fifo_underrun,
         tx_fifo_overrun,
         lost_packets,
+        received_packets,
         stop_flag,
         sender_thread: Some(sender_thread),
         receiver_thread: Some(receiver_thread),
@@ -8735,6 +8754,7 @@ fn p2_receiver_loop(
     diversity_enabled: Arc<AtomicBool>,
     diversity_main_raw_iq: Arc<Mutex<VecDeque<IqSample>>>,
     lost_packets: Arc<AtomicU64>,
+    received_packets: Arc<AtomicU64>,
     stop: Arc<AtomicBool>,
 ) {
     let mut buf = [0u8; P2_PACKET_SIZE + 64];
@@ -8799,6 +8819,7 @@ fn p2_receiver_loop(
                         eprintln!("radio: first IQ packet received for DDC{ddc} (port {port})");
                     }
                     if n == P2_PACKET_SIZE {
+                        received_packets.fetch_add(1, Ordering::Relaxed);
                         let seq = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]);
                         let lost = ddc_sequence[ddc].lost_before(seq);
                         if lost > 0 {
@@ -8953,11 +8974,16 @@ const RECEIVE_BUFFER_BYTES: usize = 1 << 20;
 fn enlarge_receive_buffer(socket: &UdpSocket) {
     let sock = socket2::SockRef::from(socket);
     if let Err(e) = sock.set_recv_buffer_size(RECEIVE_BUFFER_BYTES) {
-        eprintln!("radio: couldn't enlarge the receive buffer: {e}");
+        eprintln!("{} radio: couldn't enlarge the receive buffer: {e}", crate::iq_recorder::iso8601_now());
     }
     match sock.recv_buffer_size() {
-        Ok(n) => eprintln!("radio: receive buffer {} KB (asked for {} KB)", n / 1024, RECEIVE_BUFFER_BYTES / 1024),
-        Err(e) => eprintln!("radio: couldn't read the receive buffer size: {e}"),
+        Ok(n) => eprintln!(
+            "{} radio: receive buffer {} KB (asked for {} KB)",
+            crate::iq_recorder::iso8601_now(),
+            n / 1024,
+            RECEIVE_BUFFER_BYTES / 1024
+        ),
+        Err(e) => eprintln!("{} radio: couldn't read the receive buffer size: {e}", crate::iq_recorder::iso8601_now()),
     }
 }
 

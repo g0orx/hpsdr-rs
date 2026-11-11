@@ -2812,6 +2812,14 @@ struct ConnectedState {
     stutter_warning_until: Option<Instant>,
     /// When the last rise was logged (at most every 5 s).
     stutter_logged_at: Option<Instant>,
+    /// Settings -> About's link statistics: counted from here (connect,
+    /// or its Reset), against these raw counts (packets lost, packets
+    /// received, audio gaps) as they were then.
+    stutter_since: Instant,
+    stutter_base: (u64, u64, u64),
+    /// When packets were last lost and the audio last had a gap (UTC).
+    last_loss_utc: Option<String>,
+    last_gap_utc: Option<String>,
     /// Edge-tracks session.mox_active() so tx_spectrum.clear_display()
     /// only fires once per fresh PTT (not every frame while
     /// transmitting) -- see that method's doc comment for why a long-
@@ -2967,6 +2975,38 @@ fn system_theme(ctx: &egui::Context) -> egui::ThemePreference {
     match DESKTOP.load(Ordering::Relaxed) {
         2 => egui::ThemePreference::Light,
         _ => egui::ThemePreference::Dark,
+    }
+}
+
+/// Packets lost and received from the radio, and gaps in the speaker
+/// audio, since connecting or Settings -> About's Reset (see
+/// ConnectedState::stutter_base). Saturating: the audio count starts
+/// again at 0 when the output device is changed.
+fn stutter_counts(connected: &ConnectedState) -> (u64, u64, u64) {
+    let (lost0, received0, gaps0) = connected.stutter_base;
+    (
+        connected.session.lost_packets.load(Ordering::Relaxed).saturating_sub(lost0),
+        connected.session.received_packets.load(Ordering::Relaxed).saturating_sub(received0),
+        connected.audio_output.as_ref().map_or(0, |a| a.gaps()).saturating_sub(gaps0),
+    )
+}
+
+/// UTC time of day now, e.g. "14:03:22 UTC".
+fn utc_time_now() -> String {
+    let iso = iq_recorder::iso8601_now(); // YYYY-MM-DDTHH:MM:SSZ
+    format!("{} UTC", &iso[11..19])
+}
+
+/// A duration as "1h 02m 13s", "2m 13s" or "13s".
+fn format_duration(d: Duration) -> String {
+    let s = d.as_secs();
+    let (h, m, s) = (s / 3600, s % 3600 / 60, s % 60);
+    if h > 0 {
+        format!("{h}h {m:02}m {s:02}s")
+    } else if m > 0 {
+        format!("{m}m {s:02}s")
+    } else {
+        format!("{s}s")
     }
 }
 
@@ -3955,6 +3995,10 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                 stutter_seen: (0, 0),
                 stutter_warning_until: None,
                 stutter_logged_at: None,
+                stutter_since: Instant::now(),
+                stutter_base: (0, 0, 0),
+                last_loss_utc: None,
+                last_gap_utc: None,
                 tx_spectrum_mox_was_active: false,
                 puresignal_enabled: settings.puresignal_enabled,
                 puresignal_reserve: settings.puresignal_reserve,
@@ -7666,15 +7710,24 @@ impl eframe::App for HpsdrApp {
                         // Lost packets and audio gaps share this row (see
                         // ConnectedState::stutter_seen); a TX FIFO warning,
                         // only while transmitting, takes it first.
-                        let lost = connected.session.lost_packets.load(Ordering::Relaxed);
-                        let gaps = connected.audio_output.as_ref().map_or(0, |a| a.gaps());
+                        let (lost, _, gaps) = stutter_counts(connected);
                         if (lost, gaps) != connected.stutter_seen {
                             let now = Instant::now();
+                            if lost > connected.stutter_seen.0 {
+                                connected.last_loss_utc = Some(utc_time_now());
+                            }
+                            if gaps > connected.stutter_seen.1 {
+                                connected.last_gap_utc = Some(utc_time_now());
+                            }
                             if lost > connected.stutter_seen.0 || gaps > connected.stutter_seen.1 {
                                 connected.stutter_warning_until = Some(now + Duration::from_secs(5));
                                 if connected.stutter_logged_at.is_none_or(|t| now - t >= Duration::from_secs(5)) {
                                     connected.stutter_logged_at = Some(now);
-                                    eprintln!("stutter: {lost} packets lost from the radio, {gaps} gaps in the audio so far");
+                                    eprintln!(
+                                        "{} stutter: {lost} packets lost from the radio, {gaps} gaps in the audio in {}",
+                                        iq_recorder::iso8601_now(),
+                                        format_duration(connected.stutter_since.elapsed())
+                                    );
                                 }
                             }
                             connected.stutter_seen = (lost, gaps);
@@ -7696,11 +7749,13 @@ impl eframe::App for HpsdrApp {
                                         readable(ui, egui::Color32::from_rgb(230, 150, 50)),
                                     );
                                     fifo_row_resp.on_hover_text(format!(
-                                        "Since connecting: {lost} packets from the radio lost on the way, \
+                                        "In the last {}: {lost} packets from the radio lost on the way, \
                                          {gaps} gaps in the audio.\n\nLost packets mean the network, or \
                                          this computer too busy to take them in time -- try a cable \
                                          rather than Wi-Fi, or a lower sample rate. Audio gaps without \
-                                         lost packets point to the sound card or a busy computer."
+                                         lost packets point to the sound card or a busy computer. \
+                                         Settings -> About has the details.",
+                                        format_duration(connected.stutter_since.elapsed())
                                     ));
                                 } else {
                                     connected.stutter_warning_until = None;
@@ -8900,6 +8955,58 @@ impl eframe::App for HpsdrApp {
                                             ui.end_row();
                                         }
                                     });
+
+                                    // Link statistics: lost packets (network radios
+                                    // only) and audio gaps, since connecting or Reset.
+                                    // See ConnectedState::stutter_since.
+                                    ui.add_space(16.0);
+                                    ui.separator();
+                                    ui.add_space(8.0);
+                                    let (lost, received, gaps) = stutter_counts(connected);
+                                    let counts_packets = matches!(connected.device.protocol, 1 | 2)
+                                        && !matches!(
+                                            connected.device.board,
+                                            Boards::Ozy | Boards::Rx888 | Boards::RtlSdr | Boards::MsiSdr | Boards::Pluto
+                                        );
+                                    egui::Grid::new("about_link_grid").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
+                                        ui.label("Counting for:");
+                                        ui.label(format_duration(connected.stutter_since.elapsed()));
+                                        ui.end_row();
+                                        if counts_packets {
+                                            ui.label("Packets lost:");
+                                            let expected = lost + received;
+                                            let percent = if expected > 0 { 100.0 * lost as f64 / expected as f64 } else { 0.0 };
+                                            ui.label(format!("{lost} of {expected} ({percent:.3}%)"));
+                                            ui.end_row();
+                                            ui.label("Last lost:");
+                                            ui.label(connected.last_loss_utc.as_deref().unwrap_or("never"));
+                                            ui.end_row();
+                                        }
+                                        ui.label("Audio gaps:");
+                                        ui.label(gaps.to_string());
+                                        ui.end_row();
+                                        ui.label("Last gap:");
+                                        ui.label(connected.last_gap_utc.as_deref().unwrap_or("never"));
+                                        ui.end_row();
+                                    });
+                                    if ui
+                                        .button("Reset")
+                                        .on_hover_text("Count again from now, e.g. after changing from Wi-Fi to a cable")
+                                        .clicked()
+                                    {
+                                        connected.stutter_base = (
+                                            connected.session.lost_packets.load(Ordering::Relaxed),
+                                            connected.session.received_packets.load(Ordering::Relaxed),
+                                            connected.audio_output.as_ref().map_or(0, |a| a.gaps()),
+                                        );
+                                        connected.stutter_since = Instant::now();
+                                        connected.stutter_seen = (0, 0);
+                                        connected.stutter_warning_until = None;
+                                        connected.last_loss_utc = None;
+                                        connected.last_gap_utc = None;
+                                    }
+                                    // Keep the timer and counts moving while this is open.
+                                    ui.ctx().request_repaint_after(Duration::from_secs(1));
 
                                     ui.add_space(16.0);
                                     ui.separator();
