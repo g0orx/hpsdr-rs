@@ -3026,6 +3026,8 @@ struct HpsdrApp {
     ui_prefs: config::UiPrefs,
     /// The theme last given to egui, to set it again only when it changes.
     applied_theme: Option<egui::ThemePreference>,
+    /// The main window's minimum size last sent, see main_window_min_size.
+    applied_min_size: Option<egui::Vec2>,
 }
 
 /// Settings -> Spectrum's Theme choice (config::ThemeChoice as a u8). A
@@ -3214,6 +3216,7 @@ impl HpsdrApp {
             main_window_geometry: None,
             ui_prefs,
             applied_theme: Some(egui::ThemePreference::Dark),
+            applied_min_size: None,
         }
     }
 }
@@ -4195,6 +4198,17 @@ impl eframe::App for HpsdrApp {
             config::ThemeChoice::Light => egui::ThemePreference::Light,
             config::ThemeChoice::System => system_theme(ui.ctx()),
         };
+        // The window's minimum size follows the UI scale and the waterfall,
+        // see main_window_min_size.
+        let waterfall = match &self.state {
+            AppState::Connected(c) => c.waterfall_enabled,
+            _ => true,
+        };
+        let min_size = main_window_min_size(zoom, waterfall);
+        if Some(min_size) != self.applied_min_size {
+            self.applied_min_size = Some(min_size);
+            ui.ctx().send_viewport_cmd(egui::ViewportCommand::MinInnerSize(min_size));
+        }
         if Some(theme) != self.applied_theme {
             self.applied_theme = Some(theme);
             ui.ctx().set_theme(theme);
@@ -6955,10 +6969,11 @@ impl eframe::App for HpsdrApp {
                     let below_waterfall_reserve = 2.0 * (ui.spacing().interact_size.y + 8.0)
                         + SPECTRUM_WATERFALL_DIVIDER_HEIGHT;
                     // 120, not 200: lets the window go down to its
-                    // minimum (see main's with_min_inner_size) without
-                    // pushing Zoom/Pan and Stop off the bottom.
-                    let spectrum_waterfall_height =
-                        (ui.available_height() - below_waterfall_reserve).max(120.0);
+                    // minimum (see main_window_min_size) without
+                    // pushing Zoom/Pan off the bottom. The spectrum
+                    // alone, with the waterfall off, can go shorter.
+                    let spectrum_waterfall_height = (ui.available_height() - below_waterfall_reserve)
+                        .max(if connected.waterfall_enabled { 120.0 } else { SPECTRUM_ONLY_MIN_HEIGHT });
                     // Waterfall disabled (Settings -> Spectrum): give the
                     // spectrum trace the FULL combined height instead of
                     // its ratio-based share -- no divider to drag against
@@ -13560,6 +13575,23 @@ fn render_psk_beacon_panel_beside(ui: &mut egui::Ui, connected: &mut ConnectedSt
 /// line, an expand button and what they're set to -- band, mode and filter
 /// width, and audio gain (red while muted). Returns true if it was
 /// expanded.
+/// How short the main window's spectrum can get with the waterfall off,
+/// in place of the 120 the spectrum and waterfall together keep.
+const SPECTRUM_ONLY_MIN_HEIGHT: f32 = 50.0;
+
+/// The main window's minimum size: room for the VFO row, the control rows
+/// folded (ConnectedState::controls_minimized), the spectrum and waterfall
+/// at their minimum and the rows under them -- 900 x 360 at 100%. It's in
+/// the desktop's points, which the UI scale doesn't shrink, so it's scaled
+/// here: REAL REQUEST (2026-11-11), at 80% with the waterfall off and the
+/// controls folded the window couldn't be made shorter, and the spectrum
+/// took up the difference. With the waterfall off the spectrum alone can
+/// be shorter too (SPECTRUM_ONLY_MIN_HEIGHT).
+fn main_window_min_size(zoom: f32, waterfall: bool) -> egui::Vec2 {
+    let height = if waterfall { 360.0 } else { 360.0 - (120.0 - SPECTRUM_ONLY_MIN_HEIGHT) };
+    egui::vec2(900.0, height) * zoom
+}
+
 fn controls_strip(ui: &mut egui::Ui, connected: &mut ConnectedState) -> bool {
     let dial = if connected.ctun {
         connected.ctun_frequency_hz
@@ -17107,7 +17139,7 @@ fn main() -> eframe::Result<()> {
             // window still shows everything down to Stop at 360, with
             // spectrum_waterfall_height's own minimum lowered to match.
             // Unfolded, that small a window cuts off the bottom.
-            .with_min_inner_size([900.0, 360.0])
+            .with_min_inner_size(main_window_min_size(1.0, true))
             .with_icon(icon),
         wgpu_options: eframe::egui_wgpu::WgpuConfiguration {
             surface: eframe::egui_wgpu::SurfaceConfig {
