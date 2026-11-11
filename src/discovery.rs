@@ -221,13 +221,24 @@ fn board_info_p1(
         // "Hermes v5.4"): taken for a Hermes, it never got the HL2's
         // PA-enable bit (address 0x09 C2 0x08), so +VPA stayed off though
         // the TX LED lit. But Apache's Hermes gateware fills bytes 19 and
-        // 20 too (Thetis reads them as Metis version and receiver count),
+        // 20 too (with 0x01, see the next arm; Thetis reads them as Metis
+        // version and receiver count),
         // so those alone took an ANAN-10E for an HL2 (REAL REPORT, v0.12.0):
         // the HL2's MAC prefix has to match as well.
         1 if hl2_mac && (1..=31).contains(&(buf20 & 0x3F)) && (1..=12).contains(&buf19) => {
             (Boards::HermesLite2, 1, buf19, 1, 0, 38_400_000)
         }
-        1 => (Boards::Hermes, 1, 5, 1, 0, 61_440_000),
+        // The discovery reply doesn't say how many receivers a Hermes has:
+        // after the MAC and version, Apache's Hermes gateware fills the rest
+        // with 0x01 (Tx_MAC.v, "send 50 x 0x01s"), so bytes 19 and 20 are
+        // always 1. The version tells them apart. The ANAN-10E and 100B
+        // (Hermes10E v1.x, `NR = 2` in Hermes.v) build 2 receivers; Hermes
+        // and the ANAN-10/100 (v2.x/v3.x, `NR = 4`) build 4. Hermes v1.x
+        // from 2012 had 2 as well. Asking for more than that gets a
+        // receiver the FPGA doesn't have. REAL REPORT (2026-11-11, ANAN-10E
+        // v1.5): "Add Receiver" offered 5.
+        1 if version < 20 => (Boards::Hermes, 1, 2, 1, 0, 61_440_000),
+        1 => (Boards::Hermes, 1, 4, 1, 0, 61_440_000),
         4 => (Boards::Angelia, 2, 7, 1, 0, 61_440_000),
         5 => (Boards::Orion, 2, 7, 1, 0, 61_440_000),
         6 => {
@@ -806,11 +817,36 @@ mod tests {
         assert_eq!(Device::from_p1_reply(&reply, addr, addr).unwrap().board, Boards::Hermes);
         // An ANAN-10E fills bytes 19 and 20 too, but isn't an HL2's MAC
         // (REAL REPORT, v0.12.0 showed one as a Hermes-Lite 2).
+        let anan10e = apache_hermes_reply(15);
+        let device = Device::from_p1_reply(&anan10e, addr, addr).unwrap();
+        assert_eq!(device.board, Boards::Hermes);
+    }
+
+    /// A discovery reply as Apache's Hermes gateware sends it (Tx_MAC.v):
+    /// MAC, version, then 0x01 to the end -- board id 1 included.
+    fn apache_hermes_reply(version: u8) -> Vec<u8> {
+        let mut reply = vec![0x01u8; 60];
+        reply[..3].copy_from_slice(&[0xEF, 0xFE, 0x02]);
         reply[3..9].copy_from_slice(&[0x00, 0x04, 0xA3, 0x12, 0x34, 0x56]);
-        reply[9] = 31;
-        reply[19] = 4;
-        reply[20] = 4;
-        assert_eq!(Device::from_p1_reply(&reply, addr, addr).unwrap().board, Boards::Hermes);
+        reply[9] = version;
+        reply
+    }
+
+    /// An ANAN-10E/100B (Hermes10E v1.5) has 2 receivers and no room for
+    /// PureSignal's feedback on receivers 3 and 4; Hermes and the ANAN-10/100
+    /// (v3.3, v3.2) have 4.
+    #[test]
+    fn hermes_receivers_follow_the_firmware() {
+        let addr: SocketAddr = "192.168.1.45:1024".parse().unwrap();
+        for (version, receivers) in [(15, 2), (33, 4), (32, 4)] {
+            let device = Device::from_p1_reply(&apache_hermes_reply(version), addr, addr).unwrap();
+            assert_eq!((device.board, device.supported_receivers), (Boards::Hermes, receivers), "v{version}");
+            assert_eq!(
+                crate::radio::puresignal_supported(1, device.board, device.supported_receivers),
+                receivers == 4,
+                "v{version}"
+            );
+        }
     }
 
     /// A Brick2's real P2 discovery reply (from a Wireshark capture,
@@ -826,7 +862,7 @@ mod tests {
         assert_eq!(device.board, Boards::Hermes);
         assert_eq!(device.supported_receivers, 2);
         // Its receivers start at DDC0: no DDC0/DDC1 reservation.
-        assert!(!crate::radio::puresignal_supported(2, device.board));
+        assert!(!crate::radio::puresignal_supported(2, device.board, device.supported_receivers));
         // A reply without the count keeps the board table's.
         reply[20] = 0;
         assert_eq!(Device::from_p2_reply(&reply, addr, addr).unwrap().supported_receivers, 5);

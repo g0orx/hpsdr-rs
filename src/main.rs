@@ -3316,7 +3316,7 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
     settings.puresignal_reserve = cfg.puresignal_reserve.unwrap_or(true);
     settings.puresignal_enabled = cfg.puresignal_enabled.unwrap_or(false)
         && settings.puresignal_reserve
-        && radio::puresignal_supported(device.protocol, device.board);
+        && radio::puresignal_supported(device.protocol, device.board, device.supported_receivers);
     settings.diversity_enabled = cfg.diversity_enabled.unwrap_or(false);
     settings.diversity_gain_db = cfg.diversity_gain_db.unwrap_or(0.0);
     settings.diversity_phase_deg = cfg.diversity_phase_deg.unwrap_or(0.0);
@@ -4165,7 +4165,7 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                 puresignal_enabled: settings.puresignal_enabled,
                 puresignal_reserve: settings.puresignal_reserve,
                 puresignal_reserved: settings.puresignal_reserve
-                    && radio::puresignal_supported(device.protocol, device.board),
+                    && radio::puresignal_supported(device.protocol, device.board, device.supported_receivers),
                 diversity_enabled: settings.diversity_enabled,
                 eq_tab_is_tx: false,
                 ps_was_correcting: false,
@@ -8234,7 +8234,11 @@ impl eframe::App for HpsdrApp {
                                         continue;
                                     }
                                     if tab == SettingsTab::PureSignal
-                                        && !radio::puresignal_supported(connected.device.protocol, connected.device.board)
+                                        && !radio::puresignal_supported(
+                                            connected.device.protocol,
+                                            connected.device.board,
+                                            connected.device.supported_receivers,
+                                        )
                                     {
                                         continue;
                                     }

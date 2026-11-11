@@ -373,11 +373,12 @@ impl Default for RadioSettings {
 /// new_protocol.c's high-priority packet builder ("Set DDC0 and DDC1
 /// (synchronized) to the transmit frequency").
 /// Whether this board/protocol can run PureSignal here at all.
-pub fn puresignal_supported(protocol: u8, board: Boards) -> bool {
-    ps_feedback_config(protocol, board).is_some()
+/// `receivers` is how many the radio has (Device::supported_receivers).
+pub fn puresignal_supported(protocol: u8, board: Boards, receivers: u8) -> bool {
+    ps_feedback_config(protocol, board, receivers).is_some()
 }
 
-fn ps_feedback_config(protocol: u8, board: Boards) -> Option<(u8, u8, Option<u8>)> {
+fn ps_feedback_config(protocol: u8, board: Boards, receivers: u8) -> Option<(u8, u8, Option<u8>)> {
     match protocol {
         1 => match board {
             // piHPSDR feeds PureSignal through RX1 on these 2-receiver
@@ -386,7 +387,13 @@ fn ps_feedback_config(protocol: u8, board: Boards) -> Option<(u8, u8, Option<u8>
             // empty iq_buffers and a crash on connect (issue #12, Metis).
             // A Metis with Mercury/Penny has no feedback path anyway.
             Boards::Metis | Boards::HermesLite => None,
-            Boards::Hermes | Boards::Hermes2 | Boards::HermesLite2 => Some((2, 3, Some(2))),
+            // The feedback goes to receivers 3 and 4, so the radio has to
+            // have them. An ANAN-10E/100B has 2 (see discovery.rs's
+            // board_info_p1); piHPSDR/deskHPSDR feed its PureSignal through
+            // receivers 1 and 2 like a Metis ("anan10E ? 0 : 2"), which the
+            // whole-session reservation here can't do -- see Metis above.
+            Boards::Hermes | Boards::Hermes2 | Boards::HermesLite2 if receivers >= 4 => Some((2, 3, Some(2))),
+            Boards::Hermes | Boards::Hermes2 | Boards::HermesLite2 => None,
             Boards::Angelia | Boards::Orion | Boards::Orion2 => Some((3, 4, Some(3))),
             // Classic Ozy+Mercury+Penny hardware has no PureSignal
             // feedback ADC wiring in this project's scope (see
@@ -2056,7 +2063,7 @@ fn start_protocol1(
     // `settings.puresignal_reserve` off skips the reservation entirely,
     // exactly as on a board without PureSignal, so every receiver the
     // board has is available to "Add Receiver".
-    let ps_config = if settings.puresignal_reserve { ps_feedback_config(1, device.board) } else { None };
+    let ps_config = if settings.puresignal_reserve { ps_feedback_config(1, device.board, device.supported_receivers) } else { None };
     let mut real_receivers = match ps_config {
         Some((_, _, Some(max_real))) => settings.receivers.max(1).min(max_real),
         Some((_, _, None)) | None => settings.receivers.max(1),
@@ -7321,7 +7328,7 @@ fn start_protocol2(
     // `settings.puresignal_reserve` off skips the reservation: no DDC0/
     // DDC1 entries, real receivers start at DDC0 (`ps_supported` is
     // passed to both loops as `ps_reserved`).
-    let ps_supported = settings.puresignal_reserve && ps_feedback_config(2, device.board).is_some();
+    let ps_supported = settings.puresignal_reserve && ps_feedback_config(2, device.board, device.supported_receivers).is_some();
     let mut real_receivers = if ps_supported {
         settings.receivers.max(1).saturating_sub(2).max(1)
     } else {
