@@ -552,7 +552,8 @@ Below the meter:
 
 ## Stopping
 
-The **Stop** button at the bottom of the window disconnects from the radio
+The **Stop** button, under **Settings...** and **Add Receiver** at the top
+of the window, disconnects from the radio
 and returns to the discovery window.
 
 ---

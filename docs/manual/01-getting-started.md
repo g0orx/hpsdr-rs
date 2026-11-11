@@ -97,7 +97,8 @@ filter width, calibration, etc.) automatically -- each physical radio (by
 MAC address) keeps its own independent saved configuration, so switching
 between radios doesn't mix up their settings.
 
-To disconnect, use the **Stop** button at the bottom of the main window.
+To disconnect, use the **Stop** button under **Settings...** at the top of
+the main window.
 This returns you to the discovery window.
 
 If the spectrum stays blank with **Waiting for samples from the

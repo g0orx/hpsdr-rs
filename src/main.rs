@@ -5700,6 +5700,11 @@ impl eframe::App for HpsdrApp {
                                 } else {
                                     ui.weak(format!("All {max} receivers active"));
                                 }
+                                // Moved here from under the spectrum
+                                // (2026-11-11, real request).
+                                if ui.button("Stop").clicked() {
+                                    stop_clicked = true;
+                                }
                             });
 
                             (freq_label, vfo_b_label)
@@ -7702,9 +7707,6 @@ impl eframe::App for HpsdrApp {
 
                     ui.add_space(8.0);
                     ui.horizontal(|ui| {
-                        if ui.button("Stop").clicked() {
-                            stop_clicked = true;
-                        }
                         // See ConnectedState::status_message's doc
                         // comment. Wisdom generation takes priority
                         // while it's actually relevant (matches the
