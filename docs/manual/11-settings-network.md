@@ -272,10 +272,47 @@ named "rigctl" too.
 - Implements a practical subset of the TS-2000 command set: frequency,
   mode, PTT, S-meter, RIT/XIT, and a few identification/status commands.
   Commands with no clean equivalent in this app yet (drive/power level,
-  mic gain, CW keyer, memory channels) respond `?;` or are accepted with
+  mic gain, CW keyer speed, memory channels) respond `?;` or are accepted with
   no effect, rather than reporting a made-up value. XIT can only be
   toggled on/off (`XT`), not set to a specific value -- matches real
   Kenwood TS-2000 behavior, which has no such command either.
+- **Auto reporting**: a client that sends `AI1;` is then sent `FA...;`
+  whenever the frequency changes, and with `AI2;` also `MD...;` whenever
+  the mode changes, without having to ask.
+
+### CAT on serial ports
+
+The same CAT commands can be served on up to three serial ports
+(**Serial 1**-**3**), for equipment that follows the radio over a CAT
+cable rather than the network: an amplifier or automatic tuner that
+changes band with the radio, a band decoder switching antennas, or a
+program that only talks to a COM port (Windows: a virtual pair such as
+com0com connects it to hpsdr-rs).
+
+- **Port** -- type the name (`COM3` on Windows, `/dev/ttyUSB0` on Linux,
+  `/dev/cu.usbserial-...` on macOS), or pick one from the list next to it.
+  On Linux the list also offers `/dev/serial/by-id/...` names, which stay
+  the same whichever order USB adapters are plugged in.
+- **Baud** -- 4800 to 115200. Always 8 data bits, no parity, 1 stop bit, no
+  handshaking. Set the amplifier to **Kenwood** (TS-2000/TS-480) CAT at the
+  same speed.
+- **Auto report** -- send the frequency (`FA`) and mode (`MD`) when they
+  change, and once as soon as the port opens, without being asked. Tick it
+  for a device that only listens; leave it off for one that polls (most
+  amplifiers and programs send `FA;` or `IF;` themselves).
+- **Start**/**Stop** -- the status shows **Open**, or **Not open
+  (retrying)** with the reason when you hover over it (port in use by
+  another program, no permission, unplugged). A port that can't be opened,
+  or is unplugged while in use, is tried again every 2 seconds, so an
+  amplifier switched on or plugged in later is picked up by itself. Stop a
+  port before changing its settings.
+- On Linux, your user must be in the `dialout` group to open serial ports
+  (`sudo usermod -aG dialout $USER`, then log out and back in).
+
+Commands and replies on serial ports are logged to `cat_log.txt` too,
+each line starting with the port name. The **CAT** indicator in the main
+window is green while the server or any serial port is running, and red
+once a client is connected or a port is open.
 
 Each server's running state is saved: whichever were running when you
 last disconnected start again automatically the next time you connect to

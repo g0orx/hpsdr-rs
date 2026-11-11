@@ -96,6 +96,11 @@ nusb = "0.2"
 # are likewise OS-native, same as cpal's own per-platform backends -- no
 # new system dependency on any platform.
 midir = "0.11"
+# Serial ports for CAT (cat.rs's serial transport -- amplifiers, band
+# decoders and loggers on a COM port). Default features off: on Linux
+# that drops libudev (a system library the packages would then need);
+# port listing falls back to scanning /sys/class/tty instead.
+serialport = { version = "4", default-features = false }
 
 # Native Wayland (the default on Linux) needs the app to draw its own
 # window title bar; winit only draws a GNOME/Adwaita-style one (title

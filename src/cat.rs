@@ -46,11 +46,23 @@
         rit_enabled's doc comment (radio.rs). No command to set an
         absolute XIT value exists in real Kenwood CAT either, only XT's
         on/off toggle -- matches the reference exactly.
-      - AI's auto-reporting flag is stored and read back per the
-        client's own request, but no asynchronous FA/MD/... push
-        notifications are actually sent on state changes -- a client
-        relying on AI>0 to avoid polling will not see updates. Poll-
-        based clients (the common case) are unaffected.
+    AI (auto-reporting) is real: with AI1 or higher the client is sent
+    "FA...;" whenever the frequency changes, and with AI2 or higher
+    "MD...;" whenever the mode changes, checked every 200 ms -- the same
+    as deskHPSDR's autoreport_handler (FA/FB/MD, not IF). A serial port
+    with "Auto report" ticked starts at AI2 without being asked, for
+    devices that only listen (an amplifier or band decoder that never
+    sends a command), and sends the current frequency and mode as soon
+    as the port opens.
+
+    Serial ports: the same commands can also be served on a serial port
+    (CatSerialPort below; Settings -> Network, "Serial 1-3"), for an
+    amplifier, ATU or band decoder that follows the radio's band over a
+    Kenwood CAT cable, or a logger on a COM port (real or virtual, e.g.
+    a com0com pair on Windows). 8 data bits, no parity, 1 stop bit, no
+    flow control, as deskHPSDR's launch_serial_rigctl. A port that can't
+    be opened, or goes away (a USB adapter unplugged), is retried every
+    2 s until it's stopped.
 
     Kenwood CAT has no request/reply symmetry like Hamlib's rigctld:
     "read" commands (bare, e.g. "FA;") get a reply; "set" commands
@@ -77,13 +89,41 @@ use crate::debug_log::DebugLog;
 use crate::spectrum::{DemodParams, Mode, SpectrumDisplay};
 use std::collections::VecDeque;
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::TcpListener;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 pub const DEFAULT_ADDR: &str = "0.0.0.0:19090";
+
+/// Serial ports offered in Settings -> Network, as deskHPSDR's MAX_SERIAL.
+pub const SERIAL_PORTS: usize = 3;
+/// Baud rates offered for a serial port (deskHPSDR offers 4800-38400;
+/// some amplifiers' CAT inputs also do 57600/115200).
+pub const SERIAL_BAUD_RATES: [u32; 6] = [4800, 9600, 19200, 38400, 57600, 115200];
+pub const DEFAULT_SERIAL_BAUD: u32 = 9600;
+
+/// How often an auto-reporting client is checked for a changed
+/// frequency or mode.
+const AUTO_REPORT_INTERVAL: Duration = Duration::from_millis(200);
+
+/// The radio state every CAT client reads and changes -- the TCP
+/// server's clients and each serial port alike. See CatServer::start's
+/// parameters for what each one is.
+#[derive(Clone)]
+pub struct CatShared {
+    pub requested_frequency_hz: Arc<AtomicU64>,
+    pub rx_frequency_hz: Arc<AtomicU64>,
+    pub mox: Arc<AtomicBool>,
+    pub tx_frequency_hz: Arc<AtomicU32>,
+    pub allow_out_of_band_tx: Arc<AtomicBool>,
+    pub rit_enabled: Arc<AtomicBool>,
+    pub rit_offset_hz: Arc<AtomicI32>,
+    pub xit_enabled: Arc<AtomicBool>,
+    pub cw_remote_pending: Arc<Mutex<VecDeque<String>>>,
+    pub cw_remote_busy: Arc<AtomicBool>,
+}
 
 /// Same swappable-reference reasoning as rigctl.rs's DemodParamsCell --
 /// a sample-rate change (main.rs's change_sample_rate) rebuilds
@@ -153,6 +193,18 @@ impl CatServer {
         listener.set_nonblocking(true)?;
         println!("cat: listening on {addr}");
 
+        let shared = CatShared {
+            requested_frequency_hz,
+            rx_frequency_hz,
+            mox,
+            tx_frequency_hz,
+            allow_out_of_band_tx,
+            rit_enabled,
+            rit_offset_hz,
+            xit_enabled,
+            cw_remote_pending,
+            cw_remote_busy,
+        };
         let demod_params: DemodParamsCell = Arc::new(Mutex::new(demod_params));
         let display: DisplayCell = Arc::new(Mutex::new(display));
         let stop = Arc::new(AtomicBool::new(false));
@@ -173,28 +225,23 @@ impl CatServer {
                         if let Err(e) = stream.set_read_timeout(Some(Duration::from_millis(250))) {
                             eprintln!("cat: failed to set read timeout: {e}");
                         }
-                        let freq = Arc::clone(&requested_frequency_hz);
-                        let rx_freq = Arc::clone(&rx_frequency_hz);
+                        let _ = stream.set_nodelay(true);
+                        let writer = match stream.try_clone() {
+                            Ok(s) => s,
+                            Err(_) => continue,
+                        };
+                        let conn_shared = shared.clone();
                         let params = Arc::clone(&accept_demod_params);
                         let disp = Arc::clone(&accept_display);
-                        let conn_mox = Arc::clone(&mox);
-                        let conn_tx_frequency_hz = Arc::clone(&tx_frequency_hz);
-                        let conn_allow_out_of_band_tx = Arc::clone(&allow_out_of_band_tx);
-                        let conn_rit_enabled = Arc::clone(&rit_enabled);
-                        let conn_rit_offset_hz = Arc::clone(&rit_offset_hz);
-                        let conn_xit_enabled = Arc::clone(&xit_enabled);
-                        let conn_cw_remote_pending = Arc::clone(&cw_remote_pending);
-                        let conn_cw_remote_busy = Arc::clone(&cw_remote_busy);
                         let conn_stop = Arc::clone(&accept_stop);
                         let conn_connected = Arc::clone(&accept_connected);
                         let conn_logging = accept_logging.clone();
                         let handle = thread::spawn(move || {
                             conn_connected.fetch_add(1, Ordering::Relaxed);
+                            // Logged without a prefix, as before serial
+                            // ports existed.
                             handle_client(
-                                stream, freq, rx_freq, params, disp, conn_mox, conn_tx_frequency_hz,
-                                conn_allow_out_of_band_tx, conn_rit_enabled, conn_rit_offset_hz,
-                                conn_xit_enabled, conn_cw_remote_pending, conn_cw_remote_busy, conn_stop,
-                                conn_logging,
+                                stream, writer, "", 0, &conn_shared, &params, &disp, &conn_stop, &conn_logging,
                             );
                             conn_connected.fetch_sub(1, Ordering::Relaxed);
                         });
@@ -255,47 +302,42 @@ impl Drop for CatServer {
     }
 }
 
-fn handle_client(
-    stream: TcpStream,
-    requested_frequency_hz: Arc<AtomicU64>,
-    rx_frequency_hz: Arc<AtomicU64>,
-    demod_params: DemodParamsCell,
-    display: DisplayCell,
-    mox: Arc<AtomicBool>,
-    tx_frequency_hz: Arc<AtomicU32>,
-    allow_out_of_band_tx: Arc<AtomicBool>,
-    rit_enabled: Arc<AtomicBool>,
-    rit_offset_hz: Arc<AtomicI32>,
-    xit_enabled: Arc<AtomicBool>,
-    cw_remote_pending: Arc<Mutex<VecDeque<String>>>,
-    cw_remote_busy: Arc<AtomicBool>,
-    stop: Arc<AtomicBool>,
-    logging: DebugLog,
+/// Serves one CAT client -- a TCP connection or an open serial port --
+/// until it goes away, a read or write fails, or `stop` is set.
+/// `reader` must time out (TCP read timeout / serial port timeout) so
+/// `stop` and auto-reporting are checked even when nothing arrives.
+/// `label` prefixes this client's log lines (the port name for a
+/// serial port, empty for TCP); `initial_auto_reporting` is the AI level
+/// it starts at (0 = only answer commands).
+fn handle_client<R: Read, W: Write>(
+    mut reader: R,
+    mut writer: W,
+    label: &str,
+    initial_auto_reporting: u8,
+    shared: &CatShared,
+    demod_params: &DemodParamsCell,
+    display: &DisplayCell,
+    stop: &AtomicBool,
+    logging: &DebugLog,
 ) {
-    let _ = stream.set_nodelay(true);
-    let mut writer = match stream.try_clone() {
-        Ok(s) => s,
-        Err(_) => return,
-    };
-    let mut reader = stream;
+    let prefix = if label.is_empty() { String::new() } else { format!("{label}: ") };
     let mut read_buf = [0u8; 1024];
     // Accumulates bytes across reads until a full ';'-terminated
     // command is available -- a real command CAN arrive split across
-    // TCP packet boundaries (e.g. a slow/throttled client), unlike
-    // rigctl.rs's newline-delimited protocol where read_line already
-    // handles this for free.
+    // TCP packet boundaries (e.g. a slow/throttled client), or a few
+    // bytes at a time from a serial port, unlike rigctl.rs's
+    // newline-delimited protocol where read_line already handles this
+    // for free.
     let mut pending = String::new();
-    // Per-connection AI (auto-reporting) level -- see this module's
-    // doc comment for why setting it doesn't actually enable any push
-    // notifications yet; it's tracked and read back anyway since a
-    // client polling `AI;` to confirm its own request took effect
-    // shouldn't see it silently reset to 0.
-    let mut auto_reporting: u8 = 0;
+    // Per-client AI (auto-reporting) level -- see this module's doc
+    // comment.
+    let mut auto_reporting: u8 = initial_auto_reporting;
+    let mut auto_report = AutoReport::default();
 
     while !stop.load(Ordering::Relaxed) {
         match reader.read(&mut read_buf) {
             Ok(0) => {
-                logging.log("client closed the connection");
+                logging.log(&format!("{prefix}client closed the connection"));
                 break;
             }
             Ok(n) => {
@@ -309,43 +351,274 @@ fn handle_client(
                     if cmd.is_empty() {
                         continue;
                     }
-                    logging.log(&format!("<< {cmd};"));
+                    logging.log(&format!("{prefix}<< {cmd};"));
                     let current_params = demod_params.lock().unwrap().clone();
                     let current_display = display.lock().unwrap().clone();
                     if let Some(response) = handle_command(
                         cmd,
-                        &requested_frequency_hz,
-                        &rx_frequency_hz,
+                        &shared.requested_frequency_hz,
+                        &shared.rx_frequency_hz,
                         &current_params,
                         &current_display,
-                        &mox,
-                        &tx_frequency_hz,
-                        &allow_out_of_band_tx,
-                        &rit_enabled,
-                        &rit_offset_hz,
-                        &xit_enabled,
+                        &shared.mox,
+                        &shared.tx_frequency_hz,
+                        &shared.allow_out_of_band_tx,
+                        &shared.rit_enabled,
+                        &shared.rit_offset_hz,
+                        &shared.xit_enabled,
                         &mut auto_reporting,
-                        &cw_remote_pending,
-                        &cw_remote_busy,
+                        &shared.cw_remote_pending,
+                        &shared.cw_remote_busy,
                     ) {
-                        logging.log(&format!(">> {response}"));
-                        if writer.write_all(response.as_bytes()).is_err() {
+                        logging.log(&format!("{prefix}>> {response}"));
+                        if writer.write_all(response.as_bytes()).and_then(|_| writer.flush()).is_err() {
                             return;
                         }
                     }
                 }
+                // A device sending something that never has a ';'
+                // (line noise, a wrong baud rate) mustn't grow this
+                // forever.
+                if pending.len() > 4096 {
+                    pending.clear();
+                }
             }
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock || e.kind() == std::io::ErrorKind::TimedOut => {
-                continue;
-            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock || e.kind() == std::io::ErrorKind::TimedOut => {}
             // See rigctl.rs/tci.rs's identical arm's doc comment -- same
             // read-timeout pattern.
             Err(e) => {
-                logging.log(&format!("connection error, closing: {e:?}"));
+                logging.log(&format!("{prefix}connection error, closing: {e:?}"));
                 break;
             }
         }
+        if auto_reporting > 0 {
+            let mode = demod_params.lock().unwrap().lock().unwrap().mode;
+            let reports = auto_report.due(
+                auto_reporting,
+                shared.rx_frequency_hz.load(Ordering::Relaxed),
+                mode,
+                Instant::now(),
+            );
+            for report in reports {
+                logging.log(&format!("{prefix}>> {report}"));
+                if writer.write_all(report.as_bytes()).and_then(|_| writer.flush()).is_err() {
+                    return;
+                }
+            }
+        } else {
+            // Turned off (AI0;): report afresh if it's turned on again.
+            auto_report = AutoReport::default();
+        }
     }
+}
+
+/// What an auto-reporting client was last sent (see this module's doc
+/// comment on AI): None = nothing yet, so the first check reports the
+/// current values.
+#[derive(Default)]
+struct AutoReport {
+    last_check: Option<Instant>,
+    last_frequency_hz: Option<u64>,
+    last_mode: Option<u8>,
+}
+
+impl AutoReport {
+    /// The reports to send now for AI level `level`: FA when the
+    /// frequency has changed (level 1+), MD when the mode has (level 2+),
+    /// at most every AUTO_REPORT_INTERVAL.
+    fn due(&mut self, level: u8, frequency_hz: u64, mode: Mode, now: Instant) -> Vec<String> {
+        let mut reports = Vec::new();
+        if level == 0 || self.last_check.is_some_and(|t| now.duration_since(t) < AUTO_REPORT_INTERVAL) {
+            return reports;
+        }
+        self.last_check = Some(now);
+        if self.last_frequency_hz != Some(frequency_hz) {
+            self.last_frequency_hz = Some(frequency_hz);
+            reports.push(format!("FA{frequency_hz:011};"));
+        }
+        let code = mode_to_ts2000(mode);
+        if level >= 2 && self.last_mode != Some(code) {
+            self.last_mode = Some(code);
+            reports.push(format!("MD{code};"));
+        }
+        reports
+    }
+}
+
+/// One of Settings -> Network's CAT serial ports, as configured, and
+/// running or not.
+pub struct CatSerialSlot {
+    /// e.g. "/dev/ttyUSB0", "COM3".
+    pub port: String,
+    pub baud: u32,
+    /// Start at AI2 (send FA/MD on changes without being asked) -- for
+    /// a device that only listens.
+    pub auto_report: bool,
+    pub running: Option<CatSerialPort>,
+}
+
+impl Default for CatSerialSlot {
+    fn default() -> Self {
+        Self { port: String::new(), baud: DEFAULT_SERIAL_BAUD, auto_report: false, running: None }
+    }
+}
+
+/// The state of a running serial port, for Settings -> Network.
+#[derive(Clone, Debug, PartialEq)]
+pub enum SerialState {
+    Opening,
+    Open,
+    /// Couldn't open, or lost: why. Retried every 2 s.
+    Failed(String),
+}
+
+/// Kenwood CAT on a serial port: opens it (retrying while it can't be
+/// opened or is lost) and serves it as a CAT client would be served over
+/// TCP, until stopped or dropped.
+pub struct CatSerialPort {
+    demod_params: DemodParamsCell,
+    display: DisplayCell,
+    stop: Arc<AtomicBool>,
+    state: Arc<Mutex<SerialState>>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl CatSerialPort {
+    pub fn start(
+        port: &str,
+        baud: u32,
+        auto_report: bool,
+        shared: CatShared,
+        demod_params: Arc<Mutex<DemodParams>>,
+        display: Arc<Mutex<SpectrumDisplay>>,
+        logging: DebugLog,
+    ) -> Self {
+        let demod_params: DemodParamsCell = Arc::new(Mutex::new(demod_params));
+        let display: DisplayCell = Arc::new(Mutex::new(display));
+        let stop = Arc::new(AtomicBool::new(false));
+        let state = Arc::new(Mutex::new(SerialState::Opening));
+        let port = port.trim().to_string();
+        let thread_params = Arc::clone(&demod_params);
+        let thread_display = Arc::clone(&display);
+        let thread_stop = Arc::clone(&stop);
+        let thread_state = Arc::clone(&state);
+        let thread = thread::spawn(move || {
+            let initial_ai = if auto_report { 2 } else { 0 };
+            let mut last_error = String::new();
+            while !thread_stop.load(Ordering::Relaxed) {
+                match open_serial(&port, baud) {
+                    Ok((reader, writer)) => {
+                        println!("cat: serial port {port} open at {baud} baud");
+                        logging.log(&format!("{port}: open at {baud} baud"));
+                        last_error.clear();
+                        *thread_state.lock().unwrap() = SerialState::Open;
+                        handle_client(
+                            reader, writer, &port, initial_ai, &shared, &thread_params, &thread_display,
+                            &thread_stop, &logging,
+                        );
+                        if thread_stop.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        *thread_state.lock().unwrap() = SerialState::Failed("lost; reopening".to_string());
+                    }
+                    Err(e) => {
+                        let msg = e.to_string();
+                        // Logged once per distinct error, not every retry.
+                        if msg != last_error {
+                            eprintln!("cat: couldn't open serial port {port}: {msg}");
+                            logging.log(&format!("{port}: couldn't open: {msg}"));
+                            last_error = msg.clone();
+                        }
+                        *thread_state.lock().unwrap() = SerialState::Failed(msg);
+                    }
+                }
+                for _ in 0..20 {
+                    if thread_stop.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(100));
+                }
+            }
+            logging.log(&format!("{port}: closed"));
+        });
+        Self { demod_params, display, stop, state, thread: Some(thread) }
+    }
+
+    /// See CatServer::set_demod_params.
+    pub fn set_demod_params(&self, new_demod_params: Arc<Mutex<DemodParams>>) {
+        *self.demod_params.lock().unwrap() = new_demod_params;
+    }
+
+    pub fn set_display(&self, new_display: Arc<Mutex<SpectrumDisplay>>) {
+        *self.display.lock().unwrap() = new_display;
+    }
+
+    pub fn state(&self) -> SerialState {
+        self.state.lock().unwrap().clone()
+    }
+
+    pub fn stop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+    }
+}
+
+impl Drop for CatSerialPort {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+type SerialHalves = (Box<dyn serialport::SerialPort>, Box<dyn serialport::SerialPort>);
+
+fn open_serial(port: &str, baud: u32) -> serialport::Result<SerialHalves> {
+    if port.is_empty() {
+        return Err(serialport::Error::new(serialport::ErrorKind::InvalidInput, "no port name"));
+    }
+    let reader = serialport::new(port, baud)
+        .data_bits(serialport::DataBits::Eight)
+        .parity(serialport::Parity::None)
+        .stop_bits(serialport::StopBits::One)
+        .flow_control(serialport::FlowControl::None)
+        .timeout(Duration::from_millis(250))
+        .open()?;
+    let writer = reader.try_clone()?;
+    Ok((reader, writer))
+}
+
+/// The serial ports this computer has, for Settings -> Network's port
+/// list -- names only, sorted. Empty if they can't be listed.
+///
+/// On Linux, serialport (built without libudev) lists every legacy
+/// /dev/ttyS* slot the kernel reserves, usually 32 with no UART behind
+/// them; those whose sysfs `type` is 0 (PORT_UNKNOWN: no UART) are left
+/// out. /dev/serial/by-id names are added first: they stay the same
+/// whichever order USB adapters are plugged in, unlike /dev/ttyUSB0/1.
+pub fn serial_port_names() -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    #[cfg(target_os = "linux")]
+    if let Ok(entries) = std::fs::read_dir("/dev/serial/by-id") {
+        let mut by_id: Vec<String> =
+            entries.flatten().map(|e| e.path().to_string_lossy().into_owned()).collect();
+        by_id.sort();
+        names.extend(by_id);
+    }
+    let mut ports: Vec<String> = serialport::available_ports()
+        .map(|ports| ports.into_iter().map(|p| p.port_name).collect())
+        .unwrap_or_default();
+    #[cfg(target_os = "linux")]
+    ports.retain(|name| {
+        let Some(base) = name.strip_prefix("/dev/").filter(|b| b.starts_with("ttyS")) else {
+            return true;
+        };
+        std::fs::read_to_string(format!("/sys/class/tty/{base}/type")).map_or(true, |t| t.trim() != "0")
+    });
+    ports.sort();
+    ports.dedup();
+    names.extend(ports);
+    names
 }
 
 /// `cmd` is one command with the trailing ';' already stripped (e.g.
@@ -943,6 +1216,149 @@ mod tests {
         // "PS0;" (power off) is deliberately a no-op, not a shutdown --
         // see this module's doc comment.
         assert_eq!(handle_command("PS0", &f, &f, &p, &d, &m, &tx_of(&f), &Arc::new(AtomicBool::new(true)), &rit, &rit_hz, &xit, &mut ai, &cw_pending, &cw_busy), None);
+    }
+
+    #[test]
+    fn auto_report_sends_changes_only() {
+        let t0 = Instant::now();
+        let mut ar = AutoReport::default();
+        // First check reports the current state; AI1 is frequency only.
+        assert_eq!(ar.due(1, 14_074_000, Mode::Usb, t0), vec!["FA00014074000;".to_string()]);
+        // Nothing changed.
+        assert!(ar.due(1, 14_074_000, Mode::Usb, t0 + Duration::from_millis(300)).is_empty());
+        // Changed, but too soon after the last check.
+        assert!(ar.due(1, 7_074_000, Mode::Usb, t0 + Duration::from_millis(350)).is_empty());
+        assert_eq!(
+            ar.due(1, 7_074_000, Mode::Usb, t0 + Duration::from_millis(600)),
+            vec!["FA00007074000;".to_string()]
+        );
+        // AI2 adds the mode, reported the first time it's seen.
+        assert_eq!(ar.due(2, 7_074_000, Mode::Lsb, t0 + Duration::from_millis(900)), vec!["MD1;".to_string()]);
+        assert_eq!(
+            ar.due(2, 3_573_000, Mode::Cwu, t0 + Duration::from_millis(1200)),
+            vec!["FA00003573000;".to_string(), "MD3;".to_string()]
+        );
+        assert!(ar.due(0, 1_840_000, Mode::Lsb, t0 + Duration::from_millis(1500)).is_empty());
+    }
+
+    #[test]
+    fn serial_client_answers_and_auto_reports() {
+        // A serial-style client: commands from a byte slice, replies
+        // into a Vec, starting at AI2 as a port with Auto report does.
+        let (f, p, d, m, rit, rit_hz, xit, cw_pending, cw_busy) = fixture();
+        let shared = CatShared {
+            requested_frequency_hz: Arc::clone(&f),
+            rx_frequency_hz: Arc::clone(&f),
+            mox: m,
+            tx_frequency_hz: tx_of(&f),
+            allow_out_of_band_tx: Arc::new(AtomicBool::new(false)),
+            rit_enabled: rit,
+            rit_offset_hz: rit_hz,
+            xit_enabled: xit,
+            cw_remote_pending: cw_pending,
+            cw_remote_busy: cw_busy,
+        };
+        let mut out = Vec::new();
+        handle_client(
+            &b"ID;IF"[..],
+            &mut out,
+            "test",
+            2,
+            &shared,
+            &Arc::new(Mutex::new(p)),
+            &Arc::new(Mutex::new(d)),
+            &AtomicBool::new(false),
+            &DebugLog::new("unused.txt".into()),
+        );
+        let out = String::from_utf8(out).unwrap();
+        // The partial "IF" (no ';') isn't answered; the end of input
+        // closes the client.
+        assert!(out.starts_with("ID019;FA00014074000;MD"), "{out}");
+    }
+
+    /// CatSerialPort on a real tty: a pseudo-terminal pair stands in for
+    /// a serial cable, the test reading and writing the other end.
+    #[cfg(unix)]
+    #[test]
+    fn serial_port_serves_cat_on_a_tty() {
+        use serialport::SerialPort;
+        use std::io::{Read, Write};
+        let (mut master, slave) = serialport::TTYPort::pair().expect("pty pair");
+        master.set_timeout(Duration::from_millis(100)).unwrap();
+        let name = slave.name().expect("pty name");
+        let (f, p, d, m, rit, rit_hz, xit, cw_pending, cw_busy) = fixture();
+        let shared = CatShared {
+            requested_frequency_hz: Arc::clone(&f),
+            rx_frequency_hz: Arc::clone(&f),
+            mox: m,
+            tx_frequency_hz: tx_of(&f),
+            allow_out_of_band_tx: Arc::new(AtomicBool::new(false)),
+            rit_enabled: rit,
+            rit_offset_hz: rit_hz,
+            xit_enabled: xit,
+            cw_remote_pending: cw_pending,
+            cw_remote_busy: cw_busy,
+        };
+        let mut port = CatSerialPort::start(&name, 9600, true, shared, p, d, DebugLog::new("unused.txt".into()));
+        let read_until = |master: &mut serialport::TTYPort, want: &str| -> String {
+            let mut got = String::new();
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while !got.contains(want) && Instant::now() < deadline {
+                let mut buf = [0u8; 256];
+                if let Ok(n) = master.read(&mut buf) {
+                    got.push_str(&String::from_utf8_lossy(&buf[..n]));
+                }
+            }
+            got
+        };
+        // Auto report: the current frequency and mode as soon as it opens.
+        let got = read_until(&mut master, "MD");
+        assert!(got.contains("FA00014074000;"), "{got}");
+        assert_eq!(port.state(), SerialState::Open);
+        // Polled, as an amplifier does.
+        master.write_all(b"IF;").unwrap();
+        let got = read_until(&mut master, "IF");
+        assert!(got.contains("IF00014074000"), "{got}");
+        // A band change is reported without being asked.
+        f.store(7_074_000, Ordering::Relaxed);
+        let got = read_until(&mut master, "FA00007074000;");
+        assert!(got.contains("FA00007074000;"), "{got}");
+        port.stop();
+    }
+
+    #[test]
+    fn serial_port_that_cannot_open_reports_why() {
+        let (f, p, d, m, rit, rit_hz, xit, cw_pending, cw_busy) = fixture();
+        let shared = CatShared {
+            requested_frequency_hz: Arc::clone(&f),
+            rx_frequency_hz: f,
+            mox: m,
+            tx_frequency_hz: Arc::new(AtomicU32::new(0)),
+            allow_out_of_band_tx: Arc::new(AtomicBool::new(false)),
+            rit_enabled: rit,
+            rit_offset_hz: rit_hz,
+            xit_enabled: xit,
+            cw_remote_pending: cw_pending,
+            cw_remote_busy: cw_busy,
+        };
+        let mut port = CatSerialPort::start(
+            "/nonexistent/ttyNOPE",
+            9600,
+            false,
+            shared,
+            p,
+            d,
+            DebugLog::new("unused.txt".into()),
+        );
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while port.state() == SerialState::Opening && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(matches!(port.state(), SerialState::Failed(_)), "{:?}", port.state());
+        // Stopping doesn't wait out the 2 s retry pause.
+        let t = Instant::now();
+        port.stop();
+        assert!(t.elapsed() < Duration::from_millis(500));
     }
 
     #[test]

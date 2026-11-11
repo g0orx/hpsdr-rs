@@ -2525,6 +2525,9 @@ struct ConnectedState {
     /// not something that should reset to off every session.
     mute_local_audio_during_tci: bool,
     cat_error: Option<String>,
+    /// CAT on serial ports (Settings -> Network) -- always
+    /// cat::SERIAL_PORTS slots, each running or not.
+    cat_serial: Vec<cat::CatSerialSlot>,
     /// TX is armed automatically on connect (MicInput/TxHandle created
     /// right away, PTT control visible immediately) -- this flag is
     /// still tracked (and can still be turned off mid-session via
@@ -3496,6 +3499,39 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                     }
                 };
             }
+            let cat_serial: Vec<cat::CatSerialSlot> = {
+                let saved = cfg.cat_serial.clone().unwrap_or_default();
+                (0..cat::SERIAL_PORTS)
+                    .map(|i| {
+                        let Some(c) = saved.get(i) else {
+                            return cat::CatSerialSlot::default();
+                        };
+                        let running = (c.running && !c.port.trim().is_empty()).then(|| {
+                            cat::CatSerialPort::start(
+                                &c.port,
+                                c.baud,
+                                c.auto_report,
+                                cat::CatShared {
+                                    requested_frequency_hz: Arc::clone(&session.requested_frequency_hz),
+                                    rx_frequency_hz: Arc::clone(&session.rx_frequency_hz),
+                                    mox: Arc::clone(&session.mox),
+                                    tx_frequency_hz: Arc::clone(&session.tx_frequency_hz),
+                                    allow_out_of_band_tx: Arc::clone(&allow_out_of_band_tx),
+                                    rit_enabled: Arc::clone(&session.rit_enabled),
+                                    rit_offset_hz: Arc::clone(&session.rit_offset_hz),
+                                    xit_enabled: Arc::clone(&session.xit_enabled),
+                                    cw_remote_pending: Arc::clone(&cw_remote_pending),
+                                    cw_remote_busy: Arc::clone(&cw_remote_busy),
+                                },
+                                spectrum.demod_params_handle(),
+                                Arc::clone(&spectrum.display),
+                                cat_debug_log.clone(),
+                            )
+                        });
+                        cat::CatSerialSlot { port: c.port.clone(), baud: c.baud, auto_report: c.auto_report, running }
+                    })
+                    .collect()
+            };
             // cfg.frequency_hz is now applied earlier, via
             // settings.frequency_hz before RadioSession::start -- see
             // that assignment's doc comment for why.
@@ -3880,6 +3916,7 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                 rigctl_error,
                 tci_error,
                 cat_error,
+                cat_serial,
                 mute_local_audio_during_tci,
                 tx_enabled,
                 mic_input,
@@ -4192,7 +4229,17 @@ impl eframe::App for HpsdrApp {
                 // the gray/green/red status text in the main panel.
                 let rigctl_status: Option<bool> = connected.rigctl_server.as_ref().map(|s| s.is_connected());
                 let tci_status: Option<bool> = connected.tci_server.as_ref().map(|s| s.is_connected());
-                let cat_status: Option<bool> = connected.cat_server.as_ref().map(|s| s.is_connected());
+                // CAT: the TCP server or any serial port; "connected"
+                // = a TCP client, or a serial port open.
+                let cat_serial_running = connected.cat_serial.iter().any(|slot| slot.running.is_some());
+                let cat_serial_open = connected
+                    .cat_serial
+                    .iter()
+                    .any(|slot| slot.running.as_ref().is_some_and(|p| p.state() == cat::SerialState::Open));
+                let cat_status: Option<bool> = match (&connected.cat_server, cat_serial_running) {
+                    (None, false) => None,
+                    (server, _) => Some(server.as_ref().is_some_and(|s| s.is_connected()) || cat_serial_open),
+                };
                 // The web client server: running, and whether a remote
                 // client is connected -- through TCI, which it uses.
                 let remote_clients = connected.tci_server.as_ref().map_or(0, |s| s.remote_clients());
@@ -6102,7 +6149,21 @@ impl eframe::App for HpsdrApp {
                             ));
                         ui.add_space(12.0);
                         ui.colored_label(network_status_color(ui, cat_status), "CAT")
-                            .on_hover_text(network_status_hover("CAT", cat_status, &connected.cat_addr));
+                            .on_hover_text({
+                                // The TCP address and/or the serial ports in use.
+                                let mut places: Vec<String> = Vec::new();
+                                if connected.cat_server.is_some() {
+                                    places.push(connected.cat_addr.clone());
+                                }
+                                places.extend(
+                                    connected
+                                        .cat_serial
+                                        .iter()
+                                        .filter(|slot| slot.running.is_some())
+                                        .map(|slot| slot.port.clone()),
+                                );
+                                network_status_hover("CAT", cat_status, &places.join(", "))
+                            });
                         ui.add_space(12.0);
                         ui.colored_label(network_status_color(ui, web_status), "Web")
                             .on_hover_text(web_status_hover(web_status, &connected.web_addr, remote_clients));
@@ -8447,6 +8508,130 @@ impl eframe::App for HpsdrApp {
                                             settings_changed = true;
                                         }
                                     }
+
+                                    ui.add_space(4.0);
+                                    ui.label(
+                                        "CAT on serial ports -- for an amplifier, ATU or band decoder that \
+                                         follows the band over a Kenwood CAT cable, or a program on a COM port:",
+                                    );
+                                    let shared = cat_shared(connected);
+                                    let connected_demod_params = connected.spectrum.demod_params_handle();
+                                    let connected_display = Arc::clone(&connected.spectrum.display);
+                                    let cat_log = connected.cat_debug_log.clone();
+                                    let port_names = cached_serial_port_names();
+                                    egui::Grid::new("cat_serial_grid").num_columns(6).spacing([6.0, 4.0]).show(
+                                        ui,
+                                        |ui| {
+                                            for (i, slot) in connected.cat_serial.iter_mut().enumerate() {
+                                                let running = slot.running.is_some();
+                                                ui.label(format!("Serial {}", i + 1));
+                                                ui.add_enabled_ui(!running, |ui| {
+                                                    ui.horizontal(|ui| {
+                                                        ui.add(
+                                                            egui::TextEdit::singleline(&mut slot.port)
+                                                                .desired_width(150.0)
+                                                                .hint_text(if cfg!(windows) {
+                                                                    "COM3"
+                                                                } else {
+                                                                    "/dev/ttyUSB0"
+                                                                }),
+                                                        );
+                                                        egui::ComboBox::from_id_salt(("cat_serial_port", i))
+                                                            .selected_text("")
+                                                            .width(20.0)
+                                                            .show_ui(ui, |ui| {
+                                                                if port_names.is_empty() {
+                                                                    ui.weak("No serial ports found");
+                                                                }
+                                                                for name in &port_names {
+                                                                    if ui
+                                                                        .selectable_label(slot.port == *name, name)
+                                                                        .clicked()
+                                                                    {
+                                                                        slot.port = name.clone();
+                                                                        settings_changed = true;
+                                                                    }
+                                                                }
+                                                            })
+                                                            .response
+                                                            .on_hover_text("Serial ports on this computer");
+                                                    });
+                                                    egui::ComboBox::from_id_salt(("cat_serial_baud", i))
+                                                        .selected_text(format!("{} baud", slot.baud))
+                                                        .show_ui(ui, |ui| {
+                                                            for b in cat::SERIAL_BAUD_RATES {
+                                                                if ui
+                                                                    .selectable_value(&mut slot.baud, b, format!("{b} baud"))
+                                                                    .changed()
+                                                                {
+                                                                    settings_changed = true;
+                                                                }
+                                                            }
+                                                        });
+                                                    if ui
+                                                        .checkbox(&mut slot.auto_report, "Auto report")
+                                                        .on_hover_text(
+                                                            "Send the frequency (FA) and mode (MD) whenever they \
+                                                             change, without being asked -- for a device that \
+                                                             only listens and never polls. Leave off for one that \
+                                                             asks (most amplifiers and programs do).",
+                                                        )
+                                                        .changed()
+                                                    {
+                                                        settings_changed = true;
+                                                    }
+                                                });
+                                                if running {
+                                                    if start_stop_button(ui, true) {
+                                                        slot.running = None;
+                                                        settings_changed = true;
+                                                    }
+                                                } else if ui
+                                                    .add_enabled_ui(!slot.port.trim().is_empty(), |ui| {
+                                                        start_stop_button(ui, false)
+                                                    })
+                                                    .inner
+                                                {
+                                                    slot.running = Some(cat::CatSerialPort::start(
+                                                        &slot.port,
+                                                        slot.baud,
+                                                        slot.auto_report,
+                                                        shared.clone(),
+                                                        connected_demod_params.clone(),
+                                                        Arc::clone(&connected_display),
+                                                        cat_log.clone(),
+                                                    ));
+                                                    settings_changed = true;
+                                                }
+                                                match slot.running.as_ref().map(|p| p.state()) {
+                                                    None => {
+                                                        ui.weak("Stopped");
+                                                    }
+                                                    Some(cat::SerialState::Opening) => {
+                                                        ui.weak("Opening...");
+                                                    }
+                                                    Some(cat::SerialState::Open) => {
+                                                        ui.colored_label(
+                                                            readable(ui, egui::Color32::from_rgb(60, 190, 60)),
+                                                            "Open",
+                                                        );
+                                                    }
+                                                    Some(cat::SerialState::Failed(why)) => {
+                                                        ui.colored_label(
+                                                            readable(ui, egui::Color32::from_rgb(220, 60, 60)),
+                                                            "Not open (retrying)",
+                                                        )
+                                                        .on_hover_text(why);
+                                                    }
+                                                }
+                                                ui.end_row();
+                                            }
+                                        },
+                                    );
+                                    ui.weak(
+                                        "8 data bits, no parity, 1 stop bit, no handshaking. Set the device to \
+                                         Kenwood (TS-2000) CAT at the same speed. Stop a port before changing it.",
+                                    );
 
                                     ui.add_space(4.0);
                                     ui.separator();
@@ -12067,6 +12252,18 @@ impl eframe::App for HpsdrApp {
                         rigctl_logging_enabled: Some(connected.rigctl_debug_log.is_enabled()),
                         tci_logging_enabled: Some(connected.tci_debug_log.is_enabled()),
                         cat_logging_enabled: Some(connected.cat_debug_log.is_enabled()),
+                        cat_serial: Some(
+                            connected
+                                .cat_serial
+                                .iter()
+                                .map(|slot| config::CatSerialConfig {
+                                    port: slot.port.clone(),
+                                    baud: slot.baud,
+                                    auto_report: slot.auto_report,
+                                    running: slot.running.is_some(),
+                                })
+                                .collect(),
+                        ),
                         web_logging_enabled: Some(connected.web_debug_log.is_enabled()),
                         extra_receivers,
                         allow_out_of_band_tx: Some(
@@ -13432,6 +13629,39 @@ fn draw_band_edge_markers(painter: &egui::Painter, rect: egui::Rect, center_hz: 
 /// green/red convention below, so the button's action is visible at a
 /// glance rather than needing to read its label. Returns whether it was
 /// clicked this frame, same as `ui.button(..).clicked()`.
+/// What a CAT client (TCP or serial port) reads and changes, for
+/// starting a cat::CatSerialPort.
+fn cat_shared(connected: &ConnectedState) -> cat::CatShared {
+    cat::CatShared {
+        requested_frequency_hz: Arc::clone(&connected.session.requested_frequency_hz),
+        rx_frequency_hz: Arc::clone(&connected.session.rx_frequency_hz),
+        mox: Arc::clone(&connected.session.mox),
+        tx_frequency_hz: Arc::clone(&connected.session.tx_frequency_hz),
+        allow_out_of_band_tx: Arc::clone(&connected.allow_out_of_band_tx),
+        rit_enabled: Arc::clone(&connected.session.rit_enabled),
+        rit_offset_hz: Arc::clone(&connected.session.rit_offset_hz),
+        xit_enabled: Arc::clone(&connected.session.xit_enabled),
+        cw_remote_pending: Arc::clone(&connected.cw_remote_pending),
+        cw_remote_busy: Arc::clone(&connected.cw_remote_busy),
+    }
+}
+
+/// cat::serial_port_names, listed at most every 3 s -- Settings ->
+/// Network draws every frame, and listing ports reads the system each
+/// time.
+fn cached_serial_port_names() -> Vec<String> {
+    static CACHE: Mutex<Option<(std::time::Instant, Vec<String>)>> = Mutex::new(None);
+    let mut cache = CACHE.lock().unwrap();
+    match cache.as_ref() {
+        Some((at, names)) if at.elapsed() < std::time::Duration::from_secs(3) => names.clone(),
+        _ => {
+            let names = cat::serial_port_names();
+            *cache = Some((std::time::Instant::now(), names.clone()));
+            names
+        }
+    }
+}
+
 fn start_stop_button(ui: &mut egui::Ui, running: bool) -> bool {
     let (label, color) = if running {
         ("Stop", egui::Color32::from_rgb(220, 60, 60))
@@ -16089,6 +16319,10 @@ fn change_sample_rate(connected: &mut ConnectedState, new_rate: u32) {
         s.set_display(Arc::clone(&spectrum.display));
     }
     if let Some(s) = &connected.cat_server {
+        s.set_demod_params(spectrum.demod_params_handle());
+        s.set_display(Arc::clone(&spectrum.display));
+    }
+    for s in connected.cat_serial.iter().filter_map(|slot| slot.running.as_ref()) {
         s.set_demod_params(spectrum.demod_params_handle());
         s.set_display(Arc::clone(&spectrum.display));
     }

@@ -144,6 +144,11 @@ pub struct Config {
     pub tci_logging_enabled: Option<bool>,
     #[serde(default)]
     pub cat_logging_enabled: Option<bool>,
+    /// CAT on serial ports (Settings -> Network, "Serial 1-3") -- see
+    /// cat.rs's CatSerialPort. Missing (configs saved before these
+    /// existed) means none.
+    #[serde(default)]
+    pub cat_serial: Option<Vec<CatSerialConfig>>,
     /// The web client server's connection log, web_log.txt.
     #[serde(default)]
     pub web_logging_enabled: Option<bool>,
@@ -995,4 +1000,22 @@ mod tests {
         assert_eq!(if_era.setups[0].name, "QO-100");
         assert_eq!((if_era.setups[0].vfo_a_rf_hz, if_era.setups[0].psk_beacon), (None, None));
     }
+}
+
+/// One CAT serial port's settings (see Config::cat_serial).
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct CatSerialConfig {
+    #[serde(default)]
+    pub port: String,
+    #[serde(default = "default_cat_serial_baud")]
+    pub baud: u32,
+    #[serde(default)]
+    pub auto_report: bool,
+    /// Running when last saved: started again on connecting.
+    #[serde(default)]
+    pub running: bool,
+}
+
+fn default_cat_serial_baud() -> u32 {
+    crate::cat::DEFAULT_SERIAL_BAUD
 }
