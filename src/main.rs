@@ -5327,6 +5327,9 @@ impl eframe::App for HpsdrApp {
                     // bails out immediately on empty rows) next frame.
                 }
                 let waterfall_texture_id = connected.waterfall_texture.as_ref().map(|t| t.id());
+                // The row under Zoom/Pan, only when it has something to
+                // say (see its own comment, below the spectrum).
+                let show_status_row = waterfall_texture_id.is_none() || connected.status_message.is_some();
 
                 let mut stop_clicked = false;
                 let mut settings_changed = false;
@@ -6958,16 +6961,21 @@ impl eframe::App for HpsdrApp {
                     // the drag handle between them, see
                     // spectrum_waterfall_divider) -- so they grow with
                     // the window instead of leaving empty space below a
-                    // fixed size. Reserve room for the gap+Zoom/Pan row
-                    // AND the gap+Stop button row below the waterfall
-                    // first, since available_height() here is everything
-                    // down to the bottom of the panel, not just what's
-                    // free for the spectrum alone -- otherwise the
-                    // spectrum/waterfall split greedily claims all of it
-                    // and pushes the Zoom/Pan row (and potentially the
-                    // Stop button) below the visible window.
-                    let below_waterfall_reserve = 2.0 * (ui.spacing().interact_size.y + 8.0)
-                        + SPECTRUM_WATERFALL_DIVIDER_HEIGHT;
+                    // fixed size. Reserve room for the gap+Zoom/Pan row,
+                    // the status row under it when there's something in
+                    // it, and the divider when there's a waterfall,
+                    // since available_height() here is everything down
+                    // to the bottom of the panel, not just what's free
+                    // for the spectrum alone -- otherwise the spectrum/
+                    // waterfall split greedily claims all of it and
+                    // pushes the Zoom/Pan row below the visible window.
+                    // Reserving rows that aren't there left a gap under
+                    // Zoom/Pan (REAL REPORT, 2026-11-11, once Stop moved
+                    // to the top and the status row was mostly empty).
+                    let row_reserve = ui.spacing().interact_size.y + 8.0;
+                    let below_waterfall_reserve = row_reserve
+                        + if show_status_row { row_reserve } else { 0.0 }
+                        + if connected.waterfall_enabled { SPECTRUM_WATERFALL_DIVIDER_HEIGHT } else { 0.0 };
                     // 120, not 200: lets the window go down to its
                     // minimum (see main_window_min_size) without
                     // pushing Zoom/Pan off the bottom. The spectrum
@@ -7720,6 +7728,7 @@ impl eframe::App for HpsdrApp {
                         remember_slider_pair_other(ui, row_id, slider_width);
                     });
 
+                    if show_status_row {
                     ui.add_space(8.0);
                     ui.horizontal(|ui| {
                         // See ConnectedState::status_message's doc
@@ -7737,6 +7746,7 @@ impl eframe::App for HpsdrApp {
                             ui.weak(msg);
                         }
                     });
+                    }
                 });
 
                 egui::Area::new(egui::Id::unique("s_meter_area"))
@@ -15362,7 +15372,11 @@ fn render_extra_receiver_ui(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceiver>>) {
     // Zoom/Pan row below the waterfall needs its own reserve here too
     // (unlike a plain no-reserve version, which would let the split
     // claim all available height and push Zoom/Pan below the window).
-    let zoom_pan_reserve = ui.spacing().interact_size.y + 8.0 + SPECTRUM_WATERFALL_DIVIDER_HEIGHT;
+    // The divider only when there's a waterfall: reserving it without one
+    // left a gap under Zoom/Pan (as the main window, REAL REPORT 2026-11-11).
+    let zoom_pan_reserve = ui.spacing().interact_size.y
+        + 8.0
+        + if rx.waterfall_enabled { SPECTRUM_WATERFALL_DIVIDER_HEIGHT } else { 0.0 };
     // 120, not 200 -- the main window's reasoning: a short window, with
     // the control rows folded, still shows Zoom/Pan.
     let spectrum_waterfall_height = (ui.available_height() - zoom_pan_reserve)
