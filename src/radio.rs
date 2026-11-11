@@ -1259,6 +1259,12 @@ pub struct RadioSession {
     /// not applicable to other P1 boards.
     pub tx_fifo_underrun: Arc<AtomicBool>,
     pub tx_fifo_overrun: Arc<AtomicBool>,
+    /// Packets from the radio lost on the way, counted from the gaps in
+    /// their sequence numbers (P1's EP6 stream; each P2 DDC's own), since
+    /// the session started. Stays 0 for USB radios. Shown under the
+    /// spectrum when it goes up: lost packets are gaps in the audio and
+    /// jumps in the spectrum together.
+    pub lost_packets: Arc<AtomicU64>,
     stop_flag: Arc<AtomicBool>,
     sender_thread: Option<JoinHandle<()>>,
     receiver_thread: Option<JoinHandle<()>>,
@@ -1995,6 +2001,7 @@ fn start_protocol1(
     puresignal_enabled: Arc<AtomicBool>,
 ) -> io::Result<RadioSession> {
     let socket = UdpSocket::bind(("0.0.0.0", 0))?;
+    enlarge_receive_buffer(&socket);
     socket.set_read_timeout(Some(Duration::from_millis(500)))?;
     // device.address is the radio's IP, captured from its discovery reply;
     // confirmed streaming traffic stays on the same port 1024.
@@ -2249,6 +2256,8 @@ fn start_protocol1(
     let receiver_diversity_enabled = Arc::clone(&diversity_enabled);
     let receiver_diversity_main_raw_iq = Arc::clone(&diversity_main_raw_iq);
     let receiver_hl2_io_board = Arc::clone(&hl2_io_board);
+    let lost_packets = Arc::new(AtomicU64::new(0));
+    let receiver_lost_packets = Arc::clone(&lost_packets);
     let receiver_thread = thread::spawn(move || {
         receiver_loop(
             receiver_socket,
@@ -2269,6 +2278,7 @@ fn start_protocol1(
             receiver_diversity_enabled,
             receiver_diversity_main_raw_iq,
             receiver_hl2_io_board,
+            receiver_lost_packets,
             receiver_stop,
         );
     });
@@ -2344,6 +2354,7 @@ fn start_protocol1(
         cw_paddle_contacts,
         tx_fifo_underrun,
         tx_fifo_overrun,
+        lost_packets,
         stop_flag,
         sender_thread: Some(sender_thread),
         receiver_thread: Some(receiver_thread),
@@ -2638,6 +2649,8 @@ fn start_protocol1_ozy_usb(
     // background loop, no sender/receiver thread here needs it.
     let mute_local_audio_for_tci = Arc::new(AtomicBool::new(false));
 
+    // See RadioSession::lost_packets: nothing counts them over USB.
+    let lost_packets = Arc::new(AtomicU64::new(0));
     Ok(RadioSession {
         iq_buffers,
         frequency_hz,
@@ -2704,6 +2717,7 @@ fn start_protocol1_ozy_usb(
         cw_paddle_contacts,
         tx_fifo_underrun,
         tx_fifo_overrun,
+        lost_packets,
         stop_flag,
         sender_thread: Some(sender_thread),
         receiver_thread: Some(receiver_thread),
@@ -2911,6 +2925,8 @@ fn start_rx888_usb(
 
     let mute_local_audio_for_tci = Arc::new(AtomicBool::new(false));
 
+    // See RadioSession::lost_packets: nothing counts them over USB.
+    let lost_packets = Arc::new(AtomicU64::new(0));
     Ok(RadioSession {
         iq_buffers,
         frequency_hz,
@@ -2977,6 +2993,7 @@ fn start_rx888_usb(
         cw_paddle_contacts,
         tx_fifo_underrun,
         tx_fifo_overrun,
+        lost_packets,
         stop_flag,
         sender_thread: None,
         receiver_thread: Some(receiver_thread),
@@ -3151,6 +3168,8 @@ fn start_usb_dongle(
 
     let mute_local_audio_for_tci = Arc::new(AtomicBool::new(false));
 
+    // See RadioSession::lost_packets: nothing counts them over USB.
+    let lost_packets = Arc::new(AtomicU64::new(0));
     Ok(RadioSession {
         iq_buffers,
         frequency_hz,
@@ -3217,6 +3236,7 @@ fn start_usb_dongle(
         cw_paddle_contacts,
         tx_fifo_underrun,
         tx_fifo_overrun,
+        lost_packets,
         stop_flag,
         sender_thread: None,
         receiver_thread: Some(receiver_thread),
@@ -6319,8 +6339,10 @@ fn receiver_loop(
     diversity_enabled: Arc<AtomicBool>,
     diversity_main_raw_iq: Arc<Mutex<VecDeque<IqSample>>>,
     hl2_io_board: Arc<Hl2IoBoardShared>,
+    lost_packets: Arc<AtomicU64>,
     stop: Arc<AtomicBool>,
 ) {
+    let mut sequence = SequenceGaps::default();
     let mut buf = [0u8; PACKET_SIZE + 64]; // a little slack in case of larger packets
     // Persistent byte-stream parse state for parse_iq_stream -- see its
     // doc comment. Owned here (not per-packet) because a "frame" can
@@ -6340,6 +6362,11 @@ fn receiver_loop(
         match socket.recv(&mut buf) {
             Ok(n) if n == PACKET_SIZE => {
                 if buf[0] == 0xEF && buf[1] == 0xFE && buf[2] == 0x01 && buf[3] == EP_IQ_DATA {
+                    let seq = u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]);
+                    let lost = sequence.lost_before(seq);
+                    if lost > 0 {
+                        lost_packets.fetch_add(lost as u64, Ordering::Relaxed);
+                    }
                     let capacity = iq_buffer_capacity_for_rate(sample_rate.load(Ordering::Relaxed));
                     // Read live (not a fixed value captured at session
                     // start) so the interleaving stride matches
@@ -7312,6 +7339,7 @@ fn start_protocol2(
     }
     setup_socket.bind(&socket_addr.into())?;
     let socket: UdpSocket = setup_socket.into();
+    enlarge_receive_buffer(&socket);
     socket.set_read_timeout(Some(Duration::from_millis(500)))?;
     // Deliberately not calling connect(): we need to both send to four
     // different destination ports on the radio and receive from several
@@ -7483,6 +7511,8 @@ fn start_protocol2(
     let receiver_diversity_main_raw_iq = Arc::clone(&diversity_main_raw_iq);
     // Live -- see RadioSession::puresignal_enabled's doc comment.
     let receiver_puresignal_enabled = Arc::clone(&puresignal_enabled);
+    let lost_packets = Arc::new(AtomicU64::new(0));
+    let receiver_lost_packets = Arc::clone(&lost_packets);
     let receiver_thread = thread::spawn(move || {
         p2_receiver_loop(
             receiver_socket,
@@ -7504,6 +7534,7 @@ fn start_protocol2(
             receiver_radio_mic_audio,
             receiver_diversity_enabled,
             receiver_diversity_main_raw_iq,
+            receiver_lost_packets,
             receiver_stop,
         );
     });
@@ -7579,6 +7610,7 @@ fn start_protocol2(
         cw_paddle_contacts,
         tx_fifo_underrun,
         tx_fifo_overrun,
+        lost_packets,
         stop_flag,
         sender_thread: Some(sender_thread),
         receiver_thread: Some(receiver_thread),
@@ -8702,6 +8734,7 @@ fn p2_receiver_loop(
     // fresh each packet, same as p2_sender_loop's own live read.
     diversity_enabled: Arc<AtomicBool>,
     diversity_main_raw_iq: Arc<Mutex<VecDeque<IqSample>>>,
+    lost_packets: Arc<AtomicU64>,
     stop: Arc<AtomicBool>,
 ) {
     let mut buf = [0u8; P2_PACKET_SIZE + 64];
@@ -8719,6 +8752,8 @@ fn p2_receiver_loop(
     // live on/off state, so real receivers start at DDC2.
     let ddc_reserved: usize = if ps_reserved { 2 } else { 0 };
     let mut ddc_seen = vec![false; buffers.len() + ddc_reserved];
+    // Each DDC numbers its own packets (see RadioSession::lost_packets).
+    let mut ddc_sequence = vec![SequenceGaps::default(); buffers.len() + ddc_reserved];
     // BUG FIX: forward/reverse power used to be stored as the single
     // latest raw per-packet ADC reading, with only a UI-frame-rate
     // exponential filter downstream of that. Confirmed against
@@ -8764,6 +8799,11 @@ fn p2_receiver_loop(
                         eprintln!("radio: first IQ packet received for DDC{ddc} (port {port})");
                     }
                     if n == P2_PACKET_SIZE {
+                        let seq = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]);
+                        let lost = ddc_sequence[ddc].lost_before(seq);
+                        if lost > 0 {
+                            lost_packets.fetch_add(lost as u64, Ordering::Relaxed);
+                        }
                         let capacity = iq_buffer_capacity_for_rate(sample_rate.load(Ordering::Relaxed));
                         if ps_reserved && puresignal_enabled.load(Ordering::Relaxed) && ddc == 0 {
                             // See p2_parse_ps_feedback_packet's doc comment --
@@ -8893,6 +8933,60 @@ fn p2_receiver_loop(
             }
             Err(_) => break,
         }
+    }
+}
+
+/// The receive buffer asked for on a radio's data socket: about 1 MB,
+/// Thetis's figure (ChannelMaster/network.c, "changed from 0x10000").
+/// The system default -- 64 KB on Windows, about 208 KB on Linux -- holds
+/// only a few milliseconds of IQ at high sample rates with several
+/// receivers (every P2 DDC arrives on this one socket), so the receive
+/// thread being held up for longer than that, by a busy system, loses
+/// packets: gaps in the audio and jumps in the spectrum at once. REAL
+/// REPORTS (2026-11-11): stuttering audio and spectrum on some Windows
+/// and Raspberry Pi 5 systems, not on others.
+const RECEIVE_BUFFER_BYTES: usize = 1 << 20;
+
+/// Asks for RECEIVE_BUFFER_BYTES on `socket` and logs what it got: Linux
+/// caps it at net.core.rmem_max (about 208 KB unless raised, e.g. `sudo
+/// sysctl -w net.core.rmem_max=1048576`) and reports twice what it keeps.
+fn enlarge_receive_buffer(socket: &UdpSocket) {
+    let sock = socket2::SockRef::from(socket);
+    if let Err(e) = sock.set_recv_buffer_size(RECEIVE_BUFFER_BYTES) {
+        eprintln!("radio: couldn't enlarge the receive buffer: {e}");
+    }
+    match sock.recv_buffer_size() {
+        Ok(n) => eprintln!("radio: receive buffer {} KB (asked for {} KB)", n / 1024, RECEIVE_BUFFER_BYTES / 1024),
+        Err(e) => eprintln!("radio: couldn't read the receive buffer size: {e}"),
+    }
+}
+
+/// Counts packets missing from a numbered stream (see
+/// RadioSession::lost_packets): a sequence number more than one past the
+/// last means the ones between were lost. One going backwards, or
+/// jumping implausibly far (the radio restarting the stream), starts
+/// counting again rather than being taken for a loss.
+#[derive(Clone, Copy, Default)]
+struct SequenceGaps {
+    last: Option<u32>,
+}
+
+impl SequenceGaps {
+    /// More than this many missing at once is a restart, not a loss: a
+    /// second of P2 DDC packets at 1536 kHz is about 6500.
+    const MAX_GAP: u32 = 10_000;
+
+    /// How many packets were lost just before the one numbered `seq`.
+    fn lost_before(&mut self, seq: u32) -> u32 {
+        let lost = match self.last {
+            Some(last) => {
+                let gap = seq.wrapping_sub(last).wrapping_sub(1);
+                if gap <= Self::MAX_GAP { gap } else { 0 }
+            }
+            None => 0,
+        };
+        self.last = Some(seq);
+        lost
     }
 }
 
@@ -9276,6 +9370,22 @@ mod tests {
     /// HPSDR_P2_IP the way the app does and counts what reaches the first
     /// receiver, with the DDC count the radio reports and, if
     /// HPSDR_P2_RECEIVERS is set, with that instead.
+    /// Lost packets are the gaps in the sequence numbers; a restart or a
+    /// packet out of order isn't a loss.
+    #[test]
+    fn sequence_gaps_count_lost_packets() {
+        let mut g = SequenceGaps::default();
+        assert_eq!(g.lost_before(100), 0);
+        assert_eq!(g.lost_before(101), 0);
+        assert_eq!(g.lost_before(105), 3);
+        assert_eq!(g.lost_before(104), 0); // late, out of order
+        assert_eq!(g.lost_before(105), 0);
+        assert_eq!(g.lost_before(0), 0); // the radio restarted the stream
+        assert_eq!(g.lost_before(1), 0);
+        let mut g = SequenceGaps { last: Some(u32::MAX - 1) };
+        assert_eq!(g.lost_before(1), 2); // through the wrap
+    }
+
     #[test]
     #[ignore]
     fn p2_receiver_gets_iq() {

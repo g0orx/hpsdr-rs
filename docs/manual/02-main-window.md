@@ -528,6 +528,18 @@ Below the meter:
   when comparing. It's blank while transmitting, when the passband
   is under 3 pixels wide on the spectrum (zoom in), or when it's too
   close to the edge of the view to see the noise beside it.
+- **Lost packets / Audio gaps** -- shown in orange for a few seconds
+  whenever packets from the radio go missing on the way, or the audio runs
+  dry and has to restart, with the totals since connecting (hover for
+  details). Either one is heard as stuttering audio. Lost packets also make
+  the spectrum and waterfall jump. They point to the network (use a cable
+  rather than Wi-Fi) or a computer too busy to keep up (try a lower sample
+  rate, fewer receivers, or lighter noise reduction). Audio gaps on their
+  own point to the sound card or a busy computer. Each time the counts go
+  up, the log records the totals too. On Linux, hpsdr-rs asks for a 1 MB
+  network receive buffer, but by default Raspberry Pi OS allows only about
+  208 KB (the log says what it got). `sudo sysctl -w
+  net.core.rmem_max=1048576` raises that limit until the next reboot.
 - **Settings...** opens the [Settings window](11-settings-network.md).
 - **Add Receiver (n/max)** adds another independent receiver window (see
   [Extra Receivers](03-extra-receivers.md)) -- hidden once you've reached

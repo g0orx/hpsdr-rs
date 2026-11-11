@@ -2803,6 +2803,15 @@ struct ConnectedState {
     /// of "true" would otherwise be too brief to actually notice at
     /// this UI's frame rate).
     tx_fifo_warning_until: Option<Instant>,
+    /// Lost packets from the radio and gaps in the speaker audio (see
+    /// RadioSession::lost_packets, AudioOutput::gaps), as last shown, and
+    /// until when the warning under the spectrum stays up after either
+    /// goes up. REAL REPORTS (2026-11-11): stuttering audio and spectrum
+    /// on some systems -- this says which of the two it is.
+    stutter_seen: (u64, u64),
+    stutter_warning_until: Option<Instant>,
+    /// When the last rise was logged (at most every 5 s).
+    stutter_logged_at: Option<Instant>,
     /// Edge-tracks session.mox_active() so tx_spectrum.clear_display()
     /// only fires once per fresh PTT (not every frame while
     /// transmitting) -- see that method's doc comment for why a long-
@@ -3943,6 +3952,9 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                 smoothed_rev_power: 0.0,
                 smoothed_snr_db: None,
                 tx_fifo_warning_until: None,
+                stutter_seen: (0, 0),
+                stutter_warning_until: None,
+                stutter_logged_at: None,
                 tx_spectrum_mox_was_active: false,
                 puresignal_enabled: settings.puresignal_enabled,
                 puresignal_reserve: settings.puresignal_reserve,
@@ -7647,10 +7659,54 @@ impl eframe::App for HpsdrApp {
                         if fifo_under || fifo_over {
                             connected.tx_fifo_warning_until = Some(Instant::now() + Duration::from_secs(2));
                         }
-                        let (fifo_row_rect, _resp) = ui.allocate_exact_size(
+                        let (fifo_row_rect, fifo_row_resp) = ui.allocate_exact_size(
                             egui::vec2(180.0, line_height),
                             egui::Sense::hover(),
                         );
+                        // Lost packets and audio gaps share this row (see
+                        // ConnectedState::stutter_seen); a TX FIFO warning,
+                        // only while transmitting, takes it first.
+                        let lost = connected.session.lost_packets.load(Ordering::Relaxed);
+                        let gaps = connected.audio_output.as_ref().map_or(0, |a| a.gaps());
+                        if (lost, gaps) != connected.stutter_seen {
+                            let now = Instant::now();
+                            if lost > connected.stutter_seen.0 || gaps > connected.stutter_seen.1 {
+                                connected.stutter_warning_until = Some(now + Duration::from_secs(5));
+                                if connected.stutter_logged_at.is_none_or(|t| now - t >= Duration::from_secs(5)) {
+                                    connected.stutter_logged_at = Some(now);
+                                    eprintln!("stutter: {lost} packets lost from the radio, {gaps} gaps in the audio so far");
+                                }
+                            }
+                            connected.stutter_seen = (lost, gaps);
+                        }
+                        let fifo_showing = connected.tx_fifo_warning_until.is_some_and(|u| Instant::now() < u);
+                        if !fifo_showing {
+                            if let Some(until) = connected.stutter_warning_until {
+                                if Instant::now() < until {
+                                    let text = match (lost > 0, gaps > 0) {
+                                        (true, true) => format!("Lost {lost} pkts, {gaps} gaps"),
+                                        (true, false) => format!("Lost {lost} packets"),
+                                        _ => format!("Audio gaps: {gaps}"),
+                                    };
+                                    ui.painter().text(
+                                        fifo_row_rect.left_center(),
+                                        egui::Align2::LEFT_CENTER,
+                                        text,
+                                        egui::TextStyle::Body.resolve(ui.style()),
+                                        readable(ui, egui::Color32::from_rgb(230, 150, 50)),
+                                    );
+                                    fifo_row_resp.on_hover_text(format!(
+                                        "Since connecting: {lost} packets from the radio lost on the way, \
+                                         {gaps} gaps in the audio.\n\nLost packets mean the network, or \
+                                         this computer too busy to take them in time -- try a cable \
+                                         rather than Wi-Fi, or a lower sample rate. Audio gaps without \
+                                         lost packets point to the sound card or a busy computer."
+                                    ));
+                                } else {
+                                    connected.stutter_warning_until = None;
+                                }
+                            }
+                        }
                         if let Some(until) = connected.tx_fifo_warning_until {
                             if Instant::now() < until {
                                 let text = if fifo_under && fifo_over {

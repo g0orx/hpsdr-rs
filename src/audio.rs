@@ -27,7 +27,7 @@
 use crate::radio::{CwKeyerAtomics, CW_KEYER_MODE_IAMBIC_A, CW_KEYER_MODE_IAMBIC_B};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -78,7 +78,23 @@ pub struct AudioOutput {
     // Kept alive for as long as playback should continue; dropping this
     // stops the stream.
     _stream: cpal::Stream,
+    /// See AudioOutput::gaps.
+    gaps: Arc<AtomicU64>,
 }
+
+/// Audio queued before playback starts, and again after the queue runs
+/// dry: 50 ms at 48 kHz, or two of the sound card's own blocks if they're
+/// bigger (Bluetooth and HDMI ask for large ones). REAL REPORTS
+/// (2026-11-11): stuttering audio on some Windows and Raspberry Pi 5
+/// systems. Playback used to start on the first samples, so the queue ran
+/// close to empty and any late block from the radio or the DSP, or a
+/// sound card taking large or uneven bites, was a gap.
+const PRIME_FRAMES: usize = 2_400;
+
+/// Silence shorter than this before the audio returns is a gap (see
+/// AudioOutput::gaps); longer is a deliberate pause -- muted for TCI or
+/// while transmitting, or the receiver stopped -- and isn't counted.
+const GAP_MAX_FRAMES: usize = OUTPUT_SAMPLE_RATE as usize;
 
 impl AudioOutput {
     /// `device_name`: `None` (or a name that no longer matches any
@@ -112,6 +128,13 @@ impl AudioOutput {
             buffer_size: cpal::BufferSize::Default,
         };
 
+        let gaps = Arc::new(AtomicU64::new(0));
+        let callback_gaps = Arc::clone(&gaps);
+        // Whether the queue has filled to PRIME_FRAMES since it last ran
+        // dry, and how long it's been silent since it did (None at the
+        // start, which isn't a gap).
+        let mut primed = false;
+        let mut silent_frames: Option<usize> = None;
         let stream = device
             .build_output_stream(
                 &config,
@@ -133,9 +156,35 @@ impl AudioOutput {
                 // (L==R, same as this project's own former duplicated-
                 // mono behavior).
                 move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
+                    let frames = data.len() / OUTPUT_CHANNELS as usize;
                     let mut buf = buffer.lock().unwrap();
+                    if !primed {
+                        if buf.len() >= PRIME_FRAMES.max(2 * frames) {
+                            primed = true;
+                            if silent_frames.take().is_some_and(|n| n < GAP_MAX_FRAMES) {
+                                callback_gaps.fetch_add(1, Ordering::Relaxed);
+                            }
+                        } else {
+                            data.fill(0.0);
+                            if let Some(n) = silent_frames.as_mut() {
+                                *n += frames;
+                            }
+                            return;
+                        }
+                    }
                     for frame in data.chunks_mut(OUTPUT_CHANNELS as usize) {
-                        let (l, r) = buf.pop_front().unwrap_or((0.0, 0.0)); // silence on underrun
+                        let (l, r) = match buf.pop_front() {
+                            Some(pair) => pair,
+                            None => {
+                                // Ran dry: silence, and wait to fill again.
+                                if primed {
+                                    primed = false;
+                                    silent_frames = Some(0);
+                                }
+                                *silent_frames.get_or_insert(0) += 1;
+                                (0.0, 0.0)
+                            }
+                        };
                         if let [left, right, ..] = frame {
                             *left = l;
                             *right = r;
@@ -153,7 +202,14 @@ impl AudioOutput {
             .play()
             .map_err(|e| format!("failed to start audio playback: {e}"))?;
 
-        Ok(Self { _stream: stream })
+        Ok(Self { _stream: stream, gaps })
+    }
+
+    /// Gaps in the audio since playback started: times the queue ran dry
+    /// and the audio came back within a second (see PRIME_FRAMES and
+    /// GAP_MAX_FRAMES). Shown under the spectrum when it goes up.
+    pub fn gaps(&self) -> u64 {
+        self.gaps.load(Ordering::Relaxed)
     }
 }
 
