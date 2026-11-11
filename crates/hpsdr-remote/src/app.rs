@@ -1095,7 +1095,10 @@ impl App {
     fn frequency_row(&mut self, ui: &mut egui::Ui) {
         ui.horizontal_wrapped(|ui| {
             let digits = format_frequency(self.radio.vfo_hz);
-            let colour = if self.radio.mox { Color32::from_rgb(230, 60, 60) } else { Color32::from_rgb(60, 230, 60) };
+            let colour = readable(
+                ui,
+                if self.radio.mox { Color32::from_rgb(230, 60, 60) } else { Color32::from_rgb(60, 230, 60) },
+            );
             let resp = ui
                 .add(
                     egui::Label::new(egui::RichText::new(digits).monospace().size(32.0).color(colour))
@@ -1444,11 +1447,11 @@ impl App {
         ui.horizontal_wrapped(|ui| {
             ui.weak(text);
             if let Some(e) = &self.mic_error {
-                ui.colored_label(Color32::from_rgb(230, 80, 80), e);
+                ui.colored_label(readable(ui, Color32::from_rgb(230, 80, 80)), e);
             }
             if let Some((notice, at)) = &self.notice {
                 if now - at < NOTICE_S {
-                    ui.colored_label(Color32::from_rgb(230, 180, 60), notice);
+                    ui.colored_label(readable(ui, Color32::from_rgb(230, 180, 60)), notice);
                 }
             }
         });
@@ -1542,6 +1545,19 @@ fn nice_step(approx: f64) -> f64 {
 }
 
 /// Black through blue, cyan, yellow to red, for 0..1.
+/// Colour for text drawn straight on the page's background: as given in
+/// dark mode, darker in light mode so it still reads. The client follows
+/// the browser's (or desktop's) dark/light setting -- egui's default --
+/// while the spectrum, waterfall and meters stay dark in both.
+fn readable(ui: &egui::Ui, c: Color32) -> Color32 {
+    if ui.visuals().dark_mode {
+        return c;
+    }
+    let [r, g, b, a] = c.to_array();
+    let dim = |v: u8| (v as f32 * 0.6) as u8;
+    Color32::from_rgba_premultiplied(dim(r), dim(g), dim(b), a)
+}
+
 fn waterfall_colour(v: f32) -> Color32 {
     let v = v.clamp(0.0, 1.0);
     let stops = [(0.0, [0, 0, 0]), (0.3, [0, 0, 200]), (0.55, [0, 200, 220]), (0.8, [240, 230, 0]), (1.0, [255, 40, 40])];

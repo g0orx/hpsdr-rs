@@ -9,8 +9,15 @@
        connection through to TCI at (web_server.rs); left as is, the page
        wasn't served by hpsdr-rs. -->
   <meta name="hpsdr-tci-path" content="__HPSDR_SERVED__">
+  <!-- The client follows the browser's dark/light setting (egui reads
+       prefers-color-scheme and follows changes); the page behind it, and a
+       phone's browser bar, match egui's panel colour in each. -->
+  <meta name="color-scheme" content="dark light">
+  <meta name="theme-color" content="#1b1b1b" media="(prefers-color-scheme: dark)">
+  <meta name="theme-color" content="#f8f8f8" media="(prefers-color-scheme: light)">
   <style>
     html, body { margin: 0; padding: 0; height: 100%; overflow: hidden; background: #1b1b1b; }
+    @media (prefers-color-scheme: light) { html, body { background: #f8f8f8; } }
     canvas { display: block; width: 100%; height: 100%; touch-action: none; }
   </style>
 </head>

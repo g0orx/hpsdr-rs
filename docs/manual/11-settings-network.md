@@ -184,6 +184,8 @@ after a tap). Tune by tapping or sliding on the spectrum or waterfall, by
 sliding on the frequency, or with **-** and **+** and a chosen step. It
 uses about 150 kbit/s, compressed, rather than the several Mbit/s of
 standard TCI audio and IQ, plus about 70 kbit/s more while transmitting.
+It's dark or light as the phone, tablet or browser is set, and changes when
+that does; the spectrum and waterfall stay dark in both.
 
 To transmit, press **MOX**: the first time, the browser asks to use the
 microphone. Press **MOX** again to stop. **Mic** sets its level (keep the
