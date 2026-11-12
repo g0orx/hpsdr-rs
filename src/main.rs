@@ -7508,7 +7508,20 @@ impl eframe::App for HpsdrApp {
                     // CTUN is on pan_offset_hz already carries the CTUN
                     // offset itself, so this stays exactly the same value
                     // as before in every non-transmitting case.
-                    let view_center_hz = if transmitting { dial_freq_hz as f64 } else { freq_hz as f64 } + pan_offset_hz;
+                    // Transmitting through an FM repeater shift: the TX
+                    // trace is centred on the shifted carrier, so the
+                    // scale and band edges move with it, as VFO-A does.
+                    let repeater_shift_hz = if transmitting
+                        && !tx_on_b
+                        && current_mode == spectrum::Mode::Fmn
+                        && connected.fm_shift != 0
+                    {
+                        connected.tx_rf_frequency_hz.load(Ordering::Relaxed) as f64 - displayed_freq_hz as f64
+                    } else {
+                        0.0
+                    };
+                    let view_center_hz =
+                        if transmitting { dial_freq_hz as f64 + repeater_shift_hz } else { freq_hz as f64 } + pan_offset_hz;
 
                     // While transmitting, this displays tx_spectrum --
                     // generated TX IQ that's always centered on the real
