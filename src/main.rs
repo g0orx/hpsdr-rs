@@ -7725,6 +7725,8 @@ impl eframe::App for HpsdrApp {
                     }
 
                     if let Some(pos) = spectrum_resp.hover_pos() {
+                        // Plus the repeater shift while transmitting through
+                        // one, matching the scale (repeater_shift_hz).
                         // Shown in RF space when a transverter is active --
                         // see xvtr_rf_offset_hz's doc comment -- matching
                         // the frequency-axis tick labels, which get the
@@ -7738,7 +7740,9 @@ impl eframe::App for HpsdrApp {
                             ui.input(|i| i.modifiers.shift),
                             ui.input(|i| i.modifiers.ctrl),
                         );
-                        let hover_freq_shown = round_shown_hz(hover_freq as i64 + xvtr_rf_offset_hz, step).max(0) as u64;
+                        let hover_freq_shown =
+                            round_shown_hz(hover_freq as i64 + xvtr_rf_offset_hz + repeater_shift_hz.round() as i64, step).max(0)
+                                as u64;
                         draw_freq_hover_tooltip(ui.painter(), pos, hover_freq_shown);
                     }
 
@@ -7918,7 +7922,9 @@ impl eframe::App for HpsdrApp {
                             ui.input(|i| i.modifiers.shift),
                             ui.input(|i| i.modifiers.ctrl),
                         );
-                            let hover_freq_shown = round_shown_hz(hover_freq as i64 + xvtr_rf_offset_hz, step).max(0) as u64;
+                            let hover_freq_shown =
+                            round_shown_hz(hover_freq as i64 + xvtr_rf_offset_hz + repeater_shift_hz.round() as i64, step).max(0)
+                                as u64;
                             draw_freq_hover_tooltip(ui.painter(), pos, hover_freq_shown);
                         }
 
