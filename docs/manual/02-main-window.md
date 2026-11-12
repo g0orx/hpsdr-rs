@@ -457,7 +457,8 @@ In **FM**, the transmit row also has:
 
 - **Shift** -- **−**, **Simplex** or **+**: transmit below, on, or above
   VFO A by the offset next to it, e.g. **−** with 600 kHz for a 2m
-  repeater. The TX frequency is shown alongside. Split and Duplex take
+  repeater. The TX frequency is shown alongside, and while transmitting
+  VFO A shows it too (in red), as a radio does. Split and Duplex take
   precedence, since VFO B names its own TX frequency.
 - **Offset** -- this band's repeater offset, in kHz. It starts at the usual
   European offset (10m 100 kHz, 6m 500 kHz, 2m 600 kHz, 70cm 7.6 MHz, 23cm

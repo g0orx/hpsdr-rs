@@ -5511,7 +5511,21 @@ impl eframe::App for HpsdrApp {
                                         let resp = ui
                                             .add(
                                                 egui::Label::new(
-                                                    egui::RichText::new(format_frequency(displayed_freq_hz))
+                                                    egui::RichText::new(format_frequency(
+                                                        // Transmitting through a
+                                                        // repeater shift: show the
+                                                        // frequency going out, as
+                                                        // a radio does.
+                                                        if keyed
+                                                            && !tx_on_b
+                                                            && current_mode == spectrum::Mode::Fmn
+                                                            && connected.fm_shift != 0
+                                                        {
+                                                            connected.tx_rf_frequency_hz.load(Ordering::Relaxed)
+                                                        } else {
+                                                            displayed_freq_hz
+                                                        },
+                                                    ))
                                                         .monospace()
                                                         .size(28.0)
                                                         .strong()
