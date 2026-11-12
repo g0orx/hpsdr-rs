@@ -477,6 +477,10 @@ pub struct CwLive {
     pub rate: AtomicU32,
     /// A client is keying: the transmitter plays `events`.
     pub active: AtomicBool,
+    /// A key at this station (a MIDI CW key) is down, as it arrives: the
+    /// PC sidetone (audio.rs's CwSidetone) follows it. A remote client
+    /// plays its own sidetone, so its keying doesn't set this.
+    pub sidetone_key: AtomicBool,
 }
 
 /// 0 = Straight, 1 = Iambic A, 2 = Iambic B -- matches piHPSDR's

@@ -3932,6 +3932,7 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                 allow_out_of_band_tx: Arc::clone(&allow_out_of_band_tx),
                 cw_mode: Arc::clone(&session.cw_mode_active),
                 tx_available: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                tx_busy: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             });
             midi.enabled.store(cfg.midi_enabled.unwrap_or(false), Ordering::Relaxed);
             midi.feedback.store(cfg.midi_feedback.unwrap_or(false), Ordering::Relaxed);
@@ -4824,6 +4825,9 @@ impl eframe::App for HpsdrApp {
                 // tell it which controls are CW keys, and whether it may key.
                 connected.midi.cw_key.set_bindings(&connected.midi_bindings);
                 connected.midi.cw_key.set_tx_available(connected.tx_enabled && connected.tx_handle.is_some());
+                connected.midi.cw_key.set_tx_busy(
+                    connected.tune_active || connected.two_tone_active || connected.cw_text_sending,
+                );
                 loop {
                     let ev = {
                         let mut events = connected.midi.events.lock().unwrap();
@@ -8095,7 +8099,7 @@ impl eframe::App for HpsdrApp {
                             // UI scale or the waterfall changes.
                             let waterfall = rx_for_closure.lock().unwrap().waterfall_enabled;
                             let min_size = extra_window_min_size(ui.ctx().zoom_factor(), waterfall);
-                            let min_id = egui::Id::new(("extra_min_size", ddc_index));
+                            let min_id = egui::Id::unique(("extra_min_size", ddc_index));
                             if ui.data(|d| d.get_temp::<egui::Vec2>(min_id)) != Some(min_size) {
                                 ui.data_mut(|d| d.insert_temp(min_id, min_size));
                                 ui.ctx().send_viewport_cmd(egui::ViewportCommand::MinInnerSize(min_size));

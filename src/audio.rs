@@ -594,6 +594,8 @@ fn run(
         } else {
             cw_ptt_active.load(Ordering::Relaxed)
         };
+        // Or a MIDI CW key, which hpsdr-rs keys itself (midi::MidiCwKey).
+        let radio_keyed = radio_keyed || cw_keyer.live.sidetone_key.load(Ordering::Relaxed);
         let keyed =
             enabled.load(Ordering::Relaxed) && mox.load(Ordering::Relaxed) && cw_mode_active.load(Ordering::Relaxed) && radio_keyed;
         if keyed != was_keyed {

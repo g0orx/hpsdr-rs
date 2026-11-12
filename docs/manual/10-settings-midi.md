@@ -182,11 +182,18 @@ busy the display is.
 
 - The first key-down keys the radio, if the mode is **CWL** or **CWU**,
   transmit is armed (Settings -> TX -> Enable Transmit), the frequency is
-  inside the ham bands (or out-of-band TX is allowed) and nothing else is
-  transmitting. Otherwise it's refused, and a line saying why is printed
-  (`midi: CW key refused -- ...`); the rest of that press is ignored.
+  inside the ham bands (or out-of-band TX is allowed) and Tune, Two Tone
+  or a CW text message isn't transmitting. Otherwise it's refused, and a
+  line saying why is printed (`midi: CW key refused -- ...`); the rest of
+  that press is ignored.
 - The radio unkeys once the key has been up for the **Break-in Delay**
   (Settings -> CW).
+- If MOX is already on -- e.g. a keyer that sends a PTT note, bound to
+  **MOX**, before its paddle -- the key sends inside it, and the radio
+  stays keyed until MOX goes off, so the keyer's own PTT and hang time
+  decide when it unkeys.
+- With **PC Sidetone** on (Settings -> CW), you hear the key on the PC's
+  audio output as it's pressed.
 - If the MIDI device is unplugged or MIDI is turned off with the key down,
   or the radio is unkeyed another way, the radio unkeys at once.
 - Speed and weight are the keyer's business: hpsdr-rs plays the key as it

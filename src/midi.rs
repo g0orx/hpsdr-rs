@@ -525,6 +525,10 @@ pub struct MidiCwTarget {
     /// Transmit is armed (a TxHandle exists) -- kept up to date by
     /// main.rs every frame.
     pub tx_available: Arc<AtomicBool>,
+    /// Tune, Two Tone or a CW text message is transmitting, so a MOX
+    /// that's up isn't one the key can send inside -- kept up to date
+    /// by main.rs every frame.
+    pub tx_busy: Arc<AtomicBool>,
 }
 
 /// Its first key-down is played this long after it arrives, so later
@@ -544,11 +548,16 @@ const CW_KEY_RAMP_MS: u64 = 10;
 /// timing doesn't depend on the UI's frame rate.
 ///
 /// The first key-down of a burst keys the radio -- only in CW, in band,
-/// with transmit armed and nothing else transmitting -- and the burst
+/// with transmit armed and not Tune, Two Tone or CW text -- and the burst
 /// ends, unkeying, once the key has been up for the CW hang time (Settings
 /// -> CW, Break-in Delay). It also ends at once if the radio is unkeyed
 /// some other way, transmit is disarmed, or the device goes away with the
 /// key down.
+///
+/// If MOX is already up -- a keyer that sends a PTT note ahead of its
+/// paddle, bound to MOX -- the key sends inside it: the burst leaves MOX
+/// alone and lasts until MOX drops, so the keyer's own PTT and hang time
+/// rule. The key's state also drives the PC sidetone (CwLive::sidetone_key).
 pub struct MidiCwKey {
     target: MidiCwTarget,
     /// The CwKey bindings (main.rs keeps this up to date).
@@ -566,6 +575,9 @@ struct CwBurst {
     rate: u64,
     last_sample: u64,
     down: bool,
+    /// The burst raised MOX (else it joined one already up, and leaves
+    /// MOX to whoever raised it).
+    owns_mox: bool,
 }
 
 impl MidiCwKey {
@@ -576,6 +588,11 @@ impl MidiCwKey {
     /// Kept up to date by main.rs every frame -- see MidiCwTarget::tx_available.
     pub fn set_tx_available(&self, available: bool) {
         self.target.tx_available.store(available, Ordering::Relaxed);
+    }
+
+    /// Kept up to date by main.rs every frame -- see MidiCwTarget::tx_busy.
+    pub fn set_tx_busy(&self, busy: bool) {
+        self.target.tx_busy.store(busy, Ordering::Relaxed);
     }
 
     /// The bindings whose action is CwKey, from the full list.
@@ -606,6 +623,7 @@ impl MidiCwKey {
             if down == b.down {
                 return;
             }
+            live.sidetone_key.store(down, Ordering::Relaxed);
             let offset = now.saturating_duration_since(b.anchor).as_micros() as u64 * b.rate / 1_000_000;
             let at = (b.anchor_sample + offset).max(b.last_sample).max(live.clock.load(Ordering::Relaxed));
             live.events.lock().unwrap().push_back((at, down));
@@ -621,6 +639,7 @@ impl MidiCwKey {
             return;
         }
         let rate = live.rate.load(Ordering::Relaxed) as u64;
+        let mox_up = self.target.mox.load(Ordering::Relaxed);
         let why = if !self.target.tx_available.load(Ordering::Relaxed) || rate == 0 {
             Some("transmit isn't armed (Settings -> TX -> Enable Transmit)")
         } else if !self.target.cw_mode.load(Ordering::Relaxed) {
@@ -630,8 +649,10 @@ impl MidiCwKey {
             self.target.allow_out_of_band_tx.load(Ordering::Relaxed),
         ) {
             Some("TX frequency is outside the ham bands")
-        } else if self.target.mox.load(Ordering::Relaxed) || live.active.load(Ordering::Relaxed) {
-            Some("the radio is already transmitting")
+        } else if live.active.load(Ordering::Relaxed)
+            || (mox_up && self.target.tx_busy.load(Ordering::Relaxed))
+        {
+            Some("the radio is already transmitting (Tune, Two Tone, CW text or a remote key)")
         } else {
             None
         };
@@ -647,8 +668,11 @@ impl MidiCwKey {
             events.push_back((at, true));
         }
         live.active.store(true, Ordering::Relaxed);
-        self.target.mox.store(true, Ordering::Relaxed);
-        *burst = Some(CwBurst { anchor: now, anchor_sample: at, rate, last_sample: at, down: true });
+        live.sidetone_key.store(true, Ordering::Relaxed);
+        if !mox_up {
+            self.target.mox.store(true, Ordering::Relaxed);
+        }
+        *burst = Some(CwBurst { anchor: now, anchor_sample: at, rate, last_sample: at, down: true, owns_mox: !mox_up });
     }
 
     /// Ends the burst once the key has been up for the hang time, or at
@@ -666,9 +690,10 @@ impl MidiCwKey {
             None
         };
         let hang_ms = self.target.cw.hang_time_ms.load(Ordering::Relaxed) as u64 + CW_KEY_RAMP_MS;
-        let hung = !b.down && live.clock.load(Ordering::Relaxed) >= b.last_sample + hang_ms * b.rate / 1000;
+        // A burst inside someone else's MOX lasts as long as that MOX.
+        let hung = b.owns_mox && !b.down && live.clock.load(Ordering::Relaxed) >= b.last_sample + hang_ms * b.rate / 1000;
         if why.is_some() || hung {
-            if let Some(why) = why {
+            if let Some(why) = why.filter(|_| b.owns_mox) {
                 eprintln!("midi: CW key -- {why}, keying ended");
             }
             self.end(b);
@@ -693,7 +718,10 @@ impl MidiCwKey {
             live.events.lock().unwrap().push_back((live.clock.load(Ordering::Relaxed), false));
         }
         live.active.store(false, Ordering::Relaxed);
-        self.target.mox.store(false, Ordering::Relaxed);
+        live.sidetone_key.store(false, Ordering::Relaxed);
+        if b.owns_mox {
+            self.target.mox.store(false, Ordering::Relaxed);
+        }
     }
 }
 
@@ -967,6 +995,7 @@ mod tests {
             allow_out_of_band_tx: Arc::new(AtomicBool::new(false)),
             cw_mode: Arc::new(AtomicBool::new(true)),
             tx_available: Arc::new(AtomicBool::new(true)),
+            tx_busy: Arc::new(AtomicBool::new(false)),
         };
         (target, cw, mox)
     }
@@ -1043,6 +1072,37 @@ mod tests {
         key.release("MIDI device gone");
         assert!(!mox.load(Ordering::Relaxed));
         assert_eq!(cw.live.events.lock().unwrap().back().map(|e| e.1), Some(false));
+    }
+
+    #[test]
+    fn cw_key_sends_inside_a_mox_already_up_and_leaves_it_alone() {
+        let (target, cw, mox) = cw_target();
+        let tx_busy = Arc::clone(&target.tx_busy);
+        let key = MidiCwKey::new(target);
+        key.set_bindings(&[key_binding()]);
+        // The keyer's PTT note raised MOX first.
+        mox.store(true, Ordering::Relaxed);
+        let t0 = Instant::now();
+        assert!(key.handle(&note(true), t0));
+        assert!(cw.live.active.load(Ordering::Relaxed));
+        assert!(cw.live.sidetone_key.load(Ordering::Relaxed));
+        key.handle(&note(false), t0 + Duration::from_millis(60));
+        assert!(!cw.live.sidetone_key.load(Ordering::Relaxed));
+        // Long past the hang time: still keying, inside the keyer's PTT.
+        cw.live.clock.store(10 * 48_000, Ordering::Relaxed);
+        assert!(key.tick());
+        assert!(mox.load(Ordering::Relaxed));
+        // The keyer's PTT drops: the burst ends quietly.
+        mox.store(false, Ordering::Relaxed);
+        assert!(!key.tick());
+        assert!(!cw.live.active.load(Ordering::Relaxed));
+
+        // Inside Tune, it's refused, and MOX is left as it was.
+        tx_busy.store(true, Ordering::Relaxed);
+        mox.store(true, Ordering::Relaxed);
+        key.handle(&note(true), Instant::now());
+        assert!(!cw.live.active.load(Ordering::Relaxed));
+        assert!(mox.load(Ordering::Relaxed));
     }
 
     /// The whole input path through the OS's MIDI: a virtual port stands
