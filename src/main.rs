@@ -7634,7 +7634,10 @@ impl eframe::App for HpsdrApp {
                         // rather than an adaptive one, since 10dB is the
                         // conventional spectrum-display grid spacing
                         // regardless of the configured range.
-                        let mut db = (db_low / 10.0).ceil() * 10.0;
+                        // Wider steps when 10 dB ones would put the
+                        // labels on top of each other (db_grid_step).
+                        let step = db_grid_step(range, plot_height);
+                        let mut db = (db_low / step).ceil() * step;
                         while db <= db_high {
                             let frac = (db - db_low) / range;
                             let y = plot_bottom - frac * plot_height;
@@ -7649,7 +7652,7 @@ impl eframe::App for HpsdrApp {
                                 egui::FontId::monospace(10.0),
                                 egui::Color32::GRAY,
                             );
-                            db += 10.0;
+                            db += step;
                         }
                     }
 
@@ -14142,6 +14145,17 @@ fn draw_audio_waveform(painter: &egui::Painter, rect: egui::Rect, samples: &[f32
     }
 }
 
+/// The spectrum's dB gridline spacing: 10 dB, or 20/50/100 dB when 10 dB
+/// lines would be closer than a label is tall -- e.g. the wide TX range
+/// on a short spectrum, where the labels piled on top of each other.
+fn db_grid_step(range_db: f32, plot_height: f32) -> f32 {
+    const MIN_LABEL_SPACING: f32 = 14.0;
+    [10.0, 20.0, 50.0, 100.0]
+        .into_iter()
+        .find(|step| step * plot_height / range_db.max(1.0) >= MIN_LABEL_SPACING)
+        .unwrap_or(100.0)
+}
+
 /// Vertical orange markers on the spectrum plot at any amateur band edge
 /// (BANDS' low_hz/high_hz) that falls within the currently visible span
 /// -- e.g. tuned near the top of 40m shows a line at 7.300MHz, or near a
@@ -15788,7 +15802,8 @@ fn render_extra_receiver_ui(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceiver>>) {
         // Power-level gridlines, same treatment as the main window --
         // snapped to multiples of 10 dB rather than equal fractions of
         // db_low/db_high (see that copy's own doc comment for why).
-        let mut db = (db_low / 10.0).ceil() * 10.0;
+        let step = db_grid_step(range, plot_height);
+        let mut db = (db_low / step).ceil() * step;
         while db <= db_high {
             let frac = (db - db_low) / range;
             let y = plot_bottom - frac * plot_height;
@@ -15803,7 +15818,7 @@ fn render_extra_receiver_ui(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceiver>>) {
                 egui::FontId::monospace(10.0),
                 egui::Color32::GRAY,
             );
-            db += 10.0;
+            db += step;
         }
     }
 
@@ -17775,6 +17790,15 @@ mod tests {
         assert_eq!(default_repeater_offset_hz(145_600_000), 600_000);
         assert_eq!(default_repeater_offset_hz(433_000_000), 7_600_000);
         assert_eq!(default_repeater_offset_hz(7_100_000), 0);
+    }
+
+    #[test]
+    fn db_grid_widens_when_labels_would_overlap() {
+        // 100 dB over 300 px: 30 px per 10 dB.
+        assert_eq!(db_grid_step(100.0, 300.0), 10.0);
+        // TX's 160 dB over 120 px: 7.5 px per 10 dB, 15 per 20 dB.
+        assert_eq!(db_grid_step(160.0, 120.0), 20.0);
+        assert_eq!(db_grid_step(160.0, 40.0), 100.0);
     }
 
     #[test]

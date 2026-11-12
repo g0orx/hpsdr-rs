@@ -2,9 +2,9 @@
 
 # Main Window
 
-![Main window overview: QO-100's narrowband transponder through a Pluto,
-with a saved setup recalled (CTUN, Split, SAT and Duplex on, VFO B on the
-2400 MHz uplink) and the PSK Beacon panel open](images/02-main-window-overview.png)
+![Main window overview: 20m with CTUN on, the spectrum and waterfall
+across the band, the S-meter, and Settings..., Add Receiver and Stop at
+the top](images/02-main-window-overview.png)
 
 ## Frequency display and tuning
 
@@ -254,8 +254,8 @@ mode, filter width, and the audio gain, or **Audio muted** in red); click
 folded away, including MIDI and rigctl/TCI/CAT, and whether they're
 minimized is remembered.
 
-![The control rows folded into one line: » and QO-100, USB, 3000 Hz,
-Audio -57 dB, with MOX directly below](images/02-controls-minimized.png)
+![The control rows folded into one line: » and 20m, USB, 2700 Hz,
+Audio 30 dB, with MOX directly below](images/02-controls-minimized.png)
 
 ## Bands and modes
 
@@ -470,6 +470,10 @@ In **FM**, the transmit row also has:
 Each band remembers its own Shift and CTCSS tone as you left it there,
 like Split.
 
+![A 2m repeater on the 144MHz transverter band: VFO A on 145.625 MHz, FM,
+Shift − with a 600 kHz offset, CTCSS 88.5 Hz and TX 145.025000, with PA OFF
+beside MOX](images/02-fm-repeater.png)
+
 With transmit enabled, the **Mic gain**, **TCI TX gain** and **TX Power**
 (**TX Drive**, in dB, on a [Pluto](24-pluto.md#transmit)) sliders have
 their own row under Audio gain, Mute and SQL, and a line beneath them
@@ -479,9 +483,9 @@ shows the **Mic level** and **ALC** readouts.
 into a real antenna.** See the [top-level README](../../README.md) for the
 project's current TX verification status.
 
-![Transmitting in Duplex on QO-100: MOX ON and TUNE ON, VFO B (the uplink)
-in red, the receive spectrum still live on the downlink, and the TX inset
-showing Tune's tone in the middle of the TX filter](images/02-tx-active.png)
+![Transmitting on 20m: MOX ON, TUNE ON and TRANSMITTING, VFO A in red,
+the power meter in place of the S-meter, and the spectrum showing Tune's
+tone in the red TX filter](images/02-tx-active.png)
 
 ## Spectrum and waterfall
 
