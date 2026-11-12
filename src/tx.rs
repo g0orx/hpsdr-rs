@@ -407,6 +407,8 @@ pub struct TxParams {
     /// exactly why every reference PS implementation calibrates with a
     /// two-tone generator, never a steady carrier.
     pub two_tone: bool,
+    /// CTCSS tone added in FM, Hz; 0 = none (main.rs sends 0 outside FM).
+    pub ctcss_hz: f32,
     /// See spectrum::EqualizerParams's doc comment -- same type, TXA side.
     pub eq: EqualizerParams,
     /// WDSP's Speech Processor (a baseband RF-clipper equivalent --
@@ -451,6 +453,7 @@ impl Default for TxParams {
             compressor_enabled: false,
             compressor_gain_db: 3.0,
             cessb_enabled: false,
+            ctcss_hz: 0.0,
         }
     }
 }
@@ -465,6 +468,8 @@ struct TxProcessor {
     iq_scratch: Vec<f64>,
     last_mode: Option<Mode>,
     last_gain: Option<f32>,
+    /// The CTCSS tone as last set (0 = off) -- see set_ctcss.
+    last_ctcss_hz: Option<f32>,
     last_passband: Option<(f64, f64)>,
     /// The Tune tone's frequency as last set -- see process().
     last_tune_hz: Option<f64>,
@@ -864,6 +869,7 @@ impl TxProcessor {
             iq_scratch: vec![0.0; out_iq_pairs * 2],
             last_mode: None,
             last_gain: None,
+            last_ctcss_hz: None,
             // None, not Some(default_passband): process() also sets the
             // Tune tone (PostGen) frequency on a passband change, and
             // open() leaves it at 0 Hz -- so with the mode/width at the
@@ -913,6 +919,20 @@ impl TxProcessor {
     /// with, plus fexchange0's own error code (0 = ok, see call site
     /// below for what nonzero means -- this was previously discarded
     /// entirely, silently hiding a whole class of possible dropout).
+    /// The FM CTCSS tone (WDSP's FM modulator adds it), 0 = off.
+    fn set_ctcss(&mut self, hz: f32) {
+        if self.last_ctcss_hz == Some(hz) {
+            return;
+        }
+        unsafe {
+            if hz > 0.0 {
+                wdsp::SetTXACTCSSFreq(self.channel, hz as f64);
+            }
+            wdsp::SetTXACTCSSRun(self.channel, (hz > 0.0) as c_int);
+        }
+        self.last_ctcss_hz = Some(hz);
+    }
+
     fn process(
         &mut self,
         mic_samples: &[f32],
@@ -2343,6 +2363,7 @@ fn run(
         }
 
         let p = *params.lock().unwrap();
+        processor.set_ctcss(p.ctcss_hz);
         let (iq, exch_error) =
             processor.process(
                 &chunk,
@@ -2682,6 +2703,11 @@ impl TxHandle {
     /// See TxParams::two_tone's doc comment.
     pub fn set_two_tone(&self, two_tone: bool) {
         self.params.lock().unwrap().two_tone = two_tone;
+    }
+
+    /// See TxParams::ctcss_hz.
+    pub fn set_ctcss_hz(&self, hz: f32) {
+        self.params.lock().unwrap().ctcss_hz = hz;
     }
 
     /// See spectrum::EqualizerParams's doc comment.

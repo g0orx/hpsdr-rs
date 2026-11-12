@@ -377,6 +377,11 @@ pub struct Config {
     /// ConnectedState::allow_out_of_band_tx by every PTT path each time.
     #[serde(default)]
     pub allow_out_of_band_tx: Option<bool>,
+    /// Settings -> TX "Split off when changing band": a band button turns
+    /// Split (and Duplex) off, rather than restoring how that band was
+    /// last left (BandSettings::split).
+    #[serde(default)]
+    pub split_off_on_band_change: Option<bool>,
     /// Diversity reception (2-ADC boards only, Settings -> Diversity) --
     /// see radio::RadioSettings's matching field doc comment. Only takes
     /// effect on the next connect, same as puresignal_enabled (and
@@ -481,6 +486,16 @@ pub struct Config {
     pub vfo_b_frequency_hz: Option<u32>,
     #[serde(default)]
     pub split: Option<bool>,
+    /// FM repeater shift: -1, 0 (simplex) or +1 -- ConnectedState::fm_shift.
+    #[serde(default)]
+    pub fm_shift: Option<i8>,
+    /// CTCSS tone sent in FM, Hz; 0 = none.
+    #[serde(default)]
+    pub ctcss_hz: Option<f32>,
+    /// Repeater offset per band (band_memory key), Hz, where it was
+    /// changed from the default (main.rs's default_repeater_offset_hz).
+    #[serde(default)]
+    pub repeater_offsets: std::collections::HashMap<String, u32>,
     /// See ConnectedState::sat_mode: 0 off, 1 SAT, 2 SATR.
     #[serde(default)]
     pub sat_mode: Option<u8>,

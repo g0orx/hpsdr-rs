@@ -196,7 +196,13 @@ stored value directly, or use the buttons between the two boxes:
   VFO A's, while reception continues on VFO A as normal. The box that's
   actually red while transmitting follows whichever VFO is really in use
   -- VFO A normally, VFO B when Split is on -- so the highlight always
-  points at what's really going out over the air.
+  points at what's really going out over the air. Each band remembers
+  Split and Duplex as you left it there: changing band brings them back
+  as they were on the new band, and off on a band you've never used them
+  on, so Split left on for a 2m repeater doesn't follow you to 40m. VFO B
+  itself isn't moved. To have every band change turn them off instead,
+  tick **Split off when changing band** in [Settings:
+  TX](17-settings-tx.md#split-off-when-changing-band).
 - **SAT** -- satellite mode, for working through a transponder. Click to
   cycle Off → **SAT** → **SATR** → Off; switching it on also turns Split
   on. In **SAT**, tuning VFO A moves VFO B by the same amount in the same
@@ -440,6 +446,28 @@ The controls themselves:
   frequency.
 - **Spacebar** is a hold-to-talk shortcut for MOX, active whenever no text
   field has keyboard focus.
+- **PA OFF** (amber, next to **MOX**) -- shown when the transverter you
+  transmit on has **Disable PA** set ([Settings: XVTR](18-xvtr.md)): the
+  radio's PA is off and the power meter reads 0 W. Hover over it to see
+  which transverter and VFO.
+
+### FM repeaters
+
+In **FM**, the transmit row also has:
+
+- **Shift** -- **−**, **Simplex** or **+**: transmit below, on, or above
+  VFO A by the offset next to it, e.g. **−** with 600 kHz for a 2m
+  repeater. The TX frequency is shown alongside. Split and Duplex take
+  precedence, since VFO B names its own TX frequency.
+- **Offset** -- this band's repeater offset, in kHz. It starts at the usual
+  European offset (10m 100 kHz, 6m 500 kHz, 2m 600 kHz, 70cm 7.6 MHz, 23cm
+  6 MHz; none elsewhere), and a changed value is kept for that band or
+  transverter (e.g. 5 MHz for 70cm in the US). Drag it or click to type.
+- **CTCSS** -- a sub-audible tone sent while transmitting in FM, chosen
+  from the 50 standard tones, or off.
+
+Each band remembers its own Shift and CTCSS tone as you left it there,
+like Split.
 
 With transmit enabled, the **Mic gain**, **TCI TX gain** and **TX Power**
 (**TX Drive**, in dB, on a [Pluto](24-pluto.md#transmit)) sliders have

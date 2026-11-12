@@ -84,6 +84,12 @@ HermesLite2, which handle RX gain differently. Same underlying value as
 [PureSignal](14-puresignal.md)'s **Feedback Attenuation** slider --
 adjusting either one changes both.
 
+## Split off when changing band
+
+Off by default: each band comes back with Split and Duplex as you left
+them there (see [VFO A / VFO B / Split](02-main-window.md#vfo-a--vfo-b--split)).
+Tick it to have every band change turn Split and Duplex off.
+
 ## Allow TX outside ham bands
 
 Off by default. While off, hpsdr-rs refuses to key transmit at all

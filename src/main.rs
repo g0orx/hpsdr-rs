@@ -672,6 +672,21 @@ pub struct BandSettings {
     /// band's own default_mode.
     #[serde(default)]
     pub mode: Option<spectrum::Mode>,
+    /// Split and Duplex as this band was left, restored when its band
+    /// button is pressed (see save_band_split/restore_band_split). None
+    /// (never recorded) restores them off, so Split left on for a 2m
+    /// repeater doesn't follow you to 40m (issue #15).
+    #[serde(default)]
+    pub split: Option<bool>,
+    #[serde(default)]
+    pub duplex: Option<bool>,
+    /// FM repeater shift and CTCSS tone as this band was left (see
+    /// ConnectedState::fm_shift/ctcss_hz) -- simplex, no tone if never
+    /// recorded.
+    #[serde(default)]
+    pub fm_shift: Option<i8>,
+    #[serde(default)]
+    pub ctcss_hz: Option<f32>,
 }
 
 /// Records the current frequency, level ranges, and mode against
@@ -709,6 +724,13 @@ fn remember_band_settings(
         Some(xvtr) => xvtr_memory_key(xvtr),
         None => band_for_frequency(freq_hz).map(|b| b.name).unwrap_or("Gen").to_string(),
     };
+    // Split/Duplex and the repeater setup are only recorded on leaving
+    // the band (save_band_split): keep them.
+    let kept = band_memory.get(&name).copied();
+    let split = kept.and_then(|b| b.split);
+    let duplex = kept.and_then(|b| b.duplex);
+    let fm_shift = kept.and_then(|b| b.fm_shift);
+    let ctcss_hz = kept.and_then(|b| b.ctcss_hz);
     band_memory.insert(
         name,
         BandSettings {
@@ -718,8 +740,86 @@ fn remember_band_settings(
             waterfall_db_low,
             waterfall_db_high,
             mode: Some(mode),
+            split,
+            duplex,
+            fm_shift,
+            ctcss_hz,
         },
     );
+}
+
+/// band_memory key of the band VFO A is on now: its transverter's, or
+/// the band (or Gen) its frequency falls in -- as remember_band_settings
+/// files it.
+fn current_band_memory_key(connected: &ConnectedState) -> String {
+    match connected.active_xvtr.as_deref() {
+        Some(xvtr) => xvtr_memory_key(xvtr),
+        None => band_for_frequency(connected.session.frequency_hz.load(Ordering::Relaxed))
+            .map(|b| b.name)
+            .unwrap_or("Gen")
+            .to_string(),
+    }
+}
+
+/// Records Split/Duplex and the FM repeater shift/tone against the band
+/// being left -- called by the band switches before they change band.
+fn save_band_split(connected: &mut ConnectedState) {
+    let key = current_band_memory_key(connected);
+    let (split, duplex, shift, tone) = (connected.split, connected.duplex, connected.fm_shift, connected.ctcss_hz);
+    if let Some(b) = connected.band_memory.get_mut(&key) {
+        b.split = Some(split);
+        b.duplex = Some(duplex);
+        b.fm_shift = Some(shift);
+        b.ctcss_hz = Some(tone);
+    }
+}
+
+/// After a band switch: Split/Duplex as the new band was left (off if
+/// never recorded), or off with Settings -> TX "Split off when changing
+/// band". VFO B stays where it is.
+fn restore_band_split(connected: &mut ConnectedState) {
+    let saved = connected.band_memory.get(&current_band_memory_key(connected)).copied();
+    let (split, duplex) = if connected.split_off_on_band_change {
+        (false, false)
+    } else {
+        saved.map_or((false, false), |b| (b.split.unwrap_or(false), b.duplex.unwrap_or(false)))
+    };
+    connected.split = split;
+    connected.duplex = duplex && split;
+    connected.fm_shift = saved.and_then(|b| b.fm_shift).unwrap_or(0).clamp(-1, 1);
+    connected.ctcss_hz = saved.and_then(|b| b.ctcss_hz).unwrap_or(0.0);
+}
+
+/// The standard CTCSS tones (EIA/TIA-603), Hz.
+const CTCSS_TONES_HZ: [f32; 50] = [
+    67.0, 69.3, 71.9, 74.4, 77.0, 79.7, 82.5, 85.4, 88.5, 91.5, 94.8, 97.4, 100.0, 103.5, 107.2, 110.9, 114.8,
+    118.8, 123.0, 127.3, 131.8, 136.5, 141.3, 146.2, 151.4, 156.7, 159.8, 162.2, 165.5, 167.9, 171.3, 173.8,
+    177.3, 179.9, 183.5, 186.2, 189.9, 192.8, 196.6, 199.5, 203.5, 206.5, 210.7, 218.1, 225.7, 229.1, 233.6,
+    241.8, 250.3, 254.1,
+];
+
+/// A repeater offset to start from on the band an RF frequency is in:
+/// the usual European ones (10m 100 kHz, 6m 500 kHz, 2m 600 kHz, 70cm
+/// 7.6 MHz, 23cm 6 MHz). Elsewhere (e.g. 70cm 5 MHz in the US) it's set
+/// in the main window and kept per band (ConnectedState::repeater_offsets).
+fn default_repeater_offset_hz(rf_hz: u64) -> u32 {
+    match rf_hz {
+        28_000_000..=29_700_000 => 100_000,
+        50_000_000..=54_000_000 => 500_000,
+        144_000_000..=148_000_000 => 600_000,
+        420_000_000..=450_000_000 => 7_600_000,
+        1_240_000_000..=1_300_000_000 => 6_000_000,
+        _ => 0,
+    }
+}
+
+/// The repeater offset for VFO A's band: as set there, or the default.
+fn repeater_offset_hz(connected: &ConnectedState, rf_hz: u64) -> u32 {
+    connected
+        .repeater_offsets
+        .get(&current_band_memory_key(connected))
+        .copied()
+        .unwrap_or_else(|| default_repeater_offset_hz(rf_hz))
 }
 
 /// band_memory key for a transverter -- prefixed so a transverter named
@@ -747,6 +847,7 @@ fn width_for_mode(width_memory: &std::collections::HashMap<String, f64>, mode: s
 /// it touches enough fields (active_xvtr, band_memory, mode, width, the TX
 /// mirror) that duplicating it risks the two call sites drifting apart.
 fn apply_band(connected: &mut ConnectedState, band: &Band) {
+    save_band_split(connected);
     connected.active_xvtr = None;
     let saved = connected.band_memory.get(band.name).copied();
     let target = saved.map(|s| s.frequency_hz).unwrap_or(band.default_hz);
@@ -776,6 +877,7 @@ fn apply_band(connected: &mut ConnectedState, band: &Band) {
         tx.set_mode(resolved_mode);
         tx.set_width_hz(resolved_width_hz);
     }
+    restore_band_split(connected);
 }
 
 /// Same as `apply_band` above, but for an `ExtraReceiver` -- no XVTR/TX
@@ -840,6 +942,7 @@ fn apply_xvtr_band(connected: &mut ConnectedState, xvtr: &Xvtr) {
     let offset = xvtr_rf_offset(xvtr);
     let if_low = xvtr.frequency_min_hz as i64 - offset;
     let if_high = xvtr.frequency_max_hz as i64 - offset;
+    save_band_split(connected);
     // Explicit selection -- see ConnectedState::active_xvtr's doc comment.
     connected.active_xvtr = Some(xvtr.name.clone());
     let saved = connected.band_memory.get(&xvtr_memory_key(&xvtr.name)).copied();
@@ -866,6 +969,7 @@ fn apply_xvtr_band(connected: &mut ConnectedState, xvtr: &Xvtr) {
         tx.set_mode(resolved_mode);
         tx.set_width_hz(resolved_width_hz);
     }
+    restore_band_split(connected);
 }
 
 /// The band buttons the main window shows, in its order, with their RF
@@ -2502,6 +2606,18 @@ struct ConnectedState {
     /// unaffected -- this app has no dual-watch/second-RX-chain
     /// concept, so VFO A keeps receiving regardless of Split.
     split: bool,
+    /// Settings -> TX "Split off when changing band" -- see
+    /// restore_band_split.
+    split_off_on_band_change: bool,
+    /// FM repeater shift: in FM, without Split/Duplex, TX is VFO A minus
+    /// (-1) or plus (+1) the band's repeater offset; 0 = simplex.
+    /// Remembered per band (BandSettings::fm_shift).
+    fm_shift: i8,
+    /// CTCSS tone sent in FM, Hz; 0 = none. Remembered per band.
+    ctcss_hz: f32,
+    /// Repeater offsets changed from default_repeater_offset_hz, Hz, by
+    /// band_memory key.
+    repeater_offsets: std::collections::HashMap<String, u32>,
     /// Satellite tracking: SAT moves VFO B with VFO A (same direction),
     /// SATR (reverse, for inverting transponders) moves it the opposite
     /// way -- see track_sat_vfo_b. Switching it on turns Split on too.
@@ -4006,6 +4122,10 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                 vfo_b_frequency_hz,
                 vfo_b_scroll_accum: 0.0,
                 split,
+                split_off_on_band_change: cfg.split_off_on_band_change.unwrap_or(false),
+                fm_shift: cfg.fm_shift.unwrap_or(0).clamp(-1, 1),
+                ctcss_hz: cfg.ctcss_hz.unwrap_or(0.0),
+                repeater_offsets: cfg.repeater_offsets.clone(),
                 sat_mode: SatMode::from_config(cfg.sat_mode.unwrap_or(0)),
                 vfo_b_xvtr: match &cfg.vfo_b_xvtr {
                     Some(name) => (!name.is_empty()).then(|| name.clone()),
@@ -5077,6 +5197,18 @@ impl eframe::App for HpsdrApp {
                 // exists in this project's WDSP bindings).
                 let xit_offset_hz = if connected.xit_enabled { connected.xit_offset_hz } else { 0.0 };
                 let tx_dial_freq_hz = (tx_dial_freq_hz as i64 + xit_offset_hz.round() as i64).max(0) as u32;
+                // FM repeater shift (issue #15): VFO A plus or minus the
+                // band's offset. Split/Duplex, which name their own TX
+                // frequency on VFO B, take precedence.
+                let repeater_shift_hz = if current_mode == spectrum::Mode::Fmn && !tx_on_b && connected.fm_shift != 0 {
+                    connected.fm_shift as i64 * repeater_offset_hz(connected, displayed_freq_hz) as i64
+                } else {
+                    0
+                };
+                let tx_dial_freq_hz = (tx_dial_freq_hz as i64 + repeater_shift_hz).max(0) as u32;
+                if let Some(tx) = &connected.tx_handle {
+                    tx.set_ctcss_hz(if current_mode == spectrum::Mode::Fmn { connected.ctcss_hz } else { 0.0 });
+                }
                 // ROOT CAUSE FIX for a real report: this project's own
                 // CW RX convention (spectrum::passband_for's Cwl/Cwu
                 // arms) puts the filter -- and therefore the signal
@@ -6076,6 +6208,79 @@ impl eframe::App for HpsdrApp {
                                     }
                                 });
 
+                                // FM repeater shift and CTCSS tone (issue #15)
+                                // -- see ConnectedState::fm_shift. Kept per
+                                // band, as is the offset.
+                                if current_mode == spectrum::Mode::Fmn {
+                                    ui.horizontal(|ui| {
+                                        ui.label("Shift:");
+                                        for (value, label, hover) in [
+                                            (-1i8, "−", "Transmit below the receive frequency by the offset"),
+                                            (0, "Simplex", "Transmit on the receive frequency"),
+                                            (1, "+", "Transmit above the receive frequency by the offset"),
+                                        ] {
+                                            if ui
+                                                .add(egui::Button::selectable(connected.fm_shift == value, label))
+                                                .on_hover_text(hover)
+                                                .clicked()
+                                            {
+                                                connected.fm_shift = value;
+                                                settings_changed = true;
+                                            }
+                                        }
+                                        let rf_hz = connected.session.rx_frequency_hz.load(Ordering::Relaxed);
+                                        let mut offset_khz = repeater_offset_hz(connected, rf_hz) as f64 / 1000.0;
+                                        if ui
+                                            .add(
+                                                egui::DragValue::new(&mut offset_khz)
+                                                    .range(0.0..=50_000.0)
+                                                    .speed(5.0)
+                                                    .max_decimals(1)
+                                                    .suffix(" kHz"),
+                                            )
+                                            .on_hover_text("This band's repeater offset")
+                                            .changed()
+                                        {
+                                            let key = current_band_memory_key(connected);
+                                            connected.repeater_offsets.insert(key, (offset_khz * 1000.0).round() as u32);
+                                            settings_changed = true;
+                                        }
+                                        egui::ComboBox::from_id_salt("ctcss_tone")
+                                            .selected_text(if connected.ctcss_hz > 0.0 {
+                                                format!("CTCSS {:.1}", connected.ctcss_hz)
+                                            } else {
+                                                "CTCSS off".to_string()
+                                            })
+                                            .show_ui(ui, |ui| {
+                                                if ui.selectable_label(connected.ctcss_hz == 0.0, "Off").clicked() {
+                                                    connected.ctcss_hz = 0.0;
+                                                    settings_changed = true;
+                                                }
+                                                for tone in CTCSS_TONES_HZ {
+                                                    if ui
+                                                        .selectable_label(connected.ctcss_hz == tone, format!("{tone:.1} Hz"))
+                                                        .clicked()
+                                                    {
+                                                        connected.ctcss_hz = tone;
+                                                        settings_changed = true;
+                                                    }
+                                                }
+                                            })
+                                            .response
+                                            .on_hover_text("CTCSS tone sent while transmitting in FM");
+                                        if connected.fm_shift != 0 {
+                                            if tx_on_vfo_b(connected) {
+                                                ui.weak("(Split: TX on VFO B)");
+                                            } else {
+                                                ui.label(format!(
+                                                    "TX {}",
+                                                    format_frequency(connected.tx_rf_frequency_hz.load(Ordering::Relaxed))
+                                                ));
+                                            }
+                                        }
+                                    });
+                                }
+
                                 // Separate from Mic gain above -- a real
                                 // test against WSJT-X found its TCI TX
                                 // audio arriving at roughly 1/700th the
@@ -6481,6 +6686,27 @@ impl eframe::App for HpsdrApp {
                                 });
                             if mox_resp.clicked() {
                                 connected.session.set_mox(!mox_now);
+                            }
+                            // The transverter transmitted on has Disable PA
+                            // set: say so, since the power meter then reads
+                            // 0 W. REAL REPORT (#15): Split left on from a
+                            // 2m repeater made a 40m transmission go out on
+                            // the 2m transverter, with nothing showing why.
+                            if connected.session.disable_pa.load(Ordering::Relaxed) {
+                                let tx_xvtr = if tx_on_vfo_b(connected) {
+                                    vfo_b_xvtr(connected).map(|x| x.name.clone())
+                                } else {
+                                    connected.active_xvtr.clone()
+                                };
+                                ui.label(
+                                    egui::RichText::new("PA OFF").strong().color(egui::Color32::from_rgb(230, 140, 20)),
+                                )
+                                .on_hover_text(format!(
+                                    "Transmitting on transverter {} (VFO {}), which has Disable PA set in \
+                                     Settings -> XVTR: the radio's PA is off and the power meter reads 0 W.",
+                                    tx_xvtr.as_deref().unwrap_or("?"),
+                                    if tx_on_vfo_b(connected) { "B" } else { "A" },
+                                ));
                             }
 
                             // Tune: WDSP PostGen tone at passband
@@ -10701,6 +10927,17 @@ impl eframe::App for HpsdrApp {
                                             settings_changed = true;
                                         }
                                     }
+                                    if ui
+                                        .checkbox(&mut connected.split_off_on_band_change, "Split off when changing band")
+                                        .on_hover_text(
+                                            "On: a band button always turns Split and Duplex off. \
+                                             Off (default): each band comes back with Split and Duplex \
+                                             as you left it there -- off on a band you never used them on.",
+                                        )
+                                        .changed()
+                                    {
+                                        settings_changed = true;
+                                    }
                                     ui.add_space(8.0);
 
                                     // Speech Processor (WDSP's baseband compressor) + CESSB
@@ -12542,6 +12779,7 @@ impl eframe::App for HpsdrApp {
                         allow_out_of_band_tx: Some(
                             connected.allow_out_of_band_tx.load(std::sync::atomic::Ordering::Relaxed),
                         ),
+                        split_off_on_band_change: Some(connected.split_off_on_band_change),
                         puresignal_enabled: Some(connected.puresignal_enabled),
                         puresignal_reserve: Some(connected.puresignal_reserve),
                         diversity_enabled: Some(connected.diversity_enabled),
@@ -12590,6 +12828,9 @@ impl eframe::App for HpsdrApp {
                         ctun_frequency_hz: Some(connected.ctun_frequency_hz),
                         vfo_b_frequency_hz: Some(connected.vfo_b_frequency_hz),
                         split: Some(connected.split),
+                        fm_shift: Some(connected.fm_shift),
+                        ctcss_hz: Some(connected.ctcss_hz),
+                        repeater_offsets: connected.repeater_offsets.clone(),
                         sat_mode: Some(connected.sat_mode.to_config()),
                         vfo_b_xvtr: Some(connected.vfo_b_xvtr.clone().unwrap_or_default()),
                         duplex: Some(connected.duplex),
@@ -17482,6 +17723,25 @@ mod tests {
         assert_eq!(mem["10m"].frequency_hz, 28_400_000);
         assert_eq!(mem[&xvtr_memory_key("2m")].frequency_hz, 28_200_000);
         assert!(!mem.contains_key("2m"));
+    }
+
+    #[test]
+    fn band_memory_keeps_split_and_repeater_setup_while_tuning() {
+        let mut mem = std::collections::HashMap::new();
+        let fm = spectrum::Mode::Fmn;
+        remember_band_settings(&mut mem, None, 145_600_000, 0.0, 0.0, 0.0, 0.0, fm);
+        assert_eq!(mem["2m"].split, None);
+        let b = mem.get_mut("2m").unwrap();
+        b.split = Some(true);
+        b.fm_shift = Some(-1);
+        b.ctcss_hz = Some(77.0);
+        // Tuning within the band rewrites the entry but keeps those.
+        remember_band_settings(&mut mem, None, 145_650_000, 0.0, 0.0, 0.0, 0.0, fm);
+        assert_eq!(mem["2m"].frequency_hz, 145_650_000);
+        assert_eq!((mem["2m"].split, mem["2m"].fm_shift, mem["2m"].ctcss_hz), (Some(true), Some(-1), Some(77.0)));
+        assert_eq!(default_repeater_offset_hz(145_600_000), 600_000);
+        assert_eq!(default_repeater_offset_hz(433_000_000), 7_600_000);
+        assert_eq!(default_repeater_offset_hz(7_100_000), 0);
     }
 
     #[test]
