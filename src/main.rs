@@ -1937,7 +1937,10 @@ fn render_controller_settings(ui: &mut egui::Ui, connected: &mut ConnectedState)
             action_combo(ui, salt, &mut e.action, &knob_choices);
             if e.action.is_some_and(|a| WHEEL_ACTIONS.contains(&a)) {
                 ui.add(egui::DragValue::new(&mut e.sensitivity).range(0.1..=20.0).speed(0.05).prefix("x"))
-                    .on_hover_text("Sensitivity: multiplies each step (10 Hz for VFO Tune)");
+                    .on_hover_text(
+                        "Sensitivity: multiplies the steps. VFO Tune and VFO B Tune move by the VFO step \
+                         (VFO-A's box); RIT and XIT by 10 Hz a step.",
+                    );
             }
         });
     };
@@ -2057,6 +2060,47 @@ fn start_controller(cfg: &controller::ControllerConfig) -> (Option<controller::C
     }
 }
 
+/// The VFO steps to choose from (Hz), as piHPSDR's: 9 kHz for MW
+/// broadcast channels.
+const VFO_STEPS_HZ: [u32; 15] =
+    [1, 10, 25, 50, 100, 250, 500, 1_000, 5_000, 9_000, 10_000, 100_000, 250_000, 500_000, 1_000_000];
+
+/// The VFO step after `step` (`up`) or before it, staying at the ends.
+fn next_vfo_step(step: u32, up: bool) -> u32 {
+    let i = VFO_STEPS_HZ.iter().position(|&s| s == step).unwrap_or(4);
+    let i = if up { (i + 1).min(VFO_STEPS_HZ.len() - 1) } else { i.saturating_sub(1) };
+    VFO_STEPS_HZ[i]
+}
+
+/// A VFO step for display: "100 Hz", "9 kHz", "1 MHz".
+fn format_vfo_step(step: u32) -> String {
+    if step >= 1_000_000 && step % 1_000_000 == 0 {
+        format!("{} MHz", step / 1_000_000)
+    } else if step >= 1_000 && step % 1_000 == 0 {
+        format!("{} kHz", step / 1_000)
+    } else {
+        format!("{step} Hz")
+    }
+}
+
+/// How far `steps` VFO steps of `step_hz` move a VFO showing `rf_hz`:
+/// to a multiple of the step, as piHPSDR -- e.g. from 14.074.123 one 1 kHz
+/// step up is 14.075.000, and down is 14.074.000.
+fn vfo_step_delta(rf_hz: i64, step_hz: u32, steps: i32) -> i64 {
+    let step = step_hz.max(1) as i64;
+    let base = rf_hz.div_euclid(step) * step;
+    let target = if steps > 0 {
+        base + steps as i64 * step
+    } else if base == rf_hz {
+        base + steps as i64 * step
+    } else {
+        // Already between steps: the first step down lands on the one
+        // below.
+        base + (steps as i64 + 1) * step
+    };
+    target - rf_hz
+}
+
 /// MIDI channel the made-up bindings of a front-panel controller use (see
 /// dispatch_controller_event) -- outside 0-15, so never a real control's.
 const CONTROLLER_MIDI_CHANNEL: u8 = 200;
@@ -2105,6 +2149,42 @@ fn dispatch_controller_event(
     match ev {
         ControllerEvent::Pressed(_) if KEY_ACTIONS.contains(&action) => {
             apply_midi_binding(connected, binding(MidiBindingKind::Key, 1.0), raw(127), freq_hz, sample_rate, passband);
+        }
+        // The VFO knobs tune by the VFO step (piHPSDR), their sensitivity
+        // scaling the number of steps.
+        ControllerEvent::Turned(_, steps)
+            if steps != 0 && matches!(action, MidiAction::VfoTune | MidiAction::VfoBTune) =>
+        {
+            let scaled = steps as f32 * connected.controller_config.sensitivity(id)
+                + connected.controller_tune_remainder.get(&id).copied().unwrap_or(0.0);
+            let whole = scaled.trunc();
+            connected.controller_tune_remainder.insert(id, scaled - whole);
+            let whole = whole as i32;
+            if whole == 0 {
+                return;
+            }
+            let rf_hz = if action == MidiAction::VfoTune {
+                let dial = if connected.ctun { connected.ctun_frequency_hz } else { freq_hz };
+                let offset = connected
+                    .active_xvtr
+                    .as_deref()
+                    .and_then(|name| connected.xvtrs.iter().find(|x| x.name == name))
+                    .map_or(0, xvtr_rf_offset);
+                dial as i64 + offset
+            } else {
+                connected.vfo_b_frequency_hz as i64 + vfo_b_rf_offset(connected)
+            };
+            let delta = vfo_step_delta(rf_hz, connected.vfo_step_hz, whole);
+            // As a MIDI Wheel message moving `delta` Hz.
+            let sensitivity = delta.unsigned_abs() as f32 / MIDI_WHEEL_HZ_PER_MESSAGE as f32;
+            apply_midi_binding(
+                connected,
+                binding(MidiBindingKind::Wheel, sensitivity),
+                raw(if delta > 0 { 65 } else { 63 }),
+                freq_hz,
+                sample_rate,
+                passband,
+            );
         }
         ControllerEvent::Turned(_, steps) if steps != 0 && WHEEL_ACTIONS.contains(&action) => {
             let sensitivity = steps.unsigned_abs() as f32 * connected.controller_config.sensitivity(id);
@@ -2263,6 +2343,10 @@ fn apply_midi_binding(
             apply_mode(connected, ALL_MODES[new_idx], dial_freq_hz);
         }
         MidiAction::BandStack => step_current_band_stack(connected),
+        MidiAction::VfoStepSizeUp | MidiAction::VfoStepSizeDown => {
+            connected.vfo_step_hz =
+                next_vfo_step(connected.vfo_step_hz, binding.action == MidiAction::VfoStepSizeUp);
+        }
         MidiAction::BandUp | MidiAction::BandDown => {
             let reachable: Vec<&'static Band> = BANDS
                 .iter()
@@ -2542,6 +2626,13 @@ fn apply_midi_binding(
         }
     }
 
+    // Say what it's now set to (show_value_popup).
+    if binding.kind == MidiBindingKind::Knob
+        || matches!(binding.action, MidiAction::RitAdjust | MidiAction::XitAdjust)
+    {
+        connected.value_popup = Some((binding.action, Instant::now()));
+    }
+
     // A control's own movement isn't sent back to it: note where the app
     // now is for it (which can differ from the control's value by
     // rounding).
@@ -2601,6 +2692,72 @@ fn midi_knob_value(connected: &ConnectedState, action: MidiAction) -> Option<u8>
         MidiAction::FilterWidth => scale(connected.spectrum.width_hz(), 50.0, 5000.0),
         _ => return None,
     })
+}
+
+/// A knob action's setting as shown to the operator, e.g. "-12 dB".
+fn knob_value_text(connected: &ConnectedState, action: MidiAction) -> Option<String> {
+    let db = |gain: f32| 20.0 * (gain.max(1e-9) as f64).log10();
+    Some(match action {
+        MidiAction::AfGain => format!("{:.0} dB", db(connected.spectrum.gain())),
+        MidiAction::AgcGain => format!("{:.0} dB", connected.spectrum.agc_params().agc_top_db),
+        MidiAction::MicGain => format!("{:.1} dB", db(connected.mic_gain)),
+        MidiAction::RfAttenuation => {
+            let v = connected.session.rx_attenuation.load(Ordering::Relaxed) as i32;
+            if connected.device.protocol == 1
+                && matches!(connected.device.board, Boards::HermesLite | Boards::HermesLite2)
+            {
+                format!("RX gain {} dB", v - 12)
+            } else {
+                format!("{v} dB")
+            }
+        }
+        MidiAction::TxDrive => format!("{} W", connected.session.tx_power_watts.load(Ordering::Relaxed)),
+        MidiAction::CwSpeed => format!("{} wpm", connected.session.cw_keyer.speed_wpm.load(Ordering::Relaxed)),
+        MidiAction::CwSidetoneLevel => format!("{}", connected.session.cw_keyer.sidetone_volume.load(Ordering::Relaxed)),
+        MidiAction::CwSidetoneFreq => {
+            format!("{} Hz", connected.session.cw_keyer.sidetone_freq_hz.load(Ordering::Relaxed))
+        }
+        MidiAction::CwPitch => format!("{:.0} Hz", spectrum::cw_pitch_hz()),
+        MidiAction::FilterWidth => format!("{:.0} Hz", connected.spectrum.width_hz()),
+        MidiAction::RitAdjust => format!("{:+.0} Hz", connected.rit_offset_hz),
+        MidiAction::XitAdjust => format!("{:+.0} Hz", connected.xit_offset_hz),
+        _ => return None,
+    })
+}
+
+/// For a moment after a knob (front-panel controller or MIDI) changes a
+/// setting, its name, value and a bar over the spectrum -- REAL REQUEST:
+/// in the compact layout (or with the control rows folded) the setting's
+/// own slider isn't on screen, so turning e.g. AF Gain showed nothing.
+fn show_value_popup(ctx: &egui::Context, connected: &mut ConnectedState) {
+    const SHOW_FOR: Duration = Duration::from_millis(1500);
+    let Some((action, at)) = connected.value_popup else { return };
+    if at.elapsed() >= SHOW_FOR {
+        connected.value_popup = None;
+        return;
+    }
+    if !(compact_layout() || connected.controls_minimized) {
+        return;
+    }
+    let Some(text) = knob_value_text(connected, action) else { return };
+    let fraction = midi_knob_value(connected, action).map(|v| v as f32 / 127.0);
+    ctx.request_repaint_after(SHOW_FOR.saturating_sub(at.elapsed()));
+    egui::Area::new(egui::Id::unique("value_popup"))
+        .order(egui::Order::Foreground)
+        .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, -40.0))
+        .interactable(false)
+        .show(ctx, |ui| {
+            egui::Frame::popup(ui.style()).show(ui, |ui| {
+                ui.set_min_width(240.0);
+                ui.vertical_centered(|ui| {
+                    ui.label(egui::RichText::new(action.label()).size(16.0));
+                    ui.label(egui::RichText::new(text).size(26.0).strong().monospace());
+                    if let Some(f) = fraction {
+                        ui.add(egui::ProgressBar::new(f).desired_width(220.0));
+                    }
+                });
+            });
+        });
 }
 
 /// MIDI feedback (issue #15; midi::MidiWorker::feedback): sends each Knob
@@ -3167,6 +3324,17 @@ struct ConnectedState {
     fm_shift: i8,
     /// CTCSS tone sent in FM, Hz; 0 = none. Remembered per band.
     ctcss_hz: f32,
+    /// The VFO step (one of VFO_STEPS_HZ), chosen in VFO-A's box: what a
+    /// front-panel controller's VFO knob tunes by, snapped to multiples
+    /// of it, as piHPSDR's.
+    vfo_step_hz: u32,
+    /// A controller encoder's tuning steps not yet applied, when its
+    /// sensitivity makes them fractional (see dispatch_controller_event).
+    controller_tune_remainder: std::collections::HashMap<controller::ControlId, f32>,
+    /// The setting a knob (front-panel controller or MIDI) last changed,
+    /// and when -- shown for a moment over the spectrum when its own
+    /// control isn't on screen (see show_value_popup).
+    value_popup: Option<(MidiAction, Instant)>,
     /// Repeater offsets changed from default_repeater_offset_hz, Hz, by
     /// band_memory key.
     repeater_offsets: std::collections::HashMap<String, u32>,
@@ -4809,6 +4977,9 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                 split_off_on_band_change: cfg.split_off_on_band_change.unwrap_or(false),
                 fm_shift: cfg.fm_shift.unwrap_or(0).clamp(-1, 1),
                 ctcss_hz: cfg.ctcss_hz.unwrap_or(0.0),
+                vfo_step_hz: cfg.vfo_step_hz.filter(|s| VFO_STEPS_HZ.contains(s)).unwrap_or(100),
+                controller_tune_remainder: std::collections::HashMap::new(),
+                value_popup: None,
                 repeater_offsets: cfg.repeater_offsets.clone(),
                 bandstacks: cfg.bandstacks.clone(),
                 bandstack_index: cfg.bandstack_index.clone(),
@@ -6266,6 +6437,25 @@ impl eframe::App for HpsdrApp {
                                             ui.label("VFO-A");
                                             ui.label(egui::RichText::new(&band_stack_label).weak())
                                                 .on_hover_text("Band and band stack entry: press the band's button again for the next");
+                                            // The VFO step, as piHPSDR's.
+                                            let mut step = connected.vfo_step_hz;
+                                            egui::ComboBox::from_id_salt("vfo_step")
+                                                .selected_text(egui::RichText::new(format_vfo_step(step)).weak())
+                                                .width(64.0)
+                                                .show_ui(ui, |ui| {
+                                                    for s in VFO_STEPS_HZ {
+                                                        ui.selectable_value(&mut step, s, format_vfo_step(s));
+                                                    }
+                                                })
+                                                .response
+                                                .on_hover_text(
+                                                    "VFO step: what a front-panel controller's VFO knob \
+                                                     (Settings -> Controller) tunes by, to multiples of it",
+                                                );
+                                            if step != connected.vfo_step_hz {
+                                                connected.vfo_step_hz = step;
+                                                settings_changed = true;
+                                            }
                                         });
                                         let resp = ui
                                             .add(
@@ -8759,6 +8949,7 @@ impl eframe::App for HpsdrApp {
                     if popup_closed {
                         connected.compact_popup = None;
                     }
+                    show_value_popup(ui.ctx(), connected);
 
                     if show_status_row {
                     ui.add_space(8.0);
@@ -13700,6 +13891,7 @@ impl eframe::App for HpsdrApp {
                         split: Some(connected.split),
                         fm_shift: Some(connected.fm_shift),
                         ctcss_hz: Some(connected.ctcss_hz),
+                        vfo_step_hz: Some(connected.vfo_step_hz),
                         repeater_offsets: connected.repeater_offsets.clone(),
                         bandstacks: connected.bandstacks.clone(),
                         bandstack_index: connected.bandstack_index.clone(),
@@ -18874,6 +19066,23 @@ mod tests {
         assert_eq!(mem["10m"].frequency_hz, 28_400_000);
         assert_eq!(mem[&xvtr_memory_key("2m")].frequency_hz, 28_200_000);
         assert!(!mem.contains_key("2m"));
+    }
+
+    #[test]
+    fn vfo_step_snaps_to_multiples_and_cycles_like_pihpsdr() {
+        // Off the grid: up to the next multiple, down to the one below.
+        assert_eq!(vfo_step_delta(14_074_123, 1_000, 1), 877);
+        assert_eq!(vfo_step_delta(14_074_123, 1_000, -1), -123);
+        assert_eq!(vfo_step_delta(14_074_123, 1_000, -2), -1_123);
+        // On it: whole steps.
+        assert_eq!(vfo_step_delta(14_074_000, 100, 3), 300);
+        assert_eq!(vfo_step_delta(14_074_000, 100, -3), -300);
+        assert_eq!(next_vfo_step(100, true), 250);
+        assert_eq!(next_vfo_step(1, false), 1);
+        assert_eq!(next_vfo_step(1_000_000, true), 1_000_000);
+        assert_eq!(format_vfo_step(9_000), "9 kHz");
+        assert_eq!(format_vfo_step(250), "250 Hz");
+        assert_eq!(format_vfo_step(1_000_000), "1 MHz");
     }
 
     #[test]

@@ -177,6 +177,10 @@ pub enum MidiAction {
     /// The next entry of the current band's band stack, as pressing its
     /// band button again (piHPSDR's band stack button).
     BandStack,
+    /// The VFO step (VFO-A's box) one larger / smaller -- piHPSDR's
+    /// VFO_STEP_PLUS/MINUS. Not VfoStepUp/Down, which tune by a step.
+    VfoStepSizeUp,
+    VfoStepSizeDown,
 }
 
 impl MidiAction {
@@ -241,6 +245,8 @@ impl MidiAction {
             MidiAction::CwSidetoneFreq => "CW Sidetone Frequency",
             MidiAction::CwPitch => "CW Pitch",
             MidiAction::BandStack => "Band Stack (next)",
+            MidiAction::VfoStepSizeUp => "VFO Step Size +",
+            MidiAction::VfoStepSizeDown => "VFO Step Size -",
         }
     }
 }
@@ -268,6 +274,8 @@ pub const KEY_ACTIONS: &[MidiAction] = &[
     MidiAction::FilterWidthDown,
     MidiAction::VfoStepUp,
     MidiAction::VfoStepDown,
+    MidiAction::VfoStepSizeUp,
+    MidiAction::VfoStepSizeDown,
     MidiAction::NoiseBlankerCycle,
     MidiAction::NoiseReductionCycle,
     MidiAction::CtunToggle,

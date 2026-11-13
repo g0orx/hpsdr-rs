@@ -78,8 +78,9 @@ pub struct EncoderLines {
     /// A step on each half cycle (the Controller 2 V2 / G2 panel's small
     /// encoders), rather than one per full cycle of the A/B lines.
     pub half_step: bool,
-    /// Multiplies the step for a tuning (Wheel) action, e.g. lower for a
-    /// high-resolution optical VFO encoder.
+    /// Multiplies the steps of a tuning (Wheel) action, e.g. lower for a
+    /// high-resolution optical VFO encoder: VFO Tune / VFO B Tune move by
+    /// the VFO step (VFO-A's box), RIT/XIT 10 Hz a step.
     #[serde(default = "one")]
     pub sensitivity: f32,
 }

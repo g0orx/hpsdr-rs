@@ -135,6 +135,7 @@ to check.
 | VFO A -> B, VFO B -> A, VFO A/B Swap | Copy or swap VFO frequencies |
 | Mode Up, Mode Down | Cycle through modes |
 | Band Up, Band Down | Cycle through bands |
+| VFO Step Size +, VFO Step Size - | The VFO step (next to VFO-A) one larger or smaller; it's what a [front-panel controller](25-controller.md)'s VFO knob tunes by |
 | Band Stack (next) | The next entry of the current band's [band stack](02-main-window.md#band-stack), as pressing its band button again |
 | Band 160m ... Band 6m | Jump directly to that band (ten separate actions, one per band from 160m to 6m; there's no direct action for 60m -- use Band Up/Down to reach it). Ignored if the connected radio can't tune that band (e.g. 6m on a HermesLite/HermesLite2) |
 | Filter Width Up, Filter Width Down | Step the filter width |

@@ -11,7 +11,12 @@ the top](images/02-main-window-overview.png)
 The large number near the top, in its own **VFO-A** box, is the current
 main VFO frequency (comma-grouped, in Hz) -- green normally, red while
 that VFO is the one actually transmitting (see
-[Split](#vfo-a--vfo-b--split) below). You can tune it several ways:
+[Split](#vfo-a--vfo-b--split) below). Beside **VFO-A**'s label are the band
+and [band stack](#band-stack) entry (e.g. **20m-1**) and the **VFO step**
+(100 Hz to start with, 1 Hz to 1 MHz): what a
+[front-panel controller](25-controller.md)'s VFO knob tunes by, landing on
+multiples of it; MIDI's **VFO Step Size +/-** actions change it too. You can
+tune it several ways:
 
 - **Scroll** while hovering the frequency display, or the spectrum/waterfall
   panes: steps by 1 kHz per notch. Hold **Shift** while scrolling for 100 Hz
@@ -291,6 +296,11 @@ window can be made as small as 520x400 (at 100% UI Scale), so a 720-wide
 screen can take a UI Scale of up to about 135%. While you resize the main
 window or an extra receiver's, its size in pixels shows in the middle of it
 for a moment, to help fit a screen.
+
+When a front-panel controller's or MIDI knob changes a setting whose
+control isn't on screen -- in the compact layout, or with the control rows
+folded -- its name, new value and a bar show over the spectrum for a
+moment, e.g. **AF Gain -12 dB**. RIT and XIT show their offset the same way.
 
 To fill the screen with no title bar, start hpsdr-rs with `--fullscreen`,
 e.g. `hpsdr-rs --fullscreen` (with the AppImage,

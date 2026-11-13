@@ -24,8 +24,14 @@ Each encoder, push button and switch can do any of the
 - **Encoders** drive a tuning action (VFO Tune, VFO B Tune, RIT, XIT) or one
   of the knob actions (AF Gain, AGC Gain, Mic Gain, TX Drive, Filter Width,
   CW Speed and so on), which each step moves up or down. Turning fast speeds
-  up, as in piHPSDR. A tuning action has a **sensitivity** (x1 is 10 Hz a
-  step), e.g. lower for a high-resolution optical VFO knob.
+  up, as in piHPSDR.
+- **VFO Tune** and **VFO B Tune** move by the **VFO step**, chosen next to
+  **VFO-A** in the main window (1 Hz to 1 MHz, 100 Hz to start with), and
+  land on multiples of it, as in piHPSDR: from 14.074.123 one 1 kHz step up
+  is 14.075.000. **VFO Step Size +** and **-** change it from a button.
+- A tuning action has a **sensitivity** that multiplies its steps, e.g. x0.5
+  for a high-resolution optical VFO knob, to move one VFO step for every two
+  of its own. RIT and XIT move 10 Hz a step.
 - **Push buttons and switches** do a button action on press: MOX, Tune,
   Band and Mode up/down, **Band Stack (next)** (the next entry of the band's
   [band stack](02-main-window.md#band-stack)), A>B, CTUN, NB/NR and so on.

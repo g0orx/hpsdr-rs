@@ -492,6 +492,10 @@ pub struct Config {
     /// CTCSS tone sent in FM, Hz; 0 = none.
     #[serde(default)]
     pub ctcss_hz: Option<f32>,
+    /// VFO step, Hz (main.rs's VFO_STEPS_HZ): what a front-panel
+    /// controller's VFO knob moves by.
+    #[serde(default)]
+    pub vfo_step_hz: Option<u32>,
     /// Repeater offset per band (band_memory key), Hz, where it was
     /// changed from the default (main.rs's default_repeater_offset_hz).
     #[serde(default)]
