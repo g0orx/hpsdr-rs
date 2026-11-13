@@ -257,6 +257,50 @@ minimized is remembered.
 ![The control rows folded into one line: » and 20m, USB, 2700 Hz,
 Audio 30 dB, with MOX directly below](images/02-controls-minimized.png)
 
+## Compact layout (small screens)
+
+For a small screen such as the 7" 800x480 Raspberry Pi display, the compact
+layout keeps the VFOs and meter at the top and gives the rest of the window
+to the spectrum and waterfall. It's used by itself on a screen smaller than
+1000x600, or always or never with Settings → Spectrum → **Layout**
+(**Auto**, **Compact** or **Standard**). A window that opens bigger than the
+screen is maximized. The control rows
+open one at a time from a toolbar of large buttons under the spectrum:
+
+- **Band** (showing the band and [band stack](#band-stack) entry, e.g.
+  **20m-1**) -- the band buttons. Press the selected band again to step its
+  band stack.
+- **Mode** (showing the mode and filter width) -- the modes and **Filter
+  width**.
+- **Audio** -- Audio gain, Mute and SQL, and with transmit enabled Mic gain,
+  the FM repeater controls, TCI TX gain and TX Power.
+- **DSP** -- NB, NR, SNB, ANF, BIN, AGC, AGC Gain and RX Attenuation.
+- **TX** -- the transmit row: Tune, Two Tone, CW messages, RIT and XIT.
+- **Menu** -- **Settings...**, **Add Receiver** and **Stop**, CW Decode, PSK
+  Beacon and DATV when they apply, and the rigctl/TCI/CAT/Web status and
+  **Record**.
+- **MOX**, on the right.
+
+Each opens above the toolbar, over the spectrum; press its button again, or
+**✕**, to close it. A long press on VFO-A or VFO-B opens the frequency
+keypad (as a right-click does), and dragging the spectrum tunes.
+
+On a narrow screen, such as the 720x1280 Raspberry Pi Touch Display 2 in
+portrait, VFO-B moves under VFO-A with the S-meter beside it. The compact
+window can be made as small as 520x400 (at 100% UI Scale), so a 720-wide
+screen can take a UI Scale of up to about 135%. While you resize the main
+window or an extra receiver's, its size in pixels shows in the middle of it
+for a moment, to help fit a screen.
+
+To fill the screen with no title bar, start hpsdr-rs with `--fullscreen`,
+e.g. `hpsdr-rs --fullscreen` (with the AppImage,
+`./hpsdr-rs-*.AppImage --fullscreen`). The window size saved for each radio
+isn't applied then. Settings opens in its own window over it, no bigger
+than the screen, its tabs scrolling when they don't fit. With no title
+bar to close the window, there's a **Quit** button beside **Stop** (in the
+compact layout, in **Menu**) and in the Discovery window, and **F11** leaves
+fullscreen, or goes back to it.
+
 ## Bands and modes
 
 One row of band buttons -- **160m, 80m, 60m, 40m, 30m, 20m, 17m, 15m, 12m,

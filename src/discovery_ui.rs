@@ -497,6 +497,13 @@ impl DiscoveryWindow {
                             }
                         }
                     }
+                    // A way out with no title bar (--fullscreen), e.g. on a
+                    // touch screen.
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button("Quit").on_hover_text("Close hpsdr-rs").clicked() {
+                            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+                        }
+                    });
                 });
 
                 if let Some(err) = &self.manual_error {

@@ -910,6 +910,21 @@ pub struct UiPrefs {
     /// Spectrum). Missing in older files: Dark, as before.
     #[serde(default)]
     pub theme: ThemeChoice,
+    /// Settings -> Spectrum's Layout: the compact layout is for small
+    /// screens such as the 7" 800x480 Raspberry Pi display (the control
+    /// rows open as popups from a toolbar under the spectrum). Auto (the
+    /// default) picks it on a small screen.
+    #[serde(default)]
+    pub layout: LayoutChoice,
+}
+
+/// See UiPrefs::layout.
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Default, Debug)]
+pub enum LayoutChoice {
+    #[default]
+    Auto,
+    Standard,
+    Compact,
 }
 
 /// See UiPrefs::theme. Dark by default: hpsdr-rs was always dark, and

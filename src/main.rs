@@ -2464,6 +2464,8 @@ struct ExtraReceiver {
     /// (ConnectedState::frequency_entry), drawn inside this receiver's
     /// own window.
     frequency_entry: Option<FrequencyEntry>,
+    /// This window's size while it's resized -- see ResizeOverlay.
+    resize_overlay: ResizeOverlay,
     settings_tab: SettingsTab,
     /// Shared with ConnectedState -- any control here that changes a
     /// setting flips this, so the root window's per-frame save (which
@@ -2929,6 +2931,11 @@ struct ConnectedState {
     /// (real request). Only the rows: everything they control keeps
     /// running, and MIDI/CAT still change it.
     controls_minimized: bool,
+    /// The compact layout's open popup (see compact_layout), if any.
+    compact_popup: Option<CompactPopup>,
+    /// Height of the S-meter's area last frame, so a narrow compact
+    /// layout can leave room for it beside VFO-B.
+    meter_area_height: f32,
     /// RIT ("Receiver Incremental Tuning"): when on, rit_offset_hz is
     /// added to the RXA demod shift (see spectrum::SpectrumHandle::
     /// set_ctun -- RIT and CTUN share WDSP's one RXA shift register, so
@@ -3393,6 +3400,64 @@ struct HpsdrApp {
     applied_theme: Option<egui::ThemePreference>,
     /// The main window's minimum size last sent, see main_window_min_size.
     applied_min_size: Option<egui::Vec2>,
+    /// See ResizeOverlay.
+    resize_overlay: ResizeOverlay,
+    /// Whether the window has been checked against the screen's size yet
+    /// (see HpsdrApp::ui): a window opened bigger than a small screen is
+    /// maximized, once.
+    checked_screen_fit: bool,
+}
+
+/// While a window is being resized, its size in pixels shown in the middle
+/// of it, for fitting a small screen (e.g. 800 x 480) -- REAL REQUEST.
+/// Shown for a moment after the last change; not when the window first
+/// opens.
+#[derive(Default)]
+struct ResizeOverlay {
+    last_size: Option<egui::Vec2>,
+    until: Option<Instant>,
+}
+
+impl ResizeOverlay {
+    fn show(&mut self, ctx: &egui::Context) {
+        const SHOW_FOR: Duration = Duration::from_millis(1500);
+        let points = ctx.content_rect().size();
+        if self.last_size.is_some_and(|last| last != points) {
+            self.until = Some(Instant::now() + SHOW_FOR);
+        }
+        self.last_size = Some(points);
+        let Some(until) = self.until else { return };
+        let now = Instant::now();
+        if now >= until {
+            self.until = None;
+            return;
+        }
+        ctx.request_repaint_after(until - now);
+        let pixels = points * ctx.pixels_per_point();
+        let zoom = ctx.zoom_factor();
+        egui::Area::new(egui::Id::unique("resize_overlay"))
+            .order(egui::Order::Tooltip)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .interactable(false)
+            .show(ctx, |ui| {
+                egui::Frame::popup(ui.style()).show(ui, |ui| {
+                    ui.label(
+                        egui::RichText::new(format!("{:.0} × {:.0}", pixels.x, pixels.y))
+                            .size(28.0)
+                            .monospace()
+                            .strong(),
+                    );
+                    if (zoom - 1.0).abs() > 0.001 {
+                        ui.weak(format!(
+                            "{:.0} × {:.0} at {:.0}% UI Scale",
+                            points.x,
+                            points.y,
+                            zoom * 100.0
+                        ));
+                    }
+                });
+            });
+    }
 }
 
 /// Settings -> Spectrum's Theme choice (config::ThemeChoice as a u8). A
@@ -3407,6 +3472,54 @@ fn theme_choice() -> config::ThemeChoice {
         _ => config::ThemeChoice::Dark,
     }
 }
+
+/// Whether the main window uses the compact layout: Settings -> Spectrum's
+/// Layout (config::UiPrefs::layout, LAYOUT_CHOICE), with Auto decided by
+/// the screen's size each frame in HpsdrApp::ui. Globals like THEME_CHOICE.
+static COMPACT_LAYOUT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static LAYOUT_CHOICE: AtomicU8 = AtomicU8::new(0);
+/// The screen's size in points (0 if unknown), for Settings to say what
+/// Auto chose.
+static SCREEN_SIZE: [std::sync::atomic::AtomicU32; 2] =
+    [std::sync::atomic::AtomicU32::new(0), std::sync::atomic::AtomicU32::new(0)];
+
+/// Layout Auto picks compact on a screen smaller than this (points): the
+/// standard layout's 900-point minimum width plus some room, and enough
+/// height for its control rows and a usable spectrum. An 800x480 or
+/// portrait 720x1280 display is compact; 1280x720 and desktop monitors are
+/// standard.
+const AUTO_COMPACT_BELOW: egui::Vec2 = egui::vec2(1000.0, 600.0);
+
+fn compact_layout() -> bool {
+    COMPACT_LAYOUT.load(Ordering::Relaxed)
+}
+
+fn layout_choice() -> config::LayoutChoice {
+    match LAYOUT_CHOICE.load(Ordering::Relaxed) {
+        1 => config::LayoutChoice::Standard,
+        2 => config::LayoutChoice::Compact,
+        _ => config::LayoutChoice::Auto,
+    }
+}
+
+fn set_layout_choice(choice: config::LayoutChoice) {
+    let n = match choice {
+        config::LayoutChoice::Auto => 0,
+        config::LayoutChoice::Standard => 1,
+        config::LayoutChoice::Compact => 2,
+    };
+    LAYOUT_CHOICE.store(n, Ordering::Relaxed);
+}
+
+/// Whether Auto picks the compact layout on a screen this size (points).
+fn screen_wants_compact(screen: Option<egui::Vec2>) -> bool {
+    screen.is_some_and(|s| s.x < AUTO_COMPACT_BELOW.x || s.y < AUTO_COMPACT_BELOW.y)
+}
+
+/// `--fullscreen` on the command line: the main window fills the screen
+/// with no title bar, e.g. a Raspberry Pi with its 7" display. The window
+/// size saved per radio isn't applied then.
+static FULLSCREEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 fn set_theme_choice(choice: config::ThemeChoice) {
     let n = match choice {
@@ -3574,6 +3687,7 @@ impl HpsdrApp {
         ctx.set_zoom_factor(zoom);
         // The saved theme; HpsdrApp::ui applies it.
         set_theme_choice(ui_prefs.theme);
+        set_layout_choice(ui_prefs.layout);
         Self {
             state: AppState::Discovering(DiscoveryWindow::new(ctx)),
             was_focused: true,
@@ -3582,6 +3696,8 @@ impl HpsdrApp {
             ui_prefs,
             applied_theme: Some(egui::ThemePreference::Dark),
             applied_min_size: None,
+            resize_overlay: ResizeOverlay::default(),
+            checked_screen_fit: false,
         }
     }
 }
@@ -4392,6 +4508,8 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                 lnb_lock_enabled,
                 psk_panel_minimized,
                 controls_minimized: cfg.controls_minimized.unwrap_or(false),
+                compact_popup: None,
+                meter_area_height: 0.0,
                 rit_enabled,
                 rit_offset_hz,
                 rit_scroll_accum: 0.0,
@@ -4559,9 +4677,41 @@ impl eframe::App for HpsdrApp {
         // Settings -> Spectrum's UI Scale or Ctrl - / Ctrl + / Ctrl 0.
         let zoom = ui.ctx().zoom_factor();
         let choice = theme_choice();
-        if Some(zoom) != self.ui_prefs.zoom || choice != self.ui_prefs.theme {
+        self.resize_overlay.show(ui.ctx());
+        // F11 toggles fullscreen (see FULLSCREEN), as in a web browser.
+        if ui.input(|i| i.key_pressed(egui::Key::F11)) {
+            let fullscreen = !FULLSCREEN.load(Ordering::Relaxed);
+            FULLSCREEN.store(fullscreen, Ordering::Relaxed);
+            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Fullscreen(fullscreen));
+        }
+        // The layout: as chosen, or for Auto, by the screen's size.
+        let layout = layout_choice();
+        let screen = ui.input(|i| i.viewport().monitor_size);
+        if let Some(s) = screen {
+            SCREEN_SIZE[0].store(s.x.round() as u32, Ordering::Relaxed);
+            SCREEN_SIZE[1].store(s.y.round() as u32, Ordering::Relaxed);
+        }
+        let compact = match layout {
+            config::LayoutChoice::Standard => false,
+            config::LayoutChoice::Compact => true,
+            config::LayoutChoice::Auto => screen_wants_compact(screen),
+        };
+        COMPACT_LAYOUT.store(compact, Ordering::Relaxed);
+        // Opened bigger than a small screen (the default 1200x660 on an
+        // 800x480 display): fill the screen instead, once.
+        if !self.checked_screen_fit {
+            if let Some(s) = screen {
+                self.checked_screen_fit = true;
+                let window = ui.ctx().content_rect().size();
+                if !FULLSCREEN.load(Ordering::Relaxed) && (window.x > s.x || window.y > s.y) {
+                    ui.ctx().send_viewport_cmd(egui::ViewportCommand::Maximized(true));
+                }
+            }
+        }
+        if Some(zoom) != self.ui_prefs.zoom || choice != self.ui_prefs.theme || layout != self.ui_prefs.layout {
             self.ui_prefs.zoom = Some(zoom);
             self.ui_prefs.theme = choice;
+            self.ui_prefs.layout = layout;
             self.ui_prefs.save();
         }
         // Dark, Light or the computer's own (Settings -> Spectrum's Theme).
@@ -4576,7 +4726,7 @@ impl eframe::App for HpsdrApp {
             AppState::Connected(c) => c.waterfall_enabled,
             _ => true,
         };
-        let min_size = main_window_min_size(zoom, waterfall);
+        let min_size = main_window_min_size(zoom, waterfall, compact);
         if Some(min_size) != self.applied_min_size {
             self.applied_min_size = Some(min_size);
             ui.ctx().send_viewport_cmd(egui::ViewportCommand::MinInnerSize(min_size));
@@ -4689,7 +4839,7 @@ impl eframe::App for HpsdrApp {
                     // ViewportBuilder field, a ViewportCommand actually
                     // re-applies every time it's sent, which would fight
                     // the user moving/resizing the window themselves.
-                    if let Some(g) = cfg.window_geometry {
+                    if let Some(g) = cfg.window_geometry.filter(|_| !FULLSCREEN.load(Ordering::Relaxed)) {
                         if let (Some(x), Some(y)) = (g.x, g.y) {
                             ui.ctx().send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(x, y)));
                         }
@@ -5728,8 +5878,23 @@ impl eframe::App for HpsdrApp {
                 // reassigning self.state can't happen while `connected`
                 // (borrowed from it) is still needed by code below.
                 let mut restart_after_firmware_update: Option<Device> = None;
+                // Where the S-meter goes when the compact layout is too
+                // narrow for it at the top right: beside VFO-B (see
+                // COMPACT_NARROW_WIDTH).
+                let mut meter_pos: Option<egui::Pos2> = None;
                 egui::CentralPanel::default().show(ui, |ui| {
                     ui.add_space(4.0);
+                    // The compact layout (see compact_layout): the control
+                    // rows below open one at a time as popups from a
+                    // toolbar under the spectrum.
+                    let compact = compact_layout();
+                    let compact_popup = if compact { connected.compact_popup } else { None };
+                    let mut popup_closed = false;
+                    // Narrow (e.g. a 720-wide portrait screen): VFO-B goes
+                    // under VFO-A, with the S-meter beside it rather than
+                    // over it.
+                    let narrow = compact && ui.available_width() < COMPACT_NARROW_WIDTH;
+                    let panel_right = ui.max_rect().right();
                     // Red while transmitting -- a clear, glanceable
                     // "you're on the air" signal right where the eye
                     // already goes to read the frequency, not just the
@@ -5755,8 +5920,7 @@ impl eframe::App for HpsdrApp {
                         let name = connected.active_xvtr.clone().unwrap_or_else(|| key.clone());
                         format!("{name}-{}", bandstack_position(connected, &key) + 1)
                     };
-                    let (freq_label, vfo_b_label) = ui
-                        .horizontal(|ui| {
+                    let vfo_row = |ui: &mut egui::Ui| {
                             // VFO A, boxed and labeled to match VFO B's own
                             // box below -- see ConnectedState::
                             // vfo_b_frequency_hz/split's doc comments for
@@ -5828,7 +5992,8 @@ impl eframe::App for HpsdrApp {
                                             });
                                         // Right-click -> keypad frequency
                                         // entry popup, real request.
-                                        if resp.secondary_clicked() {
+                                        // A long press too, on a touch screen.
+                                        if resp.secondary_clicked() || resp.long_touched() {
                                             open_frequency_entry(connected, false);
                                         }
                                         resp
@@ -5981,61 +6146,16 @@ impl eframe::App for HpsdrApp {
                                         }
                                         settings_changed = true;
                                     }
-                                    // Only shown while actually in CW
-                                    // mode -- see cw_panel_visible's own
-                                    // doc comment further down. Also
-                                    // pushed to the decoder itself every
-                                    // frame (spectrum.rs's
-                                    // set_cw_decode_enabled) so it
-                                    // actually stops decoding while
-                                    // disabled, not just hides the panel
-                                    // -- a real report: without that,
-                                    // re-enabling dumped whatever had
-                                    // accumulated while hidden instead
-                                    // of resuming cleanly.
-                                    if matches!(connected.spectrum.mode(), spectrum::Mode::Cwl | spectrum::Mode::Cwu)
-                                        && ui
-                                            .add(egui::Button::selectable(
-                                                connected.cw_decode_enabled,
-                                                "CW Decode",
-                                            ))
-                                            .on_hover_text("Show/hide the CW decoder panel")
-                                            .clicked()
-                                    {
-                                        connected.cw_decode_enabled = !connected.cw_decode_enabled;
+                                    if !compact && vfo_extra_toggles(ui, connected) {
                                         settings_changed = true;
-                                    }
-                                    if connected.xvtrs.iter().any(xvtr_covers_beacon)
-                                        && ui
-                                            .add(egui::Button::selectable(
-                                                connected.psk_beacon_enabled,
-                                                "PSK Beacon",
-                                            ))
-                                            .on_hover_text(
-                                                "Monitor the QO-100 middle beacon (10489.750 MHz, 400 bit/s \
-                                                 PSK) on the received span: decode its text pages and \
-                                                 measure LNB drift",
-                                            )
-                                            .clicked()
-                                    {
-                                        connected.psk_beacon_enabled = !connected.psk_beacon_enabled;
-                                        settings_changed = true;
-                                    }
-                                    if connected.session.wideband_tap().is_some()
-                                        && ui
-                                            .add(egui::Button::selectable(connected.datv_window_open, "DATV"))
-                                            .on_hover_text(
-                                                "Receive DVB-S2 digital TV (e.g. QO-100's wideband transponder) \
-                                                 and send its video to VLC or ffplay",
-                                            )
-                                            .clicked()
-                                    {
-                                        connected.datv_window_open = !connected.datv_window_open;
                                     }
                                 });
                             });
 
-                            let vfo_b_label = ui
+                            if narrow {
+                                ui.end_row();
+                            }
+                            let vfo_b_group = ui
                                 .group(|ui| {
                                     ui.vertical(|ui| {
                                         ui.horizontal(|ui| {
@@ -6080,7 +6200,7 @@ impl eframe::App for HpsdrApp {
                                                             as u64,
                                                     ))
                                                     .monospace()
-                                                    .size(28.0)
+                                                    .size(if compact { 22.0 } else { 28.0 })
                                                     .strong()
                                                     .color(readable(ui, freq_b_color)),
                                                 )
@@ -6089,14 +6209,17 @@ impl eframe::App for HpsdrApp {
                                             .on_hover_text(
                                                 "Scroll to tune -- Alt: 10 Hz, Shift: 100 Hz, none: 1 kHz -- right-click to type a frequency",
                                             );
-                                        if resp.secondary_clicked() {
+                                        if resp.secondary_clicked() || resp.long_touched() {
                                             open_frequency_entry(connected, true);
                                         }
                                         resp
                                     })
                                     .inner
-                                })
-                                .inner;
+                                });
+                            let vfo_b_label = vfo_b_group.inner;
+                            if narrow {
+                                meter_pos = Some(egui::pos2(panel_right - METER_AREA_WIDTH, vfo_b_group.response.rect.top()));
+                            }
 
                             // Moved here (2026-09-18, real request) from
                             // the floating "s_meter_area" Area (top-right
@@ -6107,50 +6230,38 @@ impl eframe::App for HpsdrApp {
                             // for why mixing floating and normal-flow
                             // content in the same screen region is worth
                             // avoiding.
-                            ui.add_space(12.0);
-                            ui.vertical(|ui| {
-                                if ui.button("Settings...").clicked() {
-                                    connected.show_settings_window = !connected.show_settings_window;
-                                }
-                                // Used to be gated to protocol == 2 only -- P1
-                                // genuinely supports independent per-receiver
-                                // tuning too (classic Metis/Ozy DDC round-robin),
-                                // it just wasn't wired up: see start_protocol1's
-                                // extra_frequencies_hz and p1_build_packet's
-                                // ozy_command==2 branch for the actual fix.
-                                let active =
-                                    connected.session.active_receiver_count.load(Ordering::Relaxed) as usize;
-                                let max = connected.session.iq_buffers.len();
-                                if active < max {
-                                    if ui.button(format!("Add Receiver ({active}/{max})")).clicked() {
-                                        add_extra_receiver(connected);
-                                    }
-                                } else {
-                                    ui.weak(format!("All {max} receivers active"));
-                                }
-                                // Moved here from under the spectrum
-                                // (2026-11-11, real request).
-                                if ui.button("Stop").clicked() {
-                                    stop_clicked = true;
-                                }
-                            });
+                            // In the compact layout these are in the Menu
+                            // popup.
+                            if !compact {
+                                ui.add_space(12.0);
+                                ui.vertical(|ui| station_buttons(ui, connected, &mut stop_clicked));
+                            }
 
                             (freq_label, vfo_b_label)
-                        })
-                        .inner;
+                    };
+                    let (freq_label, vfo_b_label) =
+                        if narrow { ui.horizontal_wrapped(vfo_row).inner } else { ui.horizontal(vfo_row).inner };
+                    // Room for the S-meter beside VFO-B, which is taller.
+                    if let Some(pos) = meter_pos {
+                        let gap = pos.y + connected.meter_area_height - ui.cursor().top();
+                        if gap > 0.0 {
+                            ui.add_space(gap);
+                        }
+                    }
 
                     ui.add_space(8.0);
                     // The control rows, bands to rigctl, can be folded to
                     // one line -- see ConnectedState::controls_minimized.
                     // Two blocks: the DATV window and the frequency-entry
                     // popup between them run either way.
-                    if connected.controls_minimized {
+                    if !compact && connected.controls_minimized {
                         if controls_strip(ui, connected) {
                             settings_changed = true;
                         }
-                    } else {
+                    } else if !compact || compact_popup == Some(CompactPopup::Band) {
+                    compact_or_inline(ui, compact, "Band", &mut popup_closed, |ui| {
                     ui.horizontal_wrapped(|ui| {
-                        if ui
+                        if !compact && ui
                             .button("«")
                             .on_hover_text("Minimize the control rows (bands to rigctl), giving the spectrum more room")
                             .clicked()
@@ -6261,6 +6372,7 @@ impl eframe::App for HpsdrApp {
                             settings_changed = true;
                         }
                     });
+                    });
                     }
 
                     if connected.datv_window_open && render_datv_window(ui.ctx(), connected) {
@@ -6313,7 +6425,9 @@ impl eframe::App for HpsdrApp {
                         settings_changed = true;
                     }
 
-                    if !connected.controls_minimized {
+                    if compact || !connected.controls_minimized {
+                    if !compact || compact_popup == Some(CompactPopup::Mode) {
+                    compact_or_inline(ui, compact, "Mode", &mut popup_closed, |ui| {
                     ui.horizontal_wrapped(|ui| {
                         for mode in ALL_MODES {
                             let selected = mode == current_mode;
@@ -6348,7 +6462,11 @@ impl eframe::App for HpsdrApp {
                             settings_changed = true;
                         }
                     });
+                    });
+                    }
 
+                    if !compact || compact_popup == Some(CompactPopup::Audio) {
+                    compact_or_inline(ui, compact, "Audio", &mut popup_closed, |ui| {
                     ui.scope(|ui| {
                         // Reserve room for the S-meter/Settings/Add
                         // Receiver column -- a separately-positioned
@@ -6373,7 +6491,9 @@ impl eframe::App for HpsdrApp {
                         // meter, and "Add Receiver (N/N)", its widest
                         // button label) plus its -10px right margin and
                         // a visible gap.
-                        ui.set_max_width((ui.available_width() - 220.0).max(0.0));
+                        if !compact {
+                            ui.set_max_width((ui.available_width() - 220.0).max(0.0));
+                        }
                         ui.horizontal_wrapped(|ui| {
                         // Each label+slider pair below is its own nested
                         // ui.horizontal (not just a label call followed by
@@ -6698,7 +6818,11 @@ impl eframe::App for HpsdrApp {
                             ui.weak(format!("Mic level: {:.3}    ALC: {:.1}", disp.mic_pk, disp.alc_av));
                         }
                     }
+                    });
+                    }
 
+                    if !compact || compact_popup == Some(CompactPopup::Dsp) {
+                    compact_or_inline(ui, compact, "DSP", &mut popup_closed, |ui| {
                     ui.horizontal_wrapped(|ui| {
                         let nb = connected.spectrum.noise_blanker();
                         if let Some(v) = noise_blanker_menu(ui, nb) {
@@ -6787,9 +6911,22 @@ impl eframe::App for HpsdrApp {
                             settings_changed = true;
                         }
                     });
+                    });
+                    }
 
+                    if !compact || compact_popup == Some(CompactPopup::Menu) {
+                    compact_or_inline(ui, compact, "Menu", &mut popup_closed, |ui| {
+                    if compact {
+                        ui.horizontal_wrapped(|ui| {
+                            station_buttons(ui, connected, &mut stop_clicked);
+                            if vfo_extra_toggles(ui, connected) {
+                                settings_changed = true;
+                            }
+                        });
+                        ui.separator();
+                    }
                     ui.add_space(4.0);
-                    ui.horizontal(|ui| {
+                    ui.horizontal_wrapped(|ui| {
                         ui.colored_label(network_status_color(ui, rigctl_status), "rigctl")
                             .on_hover_text(network_status_hover("rigctl", rigctl_status, &connected.rigctl_addr));
                         ui.add_space(12.0);
@@ -6905,8 +7042,13 @@ impl eframe::App for HpsdrApp {
                             }
                         }
                     });
+                    });
+                    }
                     }
 
+                    // The TX row: in the compact layout, the TX popup.
+                    if !compact || compact_popup == Some(CompactPopup::Tx) {
+                    compact_or_inline(ui, compact, "TX", &mut popup_closed, |ui| {
                     // Where MOX and Tune would be: say why they aren't.
                     // REAL REPORT: with the wide stream left on from DATV,
                     // a Pluto's transmit controls just weren't there.
@@ -6922,7 +7064,8 @@ impl eframe::App for HpsdrApp {
 
                     if connected.tx_enabled {
                         ui.add_space(4.0);
-                        ui.horizontal(|ui| {
+                        // Wrapping in the compact layout's popup.
+                        let tx_row = |ui: &mut egui::Ui| {
                             // Read the session's actual MOX state for
                             // display (not just connected.ptt_held),
                             // since rigctl/TCI can also assert PTT --
@@ -7470,7 +7613,14 @@ impl eframe::App for HpsdrApp {
                             if mox_now {
                                 ui.colored_label(readable(ui, egui::Color32::from_rgb(210, 50, 50)), "TRANSMITTING");
                             }
-                        });
+                        };
+                        if compact {
+                            ui.horizontal_wrapped(tx_row);
+                        } else {
+                            ui.horizontal(tx_row);
+                        }
+                    }
+                    });
                     }
 
                     // Split the window's remaining vertical space between
@@ -7493,6 +7643,7 @@ impl eframe::App for HpsdrApp {
                     let row_reserve = ui.spacing().interact_size.y + 8.0;
                     let below_waterfall_reserve = row_reserve
                         + if show_status_row { row_reserve } else { 0.0 }
+                        + if compact { COMPACT_TOOLBAR_HEIGHT } else { 0.0 }
                         + if connected.waterfall_enabled { SPECTRUM_WATERFALL_DIVIDER_HEIGHT } else { 0.0 };
                     // 120, not 200: lets the window go down to its
                     // minimum (see main_window_min_size) without
@@ -8268,6 +8419,13 @@ impl eframe::App for HpsdrApp {
                         remember_slider_pair_other(ui, row_id, slider_width);
                     });
 
+                    if compact && compact_toolbar(ui, connected, &band_stack_label) {
+                        settings_changed = true;
+                    }
+                    if popup_closed {
+                        connected.compact_popup = None;
+                    }
+
                     if show_status_row {
                     ui.add_space(8.0);
                     ui.horizontal(|ui| {
@@ -8289,8 +8447,12 @@ impl eframe::App for HpsdrApp {
                     }
                 });
 
-                egui::Area::new(egui::Id::unique("s_meter_area"))
-                    .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-10.0, 10.0))
+                let meter_area = egui::Area::new(egui::Id::unique("s_meter_area"));
+                let meter_area = match meter_pos {
+                    Some(pos) => meter_area.fixed_pos(pos),
+                    None => meter_area.anchor(egui::Align2::RIGHT_TOP, egui::vec2(-10.0, 10.0)),
+                };
+                let meter_resp = meter_area
                     .show(ui, |ui| {
                         // Height lowered from 110 -- once draw_s_meter's
                         // Y_SQUASH flattened the arc, 110 left a real gap
@@ -8545,6 +8707,7 @@ impl eframe::App for HpsdrApp {
                         }
 
                     });
+                connected.meter_area_height = meter_resp.response.rect.height();
 
                 // One native OS window per extra receiver. Must be called
                 // every frame to stay open (egui's viewport convention) --
@@ -8712,6 +8875,17 @@ impl eframe::App for HpsdrApp {
                     // this closure borrows `connected` directly by
                     // reference rather than through an Arc<Mutex<>>).
                     let mut close_requested = false;
+                    // No bigger than the screen, less a margin -- REAL
+                    // REPORT: on a 7" Raspberry Pi display (800x480, or
+                    // 480/720 wide in portrait) the 1100x700 window didn't
+                    // fit. The tabs scroll when that's too short for them.
+                    let settings_size = {
+                        let want = egui::vec2(1100.0, 700.0);
+                        match ui.ctx().input(|i| i.viewport().monitor_size) {
+                            Some(screen) => want.min(screen - egui::vec2(40.0, 80.0)).max(egui::vec2(320.0, 240.0)),
+                            None => want,
+                        }
+                    };
                     ui.ctx().show_viewport_immediate(
                         egui::ViewportId::from_hash_of("settings_window"),
                         egui::ViewportBuilder::default()
@@ -8750,7 +8924,7 @@ impl eframe::App for HpsdrApp {
                             // always-on-top level -- it opened BEHIND
                             // this window instead, invisible without
                             // moving Settings out of the way first.
-                            .with_inner_size([1100.0, 700.0]),
+                            .with_inner_size(settings_size),
                         |ui, _class| {
                             if ui.input(|i| i.viewport().close_requested()) {
                                 close_requested = true;
@@ -8835,6 +9009,12 @@ impl eframe::App for HpsdrApp {
                             });
                             ui.separator();
 
+                            // Scrolls, so a tall tab still works in a window
+                            // sized to a small screen (see the viewport's
+                            // with_inner_size).
+                            // Sideways too, for the rows wider than a portrait
+                            // screen (e.g. Network's serial ports).
+                            egui::ScrollArea::both().auto_shrink([false; 2]).show(ui, |ui| {
                             match connected.settings_tab {
                                 SettingsTab::Network => {
                                     ui.strong("rigctl (for WSJT-X's \"Hamlib NET rigctl\", etc.):");
@@ -10879,6 +11059,43 @@ impl eframe::App for HpsdrApp {
                                         "The look of the windows and controls. The spectrum, \
                                          waterfall and meters stay dark.",
                                     );
+                                    // See config::UiPrefs::layout. Applied
+                                    // and saved by HpsdrApp::ui.
+                                    ui.horizontal(|ui| {
+                                        ui.label("Layout:");
+                                        let mut choice = layout_choice();
+                                        ui.selectable_value(&mut choice, config::LayoutChoice::Auto, "Auto")
+                                            .on_hover_text(
+                                                "Compact on a screen smaller than 1000x600 (at this UI \
+                                                 Scale), such as the 7\" Raspberry Pi displays; Standard \
+                                                 otherwise",
+                                            );
+                                        ui.selectable_value(&mut choice, config::LayoutChoice::Standard, "Standard")
+                                            .on_hover_text("Every control row in the main window");
+                                        ui.selectable_value(&mut choice, config::LayoutChoice::Compact, "Compact")
+                                            .on_hover_text(
+                                                "For a small screen such as the 7\" 800x480 Raspberry Pi \
+                                                 display: a toolbar of large buttons under the spectrum \
+                                                 opens the control rows as popups. Start with \
+                                                 --fullscreen to fill the screen.",
+                                            );
+                                        if choice != layout_choice() {
+                                            set_layout_choice(choice);
+                                            ui.ctx().request_repaint_of(egui::ViewportId::ROOT);
+                                        }
+                                        if choice == config::LayoutChoice::Auto {
+                                            let (w, h) = (
+                                                SCREEN_SIZE[0].load(Ordering::Relaxed),
+                                                SCREEN_SIZE[1].load(Ordering::Relaxed),
+                                            );
+                                            if w > 0 && h > 0 {
+                                                ui.weak(format!(
+                                                    "({} on this {w}x{h} screen)",
+                                                    if compact_layout() { "compact" } else { "standard" }
+                                                ));
+                                            }
+                                        }
+                                    });
                                     ui.separator();
                                     ui.horizontal(|ui| {
                                         ui.label("Spectrum");
@@ -12848,6 +13065,7 @@ impl eframe::App for HpsdrApp {
                                     }
                                 }
                             }
+                            });
 
                             if let Some(fw) = &mut connected.firmware_update {
                                 fw.show(ui);
@@ -14166,7 +14384,12 @@ const SPECTRUM_ONLY_MIN_HEIGHT: f32 = 50.0;
 /// controls folded the window couldn't be made shorter, and the spectrum
 /// took up the difference. With the waterfall off the spectrum alone can
 /// be shorter too (SPECTRUM_ONLY_MIN_HEIGHT).
-fn main_window_min_size(zoom: f32, waterfall: bool) -> egui::Vec2 {
+/// The compact layout's is 520 x 400, so it fits an 800 x 480 screen at
+/// 100%, and a 720-wide portrait one up to about 135%.
+fn main_window_min_size(zoom: f32, waterfall: bool, compact: bool) -> egui::Vec2 {
+    if compact {
+        return egui::vec2(520.0, 400.0) * zoom;
+    }
     let height = if waterfall { 360.0 } else { 360.0 - (120.0 - SPECTRUM_ONLY_MIN_HEIGHT) };
     egui::vec2(900.0, height) * zoom
 }
@@ -14177,6 +14400,240 @@ fn main_window_min_size(zoom: f32, waterfall: bool) -> egui::Vec2 {
 fn extra_window_min_size(zoom: f32, waterfall: bool) -> egui::Vec2 {
     let height = if waterfall { 320.0 } else { 320.0 - (120.0 - SPECTRUM_ONLY_MIN_HEIGHT) };
     egui::vec2(700.0, height) * zoom
+}
+
+/// The compact layout's popups, one per toolbar button: the main window's
+/// control rows, drawn over the spectrum above the toolbar.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum CompactPopup {
+    Band,
+    Mode,
+    Audio,
+    Dsp,
+    Tx,
+    Menu,
+}
+
+/// Height of the compact layout's toolbar buttons -- about 7 mm on a 7"
+/// 800x480 display, big enough for a finger.
+const COMPACT_BUTTON_HEIGHT: f32 = 40.0;
+/// The toolbar row: its buttons and the gap above it.
+const COMPACT_TOOLBAR_HEIGHT: f32 = COMPACT_BUTTON_HEIGHT + 8.0;
+/// Below this width (points) the compact layout's VFO row needs two lines:
+/// VFO-A and its buttons, then VFO-B with the S-meter beside it -- e.g. the
+/// 720-wide portrait Raspberry Pi Touch Display 2.
+const COMPACT_NARROW_WIDTH: f32 = 780.0;
+/// The S-meter area's width with its margin from the window's edge.
+const METER_AREA_WIDTH: f32 = 190.0;
+
+/// Draws `add` inline in the standard layout, or in the compact layout as
+/// a popup over the spectrum, just above the toolbar, with its title and a
+/// close button (setting `closed`). Bigger buttons in the popup, for a
+/// finger.
+fn compact_or_inline<R>(
+    ui: &mut egui::Ui,
+    compact: bool,
+    title: &str,
+    closed: &mut bool,
+    add: impl FnOnce(&mut egui::Ui) -> R,
+) -> R {
+    if !compact {
+        return add(ui);
+    }
+    let width = ui.max_rect().width();
+    let bottom = COMPACT_TOOLBAR_HEIGHT + ui.spacing().interact_size.y + 24.0;
+    let ctx = ui.ctx().clone();
+    egui::Area::new(egui::Id::unique(("compact_popup", title)))
+        .order(egui::Order::Foreground)
+        .anchor(egui::Align2::LEFT_BOTTOM, egui::vec2(8.0, -bottom))
+        .show(&ctx, |ui| {
+            egui::Frame::popup(ui.style())
+                .show(ui, |ui| {
+                    ui.set_max_width(width - 32.0);
+                    ui.spacing_mut().button_padding = egui::vec2(10.0, 8.0);
+                    ui.spacing_mut().interact_size.y = 32.0;
+                    ui.horizontal(|ui| {
+                        ui.strong(title);
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.button(egui::RichText::new("✕").size(16.0)).on_hover_text("Close").clicked() {
+                                *closed = true;
+                            }
+                        });
+                    });
+                    ui.separator();
+                    add(ui)
+                })
+                .inner
+        })
+        .inner
+}
+
+/// The compact layout's toolbar: a big button per popup (CompactPopup),
+/// Band and Mode showing what they're set to, and MOX. Returns true if a
+/// setting changed.
+fn compact_toolbar(ui: &mut egui::Ui, connected: &mut ConnectedState, band_label: &str) -> bool {
+    const GAP: f32 = 4.0;
+    const MOX_WIDTH: f32 = 80.0;
+    let mut changed = false;
+    ui.add_space(8.0);
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = GAP;
+        // The six buttons share the width MOX leaves, so they fit a narrow
+        // window (REAL REPORT: at 520 wide MOX covered Menu) and spread out
+        // on a wide one. Text that doesn't fit is cut short with "...".
+        let avail = ui.available_width();
+        let mox = if connected.tx_enabled { MOX_WIDTH + GAP } else { 0.0 };
+        let width = ((avail - mox - 5.0 * GAP) / 6.0).clamp(44.0, 110.0);
+        let mode = connected.spectrum.mode();
+        // The filter width too when there's room for it.
+        let mode_label = if width >= 84.0 {
+            format!("{} {:.0}", mode.label(), connected.spectrum.width_hz())
+        } else {
+            mode.label().to_string()
+        };
+        for (popup, label) in [
+            (CompactPopup::Band, band_label),
+            (CompactPopup::Mode, mode_label.as_str()),
+            (CompactPopup::Audio, "Audio"),
+            (CompactPopup::Dsp, "DSP"),
+            (CompactPopup::Tx, "TX"),
+            (CompactPopup::Menu, "Menu"),
+        ] {
+            let open = connected.compact_popup == Some(popup);
+            if ui
+                .add_sized(
+                    [width, COMPACT_BUTTON_HEIGHT],
+                    egui::Button::selectable(open, egui::RichText::new(label).size(16.0)).truncate(),
+                )
+                .on_hover_text(label)
+                .clicked()
+            {
+                connected.compact_popup = if open { None } else { Some(popup) };
+            }
+        }
+        if connected.tx_enabled {
+            // As the TX row's MOX button, at the right-hand end.
+            let spare = avail - 6.0 * width - 5.0 * GAP - mox;
+            if spare > 0.0 {
+                ui.add_space(spare);
+            }
+            let mox_now = connected.session.mox_active();
+            let allowed = mox_now
+                || tx_frequency_allowed(
+                    connected.session.tx_frequency_hz.load(Ordering::Relaxed),
+                    connected.allow_out_of_band_tx.load(Ordering::Relaxed),
+                );
+            let (fill, text) = toggle_colours(ui, mox_now.then_some(egui::Color32::from_rgb(210, 50, 50)));
+            let clicked = ui
+                .add_enabled_ui(allowed, |ui| {
+                    ui.add_sized(
+                        [MOX_WIDTH, COMPACT_BUTTON_HEIGHT],
+                        egui::Button::new(
+                            egui::RichText::new(if mox_now { "MOX ON" } else { "MOX" }).size(16.0).strong().color(text),
+                        )
+                        .fill(fill),
+                    )
+                    .clicked()
+                })
+                .inner;
+            if clicked {
+                connected.session.set_mox(!mox_now);
+                changed = true;
+            }
+        }
+    });
+    changed
+}
+
+/// CW Decode, PSK Beacon and DATV, when they apply -- beside the VFOs, or
+/// in the compact layout's Menu popup. Returns true if one changed.
+fn vfo_extra_toggles(ui: &mut egui::Ui, connected: &mut ConnectedState) -> bool {
+    let mut changed = false;
+    // Only shown while actually in CW
+    // mode -- see cw_panel_visible's own
+    // doc comment further down. Also
+    // pushed to the decoder itself every
+    // frame (spectrum.rs's
+    // set_cw_decode_enabled) so it
+    // actually stops decoding while
+    // disabled, not just hides the panel
+    // -- a real report: without that,
+    // re-enabling dumped whatever had
+    // accumulated while hidden instead
+    // of resuming cleanly.
+    if matches!(connected.spectrum.mode(), spectrum::Mode::Cwl | spectrum::Mode::Cwu)
+        && ui
+            .add(egui::Button::selectable(
+                connected.cw_decode_enabled,
+                "CW Decode",
+            ))
+            .on_hover_text("Show/hide the CW decoder panel")
+            .clicked()
+    {
+        connected.cw_decode_enabled = !connected.cw_decode_enabled;
+        changed = true;
+    }
+    if connected.xvtrs.iter().any(xvtr_covers_beacon)
+        && ui
+            .add(egui::Button::selectable(
+                connected.psk_beacon_enabled,
+                "PSK Beacon",
+            ))
+            .on_hover_text(
+                "Monitor the QO-100 middle beacon (10489.750 MHz, 400 bit/s \
+                 PSK) on the received span: decode its text pages and \
+                 measure LNB drift",
+            )
+            .clicked()
+    {
+        connected.psk_beacon_enabled = !connected.psk_beacon_enabled;
+        changed = true;
+    }
+    if connected.session.wideband_tap().is_some()
+        && ui
+            .add(egui::Button::selectable(connected.datv_window_open, "DATV"))
+            .on_hover_text(
+                "Receive DVB-S2 digital TV (e.g. QO-100's wideband transponder) \
+                 and send its video to VLC or ffplay",
+            )
+            .clicked()
+    {
+        connected.datv_window_open = !connected.datv_window_open;
+        changed = true;
+    }
+    changed
+}
+
+/// Settings..., Add Receiver and Stop -- beside the VFOs, or in the compact
+/// layout's Menu popup.
+fn station_buttons(ui: &mut egui::Ui, connected: &mut ConnectedState, stop_clicked: &mut bool) {
+    if ui.button("Settings...").clicked() {
+        connected.show_settings_window = !connected.show_settings_window;
+    }
+    // Used to be gated to protocol == 2 only -- P1 genuinely supports
+    // independent per-receiver tuning too (classic Metis/Ozy DDC
+    // round-robin), it just wasn't wired up: see start_protocol1's
+    // extra_frequencies_hz and p1_build_packet's ozy_command==2 branch
+    // for the actual fix.
+    let active = connected.session.active_receiver_count.load(Ordering::Relaxed) as usize;
+    let max = connected.session.iq_buffers.len();
+    if active < max {
+        if ui.button(format!("Add Receiver ({active}/{max})")).clicked() {
+            add_extra_receiver(connected);
+        }
+    } else {
+        ui.weak(format!("All {max} receivers active"));
+    }
+    // Moved here from under the spectrum (2026-11-11, real request).
+    if ui.button("Stop").clicked() {
+        *stop_clicked = true;
+    }
+    // Fullscreen has no title bar to close the window with.
+    if FULLSCREEN.load(Ordering::Relaxed)
+        && ui.button("Quit").on_hover_text("Close hpsdr-rs (F11 leaves fullscreen)").clicked()
+    {
+        ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+    }
 }
 
 fn controls_strip(ui: &mut egui::Ui, connected: &mut ConnectedState) -> bool {
@@ -15439,6 +15896,7 @@ fn s_meter_label(db: f64, s9: f64) -> String {
 /// which is fine at normal UI frame rates.
 fn render_extra_receiver_ui(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceiver>>) {
     let mut rx = rx.lock().unwrap();
+    rx.resize_overlay.show(ui.ctx());
 
     // Same CW decoder panel as the main receiver window -- see
     // render_cw_decoder_panel_beside's doc comment for why this is an
@@ -17091,6 +17549,7 @@ fn spawn_extra_receiver(
         spectrum_pan: saved.map(|s| s.spectrum_pan).unwrap_or(0.0),
         show_settings_window: false,
         frequency_entry: None,
+        resize_overlay: ResizeOverlay::default(),
         settings_tab: SettingsTab::Agc,
         settings_dirty,
         band_memory: saved.map(|s| s.band_settings.clone()).unwrap_or_default(),
@@ -17751,6 +18210,8 @@ fn main() -> eframe::Result<()> {
     // now keyed per-radio (see Config::window_geometry's doc comment),
     // so there's nothing to seed until a specific radio is chosen; see
     // the DiscoveryAction::Start handler in ui() for where that happens.
+    let fullscreen = std::env::args().skip(1).any(|a| a == "--fullscreen");
+    FULLSCREEN.store(fullscreen, Ordering::Relaxed);
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1200.0, 660.0])
@@ -17759,7 +18220,14 @@ fn main() -> eframe::Result<()> {
             // window still shows everything down to Stop at 360, with
             // spectrum_waterfall_height's own minimum lowered to match.
             // Unfolded, that small a window cuts off the bottom.
-            .with_min_inner_size(main_window_min_size(1.0, true))
+            // The compact minimum unless the standard layout is chosen:
+            // with Auto, the screen's size isn't known yet.
+            .with_min_inner_size(main_window_min_size(
+                1.0,
+                true,
+                config::UiPrefs::load().layout != config::LayoutChoice::Standard,
+            ))
+            .with_fullscreen(fullscreen)
             .with_icon(icon),
         wgpu_options: eframe::egui_wgpu::WgpuConfiguration {
             surface: eframe::egui_wgpu::SurfaceConfig {

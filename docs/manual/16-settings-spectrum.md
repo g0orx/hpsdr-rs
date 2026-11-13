@@ -30,6 +30,17 @@ Discovery -- but the spectrum, waterfall and meters stay dark in both, so
 signals look the same.
 Like UI Scale, it's kept for next time on this computer.
 
+## Layout
+
+**Layout** is **Auto** (the default), **Standard** (every control row in
+the main window) or **Compact**, for a small screen such as the 7" 800x480
+Raspberry Pi display -- see
+[Compact layout](02-main-window.md#compact-layout-small-screens). **Auto**
+uses Compact on a screen smaller than 1000x600, and Standard otherwise; the
+size is in points, so at a UI Scale above 100% a screen counts as smaller.
+Next to it, Auto says which it chose and the screen size it went by.
+Like UI Scale, it's kept for next time on this computer.
+
 ## Window sizes
 
 The main window and each extra receiver window reopen at the size you
