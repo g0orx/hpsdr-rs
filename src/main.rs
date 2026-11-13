@@ -715,6 +715,13 @@ pub struct BandSettings {
     pub fm_shift: Option<i8>,
     #[serde(default)]
     pub ctcss_hz: Option<f32>,
+    /// Squelch (SQL) on/off and level as this band (stack entry) was left,
+    /// restored with it like Split. None (never recorded) leaves it as it
+    /// is.
+    #[serde(default)]
+    pub squelch_enabled: Option<bool>,
+    #[serde(default)]
+    pub squelch_level: Option<f32>,
 }
 
 /// Records the current frequency, level ranges, and mode against
@@ -759,6 +766,8 @@ fn remember_band_settings(
     let duplex = kept.and_then(|b| b.duplex);
     let fm_shift = kept.and_then(|b| b.fm_shift);
     let ctcss_hz = kept.and_then(|b| b.ctcss_hz);
+    let squelch_enabled = kept.and_then(|b| b.squelch_enabled);
+    let squelch_level = kept.and_then(|b| b.squelch_level);
     band_memory.insert(
         name,
         BandSettings {
@@ -772,6 +781,8 @@ fn remember_band_settings(
             duplex,
             fm_shift,
             ctcss_hz,
+            squelch_enabled,
+            squelch_level,
         },
     );
 }
@@ -789,8 +800,9 @@ fn current_band_memory_key(connected: &ConnectedState) -> String {
     }
 }
 
-/// Records Split/Duplex and the FM repeater shift/tone against the band
-/// being left -- called by the band switches before they change band.
+/// Records Split/Duplex, the FM repeater shift/tone and squelch against
+/// the band being left -- called by the band switches before they change
+/// band.
 fn save_band_split(connected: &mut ConnectedState) {
     let key = current_band_memory_key(connected);
     let (split, duplex, shift, tone) = (connected.split, connected.duplex, connected.fm_shift, connected.ctcss_hz);
@@ -799,6 +811,23 @@ fn save_band_split(connected: &mut ConnectedState) {
         b.duplex = Some(duplex);
         b.fm_shift = Some(shift);
         b.ctcss_hz = Some(tone);
+        save_band_squelch(b, &connected.spectrum);
+    }
+}
+
+/// Records a receiver's squelch in a band memory entry.
+fn save_band_squelch(b: &mut BandSettings, spectrum: &SpectrumHandle) {
+    b.squelch_enabled = Some(spectrum.squelch_enabled());
+    b.squelch_level = Some(spectrum.squelch_level());
+}
+
+/// Restores the squelch recorded in a band memory entry, if any.
+fn restore_band_squelch(b: Option<BandSettings>, spectrum: &SpectrumHandle) {
+    if let Some(v) = b.and_then(|b| b.squelch_enabled) {
+        spectrum.set_squelch_enabled(v);
+    }
+    if let Some(v) = b.and_then(|b| b.squelch_level) {
+        spectrum.set_squelch_level(v);
     }
 }
 
@@ -816,6 +845,7 @@ fn restore_band_split(connected: &mut ConnectedState) {
     connected.duplex = duplex && split;
     connected.fm_shift = saved.and_then(|b| b.fm_shift).unwrap_or(0).clamp(-1, 1);
     connected.ctcss_hz = saved.and_then(|b| b.ctcss_hz).unwrap_or(0.0);
+    restore_band_squelch(saved, &connected.spectrum);
 }
 
 /// The standard CTCSS tones (EIA/TIA-603), Hz.
@@ -1051,9 +1081,15 @@ fn bandstack_position(connected: &ConnectedState, key: &str) -> usize {
 
 /// Hover text for the selected band's button.
 fn bandstack_hover(connected: &ConnectedState, key: &str) -> String {
+    bandstack_hover_text(&connected.bandstack_index, key)
+}
+
+/// bandstack_hover from a band stack index map -- shared with extra
+/// receivers.
+fn bandstack_hover_text(index: &std::collections::HashMap<String, usize>, key: &str) -> String {
     format!(
         "Band stack {} of {BANDSTACK_SIZE}: click for the next",
-        bandstack_position(connected, key) + 1
+        index.get(key).copied().unwrap_or(0) % BANDSTACK_SIZE + 1
     )
 }
 
@@ -1062,10 +1098,18 @@ fn bandstack_hover(connected: &ConnectedState, key: &str) -> String {
 /// going through RadioSession::set_frequency. Factored out (2026-09-20)
 /// from what used to be inline-only logic in its own band-button row, so
 /// the "Gen" button (gen_band) can share it too instead of a second copy.
-fn apply_band_extra(rx: &mut ExtraReceiver, band: &Band) {
+fn apply_band_extra(rx: &mut ExtraReceiver, band: &Band, stepping: bool) {
     let saved = rx.band_memory.get(band.name).copied();
     let target = saved.map(|s| s.frequency_hz).unwrap_or(band.default_hz);
-    rx.frequency_hz.store(target, Ordering::Relaxed);
+    // Stepping a band stack with CTUN on keeps the centre if the entry
+    // fits the span shown, as tune_recalled does in the main window.
+    let mode = saved.and_then(|s| s.mode).unwrap_or(band.default_mode);
+    let lo = rx.frequency_hz.load(Ordering::Relaxed);
+    let passband = spectrum::passband_for(mode, width_for_mode(&rx.width_memory, mode));
+    let sample_rate = rx.sample_rate_hz.load(Ordering::Relaxed);
+    if !(stepping && rx.ctun && resolve_tune(true, lo, sample_rate, passband, target).0 == target) {
+        rx.frequency_hz.store(target, Ordering::Relaxed);
+    }
     rx.ctun_frequency_hz = target;
     if let Some(s) = saved {
         rx.db_low = s.db_low;
@@ -1087,6 +1131,22 @@ fn apply_band_extra(rx: &mut ExtraReceiver, band: &Band) {
     rx.spectrum.set_mode(resolved_mode);
     rx.spectrum.set_width_hz(width_for_mode(&rx.width_memory, resolved_mode));
     rx.settings_dirty.store(true, Ordering::Relaxed);
+}
+
+/// An extra receiver's band button pressed: the band, or, if it's the
+/// band it's on, its next band stack entry (see press_band).
+fn press_band_extra(rx: &mut ExtraReceiver, band: &Band, current_band: Option<&str>) {
+    // The squelch as the band (entry) being left had it -- see
+    // save_band_split.
+    if let Some(b) = current_band.and_then(|name| rx.band_memory.get_mut(name)) {
+        save_band_squelch(b, &rx.spectrum);
+    }
+    let stepping = current_band == Some(band.name);
+    if stepping {
+        step_bandstack(&mut rx.band_memory, &mut rx.bandstacks, &mut rx.bandstack_index, band.name);
+    }
+    apply_band_extra(rx, band, stepping);
+    restore_band_squelch(rx.band_memory.get(band.name).copied(), &rx.spectrum);
 }
 
 /// Switches to `mode` at the current dial frequency. Shared by the
@@ -2411,6 +2471,9 @@ struct ExtraReceiver {
     /// Config) knows to persist it too.
     settings_dirty: Arc<std::sync::atomic::AtomicBool>,
     band_memory: std::collections::HashMap<String, BandSettings>,
+    /// This receiver's band stacks -- see ConnectedState::bandstacks.
+    bandstacks: std::collections::HashMap<String, Vec<Option<BandSettings>>>,
+    bandstack_index: std::collections::HashMap<String, usize>,
     /// Last filter width used per mode -- see width_for_mode's doc
     /// comment. Keyed by Mode::label().
     width_memory: std::collections::HashMap<String, f64>,
@@ -12877,6 +12940,8 @@ impl eframe::App for HpsdrApp {
                                 waterfall_enabled: rx.waterfall_enabled,
                                 adc: rx.adc.load(std::sync::atomic::Ordering::Relaxed) as u8,
                                 band_settings: rx.band_memory.clone(),
+                                bandstacks: rx.bandstacks.clone(),
+                                bandstack_index: rx.bandstack_index.clone(),
                                 width_memory: rx.width_memory.clone(),
                                 eq: agc_params.eq,
                                 window_geometry: rx.window_geometry,
@@ -15462,7 +15527,14 @@ fn render_extra_receiver_ui(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceiver>>) {
     ui.horizontal(|ui| {
         ui.group(|ui| {
             ui.vertical(|ui| {
-                ui.label("VFO-A");
+                // Band and band stack entry, as in the main window.
+                let band = band_for_frequency(dial_freq_hz).map(|b| b.name).unwrap_or("Gen");
+                let entry = rx.bandstack_index.get(band).copied().unwrap_or(0) % BANDSTACK_SIZE + 1;
+                ui.horizontal(|ui| {
+                    ui.label("VFO-A");
+                    ui.label(egui::RichText::new(format!("{band}-{entry}")).weak())
+                        .on_hover_text("Band and band stack entry: press the band's button again for the next");
+                });
                 let resp = ui.add(
                     egui::Label::new(
                         egui::RichText::new(format_frequency(dial_freq_hz.into()))
@@ -15677,15 +15749,23 @@ fn render_extra_receiver_ui(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceiver>>) {
                 continue;
             }
             let selected = Some(band.name) == current_band;
-            if ui.add(egui::Button::selectable(selected, band.name)).clicked() && !selected {
-                apply_band_extra(&mut rx, band);
+            let mut button = ui.add(egui::Button::selectable(selected, band.name));
+            if selected {
+                button = button.on_hover_text(bandstack_hover_text(&rx.bandstack_index, band.name));
+            }
+            if button.clicked() {
+                press_band_extra(&mut rx, band, current_band);
             }
         }
         // "Gen" -- see gen_band's own doc comment.
         let gen = gen_band(rx.frequency_min, rx.frequency_max);
         let selected = current_band == Some("Gen");
-        if ui.add(egui::Button::selectable(selected, "Gen")).clicked() && !selected {
-            apply_band_extra(&mut rx, &gen);
+        let mut button = ui.add(egui::Button::selectable(selected, "Gen"));
+        if selected {
+            button = button.on_hover_text(bandstack_hover_text(&rx.bandstack_index, "Gen"));
+        }
+        if button.clicked() {
+            press_band_extra(&mut rx, &gen, current_band);
         }
     });
 
@@ -17014,6 +17094,8 @@ fn spawn_extra_receiver(
         settings_tab: SettingsTab::Agc,
         settings_dirty,
         band_memory: saved.map(|s| s.band_settings.clone()).unwrap_or_default(),
+        bandstacks: saved.map(|s| s.bandstacks.clone()).unwrap_or_default(),
+        bandstack_index: saved.map(|s| s.bandstack_index.clone()).unwrap_or_default(),
         width_memory: saved.map(|s| s.width_memory.clone()).unwrap_or_default(),
         ctun,
         ctun_frequency_hz,

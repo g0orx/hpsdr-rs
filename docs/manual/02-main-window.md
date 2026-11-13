@@ -291,7 +291,8 @@ underneath -- see [Settings: XVTR](18-xvtr.md) for how to define one.
 Each band, **Gen** and each transverter has a stack of three settings.
 Pressing the button of the band you're already on steps to the next one,
 and round again to the first. Each keeps its own frequency, mode, display
-levels, Split/Duplex and FM repeater setup as you left it. The band and
+levels, Split/Duplex, FM repeater setup and squelch (**SQL** on/off and
+level) as you left it. The band and
 the entry you're on are shown beside **VFO-A**, e.g. **20m-1**, **Gen-2**
 or a transverter's **144MHz-3**. With **CTUN** on, stepping to an entry
 inside the span shown only moves the CTUN frequency, leaving the spectrum

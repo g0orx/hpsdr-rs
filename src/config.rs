@@ -694,6 +694,11 @@ pub struct ExtraReceiverConfig {
     pub adc: u8,
     #[serde(default)]
     pub band_settings: std::collections::HashMap<String, BandSettings>,
+    /// This receiver's band stacks -- see Config::bandstacks.
+    #[serde(default)]
+    pub bandstacks: std::collections::HashMap<String, Vec<Option<BandSettings>>>,
+    #[serde(default)]
+    pub bandstack_index: std::collections::HashMap<String, usize>,
     /// See Config::width_memory's doc comment -- same thing, per extra
     /// receiver instead of shared across the session.
     #[serde(default)]

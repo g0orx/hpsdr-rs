@@ -49,6 +49,10 @@ the waterfall (click or scroll to tune, same conventions as the main
 window, though Ctrl+scroll's 10kHz-step tuning gesture isn't available
 here), and its own S-meter with a **Settings...** button.
 
+Its band buttons have their own [band stack](02-main-window.md#band-stack),
+separate from the main window's: press the band it's on to step to the
+next of three entries, shown beside its **VFO-A** (e.g. **20m-2**).
+
 Its control rows, from the band row down to the NB/NR/AGC row, fold into
 one line with the **«** button at the start of the band row, the same as
 the [main window's](02-main-window.md#minimizing-the-control-rows), so
