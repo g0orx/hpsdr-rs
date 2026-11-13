@@ -263,8 +263,8 @@ For a small screen such as the 7" 800x480 Raspberry Pi display, the compact
 layout keeps the VFOs and meter at the top and gives the rest of the window
 to the spectrum and waterfall. It's used by itself on a screen smaller than
 1000x600, or always or never with Settings → Spectrum → **Layout**
-(**Auto**, **Compact** or **Standard**). A window that opens bigger than the
-screen is maximized. The control rows
+(**Auto**, **Compact** or **Standard**). On a screen that small the window
+opens maximized, and the size saved for each radio isn't applied. The control rows
 open one at a time from a toolbar of large buttons under the spectrum:
 
 - **Band** (showing the band and [band stack](#band-stack) entry, e.g.

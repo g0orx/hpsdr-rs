@@ -3511,6 +3511,13 @@ fn set_layout_choice(choice: config::LayoutChoice) {
     LAYOUT_CHOICE.store(n, Ordering::Relaxed);
 }
 
+/// Whether the screen the main window is on is small (see
+/// AUTO_COMPACT_BELOW), as last seen by HpsdrApp::ui.
+fn small_screen() -> bool {
+    let (w, h) = (SCREEN_SIZE[0].load(Ordering::Relaxed), SCREEN_SIZE[1].load(Ordering::Relaxed));
+    w > 0 && h > 0 && screen_wants_compact(Some(egui::vec2(w as f32, h as f32)))
+}
+
 /// Whether Auto picks the compact layout on a screen this size (points).
 fn screen_wants_compact(screen: Option<egui::Vec2>) -> bool {
     screen.is_some_and(|s| s.x < AUTO_COMPACT_BELOW.x || s.y < AUTO_COMPACT_BELOW.y)
@@ -4697,13 +4704,17 @@ impl eframe::App for HpsdrApp {
             config::LayoutChoice::Auto => screen_wants_compact(screen),
         };
         COMPACT_LAYOUT.store(compact, Ordering::Relaxed);
-        // Opened bigger than a small screen (the default 1200x660 on an
-        // 800x480 display): fill the screen instead, once.
+        // On a small screen (or opened bigger than the screen), fill it,
+        // once. REAL REPORT: on the 7" Raspberry Pi display the compositor
+        // squeezed the default 1200x660 window to 800x221 -- already
+        // "fitting", so checking only for a too-big window missed it.
         if !self.checked_screen_fit {
             if let Some(s) = screen {
                 self.checked_screen_fit = true;
                 let window = ui.ctx().content_rect().size();
-                if !FULLSCREEN.load(Ordering::Relaxed) && (window.x > s.x || window.y > s.y) {
+                if !FULLSCREEN.load(Ordering::Relaxed)
+                    && (screen_wants_compact(Some(s)) || window.x > s.x || window.y > s.y)
+                {
                     ui.ctx().send_viewport_cmd(egui::ViewportCommand::Maximized(true));
                 }
             }
@@ -4839,7 +4850,12 @@ impl eframe::App for HpsdrApp {
                     // ViewportBuilder field, a ViewportCommand actually
                     // re-applies every time it's sent, which would fight
                     // the user moving/resizing the window themselves.
-                    if let Some(g) = cfg.window_geometry.filter(|_| !FULLSCREEN.load(Ordering::Relaxed)) {
+                    // Not when fullscreen, or on a small screen, where the
+                    // window was maximized (see HpsdrApp::ui).
+                    if let Some(g) = cfg
+                        .window_geometry
+                        .filter(|_| !FULLSCREEN.load(Ordering::Relaxed) && !small_screen())
+                    {
                         if let (Some(x), Some(y)) = (g.x, g.y) {
                             ui.ctx().send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(x, y)));
                         }
