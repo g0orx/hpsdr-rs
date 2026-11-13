@@ -496,6 +496,13 @@ pub struct Config {
     /// changed from the default (main.rs's default_repeater_offset_hz).
     #[serde(default)]
     pub repeater_offsets: std::collections::HashMap<String, u32>,
+    /// Band stacks: BANDSTACK_SIZE entries per band_memory key (None = not
+    /// yet used), and which one each band is on. The entry in use lives in
+    /// band_settings; see main.rs's step_bandstack.
+    #[serde(default)]
+    pub bandstacks: std::collections::HashMap<String, Vec<Option<BandSettings>>>,
+    #[serde(default)]
+    pub bandstack_index: std::collections::HashMap<String, usize>,
     /// See ConnectedState::sat_mode: 0 off, 1 SAT, 2 SATR.
     #[serde(default)]
     pub sat_mode: Option<u8>,

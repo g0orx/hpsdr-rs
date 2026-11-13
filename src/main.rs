@@ -542,6 +542,7 @@ fn apply_lnb_correction(connected: &mut ConnectedState) {
     let vfo_b_xvtr = connected.vfo_b_xvtr.clone();
     let mut listen_shift_hz = 0i64;
     let mut vfo_b_shift_hz = 0i64;
+    let mut memory_shifts: Vec<(String, i64)> = Vec::new();
     for x in connected.xvtrs.iter_mut() {
         let is_active = active.as_deref() == Some(x.name.as_str()) && !x.name.is_empty();
         let target = if locking && is_active && xvtr_covers_beacon(x) {
@@ -564,12 +565,19 @@ fn apply_lnb_correction(connected: &mut ConnectedState) {
         if is_active {
             listen_shift_hz -= delta;
         }
+        // Its remembered tuning and band stack entries are IF too: move
+        // them the same way, or stepping back to one lands off by however
+        // far the LNB drifted since.
+        memory_shifts.push((xvtr_memory_key(&x.name), -delta));
         // VFO B is IF too: if it's displayed through this transverter,
         // move it the same way so its RF stays put -- but not if it's on
         // another one (e.g. a QO-100 uplink, whose offset didn't change).
         if vfo_b_xvtr.as_deref() == Some(x.name.as_str()) {
             vfo_b_shift_hz -= delta;
         }
+    }
+    for (key, shift) in memory_shifts {
+        shift_band_memory(&mut connected.band_memory, &mut connected.bandstacks, &key, shift);
     }
     if vfo_b_shift_hz != 0 {
         connected.vfo_b_frequency_hz =
@@ -582,6 +590,26 @@ fn apply_lnb_correction(connected: &mut ConnectedState) {
             let hw = connected.session.frequency_hz.load(Ordering::Relaxed) as i64;
             connected.session.set_frequency((hw + listen_shift_hz).clamp(0, u32::MAX as i64) as u32);
         }
+    }
+}
+
+/// Moves the frequency remembered under `key` (band_memory and every band
+/// stack entry) by `shift_hz` -- for a transverter whose IF for the same
+/// RF changed (apply_lnb_correction).
+fn shift_band_memory(
+    band_memory: &mut std::collections::HashMap<String, BandSettings>,
+    bandstacks: &mut std::collections::HashMap<String, Vec<Option<BandSettings>>>,
+    key: &str,
+    shift_hz: i64,
+) {
+    let shift = |b: &mut BandSettings| {
+        b.frequency_hz = (b.frequency_hz as i64 + shift_hz).clamp(0, u32::MAX as i64) as u32;
+    };
+    if let Some(b) = band_memory.get_mut(key) {
+        shift(b);
+    }
+    for b in bandstacks.get_mut(key).into_iter().flatten().flatten() {
+        shift(b);
     }
 }
 
@@ -848,11 +876,33 @@ fn width_for_mode(width_memory: &std::collections::HashMap<String, f64>, mode: s
 /// mirror) that duplicating it risks the two call sites drifting apart.
 fn apply_band(connected: &mut ConnectedState, band: &Band) {
     save_band_split(connected);
+    recall_band(connected, band, false);
+}
+
+/// Tunes VFO A to a recalled band (stack entry): the radio is centred on
+/// it, except with CTUN on when stepping a band stack (`keep_centre`) and
+/// the entry fits the span shown, where only the CTUN frequency moves.
+fn tune_recalled(connected: &mut ConnectedState, target: u32, mode: spectrum::Mode, keep_centre: bool) {
+    let lo = connected.session.frequency_hz.load(Ordering::Relaxed);
+    let passband = spectrum::passband_for(mode, width_for_mode(&connected.width_memory, mode));
+    if keep_centre
+        && connected.ctun
+        && resolve_tune(true, lo, connected.sample_rate, passband, target).0 == target
+    {
+        connected.ctun_frequency_hz = target;
+    } else {
+        connected.session.set_frequency(target);
+        connected.ctun_frequency_hz = target;
+    }
+}
+
+/// apply_band without recording the band being left -- for stepping its
+/// band stack (`stepping`), where band_memory already holds the next entry.
+fn recall_band(connected: &mut ConnectedState, band: &Band, stepping: bool) {
     connected.active_xvtr = None;
     let saved = connected.band_memory.get(band.name).copied();
     let target = saved.map(|s| s.frequency_hz).unwrap_or(band.default_hz);
-    connected.session.set_frequency(target);
-    connected.ctun_frequency_hz = target;
+    tune_recalled(connected, target, saved.and_then(|s| s.mode).unwrap_or(band.default_mode), stepping);
     if let Some(s) = saved {
         connected.db_low = s.db_low;
         connected.db_high = s.db_high;
@@ -878,6 +928,133 @@ fn apply_band(connected: &mut ConnectedState, band: &Band) {
         tx.set_width_hz(resolved_width_hz);
     }
     restore_band_split(connected);
+}
+
+/// Entries in each band's stack: pressing the band button of the band
+/// you're on steps to the next.
+const BANDSTACK_SIZE: usize = 3;
+
+/// Frequency and mode a band stack entry starts at, the first time it's
+/// used: entry 0 is the band's default; 1 and 2 are its CW and phone (or
+/// digital, FM on VHF/UHF) segments. None (Gen, a transverter) starts it
+/// where the band is now.
+fn bandstack_default(key: &str, index: usize) -> Option<(u32, spectrum::Mode)> {
+    use spectrum::Mode::*;
+    let band = BANDS.iter().find(|b| b.name == key)?;
+    let (cw, other) = match key {
+        "160m" => ((1_830_000, Cwl), (1_840_000, Digu)),
+        "80m" => ((3_530_000, Cwl), (3_750_000, Lsb)),
+        "60m" => ((5_351_500, Cwu), (5_363_000, Usb)),
+        "40m" => ((7_020_000, Cwl), (7_150_000, Lsb)),
+        "30m" => ((10_116_000, Cwu), (10_140_000, Digu)),
+        "20m" => ((14_025_000, Cwu), (14_200_000, Usb)),
+        "17m" => ((18_080_000, Cwu), (18_130_000, Usb)),
+        "15m" => ((21_025_000, Cwu), (21_300_000, Usb)),
+        "12m" => ((24_900_000, Cwu), (24_950_000, Usb)),
+        "10m" => ((28_025_000, Cwu), (28_500_000, Usb)),
+        "6m" => ((50_090_000, Cwu), (50_150_000, Usb)),
+        "2m" => ((144_050_000, Cwu), (145_500_000, Fmn)),
+        "70cm" => ((432_050_000, Cwu), (433_500_000, Fmn)),
+        "23cm" => ((1_296_050_000, Cwu), (1_297_500_000, Fmn)),
+        "13cm" => ((2_320_050_000, Cwu), (2_400_250_000, Usb)),
+        _ => return None,
+    };
+    match index {
+        0 => Some((band.default_hz, band.default_mode)),
+        1 => Some(cw),
+        _ => Some(other),
+    }
+}
+
+/// Steps the band filed under `key` (a band_memory key, the band you're
+/// on) to its next band stack entry: files the entry in use (with its
+/// Split/Duplex and repeater setup) into the stack, and puts the next one
+/// in band_memory for recall_band/recall_xvtr_band to tune to. Returns the
+/// new entry's index.
+fn step_bandstack(
+    band_memory: &mut std::collections::HashMap<String, BandSettings>,
+    bandstacks: &mut std::collections::HashMap<String, Vec<Option<BandSettings>>>,
+    bandstack_index: &mut std::collections::HashMap<String, usize>,
+    key: &str,
+) -> usize {
+    let current = band_memory.get(key).copied();
+    let stack = bandstacks.entry(key.to_string()).or_default();
+    stack.resize(BANDSTACK_SIZE, None);
+    let index = bandstack_index.get(key).copied().unwrap_or(0) % BANDSTACK_SIZE;
+    stack[index] = current;
+    let next = (index + 1) % BANDSTACK_SIZE;
+    let entry = stack[next].or_else(|| {
+        // First use: the entry's default frequency and mode, with the
+        // display levels the band has now; simplex, Split off. Gen and
+        // transverters start where they are.
+        let base = current?;
+        let (frequency_hz, mode) = bandstack_default(key, next).unwrap_or((base.frequency_hz, base.mode?));
+        Some(BandSettings {
+            frequency_hz,
+            mode: Some(mode),
+            split: None,
+            duplex: None,
+            fm_shift: None,
+            ctcss_hz: None,
+            ..base
+        })
+    });
+    match entry {
+        Some(e) => {
+            band_memory.insert(key.to_string(), e);
+        }
+        None => {
+            band_memory.remove(key);
+        }
+    }
+    bandstack_index.insert(key.to_string(), next);
+    next
+}
+
+/// A band button pressed: the band, or, if it's the band you're on, its
+/// next band stack entry. Shared by the band buttons, MIDI's band actions
+/// and remote clients.
+fn press_band(connected: &mut ConnectedState, band: &Band) {
+    let key = current_band_memory_key(connected);
+    if connected.active_xvtr.is_none() && key == band.name {
+        save_band_split(connected);
+        step_bandstack(&mut connected.band_memory, &mut connected.bandstacks, &mut connected.bandstack_index, &key);
+        recall_band(connected, band, true);
+    } else {
+        apply_band(connected, band);
+    }
+}
+
+/// press_band for a transverter's band button.
+fn press_xvtr_band(connected: &mut ConnectedState, xvtr: &Xvtr) {
+    if connected.active_xvtr.as_deref() == Some(xvtr.name.as_str()) {
+        let key = xvtr_memory_key(&xvtr.name);
+        save_band_split(connected);
+        step_bandstack(&mut connected.band_memory, &mut connected.bandstacks, &mut connected.bandstack_index, &key);
+        let offset = xvtr_rf_offset(xvtr);
+        recall_xvtr_band(
+            connected,
+            xvtr,
+            xvtr.frequency_min_hz as i64 - offset,
+            xvtr.frequency_max_hz as i64 - offset,
+            true,
+        );
+    } else {
+        apply_xvtr_band(connected, xvtr);
+    }
+}
+
+/// Which band stack entry (0-based) the band filed under `key` is on.
+fn bandstack_position(connected: &ConnectedState, key: &str) -> usize {
+    connected.bandstack_index.get(key).copied().unwrap_or(0) % BANDSTACK_SIZE
+}
+
+/// Hover text for the selected band's button.
+fn bandstack_hover(connected: &ConnectedState, key: &str) -> String {
+    format!(
+        "Band stack {} of {BANDSTACK_SIZE}: click for the next",
+        bandstack_position(connected, key) + 1
+    )
 }
 
 /// Same as `apply_band` above, but for an `ExtraReceiver` -- no XVTR/TX
@@ -943,6 +1120,11 @@ fn apply_xvtr_band(connected: &mut ConnectedState, xvtr: &Xvtr) {
     let if_low = xvtr.frequency_min_hz as i64 - offset;
     let if_high = xvtr.frequency_max_hz as i64 - offset;
     save_band_split(connected);
+    recall_xvtr_band(connected, xvtr, if_low, if_high, false);
+}
+
+/// apply_xvtr_band without recording the band being left (see recall_band).
+fn recall_xvtr_band(connected: &mut ConnectedState, xvtr: &Xvtr, if_low: i64, if_high: i64, stepping: bool) {
     // Explicit selection -- see ConnectedState::active_xvtr's doc comment.
     connected.active_xvtr = Some(xvtr.name.clone());
     let saved = connected.band_memory.get(&xvtr_memory_key(&xvtr.name)).copied();
@@ -953,8 +1135,7 @@ fn apply_xvtr_band(connected: &mut ConnectedState, xvtr: &Xvtr) {
         .filter(|f| (if_low..=if_high).contains(f))
         .unwrap_or(if_low)
         .clamp(0, u32::MAX as i64) as u32;
-    connected.session.set_frequency(target);
-    connected.ctun_frequency_hz = target;
+    tune_recalled(connected, target, saved.and_then(|s| s.mode).unwrap_or(xvtr.default_mode), stepping);
     if let Some(s) = saved {
         connected.db_low = s.db_low;
         connected.db_high = s.db_high;
@@ -999,13 +1180,13 @@ fn select_band_by_name(connected: &mut ConnectedState, name: &str) {
     let clean = hpsdr_proto::bands::clean_name;
     if let Some(band) = BANDS.iter().find(|b| clean(b.name) == name) {
         if band.low_hz as u64 >= connected.device.frequency_min && band.high_hz as u64 <= connected.device.frequency_max {
-            apply_band(connected, band);
+            press_band(connected, band);
         }
     } else if name == "Gen" {
         let gen = gen_band(connected.device.frequency_min, connected.device.frequency_max);
-        apply_band(connected, &gen);
+        press_band(connected, &gen);
     } else if let Some(x) = connected.xvtrs.iter().find(|x| !x.name.is_empty() && clean(&x.name) == name).cloned() {
-        apply_xvtr_band(connected, &x);
+        press_xvtr_band(connected, &x);
     }
 }
 
@@ -1884,7 +2065,7 @@ fn dispatch_midi_event(connected: &mut ConnectedState, ev: RawMidiEvent, freq_hz
             if (band.low_hz as u64) >= connected.device.frequency_min
                 && band.high_hz as u64 <= connected.device.frequency_max
             {
-                apply_band(connected, band);
+                press_band(connected, band);
             }
         }
         MidiAction::NoiseBlankerCycle => {
@@ -2618,6 +2799,11 @@ struct ConnectedState {
     /// Repeater offsets changed from default_repeater_offset_hz, Hz, by
     /// band_memory key.
     repeater_offsets: std::collections::HashMap<String, u32>,
+    /// Band stacks by band_memory key: BANDSTACK_SIZE entries each (None =
+    /// not used yet), the one in use mirrored in band_memory, and which
+    /// entry each band is on. See step_bandstack.
+    bandstacks: std::collections::HashMap<String, Vec<Option<BandSettings>>>,
+    bandstack_index: std::collections::HashMap<String, usize>,
     /// Satellite tracking: SAT moves VFO B with VFO A (same direction),
     /// SATR (reverse, for inverting transponders) moves it the opposite
     /// way -- see track_sat_vfo_b. Switching it on turns Split on too.
@@ -4126,6 +4312,8 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                 fm_shift: cfg.fm_shift.unwrap_or(0).clamp(-1, 1),
                 ctcss_hz: cfg.ctcss_hz.unwrap_or(0.0),
                 repeater_offsets: cfg.repeater_offsets.clone(),
+                bandstacks: cfg.bandstacks.clone(),
+                bandstack_index: cfg.bandstack_index.clone(),
                 sat_mode: SatMode::from_config(cfg.sat_mode.unwrap_or(0)),
                 vfo_b_xvtr: match &cfg.vfo_b_xvtr {
                     Some(name) => (!name.is_empty()).then(|| name.clone()),
@@ -5498,6 +5686,12 @@ impl eframe::App for HpsdrApp {
                     } else {
                         egui::Color32::GRAY
                     };
+                    // Band and band stack entry beside "VFO-A", e.g. "20m-1".
+                    let band_stack_label = {
+                        let key = current_band_memory_key(connected);
+                        let name = connected.active_xvtr.clone().unwrap_or_else(|| key.clone());
+                        format!("{name}-{}", bandstack_position(connected, &key) + 1)
+                    };
                     let (freq_label, vfo_b_label) = ui
                         .horizontal(|ui| {
                             // VFO A, boxed and labeled to match VFO B's own
@@ -5507,7 +5701,11 @@ impl eframe::App for HpsdrApp {
                             let freq_label = ui
                                 .group(|ui| {
                                     ui.vertical(|ui| {
-                                        ui.label("VFO-A");
+                                        ui.horizontal(|ui| {
+                                            ui.label("VFO-A");
+                                            ui.label(egui::RichText::new(&band_stack_label).weak())
+                                                .on_hover_text("Band and band stack entry: press the band's button again for the next");
+                                        });
                                         let resp = ui
                                             .add(
                                                 egui::Label::new(
@@ -5926,15 +6124,20 @@ impl eframe::App for HpsdrApp {
                                 continue;
                             }
                             let selected = Some(band.name) == current_band;
-                            if ui.add(egui::Button::selectable(selected, band.name)).clicked() && !selected {
+                            let mut button = ui.add(egui::Button::selectable(selected, band.name));
+                            if selected {
+                                button = button.on_hover_text(bandstack_hover(connected, band.name));
+                            }
+                            if button.clicked() {
                                 // Explicitly leaving any active XVTR --
                                 // see ConnectedState::active_xvtr's doc
                                 // comment. Rest of the switch (recall
                                 // last frequency/mode/range for this
                                 // band, or its default) is apply_band's
                                 // job -- shared with MIDI's BandUp/
-                                // BandDown.
-                                apply_band(connected, band);
+                                // BandDown. Pressed again, the band
+                                // steps through its band stack.
+                                press_band(connected, band);
                                 settings_changed = true;
                             }
                         }
@@ -5945,8 +6148,12 @@ impl eframe::App for HpsdrApp {
                         {
                             let gen = gen_band(connected.device.frequency_min, connected.device.frequency_max);
                             let selected = current_band == Some("Gen");
-                            if ui.add(egui::Button::selectable(selected, "Gen")).clicked() && !selected {
-                                apply_band(connected, &gen);
+                            let mut button = ui.add(egui::Button::selectable(selected, "Gen"));
+                            if selected {
+                                button = button.on_hover_text(bandstack_hover(connected, "Gen"));
+                            }
+                            if button.clicked() {
+                                press_band(connected, &gen);
                                 settings_changed = true;
                             }
                         }
@@ -5977,13 +6184,17 @@ impl eframe::App for HpsdrApp {
                                 continue;
                             }
                             let selected = active_xvtr_name.as_deref() == Some(xvtr.name.as_str());
-                            if ui.add(egui::Button::selectable(selected, &xvtr.name)).clicked() && !selected {
+                            let mut button = ui.add(egui::Button::selectable(selected, &xvtr.name));
+                            if selected {
+                                button = button.on_hover_text(bandstack_hover(connected, &xvtr_memory_key(&xvtr.name)));
+                            }
+                            if button.clicked() {
                                 selected_xvtr = Some(xvtr.clone());
                             }
                         }
                         // Applied after the loop, which borrows the list.
                         if let Some(xvtr) = selected_xvtr {
-                            apply_xvtr_band(connected, &xvtr);
+                            press_xvtr_band(connected, &xvtr);
                             settings_changed = true;
                         }
                     });
@@ -12867,6 +13078,8 @@ impl eframe::App for HpsdrApp {
                         fm_shift: Some(connected.fm_shift),
                         ctcss_hz: Some(connected.ctcss_hz),
                         repeater_offsets: connected.repeater_offsets.clone(),
+                        bandstacks: connected.bandstacks.clone(),
+                        bandstack_index: connected.bandstack_index.clone(),
                         sat_mode: Some(connected.sat_mode.to_config()),
                         vfo_b_xvtr: Some(connected.vfo_b_xvtr.clone().unwrap_or_default()),
                         duplex: Some(connected.duplex),
@@ -17771,6 +17984,52 @@ mod tests {
         assert_eq!(mem["10m"].frequency_hz, 28_400_000);
         assert_eq!(mem[&xvtr_memory_key("2m")].frequency_hz, 28_200_000);
         assert!(!mem.contains_key("2m"));
+    }
+
+    #[test]
+    fn band_stack_steps_through_three_entries_and_keeps_each() {
+        use std::collections::HashMap;
+        let (mut mem, mut stacks, mut index) = (HashMap::new(), HashMap::new(), HashMap::new());
+        let usb = spectrum::Mode::Usb;
+        // On 20m at 14.074 USB, Split on.
+        remember_band_settings(&mut mem, None, 14_074_000, -120.0, -60.0, -140.0, -100.0, usb);
+        mem.get_mut("20m").unwrap().split = Some(true);
+
+        // Second entry: its CW default, display levels kept, Split off.
+        assert_eq!(step_bandstack(&mut mem, &mut stacks, &mut index, "20m"), 1);
+        let e = mem["20m"];
+        assert_eq!((e.frequency_hz, e.mode), (14_025_000, Some(spectrum::Mode::Cwu)));
+        assert_eq!((e.db_low, e.db_high), (-120.0, -60.0));
+        assert_eq!(e.split, None);
+        // Tuned there.
+        remember_band_settings(&mut mem, None, 14_031_000, -120.0, -60.0, -140.0, -100.0, spectrum::Mode::Cwu);
+
+        // Third: the phone default.
+        assert_eq!(step_bandstack(&mut mem, &mut stacks, &mut index, "20m"), 2);
+        assert_eq!((mem["20m"].frequency_hz, mem["20m"].mode), (14_200_000, Some(usb)));
+
+        // Round to the first, as left: 14.074 with Split on.
+        assert_eq!(step_bandstack(&mut mem, &mut stacks, &mut index, "20m"), 0);
+        assert_eq!((mem["20m"].frequency_hz, mem["20m"].split), (14_074_000, Some(true)));
+
+        // And the second as it was tuned.
+        assert_eq!(step_bandstack(&mut mem, &mut stacks, &mut index, "20m"), 1);
+        assert_eq!(mem["20m"].frequency_hz, 14_031_000);
+
+        // An LNB correction moves a transverter's IF entries, in use and
+        // stacked, to keep their RF.
+        let qo = xvtr_memory_key("QO-100");
+        remember_band_settings(&mut mem, Some("QO-100"), 739_550_000, 0.0, 0.0, 0.0, 0.0, usb);
+        step_bandstack(&mut mem, &mut stacks, &mut index, &qo);
+        shift_band_memory(&mut mem, &mut stacks, &qo, -1_200);
+        assert_eq!(mem[&qo].frequency_hz, 739_548_800);
+        assert_eq!(stacks[&qo][0].unwrap().frequency_hz, 739_548_800);
+        assert!(stacks[&qo][2].is_none());
+
+        // Gen and transverters start a new entry where they are.
+        remember_band_settings(&mut mem, None, 9_500_000, 0.0, 0.0, 0.0, 0.0, spectrum::Mode::Am);
+        step_bandstack(&mut mem, &mut stacks, &mut index, "Gen");
+        assert_eq!((mem["Gen"].frequency_hz, mem["Gen"].mode), (9_500_000, Some(spectrum::Mode::Am)));
     }
 
     #[test]

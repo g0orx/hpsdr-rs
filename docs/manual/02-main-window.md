@@ -286,6 +286,26 @@ extra button alongside the band row, showing the real RF frequency (e.g.
 2m) while the radio's actual hardware stays tuned to its true IF
 underneath -- see [Settings: XVTR](18-xvtr.md) for how to define one.
 
+### Band stack
+
+Each band, **Gen** and each transverter has a stack of three settings.
+Pressing the button of the band you're already on steps to the next one,
+and round again to the first. Each keeps its own frequency, mode, display
+levels, Split/Duplex and FM repeater setup as you left it. The band and
+the entry you're on are shown beside **VFO-A**, e.g. **20m-1**, **Gen-2**
+or a transverter's **144MHz-3**. With **CTUN** on, stepping to an entry
+inside the span shown only moves the CTUN frequency, leaving the spectrum
+where it is; one outside it recentres the spectrum on it.
+
+The first time you step to them, the second and third of an HF or 6m band
+start in its CW and phone segments, e.g. on 20m 14.074 USB, then 14.025 CWU,
+then 14.200 USB. On 30m, which has no phone, and 160m, whose first is
+already 1.900 LSB, the third is in DIGU instead: 10.140 (FT4) and 1.840
+(FT8). On 2m, 70cm and 23cm the third starts at the FM calling frequency
+(145.500, 433.500, 1297.500 MHz). On **Gen** and a transverter they start
+where you are. A MIDI band button (Band 20m etc.) and a remote client's band
+buttons step the stack the same way.
+
 Below that, a row of mode buttons: **LSB, USB, DSB, CWL, CWU, FM, AM, DIGU,
 SPEC, DIGL, SAM, DRM**.
 
