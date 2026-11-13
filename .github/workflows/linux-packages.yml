@@ -5,8 +5,8 @@ name: Linux packages
 # Every run keeps them as workflow artifacts; a pushed v* tag also
 # attaches them to that GitHub release. The RPM is then installed and
 # its libraries checked on real Fedora and openSUSE Tumbleweed
-# containers, and the .deb on Debian 12 (also Raspberry Pi OS
-# Bookworm's base) and Ubuntu 24.04.
+# containers, and the .deb on Debian 12 and 13 (also Raspberry Pi OS
+# Bookworm's and Trixie's bases) and Ubuntu 24.04.
 #
 # Built on Ubuntu 22.04 on purpose: both formats need a glibc at least
 # as new as the build machine's, so the oldest supported runner gives
@@ -117,6 +117,11 @@ jobs:
             runner: ubuntu-latest
             artifact: linux-packages-X64
           - image: debian:12
+            runner: ubuntu-24.04-arm
+            artifact: linux-packages-ARM64
+          # Debian 13, Raspberry Pi OS Trixie's base: its 64-bit time
+          # library renames (libasound2 -> libasound2t64 etc.) on arm64.
+          - image: debian:13
             runner: ubuntu-24.04-arm
             artifact: linux-packages-ARM64
     runs-on: ${{ matrix.runner }}
