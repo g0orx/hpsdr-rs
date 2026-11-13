@@ -112,6 +112,12 @@ winit = { version = "0.30", default-features = false, features = ["wayland-csd-a
 # over D-Bus) for Theme: Follow system -- winit doesn't report it on Linux,
 # on Wayland or X11. Windows and macOS use egui's own detection.
 dark-light = "3"
+# piHPSDR-style front-panel controllers on a Raspberry Pi (controller.rs):
+# encoders and switches on GPIO lines, through the kernel's GPIO character
+# device (uAPI v2: pull-ups and debouncing). Pure Rust, no libgpiod.
+gpiocdev = "0.8"
+# The MCP23017 switch expander on I2C (/dev/i2c-1): SMBus ioctls.
+libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
 # SetStdHandle, used by main.rs's redirect_stdio_to_log_file() to send

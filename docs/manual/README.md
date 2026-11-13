@@ -30,6 +30,7 @@ from source and project status, see the [top-level README](../../README.md).
 22. [MSI.SDR](22-msi-sdr.md) -- receive-only Mirics MSi2500 + MSi001 sticks (MSI.SDR, SDRplay RSP1), HF to 2 GHz
 23. [DATV](23-datv.md) -- receiving DVB-S2 digital TV (QO-100's wideband transponder) with an RTL-SDR, MSI.SDR or Pluto, and the Pluto's whole-transponder view
 24. [ADALM-Pluto](24-pluto.md) -- the Pluto and its clones (AD9363, 325 MHz to 3.8 GHz), over its USB network link or Ethernet; full-duplex transmit, e.g. QO-100's 2400 MHz uplink
+25. [Front-panel controllers](25-controller.md) -- piHPSDR's Controller 1, Controller 2 V1/V2 and the G2 front panel on a Raspberry Pi's GPIO and I2C
 
 **PDF**: this whole manual is also available as a single PDF, useful for
 offline/printed reading. It's built automatically by the "Manual PDF"

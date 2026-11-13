@@ -174,6 +174,9 @@ pub enum MidiAction {
     CwSidetoneLevel,
     CwSidetoneFreq,
     CwPitch,
+    /// The next entry of the current band's band stack, as pressing its
+    /// band button again (piHPSDR's band stack button).
+    BandStack,
 }
 
 impl MidiAction {
@@ -237,6 +240,7 @@ impl MidiAction {
             MidiAction::CwSidetoneLevel => "CW Sidetone Level",
             MidiAction::CwSidetoneFreq => "CW Sidetone Frequency",
             MidiAction::CwPitch => "CW Pitch",
+            MidiAction::BandStack => "Band Stack (next)",
         }
     }
 }
@@ -259,6 +263,7 @@ pub const KEY_ACTIONS: &[MidiAction] = &[
     MidiAction::ModeDown,
     MidiAction::BandUp,
     MidiAction::BandDown,
+    MidiAction::BandStack,
     MidiAction::FilterWidthUp,
     MidiAction::FilterWidthDown,
     MidiAction::VfoStepUp,

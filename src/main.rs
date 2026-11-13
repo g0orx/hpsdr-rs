@@ -15,6 +15,7 @@ mod bootloader;
 mod bootloader_ui;
 mod cat;
 mod config;
+mod controller;
 mod cw_decoder;
 mod cw_encoder;
 mod debug_log;
@@ -1074,6 +1075,30 @@ fn press_xvtr_band(connected: &mut ConnectedState, xvtr: &Xvtr) {
     }
 }
 
+/// The band you're on (or its transverter) steps to its next band stack
+/// entry, as pressing its button again -- MIDI's and the controllers'
+/// Band Stack action.
+fn step_current_band_stack(connected: &mut ConnectedState) {
+    if let Some(name) = connected.active_xvtr.clone() {
+        if let Some(x) = connected.xvtrs.iter().find(|x| x.name == name).cloned() {
+            press_xvtr_band(connected, &x);
+        }
+        return;
+    }
+    let dial = if connected.ctun {
+        connected.ctun_frequency_hz
+    } else {
+        connected.session.frequency_hz.load(Ordering::Relaxed)
+    };
+    match band_for_frequency(dial) {
+        Some(band) => press_band(connected, band),
+        None => {
+            let gen = gen_band(connected.device.frequency_min, connected.device.frequency_max);
+            press_band(connected, &gen);
+        }
+    }
+}
+
 /// Which band stack entry (0-based) the band filed under `key` is on.
 fn bandstack_position(connected: &ConnectedState, key: &str) -> usize {
     connected.bandstack_index.get(key).copied().unwrap_or(0) % BANDSTACK_SIZE
@@ -1840,7 +1865,280 @@ fn dispatch_midi_event(connected: &mut ConnectedState, ev: RawMidiEvent, freq_hz
         }
         return;
     };
+    apply_midi_binding(connected, binding, ev, freq_hz, sample_rate, passband);
+}
 
+/// Settings -> Controller: which piHPSDR-style front panel is wired to this
+/// computer, its lines and what each control does. Saved to
+/// controller.json as it changes; the hardware is set up again when a line
+/// or the controller changes. Returns true if anything changed.
+fn render_controller_settings(ui: &mut egui::Ui, connected: &mut ConnectedState) -> bool {
+    use controller::{ControllerConfig, ControllerKind, EncoderLines, SwitchLine};
+    ui.weak(
+        "A piHPSDR front panel wired to this Raspberry Pi: rotary encoders and their push buttons on \
+         GPIO lines and, on Controller 2 and the G2 panel, 16 switches on an MCP23017 on I2C. Each knob, \
+         button and switch can do any of the MIDI actions. Kept on this computer.",
+    );
+    ui.add_space(4.0);
+    let before = connected.controller_config.clone();
+    let mut cfg = before.clone();
+    ui.horizontal(|ui| {
+        ui.label("Controller:");
+        let mut kind = cfg.kind;
+        egui::ComboBox::from_id_salt("controller_kind").selected_text(kind.label()).show_ui(ui, |ui| {
+            for k in ControllerKind::ALL {
+                ui.selectable_value(&mut kind, k, k.label());
+            }
+        });
+        if kind != cfg.kind {
+            cfg = ControllerConfig::defaults(kind);
+        }
+        if cfg.kind != ControllerKind::None
+            && ui.button("Restore defaults").on_hover_text("piHPSDR's lines and actions for this controller").clicked()
+        {
+            cfg = ControllerConfig::defaults(cfg.kind);
+        }
+    });
+    let running = connected.controller.is_some();
+    let status_color = if cfg.kind == ControllerKind::None {
+        ui.visuals().weak_text_color()
+    } else if running {
+        readable(ui, egui::Color32::from_rgb(60, 180, 60))
+    } else {
+        readable(ui, egui::Color32::from_rgb(220, 60, 60))
+    };
+    ui.colored_label(status_color, &connected.controller_status);
+
+    // An action list: none, then `choices`.
+    fn action_combo(ui: &mut egui::Ui, salt: impl std::hash::Hash + std::fmt::Debug, action: &mut Option<MidiAction>, choices: &[MidiAction]) {
+        egui::ComboBox::from_id_salt(salt)
+            .selected_text(action.map_or("--", |a| a.label()))
+            .width(150.0)
+            .show_ui(ui, |ui| {
+                ui.selectable_value(action, None, "--");
+                for &a in choices {
+                    ui.selectable_value(action, Some(a), a.label());
+                }
+            });
+    }
+    let knob_choices: Vec<MidiAction> = WHEEL_ACTIONS.iter().chain(KNOB_ACTIONS).copied().collect();
+    let key_choices: Vec<MidiAction> = KEY_ACTIONS.iter().copied().filter(|&a| a != MidiAction::CwKey).collect();
+    let pin = |ui: &mut egui::Ui, value: &mut u32| {
+        ui.add(egui::DragValue::new(value).range(0..=53).prefix("GPIO "));
+    };
+    let encoder_cell = |ui: &mut egui::Ui, salt: (&str, usize), e: &mut EncoderLines| {
+        if !e.enabled {
+            ui.weak("--");
+            return;
+        }
+        ui.horizontal(|ui| {
+            pin(ui, &mut e.pin_a);
+            pin(ui, &mut e.pin_b);
+            action_combo(ui, salt, &mut e.action, &knob_choices);
+            if e.action.is_some_and(|a| WHEEL_ACTIONS.contains(&a)) {
+                ui.add(egui::DragValue::new(&mut e.sensitivity).range(0.1..=20.0).speed(0.05).prefix("x"))
+                    .on_hover_text("Sensitivity: multiplies each step (10 Hz for VFO Tune)");
+            }
+        });
+    };
+    let button_cell = |ui: &mut egui::Ui, salt: (&str, usize), s: &mut SwitchLine, show_pin: bool| {
+        if !s.enabled && show_pin {
+            ui.weak("--");
+            return;
+        }
+        ui.horizontal(|ui| {
+            if show_pin {
+                pin(ui, &mut s.pin);
+            }
+            action_combo(ui, salt, &mut s.action, &key_choices);
+        });
+    };
+
+    if cfg.kind != ControllerKind::None {
+        ui.add_space(8.0);
+        ui.strong("Encoders");
+        ui.weak("Each with its A and B lines; turning one moves its action's setting, or tunes.");
+        egui::Grid::new("controller_encoders").striped(true).show(ui, |ui| {
+            ui.label("");
+            ui.label("Bottom (or only)");
+            ui.label("Top");
+            ui.label("Push button");
+            ui.end_row();
+            for (i, e) in cfg.encoders.iter_mut().enumerate() {
+                if !e.bottom.enabled && !e.top.enabled && !e.button.enabled {
+                    continue;
+                }
+                ui.label(if e.bottom.action == Some(MidiAction::VfoTune) && !e.top.enabled {
+                    "VFO".to_string()
+                } else {
+                    format!("Encoder {}", i + 1)
+                });
+                encoder_cell(ui, ("enc_bottom", i), &mut e.bottom);
+                encoder_cell(ui, ("enc_top", i), &mut e.top);
+                button_cell(ui, ("enc_button", i), &mut e.button, true);
+                ui.end_row();
+            }
+        });
+
+        ui.add_space(8.0);
+        let i2c = cfg.kind.uses_i2c();
+        ui.strong("Switches");
+        if i2c {
+            ui.weak("On the MCP23017, by its input.");
+        }
+        egui::Grid::new("controller_switches").striped(true).show(ui, |ui| {
+            let mut column = 0;
+            for (i, s) in cfg.switches.iter_mut().enumerate() {
+                if !i2c && !s.enabled {
+                    continue;
+                }
+                ui.label(if i2c {
+                    controller::i2c_switch_pin_name(controller::I2C_SWITCH_BITS[i])
+                } else {
+                    format!("Switch {}", i + 1)
+                });
+                button_cell(ui, ("switch", i), s, !i2c);
+                column += 1;
+                if column % 2 == 0 {
+                    ui.end_row();
+                }
+            }
+        });
+
+        if i2c {
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                ui.label("MCP23017:");
+                ui.add(egui::TextEdit::singleline(&mut cfg.i2c_device).desired_width(100.0));
+                ui.label("address");
+                ui.add(egui::DragValue::new(&mut cfg.i2c_address).range(0x08..=0x77).hexadecimal(2, false, true));
+                ui.label("interrupt on");
+                pin(ui, &mut cfg.i2c_irq_pin);
+            });
+        }
+        ui.weak(
+            "Lines are Broadcom GPIO numbers, as piHPSDR's. On a Raspberry Pi 5 GPIO 20 may be unavailable: \
+             rewire that encoder line to GPIO 14 and set it here. Your user needs to be in the 'gpio' and \
+             'i2c' groups, and I2C enabled (raspi-config).",
+        );
+    }
+
+    if cfg == before {
+        return false;
+    }
+    let restart = cfg.hardware() != before.hardware();
+    cfg.save();
+    connected.controller_config = cfg;
+    if restart {
+        // Release the lines before asking for them again.
+        connected.controller = None;
+        let (c, status) = start_controller(&connected.controller_config);
+        connected.controller = c;
+        connected.controller_status = status;
+    }
+    true
+}
+
+/// Starts the front-panel controller `cfg` describes, if any: it and a
+/// status line for Settings -> Controller.
+fn start_controller(cfg: &controller::ControllerConfig) -> (Option<controller::Controller>, String) {
+    if cfg.kind == controller::ControllerKind::None {
+        return (None, "No controller".to_string());
+    }
+    match controller::Controller::start(cfg) {
+        Ok(c) => {
+            let status = c.status();
+            (Some(c), status)
+        }
+        Err(e) => {
+            eprintln!("controller: {e}");
+            (None, e)
+        }
+    }
+}
+
+/// MIDI channel the made-up bindings of a front-panel controller use (see
+/// dispatch_controller_event) -- outside 0-15, so never a real control's.
+const CONTROLLER_MIDI_CHANNEL: u8 = 200;
+
+/// A front-panel controller's knob, button or switch (controller.rs),
+/// applied as a MIDI control bound to its action would be: a button or
+/// switch as a Key (on press), an encoder on a tuning action as a Wheel
+/// (its steps times its sensitivity), and on any other knob action as
+/// that Knob's value moved by its steps.
+fn dispatch_controller_event(
+    connected: &mut ConnectedState,
+    ev: controller::ControllerEvent,
+    freq_hz: u32,
+    sample_rate: u32,
+    passband: (f64, f64),
+) {
+    use controller::{ControlId, ControllerEvent};
+    let id = match ev {
+        ControllerEvent::Turned(id, _) | ControllerEvent::Pressed(id) | ControllerEvent::Released(id) => id,
+    };
+    let Some(action) = connected.controller_config.action(id) else { return };
+    let number = match id {
+        ControlId::EncoderBottom(i) => i * 3,
+        ControlId::EncoderTop(i) => i * 3 + 1,
+        ControlId::EncoderButton(i) => i * 3 + 2,
+        ControlId::Switch(i) => 20 + i,
+    } as u8;
+    let binding = |kind, sensitivity| MidiBinding {
+        event: MidiEventKind::ControlChange,
+        channel: Some(CONTROLLER_MIDI_CHANNEL),
+        number,
+        kind,
+        action,
+        momentary: false,
+        sensitivity,
+        debounce_ms: 0,
+        reverse: false,
+    };
+    let raw = |value| RawMidiEvent {
+        kind: MidiEventKind::ControlChange,
+        channel: CONTROLLER_MIDI_CHANNEL,
+        number,
+        value,
+        off: false,
+    };
+    match ev {
+        ControllerEvent::Pressed(_) if KEY_ACTIONS.contains(&action) => {
+            apply_midi_binding(connected, binding(MidiBindingKind::Key, 1.0), raw(127), freq_hz, sample_rate, passband);
+        }
+        ControllerEvent::Turned(_, steps) if steps != 0 && WHEEL_ACTIONS.contains(&action) => {
+            let sensitivity = steps.unsigned_abs() as f32 * connected.controller_config.sensitivity(id);
+            let value = if steps > 0 { 65 } else { 63 };
+            apply_midi_binding(
+                connected,
+                binding(MidiBindingKind::Wheel, sensitivity),
+                raw(value),
+                freq_hz,
+                sample_rate,
+                passband,
+            );
+        }
+        ControllerEvent::Turned(_, steps) if KNOB_ACTIONS.contains(&action) => {
+            let Some(now) = midi_knob_value(connected, action) else { return };
+            let value = (now as i32 + steps).clamp(0, 127) as u8;
+            if value != now {
+                apply_midi_binding(connected, binding(MidiBindingKind::Knob, 1.0), raw(value), freq_hz, sample_rate, passband);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Applies `binding`'s action for `ev` -- a MIDI control's, or a front-panel
+/// controller's made up as one (dispatch_controller_event).
+fn apply_midi_binding(
+    connected: &mut ConnectedState,
+    binding: MidiBinding,
+    ev: RawMidiEvent,
+    freq_hz: u32,
+    sample_rate: u32,
+    passband: (f64, f64),
+) {
     // A Key binding without `momentary` only fires on press; WITH
     // momentary it fires on both press AND release (piHPSDR's ONOFF
     // modifier) -- e.g. so Mox can be bound press-to-transmit/release-to-
@@ -1964,6 +2262,7 @@ fn dispatch_midi_event(connected: &mut ConnectedState, ev: RawMidiEvent, freq_hz
                 if binding.action == MidiAction::ModeUp { (idx + 1) % len } else { (idx + len - 1) % len };
             apply_mode(connected, ALL_MODES[new_idx], dial_freq_hz);
         }
+        MidiAction::BandStack => step_current_band_stack(connected),
         MidiAction::BandUp | MidiAction::BandDown => {
             let reachable: Vec<&'static Band> = BANDS
                 .iter()
@@ -2354,6 +2653,7 @@ enum SettingsTab {
     Antenna,
     Firmware,
     Midi,
+    Controller,
     About,
 }
 
@@ -2638,6 +2938,12 @@ struct ConnectedState {
     /// midi::MidiBinding. Loaded from Config at connect time, written
     /// back to Config on save; edited directly by Settings -> MIDI.
     midi_bindings: Vec<MidiBinding>,
+    /// A piHPSDR-style front-panel controller on the Pi's GPIO/I2C (see
+    /// controller.rs): its setup (per computer, controller.json), the
+    /// running hardware, and what starting it said.
+    controller_config: controller::ControllerConfig,
+    controller: Option<controller::Controller>,
+    controller_status: String,
     /// Settings -> MIDI's "learn mode" scratch state -- UI-only, never
     /// persisted (see MidiLearnState's own doc comment).
     midi_learn: MidiLearnState,
@@ -4426,6 +4732,9 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
             midi.feedback.store(cfg.midi_feedback.unwrap_or(false), Ordering::Relaxed);
             *midi.device_name.lock().unwrap() = cfg.midi_device_name.clone();
             let midi_bindings = cfg.midi_bindings.clone();
+            // The front-panel controller, if one is set up on this computer.
+            let controller_config = controller::ControllerConfig::load();
+            let (controller, controller_status) = start_controller(&controller_config);
             Ok(ConnectedState {
                 interface_name: discovery::interface_name_for(device.my_address.ip()),
                 device,
@@ -4435,6 +4744,9 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                 cw_sidetone,
                 midi,
                 midi_bindings,
+                controller_config,
+                controller,
+                controller_status,
                 midi_learn: MidiLearnState::default(),
                 midi_unmatched_last_logged: None,
                 midi_import_message: None,
@@ -5377,6 +5689,12 @@ impl eframe::App for HpsdrApp {
                         break;
                     }
                     dispatch_midi_event(connected, ev, freq_hz, sample_rate, passband);
+                }
+                // A front-panel controller's knobs and buttons, through the
+                // same actions.
+                let controller_events = connected.controller.as_ref().map(|c| c.poll()).unwrap_or_default();
+                for ev in controller_events {
+                    dispatch_controller_event(connected, ev, freq_hz, sample_rate, passband);
                 }
                 midi_feedback(connected);
 
@@ -8982,6 +9300,7 @@ impl eframe::App for HpsdrApp {
                                     (SettingsTab::Equalizer, "Equalizer"),
                                     (SettingsTab::Firmware, "Firmware"),
                                     (SettingsTab::Midi, "MIDI"),
+                                    (SettingsTab::Controller, "Controller"),
                                     (SettingsTab::Network, "Network"),
                                     (SettingsTab::OpenCollector, "Open Collector"),
                                     (SettingsTab::PaCalibration, "PA Calibration"),
@@ -9607,6 +9926,11 @@ impl eframe::App for HpsdrApp {
                                     }
                                 }
 
+                                SettingsTab::Controller => {
+                                    if render_controller_settings(ui, connected) {
+                                        settings_changed = true;
+                                    }
+                                }
                                 SettingsTab::Midi => {
                                     ui.label("MIDI control surface:");
                                     let mut midi_enabled_ui = connected.midi.enabled.load(Ordering::Relaxed);
@@ -16877,7 +17201,7 @@ fn render_extra_receiver_settings(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceive
         // MIDI control targets the primary receiver/VFO A+B only (see
         // dispatch_midi_event) -- not a per-receiver concept, redirect
         // same as Firmware.
-        SettingsTab::Midi => rx.settings_tab = SettingsTab::Agc,
+        SettingsTab::Midi | SettingsTab::Controller => rx.settings_tab = SettingsTab::Agc,
         // About shows this connection's own device/network details
         // (main.rs's ConnectedState::device/interface_name), which this
         // struct doesn't carry -- redirect same as Firmware.
