@@ -240,6 +240,9 @@ pub struct App {
     /// Data rates for the status line: bytes in and out at the last
     /// sample, when, and the rates in and out (kbit/s).
     rate_sample: (u64, u64, f64, f64, f64),
+    /// The audio output's callback count at the last sample, and whether
+    /// it had moved on since the one before (the output is running).
+    audio_callbacks: (u64, bool),
     /// The step for the frequency display's slide, the - and + buttons,
     /// and a plain scroll.
     step_hz: u64,
@@ -334,6 +337,7 @@ impl App {
             db_range: 60.0,
             band_memory: HashMap::new(),
             rate_sample: (0, 0, 0.0, 0.0, 0.0),
+            audio_callbacks: (0, true),
             step_hz: 1_000,
             vfo_slide_px: 0.0,
             span_slide_hz: 0.0,
@@ -1590,6 +1594,10 @@ impl App {
                 let rate_in = kbits(link.bytes_in.saturating_sub(bytes_in));
                 let rate_out = kbits(link.bytes_out.saturating_sub(bytes_out));
                 self.rate_sample = (link.bytes_in, link.bytes_out, now, rate_in, rate_out);
+                if let Some(p) = &self.player {
+                    let n = p.callbacks();
+                    self.audio_callbacks = (n, n != self.audio_callbacks.0);
+                }
             }
         }
         let mut text = format!("built {}   {:.0} kbit/s in", built_at(), self.rate_sample.3);
@@ -1602,8 +1610,14 @@ impl App {
         if let Some(e) = &self.audio_error {
             text.push_str(&format!("   {e}"));
         }
+        let audio_problem = self.player.as_ref().and_then(|p| {
+            p.error().or_else(|| (!self.audio_callbacks.1).then(|| "audio output isn't running".to_string()))
+        });
         ui.horizontal_wrapped(|ui| {
             ui.weak(text);
+            if let Some(e) = &audio_problem {
+                ui.colored_label(readable(ui, Color32::from_rgb(230, 80, 80)), e);
+            }
             if let Some(e) = &self.mic_error {
                 ui.colored_label(readable(ui, Color32::from_rgb(230, 80, 80)), e);
             }

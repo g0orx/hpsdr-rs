@@ -29,6 +29,10 @@ struct Jitter {
     playing: bool,
     gain: f32,
     sidetone: Sidetone,
+    /// Output callbacks so far: the status line says if they stop.
+    callbacks: u64,
+    /// The stream's last error, if any.
+    error: Option<String>,
 }
 
 /// A tone at SIDETONE_HZ while the key is down, with 5 ms ramps so it
@@ -99,6 +103,13 @@ pub struct Player {
     _stream: cpal::Stream,
 }
 
+/// Natively, the stereo 48 kHz f32 output hpsdr-rs itself opens, which works
+/// on the Raspberry Pis it runs on; the device's default config if that's
+/// refused.
+const OUTPUT_RATE: u32 = 48_000;
+#[cfg(not(target_arch = "wasm32"))]
+const OUTPUT_CHANNELS: u16 = 2;
+
 /// The output stream, writing samples of type `T`.
 fn build_output<T>(device: &cpal::Device, config: &cpal::StreamConfig, jitter: &Arc<Mutex<Jitter>>) -> Result<cpal::Stream, String>
 where
@@ -111,13 +122,22 @@ where
             config,
             move |data: &mut [T], _: &cpal::OutputCallbackInfo| {
                 let mut j = feed.lock().unwrap();
+                j.callbacks += 1;
                 let rate = j.device_rate;
                 for frame in data.chunks_mut(channels) {
                     let v = (j.next() + j.sidetone.next(rate)).clamp(-1.0, 1.0);
                     frame.fill(T::from_sample(v));
                 }
             },
-            |e| log::warn!("audio output: {e}"),
+            {
+                let jitter = Arc::clone(jitter);
+                move |e| {
+                    let e = format!("audio output: {e}");
+                    #[cfg(not(target_arch = "wasm32"))]
+                    eprintln!("hpsdr-remote: {e}");
+                    jitter.lock().unwrap().error = Some(e);
+                }
+            },
             None,
         )
         .map_err(|e| format!("audio output: {e}"))
@@ -129,29 +149,57 @@ impl Player {
     pub fn open() -> Result<Self, String> {
         let host = cpal::default_host();
         let device = host.default_output_device().ok_or("no audio output device")?;
-        let supported = device.default_output_config().map_err(|e| format!("audio output: {e}"))?;
-        let format = supported.sample_format();
-        let config: cpal::StreamConfig = supported.into();
         let jitter = Arc::new(Mutex::new(Jitter {
             buf: VecDeque::new(),
             rate: 0,
-            device_rate: config.sample_rate,
+            device_rate: OUTPUT_RATE,
             pos: 0.0,
             playing: false,
             gain: 1.0,
             sidetone: Sidetone::default(),
+            callbacks: 0,
+            error: None,
         }));
-        // In the device's own sample format. It used to insist on f32 and
-        // give up otherwise (REAL REPORT 2026-11-14: no audio, and no
-        // playback stream in pavucontrol, on a Raspberry Pi 4, whose
-        // default output is 16-bit). Any other format: ask for f32, which
-        // ALSA's default device converts.
-        let stream = match format {
-            cpal::SampleFormat::I16 => build_output::<i16>(&device, &config, &jitter),
-            cpal::SampleFormat::U16 => build_output::<u16>(&device, &config, &jitter),
-            cpal::SampleFormat::I32 => build_output::<i32>(&device, &config, &jitter),
-            _ => build_output::<f32>(&device, &config, &jitter),
-        }?;
+        // REAL REPORT 2026-11-14, Raspberry Pi 4: no audio and no playback
+        // stream in pavucontrol, though the stream opened, with the
+        // device's default config. hpsdr-rs on the same Pi plays with this
+        // fixed one.
+        #[cfg(not(target_arch = "wasm32"))]
+        let fixed = {
+            let config =
+                cpal::StreamConfig { channels: OUTPUT_CHANNELS, sample_rate: OUTPUT_RATE, buffer_size: cpal::BufferSize::Default };
+            build_output::<f32>(&device, &config, &jitter).map(|s| (s, config, cpal::SampleFormat::F32))
+        };
+        #[cfg(target_arch = "wasm32")]
+        let fixed: Result<(cpal::Stream, cpal::StreamConfig, cpal::SampleFormat), String> = Err(String::new());
+        let (stream, config, format) = match fixed {
+            Ok(opened) => opened,
+            Err(_) => {
+                let supported = device.default_output_config().map_err(|e| format!("audio output: {e}"))?;
+                let format = supported.sample_format();
+                let config: cpal::StreamConfig = supported.into();
+                jitter.lock().unwrap().device_rate = config.sample_rate;
+                // In the device's own sample format; any other than these,
+                // f32, which ALSA's default device converts.
+                let stream = match format {
+                    cpal::SampleFormat::I16 => build_output::<i16>(&device, &config, &jitter),
+                    cpal::SampleFormat::U16 => build_output::<u16>(&device, &config, &jitter),
+                    cpal::SampleFormat::I32 => build_output::<i32>(&device, &config, &jitter),
+                    _ => build_output::<f32>(&device, &config, &jitter),
+                }?;
+                (stream, config, format)
+            }
+        };
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let name = device.description().map(|d| d.name().to_string()).unwrap_or_else(|_| "?".to_string());
+            eprintln!(
+                "hpsdr-remote: audio output \"{name}\", {} Hz, {} channels, {format:?}",
+                config.sample_rate, config.channels
+            );
+        }
+        #[cfg(target_arch = "wasm32")]
+        let _ = (&config, format);
         stream.play().map_err(|e| format!("audio output: {e}"))?;
         Ok(Self { jitter, _stream: stream })
     }
@@ -169,6 +217,16 @@ impl Player {
         let mut j = self.jitter.lock().unwrap();
         j.sidetone.on = on;
         j.sidetone.level = level;
+    }
+
+    /// Output callbacks so far, and the stream's last error: for the
+    /// status line.
+    pub fn callbacks(&self) -> u64 {
+        self.jitter.lock().unwrap().callbacks
+    }
+
+    pub fn error(&self) -> Option<String> {
+        self.jitter.lock().unwrap().error.clone()
     }
 
     /// Seconds buffered, for the status line.
@@ -195,6 +253,8 @@ mod tests {
             playing: false,
             gain: 1.0,
             sidetone: Sidetone::default(),
+            callbacks: 0,
+            error: None,
         }
     }
 
