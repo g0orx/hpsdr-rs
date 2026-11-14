@@ -11,6 +11,7 @@ mod audio;
 mod keyer;
 mod link;
 mod mic;
+mod prefs;
 
 #[cfg(not(target_arch = "wasm32"))]
 fn main() -> eframe::Result<()> {

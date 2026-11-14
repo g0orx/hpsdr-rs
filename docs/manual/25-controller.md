@@ -68,3 +68,18 @@ The controller is only supported on Linux; elsewhere the tab says so.
 
 The CW paddle, straight key and PTT lines piHPSDR also offers on spare GPIO
 lines aren't supported yet.
+
+## With hpsdr-remote
+
+hpsdr-remote, the remote client, works the same controllers: run it on the
+Pi the controller is wired to, and click **Controller** beside the
+connection status for the same settings, kept in hpsdr-remote's own
+`~/.config/hpsdr-remote/controller.json`. Each control does what the
+client's own controls do, and the change goes to hpsdr-rs on the other
+computer: tuning by the client's step, band, band stack, mode, filter,
+AGC gain, NB, NR, SNB, binaural, MOX, Tune, TX power, CW speed, split,
+RIT/XIT, and VFO B. Its audio and mic gain are the client's own. A knob
+shows its new value over the spectrum for a moment. Actions the client
+can't do (CTUN, SAT, the RX equalizer, diversity, RF attenuation and the
+CW sidetone and pitch) aren't offered. Only one program can have the GPIO
+lines at a time, so not hpsdr-rs on the same Pi as well.

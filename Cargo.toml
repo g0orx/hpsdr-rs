@@ -38,6 +38,9 @@ egui = "0.37"
 # The remote-operation wire encoding, shared with hpsdr-remote
 # (docs/remote-protocol.md).
 hpsdr-proto = { path = "crates/hpsdr-proto" }
+# Front-panel controllers (GPIO/I2C on a Raspberry Pi) and the actions a
+# control can be bound to -- shared with hpsdr-remote.
+hpsdr-controller = { path = "crates/hpsdr-controller" }
 # Already in the tree through eframe/wgpu/winit; used directly only for
 # main.rs's HPSDR_LOG diagnostic logger.
 log = "0.4"
@@ -112,12 +115,6 @@ winit = { version = "0.30", default-features = false, features = ["wayland-csd-a
 # over D-Bus) for Theme: Follow system -- winit doesn't report it on Linux,
 # on Wayland or X11. Windows and macOS use egui's own detection.
 dark-light = "3"
-# piHPSDR-style front-panel controllers on a Raspberry Pi (controller.rs):
-# encoders and switches on GPIO lines, through the kernel's GPIO character
-# device (uAPI v2: pull-ups and debouncing). Pure Rust, no libgpiod.
-gpiocdev = "0.8"
-# The MCP23017 switch expander on I2C (/dev/i2c-1): SMBus ioctls.
-libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
 # SetStdHandle, used by main.rs's redirect_stdio_to_log_file() to send
@@ -266,5 +263,5 @@ assets = [
 # default-members keeps a plain `cargo build`/`cargo test` here (and the
 # packaging scripts, CI and the Windows MSI build) to hpsdr-rs alone.
 [workspace]
-members = [".", "crates/hpsdr-proto", "crates/hpsdr-remote"]
+members = [".", "crates/hpsdr-proto", "crates/hpsdr-remote", "crates/hpsdr-controller"]
 default-members = ["."]

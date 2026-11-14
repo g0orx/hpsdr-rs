@@ -1873,7 +1873,6 @@ fn dispatch_midi_event(connected: &mut ConnectedState, ev: RawMidiEvent, freq_hz
 /// controller.json as it changes; the hardware is set up again when a line
 /// or the controller changes. Returns true if anything changed.
 fn render_controller_settings(ui: &mut egui::Ui, connected: &mut ConnectedState) -> bool {
-    use controller::{ControllerConfig, ControllerKind, EncoderLines, SwitchLine};
     ui.weak(
         "A piHPSDR front panel wired to this Raspberry Pi: rotary encoders and their push buttons on \
          GPIO lines and, on Controller 2 and the G2 panel, 16 switches on an MCP23017 on I2C. Each knob, \
@@ -1882,155 +1881,20 @@ fn render_controller_settings(ui: &mut egui::Ui, connected: &mut ConnectedState)
     ui.add_space(4.0);
     let before = connected.controller_config.clone();
     let mut cfg = before.clone();
-    ui.horizontal(|ui| {
-        ui.label("Controller:");
-        let mut kind = cfg.kind;
-        egui::ComboBox::from_id_salt("controller_kind").selected_text(kind.label()).show_ui(ui, |ui| {
-            for k in ControllerKind::ALL {
-                ui.selectable_value(&mut kind, k, k.label());
-            }
-        });
-        if kind != cfg.kind {
-            cfg = ControllerConfig::defaults(kind);
-        }
-        if cfg.kind != ControllerKind::None
-            && ui.button("Restore defaults").on_hover_text("piHPSDR's lines and actions for this controller").clicked()
-        {
-            cfg = ControllerConfig::defaults(cfg.kind);
-        }
-    });
-    let running = connected.controller.is_some();
-    let status_color = if cfg.kind == ControllerKind::None {
-        ui.visuals().weak_text_color()
-    } else if running {
-        readable(ui, egui::Color32::from_rgb(60, 180, 60))
-    } else {
-        readable(ui, egui::Color32::from_rgb(220, 60, 60))
-    };
-    ui.colored_label(status_color, &connected.controller_status);
-
-    // An action list: none, then `choices`.
-    fn action_combo(ui: &mut egui::Ui, salt: impl std::hash::Hash + std::fmt::Debug, action: &mut Option<MidiAction>, choices: &[MidiAction]) {
-        egui::ComboBox::from_id_salt(salt)
-            .selected_text(action.map_or("--", |a| a.label()))
-            .width(150.0)
-            .show_ui(ui, |ui| {
-                ui.selectable_value(action, None, "--");
-                for &a in choices {
-                    ui.selectable_value(action, Some(a), a.label());
-                }
-            });
-    }
-    let knob_choices: Vec<MidiAction> = WHEEL_ACTIONS.iter().chain(KNOB_ACTIONS).copied().collect();
-    let key_choices: Vec<MidiAction> = KEY_ACTIONS.iter().copied().filter(|&a| a != MidiAction::CwKey).collect();
-    let pin = |ui: &mut egui::Ui, value: &mut u32| {
-        ui.add(egui::DragValue::new(value).range(0..=53).prefix("GPIO "));
-    };
-    let encoder_cell = |ui: &mut egui::Ui, salt: (&str, usize), e: &mut EncoderLines| {
-        if !e.enabled {
-            ui.weak("--");
-            return;
-        }
-        ui.horizontal(|ui| {
-            pin(ui, &mut e.pin_a);
-            pin(ui, &mut e.pin_b);
-            action_combo(ui, salt, &mut e.action, &knob_choices);
-            if e.action.is_some_and(|a| WHEEL_ACTIONS.contains(&a)) {
-                ui.add(egui::DragValue::new(&mut e.sensitivity).range(0.1..=20.0).speed(0.05).prefix("x"))
-                    .on_hover_text(
-                        "Sensitivity: multiplies the steps. VFO Tune and VFO B Tune move by the VFO step \
-                         (VFO-A's box); RIT and XIT by 10 Hz a step.",
-                    );
-            }
-        });
-    };
-    let button_cell = |ui: &mut egui::Ui, salt: (&str, usize), s: &mut SwitchLine, show_pin: bool| {
-        if !s.enabled && show_pin {
-            ui.weak("--");
-            return;
-        }
-        ui.horizontal(|ui| {
-            if show_pin {
-                pin(ui, &mut s.pin);
-            }
-            action_combo(ui, salt, &mut s.action, &key_choices);
-        });
-    };
-
-    if cfg.kind != ControllerKind::None {
-        ui.add_space(8.0);
-        ui.strong("Encoders");
-        ui.weak("Each with its A and B lines; turning one moves its action's setting, or tunes.");
-        egui::Grid::new("controller_encoders").striped(true).show(ui, |ui| {
-            ui.label("");
-            ui.label("Bottom (or only)");
-            ui.label("Top");
-            ui.label("Push button");
-            ui.end_row();
-            for (i, e) in cfg.encoders.iter_mut().enumerate() {
-                if !e.bottom.enabled && !e.top.enabled && !e.button.enabled {
-                    continue;
-                }
-                ui.label(if e.bottom.action == Some(MidiAction::VfoTune) && !e.top.enabled {
-                    "VFO".to_string()
-                } else {
-                    format!("Encoder {}", i + 1)
-                });
-                encoder_cell(ui, ("enc_bottom", i), &mut e.bottom);
-                encoder_cell(ui, ("enc_top", i), &mut e.top);
-                button_cell(ui, ("enc_button", i), &mut e.button, true);
-                ui.end_row();
-            }
-        });
-
-        ui.add_space(8.0);
-        let i2c = cfg.kind.uses_i2c();
-        ui.strong("Switches");
-        if i2c {
-            ui.weak("On the MCP23017, by its input.");
-        }
-        egui::Grid::new("controller_switches").striped(true).show(ui, |ui| {
-            let mut column = 0;
-            for (i, s) in cfg.switches.iter_mut().enumerate() {
-                if !i2c && !s.enabled {
-                    continue;
-                }
-                ui.label(if i2c {
-                    controller::i2c_switch_pin_name(controller::I2C_SWITCH_BITS[i])
-                } else {
-                    format!("Switch {}", i + 1)
-                });
-                button_cell(ui, ("switch", i), s, !i2c);
-                column += 1;
-                if column % 2 == 0 {
-                    ui.end_row();
-                }
-            }
-        });
-
-        if i2c {
-            ui.add_space(8.0);
-            ui.horizontal(|ui| {
-                ui.label("MCP23017:");
-                ui.add(egui::TextEdit::singleline(&mut cfg.i2c_device).desired_width(100.0));
-                ui.label("address");
-                ui.add(egui::DragValue::new(&mut cfg.i2c_address).range(0x08..=0x77).hexadecimal(2, false, true));
-                ui.label("interrupt on");
-                pin(ui, &mut cfg.i2c_irq_pin);
-            });
-        }
-        ui.weak(
-            "Lines are Broadcom GPIO numbers, as piHPSDR's. On a Raspberry Pi 5 GPIO 20 may be unavailable: \
-             rewire that encoder line to GPIO 14 and set it here. Your user needs to be in the 'gpio' and \
-             'i2c' groups, and I2C enabled (raspi-config).",
-        );
-    }
-
+    hpsdr_controller::settings_ui(
+        ui,
+        &mut cfg,
+        &connected.controller_status,
+        connected.controller.is_some(),
+        &|_| true,
+        "Sensitivity: multiplies the steps. VFO Tune and VFO B Tune move by the VFO step \
+         (VFO-A's box); RIT and XIT by 10 Hz a step.",
+    );
     if cfg == before {
         return false;
     }
     let restart = cfg.hardware() != before.hardware();
-    cfg.save();
+    cfg.save(controller::config_path().as_deref());
     connected.controller_config = cfg;
     if restart {
         // Release the lines before asking for them again.
@@ -2048,7 +1912,7 @@ fn start_controller(cfg: &controller::ControllerConfig) -> (Option<controller::C
     if cfg.kind == controller::ControllerKind::None {
         return (None, "No controller".to_string());
     }
-    match controller::Controller::start(cfg) {
+    match controller::Controller::start(cfg, "hpsdr-rs") {
         Ok(c) => {
             let status = c.status();
             (Some(c), status)
@@ -4901,7 +4765,7 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
             *midi.device_name.lock().unwrap() = cfg.midi_device_name.clone();
             let midi_bindings = cfg.midi_bindings.clone();
             // The front-panel controller, if one is set up on this computer.
-            let controller_config = controller::ControllerConfig::load();
+            let controller_config = controller::ControllerConfig::load(controller::config_path().as_deref());
             let (controller, controller_status) = start_controller(&controller_config);
             Ok(ConnectedState {
                 interface_name: discovery::interface_name_for(device.my_address.ip()),

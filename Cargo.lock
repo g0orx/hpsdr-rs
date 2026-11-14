@@ -1593,6 +1593,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
 
 [[package]]
+name = "hpsdr-controller"
+version = "0.1.0"
+dependencies = [
+ "egui",
+ "gpiocdev",
+ "libc",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "hpsdr-proto"
 version = "0.1.0"
 
@@ -1604,6 +1615,7 @@ dependencies = [
  "eframe",
  "egui",
  "ewebsock",
+ "hpsdr-controller",
  "hpsdr-proto",
  "log",
  "wasm-bindgen",
@@ -1620,9 +1632,8 @@ dependencies = [
  "dark-light",
  "eframe",
  "egui",
- "gpiocdev",
+ "hpsdr-controller",
  "hpsdr-proto",
- "libc",
  "log",
  "midir",
  "network-interface",

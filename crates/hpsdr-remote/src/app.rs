@@ -23,6 +23,9 @@ use crate::audio::Player;
 use crate::keyer::{self, Keyer};
 use crate::link::{Incoming, Link, Status};
 use crate::mic::Mic;
+use crate::prefs;
+
+mod panel;
 
 /// What's asked of the server: points a row, rows a second, audio rate.
 const SPECTRUM_POINTS: usize = 1024;
@@ -84,6 +87,14 @@ struct Radio {
     /// The keys a paddle plugged in as a keyboard types (dit, dah), as
     /// set at the radio (hpsdr_paddle_keys); None until it says.
     paddle_keys: Option<(char, char)>,
+    /// Standard TCI state the front-panel controller's buttons toggle or
+    /// move: RIT and XIT (on, offset Hz), split, tune, VFO B, binaural.
+    rit: (bool, i32),
+    xit: (bool, i32),
+    split: bool,
+    tune: bool,
+    vfo_b_hz: u64,
+    binaural: bool,
 }
 
 impl Radio {
@@ -226,6 +237,11 @@ struct Waterfall {
 
 pub struct App {
     url: String,
+    /// The servers connected to lately, newest first (prefs.rs), and
+    /// whether this connection's server has been added to them yet: it is
+    /// once the connection opens, so a mistyped address isn't kept.
+    recent: Vec<String>,
+    remembered: bool,
     link: Option<Link>,
     radio: Radio,
     player: Option<Player>,
@@ -306,6 +322,21 @@ pub struct App {
     /// Native only: filling the screen (--fullscreen, or F11), when there's
     /// a Quit button, as there's no title bar to close it from.
     pub fullscreen: bool,
+    /// A piHPSDR front-panel controller (app/panel.rs): its settings, the
+    /// running one and its status, whether its settings window is open,
+    /// and the part-steps a tuning knob has left over.
+    controller_config: hpsdr_controller::ControllerConfig,
+    controller: Option<hpsdr_controller::Controller>,
+    controller_status: String,
+    controller_open: bool,
+    controller_tune_remainder: HashMap<hpsdr_controller::ControlId, f32>,
+    /// A setting a controller knob just changed, and when: shown over the
+    /// spectrum for a moment.
+    value_popup: Option<(String, f64)>,
+    /// When a controller button last changed RIT, XIT, split, tune, VFO B
+    /// or binaural: the server's reports are ignored just after, as with
+    /// tuning.
+    controls_set_at: f64,
 }
 
 /// TX audio goes in blocks this long (20 ms).
@@ -323,8 +354,18 @@ const STEPS_HZ: [(u64, &str); 4] = [(10, "10 Hz"), (100, "100 Hz"), (1_000, "1 k
 
 impl App {
     pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
-        Self {
-            url: default_url(),
+        let recent = prefs::load_recent();
+        // Natively, the server last connected to. In a browser, the page's
+        // own address (default_url), which is right when hpsdr-rs serves
+        // it; the others are a click away.
+        #[cfg(not(target_arch = "wasm32"))]
+        let url = recent.first().cloned().unwrap_or_else(default_url);
+        #[cfg(target_arch = "wasm32")]
+        let url = default_url();
+        let mut app = Self {
+            url,
+            recent,
+            remembered: false,
             link: None,
             radio: Radio::default(),
             player: None,
@@ -371,7 +412,20 @@ impl App {
             section: None,
             layout: Layout::Auto,
             fullscreen: false,
+            controller_config: panel::load_config(),
+            controller: None,
+            controller_status: String::new(),
+            controller_open: false,
+            controller_tune_remainder: HashMap::new(),
+            value_popup: None,
+            controls_set_at: f64::NEG_INFINITY,
+        };
+        // A front-panel controller: only natively, on Linux (a Raspberry
+        // Pi); in a browser there are no settings for one.
+        if app.controller_config.kind != hpsdr_controller::ControllerKind::None {
+            app.start_controller();
         }
+        app
     }
 
     fn connect(&mut self, ctx: &egui::Context) {
@@ -381,6 +435,7 @@ impl App {
         self.waterfall.dirty = true;
         self.keyed_here = false;
         self.notice = None;
+        self.remembered = false;
         self.link = match Link::connect(&with_password(&self.url, &self.password), ctx.clone()) {
             Ok(link) => Some(link),
             Err(e) => {
@@ -440,8 +495,19 @@ impl App {
             // Receiver 0 only: hpsdr-rs reports its second receiver (an
             // extra receiver) as receiver 1, as Thetis does its RX2.
             Incoming::Command(cmd)
-                if matches!(cmd.name.as_str(), "vfo" | "modulation" | "rx_filter_band")
-                    && cmd.arg::<u32>(0) != Some(0) => {}
+                if matches!(
+                    cmd.name.as_str(),
+                    "vfo" | "modulation" | "rx_filter_band" | "rit_enable" | "rit_offset" | "rx_bin_enable"
+                ) && cmd.arg::<u32>(0) != Some(0) => {}
+            // Just after a controller button changed one of these here, the
+            // server's report may be from before it.
+            Incoming::Command(cmd)
+                if matches!(
+                    cmd.name.as_str(),
+                    "rit_enable" | "rit_offset" | "xit_enable" | "xit_offset" | "split_enable" | "tune" | "rx_bin_enable"
+                ) && self.now - self.controls_set_at < TUNE_HOLD_S => {}
+            Incoming::Command(cmd)
+                if cmd.name == "vfo" && cmd.arg::<u32>(1) == Some(1) && self.now - self.controls_set_at < TUNE_HOLD_S => {}
             Incoming::Command(cmd) => match cmd.name.as_str() {
                 "vfo" if cmd.arg::<u32>(1) == Some(0) => {
                     // Not just after tuning here -- see tuned_at.
@@ -449,6 +515,18 @@ impl App {
                         self.radio.vfo_hz = hz;
                     }
                 }
+                "vfo" if cmd.arg::<u32>(1) == Some(1) => {
+                    if let Some(hz) = cmd.arg::<u64>(2) {
+                        self.radio.vfo_b_hz = hz;
+                    }
+                }
+                "rit_enable" => self.radio.rit.0 = cmd.args.get(1).is_some_and(|v| v == "true"),
+                "rit_offset" => self.radio.rit.1 = cmd.arg::<i32>(1).unwrap_or(0),
+                "xit_enable" => self.radio.xit.0 = cmd.args.get(1).is_some_and(|v| v == "true"),
+                "xit_offset" => self.radio.xit.1 = cmd.arg::<i32>(1).unwrap_or(0),
+                "split_enable" => self.radio.split = cmd.args.get(1).is_some_and(|v| v == "true"),
+                "tune" => self.radio.tune = cmd.args.get(1).is_some_and(|v| v == "true"),
+                "rx_bin_enable" => self.radio.binaural = cmd.args.get(1).is_some_and(|v| v == "true"),
                 "modulation" => {
                     if let Some(m) = cmd.args.get(1) {
                         self.radio.mode = m.to_ascii_lowercase();
@@ -1009,7 +1087,20 @@ impl App {
                 let field = |ui: &mut egui::Ui, max: f32| if narrow { ui.available_width() - 80.0 } else { max };
                 ui.label("Server:");
                 let width = field(ui, 260.0);
+                let width = if self.recent.is_empty() { width } else { width - 36.0 };
                 ui.add(egui::TextEdit::singleline(&mut self.url).desired_width(width));
+                if !self.recent.is_empty() {
+                    ui.menu_button("\u{25BE}", |ui| {
+                        for u in self.recent.clone() {
+                            if ui.button(&u).clicked() {
+                                self.url = u;
+                                ui.close();
+                            }
+                        }
+                    })
+                    .response
+                    .on_hover_text("Servers connected to lately");
+                }
                 if narrow {
                     ui.end_row();
                 }
@@ -1046,6 +1137,14 @@ impl App {
                 })
                 .response
                 .on_hover_text("Compact: the frequency above the spectrum and a toolbar below it, for a phone or a small screen; Auto picks it when the screen is small");
+            #[cfg(not(target_arch = "wasm32"))]
+            if ui
+                .add(egui::Button::selectable(self.controller_open, "Controller"))
+                .on_hover_text("A piHPSDR front panel (encoders and switches) on this Raspberry Pi")
+                .clicked()
+            {
+                self.controller_open = !self.controller_open;
+            }
             if self.fullscreen
                 && ui.button(egui::RichText::new("Quit").strong()).on_hover_text("Close hpsdr-remote (F11 leaves fullscreen)").clicked()
             {
@@ -1227,6 +1326,27 @@ impl App {
         }
     }
 
+    /// What a controller knob just changed, for a moment, in the middle of
+    /// the spectrum (`over`).
+    fn show_value_popup(&mut self, ctx: &egui::Context, over: Rect) {
+        let Some((text, at)) = &self.value_popup else { return };
+        if self.now - at > panel::VALUE_POPUP_S {
+            self.value_popup = None;
+            return;
+        }
+        egui::Area::new(egui::Id::unique("value_popup"))
+            .order(egui::Order::Foreground)
+            .pivot(egui::Align2::CENTER_CENTER)
+            .fixed_pos(over.center())
+            .interactable(false)
+            .show(ctx, |ui| {
+                egui::Frame::popup(ui.style()).show(ui, |ui| {
+                    ui.label(egui::RichText::new(text).size(24.0).strong());
+                });
+            });
+        ctx.request_repaint_after(std::time::Duration::from_millis(100));
+    }
+
     fn section_controls(&mut self, ui: &mut egui::Ui, section: Section) {
         match section {
             Section::Step => self.step_row(ui),
@@ -1324,18 +1444,28 @@ impl App {
                 }
             } else {
                 let current = FALLBACK_BANDS.iter().find(|b| (b.1..=b.2).contains(&self.radio.vfo_hz)).map(|b| b.0);
-                for (name, low, high, first) in FALLBACK_BANDS {
+                for (name, ..) in FALLBACK_BANDS {
                     if ui.add(egui::Button::selectable(current == Some(name), name)).clicked() && current != Some(name) {
-                        if let Some(c) = current {
-                            self.band_memory.insert(c, self.radio.vfo_hz);
-                        }
-                        let hz =
-                            self.band_memory.get(name).copied().filter(|f| (low..=high).contains(f)).unwrap_or(first);
-                        self.tune(hz);
+                        self.select_fallback_band(name);
                     }
                 }
             }
         });
+    }
+
+    /// Without the server's band buttons: to `name`'s frequency when last
+    /// here, or its usual one.
+    fn select_fallback_band(&mut self, name: &str) {
+        let Some(&(name, low, high, first)) = FALLBACK_BANDS.iter().find(|b| b.0 == name) else { return };
+        let current = FALLBACK_BANDS.iter().find(|b| (b.1..=b.2).contains(&self.radio.vfo_hz)).map(|b| b.0);
+        if current == Some(name) {
+            return;
+        }
+        if let Some(c) = current {
+            self.band_memory.insert(c, self.radio.vfo_hz);
+        }
+        let hz = self.band_memory.get(name).copied().filter(|f| (low..=high).contains(f)).unwrap_or(first);
+        self.tune(hz);
     }
 
     fn mode_buttons(&mut self, ui: &mut egui::Ui) {
@@ -1375,12 +1505,7 @@ impl App {
         if filter {
             ui.horizontal_wrapped(|ui| {
                 ui.label("Filter:");
-                let presets: &[u32] = match self.radio.mode.as_str() {
-                    "cw" | "cwl" | "cwu" => &[100, 250, 500, 1000],
-                    "am" | "sam" | "dsb" => &[3000, 4000, 5000],
-                    "nfm" => &[],
-                    _ => &[1800, 2100, 2400, 2700, 3000],
-                };
+                let presets = filter_presets(&self.radio.mode);
                 for &w in presets {
                     if ui.add(egui::Button::selectable(d.width_hz == w, format_hz(w))).clicked() {
                         d.width_hz = w;
@@ -1638,12 +1763,19 @@ impl eframe::App for App {
         for i in incoming {
             self.handle(i);
         }
+        // Connected: remember the server.
+        if !self.remembered && self.link.as_ref().is_some_and(|l| l.status == Status::Open) {
+            self.remembered = true;
+            prefs::remember(&mut self.recent, &self.url);
+            prefs::save_recent(&self.recent);
+        }
         // Lost the connection: nothing to send to.
         if self.link.as_ref().is_none_or(|l| l.status != Status::Open) {
             self.keyed_here = false;
         }
         self.track_touches(ui);
         self.take_paddle_keys(ui.ctx());
+        self.poll_controller();
         self.send_tx_audio();
         if self.keyed_here {
             // Audio goes out in 20 ms blocks: keep coming back for it.
@@ -1686,6 +1818,12 @@ impl eframe::App for App {
         if compact && connected {
             self.section_popup(ui.ctx(), spectrum);
         }
+        self.show_value_popup(ui.ctx(), spectrum);
+        self.controller_window(ui.ctx());
+        if self.controller.is_some() {
+            // Controller events come between frames: look for them.
+            ui.ctx().request_repaint_after(std::time::Duration::from_millis(50));
+        }
         // After the key pads (Key, in the popup) have been read this frame.
         self.run_keyer(ui.ctx());
         // Keep the status line (data rate, buffer) moving.
@@ -1712,6 +1850,16 @@ fn built_at() -> String {
 
 /// The band to highlight for `hz`: the first whose range has it, Gen
 /// (general coverage, which spans everything) only if no other does.
+/// The filter widths offered for a mode (Hz).
+fn filter_presets(mode: &str) -> &'static [u32] {
+    match mode {
+        "cw" | "cwl" | "cwu" => &[100, 250, 500, 1000],
+        "am" | "sam" | "dsb" => &[3000, 4000, 5000],
+        "nfm" => &[],
+        _ => &[1800, 2100, 2400, 2700, 3000],
+    }
+}
+
 fn current_band(list: &[BandInfo], hz: u64) -> Option<&str> {
     list.iter()
         .find(|b| b.name != "Gen" && (b.low_hz..=b.high_hz).contains(&hz))
