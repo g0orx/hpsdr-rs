@@ -187,6 +187,14 @@ standard TCI audio and IQ, plus about 70 kbit/s more while transmitting.
 It's dark or light as the phone, tablet or browser is set, and changes when
 that does; the spectrum and waterfall stay dark in both.
 
+On a small screen -- a phone either way up -- it uses a compact layout,
+like hpsdr-rs's own: just the frequency and S-meter above the spectrum,
+and a toolbar of large buttons below it (Band, Mode, Step, Filter, Noise,
+Audio, Key, TX, and MOX at the right). Each button opens its controls over
+the spectrum; tap it again, or the close button, to close them.
+**Layout**, beside the connection status, can choose **Standard** (every
+control above the spectrum) or **Compact** instead of **Auto**.
+
 To transmit, press **MOX**: the first time, the browser asks to use the
 microphone. Press **MOX** again to stop. **Mic** sets its level (keep the
 meter beside it out of the red), **Power** is the radio's TX power

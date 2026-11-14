@@ -14,11 +14,26 @@ mod mic;
 
 #[cfg(not(target_arch = "wasm32"))]
 fn main() -> eframe::Result<()> {
+    // --fullscreen: fill the screen, as hpsdr-rs's own, for a Raspberry
+    // Pi's 7" display; F11 toggles it.
+    let fullscreen = std::env::args().skip(1).any(|a| a == "--fullscreen");
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_inner_size([1000.0, 700.0]).with_title("hpsdr-remote"),
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size([1000.0, 700.0])
+            .with_min_inner_size([320.0, 400.0])
+            .with_fullscreen(fullscreen)
+            .with_title("hpsdr-remote"),
         ..Default::default()
     };
-    eframe::run_native("hpsdr-remote", options, Box::new(|cc| Ok(Box::new(app::App::new(cc)))))
+    eframe::run_native(
+        "hpsdr-remote",
+        options,
+        Box::new(move |cc| {
+            let mut app = app::App::new(cc);
+            app.fullscreen = fullscreen;
+            Ok(Box::new(app))
+        }),
+    )
 }
 
 #[cfg(target_arch = "wasm32")]

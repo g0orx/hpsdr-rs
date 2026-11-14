@@ -151,7 +151,8 @@ impl Radio {
     }
 }
 
-/// The groups of controls a narrow screen shows one at a time.
+/// The groups of controls the compact layout's toolbar opens, one at a
+/// time, over the spectrum.
 #[derive(Clone, Copy, PartialEq)]
 enum Section {
     Step,
@@ -179,11 +180,40 @@ impl Section {
     }
 }
 
+/// Standard: every control in rows above the spectrum. Compact, as
+/// hpsdr-rs's own for small screens: just the frequency above it, and a
+/// toolbar below whose buttons open a group of controls over it. Auto picks
+/// compact on a small screen.
+#[derive(Clone, Copy, PartialEq)]
+enum Layout {
+    Auto,
+    Standard,
+    Compact,
+}
+
+impl Layout {
+    const ALL: [Layout; 3] = [Layout::Auto, Layout::Standard, Layout::Compact];
+
+    fn label(self) -> &'static str {
+        match self {
+            Layout::Auto => "Auto",
+            Layout::Standard => "Standard",
+            Layout::Compact => "Compact",
+        }
+    }
+}
+
 /// Narrower than this (points) -- a phone held upright -- or shorter than
-/// SHORT_HEIGHT -- one held sideways -- the controls show a section at a
-/// time.
+/// SHORT_HEIGHT -- one held sideways, or a Raspberry Pi's 7" 800x480
+/// display -- Auto is compact, and the Connect fields go a line each.
 const NARROW_WIDTH: f32 = 600.0;
 const SHORT_HEIGHT: f32 = 500.0;
+/// The compact toolbar's buttons: their height, the narrowest they get
+/// before wrapping onto a second row, the widest, and MOX's width.
+const TOOLBAR_BUTTON_HEIGHT: f32 = 40.0;
+const TOOLBAR_BUTTON_MIN_WIDTH: f32 = 56.0;
+const TOOLBAR_BUTTON_MAX_WIDTH: f32 = 120.0;
+const TOOLBAR_MOX_WIDTH: f32 = 80.0;
 /// The controls take at most this share of the screen's height; beyond
 /// it they scroll, so the spectrum always keeps the rest.
 const CONTROLS_MAX_HEIGHT: f32 = 0.55;
@@ -266,8 +296,13 @@ pub struct App {
     touches: HashMap<u64, Pos2>,
     /// The server's last hpsdr_notice, and when it came.
     notice: Option<(String, f64)>,
-    /// The section of controls open on a narrow screen, if any.
+    /// The section of controls open over the spectrum in the compact
+    /// layout, if any.
     section: Option<Section>,
+    layout: Layout,
+    /// Native only: filling the screen (--fullscreen, or F11), when there's
+    /// a Quit button, as there's no title bar to close it from.
+    pub fullscreen: bool,
 }
 
 /// TX audio goes in blocks this long (20 ms).
@@ -329,7 +364,9 @@ impl App {
             key_sent: (false, f64::NEG_INFINITY),
             touches: HashMap::new(),
             notice: None,
-            section: Some(Section::Band),
+            section: None,
+            layout: Layout::Auto,
+            fullscreen: false,
         }
     }
 
@@ -995,58 +1032,72 @@ impl App {
                 },
             };
             ui.weak(status);
+            ui.add_space(8.0);
+            egui::ComboBox::from_id_salt("layout")
+                .selected_text(format!("Layout: {}", self.layout.label()))
+                .show_ui(ui, |ui| {
+                    for l in Layout::ALL {
+                        ui.selectable_value(&mut self.layout, l, l.label());
+                    }
+                })
+                .response
+                .on_hover_text("Compact: the frequency above the spectrum and a toolbar below it, for a phone or a small screen; Auto picks it when the screen is small");
+            if self.fullscreen
+                && ui.button(egui::RichText::new("Quit").strong()).on_hover_text("Close hpsdr-remote (F11 leaves fullscreen)").clicked()
+            {
+                ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+            }
         });
     }
 
-    /// Wide: every row of controls. Narrow (a phone held upright): the
-    /// frequency, S-meter, MOX and - / + always, and the rest one section at
-    /// a time, picked by a row of buttons -- the selected one again closes
-    /// it, leaving more of the screen to the spectrum.
-    fn controls(&mut self, ui: &mut egui::Ui, narrow: bool) {
+    /// The standard layout: every row of controls.
+    fn controls(&mut self, ui: &mut egui::Ui) {
         self.frequency_row(ui);
-        if !narrow {
-            self.step_row(ui);
-            self.band_row(ui);
-            ui.horizontal_wrapped(|ui| {
-                self.mode_buttons(ui);
-                ui.add_space(16.0);
-                self.audio_controls(ui, false);
-            });
-            self.dsp_controls(ui, true, true);
-            if self.radio.sends_cw() {
-                ui.horizontal_wrapped(|ui| self.cw_send_row(ui, false));
-                ui.horizontal_wrapped(|ui| {
-                    self.cw_settings(ui, false);
-                    self.tx_settings(ui, false);
-                });
-                if self.radio.keys_cw() {
-                    ui.horizontal_wrapped(|ui| self.key_settings(ui, false));
-                    self.key_pads(ui, false);
-                }
-            } else if self.radio.can_transmit() {
-                ui.horizontal_wrapped(|ui| {
-                    self.mox_button(ui);
-                    ui.add_space(12.0);
-                    self.tx_settings(ui, false);
-                });
-            }
-            return;
-        }
+        self.step_row(ui);
+        self.band_row(ui);
         ui.horizontal_wrapped(|ui| {
-            if self.radio.sends_cw() {
-                self.cw_stop_button(ui);
-                ui.add_space(8.0);
-            } else if self.radio.can_transmit() {
-                self.mox_button(ui);
-                ui.add_space(8.0);
+            self.mode_buttons(ui);
+            ui.add_space(16.0);
+            self.audio_controls(ui, false);
+        });
+        self.dsp_controls(ui, true, true);
+        if self.radio.sends_cw() {
+            ui.horizontal_wrapped(|ui| self.cw_send_row(ui, false));
+            ui.horizontal_wrapped(|ui| {
+                self.cw_settings(ui, false);
+                self.tx_settings(ui, false);
+            });
+            if self.radio.keys_cw() {
+                ui.horizontal_wrapped(|ui| self.key_settings(ui, false));
+                self.key_pads(ui, false);
             }
+        } else if self.radio.can_transmit() {
+            ui.horizontal_wrapped(|ui| {
+                self.mox_button(ui);
+                ui.add_space(12.0);
+                self.tx_settings(ui, false);
+            });
+        }
+    }
+
+    /// The compact layout's top: the frequency and S-meter, - / +, and
+    /// power and SWR while transmitting.
+    fn compact_top(&mut self, ui: &mut egui::Ui) {
+        self.frequency_row(ui);
+        ui.horizontal_wrapped(|ui| {
             self.minus_plus(ui);
             if self.radio.mox {
+                ui.add_space(8.0);
                 let tx = self.radio.tx.unwrap_or_default();
                 ui.strong(format!("{:.1} W  SWR {:.2}", tx.forward_w, tx.swr));
             }
         });
-        let mut sections = vec![Section::Step, Section::Band, Section::Mode];
+    }
+
+    /// The sections the compact toolbar has buttons for, as this server
+    /// allows.
+    fn sections(&self) -> Vec<Section> {
+        let mut sections = vec![Section::Band, Section::Mode, Section::Step];
         if self.radio.dsp.is_some() {
             sections.extend([Section::Filter, Section::Noise]);
         }
@@ -1057,38 +1108,145 @@ impl App {
         if self.radio.can_transmit() {
             sections.push(Section::Tx);
         }
-        ui.horizontal_wrapped(|ui| {
-            for s in sections {
-                let open = self.section == Some(s);
-                if ui.add(egui::Button::selectable(open, egui::RichText::new(s.label()).strong())).clicked() {
-                    self.section = if open { None } else { Some(s) };
+        sections
+    }
+
+    /// A section's toolbar button text: Band and Mode show what they're
+    /// set to.
+    fn section_button_text(&self, s: Section) -> String {
+        match s {
+            Section::Band => {
+                let band = match &self.radio.bands {
+                    Some(list) => current_band(list, self.radio.vfo_hz).map(str::to_string),
+                    None => FALLBACK_BANDS
+                        .iter()
+                        .find(|b| (b.1..=b.2).contains(&self.radio.vfo_hz))
+                        .map(|b| b.0.to_string()),
+                };
+                band.unwrap_or_else(|| "Band".to_string())
+            }
+            Section::Mode => MODES
+                .iter()
+                .find(|(tci, _)| *tci == self.radio.mode)
+                .map(|(_, label)| label.to_string())
+                .unwrap_or_else(|| "Mode".to_string()),
+            s => s.label().to_string(),
+        }
+    }
+
+    /// The compact layout's toolbar, under the spectrum: a big button per
+    /// section, sharing the width (a second row if they'd be too narrow
+    /// for a finger), and MOX -- or CW's Stop -- at the right-hand end.
+    /// The selected section's button again closes it.
+    fn compact_toolbar(&mut self, ui: &mut egui::Ui) {
+        const GAP: f32 = 4.0;
+        let sections = self.sections();
+        let tx_button = self.radio.sends_cw() || self.radio.can_transmit();
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing = Vec2::new(GAP, GAP);
+            let room = ui.available_width() - if tx_button { TOOLBAR_MOX_WIDTH + GAP } else { 0.0 };
+            let fit = (((room + GAP) / (TOOLBAR_BUTTON_MIN_WIDTH + GAP)).floor() as usize).clamp(1, sections.len());
+            // Spread over the rows needed, evenly.
+            let per_row = sections.len().div_ceil(sections.len().div_ceil(fit));
+            let width =
+                ((room - (per_row - 1) as f32 * GAP) / per_row as f32).clamp(TOOLBAR_BUTTON_MIN_WIDTH, TOOLBAR_BUTTON_MAX_WIDTH);
+            ui.vertical(|ui| {
+                for row in sections.chunks(per_row) {
+                    ui.horizontal(|ui| {
+                        for &s in row {
+                            let open = self.section == Some(s);
+                            let text = self.section_button_text(s);
+                            if ui
+                                .add_sized(
+                                    [width, TOOLBAR_BUTTON_HEIGHT],
+                                    egui::Button::selectable(open, egui::RichText::new(&text).size(16.0)).truncate(),
+                                )
+                                .on_hover_text(s.label())
+                                .clicked()
+                            {
+                                self.section = if open { None } else { Some(s) };
+                            }
+                        }
+                    });
                 }
+            });
+            if tx_button {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if self.radio.sends_cw() {
+                        self.cw_stop_button(ui);
+                    } else {
+                        self.mox_button(ui);
+                    }
+                });
             }
         });
-        match self.section {
-            Some(Section::Step) => self.step_row(ui),
-            Some(Section::Band) => self.band_row(ui),
-            Some(Section::Mode) => {
+        ui.add_space(4.0);
+    }
+
+    /// The open section's controls, over the bottom of the spectrum
+    /// (`over`), with a title and a close button, scrolling if they're
+    /// taller than it. Escape closes it too.
+    fn section_popup(&mut self, ctx: &egui::Context, over: Rect) {
+        let Some(section) = self.section else { return };
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.section = None;
+            return;
+        }
+        let width = (over.width() - 16.0).max(200.0);
+        let mut close = false;
+        egui::Area::new(egui::Id::unique("section_popup"))
+            .order(egui::Order::Foreground)
+            .pivot(egui::Align2::LEFT_BOTTOM)
+            .fixed_pos(Pos2::new(over.left() + 8.0, over.bottom() - 8.0))
+            .show(ctx, |ui| {
+                egui::Frame::popup(ui.style()).show(ui, |ui| {
+                    ui.set_width(width - 16.0);
+                    ui.spacing_mut().button_padding = Vec2::new(10.0, 8.0);
+                    ui.spacing_mut().interact_size.y = 32.0;
+                    ui.horizontal(|ui| {
+                        ui.strong(section.label());
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.button(egui::RichText::new("\u{2715}").size(16.0)).on_hover_text("Close").clicked() {
+                                close = true;
+                            }
+                        });
+                    });
+                    ui.separator();
+                    egui::ScrollArea::vertical().max_height((over.height() - 80.0).max(80.0)).show(ui, |ui| {
+                        self.section_controls(ui, section);
+                    });
+                });
+            });
+        if close {
+            self.section = None;
+        }
+    }
+
+    fn section_controls(&mut self, ui: &mut egui::Ui, section: Section) {
+        match section {
+            Section::Step => self.step_row(ui),
+            Section::Band => self.band_row(ui),
+            Section::Mode => {
                 ui.horizontal_wrapped(|ui| self.mode_buttons(ui));
             }
-            Some(Section::Filter) => self.dsp_controls(ui, true, false),
-            Some(Section::Noise) => self.dsp_controls(ui, false, true),
-            Some(Section::Audio) => {
+            Section::Filter => self.dsp_controls(ui, true, false),
+            Section::Noise => self.dsp_controls(ui, false, true),
+            Section::Audio => {
                 ui.horizontal_wrapped(|ui| self.audio_controls(ui, true));
             }
-            Some(Section::Key) if self.radio.keys_cw() => {
+            Section::Key if self.radio.keys_cw() => {
                 self.key_pads(ui, true);
                 ui.horizontal_wrapped(|ui| self.key_settings(ui, true));
             }
-            Some(Section::Key) => {}
-            Some(Section::Tx) => {
+            Section::Key => {}
+            Section::Tx => {
                 if self.radio.sends_cw() {
                     ui.horizontal_wrapped(|ui| self.cw_send_row(ui, true));
                     ui.horizontal_wrapped(|ui| self.cw_settings(ui, true));
                 }
                 ui.horizontal_wrapped(|ui| self.tx_settings(ui, true));
             }
-            None => {}
         }
     }
 
@@ -1477,21 +1635,45 @@ impl eframe::App for App {
             // Audio goes out in 20 ms blocks: keep coming back for it.
             ui.ctx().request_repaint_after(std::time::Duration::from_millis(10));
         }
+        // F11 toggles fullscreen, as in a web browser (which does its own).
+        #[cfg(not(target_arch = "wasm32"))]
+        if ui.input(|i| i.key_pressed(egui::Key::F11)) {
+            self.fullscreen = !self.fullscreen;
+            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Fullscreen(self.fullscreen));
+        }
         let screen = ui.ctx().content_rect().size();
         let narrow = screen.x < NARROW_WIDTH || screen.y < SHORT_HEIGHT;
+        let compact = match self.layout {
+            Layout::Auto => narrow,
+            Layout::Standard => false,
+            Layout::Compact => true,
+        };
         egui::Panel::top("top").show(ui, |ui| {
+            if compact {
+                self.top_bar(ui, narrow);
+                self.compact_top(ui);
+                return;
+            }
             // As tall as the controls, up to the limit: without the minimum,
             // the scroll area only gets what the panel had the frame before,
             // and shows a couple of rows.
             let limit = screen.y * CONTROLS_MAX_HEIGHT;
             egui::ScrollArea::vertical().max_height(limit).min_scrolled_height(limit).show(ui, |ui| {
                 self.top_bar(ui, narrow);
-                self.controls(ui, narrow);
+                self.controls(ui);
             });
         });
-        self.run_keyer(ui.ctx());
         egui::Panel::bottom("status").show(ui, |ui| self.status_line(ui));
-        egui::CentralPanel::default().show(ui, |ui| self.spectrum_and_waterfall(ui));
+        let connected = self.link.as_ref().is_some_and(|l| l.status == Status::Open);
+        if compact && connected {
+            egui::Panel::bottom("toolbar").show(ui, |ui| self.compact_toolbar(ui));
+        }
+        let spectrum = egui::CentralPanel::default().show(ui, |ui| self.spectrum_and_waterfall(ui)).response.rect;
+        if compact && connected {
+            self.section_popup(ui.ctx(), spectrum);
+        }
+        // After the key pads (Key, in the popup) have been read this frame.
+        self.run_keyer(ui.ctx());
         // Keep the status line (data rate, buffer) moving.
         ui.ctx().request_repaint_after(std::time::Duration::from_millis(250));
     }

@@ -19,6 +19,25 @@ microphone, with mic gain and level, the radio's TX power setting, and
 power and SWR while transmitting; not CW yet. If the connection drops, or
 the client stops sending audio for a second, hpsdr-rs unkeys.
 
+## Layout
+
+**Layout** (beside the connection status) is Auto, Standard or Compact.
+Standard has every control in rows above the spectrum. Compact, as
+hpsdr-rs's own for small screens, has only the frequency, S-meter and - / +
+above the spectrum, and a toolbar of large buttons below it -- Band and Mode
+show what they're set to, then Step, Filter, Noise, Audio, Key and TX as
+the server allows, and MOX (or CW's Stop) at the right. A button opens its
+controls over the bottom of the spectrum; it again, the close button or
+Escape closes them. The buttons go onto a second row when they'd be too
+narrow for a finger. Auto is compact on a screen narrower than 600 or
+shorter than 500 points: a phone either way up, or a Raspberry Pi's 7"
+800x480 display. The choice isn't remembered between runs yet.
+
+Natively, `--fullscreen` fills the screen (with a Quit button beside
+Layout) and F11 toggles it:
+
+    cargo run -p hpsdr-remote --release -- --fullscreen
+
 ## The easy way: served by hpsdr-rs
 
 Build the web client first (below), then hpsdr-rs, which then has it built
