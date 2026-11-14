@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=hpsdr-remote
+Comment=Remote client for hpsdr-rs, over the network
+Exec=hpsdr-remote
+Icon=hpsdr-rs
+Terminal=false
+Categories=HamRadio;Network;
+Keywords=SDR;HPSDR;Ham Radio;Amateur Radio;Remote;TCI;

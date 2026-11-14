@@ -54,8 +54,12 @@ jobs:
       # Revision 1 for a release; scripts/build-deb.sh's auto-increment
       # is for local rebuilds. Same portable build as the RPM above, so
       # nothing is recompiled.
+      # The .deb carries the native remote client too; cargo deb builds
+      # only hpsdr-rs itself.
       - name: Build .deb
-        run: HPSDR_PORTABLE=1 cargo deb --deb-revision 1
+        run: |
+          cargo build --release -p hpsdr-remote
+          HPSDR_PORTABLE=1 cargo deb --deb-revision 1
 
       - name: Collect packages
         run: |
@@ -143,3 +147,6 @@ jobs:
           test -f /usr/share/hpsdr-rs/rx888/SDDC_FX3.img
           test -f /usr/share/hpsdr-rs/ozy/Ozy_Janus.rbf
           if ldd /usr/bin/hpsdr-rs | grep 'not found'; then exit 1; fi
+          test -x /usr/bin/hpsdr-remote
+          test -f /usr/share/applications/hpsdr-remote.desktop
+          if ldd /usr/bin/hpsdr-remote | grep 'not found'; then exit 1; fi

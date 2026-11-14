@@ -50,6 +50,9 @@ audio starts when you press **Connect**.
 
 ## Native
 
+The Linux .deb installs it beside hpsdr-rs, as `hpsdr-remote` with its
+own menu entry. From the source:
+
     cargo run -p hpsdr-remote --release
 
 and enter `ws://<hpsdr-rs machine>:50001` (straight to TCI, on your own

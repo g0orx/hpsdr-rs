@@ -173,7 +173,8 @@ including the ANAN series), using WDSP for DSP. \
 Features include spectrum/waterfall display, multiple simultaneous \
 receivers, PureSignal PA linearization, diversity reception, a graphic \
 equalizer, and rigctl/TCI control servers for use with WSJT-X and similar \
-digital-mode software."""
+digital-mode software. Also includes hpsdr-remote, a thin client that \
+controls hpsdr-rs on another computer over the network."""
 section = "hamradio"
 priority = "optional"
 # $auto covers what the binary links; libxkbcommon(-x11) are loaded by
@@ -190,6 +191,11 @@ depends = "$auto, libxkbcommon0, libxkbcommon-x11-0"
 revision = "2"
 assets = [
     ["target/release/hpsdr-rs", "usr/bin/", "755"],
+    # The native remote client: cargo deb builds only hpsdr-rs, so build it
+    # first (`cargo build --release -p hpsdr-remote`, as scripts/build-deb.sh
+    # and CI do).
+    ["target/release/hpsdr-remote", "usr/bin/", "755"],
+    ["assets/hpsdr-remote.desktop", "usr/share/applications/hpsdr-remote.desktop", "644"],
     ["README.md", "usr/share/doc/hpsdr-rs/README.md", "644"],
     ["docs/manual/*.md", "usr/share/doc/hpsdr-rs/manual/", "644"],
     ["docs/manual/images/*", "usr/share/doc/hpsdr-rs/manual/images/", "644"],
