@@ -99,6 +99,30 @@ pub struct Player {
     _stream: cpal::Stream,
 }
 
+/// The output stream, writing samples of type `T`.
+fn build_output<T>(device: &cpal::Device, config: &cpal::StreamConfig, jitter: &Arc<Mutex<Jitter>>) -> Result<cpal::Stream, String>
+where
+    T: cpal::SizedSample + cpal::FromSample<f32>,
+{
+    let channels = config.channels as usize;
+    let feed = Arc::clone(jitter);
+    device
+        .build_output_stream(
+            config,
+            move |data: &mut [T], _: &cpal::OutputCallbackInfo| {
+                let mut j = feed.lock().unwrap();
+                let rate = j.device_rate;
+                for frame in data.chunks_mut(channels) {
+                    let v = (j.next() + j.sidetone.next(rate)).clamp(-1.0, 1.0);
+                    frame.fill(T::from_sample(v));
+                }
+            },
+            |e| log::warn!("audio output: {e}"),
+            None,
+        )
+        .map_err(|e| format!("audio output: {e}"))
+}
+
 impl Player {
     /// Opens the default output device. In a browser this has to happen in
     /// response to a click (browsers only start audio after one).
@@ -106,11 +130,8 @@ impl Player {
         let host = cpal::default_host();
         let device = host.default_output_device().ok_or("no audio output device")?;
         let supported = device.default_output_config().map_err(|e| format!("audio output: {e}"))?;
-        if supported.sample_format() != cpal::SampleFormat::F32 {
-            return Err(format!("audio output: unsupported sample format {:?}", supported.sample_format()));
-        }
+        let format = supported.sample_format();
         let config: cpal::StreamConfig = supported.into();
-        let channels = config.channels as usize;
         let jitter = Arc::new(Mutex::new(Jitter {
             buf: VecDeque::new(),
             rate: 0,
@@ -120,22 +141,17 @@ impl Player {
             gain: 1.0,
             sidetone: Sidetone::default(),
         }));
-        let feed = Arc::clone(&jitter);
-        let stream = device
-            .build_output_stream(
-                &config,
-                move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
-                    let mut j = feed.lock().unwrap();
-                    let rate = j.device_rate;
-                    for frame in data.chunks_mut(channels) {
-                        let v = j.next() + j.sidetone.next(rate);
-                        frame.fill(v);
-                    }
-                },
-                |e| log::warn!("audio output: {e}"),
-                None,
-            )
-            .map_err(|e| format!("audio output: {e}"))?;
+        // In the device's own sample format. It used to insist on f32 and
+        // give up otherwise (REAL REPORT 2026-11-14: no audio, and no
+        // playback stream in pavucontrol, on a Raspberry Pi 4, whose
+        // default output is 16-bit). Any other format: ask for f32, which
+        // ALSA's default device converts.
+        let stream = match format {
+            cpal::SampleFormat::I16 => build_output::<i16>(&device, &config, &jitter),
+            cpal::SampleFormat::U16 => build_output::<u16>(&device, &config, &jitter),
+            cpal::SampleFormat::I32 => build_output::<i32>(&device, &config, &jitter),
+            _ => build_output::<f32>(&device, &config, &jitter),
+        }?;
         stream.play().map_err(|e| format!("audio output: {e}"))?;
         Ok(Self { jitter, _stream: stream })
     }
