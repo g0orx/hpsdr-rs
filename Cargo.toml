@@ -191,9 +191,9 @@ depends = "$auto, libxkbcommon0, libxkbcommon-x11-0"
 revision = "2"
 assets = [
     ["target/release/hpsdr-rs", "usr/bin/", "755"],
-    # The native remote client: cargo deb builds only hpsdr-rs, so build it
-    # first (`cargo build --release -p hpsdr-remote`, as scripts/build-deb.sh
-    # and CI do).
+    # The native remote client, built on its own and packaged with
+    # `cargo deb --no-build` (scripts/build-deb.sh, CI): built together with
+    # hpsdr-rs it would get hpsdr-rs's eframe features (wgpu).
     ["target/release/hpsdr-remote", "usr/bin/", "755"],
     ["assets/hpsdr-remote.desktop", "usr/share/applications/hpsdr-remote.desktop", "644"],
     ["README.md", "usr/share/doc/hpsdr-rs/README.md", "644"],

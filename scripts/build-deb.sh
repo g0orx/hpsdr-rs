@@ -24,6 +24,8 @@ echo "$next" > "$COUNTER_FILE"
 echo "Building .deb with revision $next..."
 # Portable build: no -march=native (see build.rs), so the package runs
 # on other machines' CPUs, not just this one's.
-# cargo deb builds only hpsdr-rs; the package carries hpsdr-remote too.
+# Each built on its own, then packaged without cargo deb building: built
+# together, Cargo gives hpsdr-remote hpsdr-rs's eframe features (wgpu).
+HPSDR_PORTABLE=1 cargo build --release
 cargo build --release -p hpsdr-remote
-HPSDR_PORTABLE=1 cargo deb --deb-revision "$next" "$@"
+cargo deb --no-build --deb-revision "$next" "$@"

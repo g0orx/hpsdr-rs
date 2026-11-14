@@ -54,12 +54,14 @@ jobs:
       # Revision 1 for a release; scripts/build-deb.sh's auto-increment
       # is for local rebuilds. Same portable build as the RPM above, so
       # nothing is recompiled.
-      # The .deb carries the native remote client too; cargo deb builds
-      # only hpsdr-rs itself.
+      # The .deb carries the native remote client too, built on its own:
+      # cargo deb building both together gives hpsdr-remote hpsdr-rs's
+      # eframe features (wgpu), which fails to start on a Raspberry Pi 4.
+      # hpsdr-rs is already built (portable) for the RPM above.
       - name: Build .deb
         run: |
           cargo build --release -p hpsdr-remote
-          HPSDR_PORTABLE=1 cargo deb --deb-revision 1
+          cargo deb --no-build --deb-revision 1
 
       - name: Collect packages
         run: |

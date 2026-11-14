@@ -23,6 +23,12 @@ fn main() -> eframe::Result<()> {
             .with_min_inner_size([320.0, 400.0])
             .with_fullscreen(fullscreen)
             .with_title("hpsdr-remote"),
+        // Always glow (OpenGL): if a build also brings in eframe's wgpu (as
+        // cargo deb building it beside hpsdr-rs did), eframe would choose
+        // wgpu, which on a Raspberry Pi 4 fails to start (REAL REPORT
+        // 2026-11-14: "LimitsExceeded ... max_color_attachments, requested
+        // 8, allowed 4").
+        renderer: eframe::Renderer::Glow,
         ..Default::default()
     };
     eframe::run_native(
