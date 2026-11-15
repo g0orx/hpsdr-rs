@@ -27,6 +27,18 @@ use std::time::Duration;
 
 const DISCOVERY_PORT: u16 = 1024;
 const SOCKET_TIMEOUT: Duration = Duration::from_millis(250);
+/// The longest one discovery round keeps listening for replies, however
+/// many keep arriving or errors come back.
+const REPLY_WINDOW: Duration = Duration::from_millis(1500);
+
+/// Whether a recv error means the replies have stopped (the read timed
+/// out). Anything else is skipped: Windows reports an ICMP "port
+/// unreachable" for an earlier datagram from this socket as a
+/// ConnectionReset on the next recv, which used to end the round before
+/// a radio's reply was read.
+fn quiet(e: &std::io::Error) -> bool {
+    matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut)
+}
 
 #[derive(Copy, Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum Boards {
@@ -368,7 +380,8 @@ pub fn protocol1_discovery(
 
     let local_addr = socket.local_addr().unwrap_or(socket_addr);
     let mut buf = [0u8; 1024];
-    loop {
+    let deadline = std::time::Instant::now() + REPLY_WINDOW;
+    while std::time::Instant::now() < deadline {
         match socket.recv_from(&mut buf) {
             Ok((amt, src)) if amt == 60 && src.port() == DISCOVERY_PORT => {
                 if let Some(device) = Device::from_p1_reply(&buf[..amt], src, local_addr) {
@@ -376,7 +389,8 @@ pub fn protocol1_discovery(
                 }
             }
             Ok(_) => continue,
-            Err(_) => break, // timeout or real error -- either way, stop listening
+            Err(e) if quiet(&e) => break,
+            Err(_) => continue, // see quiet()
         }
     }
 }
@@ -417,7 +431,8 @@ pub fn protocol2_discovery(
 
     let local_addr = socket.local_addr().unwrap_or(socket_addr);
     let mut buf = [0u8; 1024];
-    loop {
+    let deadline = std::time::Instant::now() + REPLY_WINDOW;
+    while std::time::Instant::now() < deadline {
         match socket.recv_from(&mut buf) {
             Ok((amt, src)) if amt == 60 && src.port() == DISCOVERY_PORT => {
                 if let Some(device) = Device::from_p2_reply(&buf[..amt], src, local_addr) {
@@ -425,7 +440,8 @@ pub fn protocol2_discovery(
                 }
             }
             Ok(_) => continue,
-            Err(_) => break,
+            Err(e) if quiet(&e) => break,
+            Err(_) => continue, // see quiet()
         }
     }
 }
@@ -470,10 +486,21 @@ pub fn discover(devices: Arc<Mutex<Vec<Device>>>, interface_names: Arc<Mutex<Has
         for addr in &itf.addr {
             if let Addr::V4(v4_info) = addr {
                 let ip = v4_info.ip;
-                // Probe that the interface is actually up/bindable before using it.
-                if std::net::UdpSocket::bind((ip, 5000)).is_ok() {
+                // Probe that the interface is actually up/bindable before
+                // using it. Port 0 (any free port), as manual_discovery
+                // has always used. REAL REPORT (2026-11-12, issue #15):
+                // on Windows, discovery found neither of two HL2s that
+                // manual addresses reached fine, while Linux found both.
+                // This probed fixed port 5000 and discovered from fixed
+                // port 50000; Windows reserves UDP port ranges for
+                // Hyper-V/WSL/Docker (`netsh int ipv4 show
+                // excludedportrange protocol=udp`), commonly taking in
+                // 50000, and a failed bind skipped the interface, logged
+                // only to a console a Windows GUI app doesn't have. The
+                // radios reply to whatever port asked.
+                if std::net::UdpSocket::bind((ip, 0)).is_ok() {
                     interface_names.lock().unwrap().insert(IpAddr::V4(ip), itf.name.clone());
-                    let socket_address = SocketAddr::new(IpAddr::V4(ip), 50000);
+                    let socket_address = SocketAddr::new(IpAddr::V4(ip), 0);
                     // See protocol1_discovery's own doc comment --
                     // this interface's own subnet-directed broadcast,
                     // straight from the OS (via the network-interface
