@@ -6,6 +6,8 @@
 
 A Rust/egui desktop client for [openHPSDR](https://openhpsdr.org/) Protocol 1 and Protocol 2 radios (Metis/Ozy-style and Hermes/Orion-style boards), using [WDSP](https://github.com/NR0V/wdsp) for DSP.
 
+**Website:** [g0orx.github.io/hpsdr-rs](https://g0orx.github.io/hpsdr-rs/) — a one-page summary of what hpsdr-rs supports, with download links.
+
 > **Status: early / actively in development.** RX has seen the most real-world testing. TX works and has been used for real QSOs, but parts of the TX signal path are still noted in the source as unverified against the official protocol spec on untested hardware. **Always bench-test into a dummy load at reduced drive before transmitting into a real antenna**, especially after pulling a new build.
 
 ![hpsdr-rs main window, showing the spectrum/waterfall display, S-meter, and TX controls](images/screenshot.png)
