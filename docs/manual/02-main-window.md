@@ -287,7 +287,7 @@ open one at a time from a toolbar of large buttons under the spectrum:
 - **MOX**, on the right.
 
 Each opens above the toolbar, over the spectrum; press its button again, or
-**✕**, to close it. A long press on VFO-A or VFO-B opens the frequency
+**×**, to close it. A long press on VFO-A or VFO-B opens the frequency
 keypad (as a right-click does), and dragging the spectrum tunes.
 
 On a narrow screen, such as the 720x1280 Raspberry Pi Touch Display 2 in
@@ -535,8 +535,8 @@ The controls themselves:
 
 In **FM**, the transmit row also has:
 
-- **Shift** -- **−**, **Simplex** or **+**: transmit below, on, or above
-  VFO A by the offset next to it, e.g. **−** with 600 kHz for a 2m
+- **Shift** -- **-**, **Simplex** or **+**: transmit below, on, or above
+  VFO A by the offset next to it, e.g. **-** with 600 kHz for a 2m
   repeater. The TX frequency is shown alongside, and while transmitting
   VFO A shows it too (in red), as a radio does. Split and Duplex take
   precedence, since VFO B names its own TX frequency.
@@ -551,7 +551,7 @@ Each band remembers its own Shift and CTCSS tone as you left it there,
 like Split.
 
 ![A 2m repeater on the 144MHz transverter band: VFO A on 145.625 MHz, FM,
-Shift − with a 600 kHz offset, CTCSS 88.5 Hz and TX 145.025000, with PA OFF
+Shift - with a 600 kHz offset, CTCSS 88.5 Hz and TX 145.025000, with PA OFF
 beside MOX](images/02-fm-repeater.png)
 
 With transmit enabled, the **Mic gain**, **TCI TX gain** and **TX Power**
