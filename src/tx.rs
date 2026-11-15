@@ -409,6 +409,8 @@ pub struct TxParams {
     pub two_tone: bool,
     /// CTCSS tone added in FM, Hz; 0 = none (main.rs sends 0 outside FM).
     pub ctcss_hz: f32,
+    /// FM peak deviation, Hz (Settings -> TX): 5000 wide, 2500 narrow.
+    pub fm_deviation_hz: f64,
     /// See spectrum::EqualizerParams's doc comment -- same type, TXA side.
     pub eq: EqualizerParams,
     /// WDSP's Speech Processor (a baseband RF-clipper equivalent --
@@ -454,9 +456,16 @@ impl Default for TxParams {
             compressor_gain_db: 3.0,
             cessb_enabled: false,
             ctcss_hz: 0.0,
+            fm_deviation_hz: FM_DEVIATION_WIDE_HZ,
         }
     }
 }
+
+/// FM peak deviation for 25 kHz channels (Thetis's default, and US 2 m
+/// repeaters).
+pub const FM_DEVIATION_WIDE_HZ: f64 = 5000.0;
+/// FM peak deviation for 12.5 kHz channels.
+pub const FM_DEVIATION_NARROW_HZ: f64 = 2500.0;
 
 /// Shared signature of PSSaveCorr/PSRestoreCorr -- see
 /// TxProcessor::ps_corr_action.
@@ -470,6 +479,8 @@ struct TxProcessor {
     last_gain: Option<f32>,
     /// The CTCSS tone as last set (0 = off) -- see set_ctcss.
     last_ctcss_hz: Option<f32>,
+    /// See set_fm_deviation.
+    last_fm_deviation_hz: Option<f64>,
     last_passband: Option<(f64, f64)>,
     /// The Tune tone's frequency as last set -- see process().
     last_tune_hz: Option<f64>,
@@ -793,7 +804,8 @@ impl TxProcessor {
             // modes, included for completeness/parity with the
             // reference rather than because this project currently
             // supports those modes.
-            wdsp::SetTXAFMDeviation(channel, 2500.0);
+            // FM deviation: set by process()'s caller from TxParams
+            // (set_fm_deviation), not here.
             wdsp::SetTXAAMCarrierLevel(channel, 0.5);
 
             // Inert startup state, matching every other TXA stage's
@@ -870,6 +882,7 @@ impl TxProcessor {
             last_mode: None,
             last_gain: None,
             last_ctcss_hz: None,
+            last_fm_deviation_hz: None,
             // None, not Some(default_passband): process() also sets the
             // Tune tone (PostGen) frequency on a passband change, and
             // open() leaves it at 0 Hz -- so with the mode/width at the
@@ -931,6 +944,22 @@ impl TxProcessor {
             wdsp::SetTXACTCSSRun(self.channel, (hz > 0.0) as c_int);
         }
         self.last_ctcss_hz = Some(hz);
+    }
+
+    /// FM peak deviation, Hz. REAL REPORT (2026-11-12, issue #15): a US
+    /// 2 m repeater wouldn't open on a 103.5 Hz tone. WDSP's FM modulator
+    /// adds CTCSS at a fixed 0.10/1.10 of the peak deviation, and this
+    /// was fixed at 2500 Hz: the tone measured 227 Hz deviation (an
+    /// ignored test, ctcss_tests), where decoders expect around 500 Hz
+    /// (about 350 on narrow channels). At 5000 Hz it's 455 Hz.
+    fn set_fm_deviation(&mut self, hz: f64) {
+        if self.last_fm_deviation_hz == Some(hz) {
+            return;
+        }
+        unsafe {
+            wdsp::SetTXAFMDeviation(self.channel, hz);
+        }
+        self.last_fm_deviation_hz = Some(hz);
     }
 
     fn process(
@@ -2369,6 +2398,7 @@ fn run(
 
         let p = *params.lock().unwrap();
         processor.set_ctcss(p.ctcss_hz);
+        processor.set_fm_deviation(p.fm_deviation_hz);
         let (iq, exch_error) =
             processor.process(
                 &chunk,
@@ -2711,6 +2741,11 @@ impl TxHandle {
     }
 
     /// See TxParams::ctcss_hz.
+    /// See TxParams::fm_deviation_hz.
+    pub fn set_fm_deviation_hz(&self, hz: f64) {
+        self.params.lock().unwrap().fm_deviation_hz = hz;
+    }
+
     pub fn set_ctcss_hz(&self, hz: f32) {
         self.params.lock().unwrap().ctcss_hz = hz;
     }
@@ -3001,5 +3036,81 @@ mod cw_live_tests {
         assert!(envelope[4_900] < 1.0, "ramps down from the release");
         assert!(envelope[4_900 + 241..].iter().all(|&g| g == 0.0), "silent 5 ms later");
         assert!(!gen.is_active(&live));
+    }
+}
+
+#[cfg(test)]
+mod ctcss_tests {
+    use super::*;
+
+    /// Measurement: FM-demodulates the TXA output with CTCSS 103.5 Hz and
+    /// prints the tone's deviation, with silence and with a 1 kHz mic tone.
+    #[test]
+    #[ignore]
+    fn ctcss_deviation() {
+        let _analyzer = crate::spectrum::SpectrumHandle::start(
+            29,
+            Arc::new(Mutex::new(VecDeque::new())),
+            48_000,
+            None,
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+        );
+        thread::sleep(Duration::from_secs(2));
+        let mut p = TxProcessor::open(30, 1, 48_000, 48_000, None);
+        p.set_ctcss(103.5);
+        let fs = 48_000.0f64;
+        for (deviation, mic_amp) in [(FM_DEVIATION_NARROW_HZ, 0.0f32), (FM_DEVIATION_WIDE_HZ, 0.0), (FM_DEVIATION_WIDE_HZ, 0.3)] {
+            p.set_fm_deviation(deviation);
+            let mut freq = Vec::new();
+            let mut last: Option<(f64, f64)> = None;
+            let mut n = 0usize;
+            let mut errors = 0;
+            for _ in 0..200 {
+                let mic: Vec<f32> = (0..TX_BUFFER_SIZE)
+                    .map(|_| {
+                        n += 1;
+                        mic_amp * (std::f64::consts::TAU * 1000.0 * n as f64 / fs).sin() as f32
+                    })
+                    .collect();
+                let (iq, err) =
+                    p.process(&mic, Mode::Fmn, 1.0, 5000.0, false, false, EqualizerParams::default(), false, 0.0, false);
+                // Paced like the real TX thread, so WDSP's own worker
+                // keeps up (fexchange0 hands back zeros otherwise).
+                thread::sleep(Duration::from_millis(15));
+                if err != 0 {
+                    errors += 1;
+                    last = None;
+                    continue;
+                }
+                for pair in iq.chunks_exact(2) {
+                    let s = (pair[0] as f64, pair[1] as f64);
+                    if let Some(l) = last {
+                        // arg(s * conj(l))
+                        let d = (s.1 * l.0 - s.0 * l.1).atan2(s.0 * l.0 + s.1 * l.1);
+                        freq.push(d * fs / std::f64::consts::TAU);
+                    }
+                    last = Some(s);
+                }
+            }
+            let f = &freq[freq.len() / 2..];
+            let proj = |hz: f64| {
+                let (mut c, mut s) = (0.0, 0.0);
+                for (k, v) in f.iter().enumerate() {
+                    let ph = std::f64::consts::TAU * hz * k as f64 / fs;
+                    c += v * ph.cos();
+                    s += v * ph.sin();
+                }
+                2.0 * (c * c + s * s).sqrt() / f.len() as f64
+            };
+            let peak = f.iter().fold(0.0f64, |a, v| a.max(v.abs()));
+            println!("{} samples, {errors} fexchange errors", freq.len());
+            println!(
+                "deviation {deviation}, mic {mic_amp}: CTCSS 103.5 Hz deviation {:.0} Hz, 1 kHz deviation {:.0} Hz, peak {:.0} Hz",
+                proj(103.5),
+                proj(1000.0),
+                peak
+            );
+        }
     }
 }

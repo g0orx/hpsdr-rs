@@ -496,6 +496,9 @@ pub struct Config {
     /// CTCSS tone sent in FM, Hz; 0 = none.
     #[serde(default)]
     pub ctcss_hz: Option<f32>,
+    /// FM TX peak deviation, Hz (tx::FM_DEVIATION_WIDE_HZ/NARROW_HZ).
+    #[serde(default)]
+    pub fm_deviation_hz: Option<f64>,
     /// VFO step, Hz (main.rs's VFO_STEPS_HZ): what a front-panel
     /// controller's VFO knob moves by.
     #[serde(default)]

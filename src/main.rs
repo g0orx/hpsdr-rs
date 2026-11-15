@@ -3229,6 +3229,8 @@ struct ConnectedState {
     fm_shift: i8,
     /// CTCSS tone sent in FM, Hz; 0 = none. Remembered per band.
     ctcss_hz: f32,
+    /// FM TX peak deviation, Hz -- see tx::TxProcessor::set_fm_deviation.
+    fm_deviation_hz: f64,
     /// The VFO step (one of VFO_STEPS_HZ), chosen in VFO-A's box: what a
     /// front-panel controller's VFO knob tunes by, snapped to multiples
     /// of it, as piHPSDR's.
@@ -4902,6 +4904,7 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                 split_off_on_band_change: cfg.split_off_on_band_change.unwrap_or(false),
                 fm_shift: cfg.fm_shift.unwrap_or(0).clamp(-1, 1),
                 ctcss_hz: cfg.ctcss_hz.unwrap_or(0.0),
+                fm_deviation_hz: cfg.fm_deviation_hz.unwrap_or(tx::FM_DEVIATION_WIDE_HZ),
                 vfo_step_hz: cfg.vfo_step_hz.filter(|s| VFO_STEPS_HZ.contains(s)).unwrap_or(100),
                 controller_tune_remainder: std::collections::HashMap::new(),
                 value_popup: None,
@@ -6043,6 +6046,7 @@ impl eframe::App for HpsdrApp {
                 let tx_dial_freq_hz = (tx_dial_freq_hz as i64 + repeater_shift_hz).max(0) as u32;
                 if let Some(tx) = &connected.tx_handle {
                     tx.set_ctcss_hz(if current_mode == spectrum::Mode::Fmn { connected.ctcss_hz } else { 0.0 });
+                    tx.set_fm_deviation_hz(connected.fm_deviation_hz);
                 }
                 // ROOT CAUSE FIX for a real report: this project's own
                 // CW RX convention (spectrum::passband_for's Cwl/Cwu
@@ -12234,6 +12238,27 @@ impl eframe::App for HpsdrApp {
                                         }
                                     });
 
+                                    ui.add_space(8.0);
+                                    ui.horizontal(|ui| {
+                                        ui.label("FM deviation:");
+                                        for (hz, label) in [
+                                            (tx::FM_DEVIATION_WIDE_HZ, "5 kHz (wide)"),
+                                            (tx::FM_DEVIATION_NARROW_HZ, "2.5 kHz (narrow)"),
+                                        ] {
+                                            if ui.selectable_label(connected.fm_deviation_hz == hz, label).clicked() {
+                                                connected.fm_deviation_hz = hz;
+                                                settings_changed = true;
+                                            }
+                                        }
+                                    })
+                                    .response
+                                    .on_hover_text(
+                                        "Peak FM deviation when transmitting. 5 kHz for 25 kHz channels \
+                                         (most 2 m repeaters, and Thetis's default), 2.5 kHz for 12.5 kHz \
+                                         channels. The CTCSS tone is a fixed share of it: about 455 Hz at \
+                                         5 kHz, 230 Hz at 2.5 kHz.",
+                                    );
+
                                     // TX audio monitor -- see TxHandle::tx_audio_monitor's doc
                                     // comment. Added while diagnosing a real report of TCI-sourced
                                     // TX audio producing splatter/no-decode: lets the user hear
@@ -13847,6 +13872,7 @@ impl eframe::App for HpsdrApp {
                         split: Some(connected.split),
                         fm_shift: Some(connected.fm_shift),
                         ctcss_hz: Some(connected.ctcss_hz),
+                        fm_deviation_hz: Some(connected.fm_deviation_hz),
                         vfo_step_hz: Some(connected.vfo_step_hz),
                         repeater_offsets: connected.repeater_offsets.clone(),
                         bandstacks: connected.bandstacks.clone(),

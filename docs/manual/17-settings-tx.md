@@ -155,6 +155,15 @@ Chooses where TX audio comes from:
   microphone, ignoring both the radio's mic input and TCI audio. Useful as
   a workaround if a particular TCI client's audio streaming has problems.
 
+## FM deviation
+
+The peak deviation when transmitting FM: **5 kHz (wide)**, the default,
+for 25 kHz channels and most 2 m repeaters, or **2.5 kHz (narrow)** for
+12.5 kHz channels. The CTCSS tone (set next to the mode buttons in FM) is
+a fixed share of it: about 455 Hz at 5 kHz and 230 Hz at 2.5 kHz. That
+lower figure is too little for many repeaters to decode, so if a
+repeater won't open on its tone, check this first.
+
 ## Radio Mic Connector (Angelia/Orion/Orion2 only)
 
 Two settings for boards with a shared PTT/mic/bias connector:
