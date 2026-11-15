@@ -2579,7 +2579,9 @@ fn knob_value_text(connected: &ConnectedState, action: MidiAction) -> Option<Str
         }
         MidiAction::TxDrive => format!("{} W", connected.session.tx_power_watts.load(Ordering::Relaxed)),
         MidiAction::CwSpeed => format!("{} wpm", connected.session.cw_keyer.speed_wpm.load(Ordering::Relaxed)),
-        MidiAction::CwSidetoneLevel => format!("{}", connected.session.cw_keyer.sidetone_volume.load(Ordering::Relaxed)),
+        MidiAction::CwSidetoneLevel => {
+            format!("{}%", sidetone_level_percent(connected.session.cw_keyer.sidetone_volume.load(Ordering::Relaxed)))
+        }
         MidiAction::CwSidetoneFreq => {
             format!("{} Hz", connected.session.cw_keyer.sidetone_freq_hz.load(Ordering::Relaxed))
         }
@@ -10778,32 +10780,30 @@ impl eframe::App for HpsdrApp {
 
                                     ui.horizontal(|ui| {
                                         ui.label("Sidetone Level:");
-                                        let mut level = connected
-                                            .session
-                                            .cw_keyer
-                                            .sidetone_volume
-                                            .load(Ordering::Relaxed) as f64;
+                                        // Shown as 0-100% (a real request, issue
+                                        // #15, like Thetis); stored as the radio's
+                                        // own 0-127, matching deskHPSDR's CW menu
+                                        // -- piHPSDR mainline allows up to 255 on
+                                        // P2, but deskHPSDR (a more actively
+                                        // hardware-tested fork) caps this at 127
+                                        // unconditionally, and its own P2 byte 6
+                                        // assembly masks with `& 0x7F`.
+                                        let mut level = sidetone_level_percent(
+                                            connected.session.cw_keyer.sidetone_volume.load(Ordering::Relaxed),
+                                        ) as f64;
                                         if scroll_slider_f64(
                                             ui,
                                             &mut connected.slider_scroll_accum,
                                             &mut level,
-                                            // 0-127 on both protocols, matching
-                                            // deskHPSDR's own CW menu -- piHPSDR
-                                            // mainline allows up to 255 on P2, but
-                                            // deskHPSDR (a more actively hardware-
-                                            // tested fork) caps this at 127
-                                            // unconditionally, and its own P2 byte 6
-                                            // assembly masks with `& 0x7F` regardless
-                                            // of what's configured.
-                                            0.0..=127.0,
-                                            5.0,
-                                            "",
+                                            0.0..=100.0,
+                                            1.0,
+                                            "%",
                                         ) {
                                             connected
                                                 .session
                                                 .cw_keyer
                                                 .sidetone_volume
-                                                .store(level as u32, Ordering::Relaxed);
+                                                .store(sidetone_level_from_percent(level), Ordering::Relaxed);
                                             settings_changed = true;
                                         }
                                     });
@@ -15483,6 +15483,17 @@ fn format_frequency(hz: u64) -> String {
 /// across all sliders (see slider_scroll_accum) since only one is ever
 /// hovered at a time -- any leftover partial accumulation carrying
 /// over when switching sliders mid-gesture is a negligible edge case.
+/// The CW sidetone level as the 0-100% the UI shows, from the radio's
+/// own 0-127 that's stored and sent.
+fn sidetone_level_percent(level: u32) -> u32 {
+    (level.min(127) as f64 * 100.0 / 127.0).round() as u32
+}
+
+/// The inverse of sidetone_level_percent.
+fn sidetone_level_from_percent(percent: f64) -> u32 {
+    (percent.round().clamp(0.0, 100.0) * 127.0 / 100.0).round() as u32
+}
+
 fn scroll_slider_f64(
     ui: &mut egui::Ui,
     scroll_accum: &mut f32,

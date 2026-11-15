@@ -159,7 +159,7 @@ to check.
 | RF Attenuation | RX step attenuator (0-31 dB) -- shown as **RF Gain** (-12 to +48 dB) instead when bound while connected to a HermesLite/HermesLite2 over Protocol 1, which has no step attenuator; the same control as the main window's slider next to **AGC Gain** |
 | TX Drive | Transmit power |
 | CW Speed | The radio's internal keyer speed (WPM) |
-| CW Sidetone Level | Sidetone level, 0-127 ([Settings: CW](06-settings-cw.md)) |
+| CW Sidetone Level | Sidetone level, 0-100% ([Settings: CW](06-settings-cw.md)) |
 | CW Sidetone Frequency | Sidetone frequency, 300-1200 Hz |
 | CW Pitch | CW Pitch, 300-1000 Hz -- where CWL/CWU center the RX filter, and the TX offset |
 | Filter Width | Set the filter width directly |

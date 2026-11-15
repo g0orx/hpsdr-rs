@@ -2159,7 +2159,7 @@ fn run(
             // Same 0-255 full-byte range reused as a 0.0-1.0 amplitude
             // scalar as audio.rs's CwSidetone -- the Sidetone Level
             // slider governs this monitor tone too.
-            let sidetone_volume = (cw_keyer.sidetone_volume.load(Ordering::Relaxed).min(255) as f32) / 255.0;
+            let sidetone_volume = (cw_keyer.sidetone_volume.load(Ordering::Relaxed).min(127) as f32) / 127.0;
             if cw_live_now {
                 cw_live_gen.fill(
                     &cw_keyer.live,

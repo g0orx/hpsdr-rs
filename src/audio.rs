@@ -627,12 +627,12 @@ fn run(
         let keyed =
             enabled.load(Ordering::Relaxed) && mox.load(Ordering::Relaxed) && cw_mode_active.load(Ordering::Relaxed) && radio_keyed;
         let freq_hz = cw_keyer.sidetone_freq_hz.load(Ordering::Relaxed);
-        // Same 0-255 full-byte range as P2's own sidetone_volume byte
-        // (see p2_tx_specific_packet) -- reused directly as a 0.0-1.0
-        // amplitude scalar rather than inventing a separate PC-only
-        // volume control, so the existing Sidetone Level slider governs
-        // both the radio's own sidetone AND this one together.
-        let amplitude = (cw_keyer.sidetone_volume.load(Ordering::Relaxed).min(255) as f32) / 255.0;
+        // The radio's own 0-127 sidetone level (shown as 0-100%), reused
+        // as a 0.0-1.0 amplitude rather than inventing a separate PC-only
+        // volume control, so the one Sidetone Level slider governs both
+        // the radio's own sidetone AND this one together. (It used to be
+        // divided by 255, so 100% was only half scale.)
+        let amplitude = (cw_keyer.sidetone_volume.load(Ordering::Relaxed).min(127) as f32) / 127.0;
         tone.set(keyed, freq_hz, amplitude);
     }
     tone.set(false, 0, 0.0);

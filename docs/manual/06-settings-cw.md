@@ -30,7 +30,7 @@ sidetone, and TX/RX switching entirely on its own.
 - **Weight** -- 0-100, 50 by default. The dot/dash timing ratio: 50 is
   the standard 1:3 ratio; higher lengthens dashes and shortens dots,
   lower does the reverse.
-- **Sidetone Level** -- 0-127, 50 by default.
+- **Sidetone Level** -- 0-100%, 39% by default.
 - **Sidetone Frequency** -- 300-1200 Hz, 800 Hz by default. What you
   hear in your own headphones while sending -- independent of **CW
   Pitch** above, which is the RX side.
