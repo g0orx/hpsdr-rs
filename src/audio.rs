@@ -1000,7 +1000,6 @@ mod tests {
 
 pub struct MicInput {
     _stream: cpal::Stream,
-    buffer: Arc<Mutex<VecDeque<f32>>>,
 }
 
 impl MicInput {
@@ -1146,14 +1145,6 @@ impl MicInput {
             .play()
             .map_err(|e| format!("failed to start audio capture: {e}"))?;
 
-        Ok(Self { _stream: stream, buffer })
-    }
-
-    /// The ring buffer this capture writes into -- lets a caller (e.g.
-    /// after a sample-rate change forces tx.rs's TXA channel to be
-    /// rebuilt) hand the *same* live mic capture to a new TxHandle
-    /// without tearing down and reopening the audio input stream too.
-    pub fn buffer(&self) -> &Arc<Mutex<VecDeque<f32>>> {
-        &self.buffer
+        Ok(Self { _stream: stream })
     }
 }

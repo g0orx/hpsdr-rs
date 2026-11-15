@@ -2008,6 +2008,7 @@ fn run(
     let mut starve_window_start = Instant::now();
     let mut starved_chunks_this_window: u32 = 0;
     let mut chunks_this_window: u32 = 0;
+    let mut mic_ever_fed = false;
 
     // Second diagnostic, added after the mic-buffer one above didn't
     // reproduce anything (no underruns logged, yet power/ALC still
@@ -2316,7 +2317,11 @@ fn run(
             } else {
                 drop(tci_buf);
                 let mut buf = mic_buffer.lock().unwrap();
-                if buf.len() < TX_BUFFER_SIZE {
+                // No local mic at all (no input device, e.g. a Raspberry
+                // Pi with no USB sound card -- see main.rs's
+                // ConnectedState::mic_input) isn't an underrun.
+                mic_ever_fed |= !buf.is_empty();
+                if mic_ever_fed && buf.len() < TX_BUFFER_SIZE {
                     starved_chunks_this_window += 1;
                 }
                 for slot in chunk.iter_mut() {

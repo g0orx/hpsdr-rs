@@ -3364,7 +3364,14 @@ struct ConnectedState {
     /// Settings -> TX) but no longer requires a manual per-session
     /// arming step by default.
     tx_enabled: bool,
+    /// None when no audio input device could be opened (e.g. a Raspberry
+    /// Pi with no USB sound card): TX still arms -- CW, TCI audio and
+    /// the radio's own mic don't need one -- with `mic_buffer` empty.
     mic_input: Option<MicInput>,
+    /// What MicInput fills and the TX chain reads; kept so choosing an
+    /// input device in Settings -> Audio can start one when there was
+    /// none.
+    mic_buffer: Arc<Mutex<VecDeque<f32>>>,
     /// Selected input device name for `mic_input` above (Settings ->
     /// Audio's "Input device" picker) -- `None` = system default. Same
     /// fallback-to-default contract as `audio_output_device` (see its doc
@@ -4638,11 +4645,22 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
             spectrum::set_cw_pitch_hz(cfg.cw_pitch_hz.unwrap_or(600.0));
             let mic_buffer = Arc::new(Mutex::new(VecDeque::new()));
             let mic_input_device = cfg.mic_input_device.clone();
-            let (tx_enabled, mic_input, tx_handle) =
-                match MicInput::start(Arc::clone(&mic_buffer), mic_input_device.as_deref()) {
-                Ok(mic) => {
+            // REAL REPORT (2026-11-15): a Raspberry Pi 4 with no USB sound
+            // card has no audio input, and TX used to refuse to arm at
+            // all (Enable Transmit unticked itself). A local mic is only
+            // one TX audio source; CW, TCI and the radio's own mic work
+            // without one.
+            let mic_input = match MicInput::start(Arc::clone(&mic_buffer), mic_input_device.as_deref()) {
+                Ok(mic) => Some(mic),
+                Err(e) => {
+                    eprintln!("mic input unavailable, TX armed without a local mic: {e}");
+                    None
+                }
+            };
+            let (tx_enabled, mic_input, tx_handle) = {
+                {
                     let tx_handle = TxHandle::start(
-                        mic_buffer,
+                        Arc::clone(&mic_buffer),
                         Arc::clone(&session.tci_tx_audio),
                         Arc::clone(&session.radio_mic_audio),
                         Arc::clone(&session.tx_audio_source),
@@ -4692,17 +4710,12 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                             }
                         }
                     }
-                    (true, Some(mic), Some(tx_handle))
-                }
-                Err(e) => {
-                    eprintln!("mic input unavailable, TX not armed: {e}");
-                    (false, None, None)
+                    (true, mic_input, Some(tx_handle))
                 }
             };
             // RX-888: receive-only hardware, no TX capability at all --
-            // `tx_enabled` above only reflects whether a local mic
-            // device happened to open successfully, with no board-
-            // capability check, so without this override the MOX/TUNE/
+            // `tx_enabled` above has no board-capability check, so
+            // without this override the MOX/TUNE/
             // TWO TONE/CW/RIT/XIT row would show up fully clickable
             // (harmless -- there's no sender thread for this board to
             // act on any of it, see start_rx888_usb's doc comment -- but
@@ -4900,6 +4913,7 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                 mute_local_audio_during_tci,
                 tx_enabled,
                 mic_input,
+                mic_buffer,
                 mic_input_device,
                 tx_handle,
                 ptt_held: false,
@@ -10662,8 +10676,9 @@ impl eframe::App for HpsdrApp {
                                                     && connected.mic_input_device.is_some()
                                                 {
                                                     connected.mic_input_device = None;
-                                                    if let Some(mic) = &connected.mic_input {
-                                                        let buffer = Arc::clone(mic.buffer());
+                                                    if connected.tx_handle.is_some() {
+                                                        connected.mic_input = None;
+                                                        let buffer = Arc::clone(&connected.mic_buffer);
                                                         match MicInput::start(buffer, None) {
                                                             Ok(new_mic) => connected.mic_input = Some(new_mic),
                                                             Err(e) => eprintln!("mic input unavailable: {e}"),
@@ -10676,8 +10691,9 @@ impl eframe::App for HpsdrApp {
                                                         connected.mic_input_device.as_deref() == Some(name.as_str());
                                                     if ui.selectable_label(selected, name).clicked() && !selected {
                                                         connected.mic_input_device = Some(name.clone());
-                                                        if let Some(mic) = &connected.mic_input {
-                                                            let buffer = Arc::clone(mic.buffer());
+                                                        if connected.tx_handle.is_some() {
+                                                            connected.mic_input = None;
+                                                            let buffer = Arc::clone(&connected.mic_buffer);
                                                             match MicInput::start(buffer, Some(name)) {
                                                                 Ok(new_mic) => connected.mic_input = Some(new_mic),
                                                                 Err(e) => eprintln!("mic input unavailable: {e}"),
@@ -12041,13 +12057,22 @@ impl eframe::App for HpsdrApp {
                                                 Arc::clone(&connected.session.mute_local_audio_for_tci),
                                             );
                                             let mic_buffer = Arc::new(Mutex::new(VecDeque::new()));
-                                            match MicInput::start(
+                                            // No input device is fine -- see
+                                            // ConnectedState::mic_input.
+                                            let mic = match MicInput::start(
                                                 Arc::clone(&mic_buffer),
                                                 connected.mic_input_device.as_deref(),
                                             ) {
-                                                Ok(mic) => {
+                                                Ok(mic) => Some(mic),
+                                                Err(e) => {
+                                                    eprintln!("mic input unavailable, TX armed without a local mic: {e}");
+                                                    None
+                                                }
+                                            };
+                                            {
+                                                {
                                                     let tx_handle = TxHandle::start(
-                                                        mic_buffer,
+                                                        Arc::clone(&mic_buffer),
                                                         Arc::clone(&connected.session.tci_tx_audio),
                                                         Arc::clone(&connected.session.radio_mic_audio),
                                                         Arc::clone(&connected.session.tx_audio_source),
@@ -12083,13 +12108,10 @@ impl eframe::App for HpsdrApp {
                                                             }
                                                         }
                                                     }
-                                                    connected.mic_input = Some(mic);
+                                                    connected.mic_input = mic;
+                                                    connected.mic_buffer = mic_buffer;
                                                     connected.tx_handle = Some(tx_handle);
                                                     connected.tx_enabled = true;
-                                                }
-                                                Err(e) => {
-                                                    eprintln!("mic input unavailable: {e}");
-                                                    connected.tx_enabled = false;
                                                 }
                                             }
                                         } else {
@@ -12117,6 +12139,12 @@ impl eframe::App for HpsdrApp {
                                             connected.two_tone_active = false;
                                         }
                                         settings_changed = true;
+                                    }
+                                    if connected.tx_enabled && connected.mic_input.is_none() {
+                                        ui.weak(
+                                            "No audio input device, so no local mic -- CW, TCI audio \
+                                             and the radio's own mic still work.",
+                                        );
                                     }
                                     }
 
@@ -18123,9 +18151,9 @@ fn change_sample_rate(connected: &mut ConnectedState, new_rate: u32) {
                 Arc::clone(&connected.session.mox),
                 Arc::clone(&connected.session.mute_local_audio_for_tci),
             );
-            if let Some(mic) = &connected.mic_input {
+            {
                 let tx_handle = TxHandle::start(
-                    Arc::clone(mic.buffer()),
+                    Arc::clone(&connected.mic_buffer),
                     Arc::clone(&connected.session.tci_tx_audio),
                     Arc::clone(&connected.session.radio_mic_audio),
                     Arc::clone(&connected.session.tx_audio_source),
