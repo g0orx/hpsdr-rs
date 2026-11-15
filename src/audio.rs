@@ -27,7 +27,7 @@
 use crate::radio::{CwKeyerAtomics, CW_KEYER_MODE_IAMBIC_A, CW_KEYER_MODE_IAMBIC_B};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -103,7 +103,14 @@ impl AudioOutput {
     /// system default output device, same as this always did before
     /// device selection existed -- never a hard error just because a
     /// specific device isn't found.
-    pub fn start(buffer: Arc<Mutex<VecDeque<(f32, f32)>>>, device_name: Option<&str>) -> Result<Self, String> {
+    ///
+    /// `sidetone`: the PC CW sidetone to mix in (see SidetoneTone), for
+    /// the main receiver's output; `None` for any other output.
+    pub fn start(
+        buffer: Arc<Mutex<VecDeque<(f32, f32)>>>,
+        device_name: Option<&str>,
+        sidetone: Option<Arc<SidetoneTone>>,
+    ) -> Result<Self, String> {
         let host = cpal::default_host();
         let device = match device_name {
             Some(name) => host
@@ -135,6 +142,7 @@ impl AudioOutput {
         // start, which isn't a gap).
         let mut primed = false;
         let mut silent_frames: Option<usize> = None;
+        let mut tone = sidetone.map(ToneSynth::new);
         let stream = device
             .build_output_stream(
                 &config,
@@ -169,6 +177,10 @@ impl AudioOutput {
                             if let Some(n) = silent_frames.as_mut() {
                                 *n += frames;
                             }
+                            drop(buf);
+                            if let Some(tone) = tone.as_mut() {
+                                tone.mix(data, OUTPUT_CHANNELS as usize);
+                            }
                             return;
                         }
                     }
@@ -189,6 +201,10 @@ impl AudioOutput {
                             *left = l;
                             *right = r;
                         }
+                    }
+                    drop(buf);
+                    if let Some(tone) = tone.as_mut() {
+                        tone.mix(data, OUTPUT_CHANNELS as usize);
                     }
                 },
                 move |err| {
@@ -213,23 +229,6 @@ impl AudioOutput {
     }
 }
 
-/// Pure overflow backstop for this generator's writes into audio_out --
-/// same "small, bounded, drop-oldest" reasoning as spectrum.rs's own
-/// AUDIO_BUFFER_CAPACITY, and deliberately the SAME size: this is only
-/// insurance against a genuine pathological stall (e.g. the process
-/// briefly suspended), not a routine control. See run()'s own doc
-/// comment for why actually keeping the queue in sync/free of a
-/// lingering tail is handled by flushing on key transitions instead of
-/// by trimming to a tight target every tick -- an earlier version of
-/// this constant (10ms, enforced every tick) fought the audio backend's
-/// OWN normal output buffering (commonly tens of ms, decided by cpal's
-/// `BufferSize::Default`/the OS, not something this code controls),
-/// repeatedly ripping out samples mid-waveform that simply hadn't been
-/// played yet -- a real report: EVERY element sounded distorted, not
-/// just some, consistent with near-constant chopping rather than an
-/// occasional real desync.
-const CW_SIDETONE_BUFFER_CAPACITY: usize = 14_400;
-
 /// How long the sidetone's on/off envelope takes to ramp fully up or
 /// down, in samples at OUTPUT_SAMPLE_RATE. Same purpose as piHPSDR's own
 /// CW pulse-shaping ramp (transmitter.c's RAMPLEN): a hard on/off edge on
@@ -237,6 +236,87 @@ const CW_SIDETONE_BUFFER_CAPACITY: usize = 14_400;
 /// CW envelope shaping recommendations (2-8ms) without softening dots at
 /// high WPM.
 const CW_SIDETONE_RAMP_SAMPLES: f32 = 0.005 * OUTPUT_SAMPLE_RATE as f32;
+
+/// What the PC CW sidetone should be doing right now, set by CwSidetone's
+/// thread and played by AudioOutput's callback (ToneSynth).
+///
+/// REAL REPORT (2026-11-12, issue #15): the PC sidetone had sharp edges
+/// and low-level ticks on Windows and Linux. It used to be generated in
+/// CwSidetone's own thread and pushed into the receiver's audio queue,
+/// which clicked in two ways once the output started waiting for 50 ms
+/// of audio before playing (PRIME_FRAMES, 2026-11-11): the queue was
+/// emptied at every key transition, cutting the tone off mid-cycle at
+/// key-up, and the 5 ms fade-out after it was too short to restart
+/// playback, so it never played. A thread pacing itself by the clock
+/// also drifts against the sound card, so the queue ran dry now and
+/// then mid-element. Synthesising the tone in the sound card's own
+/// callback has none of these: no queue, no priming, and the envelope
+/// always runs to the end.
+#[derive(Default)]
+pub struct SidetoneTone {
+    keyed: AtomicBool,
+    freq_hz: AtomicU32,
+    /// f32 bits, 0.0-1.0.
+    amplitude: AtomicU32,
+}
+
+impl SidetoneTone {
+    fn set(&self, keyed: bool, freq_hz: u32, amplitude: f32) {
+        self.freq_hz.store(freq_hz, Ordering::Relaxed);
+        self.amplitude.store(amplitude.to_bits(), Ordering::Relaxed);
+        self.keyed.store(keyed, Ordering::Relaxed);
+    }
+}
+
+/// AudioOutput's callback-side generator for SidetoneTone: a sine with a
+/// raised-cosine on/off envelope (CW_SIDETONE_RAMP_SAMPLES long), added
+/// to whatever receiver audio is playing (normally none during TX; the
+/// downlink in Duplex).
+struct ToneSynth {
+    tone: Arc<SidetoneTone>,
+    phase: f64,
+    /// Linear envelope position, 0.0-1.0; shaped below.
+    env: f32,
+}
+
+impl ToneSynth {
+    fn new(tone: Arc<SidetoneTone>) -> Self {
+        Self { tone, phase: 0.0, env: 0.0 }
+    }
+
+    fn mix(&mut self, data: &mut [f32], channels: usize) {
+        let keyed = self.tone.keyed.load(Ordering::Relaxed);
+        if !keyed && self.env <= 0.0 {
+            self.phase = 0.0;
+            return;
+        }
+        let target = if keyed { 1.0 } else { 0.0 };
+        let freq = self.tone.freq_hz.load(Ordering::Relaxed).max(1) as f64;
+        let amplitude = f32::from_bits(self.tone.amplitude.load(Ordering::Relaxed));
+        let step = std::f64::consts::TAU * freq / OUTPUT_SAMPLE_RATE as f64;
+        let ramp_step = 1.0 / CW_SIDETONE_RAMP_SAMPLES;
+        for frame in data.chunks_mut(channels) {
+            if self.env < target {
+                self.env = (self.env + ramp_step).min(target);
+            } else if self.env > target {
+                self.env = (self.env - ramp_step).max(target);
+            }
+            if self.env <= 0.0 && target <= 0.0 {
+                self.phase = 0.0;
+                break;
+            }
+            let shape = 0.5 - 0.5 * (std::f32::consts::PI * self.env).cos();
+            let s = amplitude * shape * self.phase.sin() as f32;
+            self.phase += step;
+            if self.phase >= std::f64::consts::TAU {
+                self.phase -= std::f64::consts::TAU;
+            }
+            for v in frame.iter_mut() {
+                *v = (*v + s).clamp(-1.0, 1.0);
+            }
+        }
+    }
+}
 
 /// Software reconstruction of the radio's own internal Iambic keyer,
 /// used ONLY to drive the PC sidetone's on/off envelope during Iambic
@@ -416,12 +496,15 @@ impl IambicSimulator {
 ///
 /// Added specifically as an opt-in (Settings -> CW's own checkbox, see
 /// `enabled`), NOT tied unconditionally to CW mode being selected --
-/// unlike the radio-side sidetone, this one competes for the same
-/// audio_out queue newRX audio uses (see spectrum.rs's own doc comment:
-/// audio_out is unmuted the instant mox drops), so a user who only has
+/// unlike the radio-side sidetone, this one plays out the same output
+/// as the main receiver's audio (mixed in by AudioOutput's callback,
+/// see SidetoneTone), so a user who only has
 /// the radio's own local sidetone wired up and finds a second PC-side
 /// copy redundant can turn this off without losing the radio's own.
 pub struct CwSidetone {
+    /// What the tone should be doing; AudioOutput plays it (see
+    /// SidetoneTone).
+    pub tone: Arc<SidetoneTone>,
     /// Live on/off toggle -- Settings -> CW's checkbox writes here
     /// directly, no reconnect needed (same pattern as RadioSession::
     /// puresignal_enabled/diversity_enabled).
@@ -431,14 +514,9 @@ pub struct CwSidetone {
 }
 
 impl CwSidetone {
-    /// `audio_out`: the SAME queue AudioOutput's cpal callback drains
-    /// (RadioSession's main-receiver SpectrumHandle's own audio_out) --
-    /// this generator only ever writes into it while ramped above
-    /// silence (see run()'s own doc comment for why that matters), so
-    /// it can share the queue with spectrum.rs's real RX-audio producer
-    /// without a dedicated output device or a mixing stage.
+    /// `tone`: shared with the main receiver's AudioOutput, which plays it.
     pub fn start(
-        audio_out: Arc<Mutex<VecDeque<(f32, f32)>>>,
+        tone: Arc<SidetoneTone>,
         mox: Arc<AtomicBool>,
         cw_mode_active: Arc<AtomicBool>,
         cw_ptt_active: Arc<AtomicBool>,
@@ -449,9 +527,10 @@ impl CwSidetone {
         let stop = Arc::new(AtomicBool::new(false));
         let thread_enabled = Arc::clone(&enabled);
         let thread_stop = Arc::clone(&stop);
+        let thread_tone = Arc::clone(&tone);
         let thread = thread::spawn(move || {
             run(
-                audio_out,
+                thread_tone,
                 mox,
                 cw_mode_active,
                 cw_ptt_active,
@@ -461,7 +540,7 @@ impl CwSidetone {
                 thread_stop,
             );
         });
-        Self { enabled, stop, thread: Some(thread) }
+        Self { tone, enabled, stop, thread: Some(thread) }
     }
 
     pub fn stop(&mut self) {
@@ -479,59 +558,13 @@ impl Drop for CwSidetone {
 }
 
 /// Background loop backing CwSidetone::start. Wakes on a short, fixed
-/// tick (independent of the UI's own frame rate, which can hitch/vary)
-/// and, each tick, generates however many samples real wall-clock time
-/// says should exist since the last tick -- a simple free-running audio
-/// clock, same idea as this project's own RateConverter but driven by
-/// Instant instead of an input sample count.
+/// tick (independent of the UI's own frame rate) and works out whether
+/// the sidetone should be sounding, for AudioOutput's callback to play
+/// (see SidetoneTone for why the tone itself is made there).
 ///
-/// ROOT CAUSE FIX for a real report: initial testing sounded "OK" at
-/// first, then some elements distorted, occasionally drifted out of
-/// sync, and the tone kept sounding briefly after releasing the key.
-///
-/// Bug #1: `keyed` was gated on the radio's keying readback/
-/// cw_mode_active/enabled alone, NOT on mox -- but spectrum.rs's real
-/// RX-audio producer gates its own writes into this SAME queue purely
-/// on mox being false. Since main.rs's break-in logic (which raises
-/// mox) reads that same readback on its own ~16ms UI-frame cadence,
-/// there was a real window on every key-down where this thread could
-/// already be ramping up while spectrum.rs's thread was still pushing
-/// live RX audio into the same queue -- two producers, unsynchronized,
-/// landing in one FIFO. That's the distortion: audible RX content
-/// time-interleaved with the sidetone. Fixed by also requiring `mox`
-/// here, matching spectrum.rs's own gate exactly so the two producers
-/// are mutually exclusive rather than merely usually so.
-///
-/// (A separate, later fix changed WHICH bit `cw_ptt_active` itself
-/// reads -- see RadioSession::cw_ptt_active's own doc comment -- from
-/// raw paddle-contact state to the radio's actual fully-timed keying
-/// status. That fixed a different symptom, individual elements not
-/// being audible during Iambic sending, but is the same underlying
-/// signal referred to here.)
-///
-/// Bug #2: any stale backlog already sitting in the queue when a key
-/// transition happens (leftover RX audio from just before mox went up,
-/// or this generator's own prior-element backlog) plays out BEFORE the
-/// freshly generated samples for the new state, since it's a FIFO --
-/// audible as sync drifting worse over a longer transmission, and as
-/// the tone continuing to sound for a bit after key-up (the queue was
-/// still draining old, already-generated at-full-volume samples).
-/// Fixed by flushing the queue outright on EVERY key transition (both
-/// directions), so only what's generated AFTER a transition (the fresh
-/// tone, or the fresh ramp-down) is ever queued following it.
-///
-/// A second attempt at bug #2 tried enforcing a tight (10ms) target
-/// latency on EVERY tick instead of only at transitions -- that was
-/// itself a bug: it fought the audio backend's own normal output
-/// buffering (commonly tens of ms, decided by cpal/the OS, not
-/// something this code controls), repeatedly ripping out samples mid-
-/// waveform that simply hadn't been played yet. A real report: EVERY
-/// element sounded distorted afterward, not just some -- consistent
-/// with near-constant chopping rather than an occasional real desync.
-/// Reverted to a purely transition-triggered flush plus a generous
-/// passive overflow backstop (CW_SIDETONE_BUFFER_CAPACITY, matching
-/// spectrum.rs's own AUDIO_BUFFER_CAPACITY) that only ever fires on a
-/// genuine pathological stall, never during ordinary playback.
+/// `keyed` also requires `mox`, matching spectrum.rs's own gate on the
+/// receiver audio: an earlier version sounded the tone before main.rs's
+/// break-in had raised mox, over the top of live receiver audio.
 ///
 /// Iambic A/B: `keyed` comes from IambicSimulator instead of
 /// cw_ptt_active directly -- see that struct's own doc comment for
@@ -542,7 +575,7 @@ impl Drop for CwSidetone {
 /// isn't implemented here at all -- see IambicSimulator's own doc
 /// comment on what's deliberately narrower than the reference).
 fn run(
-    audio_out: Arc<Mutex<VecDeque<(f32, f32)>>>,
+    tone: Arc<SidetoneTone>,
     mox: Arc<AtomicBool>,
     cw_mode_active: Arc<AtomicBool>,
     cw_ptt_active: Arc<AtomicBool>,
@@ -552,14 +585,9 @@ fn run(
     stop: Arc<AtomicBool>,
 ) {
     let mut last = Instant::now();
-    let mut phase: f32 = 0.0;
-    let mut gain: f32 = 0.0;
-    let mut was_keyed = false;
     let mut iambic = IambicSimulator::new();
     while !stop.load(Ordering::Relaxed) {
-        // Short tick: tighter envelope/edge timing than the original
-        // 10ms, and a smaller worst-case burst size for the backlog
-        // trim below to reason about.
+        // Short tick: element edges land within 2 ms.
         thread::sleep(Duration::from_millis(2));
         let now = Instant::now();
         let elapsed = now.duration_since(last);
@@ -598,58 +626,16 @@ fn run(
         let radio_keyed = radio_keyed || cw_keyer.live.sidetone_key.load(Ordering::Relaxed);
         let keyed =
             enabled.load(Ordering::Relaxed) && mox.load(Ordering::Relaxed) && cw_mode_active.load(Ordering::Relaxed) && radio_keyed;
-        if keyed != was_keyed {
-            // Any transition -- see this function's own doc comment
-            // (bug #2): drop anything already queued (stale RX audio
-            // from just before mox went up, or this generator's own
-            // backlog from before the transition) so only what's
-            // generated AFTER this point -- the fresh tone on a rising
-            // edge, or the fresh ramp-down on a falling edge -- is ever
-            // heard following it.
-            audio_out.lock().unwrap().clear();
-        }
-        was_keyed = keyed;
-        let target = if keyed { 1.0 } else { 0.0 };
-        let freq_hz = cw_keyer.sidetone_freq_hz.load(Ordering::Relaxed).max(1) as f32;
+        let freq_hz = cw_keyer.sidetone_freq_hz.load(Ordering::Relaxed);
         // Same 0-255 full-byte range as P2's own sidetone_volume byte
         // (see p2_tx_specific_packet) -- reused directly as a 0.0-1.0
         // amplitude scalar rather than inventing a separate PC-only
         // volume control, so the existing Sidetone Level slider governs
         // both the radio's own sidetone AND this one together.
         let amplitude = (cw_keyer.sidetone_volume.load(Ordering::Relaxed).min(255) as f32) / 255.0;
-        let step = 2.0 * std::f32::consts::PI * freq_hz / OUTPUT_SAMPLE_RATE as f32;
-        let ramp_step = 1.0 / CW_SIDETONE_RAMP_SAMPLES;
-        let mut samples: Vec<(f32, f32)> = Vec::with_capacity(samples_needed);
-        for _ in 0..samples_needed {
-            if gain < target {
-                gain = (gain + ramp_step).min(target);
-            } else if gain > target {
-                gain = (gain - ramp_step).max(target);
-            }
-            if gain <= 0.0 && target <= 0.0 {
-                // Fully silent -- stop generating for the rest of this
-                // tick too (target can't un-ramp mid-loop; enabled/
-                // mox/cw_mode_active/cw_ptt_active are only re-read
-                // next tick).
-                break;
-            }
-            phase += step;
-            if phase >= 2.0 * std::f32::consts::PI {
-                phase -= 2.0 * std::f32::consts::PI;
-            }
-            let s = amplitude * gain * phase.sin();
-            samples.push((s, s));
-        }
-        if !samples.is_empty() {
-            let mut out = audio_out.lock().unwrap();
-            for pair in samples {
-                if out.len() >= CW_SIDETONE_BUFFER_CAPACITY {
-                    out.pop_front();
-                }
-                out.push_back(pair);
-            }
-        }
+        tone.set(keyed, freq_hz, amplitude);
     }
+    tone.set(false, 0, 0.0);
 }
 
 /// Same small-ring-buffer-with-drop-on-overflow philosophy as the RX
@@ -753,6 +739,30 @@ fn downmix_to_mono(interleaved: &[f32], channels: u16, out: &mut Vec<f32>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The sidetone starts and ends at silence with no step anywhere,
+    /// including across callback boundaries and at key-up mid-cycle.
+    #[test]
+    fn sidetone_has_no_steps() {
+        let tone = Arc::new(SidetoneTone::default());
+        let mut synth = ToneSynth::new(Arc::clone(&tone));
+        let mut out = Vec::new();
+        for i in 0..200 {
+            // Key down for 40 blocks of 37 frames, then up.
+            tone.set((10..50).contains(&i), 1200, 1.0);
+            let mut block = vec![0.0f32; 37 * 2];
+            synth.mix(&mut block, 2);
+            out.extend(block.chunks(2).map(|f| f[0]));
+        }
+        // Max step for a full-scale 1200 Hz sine is 2*pi*1200/48000 =
+        // 0.157; the envelope adds very little on top.
+        let max_step = out.windows(2).map(|w| (w[1] - w[0]).abs()).fold(0.0, f32::max);
+        assert!(max_step < 0.17, "step {max_step}");
+        assert_eq!(out[0], 0.0);
+        assert_eq!(*out.last().unwrap(), 0.0);
+        assert!(out.iter().any(|v| v.abs() > 0.99));
+    }
+
 
     #[test]
     fn downmix_averages_all_channels() {

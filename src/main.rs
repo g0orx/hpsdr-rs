@@ -4266,8 +4266,13 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                 Arc::clone(&session.mute_local_audio_for_tci),
             );
             let audio_output_device = cfg.audio_output_device.clone();
+            let sidetone_tone = Arc::new(audio::SidetoneTone::default());
             let audio_output =
-                match AudioOutput::start(Arc::clone(&spectrum.audio_out), audio_output_device.as_deref()) {
+                match AudioOutput::start(
+                    Arc::clone(&spectrum.audio_out),
+                    audio_output_device.as_deref(),
+                    Some(Arc::clone(&sidetone_tone)),
+                ) {
                     Ok(a) => Some(a),
                     Err(e) => {
                         eprintln!("audio output unavailable: {e}");
@@ -4741,11 +4746,10 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
             // A separate, additive feature from the radio's own
             // internal-keyer sidetone; reads the SAME live keyed/PTT-
             // readback and keyer-config atomics main.rs's break-in
-            // mirror already reads, and writes into spectrum's own
-            // audio_out (the main receiver's local-speaker queue), so
-            // no new audio device/output is needed.
+            // mirror already reads; the main receiver's AudioOutput
+            // plays it, so no new audio device/output is needed.
             let cw_sidetone = audio::CwSidetone::start(
-                Arc::clone(&spectrum.audio_out),
+                sidetone_tone,
                 Arc::clone(&session.mox),
                 Arc::clone(&session.cw_mode_active),
                 Arc::clone(&session.cw_ptt_active),
@@ -10601,8 +10605,12 @@ impl eframe::App for HpsdrApp {
                                                 {
                                                     connected.audio_output_device = None;
                                                     connected.audio_output =
-                                                        AudioOutput::start(Arc::clone(&connected.spectrum.audio_out), None)
-                                                            .ok();
+                                                        AudioOutput::start(
+                                                        Arc::clone(&connected.spectrum.audio_out),
+                                                        None,
+                                                        Some(Arc::clone(&connected.cw_sidetone.tone)),
+                                                    )
+                                                    .ok();
                                                     settings_changed = true;
                                                 }
                                                 for name in &devices {
@@ -10613,6 +10621,7 @@ impl eframe::App for HpsdrApp {
                                                         connected.audio_output = AudioOutput::start(
                                                             Arc::clone(&connected.spectrum.audio_out),
                                                             Some(name),
+                                                            Some(Arc::clone(&connected.cw_sidetone.tone)),
                                                         )
                                                         .ok();
                                                         settings_changed = true;
@@ -12168,7 +12177,7 @@ impl eframe::App for HpsdrApp {
                                                 // ConnectedState::audio_output_device's doc comment on
                                                 // why this doesn't follow the RX output device
                                                 // selection.
-                                                match AudioOutput::start(Arc::clone(&tx.tx_audio_monitor), None) {
+                                                match AudioOutput::start(Arc::clone(&tx.tx_audio_monitor), None, None) {
                                                     Ok(out) => connected.tx_audio_monitor_output = Some(out),
                                                     Err(e) => eprintln!("tx audio monitor unavailable: {e}"),
                                                 }
@@ -17442,14 +17451,14 @@ fn render_extra_receiver_settings(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceive
                             && rx.audio_output_device.is_some()
                         {
                             rx.audio_output_device = None;
-                            rx.audio_output = AudioOutput::start(Arc::clone(&rx.spectrum.audio_out), None).ok();
+                            rx.audio_output = AudioOutput::start(Arc::clone(&rx.spectrum.audio_out), None, None).ok();
                             rx.settings_dirty.store(true, Ordering::Relaxed);
                         }
                         for name in &devices {
                             let selected = rx.audio_output_device.as_deref() == Some(name.as_str());
                             if ui.selectable_label(selected, name).clicked() && !selected {
                                 rx.audio_output_device = Some(name.clone());
-                                rx.audio_output = AudioOutput::start(Arc::clone(&rx.spectrum.audio_out), Some(name)).ok();
+                                rx.audio_output = AudioOutput::start(Arc::clone(&rx.spectrum.audio_out), Some(name), None).ok();
                                 rx.settings_dirty.store(true, Ordering::Relaxed);
                             }
                         }
@@ -17895,7 +17904,7 @@ fn spawn_extra_receiver(
 
     let audio_output_device = saved.and_then(|s| s.audio_output_device.clone());
     let audio_output =
-        AudioOutput::start(Arc::clone(&spectrum.audio_out), audio_output_device.as_deref()).ok();
+        AudioOutput::start(Arc::clone(&spectrum.audio_out), audio_output_device.as_deref(), None).ok();
     let initial_frequency_hz = freq_arc.load(Ordering::Relaxed);
     // Restore CTUN -- see Config::ctun's doc comment (same reasoning,
     // per receiver).
@@ -18044,6 +18053,7 @@ fn change_sample_rate(connected: &mut ConnectedState, new_rate: u32) {
     connected.audio_output = match AudioOutput::start(
         Arc::clone(&spectrum.audio_out),
         connected.audio_output_device.as_deref(),
+        Some(Arc::clone(&connected.cw_sidetone.tone)),
     ) {
         Ok(a) => Some(a),
         Err(e) => {
@@ -18244,7 +18254,7 @@ fn change_extra_receiver_sample_rate(rx: &mut ExtraReceiver, new_rate: u32) {
     spectrum.set_squelch_level(agc_params.squelch_level);
     spectrum.set_binaural(agc_params.binaural);
 
-    rx.audio_output = match AudioOutput::start(Arc::clone(&spectrum.audio_out), rx.audio_output_device.as_deref()) {
+    rx.audio_output = match AudioOutput::start(Arc::clone(&spectrum.audio_out), rx.audio_output_device.as_deref(), None) {
         Ok(a) => Some(a),
         Err(e) => {
             eprintln!("audio output unavailable after sample rate change: {e}");
