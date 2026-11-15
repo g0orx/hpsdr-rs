@@ -63,6 +63,13 @@ rewire that encoder line to GPIO 14, and set it here.
   on Raspberry Pi OS is: `groups` lists them; `sudo adduser $USER gpio` and
   `sudo adduser $USER i2c` add them (log out and in again).
 - No other program (piHPSDR, say) can be using the same GPIO lines.
+- No kernel driver can be using them either: SPI, or a `dtoverlay=` line
+  in `/boot/firmware/config.txt` (a display, sound card or 1-Wire overlay,
+  say). Controller 1 uses GPIO 7 and 8, SPI's chip selects, so SPI must be
+  off (`sudo raspi-config` → Interface Options → SPI → No) and no overlay
+  may claim them. If a line is busy, the status line says which one and
+  what holds it; `gpioinfo` on the Pi lists every line and its user.
+  Remove or change the overlay and reboot.
 
 The controller is only supported on Linux; elsewhere the tab says so.
 

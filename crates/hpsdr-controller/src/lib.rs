@@ -640,11 +640,16 @@ mod linux {
                     .with_debounce_period(bounce);
             }
             let request = builder.request().map_err(|e| {
-                format!(
-                    "Couldn't open the GPIO lines on {}: {e} (in use by another program, or not in the \
-                     'gpio' group?)",
-                    chip.display()
-                )
+                let busy = busy_lines(&chip, debounce.keys().copied());
+                if busy.is_empty() {
+                    format!(
+                        "Couldn't open the GPIO lines on {}: {e} (in use by another program, or not in the \
+                         'gpio' group?)",
+                        chip.display()
+                    )
+                } else {
+                    format!("Couldn't open the GPIO lines on {}: {}", chip.display(), busy)
+                }
             })?;
             // Where each encoder line is now: low (contact closed) is 1.
             for (&pin, role) in &roles {
@@ -708,6 +713,38 @@ mod linux {
         pub fn status(&self) -> String {
             self.status.clone()
         }
+    }
+
+    /// Which of `pins` something else already holds, and what: usually a
+    /// kernel driver enabled in config.txt (SPI holds GPIO 7/8 as its chip
+    /// selects, 1-Wire holds GPIO 4, ...). Empty if none or unreadable.
+    fn busy_lines(chip: &std::path::Path, pins: impl Iterator<Item = u32>) -> String {
+        let Ok(c) = gpiocdev::chip::Chip::from_path(chip) else { return String::new() };
+        let mut pins: Vec<u32> = pins.collect();
+        pins.sort_unstable();
+        let mut busy = Vec::new();
+        let mut spi = false;
+        for pin in pins {
+            let Ok(info) = c.line_info(pin) else { continue };
+            if info.used {
+                let who = if info.consumer.is_empty() { "the kernel".to_string() } else { info.consumer.clone() };
+                spi |= who.to_ascii_lowercase().contains("spi");
+                busy.push(format!("GPIO {pin} is in use by \"{who}\""));
+            }
+        }
+        if busy.is_empty() {
+            return String::new();
+        }
+        let mut s = busy.join(", ");
+        if spi {
+            s.push_str(
+                ". SPI is enabled: turn it off (raspi-config, Interface Options, SPI, or remove \
+                 dtparam=spi=on from /boot/firmware/config.txt) and reboot",
+            );
+        } else {
+            s.push_str(". Turn off whatever uses those pins in /boot/firmware/config.txt and reboot");
+        }
+        s
     }
 
     /// The Pi's 40-pin header GPIO chip: labelled pinctrl-rp1 on a Pi 5,
