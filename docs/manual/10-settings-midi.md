@@ -160,7 +160,7 @@ to check.
 | TX Drive | Transmit power |
 | CW Speed | The radio's internal keyer speed (WPM) |
 | CW Sidetone Level | Sidetone level, 0-127 ([Settings: CW](06-settings-cw.md)) |
-| CW Sidetone Frequency | Sidetone frequency, 100-1000 Hz |
+| CW Sidetone Frequency | Sidetone frequency, 300-1200 Hz |
 | CW Pitch | CW Pitch, 300-1000 Hz -- where CWL/CWU center the RX filter, and the TX offset |
 | Filter Width | Set the filter width directly |
 

@@ -445,7 +445,7 @@ fn ps_feedback_config(protocol: u8, board: Boards, receivers: u8) -> Option<(u8,
 /// Protocol 1 / 0-255 on Protocol 2): Speed 1-60 WPM (default 16),
 /// Weight 0-100 (default 50), Sidetone level 0-127 (default 50, still
 /// clamped at the point each byte is actually built, not here),
-/// Sidetone frequency 100-1000Hz (default 800), Hang time (labeled
+/// Sidetone frequency 300-1200Hz (Thetis's range) (default 800), Hang time (labeled
 /// "Break-in delay" in the UI -- matches piHPSDR's own CW menu wording
 /// for this exact value) 0-1000ms (default 500).
 pub struct CwKeyerAtomics {

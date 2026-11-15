@@ -184,6 +184,16 @@ pub fn passband_for(mode: Mode, width_hz: f64) -> (f64, f64) {
     }
 }
 
+/// The widest the filter width control goes for `mode` (Hz). FM gets
+/// 8 kHz (+/-8 kHz) for wide VHF/UHF FM; everything else stops at 5 kHz
+/// so the slider stays fine enough for CW and SSB.
+pub fn max_width_hz(mode: Mode) -> f64 {
+    match mode {
+        Mode::Fmn => 8000.0,
+        _ => 5000.0,
+    }
+}
+
 /// Reasonable default filter width (Hz) per mode, used to initialize the
 /// UI's width slider.
 pub fn default_width_hz(mode: Mode) -> f64 {

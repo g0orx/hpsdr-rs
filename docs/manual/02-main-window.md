@@ -365,7 +365,7 @@ Below that, a row of mode buttons: **LSB, USB, DSB, CWL, CWU, FM, AM, DIGU,
 SPEC, DIGL, SAM, DRM**.
 
 Next to the mode row, **Filter width** sets the demodulator passband width
-in Hz (50-5000 Hz). Each mode remembers its own last-used width. **USB**
+in Hz (50-5000 Hz, or up to 8000 Hz in FM). Each mode remembers its own last-used width. **USB**
 and **LSB** filters start 150 Hz from the carrier; **DIGU** and **DIGL**
 start at 0 Hz, using the whole audio passband (e.g. for a high-speed
 modem) -- for transmit as well as receive.

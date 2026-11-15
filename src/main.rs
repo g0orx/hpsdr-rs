@@ -2244,7 +2244,7 @@ fn apply_midi_binding(
         MidiAction::FilterWidthUp | MidiAction::FilterWidthDown => {
             let current_width = connected.spectrum.width_hz();
             let step = if binding.action == MidiAction::FilterWidthUp { 50.0 } else { -50.0 };
-            let width = (current_width + step).clamp(50.0, 5000.0);
+            let width = (current_width + step).clamp(50.0, spectrum::max_width_hz(current_mode));
             connected.spectrum.set_width_hz(width);
             if let Some(tx) = &connected.tx_handle {
                 tx.set_width_hz(width);
@@ -2252,7 +2252,7 @@ fn apply_midi_binding(
             connected.width_memory.insert(current_mode.label().to_string(), width);
         }
         MidiAction::FilterWidth => {
-            let width = midi_knob_range(ev.value, 50.0, 5000.0);
+            let width = midi_knob_range(ev.value, 50.0, spectrum::max_width_hz(current_mode));
             connected.spectrum.set_width_hz(width);
             if let Some(tx) = &connected.tx_handle {
                 tx.set_width_hz(width);
@@ -2468,7 +2468,7 @@ fn apply_midi_binding(
             connected.session.cw_keyer.sidetone_volume.store(ev.value as u32, Ordering::Relaxed);
         }
         MidiAction::CwSidetoneFreq => {
-            let hz = midi_knob_range(ev.value, 100.0, 1000.0).round() as u32;
+            let hz = midi_knob_range(ev.value, 300.0, 1200.0).round() as u32;
             connected.session.cw_keyer.sidetone_freq_hz.store(hz, Ordering::Relaxed);
         }
         MidiAction::CwPitch => {
@@ -2550,10 +2550,12 @@ fn midi_knob_value(connected: &ConnectedState, action: MidiAction) -> Option<u8>
         MidiAction::CwSpeed => scale(connected.session.cw_keyer.speed_wpm.load(Ordering::Relaxed) as f64, 1.0, 60.0),
         MidiAction::CwSidetoneLevel => connected.session.cw_keyer.sidetone_volume.load(Ordering::Relaxed).min(127) as u8,
         MidiAction::CwSidetoneFreq => {
-            scale(connected.session.cw_keyer.sidetone_freq_hz.load(Ordering::Relaxed) as f64, 100.0, 1000.0)
+            scale(connected.session.cw_keyer.sidetone_freq_hz.load(Ordering::Relaxed) as f64, 300.0, 1200.0)
         }
         MidiAction::CwPitch => scale(spectrum::cw_pitch_hz(), 300.0, 1000.0),
-        MidiAction::FilterWidth => scale(connected.spectrum.width_hz(), 50.0, 5000.0),
+        MidiAction::FilterWidth => {
+            scale(connected.spectrum.width_hz(), 50.0, spectrum::max_width_hz(connected.spectrum.mode()))
+        }
         _ => return None,
     })
 }
@@ -4230,7 +4232,7 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
             session
                 .cw_keyer
                 .sidetone_freq_hz
-                .store(cfg.cw_keyer_sidetone_freq_hz.unwrap_or(800), Ordering::Relaxed);
+                .store(cfg.cw_keyer_sidetone_freq_hz.unwrap_or(800).clamp(300, 1200), Ordering::Relaxed);
             session
                 .cw_keyer
                 .hang_time_ms
@@ -6836,7 +6838,7 @@ impl eframe::App for HpsdrApp {
                             ui,
                             &mut connected.slider_scroll_accum,
                             &mut width,
-                            50.0..=5000.0,
+                            50.0..=spectrum::max_width_hz(current_mode),
                             50.0,
                             " Hz",
                         ) {
@@ -10811,7 +10813,7 @@ impl eframe::App for HpsdrApp {
                                             ui,
                                             &mut connected.slider_scroll_accum,
                                             &mut freq,
-                                            100.0..=1000.0,
+                                            300.0..=1200.0,
                                             10.0,
                                             " Hz",
                                         ) {
@@ -16648,7 +16650,7 @@ fn render_extra_receiver_ui(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceiver>>) {
         ui.add_space(12.0);
         ui.label("Filter width:");
         let mut width = current_width;
-        if scroll_slider_f64(ui, &mut rx.slider_scroll_accum, &mut width, 50.0..=5000.0, 50.0, " Hz") {
+        if scroll_slider_f64(ui, &mut rx.slider_scroll_accum, &mut width, 50.0..=spectrum::max_width_hz(current_mode), 50.0, " Hz") {
             rx.spectrum.set_width_hz(width);
             rx.width_memory.insert(current_mode.label().to_string(), width);
             rx.settings_dirty.store(true, Ordering::Relaxed);

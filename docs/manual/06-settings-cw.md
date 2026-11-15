@@ -31,7 +31,7 @@ sidetone, and TX/RX switching entirely on its own.
   the standard 1:3 ratio; higher lengthens dashes and shortens dots,
   lower does the reverse.
 - **Sidetone Level** -- 0-127, 50 by default.
-- **Sidetone Frequency** -- 100-1000 Hz, 800 Hz by default. What you
+- **Sidetone Frequency** -- 300-1200 Hz, 800 Hz by default. What you
   hear in your own headphones while sending -- independent of **CW
   Pitch** above, which is the RX side.
 - **Break-in Delay** -- 0-1000 ms, 500 ms by default. How long the radio
