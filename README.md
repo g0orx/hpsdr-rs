@@ -18,19 +18,40 @@ This project started as an experiment: could Claude port the discovery code from
 
 ## Features
 
-- Protocol 1 (Metis/Ozy) and Protocol 2 (Hermes/Orion) support, with standard openHPSDR UDP discovery (broadcast, port 1024)
-- Multiple simultaneous receivers (main receiver + independent "extra receiver" windows), each with its own VFO, mode, filter width, and band memory
-- Spectrum/waterfall display with adjustable dB range, palette, and Click-to-Tune (CTUN)
-- SSB/CW/AM/FM/digital modes, per-mode/per-band filter width and mode memory
-- Noise blanker (NB/NB2), noise reduction (NR/NR2/NNR), and SNB (spectral noise blanker), independently switchable
-- AGC with selectable Off/Long/Slow/Medium/Fast modes
-- TX: mic audio through WDSP's TXA chain, ALC, TX power/SWR meter with per-band PA calibration, and a Tune button (WDSP PostGen tone centered in the passband, at a separate reduced "Tune Power" for safe antenna/PA tuning)
-- PureSignal (PA linearization/predistortion), on both Protocol 1 and Protocol 2 — see [PureSignal calibration](#puresignal-calibration) below for how to set it up
-- rigctl (Hamlib-compatible), TCI (WebSocket), and CAT (Kenwood TS-2000 emulation) control servers, for use with WSJT-X, N1MM+, Log4OM, and similar logging/digital-mode software
-- Dual VFO (VFO A/B) with Split -- transmit on VFO B while receiving on VFO A
-- Selectable RX output / TX input audio devices (independent of the OS default), for routing through virtual audio cables
-- Per-radio settings persistence (keyed by the radio's MAC address, so multiple physical radios each keep their own saved configuration)
+**Radios**
+- openHPSDR Protocol 1 and Protocol 2 over Ethernet: Metis, Hermes, Angelia, Orion/Orion2 (the ANAN range) and Hermes Lite 2, found by broadcast discovery on every network interface or added by IP address
+- The original Ozy/Mercury/Penny over USB (see [Ozy USB](#ozy-usb-legacy-hardware)), the ADALM-Pluto (RX and TX, see the [manual](docs/manual/24-pluto.md)), and receive-only [RX-888 Mk2](#rx-888-mk2-receive-only-direct-sampling-sdr), [RTL-SDR](#rtl-sdr-dongles-receive-only) and [MSI.SDR](#msisdr--msi2500-sticks-receive-only) dongles (several at once, each kept by USB port)
+- Settings saved per radio (keyed by MAC address)
+
+**Receive**
+- Main receiver plus independent extra receiver windows, each with its own VFO, mode, filter and AF gain
+- Spectrum/waterfall with Click-to-Tune (CTUN), adjustable dB range, palettes and automatic floor tracking
+- SSB/CW/AM/FM/digital modes; filter, AF gain and mode remembered per mode and per band; band stack with 3 memories per band
+- NB/NB2, NR/NR2/NNR, SNB, squelch; AGC Off/Long/Slow/Medium/Fast with adjustable gain
+- Diversity reception, RX equalizer, built-in CW decoder, and Record to WAV
+
+**Transmit**
+- Mic audio through WDSP's TX chain with ALC, compressor, TX equalizer and power/SWR/ALC meters; TX also works with no local mic (CW, TCI audio, the radio's own mic)
+- PureSignal (PA linearization) on both protocols, switchable live — see [PureSignal calibration](#puresignal-calibration) below
+- Per-band 9-point PA calibration, Tune at a separate reduced power, two-tone test, TX spectrum
+- Dual VFO with Split and Duplex, TX tail delay, FM repeater shift, CTCSS and selectable FM deviation
+- CW: radio keyer settings with break-in, PC sidetone, five stored messages sent as CW, TX offset by the CW pitch
+
+**Station integration**
+- TCI (WebSocket, modelled on Thetis), rigctl (Hamlib) and Kenwood TS-2000 CAT servers for WSJT-X, N1MM+, Log4OM and similar; CAT also on up to 3 serial ports for amplifiers
+- MIDI control surfaces with learn mode and Thetis Midi2Cat import
+- Raspberry Pi front panels: piHPSDR's Controller 1, 2 V1, 2 V2 and G2 (GPIO and MCP23017 I2C)
+- Open-collector outputs, filter boards (Alex, Apollo, Charly25, N2ADR), per-band RX/TX antennas, HL2 IO board and audio codec add-on
+- Selectable RX output / TX input audio devices, for virtual audio cables
+
+**VHF/UHF and satellite**
+- Transverters up to 10 GHz (QO-100 via an LNB), QO-100 beacon monitor with LNB lock, and a [DVB-S2 DATV](#datv-dvb-s2-receive) receiver
+
+**Also**
+- hpsdr-remote: a thin client (native or in a browser) that operates hpsdr-rs remotely over TCI, including from a Raspberry Pi with a front-panel controller
+- Compact layout for 7" displays (chosen automatically by screen size) and full screen
 - FPGA firmware upload and static IP configuration — see [Firmware update](#firmware-update) below
+- Installers for Windows (.msi), macOS (Apple Silicon) and Linux (AppImage, .deb, .rpm for x86_64 and ARM64); a [user manual](docs/manual/README.md), also as a PDF
 
 ## Supported hardware
 
@@ -43,6 +64,8 @@ And separately again: the receive-only [RX-888 Mk2](#rx-888-mk2-receive-only-dir
 And: receive-only [RTL-SDR dongles](#rtl-sdr-dongles-receive-only) (RTL2832U + R820T/R820T2/R828D tuner, e.g. the NooElec NESDR Smart) — see that section below. **Confirmed working on a real NESDR Smart v5.**
 
 And: receive-only [MSI.SDR / MSi2500 sticks](#msisdr--msi2500-sticks-receive-only) (Mirics MSi2500 + MSi001, also the SDRplay RSP1) — see that section below. **Confirmed working on a real MSI.SDR stick.**
+
+And: the [ADALM-Pluto](docs/manual/24-pluto.md) and its clones, reached over the network through the Pluto's own iiod server (no libiio needed). **Receive confirmed on real hardware (QO-100 and DATV); transmit checked by the chip's own loopback, not yet on air.**
 
 ## Building
 
