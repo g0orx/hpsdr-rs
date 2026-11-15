@@ -350,6 +350,10 @@ pub struct Config {
     /// map didn't exist at all.
     #[serde(default)]
     pub width_memory: std::collections::HashMap<String, f64>,
+    /// Last AF Gain used per mode, keyed by Mode::label() -- see main.rs's
+    /// track_gain_per_mode.
+    #[serde(default)]
+    pub gain_memory: std::collections::HashMap<String, f32>,
     /// Extra receivers (beyond the primary one above), P2 only. On
     /// reconnect these are automatically recreated with their saved
     /// settings, matching however many were active last time.
@@ -707,6 +711,9 @@ pub struct ExtraReceiverConfig {
     /// receiver instead of shared across the session.
     #[serde(default)]
     pub width_memory: std::collections::HashMap<String, f64>,
+    /// See Config::gain_memory.
+    #[serde(default)]
+    pub gain_memory: std::collections::HashMap<String, f32>,
     pub mode: Mode,
     pub width_hz: f64,
     pub gain: f32,

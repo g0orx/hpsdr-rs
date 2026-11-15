@@ -378,6 +378,11 @@ volume). The slider is scaled in dB (-100 to +30), so each step is an equal
 relative loudness change across the whole range rather than the low end
 being too coarse and the high end too fine on a plain linear scale.
 
+Each mode remembers its own Audio gain, as it does its filter width, so
+turning FM down doesn't change USB or CW. FM runs without AGC, so at the
+same setting it's usually much louder than SSB with AGC Off; set it once
+in FM and it stays there. Extra receivers remember theirs separately.
+
 **Mute**, next to the slider, silences the speakers without moving it,
 so unmuting comes back at the same level. It's shown in red while on.
 Only the speakers go quiet: [Record](#record), TCI's audio stream, the

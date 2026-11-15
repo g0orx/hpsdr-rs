@@ -892,6 +892,36 @@ fn xvtr_memory_key(xvtr_name: &str) -> String {
 /// first time a mode is used, same as before this per-mode memory
 /// existed. Keyed by Mode::label() (a fixed string) rather than Mode
 /// itself so it round-trips through JSON the same way band_memory does.
+/// AF Gain is remembered per mode, like filter width. REAL REPORT
+/// (2026-11-12, issue #15): FM much louder than USB/CW. WDSP runs FM with
+/// no AGC (RXASetMode turns it off), so FM always plays at the
+/// discriminator's own level -- measured -13 dBFS at 2.5 kHz deviation,
+/// and the same for open-squelch noise -- while SSB with AGC Off (the
+/// default) is only as loud as the signal. No fixed trim suits both AGC
+/// settings, so each mode keeps its own AF Gain instead.
+///
+/// Run once per frame: when the mode has changed by any route (buttons,
+/// band recall, band stack, MIDI, CAT, TCI), the gain in use is stored
+/// for the mode being left and the new mode's is restored. A mode with
+/// nothing stored yet keeps the current gain. Returns whether it did
+/// anything, so the caller can save settings.
+fn track_gain_per_mode(
+    spectrum: &SpectrumHandle,
+    memory: &mut std::collections::HashMap<String, f32>,
+    gain_mode: &mut spectrum::Mode,
+) -> bool {
+    let mode = spectrum.mode();
+    if mode == *gain_mode {
+        return false;
+    }
+    memory.insert(gain_mode.label().to_string(), spectrum.gain());
+    if let Some(&gain) = memory.get(mode.label()) {
+        spectrum.set_gain(gain);
+    }
+    *gain_mode = mode;
+    true
+}
+
 fn width_for_mode(width_memory: &std::collections::HashMap<String, f64>, mode: spectrum::Mode) -> f64 {
     width_memory
         .get(mode.label())
@@ -2804,6 +2834,9 @@ struct ExtraReceiver {
     /// Last filter width used per mode -- see width_for_mode's doc
     /// comment. Keyed by Mode::label().
     width_memory: std::collections::HashMap<String, f64>,
+    /// See track_gain_per_mode.
+    gain_memory: std::collections::HashMap<String, f32>,
+    gain_mode: spectrum::Mode,
     /// CTUN ("Click to Tune") -- see ConnectedState::ctun's doc comment
     /// for the full explanation; same behavior here, just per extra
     /// receiver instead of shared across the whole session.
@@ -3143,6 +3176,10 @@ struct ConnectedState {
     /// Last filter width used per mode -- see width_for_mode's doc
     /// comment. Keyed by Mode::label().
     width_memory: std::collections::HashMap<String, f64>,
+    /// See track_gain_per_mode.
+    gain_memory: std::collections::HashMap<String, f32>,
+    /// The mode `spectrum`'s AF Gain currently belongs to.
+    gain_mode: spectrum::Mode,
     /// CTUN ("Click to Tune"): when on, the hardware/LO frequency
     /// (session.frequency_hz) stays fixed and clicking/scrolling the
     /// spectrum instead moves ctun_frequency_hz -- a listen frequency
@@ -4763,6 +4800,7 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
             // readback and keyer-config atomics main.rs's break-in
             // mirror already reads; the main receiver's AudioOutput
             // plays it, so no new audio device/output is needed.
+            let gain_mode = spectrum.mode();
             let cw_sidetone = audio::CwSidetone::start(
                 sidetone_tone,
                 Arc::clone(&session.mox),
@@ -4853,6 +4891,8 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                 settings_dirty,
                 band_memory: cfg.band_settings.clone(),
                 width_memory: cfg.width_memory.clone(),
+                gain_memory: cfg.gain_memory.clone(),
+                gain_mode,
                 ctun,
                 ctun_frequency_hz,
                 last_requested_frequency_hz: initial_frequency_hz as u64,
@@ -5755,6 +5795,9 @@ impl eframe::App for HpsdrApp {
                 }
                 midi_feedback(connected);
 
+                if track_gain_per_mode(&connected.spectrum, &mut connected.gain_memory, &mut connected.gain_mode) {
+                    connected.settings_dirty.store(true, Ordering::Relaxed);
+                }
                 let current_gain = connected.spectrum.gain();
                 let current_agc = connected.spectrum.agc();
                 let agc_params = connected.spectrum.agc_params();
@@ -13595,6 +13638,11 @@ impl eframe::App for HpsdrApp {
                                 bandstacks: rx.bandstacks.clone(),
                                 bandstack_index: rx.bandstack_index.clone(),
                                 width_memory: rx.width_memory.clone(),
+                                gain_memory: {
+                                    let mut m = rx.gain_memory.clone();
+                                    m.insert(rx.gain_mode.label().to_string(), rx.spectrum.gain());
+                                    m
+                                },
                                 eq: agc_params.eq,
                                 window_geometry: rx.window_geometry,
                                 ctun: rx.ctun,
@@ -13683,6 +13731,11 @@ impl eframe::App for HpsdrApp {
                         antenna: None,
                         band_settings: connected.band_memory.clone(),
                         width_memory: connected.width_memory.clone(),
+                        gain_memory: {
+                            let mut m = connected.gain_memory.clone();
+                            m.insert(connected.gain_mode.label().to_string(), connected.spectrum.gain());
+                            m
+                        },
                         pa_calibration: connected.pa_calibration.clone(),
                         pa_drive_adjust: connected.pa_drive_adjust.clone(),
                         max_tx_power_watts: Some(connected.max_tx_power_watts),
@@ -16342,6 +16395,12 @@ fn s_meter_label(db: f64, s9: f64) -> String {
 /// which is fine at normal UI frame rates.
 fn render_extra_receiver_ui(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceiver>>) {
     let mut rx = rx.lock().unwrap();
+    {
+        let rx = &mut *rx;
+        if track_gain_per_mode(&rx.spectrum, &mut rx.gain_memory, &mut rx.gain_mode) {
+            rx.settings_dirty.store(true, Ordering::Relaxed);
+        }
+    }
     rx.resize_overlay.show(ui.ctx());
 
     // Same CW decoder panel as the main receiver window -- see
@@ -17960,6 +18019,7 @@ fn spawn_extra_receiver(
     let cw_decode_enabled = saved.and_then(|s| s.cw_decode_enabled).unwrap_or(true);
     let controls_minimized = saved.and_then(|s| s.controls_minimized).unwrap_or(false);
 
+    let gain_mode = spectrum.mode();
     Some(Arc::new(Mutex::new(ExtraReceiver {
         ddc_index: idx,
         iq_buffer,
@@ -18002,6 +18062,8 @@ fn spawn_extra_receiver(
         bandstacks: saved.map(|s| s.bandstacks.clone()).unwrap_or_default(),
         bandstack_index: saved.map(|s| s.bandstack_index.clone()).unwrap_or_default(),
         width_memory: saved.map(|s| s.width_memory.clone()).unwrap_or_default(),
+        gain_memory: saved.map(|s| s.gain_memory.clone()).unwrap_or_default(),
+        gain_mode,
         ctun,
         ctun_frequency_hz,
         vfo_b_frequency_hz,

@@ -2483,3 +2483,76 @@ mod squelch_tests {
         assert!(Squelch::available(Mode::Lsb));
     }
 }
+
+#[cfg(test)]
+mod level_tests {
+    use super::*;
+
+    /// RMS of the left channel after settling, for a carrier `make(n)`.
+    fn level(ch: i32, mode: Mode, agc: Agc, make: &dyn Fn(usize) -> (f64, f64)) -> f64 {
+        let mut a = SpectrumAnalyzer::open(ch, 48_000);
+        let params = DemodParams { mode, width_hz: default_width_hz(mode), agc, ..DemodParams::default() };
+        let pb = passband_for(mode, params.width_hz);
+        let (mut sum, mut count) = (0.0, 0usize);
+        for b in 0..300 {
+            let iq: Vec<IqSample> = (0..BUFFER_SIZE)
+                .map(|k| {
+                    let (re, im) = make(b * BUFFER_SIZE + k);
+                    IqSample { i: (re * IQ_NORM) as i32, q: (im * IQ_NORM) as i32 }
+                })
+                .collect();
+            let out = a.demod(&iq, params, pb);
+            if b >= 150 {
+                for (l, _) in out {
+                    sum += (l as f64) * (l as f64);
+                    count += 1;
+                }
+            }
+        }
+        (sum / count as f64).sqrt()
+    }
+
+    /// Measurement, not a check: prints the demodulated level of a
+    /// 1 kHz tone in SSB (each AGC) and in FM (several deviations).
+    #[test]
+    #[ignore]
+    fn fm_vs_ssb_level() {
+        let tau = std::f64::consts::TAU;
+        let fs = 48_000.0;
+        for amp in [1e-2, 1e-4] {
+            for agc in [Agc::Off, Agc::Medium] {
+                for (mode, f) in [(Mode::Usb, 1000.0), (Mode::Usb, -1000.0)] {
+                    let r = level(20, mode, agc, &|n| {
+                        let p = tau * f * n as f64 / fs;
+                        (amp * p.cos(), amp * p.sin())
+                    });
+                    println!("USB tone {f:+} Hz amp {amp:e} {agc:?}: rms {r:.4} ({:.1} dBFS)", 20.0 * r.log10());
+                }
+            }
+        }
+        for dev in [1000.0, 2500.0, 5000.0] {
+            let r = level(21, Mode::Fmn, Agc::Medium, &|n| {
+                let t = n as f64 / fs;
+                let p = dev / 1000.0 * (tau * 1000.0 * t).sin();
+                (1e-3 * p.cos(), 1e-3 * p.sin())
+            });
+            println!("FM 1 kHz tone dev {dev} Hz: rms {r:.4} ({:.1} dBFS)", 20.0 * r.log10());
+        }
+        // Noise only: a cheap LCG Gaussian-ish (sum of 4 uniforms).
+        let noise = |n: usize, seed: u64| {
+            let mut x = (n as u64).wrapping_mul(6364136223846793005).wrapping_add(seed);
+            let mut acc = 0.0;
+            for _ in 0..4 {
+                x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                acc += (x >> 11) as f64 / (1u64 << 53) as f64 - 0.5;
+            }
+            acc
+        };
+        for amp in [1e-6, 1e-5] {
+            for (mode, agc) in [(Mode::Usb, Agc::Off), (Mode::Usb, Agc::Medium), (Mode::Fmn, Agc::Medium)] {
+                let r = level(22, mode, agc, &|n| (amp * noise(n, 1), amp * noise(n, 7)));
+                println!("noise amp {amp:e} {mode:?} {agc:?}: rms {r:.4} ({:.1} dBFS)", 20.0 * r.log10());
+            }
+        }
+    }
+}
