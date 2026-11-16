@@ -297,9 +297,7 @@ keypad, and dragging the spectrum tunes.
 On a narrow screen, such as the 720x1280 Raspberry Pi Touch Display 2 in
 portrait, VFO-B moves under VFO-A with the S-meter beside it. The compact
 window can be made as small as 520x400 (at 100% UI Scale), so a 720-wide
-screen can take a UI Scale of up to about 135%. While you resize the main
-window or an extra receiver's, its size in pixels shows in the middle of it
-for a moment, to help fit a screen.
+screen can take a UI Scale of up to about 135%.
 
 When a front-panel controller's or MIDI knob changes a setting whose
 control isn't on screen -- in the compact layout, or with the control rows

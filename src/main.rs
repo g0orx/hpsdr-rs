@@ -2831,8 +2831,6 @@ struct ExtraReceiver {
     /// (ConnectedState::frequency_entry), drawn inside this receiver's
     /// own window.
     frequency_entry: Option<FrequencyEntry>,
-    /// This window's size while it's resized -- see ResizeOverlay.
-    resize_overlay: ResizeOverlay,
     settings_tab: SettingsTab,
     /// Shared with ConnectedState -- any control here that changes a
     /// setting flips this, so the root window's per-frame save (which
@@ -3800,64 +3798,10 @@ struct HpsdrApp {
     applied_theme: Option<egui::ThemePreference>,
     /// The main window's minimum size last sent, see main_window_min_size.
     applied_min_size: Option<egui::Vec2>,
-    /// See ResizeOverlay.
-    resize_overlay: ResizeOverlay,
     /// Whether the window has been checked against the screen's size yet
     /// (see HpsdrApp::ui): a window opened bigger than a small screen is
     /// maximized, once.
     checked_screen_fit: bool,
-}
-
-/// While a window is being resized, its size in pixels shown in the middle
-/// of it, for fitting a small screen (e.g. 800 x 480) -- REAL REQUEST.
-/// Shown for a moment after the last change; not when the window first
-/// opens.
-#[derive(Default)]
-struct ResizeOverlay {
-    last_size: Option<egui::Vec2>,
-    until: Option<Instant>,
-}
-
-impl ResizeOverlay {
-    fn show(&mut self, ctx: &egui::Context) {
-        const SHOW_FOR: Duration = Duration::from_millis(1500);
-        let points = ctx.content_rect().size();
-        if self.last_size.is_some_and(|last| last != points) {
-            self.until = Some(Instant::now() + SHOW_FOR);
-        }
-        self.last_size = Some(points);
-        let Some(until) = self.until else { return };
-        let now = Instant::now();
-        if now >= until {
-            self.until = None;
-            return;
-        }
-        ctx.request_repaint_after(until - now);
-        let pixels = points * ctx.pixels_per_point();
-        let zoom = ctx.zoom_factor();
-        egui::Area::new(egui::Id::unique("resize_overlay"))
-            .order(egui::Order::Tooltip)
-            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
-            .interactable(false)
-            .show(ctx, |ui| {
-                egui::Frame::popup(ui.style()).show(ui, |ui| {
-                    ui.label(
-                        egui::RichText::new(format!("{:.0} × {:.0}", pixels.x, pixels.y))
-                            .size(28.0)
-                            .monospace()
-                            .strong(),
-                    );
-                    if (zoom - 1.0).abs() > 0.001 {
-                        ui.weak(format!(
-                            "{:.0} × {:.0} at {:.0}% UI Scale",
-                            points.x,
-                            points.y,
-                            zoom * 100.0
-                        ));
-                    }
-                });
-            });
-    }
 }
 
 /// Settings -> Spectrum's Theme choice (config::ThemeChoice as a u8). A
@@ -4103,7 +4047,6 @@ impl HpsdrApp {
             ui_prefs,
             applied_theme: Some(egui::ThemePreference::Dark),
             applied_min_size: None,
-            resize_overlay: ResizeOverlay::default(),
             checked_screen_fit: false,
         }
     }
@@ -5108,7 +5051,6 @@ impl eframe::App for HpsdrApp {
         // Settings -> Spectrum's UI Scale or Ctrl - / Ctrl + / Ctrl 0.
         let zoom = ui.ctx().zoom_factor();
         let choice = theme_choice();
-        self.resize_overlay.show(ui.ctx());
         // F11 toggles fullscreen (see FULLSCREEN), as in a web browser.
         if ui.input(|i| i.key_pressed(egui::Key::F11)) {
             let fullscreen = !FULLSCREEN.load(Ordering::Relaxed);
@@ -16536,7 +16478,6 @@ fn render_extra_receiver_ui(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceiver>>) {
             rx.settings_dirty.store(true, Ordering::Relaxed);
         }
     }
-    rx.resize_overlay.show(ui.ctx());
 
     // Same CW decoder panel as the main receiver window -- see
     // render_cw_decoder_panel_beside's doc comment for why this is an
@@ -18258,7 +18199,6 @@ fn spawn_extra_receiver(
         spectrum_pan: saved.map(|s| s.spectrum_pan).unwrap_or(0.0),
         show_settings_window: false,
         frequency_entry: None,
-        resize_overlay: ResizeOverlay::default(),
         settings_tab: SettingsTab::Agc,
         settings_dirty,
         band_memory: saved.map(|s| s.band_settings.clone()).unwrap_or_default(),
