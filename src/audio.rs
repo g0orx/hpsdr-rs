@@ -74,6 +74,56 @@ pub fn list_input_devices() -> Vec<String> {
     }
 }
 
+/// The device "(System Default)" means. On Linux that's PipeWire's (or
+/// PulseAudio's) own ALSA device when there is one, so the audio goes
+/// through the sound server -- shown in pavucontrol, and routed to
+/// whatever output the desktop has chosen -- even where ALSA's own
+/// "default" isn't routed to it (no pipewire-alsa: on a Raspberry Pi
+/// that's the bcm2835 headphone jack; REAL REPORT 2026-11-16, a Pi 4
+/// with a USB headset played nothing). Elsewhere, cpal's default.
+/// `.1`: whether it's the sound server's device rather than cpal's
+/// default, so a caller can fall back if it won't open.
+fn system_default_device(host: &cpal::Host, output: bool) -> Option<(cpal::Device, bool)> {
+    if let Some(d) = sound_server_device(host, output) {
+        return Some((d, true));
+    }
+    let d = if output { host.default_output_device() } else { host.default_input_device() };
+    d.map(|d| (d, false))
+}
+
+/// PipeWire's ALSA device ("pipewire"), else PulseAudio's ("pulse"),
+/// if this is Linux and ALSA lists one.
+fn sound_server_device(host: &cpal::Host, output: bool) -> Option<cpal::Device> {
+    if !cfg!(target_os = "linux") {
+        return None;
+    }
+    let devices: Vec<cpal::Device> =
+        if output { host.output_devices().ok()?.collect() } else { host.input_devices().ok()?.collect() };
+    ["pipewire", "pulse"]
+        .into_iter()
+        .find_map(|want| devices.iter().find(|d| d.id().is_ok_and(|id| id.1 == want)).cloned())
+}
+
+/// Linux: a sound server (PipeWire or PulseAudio) is running but ALSA has
+/// no device that reaches it, so "(System Default)" plays straight to the
+/// first sound card. Settings -> Audio says to install pipewire-alsa.
+/// Checked once: installing the plugin needs a restart anyway.
+pub fn sound_server_unreachable() -> bool {
+    static ONCE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ONCE.get_or_init(sound_server_unreachable_now)
+}
+
+fn sound_server_unreachable_now() -> bool {
+    if !cfg!(target_os = "linux") {
+        return false;
+    }
+    let Some(dir) = std::env::var_os("XDG_RUNTIME_DIR").map(std::path::PathBuf::from) else {
+        return false;
+    };
+    let running = dir.join("pipewire-0").exists() || dir.join("pulse/native").exists();
+    running && sound_server_device(&cpal::default_host(), true).is_none()
+}
+
 pub struct AudioOutput {
     // Kept alive for as long as playback should continue; dropping this
     // stops the stream.
@@ -154,15 +204,17 @@ impl AudioOutput {
                 .and_then(|mut devices| {
                     devices.find(|d| d.description().is_ok_and(|desc| desc.name() == name))
                 })
+                .map(|d| (d, false))
                 .or_else(|| {
                     eprintln!(
                         "audio: output device \"{name}\" not found -- falling back to the system default"
                     );
-                    host.default_output_device()
+                    system_default_device(&host, true)
                 }),
-            None => host.default_output_device(),
+            None => system_default_device(&host, true),
         }
         .ok_or_else(|| "no default audio output device found".to_string())?;
+        let (mut device, sound_server) = device;
 
         let gaps = Arc::new(AtomicU64::new(0));
         if !cfg!(target_os = "linux") {
@@ -180,10 +232,23 @@ impl AudioOutput {
                 .name("audio-output".into())
                 .spawn(move || {
                     let failed = Arc::new(AtomicBool::new(false));
-                    let open = |failed: &Arc<AtomicBool>| {
-                        build_output_stream(&device, buffer.clone(), sidetone.clone(), gaps.clone(), Some(failed.clone()))
+                    let open = |device: &cpal::Device, failed: &Arc<AtomicBool>| {
+                        build_output_stream(device, buffer.clone(), sidetone.clone(), gaps.clone(), Some(failed.clone()))
                     };
-                    let mut stream = match open(&failed) {
+                    let first = match open(&device, &failed) {
+                        // The sound server's device won't open: ALSA's own
+                        // default, as before.
+                        Err(e) if sound_server => match cpal::default_host().default_output_device() {
+                            Some(d) => {
+                                eprintln!("audio: sound server output failed ({e}) -- using ALSA's default");
+                                device = d;
+                                open(&device, &failed)
+                            }
+                            None => Err(e),
+                        },
+                        r => r,
+                    };
+                    let mut stream = match first {
                         Ok(s) => Some(s),
                         Err(e) => {
                             let _ = ready_tx.send(Err(e));
@@ -211,7 +276,7 @@ impl AudioOutput {
                         failed.store(false, Ordering::Relaxed);
                         last_open = Instant::now();
                         reopens += 1;
-                        match open(&failed) {
+                        match open(&device, &failed) {
                             Ok(s) => {
                                 eprintln!("audio: output stream reopened ({reopens} so far)");
                                 stream = Some(s);
@@ -1174,20 +1239,33 @@ impl MicInput {
     /// installed just uses the default mic instead.
     pub fn start(buffer: Arc<Mutex<VecDeque<f32>>>, selected_device_name: Option<&str>) -> Result<Self, String> {
         let host = cpal::default_host();
-        let device = match selected_device_name {
+        let (device, sound_server) = match selected_device_name {
             Some(name) => host
                 .input_devices()
                 .ok()
                 .and_then(|mut devices| devices.find(|d| d.description().is_ok_and(|desc| desc.name() == name)))
+                .map(|d| (d, false))
                 .or_else(|| {
                     eprintln!(
                         "audio: input device \"{name}\" not found -- falling back to the system default"
                     );
-                    host.default_input_device()
+                    system_default_device(&host, false)
                 }),
-            None => host.default_input_device(),
+            None => system_default_device(&host, false),
         }
         .ok_or_else(|| "no default audio input device found".to_string())?;
+        match Self::start_on(Arc::clone(&buffer), device) {
+            // The sound server's device won't open: ALSA's own default.
+            Err(e) if sound_server => {
+                let device = host.default_input_device().ok_or(e.clone())?;
+                eprintln!("audio: sound server input failed ({e}) -- using ALSA's default");
+                Self::start_on(buffer, device)
+            }
+            r => r,
+        }
+    }
+
+    fn start_on(buffer: Arc<Mutex<VecDeque<f32>>>, device: cpal::Device) -> Result<Self, String> {
 
         let device_name = device
             .description()

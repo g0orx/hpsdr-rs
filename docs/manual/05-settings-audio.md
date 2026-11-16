@@ -43,22 +43,20 @@ disable/re-enable transmit (Settings → TX).
 
 ## No sound on Linux or a Raspberry Pi
 
-On Linux, **(System Default)** is ALSA's default device. That only goes
-through PipeWire (or PulseAudio) if the matching ALSA plugin is
-installed. Without it, the default is simply the first sound card -- on
-a Raspberry Pi, the **bcm2835 Headphones** jack -- so a USB headset or
-HDMI monitor stays silent, hpsdr-rs doesn't appear in pavucontrol's
-Playback tab, and the default microphone is reported as unavailable.
+On Linux, **(System Default)** uses PipeWire's ALSA device (`pipewire`)
+or PulseAudio's (`pulse`) when ALSA has one, so the audio goes through
+the sound server: hpsdr-rs shows in pavucontrol, and you can send it to
+any output there. If neither will open, it uses ALSA's own default.
 
-To check, run `aplay -L | head -4`: the `default` entry should mention
-PipeWire. If it doesn't, install the plugin and restart hpsdr-rs:
+Without either device, ALSA's default is simply the first sound card --
+on a Raspberry Pi, the **bcm2835 Headphones** jack -- so a USB headset
+or HDMI monitor stays silent, hpsdr-rs doesn't appear in pavucontrol,
+and the default microphone is reported as unavailable. Settings → Audio
+then shows a warning. Install the plugin and restart hpsdr-rs:
 
 ```
 sudo apt install pipewire-alsa
 ```
-
-hpsdr-rs then shows up in pavucontrol, where you can send it to any
-output.
 
 ---
 

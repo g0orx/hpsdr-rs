@@ -10698,6 +10698,14 @@ impl eframe::App for HpsdrApp {
                                                  like WSJT-X instead of/alongside real speakers.",
                                             );
                                     });
+                                    if audio::sound_server_unreachable() {
+                                        ui.colored_label(
+                                            ui.visuals().warn_fg_color,
+                                            "PipeWire is running, but ALSA can't reach it, so (System Default) \
+                                             plays to the first sound card. Install pipewire-alsa \
+                                             (sudo apt install pipewire-alsa) and restart hpsdr-rs.",
+                                        );
+                                    }
 
                                     ui.add_space(8.0);
                                     ui.separator();
