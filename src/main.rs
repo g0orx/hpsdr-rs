@@ -10640,7 +10640,7 @@ impl eframe::App for HpsdrApp {
                                     ui.label("RX audio:");
                                     ui.horizontal(|ui| {
                                         ui.label("Output device:");
-                                        let devices = audio::list_output_devices();
+                                        let devices = audio::device_lists().0;
                                         let current_label = connected
                                             .audio_output_device
                                             .clone()
@@ -10704,7 +10704,7 @@ impl eframe::App for HpsdrApp {
                                     ui.label("TX audio:");
                                     ui.horizontal(|ui| {
                                         ui.label("Input device:");
-                                        let devices = audio::list_input_devices();
+                                        let devices = audio::device_lists().1;
                                         let current_label = connected
                                             .mic_input_device
                                             .clone()
@@ -17655,7 +17655,7 @@ fn render_extra_receiver_settings(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceive
                 // this one feeds a virtual cable for a second decoder,
                 // or vice versa.
                 ui.label("Output device:");
-                let devices = audio::list_output_devices();
+                let devices = audio::device_lists().0;
                 let current_label =
                     rx.audio_output_device.clone().unwrap_or_else(|| "(System Default)".to_string());
                 egui::ComboBox::from_id_salt(("extra_receiver_audio_output_device", rx.ddc_index))
@@ -18728,19 +18728,34 @@ fn wgpu_backends() -> eframe::wgpu::Backends {
     Backends::from_env().unwrap_or(if cfg!(windows) { Backends::DX12 | Backends::GL } else { Backends::PRIMARY | Backends::GL })
 }
 
-/// wgpu's present mode: egui-wgpu's default (AutoVsync), unless
-/// HPSDR_PRESENT_MODE asks for `novsync` (AutoNoVsync), `fifo`,
-/// `mailbox` or `immediate`. For diagnosing, not tuning -- REAL REPORT
-/// (2026-11-06, Windows 10): an extra receiver's window doesn't update
-/// while the main one has focus, and a present waiting on vsync is one
-/// candidate (see the NOTE in main's wgpu_options for an earlier one).
+/// wgpu's present mode: on Linux AutoNoVsync, elsewhere egui-wgpu's
+/// default (AutoVsync), unless HPSDR_PRESENT_MODE asks for `novsync`
+/// (AutoNoVsync), `vsync` (AutoVsync), `fifo`, `mailbox` or `immediate`.
+///
+/// Linux is AutoNoVsync -- REAL REPORT (2026-11-16, Raspberry Pi 4/5,
+/// compact layout): with Settings open, tapping the full-screen main
+/// window (to close the Menu popup) hid Settings behind it and hpsdr-rs
+/// froze. Settings is an immediate viewport, presented inline with the
+/// main window's frame, and a vsync present to a fully hidden window
+/// waits for a frame callback the compositor never sends. CONFIRMED:
+/// HPSDR_PRESENT_MODE=novsync fixed it. Same family as minimizing
+/// Settings dropping the app to ~1 update/s (see the NOTE in main's
+/// wgpu_options). No vsync doesn't mean a busy loop: the app repaints on
+/// its own ~30 Hz request_repaint_after.
+///
+/// Elsewhere AutoVsync, untested without it. REAL REPORT (2026-11-06,
+/// Windows 10): an extra receiver's window doesn't update while the main
+/// one has focus, and a present waiting on vsync is one candidate --
+/// `novsync` there is for diagnosing.
 fn wgpu_present_mode() -> eframe::wgpu::PresentMode {
     use eframe::wgpu::PresentMode;
     match std::env::var("HPSDR_PRESENT_MODE").as_deref() {
         Ok("novsync") => PresentMode::AutoNoVsync,
+        Ok("vsync") => PresentMode::AutoVsync,
         Ok("fifo") => PresentMode::Fifo,
         Ok("mailbox") => PresentMode::Mailbox,
         Ok("immediate") => PresentMode::Immediate,
+        _ if cfg!(target_os = "linux") => PresentMode::AutoNoVsync,
         _ => PresentMode::AutoVsync,
     }
 }

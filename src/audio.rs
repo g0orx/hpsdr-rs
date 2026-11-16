@@ -74,6 +74,50 @@ pub fn list_input_devices() -> Vec<String> {
     }
 }
 
+/// The output and input device names for the Settings pickers, listed on
+/// a background thread and kept for a few seconds -- REAL REPORT
+/// (2026-11-16): Settings -> Audio called list_output_devices and
+/// list_input_devices on every frame, and on a Raspberry Pi listing
+/// opens every ALSA device, slow enough that the whole app (Settings is
+/// drawn inside the main window's frame) froze. Never blocks: the first
+/// call returns empty lists until the listing finishes, and a listing
+/// that never returns just leaves the last lists in place.
+struct DeviceLists {
+    outputs: Vec<String>,
+    inputs: Vec<String>,
+    listed_at: Option<Instant>,
+    listing: bool,
+}
+
+static DEVICE_LISTS: Mutex<DeviceLists> =
+    Mutex::new(DeviceLists { outputs: Vec::new(), inputs: Vec::new(), listed_at: None, listing: false });
+
+/// How long a listing is kept before the pickers ask for a new one (to
+/// pick up a device plugged in while Settings is open).
+const DEVICE_LIST_MAX_AGE: Duration = Duration::from_secs(5);
+
+/// (outputs, inputs) as last listed, starting a new listing in the
+/// background if those are old. For drawing the pickers every frame.
+pub fn device_lists() -> (Vec<String>, Vec<String>) {
+    let mut lists = DEVICE_LISTS.lock().unwrap();
+    let stale = lists.listed_at.is_none_or(|t| t.elapsed() >= DEVICE_LIST_MAX_AGE);
+    if stale && !lists.listing {
+        lists.listing = true;
+        let spawned = thread::Builder::new().name("audio-devices".into()).spawn(|| {
+            let (outputs, inputs) = (list_output_devices(), list_input_devices());
+            let mut lists = DEVICE_LISTS.lock().unwrap();
+            lists.outputs = outputs;
+            lists.inputs = inputs;
+            lists.listed_at = Some(Instant::now());
+            lists.listing = false;
+        });
+        if spawned.is_err() {
+            lists.listing = false;
+        }
+    }
+    (lists.outputs.clone(), lists.inputs.clone())
+}
+
 /// The device "(System Default)" means. On Linux that's PipeWire's (or
 /// PulseAudio's) own ALSA device when there is one, so the audio goes
 /// through the sound server -- shown in pavucontrol, and routed to
