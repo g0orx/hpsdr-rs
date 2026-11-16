@@ -13,20 +13,22 @@ main VFO frequency (comma-grouped, in Hz) -- green normally, red while
 that VFO is the one actually transmitting (see
 [Split](#vfo-a--vfo-b--split) below). Beside **VFO-A**'s label are the band
 and [band stack](#band-stack) entry (e.g. **20m-1**) and the **VFO step**
-(100 Hz to start with, 1 Hz to 1 MHz): what a
-[front-panel controller](25-controller.md)'s VFO knob tunes by, landing on
-multiples of it; MIDI's **VFO Step Size +/-** actions change it too. You can
+(100 Hz to start with, 1 Hz to 1 MHz): what scrolling the spectrum or
+waterfall, a [front-panel controller](25-controller.md)'s VFO knob and
+MIDI's **VFO Step Up/Down** tune by, landing on multiples of it; MIDI's
+**VFO Step Size +/-** actions change it. You can
 tune it several ways:
 
 - **Scroll** over a digit of the frequency display: steps that digit up
   or down -- over the 1 kHz digit it moves 1 kHz, over the 10 Hz digit
   10 Hz, and so on. The digit under the mouse is underlined. A step that
   would go past the radio's tuning range stops at its edge.
-- **Scroll** over the spectrum/waterfall panes: steps by 1 kHz per notch. Hold **Shift** while scrolling for 100 Hz
-  steps, or **Alt** for 10 Hz steps (in any mode -- e.g. for fine-tuning a
-  digital modem). In CW mode (**CWL**/**CWU**), steps are finer -- 100 Hz
-  per notch, 10 Hz with Shift -- matching how tightly CW is normally
-  zero-beaten.
+- **Scroll** over the spectrum/waterfall panes: steps by the **VFO step**
+  per notch, landing on multiples of it -- with a 1 kHz step, one notch up
+  from 14.074.123 is 14.075.000. Set a small step (10 or 100 Hz) for CW.
+  Holding a key gives a fixed step whatever the VFO step is: **Shift**
+  100 Hz, or **Alt** 10 Hz (in any mode -- e.g. for fine-tuning a
+  digital modem); in CW mode (**CWL**/**CWU**) Shift is 10 Hz.
   Clicking a signal on the spectrum/waterfall in CW mode also centers it in
   the (narrow) CW filter passband rather than at the dial frequency itself,
   using the *exact* frequency under the cursor rather than rounding to the

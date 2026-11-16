@@ -139,7 +139,7 @@ to check.
 | Band Stack (next) | The next entry of the current band's [band stack](02-main-window.md#band-stack), as pressing its band button again |
 | Band 160m ... Band 6m | Jump directly to that band (ten separate actions, one per band from 160m to 6m; there's no direct action for 60m -- use Band Up/Down to reach it). Ignored if the connected radio can't tune that band (e.g. 6m on a HermesLite/HermesLite2) |
 | Filter Width Up, Filter Width Down | Step the filter width |
-| VFO Step Up, VFO Step Down | Nudge the VFO by one tuning step |
+| VFO Step Up, VFO Step Down | Tune the VFO by one VFO step (the step beside VFO-A), onto a multiple of it |
 | CTUN On/Off | Toggle Click-to-Tune |
 | RX Equalizer On/Off | Toggle the RX [graphic equalizer](08-equalizer.md) |
 | Diversity On/Off | Toggle [Diversity](07-diversity.md) reception (ignored while PureSignal is enabled -- the two are mutually exclusive) |

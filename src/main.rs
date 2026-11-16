@@ -2140,10 +2140,12 @@ fn apply_midi_binding(
     }
 
     let current_mode = connected.spectrum.mode();
-    let cw_mode = matches!(current_mode, spectrum::Mode::Cwl | spectrum::Mode::Cwu);
     let dial_freq_hz = if connected.ctun { connected.ctun_frequency_hz } else { freq_hz };
 
     match binding.action {
+        MidiAction::Mox if cannot_transmit(connected) => {
+            eprintln!("midi: MOX ignored -- this radio can't transmit");
+        }
         MidiAction::Mox => {
             // Real request -- see tx_frequency_allowed's own doc
             // comment. Only gates the transition TO keyed; unkeying
@@ -2290,8 +2292,15 @@ fn apply_midi_binding(
             connected.width_memory.insert(current_mode.label().to_string(), width);
         }
         MidiAction::VfoStepUp | MidiAction::VfoStepDown => {
-            let step = scroll_tune_step_hz(cw_mode, false, false, false);
-            let signed_step = if binding.action == MidiAction::VfoStepUp { step } else { -step };
+            // One VFO step (VFO-A's box), onto a multiple of it, in RF
+            // space as shown -- as hpsdr-remote's VFO Step Up/Down.
+            let offset = connected
+                .active_xvtr
+                .as_deref()
+                .and_then(|name| connected.xvtrs.iter().find(|x| x.name == name))
+                .map_or(0, xvtr_rf_offset);
+            let steps = if binding.action == MidiAction::VfoStepUp { 1 } else { -1 };
+            let signed_step = vfo_step_delta(dial_freq_hz as i64 + offset, connected.vfo_step_hz, steps);
             let new_freq = (dial_freq_hz as i64 + signed_step).max(0) as u32;
             let (effective_freq, retune) = resolve_tune(connected.ctun, freq_hz, sample_rate, passband, new_freq);
             if let Some(lo) = retune {
@@ -2789,6 +2798,9 @@ struct ExtraReceiver {
     /// than a visibly tiny sliver.
     waterfall_display_rows: usize,
     scroll_accum: f32,
+    /// The main window's VFO step, copied in every frame: scrolling this
+    /// receiver's spectrum/waterfall moves by it (see scroll_tune_delta).
+    vfo_step_hz: u32,
     slider_scroll_accum: f32,
     /// See ConnectedState::drag_tune_accum_hz's doc comment -- same
     /// thing, per extra receiver instead of shared.
@@ -5762,6 +5774,14 @@ impl eframe::App for HpsdrApp {
                     connected.settings_dirty.store(true, std::sync::atomic::Ordering::Relaxed);
                 }
 
+                // A radio that can't transmit is never left keyed, however
+                // MOX was set: CAT, TCI, a serial PTT line, a MIDI CW key
+                // (see cannot_transmit). MIDI/controller MOX and Tune are
+                // refused before they get this far.
+                if cannot_transmit(connected) && connected.session.mox_active() {
+                    connected.session.force_mox_off();
+                }
+
                 // MIDI control surface: drain whatever arrived on the
                 // worker thread's queue since last frame (see
                 // midi::MidiWorker's own doc comment for why that thread
@@ -8243,15 +8263,28 @@ impl eframe::App for HpsdrApp {
 
                             let shift = scroll_shift;
                             let ctrl = ui.input(|i| i.modifiers.ctrl);
-                            let step: i64 =
-                                digit_step.unwrap_or_else(|| scroll_tune_step_hz(cw_mode, scroll_alt, shift, ctrl));
-
-                            let mut new_freq = dial_freq_hz as i64;
+                            let mut notches = 0i64;
                             while connected.scroll_accum.abs() >= notch {
                                 let sign = connected.scroll_accum.signum();
                                 connected.scroll_accum -= sign * notch;
-                                new_freq += step * sign as i64;
+                                notches += sign as i64;
                             }
+                            // A VFO digit steps by itself; otherwise the
+                            // VFO step, in RF space as shown (see
+                            // scroll_tune_delta).
+                            let mut new_freq = dial_freq_hz as i64
+                                + match digit_step {
+                                    Some(step) => notches * step,
+                                    None => scroll_tune_delta(
+                                        dial_freq_hz as i64 + xvtr_rf_offset_hz,
+                                        notches,
+                                        connected.vfo_step_hz,
+                                        cw_mode,
+                                        scroll_alt,
+                                        shift,
+                                        ctrl,
+                                    ),
+                                };
                             new_freq = new_freq.max(0);
                             if digit_step.is_some() {
                                 // A big digit can step past the radio's range.
@@ -8621,6 +8654,7 @@ impl eframe::App for HpsdrApp {
                         // isn't (see cw_center_click_freq).
                         let hover_freq = freq_at_x(pos.x, rect, freq_hz, sample_rate, connected.spectrum_zoom, pan_offset_hz);
                         let step = main_hover_scroll_step_hz(
+                            connected.vfo_step_hz,
                             cw_mode,
                             ui.input(|i| i.modifiers.alt),
                             ui.input(|i| i.modifiers.shift),
@@ -8713,15 +8747,23 @@ impl eframe::App for HpsdrApp {
                                 const NOTCH: f32 = 100.0;
                                 let shift = scroll_shift;
                                 let ctrl = ui.input(|i| i.modifiers.ctrl);
-                                let step: i64 = scroll_tune_step_hz(cw_mode, scroll_alt, shift, ctrl);
-
-                                let mut new_freq = dial_freq_hz as i64;
+                                let mut notches = 0i64;
                                 while connected.scroll_accum.abs() >= NOTCH {
                                     let sign = connected.scroll_accum.signum();
                                     connected.scroll_accum -= sign * NOTCH;
-                                    new_freq += step * sign as i64;
+                                    notches += sign as i64;
                                 }
-                                new_freq = new_freq.max(0);
+                                let new_freq = (dial_freq_hz as i64
+                                    + scroll_tune_delta(
+                                        dial_freq_hz as i64 + xvtr_rf_offset_hz,
+                                        notches,
+                                        connected.vfo_step_hz,
+                                        cw_mode,
+                                        scroll_alt,
+                                        shift,
+                                        ctrl,
+                                    ))
+                                .max(0);
 
                                 if new_freq as u32 != dial_freq_hz {
                                     let (effective_freq, retune) =
@@ -8803,6 +8845,7 @@ impl eframe::App for HpsdrApp {
                             // See the spectrum pane's identical treatment above.
                             let hover_freq = freq_at_x(pos.x, rect, freq_hz, sample_rate, connected.spectrum_zoom, pan_offset_hz);
                             let step = main_hover_scroll_step_hz(
+                            connected.vfo_step_hz,
                             cw_mode,
                             ui.input(|i| i.modifiers.alt),
                             ui.input(|i| i.modifiers.shift),
@@ -9215,7 +9258,11 @@ impl eframe::App for HpsdrApp {
                     .active_receiver_count
                     .store(active_count as u32, Ordering::Relaxed);
                 for rx in connected.extra_receivers.clone() {
-                    let ddc_index = rx.lock().unwrap().ddc_index;
+                    let ddc_index = {
+                        let mut r = rx.lock().unwrap();
+                        r.vfo_step_hz = connected.vfo_step_hz;
+                        r.ddc_index
+                    };
                     let viewport_id = egui::ViewportId::from_hash_of(("extra_receiver", ddc_index));
                     let title = format!("{} - RX {}", base_title, ddc_index + 1);
                     let rx_for_closure = Arc::clone(&rx);
@@ -16024,6 +16071,9 @@ fn apply_tci_rx2_requests(rx: &mut ExtraReceiver, req: tci::Rx2Requests) -> bool
 /// the button's own comments for why tune_may_start excludes
 /// Two-Tone/CW-text-sending and an externally-keyed transmission.
 fn toggle_tune(connected: &mut ConnectedState) {
+        if !connected.tune_active && cannot_transmit(connected) {
+            return;
+        }
         if connected.tune_active {
             connected.session.set_mox(false);
             if let Some(tx) = &connected.tx_handle {
@@ -16082,6 +16132,19 @@ fn mute_button(ui: &mut egui::Ui, spectrum: &SpectrumHandle) {
 /// than its USB link carries -- see radio.rs's pluto_tx_loop.
 fn pluto_tx_blocked_by_wide(board: Boards, wide: bool) -> bool {
     board == Boards::Pluto && wide
+}
+
+/// This radio can't transmit at all: receive-only hardware (RX-888,
+/// RTL-SDR, MSI.SDR) or a Pluto on its wide stream. Its MOX and Tune
+/// buttons are hidden, and nothing else may key it either -- REAL
+/// REPORT: an RTL-SDR could be put into TX (the display and audio
+/// switching to transmit) from a control that isn't the hidden button.
+fn cannot_transmit(connected: &ConnectedState) -> bool {
+    matches!(connected.device.board, Boards::Rx888 | Boards::RtlSdr | Boards::MsiSdr)
+        || pluto_tx_blocked_by_wide(
+            connected.device.board,
+            connected.session.dongle_input_rate_hz() == Some(pluto::WIDE_SAMPLE_RATE_HZ),
+        )
 }
 
 /// Draws a classic analog S-meter: semicircular scale, S0..S9 on the
@@ -17104,13 +17167,15 @@ fn render_extra_receiver_ui(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceiver>>) {
             const NOTCH: f32 = 100.0;
             let shift = scroll_shift;
             let ctrl = ui.input(|i| i.modifiers.ctrl);
-            let step: i64 = scroll_tune_step_hz(cw_mode, scroll_alt, shift, ctrl);
-            let mut new_freq = dial_freq_hz as i64;
+            let mut notches = 0i64;
             while rx.scroll_accum.abs() >= NOTCH {
                 let sign = rx.scroll_accum.signum();
                 rx.scroll_accum -= sign * NOTCH;
-                new_freq += step * sign as i64;
+                notches += sign as i64;
             }
+            // The main window's VFO step (see scroll_tune_delta).
+            let mut new_freq = dial_freq_hz as i64
+                + scroll_tune_delta(dial_freq_hz as i64, notches, rx.vfo_step_hz, cw_mode, scroll_alt, shift, ctrl);
             new_freq = new_freq.max(0);
             if new_freq as u32 != dial_freq_hz {
                 let (effective_freq, retune) =
@@ -17222,7 +17287,7 @@ fn render_extra_receiver_ui(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceiver>>) {
     draw_audio_waveform(ui.painter(), rect, &waveform_samples);
 
     if let Some(pos) = spectrum_resp.hover_pos() {
-        let hover_freq = round_to_step_hz(freq_at_x(pos.x, rect, freq_hz, sample_rate, rx.spectrum_zoom, pan_offset_hz), scroll_tune_step_hz(cw_mode, ui.input(|i| i.modifiers.alt), ui.input(|i| i.modifiers.shift), ui.input(|i| i.modifiers.ctrl)));
+        let hover_freq = round_to_step_hz(freq_at_x(pos.x, rect, freq_hz, sample_rate, rx.spectrum_zoom, pan_offset_hz), hover_scroll_step_hz(rx.vfo_step_hz, cw_mode, ui.input(|i| i.modifiers.alt), ui.input(|i| i.modifiers.shift), ui.input(|i| i.modifiers.ctrl)));
         draw_freq_hover_tooltip(ui.painter(), pos, hover_freq.into());
     }
 
@@ -17290,13 +17355,14 @@ fn render_extra_receiver_ui(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceiver>>) {
                 const NOTCH: f32 = 100.0;
                 let shift = scroll_shift;
                 let ctrl = ui.input(|i| i.modifiers.ctrl);
-                let step: i64 = scroll_tune_step_hz(cw_mode, scroll_alt, shift, ctrl);
-                let mut new_freq = dial_freq_hz as i64;
+                let mut notches = 0i64;
                 while rx.scroll_accum.abs() >= NOTCH {
                     let sign = rx.scroll_accum.signum();
                     rx.scroll_accum -= sign * NOTCH;
-                    new_freq += step * sign as i64;
+                    notches += sign as i64;
                 }
+                let mut new_freq = dial_freq_hz as i64
+                    + scroll_tune_delta(dial_freq_hz as i64, notches, rx.vfo_step_hz, cw_mode, scroll_alt, shift, ctrl);
                 new_freq = new_freq.max(0);
                 if new_freq as u32 != dial_freq_hz {
                     let (effective_freq, retune) =
@@ -17358,7 +17424,7 @@ fn render_extra_receiver_ui(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceiver>>) {
             );
         }
         if let Some(pos) = wf_resp.hover_pos() {
-            let hover_freq = round_to_step_hz(freq_at_x(pos.x, wf_rect, freq_hz, sample_rate, rx.spectrum_zoom, pan_offset_hz), scroll_tune_step_hz(cw_mode, ui.input(|i| i.modifiers.alt), ui.input(|i| i.modifiers.shift), ui.input(|i| i.modifiers.ctrl)));
+            let hover_freq = round_to_step_hz(freq_at_x(pos.x, wf_rect, freq_hz, sample_rate, rx.spectrum_zoom, pan_offset_hz), hover_scroll_step_hz(rx.vfo_step_hz, cw_mode, ui.input(|i| i.modifiers.alt), ui.input(|i| i.modifiers.shift), ui.input(|i| i.modifiers.ctrl)));
             draw_freq_hover_tooltip(ui.painter(), pos, hover_freq.into());
         }
 
@@ -17860,11 +17926,38 @@ fn ctrl_scroll_tune_step_hz(cw_mode: bool) -> i64 {
 /// existing (less precise, but harmless) scroll_tune_step_hz-only
 /// preview rather than implying a gesture that doesn't actually do
 /// anything there.
-fn main_hover_scroll_step_hz(cw_mode: bool, alt: bool, shift: bool, ctrl: bool) -> i64 {
+fn main_hover_scroll_step_hz(vfo_step_hz: u32, cw_mode: bool, alt: bool, shift: bool, ctrl: bool) -> i64 {
     if ctrl {
         ctrl_scroll_tune_step_hz(cw_mode)
     } else {
-        scroll_tune_step_hz(cw_mode, alt, shift, false)
+        hover_scroll_step_hz(vfo_step_hz, cw_mode, alt, shift, false)
+    }
+}
+
+/// The step a scroll over the spectrum/waterfall would move by, for the
+/// hover readout: the VFO step, or a modifier's fixed step (see
+/// scroll_tune_delta).
+fn hover_scroll_step_hz(vfo_step_hz: u32, cw_mode: bool, alt: bool, shift: bool, ctrl: bool) -> i64 {
+    if alt || shift || ctrl {
+        scroll_tune_step_hz(cw_mode, alt, shift, ctrl)
+    } else {
+        vfo_step_hz.max(1) as i64
+    }
+}
+
+/// How far `notches` notches of scroll over the spectrum/waterfall move
+/// a VFO showing `rf_hz`. A plain scroll moves by the VFO step (chosen
+/// beside VFO-A) and lands on multiples of it, as the controller's VFO
+/// knob does (vfo_step_delta) -- real request: the spectrum used its own
+/// fixed 1 kHz (100 Hz in CW) whatever the VFO step was. Holding Shift,
+/// Alt or Ctrl keeps that modifier's own fixed step (scroll_tune_step_hz).
+fn scroll_tune_delta(rf_hz: i64, notches: i64, vfo_step_hz: u32, cw_mode: bool, alt: bool, shift: bool, ctrl: bool) -> i64 {
+    if notches == 0 {
+        0
+    } else if alt || shift || ctrl {
+        notches * scroll_tune_step_hz(cw_mode, alt, shift, ctrl)
+    } else {
+        vfo_step_delta(rf_hz, vfo_step_hz, notches.clamp(i32::MIN as i64, i32::MAX as i64) as i32)
     }
 }
 
@@ -18149,6 +18242,7 @@ fn spawn_extra_receiver(
         waterfall_signature: None,
         waterfall_display_rows: spectrum::WATERFALL_HISTORY,
         scroll_accum: 0.0,
+        vfo_step_hz: 100,
         slider_scroll_accum: 0.0,
         drag_tune_accum_hz: 0.0,
         db_low: saved.map(|s| s.db_low).unwrap_or(-140.0),
@@ -19086,7 +19180,20 @@ mod tests {
         assert_eq!(scroll_tune_step_hz(false, true, true, false), 10);
         assert_eq!(scroll_tune_step_hz(true, true, false, false), 10);
         assert_eq!(scroll_tune_step_hz(true, true, false, true), 1);
-        assert_eq!(main_hover_scroll_step_hz(false, true, false, false), 10);
+        assert_eq!(main_hover_scroll_step_hz(500, false, true, false, false), 10);
+        assert_eq!(main_hover_scroll_step_hz(500, false, false, false, false), 500);
+    }
+
+    #[test]
+    fn spectrum_scroll_uses_the_vfo_step_unless_a_modifier_is_held() {
+        // Plain: the VFO step, onto multiples of it.
+        assert_eq!(scroll_tune_delta(14_074_123, 1, 1_000, false, false, false, false), 877);
+        assert_eq!(scroll_tune_delta(14_074_123, -1, 1_000, false, false, false, false), -123);
+        assert_eq!(scroll_tune_delta(14_074_000, 2, 100, true, false, false, false), 200);
+        // Modifiers keep their fixed steps.
+        assert_eq!(scroll_tune_delta(14_074_123, 1, 1_000, false, false, true, false), 100);
+        assert_eq!(scroll_tune_delta(14_074_123, -3, 1_000, false, true, false, false), -30);
+        assert_eq!(scroll_tune_delta(14_074_123, 0, 1_000, false, false, false, false), 0);
     }
 
     #[test]

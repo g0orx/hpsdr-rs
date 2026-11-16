@@ -1140,8 +1140,10 @@ fn handle_client(
     // rather than modeling exact hardware limits -- no single value is
     // right for every supported board/filter combination, and a
     // wide-open range never incorrectly rejects a client's request.
-    // RECEIVE_ONLY:false -- this project always has TX support wired
-    // up (Settings -> TX gates actual PTT, not the protocol handshake).
+    // RECEIVE_ONLY: true for receive-only hardware (board_name is the
+    // Boards variant's name), so a client doesn't offer to transmit;
+    // false otherwise (Settings -> TX gates actual PTT, not the
+    // protocol handshake).
     // TRX_COUNT/CHANNEL_COUNT:1 -- TCI (unlike rigctl) has no second-
     // VFO/extra-receiver concept implemented here; see this file's
     // module note on trx always being 0.
@@ -1160,7 +1162,8 @@ fn handle_client(
     // Two, as Thetis: receiver 1 is the first extra receiver, when there
     // is one (rx_enable:1 says) -- see Rx2Share.
     send_logged(&mut ws, &logging, "trx_count:2;".into());
-    send_logged(&mut ws, &logging, "receive_only:false;".into());
+    let receive_only = matches!(board_name.as_str(), "Rx888" | "RtlSdr" | "MsiSdr");
+    send_logged(&mut ws, &logging, format!("receive_only:{receive_only};").into());
     // DEVICE identifies the actual radio hardware (e.g. Thetis reports
     // "ANAN8000D" for its connected board) -- a real report/correction:
     // this used to send this project's own name ("hpsdr-rs") here
