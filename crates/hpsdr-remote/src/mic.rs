@@ -97,10 +97,22 @@ impl Mic {
 #[cfg(not(target_arch = "wasm32"))]
 mod native {
     use super::*;
-    use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+    use cpal::traits::{DeviceTrait, StreamTrait};
 
+    /// The default microphone (see audio::default_devices).
     pub fn open(shared: Arc<Mutex<Shared>>) -> Result<cpal::Stream, String> {
-        let device = cpal::default_host().default_input_device().ok_or("no microphone")?;
+        let mut last = Err("no microphone".to_string());
+        for device in crate::audio::default_devices(false) {
+            last = open_on(device, shared.clone());
+            match &last {
+                Ok(_) => break,
+                Err(e) => eprintln!("hpsdr-remote: {e}"),
+            }
+        }
+        last
+    }
+
+    fn open_on(device: cpal::Device, shared: Arc<Mutex<Shared>>) -> Result<cpal::Stream, String> {
         let supported = device.default_input_config().map_err(|e| format!("microphone: {e}"))?;
         let format = supported.sample_format();
         let config: cpal::StreamConfig = supported.into();

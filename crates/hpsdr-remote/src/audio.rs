@@ -143,12 +143,68 @@ where
         .map_err(|e| format!("audio output: {e}"))
 }
 
+/// The devices to try, in order, for the default output (`output`) or
+/// microphone. On Linux, PipeWire's ALSA device ("pipewire"), else
+/// PulseAudio's ("pulse"), comes first, then ALSA's own default: without
+/// pipewire-alsa, ALSA's default is just the first sound card (a Pi's
+/// bcm2835 headphone jack -- REAL REPORT 2026-11-16, a Pi 4 with a USB
+/// headset played nothing). Same choice as hpsdr-rs's (System Default).
+pub fn default_devices(output: bool) -> Vec<cpal::Device> {
+    let host = cpal::default_host();
+    let mut devices: Vec<cpal::Device> = sound_server_device(&host, output).into_iter().collect();
+    devices.extend(if output { host.default_output_device() } else { host.default_input_device() });
+    devices
+}
+
+#[cfg(target_os = "linux")]
+fn sound_server_device(host: &cpal::Host, output: bool) -> Option<cpal::Device> {
+    let devices: Vec<cpal::Device> =
+        if output { host.output_devices().ok()?.collect() } else { host.input_devices().ok()?.collect() };
+    ["pipewire", "pulse"]
+        .into_iter()
+        .find_map(|want| devices.iter().find(|d| d.id().is_ok_and(|id| id.1 == want)).cloned())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn sound_server_device(_host: &cpal::Host, _output: bool) -> Option<cpal::Device> {
+    None
+}
+
+/// Linux: PipeWire or PulseAudio is running but ALSA has no device that
+/// reaches it, so the audio goes to the first sound card. Checked once.
+pub fn sound_server_unreachable() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        static ONCE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ONCE.get_or_init(|| {
+            let Some(dir) = std::env::var_os("XDG_RUNTIME_DIR").map(std::path::PathBuf::from) else {
+                return false;
+            };
+            let running = dir.join("pipewire-0").exists() || dir.join("pulse/native").exists();
+            running && sound_server_device(&cpal::default_host(), true).is_none()
+        })
+    }
+    #[cfg(not(target_os = "linux"))]
+    false
+}
+
 impl Player {
-    /// Opens the default output device. In a browser this has to happen in
-    /// response to a click (browsers only start audio after one).
+    /// Opens the default output device (see default_devices). In a
+    /// browser this has to happen in response to a click (browsers only
+    /// start audio after one).
     pub fn open() -> Result<Self, String> {
-        let host = cpal::default_host();
-        let device = host.default_output_device().ok_or("no audio output device")?;
+        let mut last = Err("no audio output device".to_string());
+        for device in default_devices(true) {
+            last = Self::open_on(device);
+            match &last {
+                Ok(_) => break,
+                Err(e) => eprintln!("hpsdr-remote: {e}"),
+            }
+        }
+        last
+    }
+
+    fn open_on(device: cpal::Device) -> Result<Self, String> {
         let jitter = Arc::new(Mutex::new(Jitter {
             buf: VecDeque::new(),
             rate: 0,

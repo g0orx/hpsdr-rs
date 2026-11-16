@@ -1746,6 +1746,12 @@ impl App {
             if let Some(e) = &self.mic_error {
                 ui.colored_label(readable(ui, Color32::from_rgb(230, 80, 80)), e);
             }
+            if crate::audio::sound_server_unreachable() {
+                ui.colored_label(
+                    readable(ui, Color32::from_rgb(230, 180, 60)),
+                    "PipeWire is running, but ALSA can't reach it: install pipewire-alsa and restart",
+                );
+            }
             if let Some((notice, at)) = &self.notice {
                 if now - at < NOTICE_S {
                     ui.colored_label(readable(ui, Color32::from_rgb(230, 180, 60)), notice);
