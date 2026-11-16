@@ -280,7 +280,10 @@ impl DiscoveryWindow {
         // nor take focus, so this separate window could open hidden behind
         // the (empty, black) main window. There it's drawn inside the main
         // window instead.
-        let mut viewport_ui = |ui: &mut egui::Ui, _class: egui::ViewportClass| {
+        let mut viewport_ui = |ui: &mut egui::Ui, class: egui::ViewportClass| {
+                if class != egui::ViewportClass::Root {
+                    crate::sync_secondary_viewport_theme(ui.ctx());
+                }
                 if let Some(deadline) = self.focus_deadline {
                     let focused = ui.input(|i| i.viewport().focused).unwrap_or(false);
                     if focused || Instant::now() >= deadline {

@@ -186,6 +186,7 @@ impl FirmwareUpdateWindow {
             egui::ViewportId::from_hash_of("firmware_update_window"),
             egui::ViewportBuilder::default().with_title("Firmware Update").with_inner_size([560.0, 520.0]),
             |ui, _class| {
+                crate::sync_secondary_viewport_theme(ui.ctx());
                 if ui.input(|i| i.viewport().close_requested()) {
                     still_open = false;
                     return;

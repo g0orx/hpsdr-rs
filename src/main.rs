@@ -3881,6 +3881,161 @@ fn set_theme_choice(choice: config::ThemeChoice) {
     THEME_CHOICE.store(n, Ordering::Relaxed);
 }
 
+fn native_window_theme(theme: egui::ThemePreference) -> egui::SystemTheme {
+    match theme {
+        egui::ThemePreference::Dark => egui::SystemTheme::Dark,
+        egui::ThemePreference::Light => egui::SystemTheme::Light,
+        egui::ThemePreference::System => egui::SystemTheme::SystemDefault,
+    }
+}
+
+/// Last native theme sent to each secondary viewport: the requested theme,
+/// the resolved dark flag, and (Windows) whether the title bar was repainted.
+type SecondaryViewportThemes =
+    std::collections::HashMap<egui::ViewportId, (egui::SystemTheme, bool, bool)>;
+
+fn secondary_viewport_themes_id() -> egui::Id {
+    egui::Id::unique("secondary_viewport_themes")
+}
+
+// egui syncs native window themes for the root viewport only, so every
+// secondary viewport calls this at the start of its UI closure (the root
+// calls it too, for the Windows title-bar repaint).
+fn sync_secondary_viewport_theme(ctx: &egui::Context) {
+    let viewport_id = ctx.viewport_id();
+    let themes_id = secondary_viewport_themes_id();
+    let native_theme = native_window_theme(ctx.options(|o| o.theme_preference));
+    let dark = ctx.theme() == egui::Theme::Dark;
+    let previous = ctx.data(|data| {
+        data.get_temp::<SecondaryViewportThemes>(themes_id)
+            .and_then(|themes| themes.get(&viewport_id).copied())
+    });
+    let (mut applied, just_sent) = match previous {
+        Some((t, d, applied)) if t == native_theme && d == dark => (applied, false),
+        _ => {
+            ctx.send_viewport_cmd(egui::ViewportCommand::SetTheme(native_theme));
+            // Windows: repaint the title bar on a later frame, after winit
+            // has handled SetTheme.
+            ctx.request_repaint();
+            (false, true)
+        }
+    };
+    #[cfg(windows)]
+    if !applied && !just_sent {
+        let title = ctx.input(|i| i.viewport().title.clone()).unwrap_or_default();
+        applied = windows_title_bar::apply(&title, dark);
+        if !applied {
+            // Not shown yet -- eframe shows new windows after their first
+            // frame.
+            ctx.request_repaint_after(std::time::Duration::from_millis(50));
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = just_sent;
+        applied = true;
+    }
+    ctx.data_mut(|data| {
+        data.get_temp_mut_or_default::<SecondaryViewportThemes>(themes_id)
+            .insert(viewport_id, (native_theme, dark, applied));
+    });
+}
+
+/// Called from the root viewport each frame: forgets closed windows, so a
+/// reopened one gets its theme again.
+fn prune_secondary_viewport_themes(ctx: &egui::Context) {
+    let open: std::collections::HashSet<egui::ViewportId> =
+        ctx.input(|i| i.raw.viewports.keys().copied().collect());
+    ctx.data_mut(|data| {
+        data.get_temp_mut_or_default::<SecondaryViewportThemes>(secondary_viewport_themes_id())
+            .retain(|id, _| open.contains(id));
+    });
+}
+
+fn clear_secondary_viewport_theme(ctx: &egui::Context, viewport_id: egui::ViewportId) {
+    ctx.data_mut(|data| {
+        data.get_temp_mut_or_default::<SecondaryViewportThemes>(secondary_viewport_themes_id())
+            .remove(&viewport_id);
+    });
+}
+
+/// Windows paints a new secondary window's title bar before winit's theme
+/// takes effect and doesn't repaint it until the activation state changes
+/// (white text on a white bar until another window is clicked), so set the
+/// DWM dark-mode attribute directly and force a frame repaint.
+#[cfg(windows)]
+mod windows_title_bar {
+    use windows_sys::Win32::Foundation::{BOOL, HWND, LPARAM};
+    use windows_sys::Win32::Graphics::Dwm::{DwmSetWindowAttribute, DWMWA_USE_IMMERSIVE_DARK_MODE};
+    use windows_sys::Win32::System::Threading::GetCurrentThreadId;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        EnumThreadWindows, GetForegroundWindow, GetWindowTextW, IsWindowVisible, SendMessageW,
+        SetWindowPos, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
+        WM_NCACTIVATE,
+    };
+
+    struct Search {
+        title: Vec<u16>,
+        found: HWND,
+    }
+
+    unsafe extern "system" fn enum_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
+        let search = &mut *(lparam as *mut Search);
+        if IsWindowVisible(hwnd) == 0 {
+            return 1;
+        }
+        let mut buf = [0u16; 256];
+        let len = GetWindowTextW(hwnd, buf.as_mut_ptr(), buf.len() as i32);
+        if len > 0 && buf[..len as usize] == search.title[..] {
+            search.found = hwnd;
+            return 0;
+        }
+        1
+    }
+
+    /// Returns false if no visible window with this title exists yet. egui
+    /// runs viewports on the thread that created their windows.
+    pub fn apply(title: &str, dark: bool) -> bool {
+        let mut search = Search {
+            title: title.encode_utf16().collect(),
+            found: std::ptr::null_mut(),
+        };
+        // SAFETY: plain Win32 calls on a window owned by this thread;
+        // `search` outlives EnumThreadWindows.
+        unsafe {
+            EnumThreadWindows(
+                GetCurrentThreadId(),
+                Some(enum_proc),
+                &mut search as *mut Search as LPARAM,
+            );
+            let hwnd = search.found;
+            if hwnd.is_null() {
+                return false;
+            }
+            let value: BOOL = dark.into();
+            DwmSetWindowAttribute(
+                hwnd,
+                DWMWA_USE_IMMERSIVE_DARK_MODE as _,
+                &value as *const BOOL as _,
+                std::mem::size_of::<BOOL>() as u32,
+            );
+            SetWindowPos(
+                hwnd,
+                std::ptr::null_mut(),
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
+            );
+            let active = GetForegroundWindow() == hwnd;
+            SendMessageW(hwnd, WM_NCACTIVATE, (!active) as usize, 0);
+            SendMessageW(hwnd, WM_NCACTIVATE, active as usize, 0);
+        }
+        true
+    }
+}
+
 /// The theme for Follow system. On Windows and macOS egui follows the
 /// system itself (winit reports it, live). On Linux winit doesn't, on
 /// Wayland or X11, so a thread asks the desktop (the XDG portal's
@@ -5112,6 +5267,10 @@ impl eframe::App for HpsdrApp {
             self.applied_theme = Some(theme);
             ui.ctx().set_theme(theme);
         }
+        // egui themes the root window itself, but on Windows its title bar
+        // needs the same repaint as the secondary windows' at startup.
+        sync_secondary_viewport_theme(ui.ctx());
+        prune_secondary_viewport_themes(ui.ctx());
         // Track this window's current position/size every frame (cheap --
         // just copying floats already computed by egui-winit) so a final
         // value is always ready whenever the periodic per-radio Config
@@ -9235,6 +9394,7 @@ impl eframe::App for HpsdrApp {
                         viewport_id,
                         viewport_builder,
                         move |ui: &mut egui::Ui, _class: egui::ViewportClass| {
+                            sync_secondary_viewport_theme(ui.ctx());
                             // Tracked every frame (not just when the
                             // periodic Config save fires) for the same
                             // reason as the main window's own geometry --
@@ -9278,16 +9438,16 @@ impl eframe::App for HpsdrApp {
                             });
 
                             let show_settings = rx_for_closure.lock().unwrap().show_settings_window;
+                            let settings_viewport_id = egui::ViewportId::from_hash_of((
+                                "extra_receiver_settings",
+                                ddc_index,
+                            ));
                             if show_settings {
                                 // Own OS-level viewport, not nested inside
                                 // this receiver's window -- matches the
                                 // main Settings window's own treatment,
                                 // rather than being confined to this
                                 // receiver's own viewport.
-                                let settings_viewport_id = egui::ViewportId::from_hash_of((
-                                    "extra_receiver_settings",
-                                    ddc_index,
-                                ));
                                 let rx_for_settings = Arc::clone(&rx_for_closure);
                                 let settings_title = format!("Receiver {} Settings", ddc_index + 1);
                                 ui.ctx().show_viewport_deferred(
@@ -9296,8 +9456,14 @@ impl eframe::App for HpsdrApp {
                                         .with_title(settings_title)
                                         .with_inner_size([420.0, 500.0]),
                                     move |ui: &mut egui::Ui, _class: egui::ViewportClass| {
+                                        sync_secondary_viewport_theme(ui.ctx());
                                         if ui.input(|i| i.viewport().close_requested()) {
-                                            rx_for_settings.lock().unwrap().show_settings_window = false;
+                                            rx_for_settings.lock().unwrap().show_settings_window =
+                                                false;
+                                            clear_secondary_viewport_theme(
+                                                ui.ctx(),
+                                                ui.ctx().viewport_id(),
+                                            );
                                             return;
                                         }
                                         egui::CentralPanel::default().show(ui, |ui| {
@@ -9305,11 +9471,14 @@ impl eframe::App for HpsdrApp {
                                         });
                                     },
                                 );
+                            } else {
+                                clear_secondary_viewport_theme(ui.ctx(), settings_viewport_id);
                             }
                         },
                     );
                 }
 
+                let settings_viewport_id = egui::ViewportId::from_hash_of("settings_window");
                 if connected.show_settings_window {
                     // This window, like every other, follows Settings ->
                     // Spectrum's Theme. It used to be always light (white
@@ -9335,7 +9504,7 @@ impl eframe::App for HpsdrApp {
                         }
                     };
                     ui.ctx().show_viewport_immediate(
-                        egui::ViewportId::from_hash_of("settings_window"),
+                        settings_viewport_id,
                         egui::ViewportBuilder::default()
                             .with_title("Settings")
                             // ROOT CAUSE FIX for a real report: 860 was
@@ -9374,8 +9543,10 @@ impl eframe::App for HpsdrApp {
                             // moving Settings out of the way first.
                             .with_inner_size(settings_size),
                         |ui, _class| {
+                            sync_secondary_viewport_theme(ui.ctx());
                             if ui.input(|i| i.viewport().close_requested()) {
                                 close_requested = true;
+                                clear_secondary_viewport_theme(ui.ctx(), ui.ctx().viewport_id());
                                 return;
                             }
                             // Skip building this window's content while
@@ -13604,6 +13775,8 @@ impl eframe::App for HpsdrApp {
                     if close_requested {
                         connected.show_settings_window = false;
                     }
+                } else {
+                    clear_secondary_viewport_theme(ui.ctx(), settings_viewport_id);
                 }
 
                 // root_close_requested/stop_clicked (computed earlier
@@ -14068,6 +14241,7 @@ fn render_datv_window(ctx: &egui::Context, connected: &mut ConnectedState) -> bo
         egui::ViewportId::from_hash_of("datv_window"),
         egui::ViewportBuilder::default().with_title("DATV").with_inner_size([560.0, 720.0]),
         |ui, _class| {
+            sync_secondary_viewport_theme(ui.ctx());
             if ui.input(|i| i.viewport().close_requested()) {
                 close = true;
                 return;
@@ -18951,6 +19125,22 @@ fn main() -> eframe::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_window_theme_matches_theme_preference() {
+        assert_eq!(
+            native_window_theme(egui::ThemePreference::Dark),
+            egui::SystemTheme::Dark
+        );
+        assert_eq!(
+            native_window_theme(egui::ThemePreference::Light),
+            egui::SystemTheme::Light
+        );
+        assert_eq!(
+            native_window_theme(egui::ThemePreference::System),
+            egui::SystemTheme::SystemDefault
+        );
+    }
 
     /// A carrier plus white noise at known SNRs, through the real WDSP
     /// analyzer the way the main window feeds it, at several sample rates
