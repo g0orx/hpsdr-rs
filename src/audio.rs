@@ -77,10 +77,45 @@ pub fn list_input_devices() -> Vec<String> {
 pub struct AudioOutput {
     // Kept alive for as long as playback should continue; dropping this
     // stops the stream.
-    _stream: cpal::Stream,
+    _keep: OutputKeep,
     /// See AudioOutput::gaps.
     gaps: Arc<AtomicU64>,
 }
+
+/// What keeps an AudioOutput's stream alive: the stream itself, or (on
+/// Linux) a thread that owns it and reopens it when it dies.
+///
+/// REAL REPORT (2026-11-16, Raspberry Pi 4 B): "audio output stream
+/// error: A backend-specific error has occurred: `alsa::poll()` returned
+/// POLLERR". cpal 0.17's ALSA worker reports POLLERR (an underrun or
+/// suspend on a hw device) and polls again without recovering the PCM,
+/// so the error repeats in a tight loop and the audio stays dead. cpal
+/// 0.18 fixes this ("Polling errors trigger underrun recovery instead of
+/// looping"), but 0.18 also changes the default Linux host to PipeWire
+/// (different device names from the ones saved in settings) and much of
+/// its API. Until that upgrade, reopening the stream gets the audio back.
+enum OutputKeep {
+    Stream(#[allow(dead_code)] cpal::Stream),
+    Supervised(#[allow(dead_code)] OutputSupervisor),
+}
+
+struct OutputSupervisor {
+    stop: Arc<AtomicBool>,
+    thread: Option<thread::JoinHandle<()>>,
+}
+
+impl Drop for OutputSupervisor {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(t) = self.thread.take() {
+            t.thread().unpark();
+            let _ = t.join();
+        }
+    }
+}
+
+/// How often a dead stream may be reopened.
+const OUTPUT_REOPEN_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Audio queued before playback starts, and again after the queue runs
 /// dry: 50 ms at 48 kHz, or two of the sound card's own blocks if they're
@@ -129,96 +164,73 @@ impl AudioOutput {
         }
         .ok_or_else(|| "no default audio output device found".to_string())?;
 
-        let config = cpal::StreamConfig {
-            channels: OUTPUT_CHANNELS,
-            sample_rate: OUTPUT_SAMPLE_RATE,
-            buffer_size: cpal::BufferSize::Default,
-        };
-
         let gaps = Arc::new(AtomicU64::new(0));
-        let callback_gaps = Arc::clone(&gaps);
-        // Whether the queue has filled to PRIME_FRAMES since it last ran
-        // dry, and how long it's been silent since it did (None at the
-        // start, which isn't a gap).
-        let mut primed = false;
-        let mut silent_frames: Option<usize> = None;
-        let mut tone = sidetone.map(ToneSynth::new);
-        let stream = device
-            .build_output_stream(
-                &config,
-                // BUG FIX (history): `data` is cpal's interleaved STEREO
-                // buffer (OUTPUT_CHANNELS=2), but `buffer` (audio_out)
-                // used to be MONO content at 48kHz. Popping a fresh
-                // value from the mono queue for every interleaved slot
-                // (both L and R independently) instead of once per frame
-                // drained the queue at 2x its true production rate,
-                // playing local audio at roughly double speed/pitch --
-                // confirmed via a real report: WSJT-X (fed from this
-                // output via a loopback device) showed known signals at
-                // the wrong audio frequency, consistent with 2x speed.
-                // `buffer` now carries real (L, R) pairs (see spectrum.
-                // rs's DemodParams::binaural doc comment) -- one pair
-                // per frame, written straight to both channel slots, so
-                // this stays correct at the true 1:1 rate whether
-                // binaural is on (genuinely different L/R) or off
-                // (L==R, same as this project's own former duplicated-
-                // mono behavior).
-                move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
-                    let frames = data.len() / OUTPUT_CHANNELS as usize;
-                    let mut buf = buffer.lock().unwrap();
-                    if !primed {
-                        if buf.len() >= PRIME_FRAMES.max(2 * frames) {
-                            primed = true;
-                            if silent_frames.take().is_some_and(|n| n < GAP_MAX_FRAMES) {
-                                callback_gaps.fetch_add(1, Ordering::Relaxed);
-                            }
-                        } else {
-                            data.fill(0.0);
-                            if let Some(n) = silent_frames.as_mut() {
-                                *n += frames;
-                            }
-                            drop(buf);
-                            if let Some(tone) = tone.as_mut() {
-                                tone.mix(data, OUTPUT_CHANNELS as usize);
-                            }
+        if !cfg!(target_os = "linux") {
+            let stream = build_output_stream(&device, buffer, sidetone, gaps.clone(), None)?;
+            return Ok(Self { _keep: OutputKeep::Stream(stream), gaps });
+        }
+
+        // Linux: a thread owns the stream so it can reopen it (see
+        // OutputKeep). The first open's result comes back here.
+        let stop = Arc::new(AtomicBool::new(false));
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), String>>();
+        let thread = {
+            let (stop, gaps) = (stop.clone(), gaps.clone());
+            thread::Builder::new()
+                .name("audio-output".into())
+                .spawn(move || {
+                    let failed = Arc::new(AtomicBool::new(false));
+                    let open = |failed: &Arc<AtomicBool>| {
+                        build_output_stream(&device, buffer.clone(), sidetone.clone(), gaps.clone(), Some(failed.clone()))
+                    };
+                    let mut stream = match open(&failed) {
+                        Ok(s) => Some(s),
+                        Err(e) => {
+                            let _ = ready_tx.send(Err(e));
                             return;
                         }
-                    }
-                    for frame in data.chunks_mut(OUTPUT_CHANNELS as usize) {
-                        let (l, r) = match buf.pop_front() {
-                            Some(pair) => pair,
-                            None => {
-                                // Ran dry: silence, and wait to fill again.
-                                if primed {
-                                    primed = false;
-                                    silent_frames = Some(0);
-                                }
-                                *silent_frames.get_or_insert(0) += 1;
-                                (0.0, 0.0)
+                    };
+                    let _ = ready_tx.send(Ok(()));
+                    let mut last_open = Instant::now();
+                    let mut reopens = 0u64;
+                    while !stop.load(Ordering::Relaxed) {
+                        thread::park_timeout(Duration::from_millis(100));
+                        if stop.load(Ordering::Relaxed) || !failed.load(Ordering::Relaxed) {
+                            continue;
+                        }
+                        // Stop the dead stream now (its error loop spins),
+                        // then wait out the interval before reopening.
+                        drop(stream.take());
+                        let wait = OUTPUT_REOPEN_INTERVAL.saturating_sub(last_open.elapsed());
+                        if !wait.is_zero() {
+                            thread::park_timeout(wait);
+                            if stop.load(Ordering::Relaxed) {
+                                break;
                             }
-                        };
-                        if let [left, right, ..] = frame {
-                            *left = l;
-                            *right = r;
+                        }
+                        failed.store(false, Ordering::Relaxed);
+                        last_open = Instant::now();
+                        reopens += 1;
+                        match open(&failed) {
+                            Ok(s) => {
+                                eprintln!("audio: output stream reopened ({reopens} so far)");
+                                stream = Some(s);
+                            }
+                            Err(e) => {
+                                eprintln!("audio: couldn't reopen the output stream: {e}");
+                                failed.store(true, Ordering::Relaxed);
+                            }
                         }
                     }
-                    drop(buf);
-                    if let Some(tone) = tone.as_mut() {
-                        tone.mix(data, OUTPUT_CHANNELS as usize);
-                    }
-                },
-                move |err| {
-                    eprintln!("audio output stream error: {err}");
-                },
-                None, // no timeout; block as needed
-            )
-            .map_err(|e| format!("failed to build audio output stream: {e}"))?;
-
-        stream
-            .play()
-            .map_err(|e| format!("failed to start audio playback: {e}"))?;
-
-        Ok(Self { _stream: stream, gaps })
+                })
+                .map_err(|e| format!("couldn't start the audio output thread: {e}"))?
+        };
+        let supervisor = OutputSupervisor { stop, thread: Some(thread) };
+        match ready_rx.recv() {
+            Ok(Ok(())) => Ok(Self { _keep: OutputKeep::Supervised(supervisor), gaps }),
+            Ok(Err(e)) => Err(e),
+            Err(_) => Err("the audio output thread stopped".to_string()),
+        }
     }
 
     /// Gaps in the audio since playback started: times the queue ran dry
@@ -227,6 +239,127 @@ impl AudioOutput {
     pub fn gaps(&self) -> u64 {
         self.gaps.load(Ordering::Relaxed)
     }
+}
+
+/// Opens and starts an AudioOutput's stream on `device`. `failed`, if
+/// given, is set when the stream reports an error it won't recover from
+/// by itself (see OutputKeep).
+fn build_output_stream(
+    device: &cpal::Device,
+    buffer: Arc<Mutex<VecDeque<(f32, f32)>>>,
+    sidetone: Option<Arc<SidetoneTone>>,
+    gaps: Arc<AtomicU64>,
+    failed: Option<Arc<AtomicBool>>,
+) -> Result<cpal::Stream, String> {
+    let config = cpal::StreamConfig {
+        channels: OUTPUT_CHANNELS,
+        sample_rate: OUTPUT_SAMPLE_RATE,
+        buffer_size: cpal::BufferSize::Default,
+    };
+
+    let callback_gaps = gaps;
+    // Whether the queue has filled to PRIME_FRAMES since it last ran
+    // dry, and how long it's been silent since it did (None at the
+    // start, which isn't a gap).
+    let mut primed = false;
+    let mut silent_frames: Option<usize> = None;
+    let mut tone = sidetone.map(ToneSynth::new);
+    let stream = device
+        .build_output_stream(
+            &config,
+            // BUG FIX (history): `data` is cpal's interleaved STEREO
+            // buffer (OUTPUT_CHANNELS=2), but `buffer` (audio_out)
+            // used to be MONO content at 48kHz. Popping a fresh
+            // value from the mono queue for every interleaved slot
+            // (both L and R independently) instead of once per frame
+            // drained the queue at 2x its true production rate,
+            // playing local audio at roughly double speed/pitch --
+            // confirmed via a real report: WSJT-X (fed from this
+            // output via a loopback device) showed known signals at
+            // the wrong audio frequency, consistent with 2x speed.
+            // `buffer` now carries real (L, R) pairs (see spectrum.
+            // rs's DemodParams::binaural doc comment) -- one pair
+            // per frame, written straight to both channel slots, so
+            // this stays correct at the true 1:1 rate whether
+            // binaural is on (genuinely different L/R) or off
+            // (L==R, same as this project's own former duplicated-
+            // mono behavior).
+            move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
+                let frames = data.len() / OUTPUT_CHANNELS as usize;
+                let mut buf = buffer.lock().unwrap();
+                if !primed {
+                    if buf.len() >= PRIME_FRAMES.max(2 * frames) {
+                        primed = true;
+                        if silent_frames.take().is_some_and(|n| n < GAP_MAX_FRAMES) {
+                            callback_gaps.fetch_add(1, Ordering::Relaxed);
+                        }
+                    } else {
+                        data.fill(0.0);
+                        if let Some(n) = silent_frames.as_mut() {
+                            *n += frames;
+                        }
+                        drop(buf);
+                        if let Some(tone) = tone.as_mut() {
+                            tone.mix(data, OUTPUT_CHANNELS as usize);
+                        }
+                        return;
+                    }
+                }
+                for frame in data.chunks_mut(OUTPUT_CHANNELS as usize) {
+                    let (l, r) = match buf.pop_front() {
+                        Some(pair) => pair,
+                        None => {
+                            // Ran dry: silence, and wait to fill again.
+                            if primed {
+                                primed = false;
+                                silent_frames = Some(0);
+                            }
+                            *silent_frames.get_or_insert(0) += 1;
+                            (0.0, 0.0)
+                        }
+                    };
+                    if let [left, right, ..] = frame {
+                        *left = l;
+                        *right = r;
+                    }
+                }
+                drop(buf);
+                if let Some(tone) = tone.as_mut() {
+                    tone.mix(data, OUTPUT_CHANNELS as usize);
+                }
+            },
+            {
+                // cpal 0.17 can call this in a tight loop (see
+                // OutputKeep): print at most once a second.
+                let mut last_print: Option<Instant> = None;
+                let mut unprinted = 0u64;
+                move |err| {
+                    if matches!(err, cpal::StreamError::BackendSpecific { .. } | cpal::StreamError::StreamInvalidated) {
+                        if let Some(failed) = &failed {
+                            failed.store(true, Ordering::Relaxed);
+                        }
+                    }
+                    if last_print.is_some_and(|t| t.elapsed() < Duration::from_secs(1)) {
+                        unprinted += 1;
+                        return;
+                    }
+                    if unprinted > 0 {
+                        eprintln!("audio output stream error: {err} (and {unprinted} more)");
+                    } else {
+                        eprintln!("audio output stream error: {err}");
+                    }
+                    last_print = Some(Instant::now());
+                    unprinted = 0;
+                }
+            },
+            None, // no timeout; block as needed
+        )
+        .map_err(|e| format!("failed to build audio output stream: {e}"))?;
+
+    stream
+        .play()
+        .map_err(|e| format!("failed to start audio playback: {e}"))?;
+    Ok(stream)
 }
 
 /// How long the sidetone's on/off envelope takes to ramp fully up or
