@@ -41,6 +41,25 @@ disable/re-enable transmit (Settings → TX).
   example, the main receiver can go to real speakers while an extra
   receiver feeds a virtual cable for a second decoder, or vice versa.
 
+## No sound on Linux or a Raspberry Pi
+
+On Linux, **(System Default)** is ALSA's default device. That only goes
+through PipeWire (or PulseAudio) if the matching ALSA plugin is
+installed. Without it, the default is simply the first sound card -- on
+a Raspberry Pi, the **bcm2835 Headphones** jack -- so a USB headset or
+HDMI monitor stays silent, hpsdr-rs doesn't appear in pavucontrol's
+Playback tab, and the default microphone is reported as unavailable.
+
+To check, run `aplay -L | head -4`: the `default` entry should mention
+PipeWire. If it doesn't, install the plugin and restart hpsdr-rs:
+
+```
+sudo apt install pipewire-alsa
+```
+
+hpsdr-rs then shows up in pavucontrol, where you can send it to any
+output.
+
 ---
 
 [← About](04-about.md) | [Index](README.md) | [CW →](06-settings-cw.md)
