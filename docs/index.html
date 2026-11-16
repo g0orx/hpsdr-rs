@@ -117,7 +117,7 @@ footer a { color: var(--accent); }
 
 <div class="wrap">
   <header>
-    <div class="eyebrow">openHPSDR client · v0.15.1</div>
+    <div class="eyebrow">openHPSDR client · v0.15.2</div>
     <h1>hpsdr-rs</h1>
     <p class="lede"><strong>A free, open-source SDR client for openHPSDR radios and more,</strong> written in Rust with egui and using WDSP for the signal processing. It runs on Linux (including the Raspberry Pi), Windows and macOS. GPL-2.0-or-later, by John Melton G0ORX.</p>
     <div class="links">
@@ -151,6 +151,7 @@ footer a { color: var(--accent); }
       <ul class="f">
         <li>Main receiver plus extra receiver windows, each with its own VFO, mode, filter and AF gain.</li>
         <li>Spectrum and waterfall with Click-to-Tune, adjustable dB range, palettes and automatic floor tracking.</li>
+        <li>Tune by scrolling the digit under the mouse, by the VFO step on the spectrum, or by tapping a VFO to type a frequency.</li>
         <li>SSB, CW, AM, FM and digital modes. Filter, AF gain and mode remembered per mode and per band; band stack with 3 memories per band.</li>
         <li>NB/NB2, NR/NR2/NNR, SNB and squelch. AGC Off, Long, Slow, Medium or Fast, with adjustable gain.</li>
         <li>Diversity reception on radios with two ADCs, and an RX equalizer.</li>
@@ -214,7 +215,7 @@ footer a { color: var(--accent); }
   <footer>
     <p>Always bench-test into a dummy load at reduced drive before transmitting into an antenna, especially after a new build.</p>
     <p>Demos: <a href="audio-demo.html">noise reduction audio</a> · <a href="qo100-demo.html">QO-100</a>.</p>
-    <p>Summary as of v0.15.1, 15 November 2026. Details and status for each radio are in the <a href="https://github.com/g0orx/hpsdr-rs#readme">README</a>.</p>
+    <p>Summary as of v0.15.2, 16 November 2026. Details and status for each radio are in the <a href="https://github.com/g0orx/hpsdr-rs#readme">README</a>.</p>
   </footer>
 </div>
 </body>
