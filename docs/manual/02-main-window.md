@@ -18,8 +18,11 @@ and [band stack](#band-stack) entry (e.g. **20m-1**) and the **VFO step**
 multiples of it; MIDI's **VFO Step Size +/-** actions change it too. You can
 tune it several ways:
 
-- **Scroll** while hovering the frequency display, or the spectrum/waterfall
-  panes: steps by 1 kHz per notch. Hold **Shift** while scrolling for 100 Hz
+- **Scroll** over a digit of the frequency display: steps that digit up
+  or down -- over the 1 kHz digit it moves 1 kHz, over the 10 Hz digit
+  10 Hz, and so on. The digit under the mouse is underlined. A step that
+  would go past the radio's tuning range stops at its edge.
+- **Scroll** over the spectrum/waterfall panes: steps by 1 kHz per notch. Hold **Shift** while scrolling for 100 Hz
   steps, or **Alt** for 10 Hz steps (in any mode -- e.g. for fine-tuning a
   digital modem). In CW mode (**CWL**/**CWU**), steps are finer -- 100 Hz
   per notch, 10 Hz with Shift -- matching how tightly CW is normally
@@ -38,14 +41,14 @@ tune it several ways:
 - **Click** directly on the spectrum or waterfall: retunes straight to the
   clicked frequency -- rounded to the nearest kHz in every mode except CW,
   which uses the exact clicked frequency (see above).
-- **Right-click** the frequency display (VFO-A or VFO-B): opens a small
+- **Click** (or tap) the frequency display (VFO-A or VFO-B): opens a small
   popup with an on-screen numeric keypad (plus normal keyboard digit/
   Backspace/Enter/Escape input) to type an exact frequency directly,
   rather than scrolling or clicking a spot on the spectrum. Retunes as
   soon as you press **Enter**, clamped to the radio's own tunable range.
   The keypad opens inside the main window, on top of everything there, so
   it can't get lost behind it; drag it by its title, and close it with
-  **Cancel**, Escape or its **x**. Right-clicking a VFO while it's open
+  **Cancel**, Escape or its **x**. Clicking a VFO while it's open
   starts it afresh for that VFO. While it's open the spacebar doesn't
   key the transmitter.
 - **Click and drag** across the spectrum or waterfall: retunes by however
@@ -57,7 +60,7 @@ tune it several ways:
   instead this drags the CTUN listen point directly, the same direction as
   your cursor, the same way clicking a spot tunes straight to it.
 
-![The right-click frequency-entry keypad](images/02-frequency-entry.png)
+![The frequency-entry keypad](images/02-frequency-entry.png)
 
 ### CTUN (Click to Tune)
 
@@ -176,9 +179,8 @@ working.
 
 Next to the **VFO-A** box is a second, independent **VFO-B** box -- a
 second remembered frequency with no receiver of its own (this app doesn't
-receive on two frequencies at once). You can scroll on the VFO-B box the
-same way as VFO-A (Alt for 10 Hz steps, Shift for 100 Hz, otherwise 1 kHz) to change its
-stored value directly, or use the buttons between the two boxes:
+receive on two frequencies at once). You can scroll over a digit of VFO-B,
+as on VFO-A, to change its stored value directly, or use the buttons between the two boxes:
 
 - **A>B** -- copies VFO A's current frequency (and transverter) into VFO
   B.
@@ -287,8 +289,8 @@ open one at a time from a toolbar of large buttons under the spectrum:
 - **MOX**, on the right.
 
 Each opens above the toolbar, over the spectrum; press its button again, or
-**×**, to close it. A long press on VFO-A or VFO-B opens the frequency
-keypad (as a right-click does), and dragging the spectrum tunes.
+**×**, to close it. A tap on VFO-A or VFO-B opens the frequency
+keypad, and dragging the spectrum tunes.
 
 On a narrow screen, such as the 720x1280 Raspberry Pi Touch Display 2 in
 portrait, VFO-B moves under VFO-A with the S-meter beside it. The compact

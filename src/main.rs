@@ -1516,14 +1516,14 @@ fn save_setup(connected: &mut ConnectedState, name: &str) {
     }
 }
 
-/// Right-click on a VFO: opens the keypad for VFO A or B -- or, if it's
+/// Click (or tap) on a VFO: opens the keypad for VFO A or B -- or, if it's
 /// already open, starts it afresh for that VFO. It's a window inside the
 /// main one (see where it's drawn), so it's always in front there.
 fn open_frequency_entry(connected: &mut ConnectedState, vfo_b: bool) {
     connected.frequency_entry = Some(FrequencyEntry { vfo_b, digits: String::new() });
 }
 
-/// The keypad window opened by right-clicking a VFO, in the main window
+/// The keypad window opened by clicking a VFO, in the main window
 /// or an extra receiver's (each passes its own `entry`). Drawn inside
 /// the window it was opened from, not as a window of its own -- see
 /// where the main window calls it. Closes itself on Enter, Cancel,
@@ -2815,7 +2815,7 @@ struct ExtraReceiver {
     spectrum_zoom: i32,
     spectrum_pan: f32,
     show_settings_window: bool,
-    /// Right-click VFO-A or VFO-B -> keypad, as in the main window
+    /// Click VFO-A or VFO-B -> keypad, as in the main window
     /// (ConnectedState::frequency_entry), drawn inside this receiver's
     /// own window.
     frequency_entry: Option<FrequencyEntry>,
@@ -2947,7 +2947,7 @@ impl Default for MidiLearnState {
     }
 }
 
-/// Right-click VFO -> keypad frequency-entry popup state -- real
+/// Click VFO -> keypad frequency-entry popup state -- real
 /// request. See ConnectedState::frequency_entry's own doc comment.
 struct FrequencyEntry {
     vfo_b: bool,
@@ -3147,7 +3147,7 @@ struct ConnectedState {
     spectrum_pan: f32,
     slider_scroll_accum: f32,
     show_settings_window: bool,
-    /// Right-click VFO-A or VFO-B -> keypad frequency-entry popup, real
+    /// Click VFO-A or VFO-B -> keypad frequency-entry popup, real
     /// request. `None` = not open, same toggle idiom as
     /// show_settings_window above. `vfo_b: true` targets VFO B instead
     /// of VFO A/the dial; `digits` is what's been typed so far (ASCII
@@ -6415,7 +6415,7 @@ impl eframe::App for HpsdrApp {
                                                 )
                                                 // CLICK (not just hover) --
                                                 // needed for
-                                                // secondary_clicked() below;
+                                                // clicked() below;
                                                 // still senses hover fine
                                                 // (Sense::click() includes
                                                 // it) so the existing
@@ -6423,34 +6423,15 @@ impl eframe::App for HpsdrApp {
                                                 // further down is unaffected.
                                                 .sense(egui::Sense::click()),
                                             )
-                                            .on_hover_text(if matches!(current_mode, spectrum::Mode::Cwl | spectrum::Mode::Cwu) {
-                                                // ROOT CAUSE FIX for a real
-                                                // report: this hovering
-                                                // over VFO-A shares the
-                                                // SAME scroll handler as
-                                                // the spectrum/waterfall
-                                                // (see the "if
-                                                // freq_label.hovered() ||
-                                                // spectrum_resp.hovered()"
-                                                // check further down) --
-                                                // its real step sizes were
-                                                // already CW-aware
-                                                // (scroll_tune_step_hz/
-                                                // ctrl_scroll_tune_step_hz),
-                                                // but this tooltip text
-                                                // was a plain static
-                                                // string that never
-                                                // reflected that, always
-                                                // showing the non-CW
-                                                // values even in CW mode.
-                                                "Scroll to tune -- Shift: 10 Hz, Ctrl: 1 Hz, none: 100 Hz -- right-click to type a frequency"
-                                            } else {
-                                                "Scroll to tune -- Alt: 10 Hz, Shift: 100 Hz, Ctrl: 10 kHz, none: 1 kHz -- right-click to type a frequency"
-                                            });
-                                        // Right-click -> keypad frequency
-                                        // entry popup, real request.
-                                        // A long press too, on a touch screen.
-                                        if resp.secondary_clicked() || resp.long_touched() {
+                                            // Over a digit, scrolling steps that digit
+                                            // (vfo_digit_under_pointer, used by the
+                                            // scroll handler further down).
+                                            .on_hover_text("Scroll over a digit to step it -- click to type a frequency");
+                                        // Click (a tap on a touch screen) ->
+                                        // keypad frequency entry popup.
+                                        // Was right-click; a left click
+                                        // lets a touch screen open it.
+                                        if resp.clicked() {
                                             open_frequency_entry(connected, false);
                                         }
                                         resp
@@ -6664,9 +6645,9 @@ impl eframe::App for HpsdrApp {
                                                 .sense(egui::Sense::click()),
                                             )
                                             .on_hover_text(
-                                                "Scroll to tune -- Alt: 10 Hz, Shift: 100 Hz, none: 1 kHz -- right-click to type a frequency",
+                                                "Scroll over a digit to step it -- click to type a frequency",
                                             );
-                                        if resp.secondary_clicked() || resp.long_touched() {
+                                        if resp.clicked() {
                                             open_frequency_entry(connected, true);
                                         }
                                         resp
@@ -6836,9 +6817,9 @@ impl eframe::App for HpsdrApp {
                         settings_changed = true;
                     }
 
-                    // Right-click VFO -> keypad frequency-entry popup --
+                    // Click VFO -> keypad frequency-entry popup --
                     // real request. Opened by freq_label/vfo_b_label's
-                    // own secondary_clicked() handling above.
+                    // own clicked() handling above.
                     //
                     // A window drawn inside the main one, not its own OS
                     // window. REAL REPORT (2026-11-07): as its own window it
@@ -6847,7 +6828,7 @@ impl eframe::App for HpsdrApp {
                     // bring it back -- Wayland ignores a program raising or
                     // focusing its own windows (ViewportCommand::Focus did
                     // nothing). Inside the main window egui always draws it
-                    // on top, and right-clicking a VFO brings the main
+                    // on top, and clicking a VFO brings the main
                     // window, and it, forward.
                     if let Some((vfo_b, freq)) = frequency_entry_window(ui.ctx(), &mut connected.frequency_entry) {
                         // VFO-A entry is in RF/displayed space, like a
@@ -8236,6 +8217,9 @@ impl eframe::App for HpsdrApp {
                     // Scroll-to-tune: active while hovering the frequency
                     // label or the spectrum itself.
                     if freq_label.hovered() || spectrum_resp.hovered() {
+                        // Over a digit of VFO-A, scrolling steps that digit.
+                        let digit_step =
+                            if freq_label.hovered() { vfo_digit_under_pointer(ui, &freq_label, 28.0) } else { None };
                         let (delta, scroll_shift, scroll_alt) = scroll_tune_input(ui);
 
                         if delta != 0.0 {
@@ -8255,19 +8239,27 @@ impl eframe::App for HpsdrApp {
                             // frequency scroll-to-tune applies (VFO B,
                             // RIT, XIT, both receivers) for a consistent
                             // feel across all of them.
-                            const NOTCH: f32 = 100.0;
+                            let notch: f32 = if digit_step.is_some() { VFO_DIGIT_NOTCH } else { 100.0 };
 
                             let shift = scroll_shift;
                             let ctrl = ui.input(|i| i.modifiers.ctrl);
-                            let step: i64 = scroll_tune_step_hz(cw_mode, scroll_alt, shift, ctrl);
+                            let step: i64 =
+                                digit_step.unwrap_or_else(|| scroll_tune_step_hz(cw_mode, scroll_alt, shift, ctrl));
 
                             let mut new_freq = dial_freq_hz as i64;
-                            while connected.scroll_accum.abs() >= NOTCH {
+                            while connected.scroll_accum.abs() >= notch {
                                 let sign = connected.scroll_accum.signum();
-                                connected.scroll_accum -= sign * NOTCH;
+                                connected.scroll_accum -= sign * notch;
                                 new_freq += step * sign as i64;
                             }
                             new_freq = new_freq.max(0);
+                            if digit_step.is_some() {
+                                // A big digit can step past the radio's range.
+                                new_freq = new_freq.clamp(
+                                    connected.device.frequency_min as i64,
+                                    connected.device.frequency_max as i64,
+                                );
+                            }
 
                             if new_freq as u32 != dial_freq_hz {
                                 let (effective_freq, retune) =
@@ -8327,15 +8319,18 @@ impl eframe::App for HpsdrApp {
                     // CTUN/passband/retune handling needed here -- just a
                     // plain accumulate-then-step onto the stored value.
                     if vfo_b_label.hovered() {
+                        let digit_step = vfo_digit_under_pointer(ui, &vfo_b_label, if compact { 22.0 } else { 28.0 });
                         let (delta, scroll_shift, scroll_alt) = scroll_tune_input(ui);
 
                         if delta != 0.0 {
                             connected.vfo_b_scroll_accum += delta;
                             // Same NOTCH/step convention as VFO A's block
                             // above.
-                            const NOTCH: f32 = 100.0;
+                            let notch: f32 = if digit_step.is_some() { VFO_DIGIT_NOTCH } else { 100.0 };
                             let shift = scroll_shift;
-                            let step: i64 = if scroll_alt {
+                            let step: i64 = if let Some(step) = digit_step {
+                                step
+                            } else if scroll_alt {
                                 10
                             } else if shift {
                                 100
@@ -8344,12 +8339,18 @@ impl eframe::App for HpsdrApp {
                             };
 
                             let mut new_freq = connected.vfo_b_frequency_hz as i64;
-                            while connected.vfo_b_scroll_accum.abs() >= NOTCH {
+                            while connected.vfo_b_scroll_accum.abs() >= notch {
                                 let sign = connected.vfo_b_scroll_accum.signum();
-                                connected.vfo_b_scroll_accum -= sign * NOTCH;
+                                connected.vfo_b_scroll_accum -= sign * notch;
                                 new_freq += step * sign as i64;
                             }
                             new_freq = new_freq.max(0);
+                            if digit_step.is_some() {
+                                new_freq = new_freq.clamp(
+                                    connected.device.frequency_min as i64,
+                                    connected.device.frequency_max as i64,
+                                );
+                            }
 
                             if new_freq as u32 != connected.vfo_b_frequency_hz {
                                 let delta_b = new_freq - connected.vfo_b_frequency_hz as i64;
@@ -15592,6 +15593,43 @@ fn format_frequency(hz: u64) -> String {
     format!("{}.{:06}", hz / 1_000_000, hz % 1_000_000)
 }
 
+/// Scroll motion per step when scrolling over a VFO digit: exactly one
+/// mouse-wheel notch, so each notch moves the digit by one. winit reports
+/// a notch as one line and egui (native) makes a line 40 points
+/// (InputOptions::line_scroll_speed); the 100.0 used for other tuning
+/// is two and a half notches.
+const VFO_DIGIT_NOTCH: f32 = 40.0;
+
+/// The digit of a VFO's frequency label (format_frequency's text, in a
+/// monospace font of `size`) under the mouse, as the Hz one step of it
+/// is worth: 1 for the last digit, 10 for the one before, up to the
+/// MHz digits. Counted from the label's right edge, since there are
+/// always six digits after the point. None when the mouse isn't over
+/// the label or is on the point. Underlines that digit, so it's clear
+/// which one scrolling will step. Real request: scroll over a digit to
+/// step it.
+fn vfo_digit_under_pointer(ui: &egui::Ui, resp: &egui::Response, size: f32) -> Option<i64> {
+    let pos = resp.hover_pos()?;
+    let w = ui.ctx().fonts_mut(|f| f.glyph_width(&egui::FontId::monospace(size), '0'));
+    if w <= 0.0 {
+        return None;
+    }
+    let rect = resp.rect;
+    let k = ((rect.right() - pos.x) / w).floor() as i32;
+    let chars = (rect.width() / w).round() as i32;
+    if k < 0 || k >= chars || k == 6 {
+        return None;
+    }
+    let power = if k < 6 { k } else { k - 1 } as u32;
+    let right = rect.right() - k as f32 * w;
+    ui.painter().hline(
+        (right - w + 1.0)..=(right - 1.0),
+        rect.bottom(),
+        egui::Stroke::new(2.0, ui.visuals().strong_text_color()),
+    );
+    Some(10i64.pow(power))
+}
+
 /// Same accumulate-and-threshold pattern as frequency scroll-to-tune:
 /// a step only fires once accumulated scroll motion crosses NOTCH, so
 /// small/slow scrolling doesn't overshoot. Shares one accumulator
@@ -16540,23 +16578,41 @@ fn render_extra_receiver_ui(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceiver>>) {
                             .strong()
                             .color(readable(ui, egui::Color32::GREEN)),
                     )
-                    // Click, not just hover, for secondary_clicked()
+                    // Click, not just hover, for clicked()
                     // below; it still senses hover for scroll-to-tune.
                     .sense(egui::Sense::click()),
                 )
-                .on_hover_text(if cw_mode {
-                    // Same real report/fix as the main window's
-                    // identical tooltip (main.rs) -- this label shares
-                    // its own spectrum/waterfall scroll handler
-                    // (scroll_tune_step_hz), already CW-aware, but this
-                    // text never reflected that.
-                    "Scroll to tune -- Shift: 10 Hz, none: 100 Hz. Click spectrum/waterfall to jump. Right-click to type a frequency."
-                } else {
-                    "Scroll to tune -- Alt: 10 Hz, Shift: 100 Hz, none: 1 kHz. Click spectrum/waterfall to jump. Right-click to type a frequency."
-                });
+                .on_hover_text("Scroll over a digit to step it. Click to type a frequency.");
+                // Scroll over a digit steps it, as in the main window --
+                // tuned like a scroll over this receiver's spectrum.
+                if let Some(step) = vfo_digit_under_pointer(ui, &resp, 28.0) {
+                    let (delta, _, _) = scroll_tune_input(ui);
+                    if delta != 0.0 {
+                        rx.scroll_accum += delta;
+                        // See the main receiver's own scroll-to-tune NOTCH comment.
+                        const NOTCH: f32 = VFO_DIGIT_NOTCH;
+                        let mut new_freq = dial_freq_hz as i64;
+                        while rx.scroll_accum.abs() >= NOTCH {
+                            let sign = rx.scroll_accum.signum();
+                            rx.scroll_accum -= sign * NOTCH;
+                            new_freq += step * sign as i64;
+                        }
+                        let new_freq = new_freq.clamp(rx.frequency_min as i64, rx.frequency_max.min(u32::MAX as u64) as i64) as u32;
+                        if new_freq != dial_freq_hz {
+                            let (effective_freq, retune) = resolve_tune(rx.ctun, freq_hz, sample_rate, passband, new_freq);
+                            if let Some(lo) = retune {
+                                rx.frequency_hz.store(lo, Ordering::Relaxed);
+                            } else {
+                                rx.ctun_frequency_hz = effective_freq;
+                            }
+                            remember_band_settings(&mut rx.band_memory, None, effective_freq, db_low, db_high, wf_db_low, wf_db_high, current_mode);
+                            rx.settings_dirty.store(true, Ordering::Relaxed);
+                        }
+                    }
+                }
                 // REAL REPORT (2026-11-07): right-click did nothing on an
                 // extra receiver's VFOs -- only the main window's had it.
-                if resp.secondary_clicked() {
+                if resp.clicked() {
                     rx.frequency_entry = Some(FrequencyEntry { vfo_b: false, digits: String::new() });
                 }
             });
@@ -16686,8 +16742,27 @@ fn render_extra_receiver_ui(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceiver>>) {
                     )
                     .sense(egui::Sense::click()),
                 )
-                .on_hover_text("Right-click to type a frequency");
-                if resp.secondary_clicked() {
+                .on_hover_text("Scroll over a digit to step it. Click to type a frequency.");
+                // Scroll over a digit steps it, as on VFO-A.
+                if let Some(step) = vfo_digit_under_pointer(ui, &resp, 28.0) {
+                    let (delta, _, _) = scroll_tune_input(ui);
+                    if delta != 0.0 {
+                        rx.scroll_accum += delta;
+                        const NOTCH: f32 = VFO_DIGIT_NOTCH;
+                        let mut new_freq = rx.vfo_b_frequency_hz as i64;
+                        while rx.scroll_accum.abs() >= NOTCH {
+                            let sign = rx.scroll_accum.signum();
+                            rx.scroll_accum -= sign * NOTCH;
+                            new_freq += step * sign as i64;
+                        }
+                        let new_freq = new_freq.clamp(rx.frequency_min as i64, rx.frequency_max.min(u32::MAX as u64) as i64) as u32;
+                        if new_freq != rx.vfo_b_frequency_hz {
+                            rx.vfo_b_frequency_hz = new_freq;
+                            rx.settings_dirty.store(true, Ordering::Relaxed);
+                        }
+                    }
+                }
+                if resp.clicked() {
                     rx.frequency_entry = Some(FrequencyEntry { vfo_b: true, digits: String::new() });
                 }
             });

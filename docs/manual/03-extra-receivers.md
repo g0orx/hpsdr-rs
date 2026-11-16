@@ -31,7 +31,7 @@ PureSignal and reconnect to get those two receivers back.
 It behaves like a scaled-down version of the main window: VFO-A/VFO-B
 boxes with **A>B**/**B>A**/**A<>B** buttons (same as the main window's own
 -- see [Frequency display and tuning](02-main-window.md#frequency-display-and-tuning)
--- but no **Split** button, since extra receivers never transmit; right-click
+-- but no **Split** button, since extra receivers never transmit; click
 either VFO for the frequency keypad, which opens inside this window), with
 **CTUN** and, while in CW mode, **CW Decode** (see
 [CW decoder](02-main-window.md#cw-decode)) in the row underneath, band
@@ -46,7 +46,7 @@ receive-only feature and this window has no XIT (extra receivers never
 transmit) -- its own spectrum and waterfall panes with their own
 [Zoom/Pan sliders](02-main-window.md#zoom-and-pan) below
 the waterfall (click or scroll to tune, same conventions as the main
-window, though Ctrl+scroll's 10kHz-step tuning gesture isn't available
+window, including scrolling over a VFO's digit to step it, though Ctrl+scroll's 10kHz-step tuning gesture isn't available
 here), and its own S-meter with a **Settings...** button.
 
 Its band buttons have their own [band stack](02-main-window.md#band-stack),
