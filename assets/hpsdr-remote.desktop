@@ -5,5 +5,5 @@ Comment=Remote client for hpsdr-rs, over the network
 Exec=hpsdr-remote
 Icon=hpsdr-rs
 Terminal=false
-Categories=HamRadio;Network;
+Categories=HamRadio;
 Keywords=SDR;HPSDR;Ham Radio;Amateur Radio;Remote;TCI;

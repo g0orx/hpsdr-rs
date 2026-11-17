@@ -199,6 +199,14 @@ assets = [
     ["docs/manual/*.md", "usr/share/doc/hpsdr-rs/manual/", "644"],
     ["docs/manual/images/*", "usr/share/doc/hpsdr-rs/manual/images/", "644"],
     ["assets/hpsdr-rs.desktop", "usr/share/applications/hpsdr-rs.desktop", "644"],
+    # A "Ham Radio" submenu, for menus that have none (Raspberry Pi OS:
+    # rpd-applications.menu; LXDE, Xfce, MATE). Menus read add-ons from
+    # applications-merged; installed under each Pi menu's own name too, as
+    # the menu spec leaves which one applies unclear without a prefix.
+    ["assets/menu/hpsdr-rs-hamradio.directory", "usr/share/desktop-directories/hpsdr-rs-hamradio.directory", "644"],
+    ["assets/menu/hpsdr-rs-hamradio.menu", "etc/xdg/menus/applications-merged/hpsdr-rs-hamradio.menu", "644"],
+    ["assets/menu/hpsdr-rs-hamradio.menu", "etc/xdg/menus/rpd-applications-merged/hpsdr-rs-hamradio.menu", "644"],
+    ["assets/menu/hpsdr-rs-hamradio.menu", "etc/xdg/menus/lxde-applications-merged/hpsdr-rs-hamradio.menu", "644"],
     ["assets/icons/hpsdr-rs.png", "usr/share/icons/hicolor/256x256/apps/hpsdr-rs.png", "644"],
     ["assets/io.github.g0orx.hpsdr-rs.metainfo.xml", "usr/share/metainfo/io.github.g0orx.hpsdr-rs.metainfo.xml", "644"],
     # Not auto-installed to /etc/udev/rules.d/ (a .deb shouldn't silently
@@ -252,6 +260,9 @@ assets = [
     { source = "docs/manual/*.md", dest = "/usr/share/doc/hpsdr-rs/manual/", mode = "644", doc = true },
     { source = "docs/manual/images/*", dest = "/usr/share/doc/hpsdr-rs/manual/images/", mode = "644", doc = true },
     { source = "assets/hpsdr-rs.desktop", dest = "/usr/share/applications/hpsdr-rs.desktop", mode = "644" },
+    # "Ham Radio" submenu -- see the .deb's assets.
+    { source = "assets/menu/hpsdr-rs-hamradio.directory", dest = "/usr/share/desktop-directories/hpsdr-rs-hamradio.directory", mode = "644" },
+    { source = "assets/menu/hpsdr-rs-hamradio.menu", dest = "/etc/xdg/menus/applications-merged/hpsdr-rs-hamradio.menu", mode = "644", config = true },
     { source = "assets/icons/hpsdr-rs.png", dest = "/usr/share/icons/hicolor/256x256/apps/hpsdr-rs.png", mode = "644" },
     { source = "assets/io.github.g0orx.hpsdr-rs.metainfo.xml", dest = "/usr/share/metainfo/io.github.g0orx.hpsdr-rs.metainfo.xml", mode = "644" },
     # Reference copies, not installed to /etc/udev/rules.d/ -- same
