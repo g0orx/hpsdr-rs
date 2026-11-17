@@ -174,6 +174,14 @@ pub struct AudioOutput {
     _keep: OutputKeep,
     /// See AudioOutput::gaps.
     gaps: Arc<AtomicU64>,
+    /// See AudioOutput::device / fell_back.
+    device: String,
+    fell_back: bool,
+}
+
+/// A device's name as the pickers list it.
+fn name_of(device: &cpal::Device) -> String {
+    device.description().map(|d| d.name().to_string()).unwrap_or_else(|_| "<unknown>".to_string())
 }
 
 /// What keeps an AudioOutput's stream alive: the stream itself, or (on
@@ -241,6 +249,7 @@ impl AudioOutput {
         sidetone: Option<Arc<SidetoneTone>>,
     ) -> Result<Self, String> {
         let host = cpal::default_host();
+        let mut fell_back = false;
         let device = match device_name {
             Some(name) => host
                 .output_devices()
@@ -253,6 +262,7 @@ impl AudioOutput {
                     eprintln!(
                         "audio: output device \"{name}\" not found -- falling back to the system default"
                     );
+                    fell_back = true;
                     system_default_device(&host, true)
                 }),
             None => system_default_device(&host, true),
@@ -263,13 +273,13 @@ impl AudioOutput {
         let gaps = Arc::new(AtomicU64::new(0));
         if !cfg!(target_os = "linux") {
             let stream = build_output_stream(&device, buffer, sidetone, gaps.clone(), None)?;
-            return Ok(Self { _keep: OutputKeep::Stream(stream), gaps });
+            return Ok(Self { _keep: OutputKeep::Stream(stream), gaps, device: name_of(&device), fell_back });
         }
 
         // Linux: a thread owns the stream so it can reopen it (see
         // OutputKeep). The first open's result comes back here.
         let stop = Arc::new(AtomicBool::new(false));
-        let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), String>>();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<String, String>>();
         let thread = {
             let (stop, gaps) = (stop.clone(), gaps.clone());
             thread::Builder::new()
@@ -299,7 +309,7 @@ impl AudioOutput {
                             return;
                         }
                     };
-                    let _ = ready_tx.send(Ok(()));
+                    let _ = ready_tx.send(Ok(name_of(&device)));
                     let mut last_open = Instant::now();
                     let mut reopens = 0u64;
                     while !stop.load(Ordering::Relaxed) {
@@ -336,10 +346,22 @@ impl AudioOutput {
         };
         let supervisor = OutputSupervisor { stop, thread: Some(thread) };
         match ready_rx.recv() {
-            Ok(Ok(())) => Ok(Self { _keep: OutputKeep::Supervised(supervisor), gaps }),
+            Ok(Ok(device)) => Ok(Self { _keep: OutputKeep::Supervised(supervisor), gaps, device, fell_back }),
             Ok(Err(e)) => Err(e),
             Err(_) => Err("the audio output thread stopped".to_string()),
         }
+    }
+
+    /// The device actually playing: the chosen one, or the system default
+    /// when that wasn't found (see fell_back).
+    pub fn device(&self) -> &str {
+        &self.device
+    }
+
+    /// The chosen device wasn't found, so the system default plays
+    /// instead. Settings -> Audio says so (issue #18).
+    pub fn fell_back(&self) -> bool {
+        self.fell_back
     }
 
     /// Gaps in the audio since playback started: times the queue ran dry
@@ -1242,6 +1264,9 @@ mod tests {
 
 pub struct MicInput {
     _stream: cpal::Stream,
+    /// See MicInput::device / fell_back.
+    device: String,
+    fell_back: bool,
 }
 
 impl MicInput {
@@ -1283,6 +1308,7 @@ impl MicInput {
     /// installed just uses the default mic instead.
     pub fn start(buffer: Arc<Mutex<VecDeque<f32>>>, selected_device_name: Option<&str>) -> Result<Self, String> {
         let host = cpal::default_host();
+        let mut fell_back = false;
         let (device, sound_server) = match selected_device_name {
             Some(name) => host
                 .input_devices()
@@ -1293,12 +1319,13 @@ impl MicInput {
                     eprintln!(
                         "audio: input device \"{name}\" not found -- falling back to the system default"
                     );
+                    fell_back = true;
                     system_default_device(&host, false)
                 }),
             None => system_default_device(&host, false),
         }
         .ok_or_else(|| "no default audio input device found".to_string())?;
-        match Self::start_on(Arc::clone(&buffer), device) {
+        let mut mic = match Self::start_on(Arc::clone(&buffer), device) {
             // The sound server's device won't open: ALSA's own default.
             Err(e) if sound_server => {
                 let device = host.default_input_device().ok_or(e.clone())?;
@@ -1306,15 +1333,28 @@ impl MicInput {
                 Self::start_on(buffer, device)
             }
             r => r,
-        }
+        }?;
+        mic.fell_back = fell_back;
+        Ok(mic)
+    }
+
+    /// The device actually capturing: the chosen one, or the system
+    /// default when that wasn't found (see fell_back).
+    pub fn device(&self) -> &str {
+        &self.device
+    }
+
+    /// The chosen device wasn't found, so the system default captures
+    /// instead. REAL REPORT (issue #18, Windows 11): a renamed USB mic
+    /// left the saved choice pointing at nothing; TX audio silently came
+    /// from another mic while Settings still showed the saved name.
+    pub fn fell_back(&self) -> bool {
+        self.fell_back
     }
 
     fn start_on(buffer: Arc<Mutex<VecDeque<f32>>>, device: cpal::Device) -> Result<Self, String> {
 
-        let device_name = device
-            .description()
-            .map(|d| d.name().to_string())
-            .unwrap_or_else(|_| "<unknown>".to_string());
+        let device_name = name_of(&device);
 
         let direct_config = cpal::StreamConfig {
             channels: INPUT_CHANNELS,
@@ -1400,6 +1440,6 @@ impl MicInput {
             .play()
             .map_err(|e| format!("failed to start audio capture: {e}"))?;
 
-        Ok(Self { _stream: stream })
+        Ok(Self { _stream: stream, device: device_name, fell_back: false })
     }
 }

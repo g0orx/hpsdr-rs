@@ -3881,6 +3881,48 @@ fn set_theme_choice(choice: config::ThemeChoice) {
     THEME_CHOICE.store(n, Ordering::Relaxed);
 }
 
+/// An audio picker's closed label: the saved device, marked when it isn't
+/// in the device list (the list is empty only before the first scan).
+fn picker_label(saved: Option<&str>, devices: &[String]) -> String {
+    match saved {
+        None => "(System Default)".to_string(),
+        Some(name) if !devices.is_empty() && !devices.iter().any(|d| d == name) => {
+            format!("{name} (not found)")
+        }
+        Some(name) => name.to_string(),
+    }
+}
+
+/// Under an audio picker in Settings -> Audio: the device actually in use,
+/// and a warning when the saved one wasn't found and the system default
+/// stands in. REAL REPORT (issue #18, Windows 11): a renamed USB mic left
+/// TX audio coming from a different mic, with nothing on screen saying so.
+fn audio_device_status(ui: &mut egui::Ui, saved: Option<&str>, in_use: Option<(&str, bool)>, output: bool) {
+    let warn = ui.visuals().warn_fg_color;
+    let (kind, flow) = if output { ("output", "RX audio plays to") } else { ("input", "TX audio comes from") };
+    match in_use {
+        None => {
+            ui.colored_label(
+                ui.visuals().error_fg_color,
+                format!("No audio {kind} device could be opened -- see the terminal for why."),
+            );
+        }
+        Some((device, true)) => {
+            ui.colored_label(
+                warn,
+                format!(
+                    "\"{}\" wasn't found, so {flow} the system default, \"{device}\". \
+                     Plug it in and pick it again, or pick another device.",
+                    saved.unwrap_or("")
+                ),
+            );
+        }
+        Some((device, false)) => {
+            ui.weak(format!("In use: {device}"));
+        }
+    }
+}
+
 fn native_window_theme(theme: egui::ThemePreference) -> egui::SystemTheme {
     match theme {
         egui::ThemePreference::Dark => egui::SystemTheme::Dark,
@@ -10815,10 +10857,10 @@ impl eframe::App for HpsdrApp {
                                     ui.horizontal(|ui| {
                                         ui.label("Output device:");
                                         let devices = audio::device_lists().0;
-                                        let current_label = connected
-                                            .audio_output_device
-                                            .clone()
-                                            .unwrap_or_else(|| "(System Default)".to_string());
+                                        let fell_back =
+                                            connected.audio_output.as_ref().is_some_and(|o| o.fell_back());
+                                        let current_label =
+                                            picker_label(connected.audio_output_device.as_deref(), &devices);
                                         egui::ComboBox::from_id_salt("main_audio_output_device")
                                             .selected_text(current_label)
                                             .show_ui(ui, |ui| {
@@ -10843,7 +10885,11 @@ impl eframe::App for HpsdrApp {
                                                 for name in &devices {
                                                     let selected =
                                                         connected.audio_output_device.as_deref() == Some(name.as_str());
-                                                    if ui.selectable_label(selected, name).clicked() && !selected {
+                                                    // Picking the saved device again retries it after a
+                                                    // fallback (e.g. it's been plugged back in).
+                                                    if ui.selectable_label(selected, name).clicked()
+                                                        && (!selected || fell_back)
+                                                    {
                                                         connected.audio_output_device = Some(name.clone());
                                                         connected.audio_output = AudioOutput::start(
                                                             Arc::clone(&connected.spectrum.audio_out),
@@ -10862,6 +10908,12 @@ impl eframe::App for HpsdrApp {
                                                  like WSJT-X instead of/alongside real speakers.",
                                             );
                                     });
+                                    audio_device_status(
+                                        ui,
+                                        connected.audio_output_device.as_deref(),
+                                        connected.audio_output.as_ref().map(|o| (o.device(), o.fell_back())),
+                                        true,
+                                    );
                                     if audio::sound_server_unreachable() {
                                         ui.colored_label(
                                             ui.visuals().warn_fg_color,
@@ -10879,10 +10931,10 @@ impl eframe::App for HpsdrApp {
                                     ui.horizontal(|ui| {
                                         ui.label("Input device:");
                                         let devices = audio::device_lists().1;
-                                        let current_label = connected
-                                            .mic_input_device
-                                            .clone()
-                                            .unwrap_or_else(|| "(System Default)".to_string());
+                                        let fell_back =
+                                            connected.mic_input.as_ref().is_some_and(|m| m.fell_back());
+                                        let current_label =
+                                            picker_label(connected.mic_input_device.as_deref(), &devices);
                                         egui::ComboBox::from_id_salt("main_mic_input_device")
                                             .selected_text(current_label)
                                             .show_ui(ui, |ui| {
@@ -10908,7 +10960,9 @@ impl eframe::App for HpsdrApp {
                                                 for name in &devices {
                                                     let selected =
                                                         connected.mic_input_device.as_deref() == Some(name.as_str());
-                                                    if ui.selectable_label(selected, name).clicked() && !selected {
+                                                    if ui.selectable_label(selected, name).clicked()
+                                                        && (!selected || fell_back)
+                                                    {
                                                         connected.mic_input_device = Some(name.clone());
                                                         if connected.tx_handle.is_some() {
                                                             connected.mic_input = None;
@@ -10929,6 +10983,14 @@ impl eframe::App for HpsdrApp {
                                                  another application instead of a real mic.",
                                             );
                                     });
+                                    if connected.tx_handle.is_some() {
+                                        audio_device_status(
+                                            ui,
+                                            connected.mic_input_device.as_deref(),
+                                            connected.mic_input.as_ref().map(|m| (m.device(), m.fell_back())),
+                                            false,
+                                        );
+                                    }
                                 }
 
                                 SettingsTab::Cw => {
@@ -17833,8 +17895,8 @@ fn render_extra_receiver_settings(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceive
                 // or vice versa.
                 ui.label("Output device:");
                 let devices = audio::device_lists().0;
-                let current_label =
-                    rx.audio_output_device.clone().unwrap_or_else(|| "(System Default)".to_string());
+                let fell_back = rx.audio_output.as_ref().is_some_and(|o| o.fell_back());
+                let current_label = picker_label(rx.audio_output_device.as_deref(), &devices);
                 egui::ComboBox::from_id_salt(("extra_receiver_audio_output_device", rx.ddc_index))
                     .selected_text(current_label)
                     .show_ui(ui, |ui| {
@@ -17847,7 +17909,7 @@ fn render_extra_receiver_settings(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceive
                         }
                         for name in &devices {
                             let selected = rx.audio_output_device.as_deref() == Some(name.as_str());
-                            if ui.selectable_label(selected, name).clicked() && !selected {
+                            if ui.selectable_label(selected, name).clicked() && (!selected || fell_back) {
                                 rx.audio_output_device = Some(name.clone());
                                 rx.audio_output = AudioOutput::start(Arc::clone(&rx.spectrum.audio_out), Some(name), None).ok();
                                 rx.settings_dirty.store(true, Ordering::Relaxed);
@@ -17855,6 +17917,12 @@ fn render_extra_receiver_settings(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceive
                         }
                     });
             });
+            audio_device_status(
+                ui,
+                rx.audio_output_device.as_deref(),
+                rx.audio_output.as_ref().map(|o| (o.device(), o.fell_back())),
+                true,
+            );
         }
 
         SettingsTab::Spectrum => {
@@ -19143,6 +19211,16 @@ fn main() -> eframe::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn audio_picker_marks_a_saved_device_that_is_missing() {
+        let devices = vec!["Pico Keyer Mic".to_string(), "Blue USB Mic".to_string()];
+        assert_eq!(picker_label(None, &devices), "(System Default)");
+        assert_eq!(picker_label(Some("Blue USB Mic"), &devices), "Blue USB Mic");
+        assert_eq!(picker_label(Some("Blue USB Desk Mic"), &devices), "Blue USB Desk Mic (not found)");
+        // Before the first scan the list is empty: don't cry wolf.
+        assert_eq!(picker_label(Some("Blue USB Desk Mic"), &[]), "Blue USB Desk Mic");
+    }
 
     #[test]
     fn native_window_theme_matches_theme_preference() {
