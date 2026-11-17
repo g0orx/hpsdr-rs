@@ -13,10 +13,13 @@ main VFO frequency (comma-grouped, in Hz) -- green normally, red while
 that VFO is the one actually transmitting (see
 [Split](#vfo-a--vfo-b--split) below). Beside **VFO-A**'s label are the band
 and [band stack](#band-stack) entry (e.g. **20m-1**) and the **VFO step**
-(100 Hz to start with, 1 Hz to 1 MHz): what scrolling the spectrum or
-waterfall, a [front-panel controller](25-controller.md)'s VFO knob and
-MIDI's **VFO Step Up/Down** tune by, landing on multiples of it; MIDI's
-**VFO Step Size +/-** actions change it. You can
+(100 Hz to start with, 1 Hz to 1 MHz, including the FM channel steps
+6.25, 12.5 and 25 kHz): what scrolling the spectrum or waterfall, a
+[front-panel controller](25-controller.md)'s VFO knob and MIDI's **VFO
+Step Up/Down** tune by, landing on multiples of it; MIDI's **VFO Step
+Size +/-** actions change it. Each mode remembers its own step, so FM can
+tune by channel while SSB and CW keep a small step. FM starts at 5 kHz
+the first time; other modes start with the step already in use. You can
 tune it several ways:
 
 - **Scroll** over a digit of the frequency display: steps that digit up
@@ -376,9 +379,11 @@ modem) -- for transmit as well as receive.
 
 **Audio gain** controls the speaker/headphone volume for the received
 audio (this is WDSP's own output gain stage, not your OS/sound-card
-volume). The slider is scaled in dB (-100 to +30), so each step is an equal
-relative loudness change across the whole range rather than the low end
-being too coarse and the high end too fine on a plain linear scale.
+volume). The slider reads 0-100% but moves in dB (-100 to +30 dB; hover
+over it for the dB), so each step is an equal relative loudness change
+across the whole range rather than the low end being too coarse and the
+high end too fine on a plain linear scale. **Mic gain** reads the same
+way, over -60 to +6 dB.
 
 Each mode remembers its own Audio gain, as it does its filter width, so
 turning FM down doesn't change USB or CW. FM runs without AGC, so at the

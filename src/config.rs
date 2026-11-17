@@ -503,6 +503,10 @@ pub struct Config {
     /// controller's VFO knob moves by.
     #[serde(default)]
     pub vfo_step_hz: Option<u32>,
+    /// VFO step per mode, keyed by Mode::label() -- see main.rs's
+    /// track_step_per_mode. `vfo_step_hz` is the current mode's.
+    #[serde(default)]
+    pub step_memory: std::collections::HashMap<String, u32>,
     /// Repeater offset per band (band_memory key), Hz, where it was
     /// changed from the default (main.rs's default_repeater_offset_hz).
     #[serde(default)]

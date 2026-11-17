@@ -922,6 +922,31 @@ fn track_gain_per_mode(
     true
 }
 
+/// The VFO step is remembered per mode, like AF Gain (issue #15: FM tunes
+/// in channel steps, SSB and CW in small ones). Run once per frame: when
+/// the mode has changed by any route, the step in use is stored for the
+/// mode being left and the new mode's is restored. A mode with nothing
+/// stored keeps the current step, except FM, which starts at
+/// FM_FIRST_VFO_STEP_HZ. Returns whether it did anything.
+fn track_step_per_mode(
+    mode: spectrum::Mode,
+    step_hz: &mut u32,
+    memory: &mut std::collections::HashMap<String, u32>,
+    step_mode: &mut spectrum::Mode,
+) -> bool {
+    if mode == *step_mode {
+        return false;
+    }
+    memory.insert(step_mode.label().to_string(), *step_hz);
+    match memory.get(mode.label()) {
+        Some(&step) if VFO_STEPS_HZ.contains(&step) => *step_hz = step,
+        _ if mode == spectrum::Mode::Fmn => *step_hz = FM_FIRST_VFO_STEP_HZ,
+        _ => {}
+    }
+    *step_mode = mode;
+    true
+}
+
 fn width_for_mode(width_memory: &std::collections::HashMap<String, f64>, mode: spectrum::Mode) -> f64 {
     width_memory
         .get(mode.label())
@@ -1956,8 +1981,15 @@ fn start_controller(cfg: &controller::ControllerConfig) -> (Option<controller::C
 
 /// The VFO steps to choose from (Hz), as piHPSDR's: 9 kHz for MW
 /// broadcast channels.
-const VFO_STEPS_HZ: [u32; 15] =
-    [1, 10, 25, 50, 100, 250, 500, 1_000, 5_000, 9_000, 10_000, 100_000, 250_000, 500_000, 1_000_000];
+// 6.25, 12.5 and 25 kHz: FM channel spacings (issue #15).
+const VFO_STEPS_HZ: [u32; 18] = [
+    1, 10, 25, 50, 100, 250, 500, 1_000, 5_000, 6_250, 9_000, 10_000, 12_500, 25_000, 100_000, 250_000,
+    500_000, 1_000_000,
+];
+
+/// A mode's VFO step the first time it's used: FM tunes by channel, so it
+/// starts at 5 kHz; other modes keep the step already in use.
+const FM_FIRST_VFO_STEP_HZ: u32 = 5_000;
 
 /// The VFO step after `step` (`up`) or before it, staying at the ends.
 fn next_vfo_step(step: u32, up: bool) -> u32 {
@@ -1970,8 +2002,9 @@ fn next_vfo_step(step: u32, up: bool) -> u32 {
 fn format_vfo_step(step: u32) -> String {
     if step >= 1_000_000 && step % 1_000_000 == 0 {
         format!("{} MHz", step / 1_000_000)
-    } else if step >= 1_000 && step % 1_000 == 0 {
-        format!("{} kHz", step / 1_000)
+    } else if step >= 1_000 {
+        // 12500 -> "12.5 kHz", 5000 -> "5 kHz".
+        format!("{} kHz", step as f64 / 1_000.0)
     } else {
         format!("{step} Hz")
     }
@@ -2603,9 +2636,15 @@ fn midi_knob_value(connected: &ConnectedState, action: MidiAction) -> Option<u8>
 fn knob_value_text(connected: &ConnectedState, action: MidiAction) -> Option<String> {
     let db = |gain: f32| 20.0 * (gain.max(1e-9) as f64).log10();
     Some(match action {
-        MidiAction::AfGain => format!("{:.0} dB", db(connected.spectrum.gain())),
+        MidiAction::AfGain => {
+            let d = db(connected.spectrum.gain());
+            format!("{:.0}% ({d:.0} dB)", gain_percent(d, -100.0, 30.0))
+        }
         MidiAction::AgcGain => format!("{:.0} dB", connected.spectrum.agc_params().agc_top_db),
-        MidiAction::MicGain => format!("{:.1} dB", db(connected.mic_gain)),
+        MidiAction::MicGain => {
+            let d = db(connected.mic_gain);
+            format!("{:.0}% ({d:.1} dB)", gain_percent(d, -60.0, 6.0))
+        }
         MidiAction::RfAttenuation => {
             let v = connected.session.rx_attenuation.load(Ordering::Relaxed) as i32;
             if connected.device.protocol == 1
@@ -3245,6 +3284,10 @@ struct ConnectedState {
     /// front-panel controller's VFO knob tunes by, snapped to multiples
     /// of it, as piHPSDR's.
     vfo_step_hz: u32,
+    /// See track_step_per_mode.
+    step_memory: std::collections::HashMap<String, u32>,
+    /// The mode `vfo_step_hz` currently belongs to.
+    step_mode: spectrum::Mode,
     /// A controller encoder's tuning steps not yet applied, when its
     /// sensitivity makes them fractional (see dispatch_controller_event).
     controller_tune_remainder: std::collections::HashMap<controller::ControlId, f32>,
@@ -5061,6 +5104,8 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                 ctcss_hz: cfg.ctcss_hz.unwrap_or(0.0),
                 fm_deviation_hz: cfg.fm_deviation_hz.unwrap_or(tx::FM_DEVIATION_WIDE_HZ),
                 vfo_step_hz: cfg.vfo_step_hz.filter(|s| VFO_STEPS_HZ.contains(s)).unwrap_or(100),
+                step_memory: cfg.step_memory.clone(),
+                step_mode: gain_mode,
                 controller_tune_remainder: std::collections::HashMap::new(),
                 value_popup: None,
                 repeater_offsets: cfg.repeater_offsets.clone(),
@@ -5965,6 +6010,14 @@ impl eframe::App for HpsdrApp {
                 midi_feedback(connected);
 
                 if track_gain_per_mode(&connected.spectrum, &mut connected.gain_memory, &mut connected.gain_mode) {
+                    connected.settings_dirty.store(true, Ordering::Relaxed);
+                }
+                if track_step_per_mode(
+                    connected.spectrum.mode(),
+                    &mut connected.vfo_step_hz,
+                    &mut connected.step_memory,
+                    &mut connected.step_mode,
+                ) {
                     connected.settings_dirty.store(true, Ordering::Relaxed);
                 }
                 let current_gain = connected.spectrum.gain();
@@ -7147,7 +7200,7 @@ impl eframe::App for HpsdrApp {
                             // AM users who leave AGC on. Widening THIS
                             // user-controlled slider instead only affects
                             // whoever actually drags it up.
-                            if scroll_slider_f32_db(
+                            if scroll_slider_f32_percent(
                                 ui,
                                 &mut connected.slider_scroll_accum,
                                 &mut gain,
@@ -7204,7 +7257,7 @@ impl eframe::App for HpsdrApp {
                                     // scroll_slider_f32_db's doc comment) --
                                     // +6dB ceiling matches the old 2.0 linear
                                     // max, -60dB floor matches Audio gain's own.
-                                    if scroll_slider_f32_db(
+                                    if scroll_slider_f32_percent(
                                         ui,
                                         &mut connected.slider_scroll_accum,
                                         &mut mic_gain,
@@ -14110,6 +14163,11 @@ impl eframe::App for HpsdrApp {
                         ctcss_hz: Some(connected.ctcss_hz),
                         fm_deviation_hz: Some(connected.fm_deviation_hz),
                         vfo_step_hz: Some(connected.vfo_step_hz),
+                        step_memory: {
+                            let mut m = connected.step_memory.clone();
+                            m.insert(connected.step_mode.label().to_string(), connected.vfo_step_hz);
+                            m
+                        },
                         repeater_offsets: connected.repeater_offsets.clone(),
                         bandstacks: connected.bandstacks.clone(),
                         bandstack_index: connected.bandstack_index.clone(),
@@ -15423,7 +15481,8 @@ fn controls_strip_line(ui: &mut egui::Ui, band: &str, spectrum: &SpectrumHandle,
         if spectrum.muted() {
             ui.colored_label(readable(ui, egui::Color32::from_rgb(220, 60, 60)), "Audio muted");
         } else {
-            ui.weak(format!("Audio {:.0} dB", 20.0 * spectrum.gain().max(1e-9).log10()));
+            let db = 20.0 * (spectrum.gain().max(1e-9) as f64).log10();
+            ui.weak(format!("Audio {:.0}%", gain_percent(db, -100.0, 30.0)));
         }
         clicked
     })
@@ -16003,8 +16062,55 @@ fn scroll_slider_f32_db(
     max_db: f32,
     step_db: f32,
 ) -> bool {
+    scroll_slider_gain(ui, scroll_accum, gain, min_db, max_db, step_db, false)
+}
+
+/// As scroll_slider_f32_db, but labelled 0-100% of the slider's travel,
+/// with the dB in its hover text: Audio gain and Mic gain, to match the
+/// app's other level controls (issue #15). Only the label differs; the
+/// slider still moves in dB.
+fn scroll_slider_f32_percent(
+    ui: &mut egui::Ui,
+    scroll_accum: &mut f32,
+    gain: &mut f32,
+    min_db: f32,
+    max_db: f32,
+    step_db: f32,
+) -> bool {
+    scroll_slider_gain(ui, scroll_accum, gain, min_db, max_db, step_db, true)
+}
+
+/// Where `db` sits in `min_db..=max_db`, 0-100%.
+fn gain_percent(db: f64, min_db: f64, max_db: f64) -> f64 {
+    ((db - min_db) / (max_db - min_db) * 100.0).clamp(0.0, 100.0)
+}
+
+fn scroll_slider_gain(
+    ui: &mut egui::Ui,
+    scroll_accum: &mut f32,
+    gain: &mut f32,
+    min_db: f32,
+    max_db: f32,
+    step_db: f32,
+    percent: bool,
+) -> bool {
     let mut db = if *gain > 0.0 { 20.0 * gain.log10() } else { min_db };
-    let resp = ui.add(egui::Slider::new(&mut db, min_db..=max_db).suffix(" dB"));
+    let shown_db = db;
+    let slider = egui::Slider::new(&mut db, min_db..=max_db);
+    let resp = if percent {
+        let (lo, hi) = (min_db as f64, max_db as f64);
+        ui.add(
+            slider
+                .custom_formatter(move |v, _| format!("{:.0}%", gain_percent(v, lo, hi)))
+                .custom_parser(move |t| {
+                    let p: f64 = t.trim().trim_end_matches('%').trim().parse().ok()?;
+                    Some(lo + p.clamp(0.0, 100.0) / 100.0 * (hi - lo))
+                }),
+        )
+        .on_hover_text(format!("{shown_db:.0} dB"))
+    } else {
+        ui.add(slider.suffix(" dB"))
+    };
     let mut changed = resp.changed();
     if resp.hovered() {
         let scroll_delta = ui.input(|i| i.smooth_scroll_delta);
@@ -17124,7 +17230,7 @@ fn render_extra_receiver_ui(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceiver>>) {
         // comment (main.rs) and that control's own doc comment for why
         // 30dB, not rx888::Ddc::HEADROOM_FACTOR, was raised for the real
         // AGC-off-too-quiet RX-888 report this fixes.
-        if scroll_slider_f32_db(ui, &mut rx.slider_scroll_accum, &mut gain, -100.0, 30.0, 1.0) {
+        if scroll_slider_f32_percent(ui, &mut rx.slider_scroll_accum, &mut gain, -100.0, 30.0, 1.0) {
             rx.spectrum.set_gain(gain);
             rx.settings_dirty.store(true, Ordering::Relaxed);
         }
@@ -19211,6 +19317,47 @@ fn main() -> eframe::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn vfo_step_is_remembered_per_mode() {
+        use spectrum::Mode;
+        let mut memory = std::collections::HashMap::new();
+        let (mut step, mut mode) = (100u32, Mode::Usb);
+        // Same mode: nothing to do.
+        assert!(!track_step_per_mode(Mode::Usb, &mut step, &mut memory, &mut mode));
+        // FM the first time starts at its channel step.
+        assert!(track_step_per_mode(Mode::Fmn, &mut step, &mut memory, &mut mode));
+        assert_eq!(step, FM_FIRST_VFO_STEP_HZ);
+        step = 12_500;
+        // CW the first time keeps the step in use.
+        track_step_per_mode(Mode::Cwu, &mut step, &mut memory, &mut mode);
+        assert_eq!(step, 12_500);
+        step = 10;
+        // Back to USB and FM: each gets its own back.
+        track_step_per_mode(Mode::Usb, &mut step, &mut memory, &mut mode);
+        assert_eq!(step, 100);
+        track_step_per_mode(Mode::Fmn, &mut step, &mut memory, &mut mode);
+        assert_eq!(step, 12_500);
+        track_step_per_mode(Mode::Cwu, &mut step, &mut memory, &mut mode);
+        assert_eq!(step, 10);
+    }
+
+    #[test]
+    fn fm_channel_steps_are_labelled_in_khz() {
+        assert_eq!(format_vfo_step(12_500), "12.5 kHz");
+        assert_eq!(format_vfo_step(6_250), "6.25 kHz");
+        assert_eq!(format_vfo_step(5_000), "5 kHz");
+        assert_eq!(format_vfo_step(100), "100 Hz");
+        assert_eq!(format_vfo_step(1_000_000), "1 MHz");
+    }
+
+    #[test]
+    fn gain_percent_spans_the_slider() {
+        assert_eq!(gain_percent(-100.0, -100.0, 30.0), 0.0);
+        assert_eq!(gain_percent(30.0, -100.0, 30.0), 100.0);
+        assert_eq!(gain_percent(-35.0, -100.0, 30.0), 50.0);
+        assert_eq!(gain_percent(-200.0, -100.0, 30.0), 0.0);
+    }
 
     #[test]
     fn audio_picker_marks_a_saved_device_that_is_missing() {
