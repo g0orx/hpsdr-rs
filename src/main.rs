@@ -3932,8 +3932,11 @@ fn sync_secondary_viewport_theme(ctx: &egui::Context) {
     }
     #[cfg(not(windows))]
     {
+        // Only Windows needs the title-bar repaint.
         let _ = just_sent;
-        applied = true;
+        if !applied {
+            applied = true;
+        }
     }
     ctx.data_mut(|data| {
         data.get_temp_mut_or_default::<SecondaryViewportThemes>(themes_id)
