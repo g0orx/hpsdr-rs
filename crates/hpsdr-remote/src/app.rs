@@ -1195,18 +1195,14 @@ impl App {
         }
     }
 
-    /// The compact layout's top: the frequency and S-meter, - / +, and
+    /// The compact layout's top: the frequency, - / + and S-meter, and
     /// power and SWR while transmitting.
     fn compact_top(&mut self, ui: &mut egui::Ui) {
         self.frequency_row(ui);
-        ui.horizontal_wrapped(|ui| {
-            self.minus_plus(ui);
-            if self.radio.mox {
-                ui.add_space(8.0);
-                let tx = self.radio.tx.unwrap_or_default();
-                ui.strong(format!("{:.1} W  SWR {:.2}", tx.forward_w, tx.swr));
-            }
-        });
+        if self.radio.mox {
+            let tx = self.radio.tx.unwrap_or_default();
+            ui.strong(format!("{:.1} W  SWR {:.2}", tx.forward_w, tx.swr));
+        }
     }
 
     /// The sections the compact toolbar has buttons for, as this server
@@ -1411,12 +1407,14 @@ impl App {
             } else {
                 self.vfo_slide_px = 0.0;
             }
+            ui.add_space(8.0);
+            self.minus_plus(ui);
             ui.add_space(16.0);
             self.s_meter(ui);
         });
     }
 
-    /// Steps, and - / +.
+    /// The steps; - / + are next to the frequency.
     fn step_row(&mut self, ui: &mut egui::Ui) {
         ui.horizontal_wrapped(|ui| {
             ui.label("Step:");
@@ -1425,8 +1423,6 @@ impl App {
                     self.step_hz = hz;
                 }
             }
-            ui.add_space(8.0);
-            self.minus_plus(ui);
         });
     }
 

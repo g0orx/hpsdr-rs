@@ -181,7 +181,7 @@ The client shows the radio's spectrum and waterfall, its band buttons, the
 VFO, mode, filter, AGC and noise controls, the S-meter, and the receive
 audio (which starts when you press **Connect** -- browsers only start audio
 after a tap). Tune by tapping or sliding on the spectrum or waterfall, by
-sliding on the frequency, or with **-** and **+** and a chosen step. It
+sliding on the frequency, or with the **-** and **+** beside it, by a chosen step. It
 uses about 150 kbit/s, compressed, rather than the several Mbit/s of
 standard TCI audio and IQ, plus about 70 kbit/s more while transmitting.
 It's dark or light as the phone, tablet or browser is set, and changes when

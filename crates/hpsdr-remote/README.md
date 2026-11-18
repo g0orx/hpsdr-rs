@@ -23,7 +23,7 @@ the client stops sending audio for a second, hpsdr-rs unkeys.
 
 **Layout** (beside the connection status) is Auto, Standard or Compact.
 Standard has every control in rows above the spectrum. Compact, as
-hpsdr-rs's own for small screens, has only the frequency, S-meter and - / +
+hpsdr-rs's own for small screens, has only the frequency, - / + and S-meter
 above the spectrum, and a toolbar of large buttons below it -- Band and Mode
 show what they're set to, then Step, Filter, Noise, Audio, Key and TX as
 the server allows, and MOX (or CW's Stop) at the right. A button opens its
