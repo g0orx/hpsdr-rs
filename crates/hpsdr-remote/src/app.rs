@@ -228,6 +228,18 @@ const TOOLBAR_MOX_WIDTH: f32 = 80.0;
 /// The controls take at most this share of the screen's height; beyond
 /// it they scroll, so the spectrum always keeps the rest.
 const CONTROLS_MAX_HEIGHT: f32 = 0.55;
+/// Compact and shorter than this (points) -- a phone held sideways, with
+/// the browser's own bars -- the whole page scrolls, with the spectrum and
+/// waterfall PANES_HEIGHT tall together. Fitted to the screen instead, they
+/// got squeezed until the waterfall vanished (REAL REPORT 2026-11-18,
+/// Pixel 10 Pro landscape, about 330 points high). A Pi's 7" display
+/// (480) stays as it was.
+const SCROLL_PAGE_HEIGHT: f32 = 420.0;
+const PANES_HEIGHT: f32 = 300.0;
+/// Frequency labels under the spectrum: at least this far apart
+/// (points) beyond their own width, and their font size.
+const FREQ_LABEL_GAP: f32 = 12.0;
+const FREQ_LABEL_SIZE: f32 = 10.0;
 
 struct Waterfall {
     rows: VecDeque<Vec<Color32>>,
@@ -1623,7 +1635,7 @@ impl App {
         let x_of = |hz: f64| rect.left() + ((hz - low_hz) / frame.span_hz as f64) as f32 * rect.width();
         let y_of = |v: f32| rect.bottom() - ((v - self.db_low) / self.db_range).clamp(0.0, 1.0) * rect.height();
 
-        // Passband and dial line.
+        // Passband (the dial line goes on top of the grid and labels, below).
         let (pb_low, pb_high) = self.radio.passband();
         let vfo = self.radio.vfo_hz as f64;
         painter.rect_filled(
@@ -1631,7 +1643,6 @@ impl App {
             0.0,
             Color32::from_rgba_unmultiplied(70, 150, 230, 50),
         );
-        painter.line_segment([Pos2::new(x_of(vfo), rect.top()), Pos2::new(x_of(vfo), rect.bottom())], Stroke::new(1.0, Color32::RED));
 
         // dB gridlines every 10 dB, and frequency labels.
         let mut g = (self.db_low / 10.0).ceil() * 10.0;
@@ -1641,14 +1652,25 @@ impl App {
             painter.text(Pos2::new(rect.left() + 2.0, y), egui::Align2::LEFT_BOTTOM, format!("{g:.0} dB"), egui::FontId::monospace(10.0), Color32::GRAY);
             g += 10.0;
         }
-        let tick = nice_step(frame.span_hz as f64 / 8.0);
+        // As many labels as fit without touching (REAL REPORT 2026-11-18,
+        // Pixel 10 Pro portrait: "10489.400" labels ran into each other),
+        // and none that would run off the right-hand edge.
+        let font = egui::FontId::monospace(FREQ_LABEL_SIZE);
+        let label_of = |hz: f64| format!("{:.3}", hz / 1e6);
+        let char_w = ui.ctx().fonts_mut(|f| f.glyph_width(&font, '0'));
+        let label_w = label_of(low_hz + frame.span_hz as f64).len() as f32 * char_w;
+        let tick = freq_tick_hz(frame.span_hz as f64, rect.width(), label_w + FREQ_LABEL_GAP);
         let mut f = (low_hz / tick).ceil() * tick;
         while f < low_hz + frame.span_hz as f64 {
             let x = x_of(f);
             painter.line_segment([Pos2::new(x, rect.top()), Pos2::new(x, rect.bottom())], Stroke::new(1.0, Color32::from_gray(45)));
-            painter.text(Pos2::new(x + 2.0, rect.bottom()), egui::Align2::LEFT_BOTTOM, format!("{:.3}", f / 1e6), egui::FontId::monospace(10.0), Color32::GRAY);
+            if x + 2.0 + label_w <= rect.right() {
+                painter.text(Pos2::new(x + 2.0, rect.bottom()), egui::Align2::LEFT_BOTTOM, label_of(f), font.clone(), Color32::GRAY);
+            }
             f += tick;
         }
+        // The dial line, over the grid and frequency labels.
+        painter.line_segment([Pos2::new(x_of(vfo), rect.top()), Pos2::new(x_of(vfo), rect.bottom())], Stroke::new(1.0, Color32::RED));
 
         // The trace.
         let n = db.len().max(2);
@@ -1800,6 +1822,11 @@ impl eframe::App for App {
             Layout::Standard => false,
             Layout::Compact => true,
         };
+        let connected = self.link.as_ref().is_some_and(|l| l.status == Status::Open);
+        if compact && screen.y < SCROLL_PAGE_HEIGHT {
+            self.scrolling_page(ui, narrow, connected);
+            return;
+        }
         egui::Panel::top("top").show(ui, |ui| {
             if compact {
                 self.top_bar(ui, narrow);
@@ -1816,7 +1843,6 @@ impl eframe::App for App {
             });
         });
         egui::Panel::bottom("status").show(ui, |ui| self.status_line(ui));
-        let connected = self.link.as_ref().is_some_and(|l| l.status == Status::Open);
         if compact && connected {
             egui::Panel::bottom("toolbar").show(ui, |ui| self.compact_toolbar(ui));
         }
@@ -1825,6 +1851,55 @@ impl eframe::App for App {
             self.section_popup(ui.ctx(), spectrum);
         }
         self.show_value_popup(ui.ctx(), spectrum);
+        self.after_layout(ui);
+    }
+}
+
+impl App {
+    /// The compact layout on a screen too short for it (SCROLL_PAGE_HEIGHT):
+    /// everything in one page that scrolls -- drag anywhere but the
+    /// spectrum and waterfall, which tune -- with the spectrum and
+    /// waterfall a usable size.
+    fn scrolling_page(&mut self, ui: &mut egui::Ui, narrow: bool, connected: bool) {
+        let panes = egui::CentralPanel::default()
+            .show(ui, |ui| {
+                egui::ScrollArea::vertical()
+                    .auto_shrink(false)
+                    .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
+                    .show(ui, |ui| {
+                        self.top_bar(ui, narrow);
+                        self.compact_top(ui);
+                        ui.separator();
+                        let panes = ui
+                            .allocate_ui(Vec2::new(ui.available_width(), PANES_HEIGHT), |ui| {
+                                ui.set_min_height(PANES_HEIGHT);
+                                self.spectrum_and_waterfall(ui);
+                            })
+                            .response
+                            .rect;
+                        if connected {
+                            ui.separator();
+                            self.compact_toolbar(ui);
+                        }
+                        ui.separator();
+                        self.status_line(ui);
+                        panes
+                    })
+                    .inner
+            })
+            .inner;
+        // Popups over the part of the panes on screen.
+        let shown = panes.intersect(ui.ctx().content_rect());
+        let over = if shown.height() >= 120.0 { shown } else { ui.ctx().content_rect() };
+        if connected {
+            self.section_popup(ui.ctx(), over);
+        }
+        self.show_value_popup(ui.ctx(), over);
+        self.after_layout(ui);
+    }
+
+    /// The end of every frame, whatever the layout.
+    fn after_layout(&mut self, ui: &mut egui::Ui) {
         self.controller_window(ui.ctx());
         if self.controller.is_some() {
             // Controller events come between frames: look for them.
@@ -1886,6 +1961,14 @@ fn format_hz(hz: u32) -> String {
 /// `hz` as MHz with kHz and Hz groups: 7.100.000 -> "7.100000".
 fn format_frequency(hz: u64) -> String {
     format!("{}.{:06}", hz / 1_000_000, hz % 1_000_000)
+}
+
+/// The frequency grid's spacing for `span_hz` across `width` points: about
+/// eight lines, fewer if their labels (`label_room` points each) wouldn't
+/// fit.
+fn freq_tick_hz(span_hz: f64, width: f32, label_room: f32) -> f64 {
+    let fit = (width / label_room.max(1.0)).floor().max(1.0) as f64;
+    nice_step(span_hz / fit.min(8.0))
 }
 
 /// A round number of Hz near `approx`: 1, 2 or 5 times a power of ten.
@@ -1977,6 +2060,11 @@ mod tests {
         assert_eq!(format_frequency(7_100_000), "7.100000");
         assert_eq!(format_frequency(10_489_750_000), "10489.750000");
         assert_eq!(nice_step(23_000.0), 50_000.0);
+        // 800 kHz across a phone held upright (~400 points), "10489.400"
+        // labels about 70 points with their gap: 200 kHz apart, not 100.
+        assert_eq!(freq_tick_hz(800_000.0, 400.0, 70.0), 200_000.0);
+        // Wide enough for eight: as before.
+        assert_eq!(freq_tick_hz(800_000.0, 1200.0, 70.0), nice_step(100_000.0));
         assert_eq!(nice_step(9_000.0), 10_000.0);
         assert_eq!(waterfall_colour(0.0), Color32::BLACK);
         let mut r = Radio { mode: "usb".into(), ..Default::default() };
