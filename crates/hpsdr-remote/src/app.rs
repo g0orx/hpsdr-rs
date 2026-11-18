@@ -52,6 +52,9 @@ const FALLBACK_BANDS: [(&str, u64, u64, u64); 14] = [
     ("QO-100", 10_489_500_000, 10_490_000_000, 10_489_750_000),
 ];
 
+/// Band edge lines on the spectrum -- hpsdr-rs's own colour.
+const BAND_EDGE_COLOUR: Color32 = Color32::from_rgb(255, 140, 0);
+
 /// TCI mode names and their buttons.
 const MODES: [(&str, &str); 9] = [
     ("lsb", "LSB"),
@@ -1610,6 +1613,15 @@ impl App {
         self.step(notches, step);
     }
 
+    /// Each band's edges, Hz: the server's band buttons, or the fallback
+    /// list for an older server. Not Gen's, which is the whole receiver.
+    fn band_edges(&self) -> Vec<(u64, u64)> {
+        match &self.radio.bands {
+            Some(list) => list.iter().filter(|b| b.name != "Gen").map(|b| (b.low_hz, b.high_hz)).collect(),
+            None => FALLBACK_BANDS.iter().map(|b| (b.1, b.2)).collect(),
+        }
+    }
+
     fn spectrum_and_waterfall(&mut self, ui: &mut egui::Ui) {
         let Some(frame) = self.spectrum.clone() else {
             ui.weak("No spectrum yet.");
@@ -1665,7 +1677,17 @@ impl App {
             }
             f += tick;
         }
-        // The dial line, over the grid and frequency labels.
+        // Band edges, as on the radio's own spectrum: orange, under the
+        // dial line and the trace.
+        for (low, high) in self.band_edges() {
+            for edge in [low as f64, high as f64] {
+                if (low_hz..=low_hz + frame.span_hz as f64).contains(&edge) {
+                    let x = x_of(edge);
+                    painter.line_segment([Pos2::new(x, rect.top()), Pos2::new(x, rect.bottom())], Stroke::new(2.0, BAND_EDGE_COLOUR));
+                }
+            }
+        }
+        // The dial line, over the grid, frequency labels and band edges.
         painter.line_segment([Pos2::new(x_of(vfo), rect.top()), Pos2::new(x_of(vfo), rect.bottom())], Stroke::new(1.0, Color32::RED));
 
         // The trace.
