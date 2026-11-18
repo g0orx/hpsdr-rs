@@ -915,7 +915,16 @@ fn handle_client(
     // handshake ~700ms later onto an already-closed connection.
     let _ = stream.set_nonblocking(false);
 
-    let mut ws = match tungstenite::accept(stream) {
+    // Through the web server with no password: listen and tune only --
+    // see crate::web_server::RECEIVE_ONLY_HEADER.
+    let mut web_receive_only = false;
+    let mut ws = match tungstenite::accept_hdr(
+        stream,
+        |request: &tungstenite::handshake::server::Request, response: tungstenite::handshake::server::Response| {
+            web_receive_only = request.headers().contains_key(crate::web_server::RECEIVE_ONLY_HEADER);
+            Ok(response)
+        },
+    ) {
         Ok(ws) => ws,
         Err(e) => {
             logging.log(&format!("websocket handshake failed: {e}"));
@@ -1054,7 +1063,7 @@ fn handle_client(
     send_logged(&mut ws, &logging, format!("tune_drive:0,{};", tx_info.tune_power_percent).into());
     send_logged(&mut ws, &logging, format!("drive:0,{};", drive_percent(&tx_info)).into());
     send_logged(&mut ws, &logging, "rx_channel_enable:0,0,true;".into());
-    send_logged(&mut ws, &logging, "tx_enable:0,true;".into());
+    send_logged(&mut ws, &logging, format!("tx_enable:0,{};", !web_receive_only).into());
     send_logged(&mut ws, &logging, format!("split_enable:0,{};", tx_info.split).into());
     // No real value to report for features this project doesn't
     // implement at all (CW keyer, squelch, VFO lock, calibration,
@@ -1163,7 +1172,7 @@ fn handle_client(
     // is one (rx_enable:1 says) -- see Rx2Share.
     send_logged(&mut ws, &logging, "trx_count:2;".into());
     let receive_only = matches!(board_name.as_str(), "Rx888" | "RtlSdr" | "MsiSdr");
-    send_logged(&mut ws, &logging, format!("receive_only:{receive_only};").into());
+    send_logged(&mut ws, &logging, format!("receive_only:{};", receive_only || web_receive_only).into());
     // DEVICE identifies the actual radio hardware (e.g. Thetis reports
     // "ANAN8000D" for its connected board) -- a real report/correction:
     // this used to send this project's own name ("hpsdr-rs") here
@@ -1192,6 +1201,10 @@ fn handle_client(
     // hpsdr-rs's remote extensions, if this client asks for them -- see
     // remote.rs and docs/remote-protocol.md.
     let mut remote = crate::remote::RemoteStreams::default();
+    remote.receive_only = web_receive_only;
+    if web_receive_only {
+        logging.log("receive only: through the web server, which has no password");
+    }
     // Counts this client as a remote client once it says hpsdr_hello, until
     // it goes -- see remote::ClientCount.
     let mut remote_count: Option<crate::remote::ClientCount> = None;
@@ -1358,6 +1371,10 @@ fn handle_client(
                     }
                     logging.log(&format!("<< {cmd};"));
                     let name = cmd.split(':').next().unwrap_or("").trim().to_ascii_lowercase();
+                    if web_receive_only && transmits(cmd) {
+                        logging.log("refused: receive only");
+                        continue;
+                    }
                     for family in live_families(&name) {
                         live_held.insert(family.to_string(), Instant::now());
                     }
@@ -1472,6 +1489,8 @@ fn handle_client(
                 logging.log("client closed the connection");
                 break;
             }
+            // Receive only: no TX audio either.
+            Ok(Message::Binary(_)) if web_receive_only => {}
             // A remote client's TX audio: its own ADPCM blocks (remote.rs).
             Ok(Message::Binary(data)) if remote.hello => remote.tx_audio(&data, &tx_link),
             Ok(Message::Binary(data)) => {
@@ -2576,6 +2595,21 @@ fn rx2_command(
 /// Tune and drive go through main.rs, as the TUNE button and the TX
 /// Power slider (RemoteShare); the rest straight into the receiver's
 /// settings, as the hpsdr-remote client's hpsdr_set does.
+/// Whether `cmd` (one command, without its ';') would key the radio or
+/// change how it transmits -- refused from a receive-only client. Asking
+/// what trx, tune or drive are (the receiver alone) is fine.
+fn transmits(cmd: &str) -> bool {
+    let (name, args) = cmd.split_once(':').unwrap_or((cmd, ""));
+    let name = name.trim().to_ascii_lowercase();
+    let mut args = args.split(',').map(str::trim).filter(|a| !a.is_empty());
+    match name.as_str() {
+        "trx" | "tune" | "drive" | "tune_drive" => args.nth(1).is_some(),
+        hpsdr_proto::tx::MOX | hpsdr_proto::cw::KEY | hpsdr_proto::cw::KEYER => true,
+        hpsdr_proto::state::SET => args.next() == Some(hpsdr_proto::tx::SET_POWER),
+        n => n.starts_with(hpsdr_proto::cw::MACROS),
+    }
+}
+
 fn control_command(cmd: &str, share: &crate::remote::RemoteShare, params: &Mutex<DemodParams>) -> Option<Option<String>> {
     let (name, args) = cmd.split_once(':').unwrap_or((cmd, ""));
     let name = name.trim().to_ascii_lowercase();
@@ -3628,6 +3662,32 @@ mod remote_tests {
             ..Default::default()
         });
 
+        // Through the web server with no password: told it can't, and
+        // never keys.
+        {
+            use tungstenite::client::IntoClientRequest;
+            let mut request = format!("ws://127.0.0.1:{port}").into_client_request().unwrap();
+            request.headers_mut().insert(
+                tungstenite::http::HeaderName::from_bytes(crate::web_server::RECEIVE_ONLY_HEADER.as_bytes()).unwrap(),
+                "1".parse().unwrap(),
+            );
+            let (mut ws, _) = tungstenite::connect(request).unwrap();
+            if let tungstenite::stream::MaybeTlsStream::Plain(s) = ws.get_ref() {
+                s.set_read_timeout(Some(Duration::from_millis(20))).unwrap();
+            }
+            ws.send(Message::Text("hpsdr_hello:1;hpsdr_mox:true;trx:0,true;keyer:0,true;".into())).unwrap();
+            let mut heard = String::new();
+            let until = Instant::now() + Duration::from_millis(1500);
+            while Instant::now() < until {
+                if let Ok(Message::Text(t)) = ws.read() {
+                    heard.push_str(&t);
+                }
+                assert!(!mox.load(Ordering::Relaxed), "a receive-only client keyed the radio");
+            }
+            assert!(heard.contains("receive_only:true;") && heard.contains("tx_enable:0,false;"), "{heard}");
+            assert!(heard.contains("hpsdr_tx:false,"), "{heard}");
+        }
+
         let (mut ws, _) = tungstenite::connect(format!("ws://127.0.0.1:{port}")).unwrap();
         if let tungstenite::stream::MaybeTlsStream::Plain(s) = ws.get_ref() {
             s.set_read_timeout(Some(Duration::from_millis(20))).unwrap();
@@ -3901,6 +3961,18 @@ mod remote_tests {
 
     /// CW goes out as Thetis has it, CWL or CWU; a client's plain CW
     /// takes the usual sideband for the frequency, CWR the other.
+    #[test]
+    fn receive_only_refuses_what_transmits() {
+        for cmd in ["trx:0,true", "TRX:0,false", "tune:0,true", "drive:0,50", "tune_drive:0,10", "hpsdr_mox:true",
+            "hpsdr_key:5000,true,100", "keyer:0,true", "cw_macros:0,CQ", "cw_macros_speed:20", "hpsdr_set:power,10"]
+        {
+            assert!(transmits(cmd), "{cmd}");
+        }
+        for cmd in ["trx:0", "drive:0", "vfo:0,0,14074000", "modulation:0,usb", "hpsdr_set:width,2700", "hpsdr_hello:1"] {
+            assert!(!transmits(cmd), "{cmd}");
+        }
+    }
+
     #[test]
     fn cw_is_cwl_or_cwu() {
         assert_eq!((mode_to_tci(Mode::Cwl), mode_to_tci(Mode::Cwu)), ("cwl", "cwu"));

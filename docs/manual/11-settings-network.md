@@ -243,9 +243,12 @@ transmit: their **MOX** button disappears, and one already transmitting is
 unkeyed at once. It takes effect straight away, without stopping the
 server.
 
-Set a **password** before making this port reachable from outside your own
-network: without one, anyone who can reach it can control the radio,
-transmitting included. TCI itself has no password, so for use over the
+Without a **password**, clients connecting here can only listen and tune:
+they get no **MOX** button, and anything they send that would transmit
+(MOX, CW, Tune, TX audio, power) is ignored, whatever **Allow transmit**
+says. Set one to transmit from the web client, and before making this port
+reachable from outside your own network. TCI itself has no password, and a
+program connecting to TCI directly isn't held by this, so for use over the
 internet forward only this port; TCI's address can then be
 `127.0.0.1:50001`, which the web client still reaches through here. A VPN
 (WireGuard, Tailscale) or an SSH tunnel is safer still.

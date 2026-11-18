@@ -37,6 +37,9 @@ pub struct RemoteStreams {
     /// The client sent hpsdr_hello: it takes the extension streams in
     /// place of TCI's float audio.
     pub hello: bool,
+    /// Came through the web server with no password set: it may listen
+    /// and tune, but never transmit (tci.rs refuses its TX commands too).
+    pub receive_only: bool,
     spectrum: Option<SpectrumStream>,
     audio: Option<AudioStream>,
     /// The DSP settings last sent (hpsdr_state), and when.
@@ -489,6 +492,19 @@ impl RemoteStreams {
         Some(bands::to_command(&list).to_string())
     }
 
+    /// Why this client may not transmit, beyond the radio being unable:
+    /// it's receive-only, or it's a remote client (said hpsdr_hello) and
+    /// Allow transmit is off.
+    fn remote_tx_refused(&self, info: &TxInfo) -> Option<&'static str> {
+        if self.receive_only {
+            Some("The web server has no password, so it doesn't allow transmitting")
+        } else if self.hello && !info.remote_allowed {
+            Some("Transmitting from remote clients is turned off at the radio")
+        } else {
+            None
+        }
+    }
+
     /// Keys or unkeys for this client; returns why not, if it couldn't key.
     /// Anyone may unkey, whoever keyed.
     fn set_mox(&mut self, on: bool, mode: Mode, share: &RemoteShare, tx: &TxLink) -> Option<&'static str> {
@@ -501,8 +517,8 @@ impl RemoteStreams {
         if !info.available {
             return Some("This radio can't transmit");
         }
-        if !info.remote_allowed {
-            return Some("Transmitting from remote clients is turned off at the radio");
+        if let Some(why) = self.remote_tx_refused(&info) {
+            return Some(why);
         }
         if matches!(mode, Mode::Cwl | Mode::Cwu) {
             return Some("In CW, send text with the CW controls - MOX is for voice and data");
@@ -556,7 +572,7 @@ impl RemoteStreams {
             return None;
         }
         let info = share.tx();
-        if !info.available || !info.remote_allowed {
+        if !info.available || self.remote_tx_refused(&info).is_some() {
             k.mox.store(false, Ordering::Relaxed);
             self.keyed = None;
             return Some("remote transmit turned off while a remote client was transmitting -- unkeyed");
@@ -584,7 +600,7 @@ impl RemoteStreams {
         let on = mox.load(Ordering::Relaxed);
         let state = TxState {
             // Off for remote clients is, to them, a radio that can't.
-            available: info.available && info.remote_allowed,
+            available: info.available && self.remote_tx_refused(&info).is_none(),
             mox: on,
             power_w: info.power_w,
             max_power_w: info.max_power_w,
@@ -628,8 +644,8 @@ impl RemoteStreams {
                 if !info.available {
                     return notice("This radio can't transmit");
                 }
-                if self.hello && !info.remote_allowed {
-                    return notice("Transmitting from remote clients is turned off at the radio");
+                if let Some(why) = self.remote_tx_refused(&info) {
+                    return notice(why);
                 }
                 if !matches!(mode, Mode::Cwl | Mode::Cwu) {
                     return notice("Choose CW to send CW");
@@ -679,8 +695,8 @@ impl RemoteStreams {
         let rate = live.rate.load(Ordering::Relaxed) as u64;
         let why = if !info.available || rate == 0 {
             Some("This radio can't transmit")
-        } else if self.hello && !info.remote_allowed {
-            Some("Transmitting from remote clients is turned off at the radio")
+        } else if let Some(why) = self.remote_tx_refused(&info) {
+            Some(why)
         } else if !matches!(mode, Mode::Cwl | Mode::Cwu) {
             Some("Choose CW to key CW")
         } else if !crate::tx_frequency_allowed(
@@ -724,11 +740,12 @@ impl RemoteStreams {
     /// or the client has gone quiet with the key down (returning why, to
     /// log).
     pub fn key_tick(&mut self, share: &RemoteShare) -> Option<&'static str> {
+        let refused = !share.tx().available || self.remote_tx_refused(&share.tx()).is_some();
         let k = self.live.as_mut()?;
         let live = &k.cw.live;
         let why = if !k.mox.load(Ordering::Relaxed) {
             Some("radio unkeyed elsewhere while a remote client was keying CW")
-        } else if !share.tx().available || (self.hello && !share.tx().remote_allowed) {
+        } else if refused {
             Some("remote transmit turned off while a remote client was keying CW -- unkeyed")
         } else if k.down && k.last_heard.elapsed() >= Duration::from_millis(cw::KEY_TIMEOUT_MS as u64) {
             Some("nothing from the remote client keying CW for 1.5 s -- key released, unkeyed")
@@ -1158,6 +1175,16 @@ mod tests {
         assert!(send(&mut r, "hpsdr_mox:true;").unwrap().contains("turned off at the radio"));
         assert!(r.tx_message(&share, &tx.mox).unwrap().starts_with("hpsdr_tx:false,"), "shown as unavailable");
         share.set_tx(allowed);
+        // Through a web server with no password: never.
+        r.receive_only = true;
+        assert!(send(&mut r, "hpsdr_mox:true;").unwrap().contains("has no password"));
+        r.receive_only = false;
+        let mut fresh = RemoteStreams::default();
+        fresh.hello = true;
+        assert!(fresh.tx_message(&share, &tx.mox).unwrap().starts_with("hpsdr_tx:true,"));
+        let mut fresh = RemoteStreams::default();
+        (fresh.hello, fresh.receive_only) = (true, true);
+        assert!(fresh.tx_message(&share, &tx.mox).unwrap().starts_with("hpsdr_tx:false,"), "receive only");
         params.lock().unwrap().mode = Mode::Cwu;
         assert!(send(&mut r, "hpsdr_mox:true;").unwrap().contains("send text with the CW controls"));
         assert!(!tx.mox.load(Ordering::Relaxed));

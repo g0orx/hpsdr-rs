@@ -9975,7 +9975,11 @@ impl eframe::App for HpsdrApp {
                                                         .password(true)
                                                         .desired_width(160.0),
                                                 )
-                                                .on_hover_text("Asked for by the client before it connects. Empty: none.")
+                                                .on_hover_text(
+                                                    "Asked for by the client before it connects. Empty: none, \
+                                                     and clients through here can listen and tune but not \
+                                                     transmit.",
+                                                )
                                                 .changed()
                                             {
                                                 settings_changed = true;
@@ -10038,8 +10042,9 @@ impl eframe::App for HpsdrApp {
                                         }
                                     }
                                     ui.weak(if connected.web_password.is_empty() {
-                                        "No password: anyone who can reach this port can control the radio, \
-                                         transmitting included. Set one before making it reachable from outside."
+                                        "No password: clients through here can listen and tune, but not \
+                                         transmit. Set one to transmit, and before making this port reachable \
+                                         from outside."
                                     } else if !connected.web_https {
                                         "Without HTTPS the password crosses the network readable, and browsers \
                                          won't allow the microphone."
