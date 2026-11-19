@@ -422,7 +422,11 @@ A row of buttons and two sliders:
   hang/top/slope for AGC are tuned in Settings → RX.
 - **AGC Gain** (0.0-140.0 dB) -- right after the AGC button. The same value
   as Settings → RX's **Top** slider, under the name piHPSDR uses for it --
-  raises or lowers the AGC's target output level.
+  raises or lowers the AGC's target output level. With AGC **Off** it
+  becomes **Fixed Gain** (-20 to +120 dB, starting at +50), the
+  receiver's gain with no AGC: raise it for a weak signal, lower it if a
+  strong one distorts. Each is kept, so switching AGC on and off doesn't
+  change the other. A MIDI AGC Gain control follows the same rule.
 - **RX Attenuation / RX Gain / RF Gain** -- right after AGC Gain. The
   radio's front-end level; which one appears depends on the radio:
   - **RX Attenuation** (0-31 dB) on most boards: turn it up if strong

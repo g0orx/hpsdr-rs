@@ -476,6 +476,13 @@ impl Squelch {
     }
 }
 
+/// AGC Off's gain, dB: +50 was calibrated on a real S9+20 AM station
+/// (see the SetRXAAGCFixed call in SpectrumAnalyzer::new) -- a weaker
+/// signal needs more, hence the slider.
+pub const DEFAULT_AGC_FIXED_DB: f64 = 50.0;
+/// Thetis's Fixed Gain range.
+pub const AGC_FIXED_DB_RANGE: (f64, f64) = (-20.0, 120.0);
+
 #[derive(Copy, Clone)]
 pub struct DemodParams {
     pub mode: Mode,
@@ -492,6 +499,11 @@ pub struct DemodParams {
     pub agc_hang_ms: i32,
     pub agc_top_db: f64,
     pub agc_slope_db: i32,
+    /// The gain with AGC Off (WDSP's SetRXAAGCFixed), dB -- Thetis's
+    /// "Fixed Gain", which its AGC-T slider sets while AGC is Fixed, as
+    /// the AGC Gain slider does here while AGC is Off. Default
+    /// DEFAULT_AGC_FIXED_DB.
+    pub agc_fixed_db: f64,
     /// NB (ANB) vs. NB2 (NOB) vs. off -- mutually exclusive, see
     /// NoiseBlanker's doc comment. External to the RXA chain: whichever
     /// stage is active runs on the raw ADC-rate IQ before fexchange0,
@@ -665,6 +677,7 @@ impl Default for DemodParams {
             // had been carrying.
             agc_top_db: 80.0,
             agc_slope_db: 35,
+            agc_fixed_db: DEFAULT_AGC_FIXED_DB,
             // NB/NR off by default, same reasoning as AGC above --
             // these reshape the signal in ways that can surprise a
             // user who didn't ask for them; opt-in from the main panel.
@@ -814,6 +827,7 @@ struct SpectrumAnalyzer {
     last_passband: Option<(f64, f64)>,
     last_agc: Option<Agc>,
     last_agc_params: Option<(i32, i32, i32, f64, i32)>,
+    last_agc_fixed_db: Option<f64>,
     last_nb_enabled: Option<NoiseBlanker>,
     last_nb_threshold: Option<f64>,
     last_nr_enabled: Option<NoiseReduction>,
@@ -1028,7 +1042,10 @@ impl SpectrumAnalyzer {
             // on real hardware -- revisit with a fresh recording (Audio
             // Gain swept low-to-high on the same or another station) if
             // it's still off in either direction.
-            wdsp::SetRXAAGCFixed(channel, 50.0);
+            // The starting point: DemodParams::agc_fixed_db (the AGC
+            // Gain slider while AGC is Off) sets it from the first
+            // demod() call.
+            wdsp::SetRXAAGCFixed(channel, DEFAULT_AGC_FIXED_DB);
 
             // Creates the noise blanker DSP objects themselves -- must
             // happen before the Set*Samplerate calls below, since those
@@ -1180,6 +1197,7 @@ impl SpectrumAnalyzer {
                 last_passband: None,
                 last_agc: None,
                 last_agc_params: None,
+                last_agc_fixed_db: None,
                 last_nb_enabled: None,
                 last_nb_threshold: None,
                 last_nr_enabled: None,
@@ -1419,6 +1437,12 @@ impl SpectrumAnalyzer {
                 // matches the reference behavior.
             }
             self.last_agc_params = Some(agc_params);
+        }
+        if self.last_agc_fixed_db != Some(params.agc_fixed_db) {
+            unsafe {
+                wdsp::SetRXAAGCFixed(self.channel, params.agc_fixed_db);
+            }
+            self.last_agc_fixed_db = Some(params.agc_fixed_db);
         }
 
         // Noise blanker: NB (ANB) and NB2 (NOB) are mutually exclusive
@@ -2320,6 +2344,9 @@ impl SpectrumHandle {
     }
     pub fn set_agc_top_db(&self, v: f64) {
         self.demod_params.lock().unwrap().agc_top_db = v;
+    }
+    pub fn set_agc_fixed_db(&self, v: f64) {
+        self.demod_params.lock().unwrap().agc_fixed_db = v.clamp(AGC_FIXED_DB_RANGE.0, AGC_FIXED_DB_RANGE.1);
     }
     pub fn set_agc_slope_db(&self, v: i32) {
         self.demod_params.lock().unwrap().agc_slope_db = v.max(0);

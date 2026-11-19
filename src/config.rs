@@ -50,6 +50,9 @@ pub struct Config {
     pub agc_hang_ms: Option<i32>,
     pub agc_top_db: Option<f64>,
     pub agc_slope_db: Option<i32>,
+    /// AGC Off's gain (spectrum::DemodParams::agc_fixed_db).
+    #[serde(default)]
+    pub agc_fixed_db: Option<f64>,
     /// See spectrum::DemodParams::meter_calibration_db's own doc
     /// comment. `#[serde(default)]` since older saved configs predate
     /// this field -- missing = 0.0/uncalibrated, the pre-existing
@@ -734,6 +737,8 @@ pub struct ExtraReceiverConfig {
     pub agc_hang_ms: i32,
     pub agc_top_db: f64,
     pub agc_slope_db: i32,
+    #[serde(default = "default_agc_fixed_db")]
+    pub agc_fixed_db: f64,
     /// See spectrum::DemodParams::meter_calibration_db's own doc
     /// comment. `#[serde(default)]` -- same reasoning as every other
     /// field added to this struct after the ones above it.
@@ -1012,6 +1017,10 @@ impl Config {
 
 fn default_squelch_level() -> f32 {
     30.0
+}
+
+fn default_agc_fixed_db() -> f64 {
+    crate::spectrum::DEFAULT_AGC_FIXED_DB
 }
 
 #[cfg(test)]

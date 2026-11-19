@@ -2473,8 +2473,14 @@ fn apply_midi_binding(
             // Same range/call as the main window's own AGC Gain slider
             // (see its doc comment -- WDSP's SetRXAAGCTop, "Top" in
             // Settings -> RX under a different name).
-            let agc_top_db = midi_knob_range(ev.value, 0.0, 140.0);
-            connected.spectrum.set_agc_top_db(agc_top_db);
+            // With AGC Off, the fixed gain, as the slider.
+            if connected.spectrum.agc() == spectrum::Agc::Off {
+                let (lo, hi) = spectrum::AGC_FIXED_DB_RANGE;
+                connected.spectrum.set_agc_fixed_db(midi_knob_range(ev.value, lo, hi));
+            } else {
+                let agc_top_db = midi_knob_range(ev.value, 0.0, 140.0);
+                connected.spectrum.set_agc_top_db(agc_top_db);
+            }
         }
         MidiAction::MicGain => {
             if connected.tx_enabled && connected.tx_handle.is_some() {
@@ -2589,7 +2595,15 @@ fn midi_knob_value(connected: &ConnectedState, action: MidiAction) -> Option<u8>
     let db = |gain: f32| 20.0 * (gain.max(1e-9) as f64).log10();
     Some(match action {
         MidiAction::AfGain => scale(db(connected.spectrum.gain()), -100.0, 18.0),
-        MidiAction::AgcGain => scale(connected.spectrum.agc_params().agc_top_db, 0.0, 140.0),
+        MidiAction::AgcGain => {
+            let p = connected.spectrum.agc_params();
+            if p.agc == spectrum::Agc::Off {
+                let (lo, hi) = spectrum::AGC_FIXED_DB_RANGE;
+                scale(p.agc_fixed_db, lo, hi)
+            } else {
+                scale(p.agc_top_db, 0.0, 140.0)
+            }
+        }
         MidiAction::MicGain => {
             if !(connected.tx_enabled && connected.tx_handle.is_some()) {
                 return None;
@@ -2640,7 +2654,14 @@ fn knob_value_text(connected: &ConnectedState, action: MidiAction) -> Option<Str
             let d = db(connected.spectrum.gain());
             format!("{:.0}% ({d:.0} dB)", gain_percent(d, -100.0, 30.0))
         }
-        MidiAction::AgcGain => format!("{:.0} dB", connected.spectrum.agc_params().agc_top_db),
+        MidiAction::AgcGain => {
+            let p = connected.spectrum.agc_params();
+            if p.agc == spectrum::Agc::Off {
+                format!("Fixed {:.0} dB", p.agc_fixed_db)
+            } else {
+                format!("{:.0} dB", p.agc_top_db)
+            }
+        }
         MidiAction::MicGain => {
             let d = db(connected.mic_gain);
             format!("{:.0}% ({d:.1} dB)", gain_percent(d, -60.0, 6.0))
@@ -4760,6 +4781,9 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
             }
             if let Some(v) = cfg.agc_top_db {
                 spectrum.set_agc_top_db(v);
+            }
+            if let Some(v) = cfg.agc_fixed_db {
+                spectrum.set_agc_fixed_db(v);
             }
             if let Some(v) = cfg.agc_slope_db {
                 spectrum.set_agc_slope_db(v);
@@ -7546,17 +7570,7 @@ impl eframe::App for HpsdrApp {
                         // next to Audio gain -- it tunes the AGC itself,
                         // not the speaker volume.
                         ui.add_space(12.0);
-                        ui.label("AGC Gain:");
-                        let mut agc_top_db = connected.spectrum.agc_params().agc_top_db;
-                        if scroll_slider_f64(
-                            ui,
-                            &mut connected.slider_scroll_accum,
-                            &mut agc_top_db,
-                            0.0..=140.0,
-                            2.0,
-                            " dB",
-                        ) {
-                            connected.spectrum.set_agc_top_db(agc_top_db);
+                        if agc_gain_slider(ui, &mut connected.slider_scroll_accum, &connected.spectrum) {
                             settings_changed = true;
                         }
 
@@ -13934,6 +13948,7 @@ impl eframe::App for HpsdrApp {
                                 agc_hang_ms: agc_params.agc_hang_ms,
                                 agc_top_db: agc_params.agc_top_db,
                                 agc_slope_db: agc_params.agc_slope_db,
+                                agc_fixed_db: agc_params.agc_fixed_db,
                                 meter_calibration_db: agc_params.meter_calibration_db,
                                 noise_blanker: agc_params.noise_blanker,
                                 nb_threshold: agc_params.nb_threshold,
@@ -13993,6 +14008,7 @@ impl eframe::App for HpsdrApp {
                         agc_decay_ms: Some(agc_params_now.agc_decay_ms),
                         agc_hang_ms: Some(agc_params_now.agc_hang_ms),
                         agc_top_db: Some(agc_params_now.agc_top_db),
+                        agc_fixed_db: Some(agc_params_now.agc_fixed_db),
                         agc_slope_db: Some(agc_params_now.agc_slope_db),
                         meter_calibration_db: Some(agc_params_now.meter_calibration_db),
                         noise_blanker: Some(agc_params_now.noise_blanker),
@@ -15939,6 +15955,33 @@ fn sidetone_level_from_percent(percent: f64) -> u32 {
     (percent.round().clamp(0.0, 100.0) * 127.0 / 100.0).round() as u32
 }
 
+/// The AGC Gain slider: the AGC's maximum gain (WDSP's Top), or with AGC
+/// Off, the fixed gain instead -- as Thetis's AGC-T slider becomes "Fixed
+/// Gain" with AGC Fixed. Each is kept, so switching AGC back and forth
+/// doesn't change the other.
+fn agc_gain_slider(ui: &mut egui::Ui, scroll_accum: &mut f32, spectrum: &SpectrumHandle) -> bool {
+    let params = spectrum.agc_params();
+    if params.agc == spectrum::Agc::Off {
+        ui.label("Fixed Gain:")
+            .on_hover_text("With AGC Off, the receiver's gain is fixed: raise it for a weak signal, lower it if a strong one distorts");
+        let mut db = params.agc_fixed_db;
+        let (lo, hi) = spectrum::AGC_FIXED_DB_RANGE;
+        let changed = scroll_slider_f64(ui, scroll_accum, &mut db, lo..=hi, 2.0, " dB");
+        if changed {
+            spectrum.set_agc_fixed_db(db);
+        }
+        changed
+    } else {
+        ui.label("AGC Gain:");
+        let mut db = params.agc_top_db;
+        let changed = scroll_slider_f64(ui, scroll_accum, &mut db, 0.0..=140.0, 2.0, " dB");
+        if changed {
+            spectrum.set_agc_top_db(db);
+        }
+        changed
+    }
+}
+
 fn scroll_slider_f64(
     ui: &mut egui::Ui,
     scroll_accum: &mut f32,
@@ -17325,10 +17368,8 @@ fn render_extra_receiver_ui(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceiver>>) {
         // for it. Placed right after the AGC button, not next to Audio
         // gain -- it tunes the AGC itself, not the speaker volume.
         ui.add_space(12.0);
-        ui.label("AGC Gain:");
-        let mut agc_top_db = rx.spectrum.agc_params().agc_top_db;
-        if scroll_slider_f64(ui, &mut rx.slider_scroll_accum, &mut agc_top_db, 0.0..=140.0, 2.0, " dB") {
-            rx.spectrum.set_agc_top_db(agc_top_db);
+        let rx = &mut *rx;
+        if agc_gain_slider(ui, &mut rx.slider_scroll_accum, &rx.spectrum) {
             rx.settings_dirty.store(true, Ordering::Relaxed);
         }
         // RIT -- see the main receiver's identical treatment for the
@@ -18484,6 +18525,7 @@ fn spawn_extra_receiver(
         spectrum.set_agc_decay_ms(s.agc_decay_ms);
         spectrum.set_agc_hang_ms(s.agc_hang_ms);
         spectrum.set_agc_top_db(s.agc_top_db);
+        spectrum.set_agc_fixed_db(s.agc_fixed_db);
         spectrum.set_agc_slope_db(s.agc_slope_db);
         spectrum.set_meter_calibration_db(s.meter_calibration_db);
         spectrum.set_noise_blanker(s.noise_blanker);
@@ -18637,6 +18679,7 @@ fn change_sample_rate(connected: &mut ConnectedState, new_rate: u32) {
     spectrum.set_agc_decay_ms(agc_params.agc_decay_ms);
     spectrum.set_agc_hang_ms(agc_params.agc_hang_ms);
     spectrum.set_agc_top_db(agc_params.agc_top_db);
+    spectrum.set_agc_fixed_db(agc_params.agc_fixed_db);
     spectrum.set_agc_slope_db(agc_params.agc_slope_db);
     spectrum.set_meter_calibration_db(agc_params.meter_calibration_db);
     spectrum.set_noise_blanker(agc_params.noise_blanker);
@@ -18841,6 +18884,7 @@ fn change_extra_receiver_sample_rate(rx: &mut ExtraReceiver, new_rate: u32) {
     spectrum.set_agc_decay_ms(agc_params.agc_decay_ms);
     spectrum.set_agc_hang_ms(agc_params.agc_hang_ms);
     spectrum.set_agc_top_db(agc_params.agc_top_db);
+    spectrum.set_agc_fixed_db(agc_params.agc_fixed_db);
     spectrum.set_agc_slope_db(agc_params.agc_slope_db);
     spectrum.set_meter_calibration_db(agc_params.meter_calibration_db);
     spectrum.set_noise_blanker(agc_params.noise_blanker);
