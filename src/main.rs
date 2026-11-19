@@ -19123,9 +19123,28 @@ pub(crate) fn running_on_wayland() -> bool {
 /// Vulkan driver (igvk64.dll 27.20.100.8681, from 2020) -- just starting
 /// Vulkan alongside DX12 loads it. DX12 is Windows' own API, and what its
 /// drivers are tested against.
+///
+/// On a Raspberry Pi, OpenGL only. REAL REPORT (2026-11-19, Raspberry Pi
+/// 5, Pi OS trixie, X11 session, Mesa 25.0.7): through Vulkan (Mesa's
+/// v3dv) the windows flickered and filled with blocks, Settings barely
+/// readable, whatever the present mode (fifo, mailbox); WGPU_BACKEND=gl
+/// drew them perfectly -- as other egui programs drawing with OpenGL on
+/// the same desktop already did. WGPU_BACKEND=vulkan still chooses Vulkan.
 fn wgpu_backends() -> eframe::wgpu::Backends {
     use eframe::wgpu::Backends;
-    Backends::from_env().unwrap_or(if cfg!(windows) { Backends::DX12 | Backends::GL } else { Backends::PRIMARY | Backends::GL })
+    Backends::from_env().unwrap_or(if cfg!(windows) {
+        Backends::DX12 | Backends::GL
+    } else if is_raspberry_pi() {
+        Backends::GL
+    } else {
+        Backends::PRIMARY | Backends::GL
+    })
+}
+
+/// Running on a Raspberry Pi (its device tree's model says so).
+fn is_raspberry_pi() -> bool {
+    cfg!(target_os = "linux")
+        && std::fs::read("/proc/device-tree/model").is_ok_and(|m| m.starts_with(b"Raspberry Pi"))
 }
 
 /// wgpu's present mode: on Linux AutoNoVsync, elsewhere egui-wgpu's
@@ -19217,12 +19236,13 @@ fn main() -> eframe::Result<()> {
     // program or the build predated it).
     let env = |name: &str| std::env::var(name).unwrap_or_else(|_| "unset".to_string());
     eprintln!(
-        "hpsdr-rs {} ({}): HPSDR_LOG={} HPSDR_PRESENT_MODE={} WGPU_BACKEND={}",
+        "hpsdr-rs {} ({}): HPSDR_LOG={} HPSDR_PRESENT_MODE={} WGPU_BACKEND={} (drawing with {:?})",
         env!("CARGO_PKG_VERSION"),
         env!("HPSDR_GIT_COMMIT"),
         env("HPSDR_LOG"),
         env("HPSDR_PRESENT_MODE"),
         env("WGPU_BACKEND"),
+        wgpu_backends(),
     );
 
     // Native Wayland is the default; HPSDR_FORCE_X11=1 (any value but

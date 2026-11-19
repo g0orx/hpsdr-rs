@@ -30,6 +30,13 @@ driver is the general cure. To choose the graphics API yourself, set
 `WGPU_BACKEND` to `dx12`, `vulkan` or `gl` -- e.g. `setx WGPU_BACKEND gl`
 in a Command Prompt, which takes effect for programs started afterwards.
 
+### On a Raspberry Pi
+
+hpsdr-rs draws with OpenGL on a Raspberry Pi: through the Pi's Vulkan
+driver its windows can flicker and fill with blocks. To try Vulkan
+anyway, start it with `WGPU_BACKEND=vulkan hpsdr-rs`. The first line it
+prints says what it's drawing with.
+
 ## Discovering your radio
 
 On launch, the **Discover HPSDR Radios** list opens automatically and
