@@ -49,8 +49,12 @@ tune it several ways:
 - **Click** (or tap) the frequency display (VFO-A or VFO-B): opens a small
   popup with an on-screen numeric keypad (plus normal keyboard digit/
   Backspace/Enter/Escape input) to type an exact frequency directly,
-  rather than scrolling or clicking a spot on the spectrum. Retunes as
-  soon as you press **Enter**, clamped to the radio's own tunable range.
+  rather than scrolling or clicking a spot on the spectrum. **Enter**
+  takes the number in Hz; **Enter kHz** and **Enter MHz** multiply it by
+  1,000 or 1,000,000, so 14.074 then **Enter MHz**, or 14074 then
+  **Enter kHz**, tunes to 14.074 MHz. The **.** key adds a decimal point;
+  on a keyboard, **K** and **M** do the same as the kHz and MHz buttons.
+  It retunes at once, clamped to the radio's own tunable range.
   The keypad opens inside the main window, on top of everything there, so
   it can't get lost behind it; drag it by its title, and close it with
   **Cancel**, Escape or its **x**. Clicking a VFO while it's open

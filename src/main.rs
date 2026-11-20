@@ -1548,17 +1548,37 @@ fn open_frequency_entry(connected: &mut ConnectedState, vfo_b: bool) {
     connected.frequency_entry = Some(FrequencyEntry { vfo_b, digits: String::new() });
 }
 
+/// Adds a typed character to a keypad entry: a digit, up to
+/// MAX_FREQUENCY_ENTRY_DIGITS of them, or one decimal point.
+fn push_frequency_entry_char(digits: &mut String, c: char) {
+    let count = digits.chars().filter(char::is_ascii_digit).count();
+    if (c.is_ascii_digit() && count < MAX_FREQUENCY_ENTRY_DIGITS) || (c == '.' && !digits.contains('.')) {
+        digits.push(c);
+    }
+}
+
+/// A keypad entry as a frequency, Hz: the number typed, times `scale`
+/// (1 for Enter, 1000 for Enter kHz, 1000000 for Enter MHz), rounded to
+/// whole Hz. None with nothing typed.
+fn frequency_entry_hz(digits: &str, scale: f64) -> Option<u64> {
+    let value: f64 = digits.parse().ok()?;
+    let hz = (value * scale).round();
+    (hz.is_finite() && hz >= 0.0).then_some(hz as u64)
+}
+
 /// The keypad window opened by clicking a VFO, in the main window
 /// or an extra receiver's (each passes its own `entry`). Drawn inside
 /// the window it was opened from, not as a window of its own -- see
-/// where the main window calls it. Closes itself on Enter, Cancel,
-/// Escape or its close button; returns `(vfo_b, frequency)` when Enter
-/// was pressed with digits typed, for the caller to apply.
+/// where the main window calls it. Closes itself on Enter (Hz), Enter kHz,
+/// Enter MHz, Cancel, Escape or its close button; returns
+/// `(vfo_b, frequency)` when one of the Enters was pressed with a number
+/// typed, for the caller to apply.
 fn frequency_entry_window(ctx: &egui::Context, entry: &mut Option<FrequencyEntry>) -> Option<(bool, u64)> {
     let e = entry.as_mut()?;
     let vfo_b = e.vfo_b;
     let mut close_now = false;
-    let mut apply = false;
+    // The scale of the Enter pressed: 1 (Hz), 1000 (kHz), 1000000 (MHz).
+    let mut apply: Option<f64> = None;
     let mut open = true;
     egui::Window::new("Enter Frequency")
         .open(&mut open)
@@ -1578,15 +1598,18 @@ fn frequency_entry_window(ctx: &egui::Context, entry: &mut Option<FrequencyEntry
                             digits.pop();
                         }
                         egui::Event::Key { key: egui::Key::Enter, pressed: true, .. } => {
-                            apply = true;
+                            apply = Some(1.0);
                         }
                         egui::Event::Key { key: egui::Key::Escape, pressed: true, .. } => {
                             close_now = true;
                         }
                         egui::Event::Text(t) => {
                             for c in t.chars() {
-                                if c.is_ascii_digit() && digits.len() < MAX_FREQUENCY_ENTRY_DIGITS {
-                                    digits.push(c);
+                                match c.to_ascii_lowercase() {
+                                    'k' => apply = Some(1e3),
+                                    'm' => apply = Some(1e6),
+                                    ',' => push_frequency_entry_char(digits, '.'),
+                                    c => push_frequency_entry_char(digits, c),
                                 }
                             }
                         }
@@ -1601,8 +1624,14 @@ fn frequency_entry_window(ctx: &egui::Context, entry: &mut Option<FrequencyEntry
                 // 0 while empty (nothing typed yet) rather than blank --
                 // makes it clear this is a live preview, not a label
                 // that's just missing.
-                let preview_hz: u64 = digits.parse().unwrap_or(0);
-                ui.label(egui::RichText::new(format_frequency(preview_hz)).monospace().size(26.0).strong());
+                // With a decimal point it's kHz or MHz, not yet known which
+                // -- shown as typed.
+                let preview = if digits.contains('.') {
+                    digits.clone()
+                } else {
+                    format_frequency(digits.parse().unwrap_or(0))
+                };
+                ui.label(egui::RichText::new(preview).monospace().size(26.0).strong());
             });
             ui.add_space(8.0);
 
@@ -1610,21 +1639,17 @@ fn frequency_entry_window(ctx: &egui::Context, entry: &mut Option<FrequencyEntry
             egui::Grid::new("frequency_entry_keypad").spacing([6.0, 6.0]).show(ui, |ui| {
                 for row in [['7', '8', '9'], ['4', '5', '6'], ['1', '2', '3']] {
                     for d in row {
-                        if ui.add_sized(button_size, egui::Button::new(d.to_string())).clicked()
-                            && digits.len() < MAX_FREQUENCY_ENTRY_DIGITS
-                        {
-                            digits.push(d);
+                        if ui.add_sized(button_size, egui::Button::new(d.to_string())).clicked() {
+                            push_frequency_entry_char(digits, d);
                         }
                     }
                     ui.end_row();
                 }
-                if ui.add_sized(button_size, egui::Button::new("C")).clicked() {
-                    digits.clear();
+                if ui.add_sized(button_size, egui::Button::new(".")).clicked() {
+                    push_frequency_entry_char(digits, '.');
                 }
-                if ui.add_sized(button_size, egui::Button::new("0")).clicked()
-                    && digits.len() < MAX_FREQUENCY_ENTRY_DIGITS
-                {
-                    digits.push('0');
+                if ui.add_sized(button_size, egui::Button::new("0")).clicked() {
+                    push_frequency_entry_char(digits, '0');
                 }
                 // Monospace: "←" is only in egui's Hack font, which 0.37
                 // no longer uses as a fallback for normal text (it drew
@@ -1636,18 +1661,36 @@ fn frequency_entry_window(ctx: &egui::Context, entry: &mut Option<FrequencyEntry
                 ui.end_row();
             });
 
+            // The keypad's own width: three buttons and two gaps.
+            let row_width = button_size[0] * 3.0 + 12.0;
             ui.add_space(10.0);
             ui.horizontal(|ui| {
-                if ui.add_sized([123.0, 32.0], egui::Button::new("Cancel")).clicked() {
+                ui.spacing_mut().item_spacing.x = 6.0;
+                let half = [(row_width - 6.0) / 2.0, 36.0];
+                if ui.add_sized(half, egui::Button::new("Enter kHz")).on_hover_text("The number times 1,000 (K key)").clicked() {
+                    apply = Some(1e3);
+                }
+                if ui.add_sized(half, egui::Button::new("Enter MHz")).on_hover_text("The number times 1,000,000 (M key)").clicked() {
+                    apply = Some(1e6);
+                }
+            });
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 6.0;
+                if ui.add_sized(button_size, egui::Button::new("C")).on_hover_text("Clear").clicked() {
+                    digits.clear();
+                }
+                let rest = [(row_width - button_size[0] - 12.0) / 2.0, 36.0];
+                if ui.add_sized(rest, egui::Button::new("Cancel")).clicked() {
                     close_now = true;
                 }
-                if ui.add_sized([123.0, 32.0], egui::Button::new("Enter")).clicked() {
-                    apply = true;
+                if ui.add_sized(rest, egui::Button::new("Enter")).on_hover_text("The number in Hz (Enter key)").clicked() {
+                    apply = Some(1.0);
                 }
             });
         });
-    let result = if apply { e.digits.parse::<u64>().ok().map(|f| (vfo_b, f)) } else { None };
-    if apply || close_now || !open {
+    let result = apply.and_then(|scale| frequency_entry_hz(&e.digits, scale)).map(|f| (vfo_b, f));
+    if apply.is_some() || close_now || !open {
         *entry = None;
     }
     result
@@ -19409,6 +19452,28 @@ mod tests {
         assert_eq!(step, 12_500);
         track_step_per_mode(Mode::Cwu, &mut step, &mut memory, &mut mode);
         assert_eq!(step, 10);
+    }
+
+    #[test]
+    fn keypad_enters_hz_khz_and_mhz() {
+        assert_eq!(frequency_entry_hz("14074000", 1.0), Some(14_074_000));
+        assert_eq!(frequency_entry_hz("14074", 1e3), Some(14_074_000));
+        assert_eq!(frequency_entry_hz("14.074", 1e6), Some(14_074_000));
+        assert_eq!(frequency_entry_hz("7074.5", 1e3), Some(7_074_500));
+        assert_eq!(frequency_entry_hz("10489.55", 1e6), Some(10_489_550_000));
+        assert_eq!(frequency_entry_hz(".5", 1e6), Some(500_000));
+        assert_eq!(frequency_entry_hz("", 1e6), None);
+        assert_eq!(frequency_entry_hz(".", 1e6), None);
+        let mut digits = String::new();
+        for c in "1.4.07x4".chars() {
+            push_frequency_entry_char(&mut digits, c);
+        }
+        assert_eq!(digits, "1.4074", "one decimal point, digits only");
+        let mut digits = String::new();
+        for c in "123456789012".chars() {
+            push_frequency_entry_char(&mut digits, c);
+        }
+        assert_eq!(digits.len(), MAX_FREQUENCY_ENTRY_DIGITS);
     }
 
     #[test]
