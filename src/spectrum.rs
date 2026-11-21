@@ -880,8 +880,21 @@ impl SpectrumAnalyzer {
             // See config::settings_dir's doc comment -- shared, platform-
             // correct settings directory logic (this used to duplicate
             // an $HOME/.config-only version of the same thing here).
-            if let Some(dir) = crate::config::settings_dir().map(|d| d.join("wdsp_wisdom")) {
+            if let Some(settings) = crate::config::settings_dir() {
+                let dir = settings.join("wdsp_wisdom");
                 if std::fs::create_dir_all(&dir).is_ok() {
+                    // WDSPwisdom appends "wdspWisdom01" straight onto the
+                    // string with no separator, so it needs a trailing one
+                    // (join("") adds '/' or '\' per platform). Without it
+                    // the file landed beside the folder as
+                    // "wdsp_wisdomwdspWisdom01". Move any such file into
+                    // the folder so existing users don't re-plan FFTs.
+                    let stray = settings.join("wdsp_wisdomwdspWisdom01");
+                    let wanted = dir.join("wdspWisdom01");
+                    if stray.is_file() && !wanted.exists() {
+                        let _ = std::fs::rename(&stray, &wanted);
+                    }
+                    let dir = dir.join("");
                     if let Ok(cstring) = std::ffi::CString::new(dir.to_string_lossy().as_bytes()) {
                         // WDSP 2.11: -1 means the path was rejected and no
                         // wisdom was loaded or built.
