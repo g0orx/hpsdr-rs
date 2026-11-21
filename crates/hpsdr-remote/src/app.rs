@@ -1527,11 +1527,9 @@ impl App {
                     ui.weak(format_hz(d.width_hz));
                 }
                 ui.add_space(12.0);
-                for (mode, label) in dsp::AGC_MODES.iter().zip(["AGC Off", "Long", "Slow", "Med", "Fast"]) {
-                    if ui.add(egui::Button::selectable(d.agc == *mode, label)).clicked() {
-                        d.agc = mode.to_string();
-                        changes.push((dsp::SET_AGC, mode.to_string()));
-                    }
+                if let Some(mode) = choice_combo(ui, "agc", "AGC", &d.agc, &dsp::AGC_MODES, &["Off", "Long", "Slow", "Medium", "Fast"]) {
+                    d.agc = mode.to_string();
+                    changes.push((dsp::SET_AGC, mode.to_string()));
                 }
                 if ui.add(egui::Slider::new(&mut d.agc_gain_db, 0..=140).suffix(" dB")).changed() {
                     changes.push((dsp::SET_AGC_GAIN, d.agc_gain_db.to_string()));
@@ -1540,19 +1538,15 @@ impl App {
         }
         if noise {
             ui.horizontal_wrapped(|ui| {
-                for (mode, label) in dsp::NB_MODES.iter().zip(["NB Off", "NB", "NB2"]) {
-                    if ui.add(egui::Button::selectable(d.nb == *mode, label)).clicked() {
-                        d.nb = mode.to_string();
-                        changes.push((dsp::SET_NB, mode.to_string()));
-                    }
+                if let Some(mode) = choice_combo(ui, "nb", "NB", &d.nb, &dsp::NB_MODES, &["Off", "NB", "NB2"]) {
+                    d.nb = mode.to_string();
+                    changes.push((dsp::SET_NB, mode.to_string()));
                 }
                 ui.add_space(12.0);
                 // Labels as hpsdr-rs's own NR menu: its third, "nr3" here, is NNR.
-                for (mode, label) in dsp::NR_MODES.iter().zip(["NR Off", "NR", "NR2", "NNR"]) {
-                    if ui.add(egui::Button::selectable(d.nr == *mode, label)).clicked() {
-                        d.nr = mode.to_string();
-                        changes.push((dsp::SET_NR, mode.to_string()));
-                    }
+                if let Some(mode) = choice_combo(ui, "nr", "NR", &d.nr, &dsp::NR_MODES, &["Off", "NR", "NR2", "NNR"]) {
+                    d.nr = mode.to_string();
+                    changes.push((dsp::SET_NR, mode.to_string()));
                 }
                 ui.add_space(12.0);
                 if ui.add(egui::Button::selectable(d.anf, "ANF")).clicked() {
@@ -2067,6 +2061,29 @@ fn with_password(url: &str, password: &str) -> String {
     format!("{url}{separator}password={encoded}")
 }
 
+/// A drop-down for one of the server's DSP choices (AGC, NB, NR): shows
+/// "`title`: <current>" and returns the wire value picked, if it changed.
+/// `modes` are the wire values, `labels` what the menu shows for each.
+fn choice_combo(
+    ui: &mut egui::Ui,
+    id: &str,
+    title: &str,
+    current: &str,
+    modes: &[&'static str],
+    labels: &[&str],
+) -> Option<&'static str> {
+    let shown = modes.iter().position(|m| *m == current).map_or(current, |i| labels[i]);
+    let mut picked = None;
+    egui::ComboBox::from_id_salt(id).selected_text(format!("{title}: {shown}")).show_ui(ui, |ui| {
+        for (mode, label) in modes.iter().zip(labels) {
+            if ui.selectable_label(*mode == current, *label).clicked() && *mode != current {
+                picked = Some(*mode);
+            }
+        }
+    });
+    picked
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2117,3 +2134,4 @@ mod tests {
         assert_eq!(current_band(&list, 1_000_000_000), Some("Gen"));
     }
 }
+
