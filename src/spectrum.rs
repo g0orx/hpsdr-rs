@@ -242,13 +242,16 @@ impl Agc {
         }
     }
 
-    pub fn next(self) -> Self {
+    pub const ALL: [Self; 5] = [Agc::Off, Agc::Long, Agc::Slow, Agc::Medium, Agc::Fast];
+
+    /// The choice on its own, for the main window's AGC menu.
+    pub fn name(self) -> &'static str {
         match self {
-            Agc::Off => Agc::Long,
-            Agc::Long => Agc::Slow,
-            Agc::Slow => Agc::Medium,
-            Agc::Medium => Agc::Fast,
-            Agc::Fast => Agc::Off,
+            Agc::Off => "Off",
+            Agc::Long => "Long",
+            Agc::Slow => "Slow",
+            Agc::Medium => "Medium",
+            Agc::Fast => "Fast",
         }
     }
 }

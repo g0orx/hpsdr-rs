@@ -1748,6 +1748,18 @@ fn noise_blanker_menu(ui: &mut egui::Ui, current: spectrum::NoiseBlanker) -> Opt
     )
 }
 
+fn agc_menu(ui: &mut egui::Ui, current: spectrum::Agc) -> Option<spectrum::Agc> {
+    let choices: Vec<_> = spectrum::Agc::ALL.iter().map(|&v| (v, v.name())).collect();
+    choice_menu_button(
+        ui,
+        current,
+        spectrum::Agc::Off,
+        current.label(),
+        &choices,
+        "AGC: click to choose Off, Long, Slow, Medium or Fast",
+    )
+}
+
 fn noise_reduction_menu(ui: &mut egui::Ui, current: spectrum::NoiseReduction) -> Option<spectrum::NoiseReduction> {
     let choices: Vec<_> = spectrum::NoiseReduction::ALL.iter().map(|&v| (v, v.name())).collect();
     choice_menu_button(
@@ -7590,15 +7602,8 @@ impl eframe::App for HpsdrApp {
                             connected.spectrum.set_binaural(!binaural);
                             settings_changed = true;
                         }
-                        if ui
-                            .add(egui::Button::selectable(
-                                current_agc != spectrum::Agc::Off,
-                                current_agc.label(),
-                            ))
-                            .on_hover_text("Click to cycle: Off -> Long -> Slow -> Medium -> Fast -> Off")
-                            .clicked()
-                        {
-                            connected.spectrum.set_agc(current_agc.next());
+                        if let Some(v) = agc_menu(ui, current_agc) {
+                            connected.spectrum.set_agc(v);
                             settings_changed = true;
                         }
 
@@ -17396,12 +17401,8 @@ fn render_extra_receiver_ui(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceiver>>) {
             rx.settings_dirty.store(true, Ordering::Relaxed);
         }
         let current_agc = rx.spectrum.agc();
-        if ui
-            .add(egui::Button::selectable(current_agc != spectrum::Agc::Off, current_agc.label()))
-            .on_hover_text("Click to cycle: Off -> Long -> Slow -> Medium -> Fast -> Off")
-            .clicked()
-        {
-            rx.spectrum.set_agc(current_agc.next());
+        if let Some(v) = agc_menu(ui, current_agc) {
+            rx.spectrum.set_agc(v);
             rx.settings_dirty.store(true, Ordering::Relaxed);
         }
 
