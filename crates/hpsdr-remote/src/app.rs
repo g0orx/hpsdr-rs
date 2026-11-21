@@ -24,6 +24,7 @@ use crate::keyer::{self, Keyer};
 use crate::link::{Incoming, Link, Status};
 use crate::mic::Mic;
 use crate::prefs;
+use crate::reload;
 
 mod panel;
 
@@ -330,6 +331,11 @@ pub struct App {
     touches: HashMap<u64, Pos2>,
     /// The server's last hpsdr_notice, and when it came.
     notice: Option<(String, f64)>,
+    /// Connect on the first frame: the page was reloaded after a lost
+    /// WebGL context while connected (reload.rs).
+    reconnect: bool,
+    /// Audio output opened without a click: resume it on the next one.
+    audio_needs_click: bool,
     /// The section of controls open over the spectrum in the compact
     /// layout, if any.
     section: Option<Section>,
@@ -424,6 +430,8 @@ impl App {
             key_sent: (false, f64::NEG_INFINITY),
             touches: HashMap::new(),
             notice: None,
+            reconnect: false,
+            audio_needs_click: false,
             section: None,
             layout: Layout::Auto,
             fullscreen: false,
@@ -440,6 +448,11 @@ impl App {
         if app.controller_config.kind != hpsdr_controller::ControllerKind::None {
             app.start_controller();
         }
+        if let Some((url, password)) = reload::take_reconnect() {
+            app.url = url;
+            app.password = password;
+            app.reconnect = true;
+        }
         app
     }
 
@@ -451,6 +464,7 @@ impl App {
         self.keyed_here = false;
         self.notice = None;
         self.remembered = false;
+        reload::set_connected(Some((&self.url, &self.password)));
         self.link = match Link::connect(&with_password(&self.url, &self.password), ctx.clone()) {
             Ok(link) => Some(link),
             Err(e) => {
@@ -1089,6 +1103,7 @@ impl App {
                     }
                     self.link = None;
                     self.keyed_here = false;
+                    reload::set_connected(None);
                 }
                 if !narrow {
                     ui.weak(&self.url);
@@ -1798,6 +1813,22 @@ impl App {
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.now = ui.input(|i| i.time);
+        if self.reconnect {
+            self.reconnect = false;
+            self.connect(ui.ctx());
+            self.audio_needs_click = true;
+            self.notice = Some(("Reconnected after the browser's graphics reset: click if there's no audio".to_string(), self.now));
+        }
+        if self.audio_needs_click
+            && ui.input(|i| {
+                i.pointer.any_pressed() || i.events.iter().any(|e| matches!(e, egui::Event::Key { pressed: true, .. }))
+            })
+        {
+            self.audio_needs_click = false;
+            if let Some(player) = &self.player {
+                player.resume();
+            }
+        }
         self.flush_tune();
         let incoming = self.link.as_mut().map(|l| l.poll()).unwrap_or_default();
         for i in incoming {

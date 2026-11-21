@@ -12,6 +12,7 @@ mod keyer;
 mod link;
 mod mic;
 mod prefs;
+mod reload;
 
 #[cfg(not(target_arch = "wasm32"))]
 fn main() -> eframe::Result<()> {
@@ -52,6 +53,7 @@ fn main() {
             .and_then(|d| d.get_element_by_id("hpsdr_remote"))
             .and_then(|e| e.dyn_into::<web_sys::HtmlCanvasElement>().ok())
             .expect("no canvas with id hpsdr_remote");
+        reload::install(&canvas);
         let result = eframe::WebRunner::new()
             .start(canvas, eframe::WebOptions::default(), Box::new(|cc| Ok(Box::new(app::App::new(cc)))))
             .await;

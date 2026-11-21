@@ -285,6 +285,12 @@ impl Player {
         self.jitter.lock().unwrap().error.clone()
     }
 
+    /// Start it again: in a browser, output opened without a click (the
+    /// reconnect after a reload, reload.rs) stays suspended until one.
+    pub fn resume(&self) {
+        let _ = self._stream.play();
+    }
+
     /// Seconds buffered, for the status line.
     pub fn buffered_s(&self) -> f32 {
         let j = self.jitter.lock().unwrap();
