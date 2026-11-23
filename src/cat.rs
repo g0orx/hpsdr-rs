@@ -17,13 +17,16 @@
     written by the same author as this app), scoped down to a practical
     subset rather than porting its full ~5900 lines. Implemented:
     ID, IF, FA, FB, FR, FT, MD, AI, PS, TX, RX, SM, TY, RT, RC, RD, RU,
-    XT, KY. Deliberately NOT implemented (unlike the reference) because
+    XT, KY, PC. PC (output power) is the TX Power setting as a
+    percentage of the radio's maximum (Settings -> TX), as TCI's drive:
+    "PC;" answers "PC050;" for 50 W of 100 W, "PC005;" sets 5 %. On a
+    100 W radio that's watts, as a TS-2000's own PC. Real request
+    (2026-11-23): an SPE Expert amplifier sends PC when Operate is
+    pressed or its drive steps change, and got "?;". See CatPower.
+    Deliberately NOT implemented (unlike the reference) because
     this app has no clean value/range to back them with yet, matching
     rigctl.rs's own "respond unsupported rather than a made-up value"
     philosophy:
-      - PC (drive/power level): max_tx_power_watts isn't currently
-        shared via an Arc the way frequency/mox are, and the reference's
-        0-100 scale doesn't map cleanly onto watts without it.
       - MG (mic gain): this app's mic_gain is a linear 0.0-8.0
         multiplier, not the reference's -12..+50 dB range -- no honest
         conversion between the two.
@@ -134,6 +137,61 @@ pub struct CatShared {
     pub xit_enabled: Arc<AtomicBool>,
     pub cw_remote_pending: Arc<Mutex<VecDeque<String>>>,
     pub cw_remote_busy: Arc<AtomicBool>,
+    pub power: CatPower,
+}
+
+/// The TX Power setting, for PC (see this module's doc comment). The
+/// setting itself is read here; a change is only asked for, and main.rs
+/// applies it each frame as the TX Power slider would (or not at all,
+/// with transmit off).
+#[derive(Clone)]
+pub struct CatPower {
+    /// RadioSession::tx_power_watts.
+    pub watts: Arc<AtomicU32>,
+    /// The radio's maximum power, W, kept current by main.rs; 0 when it
+    /// can't transmit, and then PC reads 0 and a set is ignored.
+    pub max_watts: Arc<AtomicU32>,
+    /// A setting a client has asked for, W; NO_REQUEST when none.
+    request: Arc<AtomicU32>,
+}
+
+const NO_REQUEST: u32 = u32::MAX;
+
+impl CatPower {
+    pub fn new(watts: Arc<AtomicU32>) -> Self {
+        CatPower {
+            watts,
+            max_watts: Arc::new(AtomicU32::new(0)),
+            request: Arc::new(AtomicU32::new(NO_REQUEST)),
+        }
+    }
+
+    /// A TX Power setting a client has asked for since the last call, W.
+    pub fn take_request(&self) -> Option<u32> {
+        match self.request.swap(NO_REQUEST, Ordering::Relaxed) {
+            NO_REQUEST => None,
+            watts => Some(watts),
+        }
+    }
+
+    /// PC's reply (read) or None (a set, asked for, or a bad one).
+    fn command(&self, suffix: &str) -> Option<String> {
+        let max = self.max_watts.load(Ordering::Relaxed);
+        if suffix.is_empty() {
+            let percent = if max == 0 {
+                0
+            } else {
+                ((self.watts.load(Ordering::Relaxed).min(max) * 100 + max / 2) / max).min(100)
+            };
+            Some(format!("PC{percent:03};"))
+        } else {
+            if let (Ok(percent), true) = (suffix.parse::<u32>(), max > 0) {
+                let watts = (percent.min(100) * max + 50) / 100;
+                self.request.store(watts, Ordering::Relaxed);
+            }
+            None
+        }
+    }
 }
 
 /// Same swappable-reference reasoning as rigctl.rs's DemodParamsCell --
@@ -340,7 +398,10 @@ fn handle_client<R: Read, W: Write>(
                     logging.log(&format!("{prefix}<< {cmd};"));
                     let current_params = demod_params.lock().unwrap().clone();
                     let current_display = display.lock().unwrap().clone();
-                    if let Some(response) = handle_command(
+                    let response = if cmd.len() >= 2 && cmd[..2].eq_ignore_ascii_case("PC") {
+                        shared.power.command(cmd[2..].trim())
+                    } else {
+                        handle_command(
                         cmd,
                         &shared.requested_frequency_hz,
                         reported_frequency_hz,
@@ -355,7 +416,9 @@ fn handle_client<R: Read, W: Write>(
                         &mut auto_reporting,
                         &shared.cw_remote_pending,
                         &shared.cw_remote_busy,
-                    ) {
+                        )
+                    };
+                    if let Some(response) = response {
                         logging.log(&format!("{prefix}>> {response}"));
                         if writer.write_all(response.as_bytes()).and_then(|_| writer.flush()).is_err() {
                             return;
@@ -1447,7 +1510,40 @@ mod tests {
             xit_enabled: xit,
             cw_remote_pending: cw_pending,
             cw_remote_busy: cw_busy,
+            power: CatPower::new(Arc::new(AtomicU32::new(0))),
         }
+    }
+
+    #[test]
+    fn pc_reads_and_asks_for_percent_of_max_power() {
+        let power = CatPower::new(Arc::new(AtomicU32::new(50)));
+        // Can't transmit: reads 0, a set is ignored.
+        assert_eq!(power.command(""), Some("PC000;".to_string()));
+        assert_eq!(power.command("005"), None);
+        assert_eq!(power.take_request(), None);
+
+        // 100 W radio: percent is watts.
+        power.max_watts.store(100, Ordering::Relaxed);
+        assert_eq!(power.command(""), Some("PC050;".to_string()));
+        assert_eq!(power.command("005"), None);
+        assert_eq!(power.take_request(), Some(5));
+        assert_eq!(power.take_request(), None);
+        assert_eq!(power.command("150"), None);
+        assert_eq!(power.take_request(), Some(100));
+        assert_eq!(power.command("x"), None);
+        assert_eq!(power.take_request(), None);
+
+        // 200 W radio: a percentage of it.
+        power.max_watts.store(200, Ordering::Relaxed);
+        assert_eq!(power.command(""), Some("PC025;".to_string()));
+        assert_eq!(power.command("009"), None);
+        assert_eq!(power.take_request(), Some(18));
+        // HL2, 5 W: 50 % rounds to 3 W (2.5), and 3 W reads back as 60 %.
+        power.max_watts.store(5, Ordering::Relaxed);
+        assert_eq!(power.command("050"), None);
+        assert_eq!(power.take_request(), Some(3));
+        power.watts.store(3, Ordering::Relaxed);
+        assert_eq!(power.command(""), Some("PC060;".to_string()));
     }
 
     #[test]
@@ -1473,6 +1569,30 @@ mod tests {
         // The partial "IF" (no ';') isn't answered; the end of input
         // closes the client.
         assert!(out.starts_with("ID019;FA00014074000;MD"), "{out}");
+    }
+
+    #[test]
+    fn serial_client_reads_and_sets_pc() {
+        // As an SPE Expert does on Operate: PC set, then read.
+        let (f, p, d, ..) = fixture();
+        let shared = test_shared(&f, 14_074_000);
+        shared.power.max_watts.store(100, Ordering::Relaxed);
+        shared.power.watts.store(50, Ordering::Relaxed);
+        let mut out = Vec::new();
+        handle_client(
+            &b"PC;pc009;"[..],
+            &mut out,
+            "test",
+            0,
+            false,
+            &shared,
+            &Arc::new(Mutex::new(p)),
+            &Arc::new(Mutex::new(d)),
+            &AtomicBool::new(false),
+            &DebugLog::new("unused.txt".into()),
+        );
+        assert_eq!(String::from_utf8(out).unwrap(), "PC050;");
+        assert_eq!(shared.power.take_request(), Some(9));
     }
 
     #[test]

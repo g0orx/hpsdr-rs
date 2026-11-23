@@ -3190,6 +3190,8 @@ struct ConnectedState {
     cw_remote_pending: Arc<Mutex<VecDeque<String>>>,
     cw_remote_stop: Arc<std::sync::atomic::AtomicBool>,
     cw_remote_busy: Arc<std::sync::atomic::AtomicBool>,
+    /// CAT's PC (cat::CatPower), shared like cw_remote_pending.
+    cat_power: cat::CatPower,
     waterfall_texture: Option<egui::TextureHandle>,
     /// See ExtraReceiver::waterfall_signature's identical doc comment.
     waterfall_signature: Option<(u64, Palette, f32, f32, usize)>,
@@ -4751,6 +4753,7 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
             // every frame with the HL2 IO board's copy. Starts at the RX
             // frequency (no Split yet).
             let tx_rf_frequency_hz = Arc::new(std::sync::atomic::AtomicU64::new(session.rx_frequency_hz.load(Ordering::Relaxed)));
+            let cat_power = cat::CatPower::new(Arc::clone(&session.tx_power_watts));
             let shared_for_cat = cat::CatShared {
                 requested_frequency_hz: Arc::clone(&session.requested_frequency_hz),
                 rx_frequency_hz: Arc::clone(&session.rx_frequency_hz),
@@ -4763,6 +4766,7 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                 xit_enabled: Arc::clone(&session.xit_enabled),
                 cw_remote_pending: Arc::clone(&cw_remote_pending),
                 cw_remote_busy: Arc::clone(&cw_remote_busy),
+                power: cat_power.clone(),
             };
             let mut cat_server: Option<CatServer> = None;
             let mut cat_error: Option<String> = None;
@@ -5132,6 +5136,7 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                 cw_remote_pending,
                 cw_remote_stop,
                 cw_remote_busy,
+                cat_power,
                 waterfall_texture: None,
                 waterfall_signature: None,
                 waterfall_display_rows: spectrum::WATERFALL_HISTORY,
@@ -5932,6 +5937,22 @@ impl eframe::App for HpsdrApp {
                             .session
                             .tx_power_watts
                             .store(watts.min(connected.max_tx_power_watts), Ordering::Relaxed);
+                        if connected.tune_active || connected.two_tone_active {
+                            connected.pre_tune_power_watts = None;
+                        }
+                        connected.settings_dirty.store(true, Ordering::Relaxed);
+                    }
+                }
+
+                // CAT's PC (TCP and serial ports alike): the maximum it's a
+                // percentage of, and a setting a client has asked for,
+                // applied as TCI's drive is above.
+                {
+                    let can_transmit = connected.tx_enabled && connected.tx_handle.is_some();
+                    let max = if can_transmit { connected.max_tx_power_watts } else { 0 };
+                    connected.cat_power.max_watts.store(max, Ordering::Relaxed);
+                    if let Some(watts) = connected.cat_power.take_request().filter(|_| can_transmit) {
+                        connected.session.tx_power_watts.store(watts.min(max), Ordering::Relaxed);
                         if connected.tune_active || connected.two_tone_active {
                             connected.pre_tune_power_watts = None;
                         }
@@ -15846,6 +15867,7 @@ fn cat_shared(connected: &ConnectedState) -> cat::CatShared {
         xit_enabled: Arc::clone(&connected.session.xit_enabled),
         cw_remote_pending: Arc::clone(&connected.cw_remote_pending),
         cw_remote_busy: Arc::clone(&connected.cw_remote_busy),
+        power: connected.cat_power.clone(),
     }
 }
 
