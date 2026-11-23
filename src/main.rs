@@ -1805,6 +1805,165 @@ fn set_tx_monitor(connected: &mut ConnectedState, on: bool) {
     }
 }
 
+/// The TX settings kept on ConnectedState (see its tx_eq doc comment), on
+/// a TxHandle -- one just made (arming TX, a P1 rate change) or after a
+/// TX profile is chosen.
+fn push_tx_settings(tx: &TxHandle, connected: &ConnectedState) {
+    tx.set_mic_gain(connected.mic_gain);
+    tx.set_eq(connected.tx_eq);
+    tx.set_compressor_enabled(connected.tx_compressor_enabled);
+    tx.set_compressor_gain_db(connected.tx_compressor_gain_db);
+    tx.set_cessb_enabled(connected.tx_cessb_enabled);
+    tx.set_filter(connected.tx_filter.edges());
+}
+
+/// The TX settings as they are now, as a profile named `name`.
+fn capture_tx_profile(connected: &ConnectedState, name: &str) -> config::TxProfile {
+    config::TxProfile {
+        name: name.to_string(),
+        mic_gain: connected.mic_gain,
+        eq: connected.tx_eq,
+        compressor_enabled: connected.tx_compressor_enabled,
+        compressor_gain_db: connected.tx_compressor_gain_db,
+        cessb_enabled: connected.tx_cessb_enabled,
+        filter: connected.tx_filter,
+    }
+}
+
+/// Chooses a TX profile: its settings become the TX settings (on the
+/// transmitter now, if TX is armed).
+fn apply_tx_profile(connected: &mut ConnectedState, profile: &config::TxProfile) {
+    connected.mic_gain = profile.mic_gain;
+    connected.tx_eq = profile.eq;
+    connected.tx_compressor_enabled = profile.compressor_enabled;
+    connected.tx_compressor_gain_db = profile.compressor_gain_db;
+    connected.tx_cessb_enabled = profile.cessb_enabled;
+    connected.tx_filter = profile.filter;
+    connected.tx_profile = Some(profile.name.clone());
+    if let Some(tx) = &connected.tx_handle {
+        push_tx_settings(tx, connected);
+    }
+}
+
+/// Saves the TX settings as profile `name`, replacing one of that name
+/// (in its place in the list), and makes it the current one.
+fn save_tx_profile(connected: &mut ConnectedState, name: &str) {
+    let profile = capture_tx_profile(connected, name);
+    match connected.tx_profiles.iter_mut().find(|p| p.name == name) {
+        Some(existing) => *existing = profile,
+        None => connected.tx_profiles.push(profile),
+    }
+    connected.tx_profile = Some(name.to_string());
+}
+
+/// Settings -> TX -> TX Profile: choose one (applying it), save the TX
+/// settings under a name (new, or replacing one), delete the current
+/// one. "(changed)" once the settings no longer match the current
+/// profile. True if anything changed.
+fn tx_profile_settings(ui: &mut egui::Ui, connected: &mut ConnectedState) -> bool {
+    let mut changed = false;
+    let current = connected.tx_profile.clone().filter(|n| connected.tx_profiles.iter().any(|p| &p.name == n));
+    let modified = current.as_ref().is_some_and(|name| {
+        connected.tx_profiles.iter().find(|p| &p.name == name) != Some(&capture_tx_profile(connected, name))
+    });
+    let mut chosen = None;
+    ui.horizontal(|ui| {
+        ui.label("TX Profile:");
+        let shown = match &current {
+            Some(name) if modified => format!("{name} (changed)"),
+            Some(name) => name.clone(),
+            None => "None".to_string(),
+        };
+        egui::ComboBox::from_id_salt("tx_profile").selected_text(shown).show_ui(ui, |ui| {
+            if connected.tx_profiles.is_empty() {
+                ui.weak("No profiles saved yet");
+            }
+            for (i, p) in connected.tx_profiles.iter().enumerate() {
+                if ui.selectable_label(current.as_deref() == Some(p.name.as_str()), &p.name).clicked() {
+                    chosen = Some(i);
+                }
+            }
+        })
+        .response
+        .on_hover_text(
+            "Saved TX settings: mic gain, TX EQ, Speech Processor and compression, CESSB and the TX \
+             filter. Choosing one applies it.",
+        );
+        if let Some(name) = &current {
+            if ui.add_enabled(modified, egui::Button::new("Save")).on_hover_text("Save the changes to this profile").clicked() {
+                save_tx_profile(connected, &name.clone());
+                changed = true;
+            }
+            if ui.button("Delete").on_hover_text("Delete this profile (the settings stay as they are)").clicked() {
+                connected.tx_profiles.retain(|p| &p.name != name);
+                connected.tx_profile = None;
+                changed = true;
+            }
+        }
+    });
+    ui.horizontal(|ui| {
+        let field = ui.add(
+            egui::TextEdit::singleline(&mut connected.tx_profile_name).hint_text("New profile name").desired_width(160.0),
+        );
+        // Not , ; or : -- TCI lists the names (tx_profiles_ex) with those.
+        connected.tx_profile_name.retain(|c| !matches!(c, ',' | ';' | ':'));
+        let name = connected.tx_profile_name.trim().to_string();
+        let exists = connected.tx_profiles.iter().any(|p| p.name == name);
+        let enter = field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+        let clicked = ui
+            .add_enabled(!name.is_empty(), egui::Button::new(if exists { "Replace" } else { "Save As" }))
+            .on_hover_text("Save the TX settings as they are now under this name")
+            .clicked();
+        if !name.is_empty() && (clicked || enter) {
+            save_tx_profile(connected, &name);
+            connected.tx_profile_name.clear();
+            changed = true;
+        }
+    });
+    if let Some(i) = chosen {
+        let profile = connected.tx_profiles[i].clone();
+        apply_tx_profile(connected, &profile);
+        changed = true;
+    }
+    changed
+}
+
+/// Settings -> TX -> TX Filter: follow the RX filter (default), or the
+/// TX filter's own low and high edges -- see spectrum::tx_passband_for.
+/// True if it changed.
+fn tx_filter_settings(ui: &mut egui::Ui, connected: &mut ConnectedState) -> bool {
+    let mut filter = connected.tx_filter;
+    ui.horizontal(|ui| {
+        ui.label("TX Filter:");
+        ui.checkbox(&mut filter.use_rx, "Use RX filter").on_hover_text(
+            "Transmit through the receive filter, as set in the main window (the default). Off, the \
+             TX filter has its own edges.",
+        );
+    });
+    ui.add_enabled_ui(!filter.use_rx, |ui| {
+        ui.horizontal(|ui| {
+            ui.label("Low:");
+            ui.add(egui::DragValue::new(&mut filter.low_hz).range(0.0..=1000.0).speed(10.0).suffix(" Hz"));
+            ui.label("High:");
+            ui.add(egui::DragValue::new(&mut filter.high_hz).range(500.0..=8000.0).speed(10.0).suffix(" Hz"));
+        });
+        ui.weak(
+            "Audio edges for USB and DIGU, mirrored for LSB and DIGL; AM, DSB and FM use +/- High. CW \
+             always uses the RX filter.",
+        );
+    });
+    filter.low_hz = filter.low_hz.round();
+    filter.high_hz = filter.high_hz.round().max(filter.low_hz + 100.0);
+    if filter == connected.tx_filter {
+        return false;
+    }
+    connected.tx_filter = filter;
+    if let Some(tx) = &connected.tx_handle {
+        tx.set_filter(filter.edges());
+    }
+    true
+}
+
 /// Monitor TX Audio's level, linear 0.0-1.0 (Settings -> TX's slider and
 /// TCI's mon_volume): kept here, and passed on to the transmitter.
 fn set_tx_monitor_volume(connected: &mut ConnectedState, volume: f32) {
@@ -3612,6 +3771,22 @@ struct ConnectedState {
     /// disable/re-enable of TX within the same session, and so it's
     /// available to persist even while TX is currently disarmed.
     mic_gain: f32,
+    /// The TX EQ, Speech Processor (on, compression dB), CESSB and TX
+    /// Filter, as mic_gain: kept here, not only on TxHandle, so they
+    /// survive TX being disarmed and re-armed (REAL GAP found adding TX
+    /// profiles: re-arming used to reset them to their defaults, and
+    /// saving while disarmed lost them), and a TX profile can be chosen
+    /// while TX is off. Written through to TxHandle (push_tx_settings).
+    tx_eq: spectrum::EqualizerParams,
+    tx_compressor_enabled: bool,
+    tx_compressor_gain_db: f32,
+    tx_cessb_enabled: bool,
+    tx_filter: config::TxFilter,
+    /// Settings -> TX -> TX Profile: the saved profiles, the one last
+    /// chosen or saved, and the name being typed for Save.
+    tx_profiles: Vec<config::TxProfile>,
+    tx_profile: Option<String>,
+    tx_profile_name: String,
     /// Settings -> TX's Monitor TX Audio level, as mic_gain: tracked here
     /// so it survives TX being re-armed, written through to TxHandle.
     tx_monitor_volume: f32,
@@ -4964,6 +5139,12 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
             // ALC headroom); 1.0 (0dB/unity) confirmed working.
             let mic_gain = cfg.mic_gain.unwrap_or(1.0);
             let tx_monitor_volume = cfg.tx_monitor_volume.unwrap_or(1.0).clamp(0.0, 1.0);
+            let tx_defaults = tx::TxParams::default();
+            let tx_eq = cfg.tx_eq.unwrap_or(tx_defaults.eq);
+            let tx_compressor_enabled = cfg.tx_compressor_enabled.unwrap_or(tx_defaults.compressor_enabled);
+            let tx_compressor_gain_db = cfg.tx_compressor_gain_db.unwrap_or(tx_defaults.compressor_gain_db);
+            let tx_cessb_enabled = cfg.tx_cessb_enabled.unwrap_or(tx_defaults.cessb_enabled);
+            let tx_filter = cfg.tx_filter.unwrap_or_default();
             let tci_tx_gain = cfg.tci_tx_gain.unwrap_or(1.0);
             *session.tci_tx_gain.lock().unwrap() = tci_tx_gain;
             // See tx::PsParams::default for these same
@@ -5069,18 +5250,11 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                     tx_handle.set_ps_mox_delay(ps_mox_delay);
                     tx_handle.set_ps_loop_delay(ps_loop_delay);
                     tx_handle.set_ps_tx_delay_ns(ps_tx_delay_ns);
-                    if let Some(v) = cfg.tx_eq {
-                        tx_handle.set_eq(v);
-                    }
-                    if let Some(v) = cfg.tx_compressor_enabled {
-                        tx_handle.set_compressor_enabled(v);
-                    }
-                    if let Some(v) = cfg.tx_compressor_gain_db {
-                        tx_handle.set_compressor_gain_db(v);
-                    }
-                    if let Some(v) = cfg.tx_cessb_enabled {
-                        tx_handle.set_cessb_enabled(v);
-                    }
+                    tx_handle.set_eq(tx_eq);
+                    tx_handle.set_compressor_enabled(tx_compressor_enabled);
+                    tx_handle.set_compressor_gain_db(tx_compressor_gain_db);
+                    tx_handle.set_cessb_enabled(tx_cessb_enabled);
+                    tx_handle.set_filter(tx_filter.edges());
                     // Apply a previously-saved correction table
                     // immediately, if PS is enabled and one exists for
                     // this radio -- see TxHandle::restore_ps_corr's doc
@@ -5308,6 +5482,14 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                 tx_handle,
                 ptt_held: false,
                 mic_gain,
+                tx_eq,
+                tx_compressor_enabled,
+                tx_compressor_gain_db,
+                tx_cessb_enabled,
+                tx_filter,
+                tx_profiles: cfg.tx_profiles.clone(),
+                tx_profile: cfg.tx_profile.clone(),
+                tx_profile_name: String::new(),
                 tx_monitor_volume,
                 tci_tx_gain,
                 ps_enabled,
@@ -5867,6 +6049,14 @@ impl eframe::App for HpsdrApp {
                         monitor: connected.tx_audio_monitor_output.is_some(),
                         monitor_volume: connected.tx_monitor_volume,
                         rx_att: rx_att_info(connected),
+                        tx_filter: {
+                            let (low, high) = spectrum::tx_passband_for(
+                                connected.spectrum.mode(),
+                                connected.spectrum.width_hz(),
+                                connected.tx_filter.edges(),
+                            );
+                            (low.round() as i32, high.round() as i32)
+                        },
                         mic_db: match &connected.tx_handle {
                             Some(tx) if connected.session.mox_active() => tx.display.lock().unwrap().mic_pk as f32,
                             _ => -200.0,
@@ -5936,8 +6126,17 @@ impl eframe::App for HpsdrApp {
                             None => s.set_rx2(None),
                         }
                     }
+                    let tx_profiles = remote::TxProfiles {
+                        names: connected.tx_profiles.iter().map(|p| p.name.clone()).collect(),
+                        current: connected
+                            .tx_profile
+                            .clone()
+                            .filter(|n| connected.tx_profiles.iter().any(|p| &p.name == n))
+                            .unwrap_or_default(),
+                    };
                     let power_request = connected.tci_server.as_ref().and_then(|s| {
                         s.set_tx_info(info);
+                        s.set_tx_profiles(tx_profiles);
                         s.take_power_request()
                     });
                     // CW text from TCI clients (cw_macros): into the same
@@ -6010,6 +6209,22 @@ impl eframe::App for HpsdrApp {
                     }
                     if let Some(volume) = control.monitor_volume {
                         set_tx_monitor_volume(connected, volume);
+                        connected.settings_dirty.store(true, Ordering::Relaxed);
+                    }
+                    // tx_profile_ex and tx_filter_band_ex, as Settings ->
+                    // TX -> TX Profile and TX Filter. A profile that isn't
+                    // there is ignored, as Thetis does.
+                    if let Some(name) = &control.tx_profile {
+                        if let Some(profile) = connected.tx_profiles.iter().find(|p| &p.name == name).cloned() {
+                            apply_tx_profile(connected, &profile);
+                            connected.settings_dirty.store(true, Ordering::Relaxed);
+                        }
+                    }
+                    if let Some((low, high)) = control.tx_filter {
+                        connected.tx_filter.set_passband(low, high);
+                        if let Some(tx) = &connected.tx_handle {
+                            tx.set_filter(connected.tx_filter.edges());
+                        }
                         connected.settings_dirty.store(true, Ordering::Relaxed);
                     }
                     if let Some(on) = control.tune {
@@ -6272,7 +6487,9 @@ impl eframe::App for HpsdrApp {
                 // feeds the inset, zoomed to the TX filter plus a margin
                 // (tx_inset_shown_hz, for draw_tx_spectrum_inset).
                 let tx_spectrum_rate = if connected.device.protocol == 2 { 192_000.0 } else { 48_000.0 };
-                let tx_inset_filter_hz = tx_inset_filter(current_mode, passband);
+                // The TX filter's own passband (Settings -> TX -> TX Filter).
+                let tx_passband = spectrum::tx_passband_for(current_mode, current_width, connected.tx_filter.edges());
+                let tx_inset_filter_hz = tx_inset_filter(current_mode, tx_passband);
                 let tx_inset_shown_hz = if connected.duplex {
                     let (zoom, pan, shown) = tx_inset_zoom_pan(tx_inset_window(tx_inset_filter_hz), tx_spectrum_rate);
                     connected.tx_spectrum.set_zoom_pan(zoom, pan);
@@ -8857,7 +9074,7 @@ impl eframe::App for HpsdrApp {
                     // pitch, so the filter is shifted back as in the Duplex
                     // inset (tx_inset_filter).
                     let (pb_low, pb_high) =
-                        if transmitting { tx_inset_filter(current_mode, passband) } else { passband };
+                        if transmitting { tx_inset_filter(current_mode, tx_passband) } else { passband };
                     let x_low = x_for_offset(pb_low + ctun_offset_hz);
                     let x_high = x_for_offset(pb_high + ctun_offset_hz);
                     ui.painter().rect_filled(
@@ -12236,6 +12453,10 @@ impl eframe::App for HpsdrApp {
                                          parts are confirmed vs. best-effort guesses.",
                                     );
                                     ui.add_space(8.0);
+                                    if tx_profile_settings(ui, connected) {
+                                        settings_changed = true;
+                                    }
+                                    ui.add_space(8.0);
 
                                     // A Pluto's drive is in dB (main window's
                                     // TX Drive), with no watts to cap.
@@ -12412,7 +12633,7 @@ impl eframe::App for HpsdrApp {
                                         // interacted with (or take effect) while a digital
                                         // mode is active.
                                         let digital_mode = connected.spectrum.mode().is_digital();
-                                        let mut compressor_enabled = tx.compressor_enabled();
+                                        let mut compressor_enabled = connected.tx_compressor_enabled;
                                         let compressor_resp = ui.add_enabled(
                                             !digital_mode,
                                             egui::Checkbox::new(&mut compressor_enabled, "Speech Processor"),
@@ -12432,13 +12653,14 @@ impl eframe::App for HpsdrApp {
                                             )
                                             .changed()
                                         {
+                                            connected.tx_compressor_enabled = compressor_enabled;
                                             tx.set_compressor_enabled(compressor_enabled);
                                             settings_changed = true;
                                         }
                                         ui.add_enabled_ui(!digital_mode, |ui| {
                                             ui.horizontal(|ui| {
                                                 ui.label("Compression:");
-                                                let mut gain_db = tx.compressor_gain_db();
+                                                let mut gain_db = connected.tx_compressor_gain_db;
                                                 if scroll_slider_f32(
                                                     ui,
                                                     &mut connected.slider_scroll_accum,
@@ -12446,13 +12668,14 @@ impl eframe::App for HpsdrApp {
                                                     0.0..=20.0,
                                                     1.0,
                                                 ) {
+                                                    connected.tx_compressor_gain_db = gain_db.clamp(0.0, 20.0);
                                                     tx.set_compressor_gain_db(gain_db);
                                                     settings_changed = true;
                                                 }
                                                 ui.label("dB");
                                             });
                                         });
-                                        let mut cessb_enabled = tx.cessb_enabled();
+                                        let mut cessb_enabled = connected.tx_cessb_enabled;
                                         if ui
                                             .add_enabled(
                                                 compressor_enabled && !digital_mode,
@@ -12469,9 +12692,14 @@ impl eframe::App for HpsdrApp {
                                             })
                                             .changed()
                                         {
+                                            connected.tx_cessb_enabled = cessb_enabled;
                                             tx.set_cessb_enabled(cessb_enabled);
                                             settings_changed = true;
                                         }
+                                    }
+                                    ui.add_space(8.0);
+                                    if tx_filter_settings(ui, connected) {
+                                        settings_changed = true;
                                     }
                                     ui.add_space(8.0);
 
@@ -12602,6 +12830,7 @@ impl eframe::App for HpsdrApp {
                                                     );
                                                     tx_handle.set_mic_gain(connected.mic_gain);
                                                     tx_handle.set_monitor_volume(connected.tx_monitor_volume);
+                                                    push_tx_settings(&tx_handle, connected);
                                                     tx_handle.set_mode(connected.spectrum.mode());
                                                     tx_handle.set_width_hz(connected.spectrum.width_hz());
                                                     tx_handle.set_ps_enabled(connected.ps_enabled);
@@ -14011,15 +14240,17 @@ impl eframe::App for HpsdrApp {
                                         ui.separator();
                                     }
                                     if connected.eq_tab_is_tx && connected.tx_handle.is_some() {
-                                        let tx = connected.tx_handle.as_ref().unwrap();
-                                        let mut eq = tx.eq();
+                                        let mut eq = connected.tx_eq;
                                         if render_equalizer_panel(
                                             ui,
                                             &mut connected.slider_scroll_accum,
                                             "TX",
                                             &mut eq,
                                         ) {
-                                            tx.set_eq(eq);
+                                            connected.tx_eq = eq;
+                                            if let Some(tx) = &connected.tx_handle {
+                                                tx.set_eq(eq);
+                                            }
                                             settings_changed = true;
                                         }
                                     } else {
@@ -14189,10 +14420,13 @@ impl eframe::App for HpsdrApp {
                         rx_eq: Some(agc_params_now.eq),
                         mic_gain: Some(connected.mic_gain),
                         tx_monitor_volume: Some(connected.tx_monitor_volume),
-                        tx_eq: connected.tx_handle.as_ref().map(|t| t.eq()),
-                        tx_compressor_enabled: connected.tx_handle.as_ref().map(|t| t.compressor_enabled()),
-                        tx_compressor_gain_db: connected.tx_handle.as_ref().map(|t| t.compressor_gain_db()),
-                        tx_cessb_enabled: connected.tx_handle.as_ref().map(|t| t.cessb_enabled()),
+                        tx_eq: Some(connected.tx_eq),
+                        tx_compressor_enabled: Some(connected.tx_compressor_enabled),
+                        tx_compressor_gain_db: Some(connected.tx_compressor_gain_db),
+                        tx_cessb_enabled: Some(connected.tx_cessb_enabled),
+                        tx_filter: Some(connected.tx_filter),
+                        tx_profiles: connected.tx_profiles.clone(),
+                        tx_profile: connected.tx_profile.clone(),
                         tci_tx_gain: Some(connected.tci_tx_gain),
                         tx_power_watts: Some(connected.session.tx_power_watts.load(Ordering::Relaxed)),
                         cw_keyer_mode: Some(connected.session.cw_keyer.mode.load(Ordering::Relaxed)),
@@ -19001,6 +19235,7 @@ fn change_sample_rate(connected: &mut ConnectedState, new_rate: u32) {
                 );
                 tx_handle.set_mic_gain(mic_gain);
                 tx_handle.set_monitor_volume(connected.tx_monitor_volume);
+                push_tx_settings(&tx_handle, connected);
                 tx_handle.set_mode(connected.spectrum.mode());
                 tx_handle.set_width_hz(connected.spectrum.width_hz());
                 tx_handle.set_ps_enabled(connected.ps_enabled);

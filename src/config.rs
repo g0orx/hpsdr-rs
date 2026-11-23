@@ -210,6 +210,15 @@ pub struct Config {
     /// tx::TxParams::cessb_enabled's doc comment.
     #[serde(default)]
     pub tx_cessb_enabled: Option<bool>,
+    /// Settings -> TX -> TX Filter -- see TxFilter.
+    #[serde(default)]
+    pub tx_filter: Option<TxFilter>,
+    /// Settings -> TX -> TX Profile: the saved profiles, and the one last
+    /// chosen or saved.
+    #[serde(default)]
+    pub tx_profiles: Vec<TxProfile>,
+    #[serde(default)]
+    pub tx_profile: Option<String>,
     /// Gain applied specifically to TX audio received from a TCI
     /// client (WSJT-X, TCI Remote, etc.), independent of mic_gain
     /// above -- see radio::RadioSession::tci_tx_gain's doc comment for
@@ -711,6 +720,64 @@ pub struct SavedSetup {
     pub lnb_lock: Option<bool>,
 }
 
+/// Settings -> TX -> TX Filter: follow the RX filter (the default, as
+/// before this existed), or the TX filter's own audio edges, Hz -- see
+/// spectrum::tx_passband_for for how they're placed for each mode.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq)]
+pub struct TxFilter {
+    pub use_rx: bool,
+    pub low_hz: f64,
+    pub high_hz: f64,
+}
+
+impl Default for TxFilter {
+    /// The RX filter's own default for USB (150-2700 Hz), so turning
+    /// "Use RX filter" off starts where it was.
+    fn default() -> Self {
+        TxFilter { use_rx: true, low_hz: 150.0, high_hz: 2700.0 }
+    }
+}
+
+impl TxFilter {
+    /// The edges for tx::TxParams::filter, or None to follow RX.
+    pub fn edges(&self) -> Option<(f64, f64)> {
+        (!self.use_rx).then_some((self.low_hz, self.high_hz))
+    }
+
+    /// Sets the edges from a passband as TCI's tx_filter_band_ex gives it
+    /// -- Hz from the carrier, signed as rx_filter_band's: below the
+    /// carrier (LSB) is mirrored; one straddling it (AM, FM) sets High
+    /// only, from its wider side. Use RX filter goes off. Kept to the
+    /// Settings -> TX ranges (Low 0-1000, High 500-8000, 100 Hz apart).
+    pub fn set_passband(&mut self, low: f64, high: f64) {
+        let (low, high) = if high <= 0.0 {
+            (-high, -low)
+        } else if low < 0.0 {
+            (self.low_hz, high.max(-low))
+        } else {
+            (low, high)
+        };
+        self.use_rx = false;
+        self.low_hz = low.round().clamp(0.0, 1000.0);
+        self.high_hz = high.round().clamp(500.0, 8000.0).max(self.low_hz + 100.0);
+    }
+}
+
+/// A named set of TX audio settings (Settings -> TX -> TX Profile), as
+/// Thetis's TX profiles: mic gain, the TX EQ, the Speech Processor and
+/// its compression, CESSB, and the TX filter. Not power, drive or FM
+/// settings -- those go with the band and the mode, not the voice.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct TxProfile {
+    pub name: String,
+    pub mic_gain: f32,
+    pub eq: EqualizerParams,
+    pub compressor_enabled: bool,
+    pub compressor_gain_db: f32,
+    pub cessb_enabled: bool,
+    pub filter: TxFilter,
+}
+
 #[derive(Serialize, Deserialize, Clone)]
 pub struct ExtraReceiverConfig {
     pub frequency_hz: u32,
@@ -1047,6 +1114,52 @@ mod tests {
         let json = serde_json::to_string(&g).unwrap();
         let g: WindowGeometry = serde_json::from_str(&json).unwrap();
         assert_eq!((g.x, g.height), (None, 400.0));
+    }
+
+    /// TX profiles and the TX filter survive a save and load; a config
+    /// written before they existed loads with none, and the TX filter
+    /// following RX.
+    #[test]
+    fn tx_profiles_round_trip_and_old_configs_load() {
+        let profile = TxProfile {
+            name: "DX".to_string(),
+            mic_gain: 1.5,
+            eq: EqualizerParams::default(),
+            compressor_enabled: true,
+            compressor_gain_db: 8.0,
+            cessb_enabled: true,
+            filter: TxFilter { use_rx: false, low_hz: 200.0, high_hz: 2600.0 },
+        };
+        let cfg = Config {
+            tx_profiles: vec![profile.clone()],
+            tx_profile: Some("DX".to_string()),
+            tx_filter: Some(profile.filter),
+            ..Default::default()
+        };
+        let back: Config = serde_json::from_str(&serde_json::to_string(&cfg).unwrap()).unwrap();
+        assert_eq!(back.tx_profiles, vec![profile]);
+        assert_eq!(back.tx_profile.as_deref(), Some("DX"));
+        assert_eq!(back.tx_filter.unwrap().edges(), Some((200.0, 2600.0)));
+
+        let old: Config = serde_json::from_str("{}").unwrap();
+        assert!(old.tx_profiles.is_empty() && old.tx_profile.is_none());
+        assert_eq!(old.tx_filter.unwrap_or_default().edges(), None, "follows RX");
+    }
+
+    /// TCI's tx_filter_band_ex passbands, signed as rx_filter_band's,
+    /// become the TX filter's own edges, whichever side of the carrier.
+    #[test]
+    fn tx_filter_from_a_tci_passband() {
+        let set = |low, high| {
+            let mut f = TxFilter::default();
+            f.set_passband(low, high);
+            f.edges()
+        };
+        assert_eq!(set(100.0, 2900.0), Some((100.0, 2900.0)), "USB");
+        assert_eq!(set(-2800.0, -200.0), Some((200.0, 2800.0)), "LSB, mirrored");
+        assert_eq!(set(-4000.0, 3500.0), Some((150.0, 4000.0)), "AM: High only, Low kept");
+        assert_eq!(set(0.0, 20_000.0), Some((0.0, 8000.0)), "kept to the range");
+        assert_eq!(set(900.0, 950.0), Some((900.0, 1000.0)), "100 Hz apart");
     }
 
     /// A named setup survives a save and load, and a config written before

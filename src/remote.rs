@@ -211,6 +211,7 @@ pub struct RemoteShare {
     cw: Mutex<CwRequests>,
     cw_messages: Mutex<(u64, Vec<String>)>,
     paddle_keys: Mutex<(u64, (char, char))>,
+    tx_profiles: Mutex<TxProfiles>,
 }
 
 /// CW text clients have asked to send (TCI's cw_macros), a stop
@@ -239,6 +240,12 @@ pub struct ControlRequests {
     pub monitor: Option<bool>,
     /// mon_volume, its level, linear 0.0-1.0.
     pub monitor_volume: Option<f32>,
+    /// tx_profile_ex:<name>, as choosing it in Settings -> TX -> TX
+    /// Profile.
+    pub tx_profile: Option<String>,
+    /// tx_filter_band_ex: the TX filter's own edges, Hz, as Settings ->
+    /// TX -> TX Filter's Low and High (Use RX filter off).
+    pub tx_filter: Option<(f64, f64)>,
 }
 
 /// The radio's RX front end as TCI's rx_step_att_ex has it: attenuation,
@@ -288,6 +295,18 @@ pub struct TxInfo {
     /// Receiver 0's front end -- for TCI's rx_step_att_ex; None without a
     /// step attenuator (see RxAtt).
     pub rx_att: Option<RxAtt>,
+    /// The TX filter's passband now, Hz from the carrier, as
+    /// rx_filter_band's -- the RX filter's or its own (see
+    /// spectrum::tx_passband_for) -- for TCI's tx_filter_band_ex.
+    pub tx_filter: (i32, i32),
+}
+
+/// The saved TX profiles' names and the one chosen ("" for none), for
+/// TCI's tx_profiles_ex and tx_profile_ex.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct TxProfiles {
+    pub names: Vec<String>,
+    pub current: String,
 }
 
 /// One connected remote client (one that said hpsdr_hello), counted in
@@ -394,6 +413,22 @@ impl RemoteShare {
 
     pub fn request_monitor_volume(&self, volume: f32) {
         self.control.lock().unwrap().monitor_volume = Some(volume.clamp(0.0, 1.0));
+    }
+
+    pub fn request_tx_profile(&self, name: &str) {
+        self.control.lock().unwrap().tx_profile = Some(name.to_string());
+    }
+
+    pub fn request_tx_filter(&self, low_hz: f64, high_hz: f64) {
+        self.control.lock().unwrap().tx_filter = Some((low_hz, high_hz));
+    }
+
+    pub fn set_tx_profiles(&self, profiles: TxProfiles) {
+        *self.tx_profiles.lock().unwrap() = profiles;
+    }
+
+    pub fn tx_profiles(&self) -> TxProfiles {
+        self.tx_profiles.lock().unwrap().clone()
     }
 
     pub fn request_tune(&self, on: bool) {

@@ -711,6 +711,11 @@ impl TciServer {
         self.remote_share.set_tx(info);
     }
 
+    /// The saved TX profiles, for tx_profiles_ex and tx_profile_ex.
+    pub fn set_tx_profiles(&self, profiles: crate::remote::TxProfiles) {
+        self.remote_share.set_tx_profiles(profiles);
+    }
+
     /// A TX power setting (W) a remote client has asked for, for main.rs
     /// to apply as its own slider would.
     pub fn take_power_request(&self) -> Option<u32> {
@@ -1029,10 +1034,11 @@ fn handle_client(
     // unconfirmed belief about Thetis's own order.
     send_logged(&mut ws, &logging, "start;".into());
     send_logged(&mut ws, &logging, "ready;".into());
-    // This project has no real TX-profile concept (Thetis-style PA/EQ
-    // profile switching) -- "Default" is a static, harmless stand-in.
-    send_logged(&mut ws, &logging, "tx_profile_ex:Default;".into());
-    send_logged(&mut ws, &logging, "tx_profiles_ex:Default;".into());
+    // Settings -> TX -> TX Profile's (see tx_profile_state).
+    for (_, msg) in tx_profile_state(&remote_share) {
+        send_logged(&mut ws, &logging, msg.into());
+    }
+    send_logged(&mut ws, &logging, tx_filter_message(&remote_share.tx()).into());
 
     // TX_ENABLE (spec section 4.3): "informs clients that TX is
     // enabled... sent to the client when connected... in case
@@ -2209,9 +2215,11 @@ fn live_state(
             ("mon_enable", format!("mon_enable:{};", tx.monitor)),
             ("mon_volume", format!("mon_volume:{:.1};", monitor_volume_db(tx))),
             ("cw_keyer_speed", format!("cw_keyer_speed:{};", tx.cw_speed_wpm)),
+            ("tx_filter_band_ex", tx_filter_message(tx)),
         ]
         .map(|(k, m)| (k.to_string(), m)),
     );
+    out.extend(tx_profile_state(share));
     out.extend(rx_att_state(tx));
     out.extend(tx_frequency_state(rx_frequency_hz, vfo_b, xit_enabled, xit_offset_hz, share));
     out
@@ -2301,6 +2309,26 @@ fn receiver_live_state(rx: u32, f: &Rx2State, params: &DemodParams) -> Vec<(Stri
         out.push((format!("if:{rx},1"), format!("if:{rx},1,{};", f.vfo_b_hz as i64 - dds_freq)));
     }
     out
+}
+
+/// Settings -> TX -> TX Profile as Thetis reports its TX profiles
+/// (TCIServer.cs sendTXProfiles/sendTXProfile): tx_profiles_ex with the
+/// names, comma-separated, then tx_profile_ex with the chosen one ("" for
+/// none). With none saved, a single "Default", as before there were any.
+fn tx_profile_state(share: &crate::remote::RemoteShare) -> Vec<(String, String)> {
+    let p = share.tx_profiles();
+    let (names, current) =
+        if p.names.is_empty() { ("Default".to_string(), "Default".to_string()) } else { (p.names.join(","), p.current) };
+    vec![
+        ("tx_profiles_ex".to_string(), format!("tx_profiles_ex:{names};")),
+        ("tx_profile_ex".to_string(), format!("tx_profile_ex:{current};")),
+    ]
+}
+
+/// The TX filter's passband (see TxInfo::tx_filter) as
+/// tx_filter_band_ex:<low>,<high>; -- signed as rx_filter_band's.
+fn tx_filter_message(tx: &crate::remote::TxInfo) -> String {
+    format!("tx_filter_band_ex:{},{};", tx.tx_filter.0, tx.tx_filter.1)
 }
 
 /// Monitor TX Audio's level as TCI's mon_volume, dB, -60 (and below:
@@ -2670,6 +2698,7 @@ fn transmits(cmd: &str) -> bool {
     let mut args = args.split(',').map(str::trim).filter(|a| !a.is_empty());
     match name.as_str() {
         "trx" | "tune" | "drive" | "tune_drive" => args.nth(1).is_some(),
+        "tx_profile_ex" | "tx_filter_band_ex" => args.next().is_some(),
         hpsdr_proto::tx::MOX | hpsdr_proto::cw::KEY | hpsdr_proto::cw::KEYER => true,
         hpsdr_proto::state::SET => args.next() == Some(hpsdr_proto::tx::SET_POWER),
         n => n.starts_with(hpsdr_proto::cw::MACROS),
@@ -2685,6 +2714,32 @@ fn control_command(cmd: &str, share: &crate::remote::RemoteShare, params: &Mutex
     if name == "vfo_swap_ex" {
         share.request_vfo_swap();
         return Some(None);
+    }
+    // TX profiles and the TX filter (Settings -> TX): no receiver. As
+    // Thetis, choosing a profile has no reply -- the live notification
+    // reports it (unknown names do nothing, main.rs).
+    match name.as_str() {
+        "tx_profiles_ex" => return Some(Some(tx_profile_state(share)[0].1.clone())),
+        "tx_profile_ex" => {
+            return Some(match args.first() {
+                Some(profile) => {
+                    share.request_tx_profile(profile);
+                    None
+                }
+                None => Some(tx_profile_state(share)[1].1.clone()),
+            });
+        }
+        "tx_filter_band_ex" => {
+            let edges = (args.first().and_then(|v| v.parse::<f64>().ok()), args.get(1).and_then(|v| v.parse::<f64>().ok()));
+            return Some(match edges {
+                (Some(low), Some(high)) if high > low => {
+                    share.request_tx_filter(low, high);
+                    None
+                }
+                _ => Some(tx_filter_message(&tx)),
+            });
+        }
+        _ => {}
     }
     let mut p = params.lock().unwrap();
     // Receiver, then the value(s) -- rx_volume has a channel too.
@@ -2926,6 +2981,8 @@ fn live_families(name: &str) -> &'static [&'static str] {
         "rx_balance" => &["rx_balance"],
         "cw_keyer_speed" | "cw_macros_speed" => &["cw_keyer_speed"],
         "rx_step_att_ex" => &["rx_step_att_ex"],
+        "tx_profile_ex" => &["tx_profile_ex", "tx_filter_band_ex"],
+        "tx_filter_band_ex" => &["tx_filter_band_ex"],
         "vfo_swap_ex" => &["vfo", "if", "dds", "tx_frequency", "tx_frequency_ex"],
         "rx_anf_enable" => &["rx_anf_enable"],
         "rx_bin_enable" => &["rx_bin_enable"],
@@ -3541,14 +3598,6 @@ fn handle_command(
             *iq_streaming = false;
             Some(format!("iq_stop:{};", args.first().unwrap_or(&"0")))
         }
-        // Bare queries (no args) for state also pushed once at connect
-        // (see handle_client's initial state push) -- answered here too
-        // since a client is explicitly asking again, not just relying
-        // on what it already got. This project has no real TX-profile
-        // concept (Thetis-style PA/EQ profile switching), so "Default"
-        // is a static, harmless stand-in.
-        "tx_profile_ex" => Some("tx_profile_ex:Default;".to_string()),
-        "tx_profiles_ex" => Some("tx_profiles_ex:Default;".to_string()),
         _ => None,
     }
 }
@@ -4626,6 +4675,97 @@ mod remote_tests {
         for want in ["rx_step_att_ex:0,20", "mon_enable:true", "cw_keyer_speed:30", "mon_volume:0.0", "rx_balance:0,0,20.00"] {
             assert!(got.iter().any(|m| m == want), "no {want} in {got:?}");
         }
+        server.stop();
+    }
+
+    /// tx_profiles_ex/tx_profile_ex list and choose Settings -> TX's TX
+    /// profiles ("Default" with none saved); tx_filter_band_ex reads and
+    /// sets the TX filter, live; setting either is refused from a
+    /// receive-only client (transmits).
+    #[test]
+    fn a_client_chooses_a_tx_profile_and_sets_the_tx_filter() {
+        let port = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let mut server = TciServer::start(
+            &format!("127.0.0.1:{port}"),
+            Arc::new(AtomicU64::new(7_100_000)),
+            Arc::new(AtomicU64::new(7_100_000)),
+            Arc::new(AtomicU32::new(7_100_000)),
+            Arc::new(AtomicI64::new(0)),
+            Arc::new(crate::radio::VfoBShared::default()),
+            Arc::new(AtomicU32::new(192_000)),
+            Arc::new(Mutex::new(DemodParams::default())),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicU32::new(7_100_000)),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(Mutex::new(VecDeque::new())),
+            Arc::new(Mutex::new(VecDeque::new())),
+            Arc::new(Mutex::new(VecDeque::new())),
+            Arc::new(Mutex::new(1.0)),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicI32::new(0)),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicI32::new(0)),
+            "Test".to_string(),
+            Arc::new(crate::radio::CwKeyerAtomics::default()),
+            DebugLog::new(std::env::temp_dir().join("hpsdr-rs-tci-tx-profile-test.log")),
+        )
+        .unwrap();
+        server.set_tx_info(crate::remote::TxInfo { available: true, tx_filter: (150, 2700), ..Default::default() });
+        let (mut ws, _) = tungstenite::connect(format!("ws://127.0.0.1:{port}")).unwrap();
+        if let tungstenite::stream::MaybeTlsStream::Plain(s) = ws.get_ref() {
+            s.set_read_timeout(Some(Duration::from_millis(10))).unwrap();
+        }
+        let read_for = |ws: &mut tungstenite::WebSocket<tungstenite::stream::MaybeTlsStream<TcpStream>>, ms: u64| {
+            let mut got = Vec::new();
+            let start = Instant::now();
+            while start.elapsed() < Duration::from_millis(ms) {
+                if let Ok(Message::Text(t)) = ws.read() {
+                    got.extend(t.split(';').filter(|m| !m.is_empty()).map(str::to_string));
+                }
+            }
+            got
+        };
+        let got = read_for(&mut ws, 300);
+        for want in ["tx_profiles_ex:Default", "tx_profile_ex:Default", "tx_filter_band_ex:150,2700"] {
+            assert!(got.iter().any(|m| m == want), "no {want} at connect in {got:?}");
+        }
+
+        // Profiles saved in hpsdr-rs reach the client, the list first.
+        server.set_tx_profiles(crate::remote::TxProfiles {
+            names: vec!["Rag chew".to_string(), "DX".to_string()],
+            current: "DX".to_string(),
+        });
+        let got = read_for(&mut ws, 700);
+        let list = got.iter().position(|m| m == "tx_profiles_ex:Rag chew,DX");
+        let current = got.iter().position(|m| m == "tx_profile_ex:DX");
+        assert!(list.is_some() && list < current, "{got:?}");
+
+        ws.send(Message::Text("tx_profiles_ex;tx_profile_ex;tx_filter_band_ex;".into())).unwrap();
+        let got = read_for(&mut ws, 200);
+        for want in ["tx_profiles_ex:Rag chew,DX", "tx_profile_ex:DX", "tx_filter_band_ex:150,2700"] {
+            assert!(got.iter().any(|m| m == want), "no {want} in {got:?}");
+        }
+
+        ws.send(Message::Text("tx_profile_ex:Rag chew;tx_filter_band_ex:-2800,-200;".into())).unwrap();
+        read_for(&mut ws, 200);
+        let control = server.take_control();
+        assert_eq!(control.tx_profile.as_deref(), Some("Rag chew"));
+        assert_eq!(control.tx_filter, Some((-2800.0, -200.0)));
+
+        // Nonsense edges are a question.
+        ws.send(Message::Text("tx_filter_band_ex:3000,100;".into())).unwrap();
+        let got = read_for(&mut ws, 200);
+        assert!(got.iter().any(|m| m == "tx_filter_band_ex:150,2700"), "{got:?}");
+        assert_eq!(server.take_control().tx_filter, None);
+
+        assert!(transmits("tx_profile_ex:DX") && transmits("tx_filter_band_ex:100,2900"));
+        assert!(!transmits("tx_profile_ex") && !transmits("tx_filter_band_ex"));
+
+        // Live: the TX filter changing in hpsdr-rs reaches the client.
+        server.set_tx_info(crate::remote::TxInfo { available: true, tx_filter: (-2800, -200), ..Default::default() });
+        let got = read_for(&mut ws, 700);
+        assert!(got.iter().any(|m| m == "tx_filter_band_ex:-2800,-200"), "{got:?}");
         server.stop();
     }
 

@@ -378,6 +378,10 @@ pub fn ps_state_name(state: i32) -> String {
 pub struct TxParams {
     pub mode: Mode,
     pub mic_gain: f32,
+    /// Settings -> TX -> TX Filter's own edges, `(low, high)` Hz, or None
+    /// to follow the RX filter (width_hz) -- see
+    /// spectrum::tx_passband_for.
+    pub filter: Option<(f64, f64)>,
     /// Monitor TX Audio's level (Settings -> TX), linear, 0.0-1.0 --
     /// applied to tx_audio_monitor only, not to what's transmitted.
     pub monitor_volume: f32,
@@ -452,6 +456,7 @@ impl Default for TxParams {
             // breaking change to already-saved config values.
             mic_gain: 1.0,
             monitor_volume: 1.0,
+            filter: None,
             width_hz: crate::spectrum::default_width_hz(Mode::Usb),
             tune: false,
             two_tone: false,
@@ -972,6 +977,7 @@ impl TxProcessor {
         mode: Mode,
         mic_gain: f32,
         width_hz: f64,
+        filter: Option<(f64, f64)>,
         tune: bool,
         two_tone: bool,
         eq: EqualizerParams,
@@ -987,7 +993,7 @@ impl TxProcessor {
         // keyed on the computed (f_low, f_high) pair instead of the
         // raw mode/width so a width change alone (same mode) still
         // triggers it.
-        let passband = crate::spectrum::passband_for(mode, width_hz);
+        let passband = crate::spectrum::tx_passband_for(mode, width_hz, filter);
         if self.last_passband != Some(passband) {
             unsafe {
                 wdsp::SetTXABandpassFreqs(self.channel, passband.0, passband.1);
@@ -2411,6 +2417,7 @@ fn run(
                 p.mode,
                 p.mic_gain,
                 p.width_hz,
+                p.filter,
                 p.tune,
                 p.two_tone,
                 p.eq,
@@ -2730,6 +2737,11 @@ impl TxHandle {
         self.params.lock().unwrap().mic_gain = gain.max(0.0);
     }
 
+    /// See TxParams::filter.
+    pub fn set_filter(&self, filter: Option<(f64, f64)>) {
+        self.params.lock().unwrap().filter = filter;
+    }
+
     /// See TxParams::monitor_volume.
     pub fn set_monitor_volume(&self, volume: f32) {
         self.params.lock().unwrap().monitor_volume = volume.clamp(0.0, 1.0);
@@ -2762,25 +2774,16 @@ impl TxHandle {
     }
 
     /// See spectrum::EqualizerParams's doc comment.
-    pub fn eq(&self) -> EqualizerParams {
-        self.params.lock().unwrap().eq
-    }
     pub fn set_eq(&self, eq: EqualizerParams) {
         self.params.lock().unwrap().eq = eq;
     }
 
     /// See TxParams::compressor_enabled's doc comment.
-    pub fn compressor_enabled(&self) -> bool {
-        self.params.lock().unwrap().compressor_enabled
-    }
     pub fn set_compressor_enabled(&self, enabled: bool) {
         self.params.lock().unwrap().compressor_enabled = enabled;
     }
 
     /// See TxParams::compressor_gain_db's doc comment.
-    pub fn compressor_gain_db(&self) -> f32 {
-        self.params.lock().unwrap().compressor_gain_db
-    }
     pub fn set_compressor_gain_db(&self, gain_db: f32) {
         self.params.lock().unwrap().compressor_gain_db = gain_db.clamp(0.0, 20.0);
     }
@@ -2788,9 +2791,6 @@ impl TxHandle {
     /// See TxParams::cessb_enabled's doc comment -- note that setting
     /// this alone doesn't guarantee CESSB actually runs in WDSP; see
     /// TxProcessor::process's compressor/CESSB update for why.
-    pub fn cessb_enabled(&self) -> bool {
-        self.params.lock().unwrap().cessb_enabled
-    }
     pub fn set_cessb_enabled(&self, enabled: bool) {
         self.params.lock().unwrap().cessb_enabled = enabled;
     }
@@ -2935,7 +2935,7 @@ mod tune_tone_tests {
         for _ in 0..8 {
             for _ in 0..(12_000 / TX_BUFFER_SIZE) {
                 let (iq, _) =
-                    processor.process(&mic, mode, 1.0, width_hz, true, false, EqualizerParams::default(), false, 0.0, false);
+                    processor.process(&mic, mode, 1.0, width_hz, None, true, false, EqualizerParams::default(), false, 0.0, false);
                 let mut q = iq_buf.lock().unwrap();
                 for pair in iq.chunks_exact(2) {
                     q.push_back(IqSample { i: (pair[0] * PS_IQ_NORM) as i32, q: (pair[1] * PS_IQ_NORM) as i32 });
@@ -3085,7 +3085,7 @@ mod ctcss_tests {
                     })
                     .collect();
                 let (iq, err) =
-                    p.process(&mic, Mode::Fmn, 1.0, 5000.0, false, false, EqualizerParams::default(), false, 0.0, false);
+                    p.process(&mic, Mode::Fmn, 1.0, 5000.0, None, false, false, EqualizerParams::default(), false, 0.0, false);
                 // Paced like the real TX thread, so WDSP's own worker
                 // keeps up (fexchange0 hands back zeros otherwise).
                 thread::sleep(Duration::from_millis(15));

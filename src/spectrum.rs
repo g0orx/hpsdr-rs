@@ -184,6 +184,24 @@ pub fn passband_for(mode: Mode, width_hz: f64) -> (f64, f64) {
     }
 }
 
+/// The TX filter's passband: passband_for's (the RX filter's) with no
+/// `filter` of its own -- Settings -> TX -> TX Filter's "Use RX filter" --
+/// else that filter's `(low, high)` audio edges, Hz, placed for the mode:
+/// as they are for USB and DIGU, mirrored below the carrier for LSB and
+/// DIGL, and +/-high for AM, SAM, DSB, FM and DRM (both sidebands; low
+/// cut only matters with one). CW keeps the RX filter's: its carrier is
+/// generated, not filtered, so there's nothing to shape.
+pub fn tx_passband_for(mode: Mode, width_hz: f64, filter: Option<(f64, f64)>) -> (f64, f64) {
+    let Some((low, high)) = filter else { return passband_for(mode, width_hz) };
+    let high = high.max(low + 50.0);
+    match mode {
+        Mode::Usb | Mode::Digu | Mode::Spec => (low, high),
+        Mode::Lsb | Mode::Digl => (-high, -low),
+        Mode::Dsb | Mode::Am | Mode::Sam | Mode::Drm | Mode::Fmn => (-high, high),
+        Mode::Cwl | Mode::Cwu => passband_for(mode, width_hz),
+    }
+}
+
 /// The widest the filter width control goes for `mode` (Hz). FM gets
 /// 8 kHz (+/-8 kHz) for wide VHF/UHF FM; everything else stops at 5 kHz
 /// so the slider stays fine enough for CW and SSB.
@@ -2534,6 +2552,19 @@ impl Drop for SpectrumHandle {
 #[cfg(test)]
 mod squelch_tests {
     use super::*;
+
+    #[test]
+    fn tx_filter_is_placed_for_the_mode() {
+        let f = Some((200.0, 2600.0));
+        assert_eq!(tx_passband_for(Mode::Usb, 2700.0, None), passband_for(Mode::Usb, 2700.0), "follows RX");
+        assert_eq!(tx_passband_for(Mode::Usb, 2700.0, f), (200.0, 2600.0));
+        assert_eq!(tx_passband_for(Mode::Digu, 2700.0, f), (200.0, 2600.0));
+        assert_eq!(tx_passband_for(Mode::Lsb, 2700.0, f), (-2600.0, -200.0));
+        assert_eq!(tx_passband_for(Mode::Digl, 2700.0, f), (-2600.0, -200.0));
+        assert_eq!(tx_passband_for(Mode::Am, 2700.0, f), (-2600.0, 2600.0));
+        assert_eq!(tx_passband_for(Mode::Fmn, 2700.0, f), (-2600.0, 2600.0));
+        assert_eq!(tx_passband_for(Mode::Cwu, 500.0, f), passband_for(Mode::Cwu, 500.0), "CW keeps RX's");
+    }
 
     #[test]
     fn pan_follows_wdsps_law() {
