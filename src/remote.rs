@@ -230,6 +230,27 @@ pub struct ControlRequests {
     pub tune_power_percent: Option<u32>,
     /// split_enable, as the Split button.
     pub split: Option<bool>,
+    /// vfo_swap_ex, as the A<>B button.
+    pub vfo_swap: bool,
+    /// rx_step_att_ex: receiver 0's attenuation, dB (negative is gain --
+    /// see TxInfo::rx_att).
+    pub rx_att_db: Option<i32>,
+    /// mon_enable, as Settings -> TX's Monitor TX Audio.
+    pub monitor: Option<bool>,
+    /// mon_volume, its level, linear 0.0-1.0.
+    pub monitor_volume: Option<f32>,
+}
+
+/// The radio's RX front end as TCI's rx_step_att_ex has it: attenuation,
+/// dB, and the range it can be set in. Negative is gain -- a HermesLite
+/// on Protocol 1 has an RX Gain of -12..+48 dB, attenuation 12..-48, as
+/// Thetis shows the HL2's. Boards whose control is an RF gain of their
+/// own (RTL-SDR, MSI.SDR, Pluto) have none.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct RxAtt {
+    pub db: i32,
+    pub min_db: i32,
+    pub max_db: i32,
 }
 
 /// The transmitter as main.rs sees it, for hpsdr_tx.
@@ -260,6 +281,13 @@ pub struct TxInfo {
     /// The microphone's peak level, dB (WDSP's TXA mic peak meter), while
     /// transmitting -- for TCI's tx_sensors.
     pub mic_db: f32,
+    /// Settings -> TX's Monitor TX Audio is on, and its level (linear,
+    /// 0.0-1.0) -- for TCI's mon_enable and mon_volume.
+    pub monitor: bool,
+    pub monitor_volume: f32,
+    /// Receiver 0's front end -- for TCI's rx_step_att_ex; None without a
+    /// step attenuator (see RxAtt).
+    pub rx_att: Option<RxAtt>,
 }
 
 /// One connected remote client (one that said hpsdr_hello), counted in
@@ -345,6 +373,27 @@ impl RemoteShare {
 
     pub fn request_split(&self, on: bool) {
         self.control.lock().unwrap().split = Some(on);
+    }
+
+    /// TCI's cw_keyer_speed, as cw_macros_speed: the CW tab's speed.
+    pub fn request_cw_speed(&self, wpm: u32) {
+        self.cw.lock().unwrap().speed_wpm = Some(wpm.clamp(hpsdr_proto::cw::SPEED_MIN, hpsdr_proto::cw::SPEED_MAX));
+    }
+
+    pub fn request_vfo_swap(&self) {
+        self.control.lock().unwrap().vfo_swap = true;
+    }
+
+    pub fn request_rx_att(&self, db: i32) {
+        self.control.lock().unwrap().rx_att_db = Some(db);
+    }
+
+    pub fn request_monitor(&self, on: bool) {
+        self.control.lock().unwrap().monitor = Some(on);
+    }
+
+    pub fn request_monitor_volume(&self, volume: f32) {
+        self.control.lock().unwrap().monitor_volume = Some(volume.clamp(0.0, 1.0));
     }
 
     pub fn request_tune(&self, on: bool) {

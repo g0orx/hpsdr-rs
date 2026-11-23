@@ -171,6 +171,9 @@ pub const DEFAULT_ADDR: &str = "0.0.0.0:50001";
 /// accurately self-describe.
 const PROTOCOL_MESSAGE: &str = "protocol:ExpertSDR3,2.0;";
 
+/// hpsdr-rs's own name and version, sent after PROTOCOL_MESSAGE.
+const APP_MESSAGE: &str = concat!("app_ex:hpsdr-rs,", env!("CARGO_PKG_VERSION"), ";");
+
 /// A swappable reference to "whichever DemodParams is current right
 /// now" -- see TciServer::set_demod_params's doc comment (and
 /// rigctl.rs's identical DemodParamsCell, which this mirrors) for why
@@ -1044,11 +1047,12 @@ fn handle_client(
     // TCI_TX_AUDIO_CHUNK (this project's own real per-reply request
     // size -- see that constant's doc comment for the full back-and-
     // forth on what value actually belongs here).
-    send_logged(&mut ws, &logging, "mon_volume:0.0;".into());
-    send_logged(&mut ws, &logging, "mon_enable:false;".into());
+    send_logged(&mut ws, &logging, format!("mon_volume:{:.1};", monitor_volume_db(&remote_share.tx())).into());
+    send_logged(&mut ws, &logging, format!("mon_enable:{};", remote_share.tx().monitor).into());
+    send_logged(&mut ws, &logging, format!("cw_keyer_speed:{};", remote_share.tx().cw_speed_wpm).into());
     send_logged(&mut ws, &logging, format!("tune:0,{};", remote_share.tx().tune).into());
-    send_logged(&mut ws, &logging, "rx_mute:0,false;".into());
-    send_logged(&mut ws, &logging, "mute:false;".into());
+    send_logged(&mut ws, &logging, format!("rx_mute:0,{};", params.muted).into());
+    send_logged(&mut ws, &logging, format!("mute:{};", params.muted).into());
     send_logged(&mut ws, &logging, "tx_stream_audio_buffering:50;".into());
     send_logged(&mut ws, &logging, format!("audio_stream_samples:{TCI_TX_AUDIO_CHUNK};").into());
     send_logged(&mut ws, &logging, "audio_stream_channels:2;".into());
@@ -1088,10 +1092,11 @@ fn handle_client(
     send_logged(&mut ws, &logging, "agc_auto_ex:0,false;".into());
     send_logged(&mut ws, &logging, format!("agc_mode:0,{};", agc_to_tci(params.agc)).into());
     send_logged(&mut ws, &logging, "rx_preamp_att_ex:0,0;".into());
-    send_logged(&mut ws, &logging, "rx_step_att_ex:0,0;".into());
-    send_logged(&mut ws, &logging, "rx_step_att_enabled_ex:0,false;".into());
+    for (_, msg) in rx_att_state(&remote_share.tx()) {
+        send_logged(&mut ws, &logging, msg.into());
+    }
     send_logged(&mut ws, &logging, "vfo_sync_ex:false;".into());
-    send_logged(&mut ws, &logging, "rx_balance:0,0,0.00;".into());
+    send_logged(&mut ws, &logging, format!("rx_balance:0,0,{:.2};", pan_to_balance(params.audio_pan)).into());
     send_logged(&mut ws, &logging, format!("rx_volume:0,0,{:.2};", gain_to_tci_db(params.gain)).into());
     send_logged(&mut ws, &logging, format!("volume:{:.1};", gain_to_tci_db(params.gain).clamp(-60.0, 0.0)).into());
     send_logged(&mut ws, &logging, format!("agc_gain:0,{};", params.agc_top_db.round() as i64).into());
@@ -1184,6 +1189,10 @@ fn handle_client(
     // reported over the wire.
     send_logged(&mut ws, &logging, format!("device:{board_name};").into());
     send_logged(&mut ws, &logging, PROTOCOL_MESSAGE.into());
+    // Which program this really is, and its version: protocol: has to say
+    // ExpertSDR3 for clients that expect it, so a client that wants to
+    // tell hpsdr-rs apart (ThetisLink asked) looks here.
+    send_logged(&mut ws, &logging, APP_MESSAGE.into());
 
     // Per-client streaming state -- audio defaults to ON (see below),
     // IQ defaults to OFF, only enabled by an explicit iq_start. This
@@ -2071,6 +2080,10 @@ fn handle_client(
                 match rx2 {
                     Some((taps, f)) => {
                         let params2 = *taps.demod_params.lock().unwrap();
+                        // Its channel too, as Thetis: what makes a client
+                        // that asked for its audio and IQ at connect ask
+                        // again now it's open.
+                        state.push(("rx_channel_enable:1,0".to_string(), "rx_channel_enable:1,0,true;".to_string()));
                         state.extend(receiver_live_state(1, &f, &params2));
                     }
                     None => live_sent.retain(|key, _| key == "rx_enable:1" || !is_rx1_key(key)),
@@ -2192,9 +2205,14 @@ fn live_state(
             ("tune_drive:0", format!("tune_drive:0,{};", tx.tune_power_percent)),
             ("drive:0", format!("drive:0,{};", drive_percent(tx))),
             ("split_enable:0", format!("split_enable:0,{};", tx.split)),
+            ("mute", format!("mute:{};", params.muted)),
+            ("mon_enable", format!("mon_enable:{};", tx.monitor)),
+            ("mon_volume", format!("mon_volume:{:.1};", monitor_volume_db(tx))),
+            ("cw_keyer_speed", format!("cw_keyer_speed:{};", tx.cw_speed_wpm)),
         ]
         .map(|(k, m)| (k.to_string(), m)),
     );
+    out.extend(rx_att_state(tx));
     out.extend(tx_frequency_state(rx_frequency_hz, vfo_b, xit_enabled, xit_offset_hz, share));
     out
 }
@@ -2275,12 +2293,44 @@ fn receiver_live_state(rx: u32, f: &Rx2State, params: &DemodParams) -> Vec<(Stri
         (format!("rx_nr_enable:{rx}"), format!("rx_nr_enable:{rx},{nr_on};")),
         (format!("sql_enable:{rx}"), format!("sql_enable:{rx},{};", params.squelch_enabled)),
         (format!("sql_level:{rx}"), format!("sql_level:{rx},{};", squelch_to_tci_db(params.squelch_level))),
+        (format!("rx_mute:{rx}"), format!("rx_mute:{rx},{};", params.muted)),
+        (format!("rx_balance:{rx},0"), format!("rx_balance:{rx},0,{:.2};", pan_to_balance(params.audio_pan))),
     ];
     if f.vfo_b_hz != 0 {
         out.push((format!("vfo:{rx},1"), format!("vfo:{rx},1,{};", f.vfo_b_hz)));
         out.push((format!("if:{rx},1"), format!("if:{rx},1,{};", f.vfo_b_hz as i64 - dds_freq)));
     }
     out
+}
+
+/// Monitor TX Audio's level as TCI's mon_volume, dB, -60 (and below:
+/// silence) to 0 -- as Thetis's (its TXAF), the same scale as volume.
+fn monitor_volume_db(tx: &crate::remote::TxInfo) -> f64 {
+    gain_to_tci_db(tx.monitor_volume).clamp(-60.0, 0.0) as f64
+}
+
+/// A receiver's audio pan (spectrum::DemodParams::audio_pan, -1.0 left
+/// to 1.0 right) as TCI's rx_balance, -40 to 40 -- Thetis's scale and
+/// sign (TCIServer.cs: balance = 40 - pan * 0.8, pan 0 left to 100
+/// right), so +40 is all the way left.
+fn pan_to_balance(pan: f32) -> f64 {
+    // + 0.0: the middle is 0.00, not -0.00.
+    -40.0 * pan.clamp(-1.0, 1.0) as f64 + 0.0
+}
+
+fn balance_to_pan(balance: f64) -> f32 {
+    (-balance.clamp(-40.0, 40.0) / 40.0) as f32
+}
+
+/// Receiver 0's front end as TCI has it (see remote::RxAtt):
+/// rx_step_att_ex, attenuation dB, and rx_step_att_enabled_ex, whether
+/// there's a step attenuator at all.
+fn rx_att_state(tx: &crate::remote::TxInfo) -> Vec<(String, String)> {
+    let (db, on) = tx.rx_att.map_or((0, false), |a| (a.db, true));
+    vec![
+        ("rx_step_att_ex:0".to_string(), format!("rx_step_att_ex:0,{db};")),
+        ("rx_step_att_enabled_ex:0".to_string(), format!("rx_step_att_enabled_ex:0,{on};")),
+    ]
 }
 
 /// A live_state key belongs to receiver 1: its first argument is 1.
@@ -2453,6 +2503,8 @@ const RECEIVER_COMMANDS: &[&str] = &[
     "iq_start",
     "iq_stop",
     "rx_enable",
+    "rx_mute",
+    "rx_balance",
 ];
 
 /// A command for receiver 1 (see Rx2Share): None if it isn't one --
@@ -2486,7 +2538,21 @@ fn rx2_command(
         }
     }
     let Some((taps, f)) = share.rx2.get() else {
-        return Some((name == "rx_enable").then(|| "rx_enable:1,false;".to_string()));
+        // Audio and IQ asked for before receiver 1 is open (a client that
+        // asks once, at connect -- ThetisLink does): remembered, so they
+        // flow as soon as it opens.
+        match name {
+            "audio_start" => *audio2_streaming = true,
+            "audio_stop" => *audio2_streaming = false,
+            "iq_start" => *iq2_streaming = true,
+            "iq_stop" => *iq2_streaming = false,
+            _ => {}
+        }
+        return Some(match name {
+            "rx_enable" => Some("rx_enable:1,false;".to_string()),
+            "audio_start" | "audio_stop" | "iq_start" | "iq_stop" => Some(format!("{name}:1;")),
+            _ => None,
+        });
     };
     let mut requests = share.rx2.requests.lock().unwrap();
     let reply = match name {
@@ -2615,13 +2681,19 @@ fn control_command(cmd: &str, share: &crate::remote::RemoteShare, params: &Mutex
     let name = name.trim().to_ascii_lowercase();
     let args: Vec<&str> = args.split(',').map(str::trim).filter(|a| !a.is_empty()).collect();
     let tx = share.tx();
+    // vfo_swap_ex; -- no arguments at all, as the A<>B button.
+    if name == "vfo_swap_ex" {
+        share.request_vfo_swap();
+        return Some(None);
+    }
     let mut p = params.lock().unwrap();
     // Receiver, then the value(s) -- rx_volume has a channel too.
     let values = match name.as_str() {
-        "volume" => &args[..],
+        "volume" | "mute" | "mon_enable" | "mon_volume" | "cw_keyer_speed" => &args[..],
+        "rx_balance" => args.get(2..).unwrap_or(&[]),
         "rx_volume" => args.get(2..).unwrap_or(&[]),
         "tune" | "drive" | "tune_drive" | "split_enable" | "rx_filter_band" | "agc_mode" | "agc_gain" | "sql_enable"
-        | "sql_level" => {
+        | "sql_level" | "rx_mute" | "rx_step_att_ex" | "rx_step_att_enabled_ex" => {
             args.get(1..).unwrap_or(&[])
         }
         _ => return None,
@@ -2642,6 +2714,20 @@ fn control_command(cmd: &str, share: &crate::remote::RemoteShare, params: &Mutex
             "agc_mode" => format!("agc_mode:{rx},{};", agc_to_tci(p.agc)),
             "agc_gain" => format!("agc_gain:{rx},{};", p.agc_top_db.round() as i64),
             "sql_enable" => format!("sql_enable:{rx},{};", p.squelch_enabled),
+            "rx_mute" => format!("rx_mute:{rx},{};", p.muted),
+            "mute" => format!("mute:{};", p.muted),
+            "mon_enable" => format!("mon_enable:{};", tx.monitor),
+            "mon_volume" => format!("mon_volume:{:.1};", monitor_volume_db(&tx)),
+            // Sub-receiver (channel 1): hpsdr-rs has none, so it's in the
+            // middle.
+            "rx_balance" => {
+                let chan = args.get(1).copied().unwrap_or("0");
+                let balance = if chan == "0" { pan_to_balance(p.audio_pan) } else { 0.0 };
+                format!("rx_balance:{rx},{chan},{balance:.2};")
+            }
+            "cw_keyer_speed" => format!("cw_keyer_speed:{};", tx.cw_speed_wpm),
+            "rx_step_att_ex" => format!("rx_step_att_ex:{rx},{};", tx.rx_att.map_or(0, |a| a.db)),
+            "rx_step_att_enabled_ex" => format!("rx_step_att_enabled_ex:{rx},{};", tx.rx_att.is_some()),
             _ => format!("sql_level:{rx},{};", squelch_to_tci_db(p.squelch_level)),
         }));
     }
@@ -2699,6 +2785,42 @@ fn control_command(cmd: &str, share: &crate::remote::RemoteShare, params: &Mutex
                 p.squelch_enabled = on;
             }
         }
+        // As the main window's Mute: this receiver's speakers only.
+        "rx_mute" | "mute" => {
+            if let Some(on) = boolean(0) {
+                p.muted = on;
+            }
+        }
+        "mon_enable" => {
+            if let Some(on) = boolean(0) {
+                share.request_monitor(on);
+            }
+        }
+        "mon_volume" => {
+            if let Some(db) = number(0) {
+                share.request_monitor_volume(tci_db_to_gain(db));
+            }
+        }
+        // Channel 0 only: there's no sub-receiver to pan.
+        "rx_balance" => {
+            if let (Some(balance), Some(&"0")) = (number(0), args.get(1)) {
+                p.audio_pan = balance_to_pan(balance);
+            }
+        }
+        "cw_keyer_speed" => {
+            if let Some(wpm) = number(0) {
+                share.request_cw_speed(wpm.round().max(0.0) as u32);
+            }
+        }
+        // Receiver 0's only: one front end (main.rs clamps it to the
+        // board's range).
+        "rx_step_att_ex" => {
+            if let (Some(db), "0", Some(_)) = (number(0), rx, tx.rx_att) {
+                share.request_rx_att(db.round() as i32);
+            }
+        }
+        // There's a step attenuator or there isn't: nothing to set.
+        "rx_step_att_enabled_ex" => {}
         _ => {
             if let Some(db) = number(0) {
                 p.squelch_level = tci_db_to_squelch(db);
@@ -2798,6 +2920,13 @@ fn live_families(name: &str) -> &'static [&'static str] {
         "sql_enable" => &["sql_enable"],
         "rx_enable" => &["rx_enable"],
         "sql_level" => &["sql_level"],
+        "rx_mute" | "mute" => &["rx_mute", "mute"],
+        "mon_enable" => &["mon_enable"],
+        "mon_volume" => &["mon_volume"],
+        "rx_balance" => &["rx_balance"],
+        "cw_keyer_speed" | "cw_macros_speed" => &["cw_keyer_speed"],
+        "rx_step_att_ex" => &["rx_step_att_ex"],
+        "vfo_swap_ex" => &["vfo", "if", "dds", "tx_frequency", "tx_frequency_ex"],
         "rx_anf_enable" => &["rx_anf_enable"],
         "rx_bin_enable" => &["rx_bin_enable"],
         "rx_nb_enable" | "rx_nb_enable_ex" | "rx_nb2_enable" => &["rx_nb_enable", "rx_nb_enable_ex", "rx_nb2_enable"],
@@ -4295,6 +4424,208 @@ mod remote_tests {
         server.set_rx2(None);
         let (got, _) = read_for(&mut ws, 700);
         assert!(got.contains(&"rx_enable:1,false".to_string()), "{got:?}");
+        server.stop();
+    }
+
+    /// Receiver 1's audio and IQ asked for at connect, before it's open
+    /// (ThetisLink does): they flow once it opens, and the client's told
+    /// its channel is there (rx_channel_enable:1,0,true), as Thetis does.
+    #[test]
+    fn receiver_1_audio_asked_for_before_it_opens() {
+        let port = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let params = Arc::new(Mutex::new(DemodParams::default()));
+        let mut server = TciServer::start(
+            &format!("127.0.0.1:{port}"),
+            Arc::new(AtomicU64::new(7_100_000)),
+            Arc::new(AtomicU64::new(7_100_000)),
+            Arc::new(AtomicU32::new(7_100_000)),
+            Arc::new(AtomicI64::new(0)),
+            Arc::new(crate::radio::VfoBShared::default()),
+            Arc::new(AtomicU32::new(192_000)),
+            Arc::clone(&params),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicU32::new(7_100_000)),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(Mutex::new(VecDeque::new())),
+            Arc::new(Mutex::new(VecDeque::new())),
+            Arc::new(Mutex::new(VecDeque::new())),
+            Arc::new(Mutex::new(1.0)),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicI32::new(0)),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicI32::new(0)),
+            "Test".to_string(),
+            Arc::new(crate::radio::CwKeyerAtomics::default()),
+            DebugLog::new(std::env::temp_dir().join("hpsdr-rs-tci-rx2-early-test.log")),
+        )
+        .unwrap();
+        let (mut ws, _) = tungstenite::connect(format!("ws://127.0.0.1:{port}")).unwrap();
+        if let tungstenite::stream::MaybeTlsStream::Plain(s) = ws.get_ref() {
+            s.set_read_timeout(Some(Duration::from_millis(10))).unwrap();
+        }
+        let read_for = |ws: &mut tungstenite::WebSocket<tungstenite::stream::MaybeTlsStream<TcpStream>>, ms: u64| {
+            let (mut text, mut audio1, mut iq1) = (Vec::new(), 0, 0);
+            let start = Instant::now();
+            while start.elapsed() < Duration::from_millis(ms) {
+                match ws.read() {
+                    Ok(Message::Text(t)) => text.extend(t.split(';').filter(|m| !m.is_empty()).map(str::to_string)),
+                    Ok(Message::Binary(b)) => {
+                        let (h, _) = hpsdr_proto::Header::decode(&b).unwrap();
+                        if h.receiver == 1 && h.msg_type == hpsdr_proto::TYPE_RX_AUDIO {
+                            audio1 += 1;
+                        }
+                        if h.receiver == 1 && h.msg_type == hpsdr_proto::TYPE_IQ {
+                            iq1 += 1;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            (text, audio1, iq1)
+        };
+        read_for(&mut ws, 300);
+        ws.send(Message::Text("audio_start:1;iq_start:1;".into())).unwrap();
+        let (got, _, _) = read_for(&mut ws, 100);
+        assert!(got.contains(&"audio_start:1".to_string()) && got.contains(&"iq_start:1".to_string()), "{got:?}");
+        assert!(!got.iter().any(|m| m.starts_with("rx_channel_enable:1")), "{got:?}");
+
+        let taps = Rx2Taps {
+            demod_params: Arc::new(Mutex::new(DemodParams::default())),
+            audio: Arc::new(Mutex::new(VecDeque::new())),
+            iq: Arc::new(Mutex::new(VecDeque::new())),
+            display: Arc::new(Mutex::new(SpectrumDisplay::default())),
+        };
+        let state = Rx2State { sample_rate_hz: 96_000, frequency_hz: 14_200_000, dds_hz: 14_190_000, ..Default::default() };
+        server.set_rx2(Some((taps.clone(), state)));
+        let (got, _, _) = read_for(&mut ws, 200);
+        assert!(got.contains(&"rx_channel_enable:1,0,true".to_string()), "{got:?}");
+        taps.audio.lock().unwrap().extend(std::iter::repeat_n((0.1f32, 0.1f32), 4096 + 100));
+        taps.iq.lock().unwrap().extend(std::iter::repeat_n((0.25f32, 0.5f32), 600));
+        let (_, audio1, iq1) = read_for(&mut ws, 300);
+        assert_eq!(audio1, 2, "receiver 1's audio, without asking again");
+        assert!(iq1 > 0, "and its IQ");
+        server.stop();
+    }
+
+    /// mute/rx_mute, mon_enable, cw_keyer_speed, rx_step_att_ex and
+    /// vfo_swap_ex: settings change or go to main.rs, questions are
+    /// answered, the attenuator and the program's own name are reported.
+    #[test]
+    fn a_client_sets_mute_monitor_speed_attenuator_and_swaps_vfos() {
+        let port = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let params = Arc::new(Mutex::new(DemodParams::default()));
+        let mut server = TciServer::start(
+            &format!("127.0.0.1:{port}"),
+            Arc::new(AtomicU64::new(7_100_000)),
+            Arc::new(AtomicU64::new(7_100_000)),
+            Arc::new(AtomicU32::new(7_100_000)),
+            Arc::new(AtomicI64::new(0)),
+            Arc::new(crate::radio::VfoBShared::default()),
+            Arc::new(AtomicU32::new(192_000)),
+            Arc::clone(&params),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicU32::new(7_100_000)),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(Mutex::new(VecDeque::new())),
+            Arc::new(Mutex::new(VecDeque::new())),
+            Arc::new(Mutex::new(VecDeque::new())),
+            Arc::new(Mutex::new(1.0)),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicI32::new(0)),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicI32::new(0)),
+            "Test".to_string(),
+            Arc::new(crate::radio::CwKeyerAtomics::default()),
+            DebugLog::new(std::env::temp_dir().join("hpsdr-rs-tci-more-controls-test.log")),
+        )
+        .unwrap();
+        server.set_tx_info(crate::remote::TxInfo {
+            available: true,
+            cw_speed_wpm: 22,
+            rx_att: Some(crate::remote::RxAtt { db: 10, min_db: 0, max_db: 31 }),
+            monitor_volume: 0.5,
+            ..Default::default()
+        });
+        let (mut ws, _) = tungstenite::connect(format!("ws://127.0.0.1:{port}")).unwrap();
+        if let tungstenite::stream::MaybeTlsStream::Plain(s) = ws.get_ref() {
+            s.set_read_timeout(Some(Duration::from_millis(10))).unwrap();
+        }
+        let read_for = |ws: &mut tungstenite::WebSocket<tungstenite::stream::MaybeTlsStream<TcpStream>>, ms: u64| {
+            let mut got = Vec::new();
+            let start = Instant::now();
+            while start.elapsed() < Duration::from_millis(ms) {
+                if let Ok(Message::Text(t)) = ws.read() {
+                    got.extend(t.split(';').filter(|m| !m.is_empty()).map(str::to_string));
+                }
+            }
+            got
+        };
+        let got = read_for(&mut ws, 300);
+        for want in [
+            "rx_step_att_ex:0,10",
+            "rx_step_att_enabled_ex:0,true",
+            "mute:false",
+            "rx_mute:0,false",
+            "mon_enable:false",
+            "cw_keyer_speed:22",
+            "mon_volume:-6.0",
+            "rx_balance:0,0,0.00",
+            APP_MESSAGE.trim_end_matches(';'),
+        ] {
+            assert!(got.iter().any(|m| m == want), "no {want} at connect in {got:?}");
+        }
+
+        ws.send(Message::Text(
+            "rx_mute:0;mon_enable;cw_keyer_speed;rx_step_att_ex:0;mon_volume;rx_balance:0,0;rx_balance:0,1;".into(),
+        ))
+        .unwrap();
+        let got = read_for(&mut ws, 200);
+        for want in [
+            "rx_mute:0,false",
+            "mon_enable:false",
+            "cw_keyer_speed:22",
+            "rx_step_att_ex:0,10",
+            "mon_volume:-6.0",
+            "rx_balance:0,0,0.00",
+            "rx_balance:0,1,0.00",
+        ] {
+            assert!(got.iter().any(|m| m == want), "no {want} in {got:?}");
+        }
+
+        ws.send(Message::Text(
+            "rx_mute:0,true;mon_enable:true;cw_keyer_speed:30;rx_step_att_ex:0,20;rx_step_att_ex:1,5;vfo_swap_ex;\
+             mon_volume:-20;rx_balance:0,0,20;rx_balance:0,1,-40;"
+                .into(),
+        ))
+        .unwrap();
+        read_for(&mut ws, 200);
+        assert!(params.lock().unwrap().muted);
+        // Thetis's sign: +20 is halfway to the left.
+        assert_eq!(params.lock().unwrap().audio_pan, -0.5, "channel 1 (no sub-receiver) ignored");
+        let control = server.take_control();
+        assert_eq!((control.monitor, control.rx_att_db, control.vfo_swap), (Some(true), Some(20), true));
+        assert!((control.monitor_volume.unwrap() - 0.1).abs() < 1e-6, "{:?}", control.monitor_volume);
+        assert_eq!(server.take_cw().speed_wpm, Some(30));
+
+        // Receiver 0's mute is the main window's, and mute: is it too.
+        ws.send(Message::Text("mute:false;".into())).unwrap();
+        read_for(&mut ws, 100);
+        assert!(!params.lock().unwrap().muted);
+
+        // Live: a change made in hpsdr-rs reaches the client.
+        server.set_tx_info(crate::remote::TxInfo {
+            monitor: true,
+            rx_att: Some(crate::remote::RxAtt { db: 20, min_db: 0, max_db: 31 }),
+            cw_speed_wpm: 30,
+            monitor_volume: 1.0,
+            ..Default::default()
+        });
+        let got = read_for(&mut ws, 700);
+        for want in ["rx_step_att_ex:0,20", "mon_enable:true", "cw_keyer_speed:30", "mon_volume:0.0", "rx_balance:0,0,20.00"] {
+            assert!(got.iter().any(|m| m == want), "no {want} in {got:?}");
+        }
         server.stop();
     }
 

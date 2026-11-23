@@ -182,6 +182,9 @@ pub struct Config {
     /// Binaural ("phasing") RX audio -- see spectrum::DemodParams::
     /// binaural's doc comment.
     pub binaural: Option<bool>,
+    /// Main receiver's audio pan, -1.0 (left) to 1.0 (right) -- see
+    /// spectrum::DemodParams::audio_pan.
+    pub audio_pan: Option<f32>,
     /// Main receiver's graphic EQ -- see spectrum::EqualizerParams's doc
     /// comment. Each extra receiver window persists its own copy
     /// separately, see ExtraReceiverConfig::eq.
@@ -190,6 +193,9 @@ pub struct Config {
     /// -- whether TX was armed (tx_enabled) is intentionally NOT saved
     /// (see main.rs's auto-arm-on-connect comment).
     pub mic_gain: Option<f32>,
+    /// Settings -> TX's Monitor TX Audio level, linear 0.0-1.0 -- see
+    /// tx::TxParams::monitor_volume.
+    pub tx_monitor_volume: Option<f32>,
     /// TX graphic EQ -- see spectrum::EqualizerParams's doc comment.
     pub tx_eq: Option<EqualizerParams>,
     /// Speech Processor (WDSP compressor) on/off -- see
@@ -778,6 +784,9 @@ pub struct ExtraReceiverConfig {
     /// See Config::binaural's doc comment.
     #[serde(default)]
     pub binaural: bool,
+    /// See Config::audio_pan's doc comment.
+    #[serde(default)]
+    pub audio_pan: f32,
     /// See Config::spectrum_waterfall_ratio's doc comment.
     #[serde(default = "default_spectrum_waterfall_ratio")]
     pub spectrum_waterfall_ratio: f32,

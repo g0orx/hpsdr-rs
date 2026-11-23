@@ -486,6 +486,16 @@ pub const DEFAULT_AGC_FIXED_DB: f64 = 50.0;
 /// Thetis's Fixed Gain range.
 pub const AGC_FIXED_DB_RANGE: (f64, f64) = (-20.0, 120.0);
 
+/// The left and right gains for audio pan `pan` (DemodParams::audio_pan,
+/// -1.0 left to 1.0 right): WDSP's SetRXAPanelPan law, constant power --
+/// the near side stays at full level, the far side falls away to nothing
+/// as sin(), both at 1.0 in the middle.
+pub fn pan_gains(pan: f32) -> (f32, f32) {
+    let p = (pan.clamp(-1.0, 1.0) + 1.0) / 2.0;
+    let far = (p * std::f32::consts::PI).sin();
+    if p <= 0.5 { (1.0, far) } else { (far, 1.0) }
+}
+
 #[derive(Copy, Clone)]
 pub struct DemodParams {
     pub mode: Mode,
@@ -564,6 +574,13 @@ pub struct DemodParams {
     /// actually applied. radio-audio-to-radio downmixes to mono
     /// regardless of this setting -- see run()'s own doc comment.
     pub binaural: bool,
+    /// Audio pan (balance), -1.0 (left only) to 1.0 (right only), 0.0 the
+    /// middle -- the same constant-power law as WDSP's SetRXAPanelPan
+    /// (pan_gains), applied in run() to the speakers, Record and TCI, as
+    /// Thetis pans its TCI audio too. Not in WDSP itself: the mono taps
+    /// (CW decoder, waveform, audio to the radio) take (L+R)/2 and would
+    /// lose 6 dB at either end.
+    pub audio_pan: f32,
     /// CTUN ("Click to Tune"): when true, the hardware/LO frequency
     /// (lo_frequency_hz below) stays fixed and ctun_offset_hz shifts the
     /// RXA demod chain instead, so the user can pick a different listen
@@ -694,6 +711,7 @@ impl Default for DemodParams {
             squelch_enabled: false,
             squelch_level: 30.0,
             binaural: false,
+            audio_pan: 0.0,
             ctun: false,
             ctun_offset_hz: 0.0,
             lo_frequency_hz: 0.0,
@@ -2001,7 +2019,11 @@ fn run(
                 // the real (l, r) pair -- identical (l==r) when binaural
                 // is off, same as every consumer effectively saw before
                 // this was ever a stereo pair at all.
-                let (l, r) = ((l * params.gain).clamp(-1.0, 1.0), (r * params.gain).clamp(-1.0, 1.0));
+                let (pan_l, pan_r) = pan_gains(params.audio_pan);
+                let (l, r) = (
+                    (l * params.gain * pan_l).clamp(-1.0, 1.0),
+                    (r * params.gain * pan_r).clamp(-1.0, 1.0),
+                );
                 if !mute_local {
                     if out.len() >= AUDIO_BUFFER_CAPACITY {
                         out.pop_front();
@@ -2445,6 +2467,14 @@ impl SpectrumHandle {
         self.demod_params.lock().unwrap().binaural = v;
     }
 
+    /// See DemodParams::audio_pan.
+    pub fn audio_pan(&self) -> f32 {
+        self.demod_params.lock().unwrap().audio_pan
+    }
+    pub fn set_audio_pan(&self, v: f32) {
+        self.demod_params.lock().unwrap().audio_pan = v.clamp(-1.0, 1.0);
+    }
+
     pub fn eq(&self) -> EqualizerParams {
         self.demod_params.lock().unwrap().eq
     }
@@ -2504,6 +2534,19 @@ impl Drop for SpectrumHandle {
 #[cfg(test)]
 mod squelch_tests {
     use super::*;
+
+    #[test]
+    fn pan_follows_wdsps_law() {
+        assert_eq!(pan_gains(0.0), (1.0, 1.0));
+        let (l, r) = pan_gains(-1.0);
+        assert_eq!(l, 1.0);
+        assert!(r.abs() < 1e-6, "left only: {r}");
+        let (l, r) = pan_gains(1.0);
+        assert!(l.abs() < 1e-6 && r == 1.0, "right only: {l}");
+        // Halfway right: WDSP's pan 0.75, sin(0.75 pi) on the left.
+        let (l, r) = pan_gains(0.5);
+        assert!((l - 0.70710677).abs() < 1e-6 && r == 1.0, "{l}");
+    }
 
     #[test]
     fn digital_modes_start_at_0_hz() {

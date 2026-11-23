@@ -378,6 +378,9 @@ pub fn ps_state_name(state: i32) -> String {
 pub struct TxParams {
     pub mode: Mode,
     pub mic_gain: f32,
+    /// Monitor TX Audio's level (Settings -> TX), linear, 0.0-1.0 --
+    /// applied to tx_audio_monitor only, not to what's transmitted.
+    pub monitor_volume: f32,
     /// Filter width (Hz), same UI control/meaning as RX's per-mode
     /// width slider (spectrum::width_for_mode) -- ROOT CAUSE FIX, see
     /// TxProcessor's bandpass-freqs update in process() for the full
@@ -448,6 +451,7 @@ impl Default for TxParams {
             // switching to the reference's own dB convention to avoid a
             // breaking change to already-saved config values.
             mic_gain: 1.0,
+            monitor_volume: 1.0,
             width_hz: crate::spectrum::default_width_hz(Mode::Usb),
             tune: false,
             two_tone: false,
@@ -2223,13 +2227,14 @@ fn run(
                 }
             }
             {
+                let volume = params.lock().unwrap().monitor_volume;
                 let mut mon = tx_audio_monitor.lock().unwrap();
                 let mut wave = waveform_tap.lock().unwrap();
                 for &sample in &cw_mono_scratch {
                     if mon.len() >= TX_AUDIO_MONITOR_CAPACITY {
                         mon.pop_front();
                     }
-                    mon.push_back((sample, sample));
+                    mon.push_back((sample * volume, sample * volume));
                     if wave.len() >= WAVEFORM_TAP_CAPACITY {
                         wave.pop_front();
                     }
@@ -2364,6 +2369,7 @@ fn run(
         // present in the source audio or introduced downstream. See
         // TxHandle::tx_audio_monitor's doc comment.
         {
+            let volume = params.lock().unwrap().monitor_volume;
             let mut mon = tx_audio_monitor.lock().unwrap();
             let mut wave = waveform_tap.lock().unwrap();
             for &sample in chunk.iter() {
@@ -2375,7 +2381,7 @@ fn run(
                 // content (no binaural concept on TX), so duplicate to
                 // both channels, same as this project's own RX audio
                 // used to do before it gained real binaural support.
-                mon.push_back((sample, sample));
+                mon.push_back((sample * volume, sample * volume));
                 if wave.len() >= WAVEFORM_TAP_CAPACITY {
                     wave.pop_front();
                 }
@@ -2722,6 +2728,11 @@ impl TxHandle {
 
     pub fn set_mic_gain(&self, gain: f32) {
         self.params.lock().unwrap().mic_gain = gain.max(0.0);
+    }
+
+    /// See TxParams::monitor_volume.
+    pub fn set_monitor_volume(&self, volume: f32) {
+        self.params.lock().unwrap().monitor_volume = volume.clamp(0.0, 1.0);
     }
 
     /// See TxParams::width_hz's doc comment -- feeds the TX bandpass

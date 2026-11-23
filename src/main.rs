@@ -1772,6 +1772,73 @@ fn noise_reduction_menu(ui: &mut egui::Ui, current: spectrum::NoiseReduction) ->
     )
 }
 
+/// A<>B: VFO A and VFO B (and their transverters) change places -- for
+/// MIDI and TCI's vfo_swap_ex, as the main window's A<>B button.
+fn swap_vfos(connected: &mut ConnectedState, freq_hz: u32, sample_rate: u32, passband: (f64, f64)) {
+    let dial_freq_hz = if connected.ctun { connected.ctun_frequency_hz } else { freq_hz };
+    connected.sat_last = None;
+    std::mem::swap(&mut connected.active_xvtr, &mut connected.vfo_b_xvtr);
+    let (effective_freq, retune) =
+        resolve_tune(connected.ctun, freq_hz, sample_rate, passband, connected.vfo_b_frequency_hz);
+    if let Some(lo) = retune {
+        connected.session.set_frequency(lo);
+    } else {
+        connected.ctun_frequency_hz = effective_freq;
+    }
+    connected.vfo_b_frequency_hz = dial_freq_hz;
+}
+
+/// Settings -> TX's Monitor TX Audio on or off -- for the checkbox and
+/// TCI's mon_enable. Always the system default output (see
+/// ConnectedState::audio_output_device's doc comment on why it doesn't
+/// follow the RX output device).
+fn set_tx_monitor(connected: &mut ConnectedState, on: bool) {
+    if !on {
+        connected.tx_audio_monitor_output = None;
+    } else if connected.tx_audio_monitor_output.is_none() {
+        if let Some(tx) = &connected.tx_handle {
+            match AudioOutput::start(Arc::clone(&tx.tx_audio_monitor), None, None) {
+                Ok(out) => connected.tx_audio_monitor_output = Some(out),
+                Err(e) => eprintln!("tx audio monitor unavailable: {e}"),
+            }
+        }
+    }
+}
+
+/// Monitor TX Audio's level, linear 0.0-1.0 (Settings -> TX's slider and
+/// TCI's mon_volume): kept here, and passed on to the transmitter.
+fn set_tx_monitor_volume(connected: &mut ConnectedState, volume: f32) {
+    connected.tx_monitor_volume = volume.clamp(0.0, 1.0);
+    if let Some(tx) = &connected.tx_handle {
+        tx.set_monitor_volume(connected.tx_monitor_volume);
+    }
+}
+
+/// Receiver 0's front end as TCI's rx_step_att_ex has it (remote::RxAtt):
+/// RX Attenuation 0-31 dB, or a HermesLite's RX Gain on Protocol 1 as
+/// attenuation (-gain, 12 to -48). None for boards whose control is an RF
+/// gain of their own (RTL-SDR, MSI.SDR, Pluto). See rx_gain_slider.
+fn rx_att_info(connected: &ConnectedState) -> Option<remote::RxAtt> {
+    let wire = connected.session.rx_attenuation.load(Ordering::Relaxed) as i32;
+    if connected.session.rtlsdr_controls.is_some() || matches!(connected.device.board, Boards::MsiSdr | Boards::Pluto) {
+        None
+    } else if connected.device.protocol == 1 && matches!(connected.device.board, Boards::HermesLite | Boards::HermesLite2) {
+        Some(remote::RxAtt { db: 12 - wire, min_db: -48, max_db: 12 })
+    } else {
+        Some(remote::RxAtt { db: wire, min_db: 0, max_db: 31 })
+    }
+}
+
+/// Sets receiver 0's attenuation, dB, as rx_att_info has it, clamped to
+/// the board's range. False if there's no attenuator.
+fn set_rx_att_db(connected: &mut ConnectedState, db: i32) -> bool {
+    let Some(att) = rx_att_info(connected) else { return false };
+    let db = db.clamp(att.min_db, att.max_db);
+    let wire = if att.max_db == 12 { 12 - db } else { db };
+    connected.session.rx_attenuation.store(wire as u32, Ordering::Relaxed);
+    true
+}
+
 /// The main window's RX front-end gain slider, next to AGC Gain (moved
 /// from Settings -> RX). One control, four meanings, all stored in
 /// RadioSession::rx_attenuation (see its doc comment for each one's wire
@@ -2306,19 +2373,7 @@ fn apply_midi_binding(
                 connected.ctun_frequency_hz = effective_freq;
             }
         }
-        MidiAction::VfoSwap => {
-            connected.sat_last = None;
-            std::mem::swap(&mut connected.active_xvtr, &mut connected.vfo_b_xvtr);
-            let new_b = dial_freq_hz;
-            let (effective_freq, retune) =
-                resolve_tune(connected.ctun, freq_hz, sample_rate, passband, connected.vfo_b_frequency_hz);
-            if let Some(lo) = retune {
-                connected.session.set_frequency(lo);
-            } else {
-                connected.ctun_frequency_hz = effective_freq;
-            }
-            connected.vfo_b_frequency_hz = new_b;
-        }
+        MidiAction::VfoSwap => swap_vfos(connected, freq_hz, sample_rate, passband),
         MidiAction::ModeUp | MidiAction::ModeDown => {
             let idx = ALL_MODES.iter().position(|&m| m == current_mode).unwrap_or(0);
             let len = ALL_MODES.len();
@@ -3557,6 +3612,9 @@ struct ConnectedState {
     /// disable/re-enable of TX within the same session, and so it's
     /// available to persist even while TX is currently disarmed.
     mic_gain: f32,
+    /// Settings -> TX's Monitor TX Audio level, as mic_gain: tracked here
+    /// so it survives TX being re-armed, written through to TxHandle.
+    tx_monitor_volume: f32,
     /// Cached UI copy of session.tci_tx_gain -- see that field's doc
     /// comment (radio.rs) for what it does. Written through to the
     /// live Arc<Mutex<f32>> on change, same "cache here, write-through"
@@ -4891,6 +4949,9 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
             if let Some(v) = cfg.squelch_level {
                 spectrum.set_squelch_level(v);
             }
+            if let Some(v) = cfg.audio_pan {
+                spectrum.set_audio_pan(v);
+            }
             if let Some(v) = cfg.binaural {
                 spectrum.set_binaural(v);
             }
@@ -4902,6 +4963,7 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
             // both pipewire and TCI audio at WDSP's default no-boost
             // ALC headroom); 1.0 (0dB/unity) confirmed working.
             let mic_gain = cfg.mic_gain.unwrap_or(1.0);
+            let tx_monitor_volume = cfg.tx_monitor_volume.unwrap_or(1.0).clamp(0.0, 1.0);
             let tci_tx_gain = cfg.tci_tx_gain.unwrap_or(1.0);
             *session.tci_tx_gain.lock().unwrap() = tci_tx_gain;
             // See tx::PsParams::default for these same
@@ -4999,6 +5061,7 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                         Arc::clone(&session.cw_keyer),
                     );
                     tx_handle.set_mic_gain(mic_gain);
+                    tx_handle.set_monitor_volume(tx_monitor_volume);
                     tx_handle.set_mode(spectrum.mode());
                     tx_handle.set_width_hz(spectrum.width_hz());
                     tx_handle.set_ps_enabled(ps_enabled);
@@ -5245,6 +5308,7 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                 tx_handle,
                 ptt_held: false,
                 mic_gain,
+                tx_monitor_volume,
                 tci_tx_gain,
                 ps_enabled,
                 ps_oneshot: false,
@@ -5800,6 +5864,9 @@ impl eframe::App for HpsdrApp {
                         tune_power_percent: connected.tune_power_percent,
                         split: connected.split,
                         tx_on_vfo_b: tx_on_vfo_b(connected),
+                        monitor: connected.tx_audio_monitor_output.is_some(),
+                        monitor_volume: connected.tx_monitor_volume,
+                        rx_att: rx_att_info(connected),
                         mic_db: match &connected.tx_handle {
                             Some(tx) if connected.session.mox_active() => tx.display.lock().unwrap().mic_pk as f32,
                             _ => -200.0,
@@ -5925,6 +5992,24 @@ impl eframe::App for HpsdrApp {
                     if let Some(on) = control.split {
                         connected.split = on;
                         connected.duplex &= on;
+                        connected.settings_dirty.store(true, Ordering::Relaxed);
+                    }
+                    // vfo_swap_ex, rx_step_att_ex and mon_enable, as A<>B,
+                    // the RX Attenuation slider and Monitor TX Audio.
+                    if control.vfo_swap {
+                        swap_vfos(connected, freq_hz, sample_rate, passband);
+                        connected.settings_dirty.store(true, Ordering::Relaxed);
+                    }
+                    if let Some(db) = control.rx_att_db {
+                        if set_rx_att_db(connected, db) {
+                            connected.settings_dirty.store(true, Ordering::Relaxed);
+                        }
+                    }
+                    if let Some(on) = control.monitor {
+                        set_tx_monitor(connected, on);
+                    }
+                    if let Some(volume) = control.monitor_volume {
+                        set_tx_monitor_volume(connected, volume);
                         connected.settings_dirty.store(true, Ordering::Relaxed);
                     }
                     if let Some(on) = control.tune {
@@ -7312,6 +7397,9 @@ impl eframe::App for HpsdrApp {
                                 settings_changed = true;
                             }
                             mute_button(ui, &connected.spectrum);
+                            if pan_slider(ui, &mut connected.slider_scroll_accum, &connected.spectrum) {
+                                settings_changed = true;
+                            }
                         });
 
                         // Squelch -- see spectrum::Squelch. Next to Audio
@@ -12513,6 +12601,7 @@ impl eframe::App for HpsdrApp {
                                                         Arc::clone(&connected.session.cw_keyer),
                                                     );
                                                     tx_handle.set_mic_gain(connected.mic_gain);
+                                                    tx_handle.set_monitor_volume(connected.tx_monitor_volume);
                                                     tx_handle.set_mode(connected.spectrum.mode());
                                                     tx_handle.set_width_hz(connected.spectrum.width_hz());
                                                     tx_handle.set_ps_enabled(connected.ps_enabled);
@@ -12639,23 +12728,28 @@ impl eframe::App for HpsdrApp {
                                     // TX audio producing splatter/no-decode: lets the user hear
                                     // exactly what's reaching WDSP, to tell "already wrong in the
                                     // source audio" apart from "introduced downstream".
-                                    if let Some(tx) = &connected.tx_handle {
+                                    if connected.tx_handle.is_some() {
                                         ui.add_space(8.0);
                                         let mut monitoring = connected.tx_audio_monitor_output.is_some();
-                                        if ui.checkbox(&mut monitoring, "Monitor TX Audio").changed() {
-                                            if monitoring {
-                                                // Always the system default (None) -- see
-                                                // ConnectedState::audio_output_device's doc comment on
-                                                // why this doesn't follow the RX output device
-                                                // selection.
-                                                match AudioOutput::start(Arc::clone(&tx.tx_audio_monitor), None, None) {
-                                                    Ok(out) => connected.tx_audio_monitor_output = Some(out),
-                                                    Err(e) => eprintln!("tx audio monitor unavailable: {e}"),
-                                                }
-                                            } else {
-                                                connected.tx_audio_monitor_output = None;
+                                        ui.horizontal(|ui| {
+                                            if ui.checkbox(&mut monitoring, "Monitor TX Audio").changed() {
+                                                set_tx_monitor(connected, monitoring);
                                             }
-                                        }
+                                            ui.add_space(12.0);
+                                            ui.label("Volume:");
+                                            let mut volume = connected.tx_monitor_volume;
+                                            if scroll_slider_f32_percent(
+                                                ui,
+                                                &mut connected.slider_scroll_accum,
+                                                &mut volume,
+                                                -60.0,
+                                                0.0,
+                                                1.0,
+                                            ) {
+                                                set_tx_monitor_volume(connected, volume);
+                                                settings_changed = true;
+                                            }
+                                        });
                                         ui.weak(
                                             "Plays the exact audio being fed to WDSP (post source \
                                              selection, pre-processing) through the local speaker/ \
@@ -14029,6 +14123,7 @@ impl eframe::App for HpsdrApp {
                                 squelch_enabled: agc_params.squelch_enabled,
                                 squelch_level: agc_params.squelch_level,
                                 binaural: agc_params.binaural,
+                                audio_pan: agc_params.audio_pan,
                                 db_low: rx.db_low,
                                 db_high: rx.db_high,
                                 waterfall_db_low: rx.waterfall_db_low,
@@ -14090,8 +14185,10 @@ impl eframe::App for HpsdrApp {
                         squelch_enabled: Some(agc_params_now.squelch_enabled),
                         squelch_level: Some(agc_params_now.squelch_level),
                         binaural: Some(agc_params_now.binaural),
+                        audio_pan: Some(agc_params_now.audio_pan),
                         rx_eq: Some(agc_params_now.eq),
                         mic_gain: Some(connected.mic_gain),
+                        tx_monitor_volume: Some(connected.tx_monitor_volume),
                         tx_eq: connected.tx_handle.as_ref().map(|t| t.eq()),
                         tx_compressor_enabled: connected.tx_handle.as_ref().map(|t| t.compressor_enabled()),
                         tx_compressor_gain_db: connected.tx_handle.as_ref().map(|t| t.compressor_gain_db()),
@@ -16523,6 +16620,60 @@ fn tune_power_level(connected: &ConnectedState, current: u32) -> u32 {
 /// gain, so unmuting comes back at the same level. Record, TCI and the
 /// rest still get the audio (see spectrum::DemodParams::muted). Not
 /// saved: a restart always starts with sound.
+/// The receiver's audio pan (see spectrum::DemodParams::audio_pan): a
+/// short slider, L100 to R100, scroll-wheel stepped; double-click puts it
+/// back in the middle. True if it changed.
+fn pan_slider(ui: &mut egui::Ui, scroll_accum: &mut f32, spectrum: &SpectrumHandle) -> bool {
+    let mut pan = (spectrum.audio_pan() * 100.0).round();
+    let before = pan;
+    ui.label("Pan:");
+    let resp = ui
+        .scope(|ui| {
+            ui.spacing_mut().slider_width = 70.0;
+            let resp = ui.add(
+                egui::Slider::new(&mut pan, -100.0..=100.0)
+                    .step_by(1.0)
+                    .custom_formatter(|v, _| match v.round() as i32 {
+                        0 => "C".to_string(),
+                        v if v < 0 => format!("L{}", -v),
+                        v => format!("R{v}"),
+                    })
+                    .custom_parser(|t| {
+                        let t = t.trim().to_ascii_uppercase();
+                        match t.chars().next()? {
+                            'C' => Some(0.0),
+                            'L' => t[1..].trim().parse::<f64>().ok().map(|v| -v),
+                            'R' => t[1..].trim().parse::<f64>().ok(),
+                            _ => t.parse::<f64>().ok(),
+                        }
+                    }),
+            );
+            if resp.hovered() {
+                let delta = ui.input(|i| i.smooth_scroll_delta);
+                let delta = if delta.y.abs() >= delta.x.abs() { delta.y } else { delta.x };
+                *scroll_accum += delta;
+                const NOTCH: f32 = 20.0;
+                while scroll_accum.abs() >= NOTCH {
+                    let sign = scroll_accum.signum();
+                    *scroll_accum -= sign * NOTCH;
+                    pan = (pan + 5.0 * sign).clamp(-100.0, 100.0);
+                }
+            }
+            resp
+        })
+        .inner;
+    if resp.double_clicked() {
+        pan = 0.0;
+    }
+    resp.on_hover_text("Audio pan: left to right. Double-click for the middle.");
+    if pan != before {
+        spectrum.set_audio_pan(pan / 100.0);
+        true
+    } else {
+        false
+    }
+}
+
 fn mute_button(ui: &mut egui::Ui, spectrum: &SpectrumHandle) {
     let muted = spectrum.muted();
     let button = egui::Button::selectable(muted, "Mute");
@@ -17353,6 +17504,11 @@ fn render_extra_receiver_ui(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceiver>>) {
             rx.settings_dirty.store(true, Ordering::Relaxed);
         }
         mute_button(ui, &rx.spectrum);
+        let mut scroll_accum = rx.slider_scroll_accum;
+        if pan_slider(ui, &mut scroll_accum, &rx.spectrum) {
+            rx.settings_dirty.store(true, Ordering::Relaxed);
+        }
+        rx.slider_scroll_accum = scroll_accum;
 
         // Squelch -- same control as the main window's, next to Audio
         // gain; see spectrum::Squelch.
@@ -18604,6 +18760,7 @@ fn spawn_extra_receiver(
         spectrum.set_squelch_enabled(s.squelch_enabled);
         spectrum.set_squelch_level(s.squelch_level);
         spectrum.set_binaural(s.binaural);
+        spectrum.set_audio_pan(s.audio_pan);
         spectrum.set_eq(s.eq);
     }
 
@@ -18758,6 +18915,7 @@ fn change_sample_rate(connected: &mut ConnectedState, new_rate: u32) {
     spectrum.set_squelch_enabled(agc_params.squelch_enabled);
     spectrum.set_squelch_level(agc_params.squelch_level);
     spectrum.set_binaural(agc_params.binaural);
+    spectrum.set_audio_pan(agc_params.audio_pan);
 
     connected.audio_output = match AudioOutput::start(
         Arc::clone(&spectrum.audio_out),
@@ -18842,6 +19000,7 @@ fn change_sample_rate(connected: &mut ConnectedState, new_rate: u32) {
                     Arc::clone(&connected.session.cw_keyer),
                 );
                 tx_handle.set_mic_gain(mic_gain);
+                tx_handle.set_monitor_volume(connected.tx_monitor_volume);
                 tx_handle.set_mode(connected.spectrum.mode());
                 tx_handle.set_width_hz(connected.spectrum.width_hz());
                 tx_handle.set_ps_enabled(connected.ps_enabled);
@@ -18963,6 +19122,7 @@ fn change_extra_receiver_sample_rate(rx: &mut ExtraReceiver, new_rate: u32) {
     spectrum.set_squelch_enabled(agc_params.squelch_enabled);
     spectrum.set_squelch_level(agc_params.squelch_level);
     spectrum.set_binaural(agc_params.binaural);
+    spectrum.set_audio_pan(agc_params.audio_pan);
 
     rx.audio_output = match AudioOutput::start(Arc::clone(&spectrum.audio_out), rx.audio_output_device.as_deref(), None) {
         Ok(a) => Some(a),
