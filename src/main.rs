@@ -9599,6 +9599,23 @@ impl eframe::App for HpsdrApp {
                                 settings_changed = true;
                             }
                         }
+                        // Right-click: the same notch menu as the spectrum
+                        // pane's (see there).
+                        if !transmitting {
+                            if waterfall_click_resp.secondary_clicked() {
+                                connected.notch_menu_hz = waterfall_click_resp.interact_pointer_pos().map(|pos| {
+                                    freq_at_x(pos.x, rect, freq_hz, sample_rate, connected.spectrum_zoom, pan_offset_hz)
+                                        as f64
+                                        + xvtr_rf_offset_hz as f64
+                                });
+                            }
+                            let hz_per_px = (2.0 * visible_half_span_hz) / rect.width().max(1.0) as f64;
+                            waterfall_click_resp.context_menu(|ui| {
+                                if notch_menu(ui, connected.notch_menu_hz, hz_per_px) {
+                                    settings_changed = true;
+                                }
+                            });
+                        }
                         // Click-and-drag -- see the spectrum pane's identical
                         // treatment above for why this uses drag_delta()
                         // rather than an absolute cursor-position mapping,
