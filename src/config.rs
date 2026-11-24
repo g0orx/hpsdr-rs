@@ -547,6 +547,14 @@ pub struct Config {
     /// See ConnectedState::duplex. `None` falls back to off.
     #[serde(default)]
     pub duplex: Option<bool>,
+    /// See ConnectedState::vfo_a_lock, vfo_b_lock and vfo_sync. Off when
+    /// missing.
+    #[serde(default)]
+    pub vfo_a_lock: bool,
+    #[serde(default)]
+    pub vfo_b_lock: bool,
+    #[serde(default)]
+    pub vfo_sync: bool,
     /// Named setups (the main window's Setups menu), in the order saved.
     #[serde(default)]
     pub setups: Vec<SavedSetup>,

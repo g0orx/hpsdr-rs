@@ -481,13 +481,78 @@ fn track_sat_vfo_b(connected: &mut ConnectedState, displayed_hz: u64, band_key: 
     let Some((last_hz, last_key)) = last else {
         return false;
     };
-    if connected.sat_mode == SatMode::Off || last_key != band_key || last_hz == displayed_hz {
+    if connected.sat_mode == SatMode::Off || connected.vfo_b_lock || last_key != band_key || last_hz == displayed_hz {
         return false;
     }
     let delta = displayed_hz as i64 - last_hz as i64;
     let delta = if connected.sat_mode == SatMode::SatR { -delta } else { delta };
     connected.vfo_b_frequency_hz = (connected.vfo_b_frequency_hz as i64 + delta).clamp(0, u32::MAX as i64) as u32;
     true
+}
+
+/// VFO Sync, each frame: VFO A moved (or Sync just came on) -- VFO B goes
+/// to it, transverter and all, as A>B; VFO B moved instead -- VFO A is
+/// asked to follow (vfo_sync_a_request, applied next frame as a network
+/// client's frequency is, so CTUN and transverters are handled the same).
+/// Compared in RF, as shown. Split (and so Duplex and SAT) and either
+/// Lock turn Sync off, as in Thetis. `displayed_hz` is VFO A as shown,
+/// `dial_hz` its IF. True if VFO B moved.
+fn track_vfo_sync(connected: &mut ConnectedState, displayed_hz: u64, dial_hz: u32) -> bool {
+    if connected.split || connected.vfo_a_lock || connected.vfo_b_lock {
+        connected.vfo_sync = false;
+    }
+    if !connected.vfo_sync {
+        connected.vfo_sync_last = None;
+        return false;
+    }
+    let b_hz = (connected.vfo_b_frequency_hz as i64 + vfo_b_rf_offset(connected)).max(0) as u64;
+    match vfo_sync_step(connected.vfo_sync_last, displayed_hz, b_hz) {
+        VfoSyncStep::None => false,
+        VfoSyncStep::AFollowsB => {
+            connected.vfo_sync_a_request = Some(b_hz);
+            connected.vfo_sync_last = Some((displayed_hz, b_hz));
+            false
+        }
+        VfoSyncStep::BFollowsA => {
+            let moved = b_hz != displayed_hz || connected.vfo_b_xvtr != connected.active_xvtr;
+            connected.vfo_b_frequency_hz = dial_hz;
+            connected.vfo_b_xvtr = connected.active_xvtr.clone();
+            connected.vfo_sync_last = Some((displayed_hz, displayed_hz));
+            moved
+        }
+    }
+}
+
+/// What VFO Sync does this frame -- see track_vfo_sync.
+#[derive(Debug, PartialEq)]
+enum VfoSyncStep {
+    None,
+    BFollowsA,
+    AFollowsB,
+}
+
+/// VFO Sync's decision, from VFO A and B now and last frame (RF): A moved
+/// (or there's no last frame -- Sync just came on) wins, then B moved.
+fn vfo_sync_step(last: Option<(u64, u64)>, a_hz: u64, b_hz: u64) -> VfoSyncStep {
+    match last {
+        Some((a, _)) if a != a_hz => VfoSyncStep::BFollowsA,
+        Some((_, b)) if b != b_hz => VfoSyncStep::AFollowsB,
+        Some(_) => VfoSyncStep::None,
+        None => VfoSyncStep::BFollowsA,
+    }
+}
+
+/// VFO Sync on or off (its button, TCI's vfo_sync_ex). On, it turns
+/// Split off (with Duplex and SAT, which need it); with either VFO locked
+/// it stays off.
+fn set_vfo_sync(connected: &mut ConnectedState, on: bool) {
+    let on = on && !connected.vfo_a_lock && !connected.vfo_b_lock;
+    if on {
+        connected.split = false;
+        connected.duplex = false;
+        connected.sat_mode = SatMode::Off;
+    }
+    connected.vfo_sync = on;
 }
 
 /// SAT/SATR, the other direction: tuning VFO B by `delta_b` moves VFO A
@@ -502,6 +567,9 @@ fn sat_follow_vfo_b(
     sample_rate: u32,
     passband: (f64, f64),
 ) {
+    if connected.vfo_a_lock {
+        return;
+    }
     let delta_a = match connected.sat_mode {
         SatMode::Off => return,
         SatMode::Sat => delta_b,
@@ -1101,6 +1169,9 @@ fn step_bandstack(
 /// next band stack entry. Shared by the band buttons, MIDI's band actions
 /// and remote clients.
 fn press_band(connected: &mut ConnectedState, band: &Band) {
+    if connected.vfo_a_lock {
+        return;
+    }
     let key = current_band_memory_key(connected);
     if connected.active_xvtr.is_none() && key == band.name {
         save_band_split(connected);
@@ -1113,6 +1184,9 @@ fn press_band(connected: &mut ConnectedState, band: &Band) {
 
 /// press_band for a transverter's band button.
 fn press_xvtr_band(connected: &mut ConnectedState, xvtr: &Xvtr) {
+    if connected.vfo_a_lock {
+        return;
+    }
     if connected.active_xvtr.as_deref() == Some(xvtr.name.as_str()) {
         let key = xvtr_memory_key(&xvtr.name);
         save_band_split(connected);
@@ -1486,9 +1560,16 @@ fn setups_menu(ui: &mut egui::Ui, connected: &mut ConnectedState) -> bool {
         if connected.setups.is_empty() {
             ui.weak("No setups saved yet");
         }
+        // A setup sets both VFOs: not while either is locked.
+        let locked = connected.vfo_a_lock || connected.vfo_b_lock;
         for (i, setup) in connected.setups.iter().enumerate() {
             ui.horizontal(|ui| {
-                if ui.button(&setup.name).on_hover_text("Recall this setup").clicked() {
+                if ui
+                    .add_enabled(!locked, egui::Button::new(&setup.name))
+                    .on_hover_text("Recall this setup")
+                    .on_disabled_hover_text("Unlock VFO A and B to recall a setup")
+                    .clicked()
+                {
                     recall = Some(i);
                     ui.close();
                 }
@@ -1543,8 +1624,12 @@ fn save_setup(connected: &mut ConnectedState, name: &str) {
 
 /// Click (or tap) on a VFO: opens the keypad for VFO A or B -- or, if it's
 /// already open, starts it afresh for that VFO. It's a window inside the
-/// main one (see where it's drawn), so it's always in front there.
+/// main one (see where it's drawn), so it's always in front there. Not
+/// for a locked VFO.
 fn open_frequency_entry(connected: &mut ConnectedState, vfo_b: bool) {
+    if (vfo_b && connected.vfo_b_lock) || (!vfo_b && connected.vfo_a_lock) {
+        return;
+    }
     connected.frequency_entry = Some(FrequencyEntry { vfo_b, digits: String::new() });
 }
 
@@ -1775,6 +1860,9 @@ fn noise_reduction_menu(ui: &mut egui::Ui, current: spectrum::NoiseReduction) ->
 /// A<>B: VFO A and VFO B (and their transverters) change places -- for
 /// MIDI and TCI's vfo_swap_ex, as the main window's A<>B button.
 fn swap_vfos(connected: &mut ConnectedState, freq_hz: u32, sample_rate: u32, passband: (f64, f64)) {
+    if connected.vfo_a_lock || connected.vfo_b_lock {
+        return;
+    }
     let dial_freq_hz = if connected.ctun { connected.ctun_frequency_hz } else { freq_hz };
     connected.sat_last = None;
     std::mem::swap(&mut connected.active_xvtr, &mut connected.vfo_b_xvtr);
@@ -2455,6 +2543,23 @@ fn apply_midi_binding(
 
     let current_mode = connected.spectrum.mode();
     let dial_freq_hz = if connected.ctun { connected.ctun_frequency_hz } else { freq_hz };
+
+    // VFO Lock: nothing that would retune a locked VFO (band changes are
+    // refused in press_band too; Band Up/Down call apply_band directly).
+    let a_tunes = matches!(
+        binding.action,
+        MidiAction::VfoBtoA
+            | MidiAction::VfoSwap
+            | MidiAction::BandUp
+            | MidiAction::BandDown
+            | MidiAction::VfoStepUp
+            | MidiAction::VfoStepDown
+            | MidiAction::VfoTune
+    );
+    let b_tunes = matches!(binding.action, MidiAction::VfoAtoB | MidiAction::VfoSwap | MidiAction::VfoBTune);
+    if (a_tunes && connected.vfo_a_lock) || (b_tunes && connected.vfo_b_lock) {
+        return;
+    }
 
     match binding.action {
         MidiAction::Mox if cannot_transmit(connected) => {
@@ -3619,6 +3724,23 @@ struct ConnectedState {
     /// draw_tx_spectrum_inset). For full-duplex setups such as QO-100
     /// (separate uplink and downlink). Turning it on turns Split on.
     duplex: bool,
+    /// VFO A's Lock, as Thetis's: nothing retunes VFO A -- not the
+    /// window (VFO, spectrum, band and band-stack buttons, setups, B>A,
+    /// A<>B), MIDI, a controller, CAT, rigctl or TCI. Modes still change.
+    vfo_a_lock: bool,
+    /// VFO B's Lock: the same for VFO B (A>B, A<>B, its own box, CAT,
+    /// TCI, and SAT tracking).
+    vfo_b_lock: bool,
+    /// VFO Sync, as Thetis's: VFO B stays on VFO A's frequency (and
+    /// transverter), and tuning VFO B tunes VFO A. Split (so Duplex and
+    /// SAT) and either Lock turn it off -- see track_vfo_sync.
+    vfo_sync: bool,
+    /// VFO A's and VFO B's displayed (RF) frequencies last frame, for
+    /// track_vfo_sync; None when Sync has just come on.
+    vfo_sync_last: Option<(u64, u64)>,
+    /// VFO A's frequency (RF) Sync wants after VFO B was tuned: applied
+    /// next frame as a network client's request is.
+    vfo_sync_a_request: Option<u64>,
     /// Named setups (the Setups menu; see SavedSetup), and the name being
     /// typed there to save the current one under.
     setups: Vec<config::SavedSetup>,
@@ -5438,6 +5560,11 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                     None => cfg.active_xvtr.clone(),
                 },
                 duplex: cfg.duplex.unwrap_or(false),
+                vfo_a_lock: cfg.vfo_a_lock,
+                vfo_b_lock: cfg.vfo_b_lock,
+                vfo_sync: cfg.vfo_sync,
+                vfo_sync_last: None,
+                vfo_sync_a_request: None,
                 setups: cfg.setups.clone(),
                 setup_name: String::new(),
                 window_title: String::new(),
@@ -6057,6 +6184,9 @@ impl eframe::App for HpsdrApp {
                             );
                             (low.round() as i32, high.round() as i32)
                         },
+                        vfo_a_lock: connected.vfo_a_lock,
+                        vfo_b_lock: connected.vfo_b_lock,
+                        vfo_sync: connected.vfo_sync,
                         mic_db: match &connected.tx_handle {
                             Some(tx) if connected.session.mox_active() => tx.display.lock().unwrap().mic_pk as f32,
                             _ => -200.0,
@@ -6220,6 +6350,20 @@ impl eframe::App for HpsdrApp {
                             connected.settings_dirty.store(true, Ordering::Relaxed);
                         }
                     }
+                    // lock / vfo_lock and vfo_sync_ex, as the Lock and Sync
+                    // buttons (a lock turns Sync off next frame).
+                    if let Some(on) = control.vfo_a_lock {
+                        connected.vfo_a_lock = on;
+                        connected.settings_dirty.store(true, Ordering::Relaxed);
+                    }
+                    if let Some(on) = control.vfo_b_lock {
+                        connected.vfo_b_lock = on;
+                        connected.settings_dirty.store(true, Ordering::Relaxed);
+                    }
+                    if let Some(on) = control.vfo_sync {
+                        set_vfo_sync(connected, on);
+                        connected.settings_dirty.store(true, Ordering::Relaxed);
+                    }
                     if let Some((low, high)) = control.tx_filter {
                         connected.tx_filter.set_passband(low, high);
                         if let Some(tx) = &connected.tx_handle {
@@ -6266,11 +6410,21 @@ impl eframe::App for HpsdrApp {
                 // reconcile it exactly like any other frequency change
                 // that needs to respect CTUN (same resolve_tune call the
                 // scroll-tune/VFO-B-button handlers use).
-                let requested_freq_hz = connected
+                //
+                // VFO Sync's request (VFO B was tuned) goes the same way.
+                // With VFO A locked, neither is applied -- clients then
+                // hear the frequency it stayed on.
+                let network_request = connected
                     .session
                     .requested_frequency_hz
                     .load(std::sync::atomic::Ordering::Relaxed);
-                if requested_freq_hz != connected.last_requested_frequency_hz {
+                let network_request = (network_request != connected.last_requested_frequency_hz).then(|| {
+                    connected.last_requested_frequency_hz = network_request;
+                    network_request
+                });
+                let sync_request = connected.vfo_sync_a_request.take();
+                let request = network_request.or(sync_request);
+                if let Some(requested_freq_hz) = request.filter(|_| !connected.vfo_a_lock) {
                     // requested_freq_hz is whatever a network client wrote
                     // (RF/displayed space -- CAT/rigctl/TCI never see IF),
                     // so convert back to real hardware IF before handing
@@ -6329,7 +6483,6 @@ impl eframe::App for HpsdrApp {
                             connected.ctun_frequency_hz = effective_freq;
                         }
                     }
-                    connected.last_requested_frequency_hz = requested_freq_hz;
                     // settings_changed isn't declared yet at this point in
                     // the frame -- settings_dirty is the established
                     // mechanism for marking a save needed from outside its
@@ -6591,6 +6744,9 @@ impl eframe::App for HpsdrApp {
                 if track_sat_vfo_b(connected, displayed_freq_hz, current_band_name) {
                     connected.settings_dirty.store(true, std::sync::atomic::Ordering::Relaxed);
                 }
+                if track_vfo_sync(connected, displayed_freq_hz, dial_freq_hz) {
+                    connected.settings_dirty.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
                 // TX on VFO B: its transverter's (or IF's) band for the TX
                 // OC outputs and TX antenna -- same resolution as
                 // current_band_name.
@@ -6624,7 +6780,7 @@ impl eframe::App for HpsdrApp {
                 // frequency is applied like a VFO-B keypad entry: RF
                 // space, picking the transverter whose range covers it.
                 let vfo_b_request = connected.session.vfo_b.requested_hz.swap(0, std::sync::atomic::Ordering::Relaxed);
-                if vfo_b_request != 0 {
+                if vfo_b_request != 0 && !connected.vfo_b_lock {
                     let xvtr = xvtr_for_rf_freq(&connected.xvtrs, vfo_b_request);
                     let offset = xvtr.map(xvtr_rf_offset).unwrap_or(0);
                     connected.vfo_b_xvtr = xvtr.map(|x| x.name.clone());
@@ -7010,6 +7166,17 @@ impl eframe::App for HpsdrApp {
                                                 connected.vfo_step_hz = step;
                                                 settings_changed = true;
                                             }
+                                            if ui
+                                                .add(egui::Button::selectable(connected.vfo_a_lock, "Lock"))
+                                                .on_hover_text(
+                                                    "Lock VFO A: nothing retunes it or changes band -- not \
+                                                     the spectrum, MIDI, CAT or TCI. Turns Sync off.",
+                                                )
+                                                .clicked()
+                                            {
+                                                connected.vfo_a_lock = !connected.vfo_a_lock;
+                                                settings_changed = true;
+                                            }
                                         });
                                         let resp = ui
                                             .add(
@@ -7063,9 +7230,11 @@ impl eframe::App for HpsdrApp {
 
                             ui.vertical(|ui| {
                                 ui.horizontal(|ui| {
+                                    let (a_lock, b_lock) = (connected.vfo_a_lock, connected.vfo_b_lock);
                                     if ui
-                                        .button("A>B")
+                                        .add_enabled(!b_lock, egui::Button::new("A>B"))
                                         .on_hover_text("Copy VFO A's frequency (and transverter) to VFO B")
+                                        .on_disabled_hover_text("VFO B is locked")
                                         .clicked()
                                     {
                                         connected.vfo_b_frequency_hz = dial_freq_hz;
@@ -7073,8 +7242,9 @@ impl eframe::App for HpsdrApp {
                                         settings_changed = true;
                                     }
                                     if ui
-                                        .button("B>A")
+                                        .add_enabled(!a_lock, egui::Button::new("B>A"))
                                         .on_hover_text("Retune VFO A to VFO B's frequency (and transverter)")
+                                        .on_disabled_hover_text("VFO A is locked")
                                         .clicked()
                                     {
                                         connected.sat_last = None;
@@ -7101,14 +7271,33 @@ impl eframe::App for HpsdrApp {
                                         }
                                         settings_changed = true;
                                     }
+                                    if ui
+                                        .add_enabled(
+                                            !a_lock && !b_lock,
+                                            egui::Button::selectable(connected.vfo_sync, "Sync"),
+                                        )
+                                        .on_hover_text(
+                                            "Sync: VFO B stays on VFO A's frequency, and tuning either \
+                                             tunes both. Turns Split, Duplex and SAT off.",
+                                        )
+                                        .on_disabled_hover_text("Unlock VFO A and B to sync them")
+                                        .clicked()
+                                    {
+                                        set_vfo_sync(connected, !connected.vfo_sync);
+                                        settings_changed = true;
+                                    }
                                     if setups_menu(ui, connected) {
                                         settings_changed = true;
                                     }
                                 });
                                 ui.horizontal(|ui| {
                                     if ui
-                                        .button("A<>B")
+                                        .add_enabled(
+                                            !connected.vfo_a_lock && !connected.vfo_b_lock,
+                                            egui::Button::new("A<>B"),
+                                        )
                                         .on_hover_text("Swap VFO A and VFO B (and their transverters)")
+                                        .on_disabled_hover_text("A VFO is locked")
                                         .clicked()
                                     {
                                         connected.sat_last = None;
@@ -7219,6 +7408,17 @@ impl eframe::App for HpsdrApp {
                                     ui.vertical(|ui| {
                                         ui.horizontal(|ui| {
                                             ui.label("VFO-B");
+                                            if ui
+                                                .add(egui::Button::selectable(connected.vfo_b_lock, "Lock"))
+                                                .on_hover_text(
+                                                    "Lock VFO B: nothing retunes it -- not A>B, SAT, MIDI, \
+                                                     CAT or TCI. Turns Sync off.",
+                                                )
+                                                .clicked()
+                                            {
+                                                connected.vfo_b_lock = !connected.vfo_b_lock;
+                                                settings_changed = true;
+                                            }
                                             // VFO B's own transverter -- see
                                             // ConnectedState::vfo_b_xvtr.
                                             let names: Vec<String> = connected
@@ -7242,7 +7442,7 @@ impl eframe::App for HpsdrApp {
                                                         "VFO B's transverter -- e.g. a QO-100 uplink, separate \
                                                          from VFO A's downlink. Used for TX with Split/Duplex.",
                                                     );
-                                                if chosen != connected.vfo_b_xvtr {
+                                                if chosen != connected.vfo_b_xvtr && !connected.vfo_b_lock {
                                                     set_vfo_b_xvtr(connected, chosen);
                                                     settings_changed = true;
                                                 }
@@ -7451,7 +7651,9 @@ impl eframe::App for HpsdrApp {
                     // nothing). Inside the main window egui always draws it
                     // on top, and clicking a VFO brings the main
                     // window, and it, forward.
-                    if let Some((vfo_b, freq)) = frequency_entry_window(ui.ctx(), &mut connected.frequency_entry) {
+                    let entered = frequency_entry_window(ui.ctx(), &mut connected.frequency_entry)
+                        .filter(|&(vfo_b, _)| if vfo_b { !connected.vfo_b_lock } else { !connected.vfo_a_lock });
+                    if let Some((vfo_b, freq)) = entered {
                         // VFO-A entry is in RF/displayed space, like a
                         // CAT/rigctl/TCI set: a frequency inside a
                         // configured transverter's RF range selects it and
@@ -8751,7 +8953,7 @@ impl eframe::App for HpsdrApp {
                         // See suppress_refocus_click's own doc comment --
                         // this is the one thing that click-to-refocus the
                         // window must NOT also do.
-                        if spectrum_resp.clicked() && !suppress_refocus_click {
+                        if spectrum_resp.clicked() && !suppress_refocus_click && !connected.vfo_a_lock {
                             let new_freq = freq_at_x(pos.x, rect, freq_hz, sample_rate, connected.spectrum_zoom, pan_offset_hz);
                             let new_freq = cw_center_click_freq(current_mode, new_freq, xvtr_rf_offset_hz);
                             let (effective_freq, retune) =
@@ -8775,7 +8977,7 @@ impl eframe::App for HpsdrApp {
                     // which shifts what a STATIONARY cursor maps to on
                     // the very next frame, so the frequency kept drifting
                     // even after the drag stopped moving (a real report).
-                    if spectrum_resp.dragged() && !suppress_refocus_click {
+                    if spectrum_resp.dragged() && !suppress_refocus_click && !connected.vfo_a_lock {
                         let hz_per_px = (2.0 * visible_half_span_hz) / rect.width().max(1.0) as f64;
                         // Negated when CTUN is off: dragging right pulls
                         // lower frequencies in from the right edge, the
@@ -8823,7 +9025,7 @@ impl eframe::App for HpsdrApp {
 
                     // Scroll-to-tune: active while hovering the frequency
                     // label or the spectrum itself.
-                    if freq_label.hovered() || spectrum_resp.hovered() {
+                    if (freq_label.hovered() || spectrum_resp.hovered()) && !connected.vfo_a_lock {
                         // Over a digit of VFO-A, scrolling steps that digit.
                         let digit_step =
                             if freq_label.hovered() { vfo_digit_under_pointer(ui, &freq_label, 28.0) } else { None };
@@ -8938,7 +9140,7 @@ impl eframe::App for HpsdrApp {
                     // comment), so unlike VFO A's block above there's no
                     // CTUN/passband/retune handling needed here -- just a
                     // plain accumulate-then-step onto the stored value.
-                    if vfo_b_label.hovered() {
+                    if vfo_b_label.hovered() && !connected.vfo_b_lock {
                         let digit_step = vfo_digit_under_pointer(ui, &vfo_b_label, if compact { 22.0 } else { 28.0 });
                         let (delta, scroll_shift, scroll_alt) = scroll_tune_input(ui);
 
@@ -9275,7 +9477,7 @@ impl eframe::App for HpsdrApp {
                         );
                         if let Some(pos) = waterfall_click_resp.interact_pointer_pos() {
                             // See suppress_refocus_click's own doc comment.
-                            if waterfall_click_resp.clicked() && !suppress_refocus_click {
+                            if waterfall_click_resp.clicked() && !suppress_refocus_click && !connected.vfo_a_lock {
                                 let new_freq = freq_at_x(pos.x, rect, freq_hz, sample_rate, connected.spectrum_zoom, pan_offset_hz);
                                 let new_freq = cw_center_click_freq(current_mode, new_freq, xvtr_rf_offset_hz);
                                 let (effective_freq, retune) =
@@ -9293,7 +9495,7 @@ impl eframe::App for HpsdrApp {
                         // treatment above for why this uses drag_delta()
                         // rather than an absolute cursor-position mapping,
                         // and why the sign flips depending on CTUN.
-                        if waterfall_click_resp.dragged() && !suppress_refocus_click {
+                        if waterfall_click_resp.dragged() && !suppress_refocus_click && !connected.vfo_a_lock {
                             let hz_per_px = (2.0 * visible_half_span_hz) / rect.width().max(1.0) as f64;
                             let drag_sign = if connected.ctun { 1.0 } else { -1.0 };
                             connected.drag_tune_accum_hz += drag_sign * waterfall_click_resp.drag_delta().x as f64 * hz_per_px;
@@ -9326,7 +9528,7 @@ impl eframe::App for HpsdrApp {
                         // Shares connected.scroll_accum/zoom_accum with the
                         // spectrum pane -- only one pane can be hovered at
                         // once, so there's no cross-talk.
-                        if waterfall_click_resp.hovered() {
+                        if waterfall_click_resp.hovered() && !connected.vfo_a_lock {
                             let (delta, scroll_shift, scroll_alt) = scroll_tune_input(ui);
 
                             if delta != 0.0 {
@@ -14595,6 +14797,9 @@ impl eframe::App for HpsdrApp {
                         sat_mode: Some(connected.sat_mode.to_config()),
                         vfo_b_xvtr: Some(connected.vfo_b_xvtr.clone().unwrap_or_default()),
                         duplex: Some(connected.duplex),
+                        vfo_a_lock: connected.vfo_a_lock,
+                        vfo_b_lock: connected.vfo_b_lock,
+                        vfo_sync: connected.vfo_sync,
                         setups: connected.setups.clone(),
                         cw_decode_enabled: Some(connected.cw_decode_enabled),
                         psk_beacon_enabled: Some(connected.psk_beacon_enabled),
@@ -14813,6 +15018,9 @@ fn render_datv_window(ctx: &egui::Context, connected: &mut ConnectedState) -> bo
 /// offset below the stream's centre, which leaves room for anything
 /// DATV can receive at that rate.
 fn datv_bring_into_stream(connected: &mut ConnectedState, rate_hz: u32) {
+    if connected.vfo_a_lock {
+        return;
+    }
     let s = &connected.datv_settings;
     let rf_offset = connected.session.rx_rf_offset_hz.load(Ordering::Relaxed);
     let dial_if = connected.session.frequency_hz.load(Ordering::Relaxed) as i64;
@@ -19847,6 +20055,18 @@ fn main() -> eframe::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// VFO Sync: B goes to A when Sync comes on and whenever A moves (even
+    /// if B moved too); A goes to B when only B moved.
+    #[test]
+    fn vfo_sync_follows_whichever_vfo_moved() {
+        assert_eq!(vfo_sync_step(None, 14_200_000, 7_100_000), VfoSyncStep::BFollowsA, "just on");
+        let last = Some((14_200_000, 14_200_000));
+        assert_eq!(vfo_sync_step(last, 14_200_000, 14_200_000), VfoSyncStep::None);
+        assert_eq!(vfo_sync_step(last, 14_201_000, 14_200_000), VfoSyncStep::BFollowsA);
+        assert_eq!(vfo_sync_step(last, 14_200_000, 14_199_000), VfoSyncStep::AFollowsB);
+        assert_eq!(vfo_sync_step(last, 14_201_000, 14_199_000), VfoSyncStep::BFollowsA, "A wins");
+    }
 
     #[test]
     fn vfo_step_is_remembered_per_mode() {

@@ -246,6 +246,11 @@ pub struct ControlRequests {
     /// tx_filter_band_ex: the TX filter's own edges, Hz, as Settings ->
     /// TX -> TX Filter's Low and High (Use RX filter off).
     pub tx_filter: Option<(f64, f64)>,
+    /// vfo_lock / lock: VFO A's and VFO B's Lock buttons.
+    pub vfo_a_lock: Option<bool>,
+    pub vfo_b_lock: Option<bool>,
+    /// vfo_sync_ex, as the Sync button.
+    pub vfo_sync: Option<bool>,
 }
 
 /// The radio's RX front end as TCI's rx_step_att_ex has it: attenuation,
@@ -299,6 +304,11 @@ pub struct TxInfo {
     /// rx_filter_band's -- the RX filter's or its own (see
     /// spectrum::tx_passband_for) -- for TCI's tx_filter_band_ex.
     pub tx_filter: (i32, i32),
+    /// VFO A's and VFO B's Lock, and Sync -- for TCI's lock, vfo_lock and
+    /// vfo_sync_ex.
+    pub vfo_a_lock: bool,
+    pub vfo_b_lock: bool,
+    pub vfo_sync: bool,
 }
 
 /// The saved TX profiles' names and the one chosen ("" for none), for
@@ -413,6 +423,20 @@ impl RemoteShare {
 
     pub fn request_monitor_volume(&self, volume: f32) {
         self.control.lock().unwrap().monitor_volume = Some(volume.clamp(0.0, 1.0));
+    }
+
+    /// VFO A's (false) or VFO B's (true) Lock.
+    pub fn request_vfo_lock(&self, vfo_b: bool, on: bool) {
+        let mut c = self.control.lock().unwrap();
+        if vfo_b {
+            c.vfo_b_lock = Some(on);
+        } else {
+            c.vfo_a_lock = Some(on);
+        }
+    }
+
+    pub fn request_vfo_sync(&self, on: bool) {
+        self.control.lock().unwrap().vfo_sync = Some(on);
     }
 
     pub fn request_tx_profile(&self, name: &str) {

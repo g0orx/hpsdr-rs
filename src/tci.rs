@@ -1076,14 +1076,16 @@ fn handle_client(
     send_logged(&mut ws, &logging, format!("tx_enable:0,{};", !web_receive_only).into());
     send_logged(&mut ws, &logging, format!("split_enable:0,{};", tx_info.split).into());
     // No real value to report for features this project doesn't
-    // implement at all (CW keyer, squelch, VFO lock, calibration,
+    // implement at all (CW keyer, squelch, calibration,
     // preamp/step attenuator) -- a safe/neutral static default (matching
     // Thetis's own example values where they're clearly just
     // "off"/"none") still beats the client getting no reply at all to a
     // field it expects.
     send_logged(&mut ws, &logging, format!("sql_level:0,{};", squelch_to_tci_db(params.squelch_level)).into());
     send_logged(&mut ws, &logging, format!("sql_enable:0,{};", params.squelch_enabled).into());
-    send_logged(&mut ws, &logging, "lock:0,false;".into());
+    for (_, msg) in vfo_lock_state(&remote_share.tx()) {
+        send_logged(&mut ws, &logging, msg.into());
+    }
     // Real values below where this project actually tracks the
     // underlying state (RIT/XIT, CTUN, AGC mode, noise blanker/
     // reduction, audio gain, filter passband, frequency/mode/dds).
@@ -1101,7 +1103,6 @@ fn handle_client(
     for (_, msg) in rx_att_state(&remote_share.tx()) {
         send_logged(&mut ws, &logging, msg.into());
     }
-    send_logged(&mut ws, &logging, "vfo_sync_ex:false;".into());
     send_logged(&mut ws, &logging, format!("rx_balance:0,0,{:.2};", pan_to_balance(params.audio_pan)).into());
     send_logged(&mut ws, &logging, format!("rx_volume:0,0,{:.2};", gain_to_tci_db(params.gain)).into());
     send_logged(&mut ws, &logging, format!("volume:{:.1};", gain_to_tci_db(params.gain).clamp(-60.0, 0.0)).into());
@@ -2220,6 +2221,7 @@ fn live_state(
         .map(|(k, m)| (k.to_string(), m)),
     );
     out.extend(tx_profile_state(share));
+    out.extend(vfo_lock_state(tx));
     out.extend(rx_att_state(tx));
     out.extend(tx_frequency_state(rx_frequency_hz, vfo_b, xit_enabled, xit_offset_hz, share));
     out
@@ -2322,6 +2324,18 @@ fn tx_profile_state(share: &crate::remote::RemoteShare) -> Vec<(String, String)>
     vec![
         ("tx_profiles_ex".to_string(), format!("tx_profiles_ex:{names};")),
         ("tx_profile_ex".to_string(), format!("tx_profile_ex:{current};")),
+    ]
+}
+
+/// VFO A's and VFO B's Lock and Sync, as Thetis reports them without RX2
+/// (TCIServer.cs sendLock, sendAllVFOLocks): lock:0 and vfo_lock:0,0 are
+/// VFO A, vfo_lock:0,1 VFO B; then vfo_sync_ex.
+fn vfo_lock_state(tx: &crate::remote::TxInfo) -> Vec<(String, String)> {
+    vec![
+        ("lock:0".to_string(), format!("lock:0,{};", tx.vfo_a_lock)),
+        ("vfo_lock:0,0".to_string(), format!("vfo_lock:0,0,{};", tx.vfo_a_lock)),
+        ("vfo_lock:0,1".to_string(), format!("vfo_lock:0,1,{};", tx.vfo_b_lock)),
+        ("vfo_sync_ex".to_string(), format!("vfo_sync_ex:{};", tx.vfo_sync)),
     ]
 }
 
@@ -2729,6 +2743,41 @@ fn control_command(cmd: &str, share: &crate::remote::RemoteShare, params: &Mutex
                 None => Some(tx_profile_state(share)[1].1.clone()),
             });
         }
+        // As Thetis without RX2 (TCIServer.cs handleLock, handleVFOLock):
+        // lock:0 is VFO A, lock:1 VFO B; vfo_lock:0,0 VFO A, vfo_lock:0,1
+        // VFO B, any other receiver or VFO nothing. With the value it's
+        // set (reported live), without it answered.
+        "lock" | "vfo_lock" => {
+            let vfo_b = match (name.as_str(), args.first().copied(), args.get(1).copied()) {
+                ("lock", Some("0"), _) | ("vfo_lock", Some("0"), Some("0")) => false,
+                ("lock", Some("1"), _) | ("vfo_lock", Some("0"), Some("1")) => true,
+                _ => return Some(None),
+            };
+            let value = args.get(if name == "lock" { 1 } else { 2 });
+            return Some(match value.and_then(|v| v.to_ascii_lowercase().parse::<bool>().ok()) {
+                Some(on) => {
+                    share.request_vfo_lock(vfo_b, on);
+                    None
+                }
+                None => {
+                    let on = if vfo_b { tx.vfo_b_lock } else { tx.vfo_a_lock };
+                    Some(if name == "lock" {
+                        format!("lock:{},{on};", args[0])
+                    } else {
+                        format!("vfo_lock:0,{},{on};", args[1])
+                    })
+                }
+            });
+        }
+        "vfo_sync_ex" => {
+            return Some(match args.first().and_then(|v| v.to_ascii_lowercase().parse::<bool>().ok()) {
+                Some(on) => {
+                    share.request_vfo_sync(on);
+                    None
+                }
+                None => Some(format!("vfo_sync_ex:{};", tx.vfo_sync)),
+            });
+        }
         "tx_filter_band_ex" => {
             let edges = (args.first().and_then(|v| v.parse::<f64>().ok()), args.get(1).and_then(|v| v.parse::<f64>().ok()));
             return Some(match edges {
@@ -2983,6 +3032,9 @@ fn live_families(name: &str) -> &'static [&'static str] {
         "rx_step_att_ex" => &["rx_step_att_ex"],
         "tx_profile_ex" => &["tx_profile_ex", "tx_filter_band_ex"],
         "tx_filter_band_ex" => &["tx_filter_band_ex"],
+        // A lock turns Sync off; Sync turns Split off and moves VFO B.
+        "lock" | "vfo_lock" => &["lock", "vfo_lock", "vfo_sync_ex"],
+        "vfo_sync_ex" => &["vfo_sync_ex", "split_enable", "vfo", "if", "tx_frequency", "tx_frequency_ex"],
         "vfo_swap_ex" => &["vfo", "if", "dds", "tx_frequency", "tx_frequency_ex"],
         "rx_anf_enable" => &["rx_anf_enable"],
         "rx_bin_enable" => &["rx_bin_enable"],
@@ -4766,6 +4818,81 @@ mod remote_tests {
         server.set_tx_info(crate::remote::TxInfo { available: true, tx_filter: (-2800, -200), ..Default::default() });
         let got = read_for(&mut ws, 700);
         assert!(got.iter().any(|m| m == "tx_filter_band_ex:-2800,-200"), "{got:?}");
+        server.stop();
+    }
+
+    /// lock, vfo_lock and vfo_sync_ex, as Thetis without RX2: reported at
+    /// connect and live, answered, and set through main.rs; vfo_lock on
+    /// another receiver or VFO is ignored.
+    #[test]
+    fn a_client_locks_and_syncs_the_vfos() {
+        let port = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let mut server = TciServer::start(
+            &format!("127.0.0.1:{port}"),
+            Arc::new(AtomicU64::new(7_100_000)),
+            Arc::new(AtomicU64::new(7_100_000)),
+            Arc::new(AtomicU32::new(7_100_000)),
+            Arc::new(AtomicI64::new(0)),
+            Arc::new(crate::radio::VfoBShared::default()),
+            Arc::new(AtomicU32::new(192_000)),
+            Arc::new(Mutex::new(DemodParams::default())),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicU32::new(7_100_000)),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(Mutex::new(VecDeque::new())),
+            Arc::new(Mutex::new(VecDeque::new())),
+            Arc::new(Mutex::new(VecDeque::new())),
+            Arc::new(Mutex::new(1.0)),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicI32::new(0)),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicI32::new(0)),
+            "Test".to_string(),
+            Arc::new(crate::radio::CwKeyerAtomics::default()),
+            DebugLog::new(std::env::temp_dir().join("hpsdr-rs-tci-vfo-lock-test.log")),
+        )
+        .unwrap();
+        server.set_tx_info(crate::remote::TxInfo { available: true, vfo_b_lock: true, ..Default::default() });
+        let (mut ws, _) = tungstenite::connect(format!("ws://127.0.0.1:{port}")).unwrap();
+        if let tungstenite::stream::MaybeTlsStream::Plain(s) = ws.get_ref() {
+            s.set_read_timeout(Some(Duration::from_millis(10))).unwrap();
+        }
+        let read_for = |ws: &mut tungstenite::WebSocket<tungstenite::stream::MaybeTlsStream<TcpStream>>, ms: u64| {
+            let mut got = Vec::new();
+            let start = Instant::now();
+            while start.elapsed() < Duration::from_millis(ms) {
+                if let Ok(Message::Text(t)) = ws.read() {
+                    got.extend(t.split(';').filter(|m| !m.is_empty()).map(str::to_string));
+                }
+            }
+            got
+        };
+        let got = read_for(&mut ws, 300);
+        for want in ["lock:0,false", "vfo_lock:0,0,false", "vfo_lock:0,1,true", "vfo_sync_ex:false"] {
+            assert!(got.iter().any(|m| m == want), "no {want} at connect in {got:?}");
+        }
+
+        ws.send(Message::Text("lock:0;lock:1;vfo_lock:0,1;vfo_sync_ex;".into())).unwrap();
+        let got = read_for(&mut ws, 200);
+        for want in ["lock:0,false", "lock:1,true", "vfo_lock:0,1,true", "vfo_sync_ex:false"] {
+            assert!(got.iter().any(|m| m == want), "no {want} in {got:?}");
+        }
+
+        ws.send(Message::Text("vfo_lock:0,0,true;vfo_lock:1,0,true;vfo_sync_ex:true;".into())).unwrap();
+        read_for(&mut ws, 200);
+        let control = server.take_control();
+        assert_eq!((control.vfo_a_lock, control.vfo_b_lock, control.vfo_sync), (Some(true), None, Some(true)));
+        ws.send(Message::Text("lock:1,false;".into())).unwrap();
+        read_for(&mut ws, 200);
+        assert_eq!(server.take_control().vfo_b_lock, Some(false));
+
+        // Live.
+        server.set_tx_info(crate::remote::TxInfo { available: true, vfo_a_lock: true, vfo_sync: false, ..Default::default() });
+        let got = read_for(&mut ws, 700);
+        for want in ["lock:0,true", "vfo_lock:0,0,true", "vfo_lock:0,1,false"] {
+            assert!(got.iter().any(|m| m == want), "no {want} in {got:?}");
+        }
         server.stop();
     }
 
