@@ -384,6 +384,27 @@ unsafe extern "C" {
     pub fn RXANBPSetNotchesRun(channel: ::std::os::raw::c_int, run: ::std::os::raw::c_int);
 }
 unsafe extern "C" {
+    pub fn RXANBPDeleteNotch(channel: ::std::os::raw::c_int, notch: ::std::os::raw::c_int) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn RXANBPGetNumNotches(channel: ::std::os::raw::c_int, nnotches: *mut ::std::os::raw::c_int);
+}
+unsafe extern "C" {
+    pub fn SetRXASPCWSelection(channel: ::std::os::raw::c_int, selection: ::std::os::raw::c_int);
+}
+unsafe extern "C" {
+    pub fn SetRXASPCWRun(channel: ::std::os::raw::c_int, run: ::std::os::raw::c_int);
+}
+unsafe extern "C" {
+    pub fn SetRXASPCWFreq(channel: ::std::os::raw::c_int, f_center: f64);
+}
+unsafe extern "C" {
+    pub fn SetRXASPCWBandwidth(channel: ::std::os::raw::c_int, bandwidth: f64);
+}
+unsafe extern "C" {
+    pub fn SetRXASPCWGain(channel: ::std::os::raw::c_int, gain: f64);
+}
+unsafe extern "C" {
     pub fn RXANBPSetTuneFrequency(channel: ::std::os::raw::c_int, tunefreq: f64);
 }
 unsafe extern "C" {

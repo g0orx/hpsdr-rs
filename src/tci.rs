@@ -1107,8 +1107,8 @@ fn handle_client(
     send_logged(&mut ws, &logging, format!("rx_volume:0,0,{:.2};", gain_to_tci_db(params.gain)).into());
     send_logged(&mut ws, &logging, format!("volume:{:.1};", gain_to_tci_db(params.gain).clamp(-60.0, 0.0)).into());
     send_logged(&mut ws, &logging, format!("agc_gain:0,{};", params.agc_top_db.round() as i64).into());
-    send_logged(&mut ws, &logging, "rx_nf_enable:0,false;".into());
-    send_logged(&mut ws, &logging, "rx_apf_enable:0,false;".into());
+    send_logged(&mut ws, &logging, format!("rx_nf_enable:0,{};", crate::spectrum::tnf()).into());
+    send_logged(&mut ws, &logging, format!("rx_apf_enable:0,{};", params.apf).into());
     send_logged(&mut ws, &logging, format!("rx_anf_enable:0,{};", params.anf).into());
     send_logged(&mut ws, &logging, format!("rx_bin_enable:0,{};", params.binaural).into());
     // ROOT CAUSE FIX: stage was hardcoded to 0 here regardless of which
@@ -2292,6 +2292,9 @@ fn receiver_live_state(rx: u32, f: &Rx2State, params: &DemodParams) -> Vec<(Stri
         (format!("rx_volume:{rx},0"), format!("rx_volume:{rx},0,{:.2};", gain_to_tci_db(params.gain))),
         (format!("agc_gain:{rx}"), format!("agc_gain:{rx},{};", params.agc_top_db.round() as i64)),
         (format!("rx_anf_enable:{rx}"), format!("rx_anf_enable:{rx},{};", params.anf)),
+        (format!("rx_apf_enable:{rx}"), format!("rx_apf_enable:{rx},{};", params.apf)),
+        // TNF is every receiver's, as Thetis's (GetMNF).
+        (format!("rx_nf_enable:{rx}"), format!("rx_nf_enable:{rx},{};", crate::spectrum::tnf())),
         (format!("rx_bin_enable:{rx}"), format!("rx_bin_enable:{rx},{};", params.binaural)),
         (format!("rx_nb_enable_ex:{rx}"), format!("rx_nb_enable_ex:{rx},{nb_on},{nb_stage};")),
         (format!("rx_nb_enable:{rx}"), format!("rx_nb_enable:{rx},{nb_on};")),
@@ -2531,6 +2534,8 @@ const RECEIVER_COMMANDS: &[&str] = &[
     "rx_nr_enable",
     "rx_nr_enable_ex",
     "rx_anf_enable",
+    "rx_apf_enable",
+    "rx_nf_enable",
     "rx_bin_enable",
     "rit_enable",
     "rit_offset",
@@ -3037,6 +3042,8 @@ fn live_families(name: &str) -> &'static [&'static str] {
         "vfo_sync_ex" => &["vfo_sync_ex", "split_enable", "vfo", "if", "tx_frequency", "tx_frequency_ex"],
         "vfo_swap_ex" => &["vfo", "if", "dds", "tx_frequency", "tx_frequency_ex"],
         "rx_anf_enable" => &["rx_anf_enable"],
+        "rx_apf_enable" => &["rx_apf_enable"],
+        "rx_nf_enable" => &["rx_nf_enable"],
         "rx_bin_enable" => &["rx_bin_enable"],
         "rx_nb_enable" | "rx_nb_enable_ex" | "rx_nb2_enable" => &["rx_nb_enable", "rx_nb_enable_ex", "rx_nb2_enable"],
         "rx_nr_enable" | "rx_nr_enable_ex" => &["rx_nr_enable", "rx_nr_enable_ex"],
@@ -3479,6 +3486,27 @@ fn handle_command(
                     Some(format!("rx_anf_enable:{recv},{on};"))
                 }
             }
+        }
+        // rx_apf_enable:receiver[,bool]; -- the CW Audio Peak Filter
+        // (DemodParams::apf), set or asked as rx_anf_enable above. As
+        // Thetis's (TCIServer.cs handleRxApfEnable) it can be on in any
+        // mode but only runs in CW.
+        "rx_apf_enable" => {
+            let recv = args.first().unwrap_or(&"0");
+            if let Some(on) = args.get(1).and_then(|v| v.trim().to_ascii_lowercase().parse::<bool>().ok()) {
+                demod_params.lock().unwrap().apf = on;
+            }
+            Some(format!("rx_apf_enable:{recv},{};", demod_params.lock().unwrap().apf))
+        }
+        // rx_nf_enable:receiver[,bool]; -- TNF, the manual notches' master
+        // switch, which is every receiver's: as Thetis's handleRxNfEnable
+        // (TNFActive), whichever receiver it names.
+        "rx_nf_enable" => {
+            let recv = args.first().unwrap_or(&"0");
+            if let Some(on) = args.get(1).and_then(|v| v.trim().to_ascii_lowercase().parse::<bool>().ok()) {
+                crate::spectrum::set_tnf(on);
+            }
+            Some(format!("rx_nf_enable:{recv},{};", crate::spectrum::tnf()))
         }
         // rx_bin_enable:receiver[,bool]; -- same bare-query-or-set
         // pattern as rx_anf_enable above. See DemodParams::binaural's
@@ -4383,6 +4411,20 @@ mod remote_tests {
         for want in ["agc_mode:0,fast", "agc_gain:0,90", "sql_enable:0,true", "sql_level:0,-70", "volume:-20.0", "tune:0,false"] {
             assert!(later.iter().any(|m| m == want), "no {want} in {later:?}");
         }
+
+        // APF (this receiver's) and TNF (every receiver's), as Thetis's
+        // rx_apf_enable/rx_nf_enable: set, asked, and a bad value ignored.
+        ws.send(Message::Text("rx_apf_enable:0,true;rx_nf_enable:0,true;".into())).unwrap();
+        let got = read_for(&mut ws, 200);
+        for want in ["rx_apf_enable:0,true", "rx_nf_enable:0,true"] {
+            assert!(got.iter().any(|m| m == want), "no {want} in {got:?}");
+        }
+        assert!(params.lock().unwrap().apf && crate::spectrum::tnf());
+        ws.send(Message::Text("rx_apf_enable:0,maybe;rx_nf_enable:0,false;rx_apf_enable:0;".into())).unwrap();
+        let got = read_for(&mut ws, 200);
+        assert!(got.iter().any(|m| m == "rx_nf_enable:0,false"), "{got:?}");
+        assert!(got.iter().filter(|m| *m == "rx_apf_enable:0,true").count() == 2, "{got:?}");
+        assert!(!crate::spectrum::tnf());
         server.stop();
     }
 

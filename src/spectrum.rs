@@ -154,6 +154,103 @@ pub fn set_cw_pitch_hz(hz: f64) {
     CW_PITCH_HZ.store(clamped, Ordering::Relaxed);
 }
 
+/// The CW Audio Peak Filter's (APF) settings, shared by every receiver
+/// like the CW pitch above; each receiver only has its own on/off
+/// (DemodParams::apf). As Thetis's Settings -> DSP -> Audio -> APF: the
+/// filter type, a tune offset from the CW pitch, the bandwidth, and a
+/// 0-100 gain that WDSP gets as 10^(gain/200) (0 = unity, 100 = +10 dB).
+/// Defaults are Thetis's: Bi-Quad, 150 Hz, no offset, unity gain.
+#[derive(Copy, Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct ApfSettings {
+    /// WDSP's SetRXASPCWSelection: 0 Double Pole, 1 Matched, 2 Gaussian,
+    /// 3 Bi-Quad.
+    pub kind: u8,
+    /// Hz from the CW pitch, -250..250.
+    pub tune_hz: i32,
+    /// Approximate -3 dB bandwidth, 10..150 Hz.
+    pub bandwidth_hz: i32,
+    /// 0..100, see above.
+    pub gain: i32,
+}
+
+pub const APF_KINDS: [&str; 4] = ["Double Pole", "Matched", "Gaussian", "Bi-Quad"];
+
+impl ApfSettings {
+    pub const DEFAULT: Self = Self { kind: 3, tune_hz: 0, bandwidth_hz: 150, gain: 0 };
+
+    pub fn clamped(self) -> Self {
+        Self {
+            kind: self.kind.min(3),
+            tune_hz: self.tune_hz.clamp(-250, 250),
+            bandwidth_hz: self.bandwidth_hz.clamp(10, 150),
+            gain: self.gain.clamp(0, 100),
+        }
+    }
+}
+
+impl Default for ApfSettings {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
+
+static APF_SETTINGS: Mutex<ApfSettings> = Mutex::new(ApfSettings::DEFAULT);
+
+pub fn apf_settings() -> ApfSettings {
+    *APF_SETTINGS.lock().unwrap()
+}
+
+pub fn set_apf_settings(s: ApfSettings) {
+    *APF_SETTINGS.lock().unwrap() = s.clamped();
+}
+
+/// One manual notch (Thetis's TNF notches): an RF frequency -- what the
+/// VFO shows, transverter included -- and a width, both Hz. It stays at
+/// that frequency whatever the receiver is tuned to.
+#[derive(Copy, Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Notch {
+    pub frequency_hz: f64,
+    pub width_hz: f64,
+}
+
+/// The manual notches and TNF, Thetis's master switch for them, shared
+/// by every receiver as in Thetis. `generation` moves on every change, so
+/// each receiver's thread reloads WDSP's notch list only then.
+struct NotchState {
+    generation: u64,
+    tnf: bool,
+    notches: Vec<Notch>,
+}
+
+static NOTCHES: Mutex<NotchState> = Mutex::new(NotchState { generation: 0, tnf: false, notches: Vec::new() });
+
+/// Most notches kept -- WDSP's notch list holds 1024; this is plenty.
+pub const MAX_NOTCHES: usize = 64;
+
+pub fn notches() -> Vec<Notch> {
+    NOTCHES.lock().unwrap().notches.clone()
+}
+
+pub fn set_notches(notches: Vec<Notch>) {
+    let mut s = NOTCHES.lock().unwrap();
+    s.notches = notches;
+    s.notches.truncate(MAX_NOTCHES);
+    s.generation += 1;
+}
+
+pub fn tnf() -> bool {
+    NOTCHES.lock().unwrap().tnf
+}
+
+pub fn set_tnf(on: bool) {
+    let mut s = NOTCHES.lock().unwrap();
+    if s.tnf != on {
+        s.tnf = on;
+        s.generation += 1;
+    }
+}
+
 /// Computes passband edges (Hz, relative to the tuned/dial frequency)
 /// from mode + a single "width" control. This is our own UI convention,
 /// not a WDSP requirement -- WDSP just takes whatever edges it's given
@@ -579,6 +676,9 @@ pub struct DemodParams {
     /// no mutually-exclusive cycle to fold into). Targets a steady
     /// heterodyne/carrier within the passband, not broadband noise.
     pub anf: bool,
+    /// CW Audio Peak Filter on/off; it only runs in CWL/CWU, as Thetis's.
+    /// Its settings are shared -- see ApfSettings.
+    pub apf: bool,
     /// Squelch: on/off and a 0-100 level (0 = open, 100 = tightest),
     /// mapped per mode onto WDSP's three squelches -- see Squelch.
     pub squelch_enabled: bool,
@@ -609,11 +709,12 @@ pub struct DemodParams {
     /// Only meaningful while ctun is true; ignored (and reset to 0 on
     /// the wire) while false.
     pub ctun_offset_hz: f64,
-    /// The actual hardware-tuned (LO) frequency, mirrored here every
-    /// frame from main.rs's RadioSession/ExtraReceiver state purely so
-    /// demod() can pass it to RXANBPSetTuneFrequency while CTUN is off
-    /// -- radio.rs/main.rs own the real value, this is just a read-only
-    /// copy for the analyzer thread.
+    /// The actual hardware-tuned (LO) frequency as RF -- the transverter
+    /// offset added, as the VFO shows it -- mirrored here every frame
+    /// from main.rs's RadioSession/ExtraReceiver state purely so demod()
+    /// can pass it to RXANBPSetTuneFrequency, which places the manual
+    /// notches (Notch) -- radio.rs/main.rs own the real value, this is
+    /// just a read-only copy for the analyzer thread.
     pub lo_frequency_hz: f64,
     /// See EqualizerParams's doc comment. One instance per receiver --
     /// every extra receiver window has its own DemodParams (and thus its
@@ -726,6 +827,7 @@ impl Default for DemodParams {
             nnr_premium: false,
             snb: false,
             anf: false,
+            apf: false,
             squelch_enabled: false,
             squelch_level: 30.0,
             binaural: false,
@@ -873,6 +975,11 @@ struct SpectrumAnalyzer {
     last_nnr_params: Option<(f64, c_int)>,
     last_snb_enabled: Option<bool>,
     last_anf_enabled: Option<bool>,
+    /// What the APF was last set to: run, (kind, centre Hz, bandwidth,
+    /// gain) -- see ApfSettings.
+    last_apf: Option<(bool, u8, f64, f64, f64)>,
+    /// NotchState::generation last loaded into WDSP.
+    last_notch_generation: Option<u64>,
     last_squelch: Option<Squelch>,
     last_binaural: Option<bool>,
     last_ctun: Option<bool>,
@@ -1256,6 +1363,8 @@ impl SpectrumAnalyzer {
                 last_nnr_params: None,
                 last_snb_enabled: None,
                 last_anf_enabled: None,
+                last_apf: None,
+                last_notch_generation: None,
                 last_squelch: None,
                 last_binaural: None,
                 last_ctun: None,
@@ -1577,6 +1686,51 @@ impl SpectrumAnalyzer {
             self.last_anf_enabled = Some(params.anf);
         }
 
+        // APF -- see ApfSettings. As Thetis (setup.cs
+        // chkDSPRX1APFEnable_CheckedChanged): runs only in CW, centred on
+        // the CW pitch plus the tune offset, the gain as 10^(gain/200).
+        let apf = apf_settings();
+        let apf_now = (
+            params.apf && matches!(params.mode, Mode::Cwl | Mode::Cwu),
+            apf.kind,
+            cw_pitch_hz() + apf.tune_hz as f64,
+            apf.bandwidth_hz as f64,
+            10f64.powf(apf.gain as f64 / 200.0),
+        );
+        if self.last_apf != Some(apf_now) {
+            let (run, kind, freq, bandwidth, gain) = apf_now;
+            unsafe {
+                wdsp::SetRXASPCWFreq(self.channel, freq);
+                wdsp::SetRXASPCWBandwidth(self.channel, bandwidth);
+                wdsp::SetRXASPCWGain(self.channel, gain);
+                wdsp::SetRXASPCWSelection(self.channel, kind as c_int);
+                wdsp::SetRXASPCWRun(self.channel, run as c_int);
+            }
+            self.last_apf = Some(apf_now);
+        }
+
+        // Manual notches and TNF -- see NotchState. WDSP's list is
+        // reloaded whole on any change; the notches are RF frequencies,
+        // placed through RXANBPSetTuneFrequency below.
+        let notch_update = {
+            let s = NOTCHES.lock().unwrap();
+            (self.last_notch_generation != Some(s.generation)).then(|| (s.generation, s.tnf, s.notches.clone()))
+        };
+        if let Some((generation, tnf, notches)) = notch_update {
+            unsafe {
+                let mut n: c_int = 0;
+                wdsp::RXANBPGetNumNotches(self.channel, &mut n);
+                for _ in 0..n {
+                    wdsp::RXANBPDeleteNotch(self.channel, 0);
+                }
+                for (i, notch) in notches.iter().enumerate() {
+                    wdsp::RXANBPAddNotch(self.channel, i as c_int, notch.frequency_hz, notch.width_hz, 1);
+                }
+                wdsp::RXANBPSetNotchesRun(self.channel, tnf as c_int);
+            }
+            self.last_notch_generation = Some(generation);
+        }
+
         // Squelch -- see Squelch. Exactly one of WDSP's three runs (or
         // none), re-sent whenever the mode, level or on/off changes.
         let squelch = Squelch::for_mode(params.mode, params.squelch_enabled, params.squelch_level);
@@ -1630,12 +1784,10 @@ impl SpectrumAnalyzer {
         // (rustyHPSDR). SetRXAShiftFreq shifts the IQ into the RXA
         // demod chain so the passband tracks the CTUN'd frequency
         // without retuning the radio; RXANBPSetShiftFrequency keeps the
-        // noise-blanker preprocessor's own frequency reference in sync
-        // with that same shift. These are mutually exclusive with
-        // RXANBPSetTuneFrequency below -- the NBP object tracks either
-        // an absolute tuned frequency or a shift, never both at once,
-        // matching the reference's own if/else (never both branches in
-        // the same call).
+        // notch filter's own frequency reference in sync with that same
+        // shift. RXANBPSetTuneFrequency below is sent either way: WDSP
+        // places the manual notches at tune frequency + shift, and
+        // Thetis sets both (console.cs, radio.cs RXOsc).
         if params.ctun {
             if self.last_ctun != Some(true) {
                 unsafe {
@@ -1655,16 +1807,17 @@ impl SpectrumAnalyzer {
                 unsafe {
                     wdsp::SetRXAShiftFreq(self.channel, 0.0);
                     wdsp::SetRXAShiftRun(self.channel, 0);
+                    wdsp::RXANBPSetShiftFrequency(self.channel, 0.0);
                 }
                 self.last_ctun = Some(false);
                 self.last_ctun_offset = Some(0.0);
             }
-            if self.last_lo_frequency != Some(params.lo_frequency_hz) {
-                unsafe {
-                    wdsp::RXANBPSetTuneFrequency(self.channel, params.lo_frequency_hz);
-                }
-                self.last_lo_frequency = Some(params.lo_frequency_hz);
+        }
+        if self.last_lo_frequency != Some(params.lo_frequency_hz) {
+            unsafe {
+                wdsp::RXANBPSetTuneFrequency(self.channel, params.lo_frequency_hz);
             }
+            self.last_lo_frequency = Some(params.lo_frequency_hz);
         }
 
         for (i, s) in samples.iter().enumerate() {
@@ -2464,6 +2617,12 @@ impl SpectrumHandle {
     pub fn set_anf(&self, v: bool) {
         self.demod_params.lock().unwrap().anf = v;
     }
+    pub fn apf(&self) -> bool {
+        self.demod_params.lock().unwrap().apf
+    }
+    pub fn set_apf(&self, v: bool) {
+        self.demod_params.lock().unwrap().apf = v;
+    }
 
     pub fn squelch_enabled(&self) -> bool {
         self.demod_params.lock().unwrap().squelch_enabled
@@ -2627,6 +2786,101 @@ mod level_tests {
             }
         }
         (sum / count as f64).sqrt()
+    }
+
+    /// As level(), with any DemodParams (lo_frequency_hz, CTUN, APF...).
+    fn level_with(ch: i32, params: DemodParams, make: &dyn Fn(usize) -> (f64, f64)) -> f64 {
+        let mut a = SpectrumAnalyzer::open(ch, 48_000);
+        let pb = passband_for(params.mode, params.width_hz);
+        let (mut sum, mut count) = (0.0, 0usize);
+        for b in 0..300 {
+            let iq: Vec<IqSample> = (0..BUFFER_SIZE)
+                .map(|k| {
+                    let (re, im) = make(b * BUFFER_SIZE + k);
+                    IqSample { i: (re * IQ_NORM) as i32, q: (im * IQ_NORM) as i32 }
+                })
+                .collect();
+            let out = a.demod(&iq, params, pb);
+            if b >= 150 {
+                for (l, _) in out {
+                    sum += (l as f64) * (l as f64);
+                    count += 1;
+                }
+            }
+        }
+        (sum / count as f64).sqrt()
+    }
+
+    /// The manual notches and the APF in the real WDSP chain: a notch at
+    /// a tone's RF frequency (LO + its offset, with and without CTUN)
+    /// takes it out only with TNF on, one elsewhere doesn't; the APF
+    /// lifts a tone on the CW pitch against one off it. Ignored: WDSP
+    /// channels and the shared notch list -- run alone with
+    /// `cargo test --bin hpsdr-rs notches_and_apf -- --ignored --test-threads=1`.
+    #[test]
+    #[ignore]
+    fn notches_and_apf_act_where_they_should() {
+        let tau = std::f64::consts::TAU;
+        let fs = 48_000.0;
+        let lo = 14_000_000.0;
+        // Which sign of baseband offset USB hears (see IqSample's
+        // real/imaginary note): the louder of the two.
+        let tone = |f: f64| move |n: usize| {
+            let p = tau * f * n as f64 / fs;
+            (1e-3 * p.cos(), 1e-3 * p.sin())
+        };
+        let usb = DemodParams { mode: Mode::Usb, width_hz: 2700.0, agc: Agc::Off, lo_frequency_hz: lo, ..DemodParams::default() };
+        let sign = if level_with(23, usb, &tone(1000.0)) > level_with(23, usb, &tone(-1000.0)) { 1.0 } else { -1.0 };
+        // main.rs's CTUN offset is + when listening above the LO: check
+        // that holds here (narrow CW filter, so only one sign hears it).
+        {
+            let cw = DemodParams { mode: Mode::Cwu, width_hz: 200.0, ctun: true, ..usb };
+            let at = sign * (500.0 + cw_pitch_hz());
+            let up = level_with(30, DemodParams { ctun_offset_hz: 500.0, ..cw }, &tone(at));
+            let down = level_with(30, DemodParams { ctun_offset_hz: -500.0, ..cw }, &tone(at));
+            assert!(up > 100.0 * down, "CTUN +500 listens 500 Hz above the LO");
+        }
+        let db = |v: f64| 20.0 * v.log10();
+
+        let cases: [(&str, DemodParams, f64, f64); 3] = [
+            ("no CTUN", usb, 1000.0, lo + 1000.0),
+            // CTUN 500 Hz up: a tone 1500 Hz above the LO is heard at 1000.
+            ("CTUN", DemodParams { ctun: true, ctun_offset_hz: 500.0, ..usb }, 1500.0, lo + 1500.0),
+            // A transverter-style RF tune frequency.
+            ("RF LO", DemodParams { lo_frequency_hz: 144_000_000.0, ..usb }, 1000.0, 144_001_000.0),
+        ];
+        for (i, (name, params, offset, rf)) in cases.into_iter().enumerate() {
+            let ch = 24 + i as i32;
+            let make = tone(sign * offset);
+            set_notches(vec![Notch { frequency_hz: rf, width_hz: 200.0 }]);
+            set_tnf(false);
+            let off = level_with(ch, params, &make);
+            set_tnf(true);
+            let on = level_with(ch, params, &make);
+            set_notches(vec![Notch { frequency_hz: rf + 600.0, width_hz: 200.0 }]);
+            let elsewhere = level_with(ch, params, &make);
+            println!("{name}: TNF off {:.1} dB, on {:.1} dB, notch 600 Hz away {:.1} dB", db(off), db(on), db(elsewhere));
+            assert!(db(off) - db(on) > 20.0, "{name}: the notch takes the tone out");
+            assert!((db(off) - db(elsewhere)).abs() < 1.5, "{name}: a notch elsewhere leaves it");
+        }
+        set_notches(Vec::new());
+        set_tnf(false);
+
+        // APF: CWU, peak on the pitch, full gain, narrow.
+        set_apf_settings(ApfSettings { kind: 3, tune_hz: 0, bandwidth_hz: 50, gain: 100 });
+        let cw = DemodParams { mode: Mode::Cwu, width_hz: 500.0, ..usb };
+        let pitch = cw_pitch_hz();
+        let ratio = |apf: bool| {
+            let p = DemodParams { apf, ..cw };
+            db(level_with(27, p, &tone(sign * pitch))) - db(level_with(28, p, &tone(sign * (pitch + 150.0))))
+        };
+        let (without, with) = (ratio(false), ratio(true));
+        println!("APF: on-pitch vs 150 Hz off, without {without:.1} dB, with {with:.1} dB");
+        assert!(with - without > 6.0, "the APF lifts the pitch against 150 Hz off it");
+        // Not in USB.
+        let usb_apf = |apf: bool| db(level_with(29, DemodParams { apf, ..usb }, &tone(sign * pitch)));
+        assert!((usb_apf(true) - usb_apf(false)).abs() < 0.5, "no APF outside CW");
+        set_apf_settings(ApfSettings::DEFAULT);
     }
 
     /// Measurement, not a check: prints the demodulated level of a

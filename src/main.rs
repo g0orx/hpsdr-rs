@@ -3744,6 +3744,9 @@ struct ConnectedState {
     /// VFO A's frequency (RF) Sync wants after VFO B was tuned: applied
     /// next frame as a network client's request is.
     vfo_sync_a_request: Option<u64>,
+    /// The RF frequency the spectrum was right-clicked at, for its notch
+    /// menu (see spectrum::Notch).
+    notch_menu_hz: Option<f64>,
     /// Named setups (the Setups menu; see SavedSetup), and the name being
     /// typed there to save the current one under.
     setups: Vec<config::SavedSetup>,
@@ -5243,6 +5246,10 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
             if let Some(v) = cfg.anf {
                 spectrum.set_anf(v);
             }
+            spectrum.set_apf(cfg.apf);
+            spectrum::set_apf_settings(cfg.apf_settings);
+            spectrum::set_notches(cfg.notches.clone());
+            spectrum::set_tnf(cfg.tnf);
             if let Some(v) = cfg.squelch_enabled {
                 spectrum.set_squelch_enabled(v);
             }
@@ -5568,6 +5575,7 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                 vfo_sync: cfg.vfo_sync,
                 vfo_sync_last: None,
                 vfo_sync_a_request: None,
+                notch_menu_hz: None,
                 setups: cfg.setups.clone(),
                 setup_name: String::new(),
                 window_title: String::new(),
@@ -6598,7 +6606,6 @@ impl eframe::App for HpsdrApp {
                 } else {
                     0.0
                 };
-                connected.spectrum.set_lo_frequency_hz(freq_hz as f64);
                 // RIT ("Receiver Incremental Tuning"): summed into the
                 // same WDSP RXA shift CTUN uses (WDSP has one shift
                 // register -- see ConnectedState::rit_enabled's doc
@@ -6689,6 +6696,10 @@ impl eframe::App for HpsdrApp {
                         None => (0, false, None),
                     };
                 let displayed_freq_hz = (dial_freq_hz as i64 + xvtr_rf_offset_hz).max(0) as u64;
+                // As RF, so the manual notches (RF frequencies) land
+                // right on a transverter band -- see
+                // DemodParams::lo_frequency_hz.
+                connected.spectrum.set_lo_frequency_hz((freq_hz as i64 + xvtr_rf_offset_hz) as f64);
                 // VFO B's own transverter -- same auto-clear as VFO A's
                 // just above if VFO B has been scrolled out of its range.
                 if let Some(x) = vfo_b_xvtr(connected) {
@@ -8128,6 +8139,34 @@ impl eframe::App for HpsdrApp {
                             connected.spectrum.set_anf(!anf);
                             settings_changed = true;
                         }
+                        // As Thetis: APF only in CW, where it runs.
+                        if matches!(current_mode, spectrum::Mode::Cwl | spectrum::Mode::Cwu) {
+                            let apf = connected.spectrum.apf();
+                            if ui
+                                .add(egui::Button::selectable(apf, "APF"))
+                                .on_hover_text(
+                                    "CW Audio Peak Filter -- a narrow peak on the CW pitch \
+                                     (Settings -> CW)",
+                                )
+                                .clicked()
+                            {
+                                connected.spectrum.set_apf(!apf);
+                                settings_changed = true;
+                            }
+                        }
+                        let tnf = spectrum::tnf();
+                        if ui
+                            .add(egui::Button::selectable(tnf, "TNF"))
+                            .on_hover_text(format!(
+                                "Manual notch filters on or off ({} set) -- right-click the \
+                                 spectrum to add or remove a notch",
+                                spectrum::notches().len()
+                            ))
+                            .clicked()
+                        {
+                            spectrum::set_tnf(!tnf);
+                            settings_changed = true;
+                        }
                         let binaural = connected.spectrum.binaural();
                         if ui
                             .add(egui::Button::selectable(binaural, "BIN"))
@@ -8977,6 +9016,24 @@ impl eframe::App for HpsdrApp {
                             settings_changed = true;
                         }
                     }
+                    // Right-click: the manual notch menu (spectrum::Notch),
+                    // at the RF frequency clicked. Not while transmitting
+                    // -- the spectrum is the TX one then.
+                    if !transmitting {
+                        if spectrum_resp.secondary_clicked() {
+                            connected.notch_menu_hz = spectrum_resp.interact_pointer_pos().map(|pos| {
+                                freq_at_x(pos.x, rect, freq_hz, sample_rate, connected.spectrum_zoom, pan_offset_hz)
+                                    as f64
+                                    + xvtr_rf_offset_hz as f64
+                            });
+                        }
+                        let hz_per_px = (2.0 * visible_half_span_hz) / rect.width().max(1.0) as f64;
+                        spectrum_resp.context_menu(|ui| {
+                            if notch_menu(ui, connected.notch_menu_hz, hz_per_px) {
+                                settings_changed = true;
+                            }
+                        });
+                    }
                     // Click-and-drag: moves the dial by however far the
                     // cursor has actually moved (drag_delta(), zero once
                     // the pointer stops), NOT by re-deriving an absolute
@@ -9302,6 +9359,47 @@ impl eframe::App for HpsdrApp {
                             [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
                             egui::Stroke::new(1.0, passband_line),
                         );
+                    }
+                    // Manual notches (spectrum::Notch), at their RF
+                    // frequencies: orange with TNF on, grey with it off.
+                    // Not while transmitting -- the TX spectrum is centred
+                    // elsewhere.
+                    if !transmitting {
+                        let (fill, edge) = if spectrum::tnf() {
+                            (
+                                egui::Color32::from_rgba_unmultiplied(255, 140, 0, 70),
+                                egui::Color32::from_rgb(255, 160, 40),
+                            )
+                        } else {
+                            (
+                                egui::Color32::from_rgba_unmultiplied(160, 160, 160, 40),
+                                egui::Color32::from_gray(150),
+                            )
+                        };
+                        let lo_rf_hz = freq_hz as f64 + xvtr_rf_offset_hz as f64;
+                        for notch in spectrum::notches() {
+                            let centre = notch.frequency_hz - lo_rf_hz;
+                            let (low, high) = (centre - notch.width_hz / 2.0, centre + notch.width_hz / 2.0);
+                            if high < pan_offset_hz - visible_half_span_hz || low > pan_offset_hz + visible_half_span_hz {
+                                continue;
+                            }
+                            let (x0, x1) = (x_for_offset(low), x_for_offset(high));
+                            // At least 3 px, so a narrow notch on a wide
+                            // span still shows.
+                            let mid = (x0 + x1) / 2.0;
+                            let half = ((x1 - x0) / 2.0).max(1.5);
+                            let notch_rect = egui::Rect::from_min_max(
+                                egui::pos2(mid - half, rect.top()),
+                                egui::pos2(mid + half, rect.bottom()),
+                            );
+                            ui.painter().rect_filled(notch_rect, 0.0, fill);
+                            ui.painter().rect_stroke(
+                                notch_rect,
+                                0.0,
+                                egui::Stroke::new(1.0, edge),
+                                egui::StrokeKind::Inside,
+                            );
+                        }
                     }
                     let x_dial = x_for_offset(ctun_offset_hz);
 
@@ -11671,6 +11769,64 @@ impl eframe::App for HpsdrApp {
                                             settings_changed = true;
                                         }
                                     });
+                                    ui.separator();
+
+                                    // As Thetis's Setup -> DSP -> Audio -> APF;
+                                    // the APF button (DSP row, CW modes)
+                                    // turns it on. See spectrum::ApfSettings.
+                                    ui.label("CW Audio Peak Filter (APF):").on_hover_text(
+                                        "A narrow audio peak on the CW pitch, for every receiver. \
+                                         Turned on with the APF button in the DSP controls, shown \
+                                         in CWL/CWU.",
+                                    );
+                                    let mut apf = spectrum::apf_settings();
+                                    let before = apf;
+                                    ui.horizontal(|ui| {
+                                        ui.label("Type:");
+                                        egui::ComboBox::from_id_salt("apf_kind")
+                                            .selected_text(spectrum::APF_KINDS[apf.kind.min(3) as usize])
+                                            .show_ui(ui, |ui| {
+                                                for (i, name) in spectrum::APF_KINDS.iter().enumerate() {
+                                                    ui.selectable_value(&mut apf.kind, i as u8, *name);
+                                                }
+                                            });
+                                    });
+                                    for (label, value, range, unit, hover) in [
+                                        (
+                                            "Tune:",
+                                            &mut apf.tune_hz,
+                                            -250.0..=250.0,
+                                            " Hz",
+                                            "The peak's centre, from the CW pitch",
+                                        ),
+                                        (
+                                            "Bandwidth:",
+                                            &mut apf.bandwidth_hz,
+                                            10.0..=150.0,
+                                            " Hz",
+                                            "Approximate -3 dB bandwidth of the peak",
+                                        ),
+                                        ("Gain:", &mut apf.gain, 0.0..=100.0, "", "0 is unity, 100 is +10 dB"),
+                                    ] {
+                                        ui.horizontal(|ui| {
+                                            ui.label(label).on_hover_text(hover);
+                                            let mut v = *value as f64;
+                                            if scroll_slider_f64(
+                                                ui,
+                                                &mut connected.slider_scroll_accum,
+                                                &mut v,
+                                                range,
+                                                1.0,
+                                                unit,
+                                            ) {
+                                                *value = v.round() as i32;
+                                            }
+                                        });
+                                    }
+                                    if apf != before {
+                                        spectrum::set_apf_settings(apf);
+                                        settings_changed = true;
+                                    }
                                     ui.separator();
 
                                     ui.label("Keyer (radio's own built-in/internal keyer):");
@@ -14563,6 +14719,7 @@ impl eframe::App for HpsdrApp {
                                 nnr_premium: agc_params.nnr_premium,
                                 snb: agc_params.snb,
                                 anf: agc_params.anf,
+                                apf: agc_params.apf,
                                 squelch_enabled: agc_params.squelch_enabled,
                                 squelch_level: agc_params.squelch_level,
                                 binaural: agc_params.binaural,
@@ -14625,6 +14782,10 @@ impl eframe::App for HpsdrApp {
                         nnr_premium: Some(agc_params_now.nnr_premium),
                         snb: Some(agc_params_now.snb),
                         anf: Some(agc_params_now.anf),
+                        apf: agc_params_now.apf,
+                        apf_settings: spectrum::apf_settings(),
+                        tnf: spectrum::tnf(),
+                        notches: spectrum::notches(),
                         squelch_enabled: Some(agc_params_now.squelch_enabled),
                         squelch_level: Some(agc_params_now.squelch_level),
                         binaural: Some(agc_params_now.binaural),
@@ -16520,6 +16681,91 @@ fn format_frequency(hz: u64) -> String {
     format!("{}.{:06}", hz / 1_000_000, hz % 1_000_000)
 }
 
+/// The manual notch (spectrum::Notch) under a right-click at RF `hz`:
+/// inside its width, or within `slop_hz` (a few pixels) of its centre so
+/// a narrow one on a wide span can still be hit. The nearest if several.
+fn notch_at(notches: &[spectrum::Notch], hz: f64, slop_hz: f64) -> Option<usize> {
+    notches
+        .iter()
+        .enumerate()
+        .filter(|(_, n)| (n.frequency_hz - hz).abs() <= (n.width_hz / 2.0).max(slop_hz))
+        .min_by(|(_, a), (_, b)| (a.frequency_hz - hz).abs().total_cmp(&(b.frequency_hz - hz).abs()))
+        .map(|(i, _)| i)
+}
+
+/// Adds a notch at `hz`, as Thetis's AddNotch: not within 10 Hz of
+/// another one, and not past spectrum::MAX_NOTCHES. True if added.
+fn add_notch(notches: &mut Vec<spectrum::Notch>, hz: f64, width_hz: f64) -> bool {
+    if notches.len() >= spectrum::MAX_NOTCHES || notches.iter().any(|n| (n.frequency_hz - hz).abs() < 10.0) {
+        return false;
+    }
+    notches.push(spectrum::Notch { frequency_hz: hz.round(), width_hz });
+    true
+}
+
+/// Notch widths offered in the notch menu, Hz. Thetis adds 200 Hz (100
+/// with Shift).
+const NOTCH_WIDTHS_HZ: [f64; 6] = [25.0, 50.0, 100.0, 200.0, 400.0, 800.0];
+
+/// The spectrum's right-click menu for the manual notches and TNF, at RF
+/// `hz` (None: no position, only the general items). True if anything
+/// changed. Adding a notch also turns TNF on, so it's heard at once.
+fn notch_menu(ui: &mut egui::Ui, hz: Option<f64>, hz_per_px: f64) -> bool {
+    let mut notches = spectrum::notches();
+    let mut changed = false;
+    let mut notches_changed = false;
+    let hit = hz.and_then(|hz| notch_at(&notches, hz, 4.0 * hz_per_px));
+    match (hit, hz) {
+        (Some(i), _) => {
+            let n = notches[i];
+            ui.label(format!("Notch at {} MHz", format_frequency(n.frequency_hz.max(0.0) as u64)));
+            ui.horizontal(|ui| {
+                ui.label("Width:");
+                for w in NOTCH_WIDTHS_HZ {
+                    if ui.add(egui::Button::selectable(n.width_hz == w, format!("{w:.0}"))).clicked() {
+                        notches[i].width_hz = w;
+                        notches_changed = true;
+                    }
+                }
+                ui.label("Hz");
+            });
+            if ui.button("Remove this notch").clicked() {
+                notches.remove(i);
+                notches_changed = true;
+                ui.close();
+            }
+        }
+        (None, Some(hz)) => {
+            for (label, width) in [("Add notch here (200 Hz)", 200.0), ("Add narrow notch here (100 Hz)", 100.0)] {
+                if ui.button(label).clicked() {
+                    if add_notch(&mut notches, hz, width) {
+                        notches_changed = true;
+                        spectrum::set_tnf(true);
+                    }
+                    ui.close();
+                }
+            }
+        }
+        (None, None) => {}
+    }
+    if !notches.is_empty() && ui.button(format!("Remove all notches ({})", notches.len())).clicked() {
+        notches.clear();
+        notches_changed = true;
+        ui.close();
+    }
+    ui.separator();
+    let mut tnf = spectrum::tnf();
+    if ui.checkbox(&mut tnf, "TNF (notches on)").changed() {
+        spectrum::set_tnf(tnf);
+        changed = true;
+    }
+    if notches_changed {
+        spectrum::set_notches(notches);
+        changed = true;
+    }
+    changed
+}
+
 /// Scroll motion per step when scrolling over a VFO digit: exactly one
 /// mouse-wheel notch, so each notch moves the digit by one. winit reports
 /// a notch as one line and egui (native) makes a line 40 points
@@ -18018,6 +18264,18 @@ fn render_extra_receiver_ui(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceiver>>) {
             rx.spectrum.set_anf(!anf);
             rx.settings_dirty.store(true, Ordering::Relaxed);
         }
+        // As the main window's: APF only in CW.
+        if matches!(rx.spectrum.mode(), spectrum::Mode::Cwl | spectrum::Mode::Cwu) {
+            let apf = rx.spectrum.apf();
+            if ui
+                .add(egui::Button::selectable(apf, "APF"))
+                .on_hover_text("CW Audio Peak Filter -- a narrow peak on the CW pitch")
+                .clicked()
+            {
+                rx.spectrum.set_apf(!apf);
+                rx.settings_dirty.store(true, Ordering::Relaxed);
+            }
+        }
         let binaural = rx.spectrum.binaural();
         if ui
             .add(egui::Button::selectable(binaural, "BIN"))
@@ -19209,6 +19467,7 @@ fn spawn_extra_receiver(
         spectrum.set_nnr_premium(s.nnr_premium);
         spectrum.set_snb(s.snb);
         spectrum.set_anf(s.anf);
+        spectrum.set_apf(s.apf);
         spectrum.set_squelch_enabled(s.squelch_enabled);
         spectrum.set_squelch_level(s.squelch_level);
         spectrum.set_binaural(s.binaural);
@@ -19364,6 +19623,7 @@ fn change_sample_rate(connected: &mut ConnectedState, new_rate: u32) {
     spectrum.set_nnr_premium(agc_params.nnr_premium);
     spectrum.set_snb(agc_params.snb);
     spectrum.set_anf(agc_params.anf);
+    spectrum.set_apf(agc_params.apf);
     spectrum.set_squelch_enabled(agc_params.squelch_enabled);
     spectrum.set_squelch_level(agc_params.squelch_level);
     spectrum.set_binaural(agc_params.binaural);
@@ -19572,6 +19832,7 @@ fn change_extra_receiver_sample_rate(rx: &mut ExtraReceiver, new_rate: u32) {
     spectrum.set_nnr_premium(agc_params.nnr_premium);
     spectrum.set_snb(agc_params.snb);
     spectrum.set_anf(agc_params.anf);
+    spectrum.set_apf(agc_params.apf);
     spectrum.set_squelch_enabled(agc_params.squelch_enabled);
     spectrum.set_squelch_level(agc_params.squelch_level);
     spectrum.set_binaural(agc_params.binaural);
@@ -20065,6 +20326,24 @@ fn main() -> eframe::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A right-click finds the notch under it (inside its width, or a few
+    /// pixels from a narrow one's centre, nearest first); a new notch
+    /// isn't added within 10 Hz of another, as Thetis's AddNotch.
+    #[test]
+    fn notches_are_found_and_added_as_thetis() {
+        let n = |hz: f64, w: f64| spectrum::Notch { frequency_hz: hz, width_hz: w };
+        let mut notches = vec![n(14_074_000.0, 200.0), n(14_074_500.0, 25.0)];
+        assert_eq!(notch_at(&notches, 14_074_090.0, 5.0), Some(0));
+        assert_eq!(notch_at(&notches, 14_074_150.0, 5.0), None);
+        assert_eq!(notch_at(&notches, 14_074_530.0, 40.0), Some(1), "narrow, within the slop");
+        assert_eq!(notch_at(&notches, 14_074_530.0, 5.0), None);
+        assert!(!add_notch(&mut notches, 14_074_008.0, 100.0), "within 10 Hz");
+        assert!(add_notch(&mut notches, 14_075_000.4, 100.0));
+        assert_eq!(notches[2], n(14_075_000.0, 100.0));
+        notches.resize(spectrum::MAX_NOTCHES, n(1.0, 1.0));
+        assert!(!add_notch(&mut notches, 7_000_000.0, 100.0), "full");
+    }
 
     /// VFO Sync: B goes to A when Sync comes on and whenever A moves (even
     /// if B moved too); A goes to B when only B moved.

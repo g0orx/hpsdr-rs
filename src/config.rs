@@ -175,6 +175,20 @@ pub struct Config {
     /// ANF ("Automatic Notch Filter") -- see spectrum::DemodParams::anf's
     /// doc comment.
     pub anf: Option<bool>,
+    /// Main receiver CW Audio Peak Filter on/off -- see
+    /// spectrum::DemodParams::apf.
+    #[serde(default)]
+    pub apf: bool,
+    /// The APF's settings, shared by every receiver -- see
+    /// spectrum::ApfSettings.
+    #[serde(default)]
+    pub apf_settings: crate::spectrum::ApfSettings,
+    /// TNF and the manual notches, shared by every receiver -- see
+    /// spectrum::Notch.
+    #[serde(default)]
+    pub tnf: bool,
+    #[serde(default)]
+    pub notches: Vec<crate::spectrum::Notch>,
     /// Main receiver squelch on/off and 0-100 level -- see
     /// spectrum::Squelch.
     pub squelch_enabled: Option<bool>,
@@ -851,6 +865,9 @@ pub struct ExtraReceiverConfig {
     /// See Config::anf's doc comment.
     #[serde(default)]
     pub anf: bool,
+    /// See Config::apf's doc comment.
+    #[serde(default)]
+    pub apf: bool,
     /// See Config::squelch_enabled's doc comment.
     #[serde(default)]
     pub squelch_enabled: bool,
