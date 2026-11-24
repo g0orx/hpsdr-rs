@@ -2555,6 +2555,9 @@ fn apply_midi_binding(
             | MidiAction::VfoStepUp
             | MidiAction::VfoStepDown
             | MidiAction::VfoTune
+            // VFO A Lock disables the mode buttons too, as Thetis's.
+            | MidiAction::ModeUp
+            | MidiAction::ModeDown
     );
     let b_tunes = matches!(binding.action, MidiAction::VfoAtoB | MidiAction::VfoSwap | MidiAction::VfoBTune);
     if (a_tunes && connected.vfo_a_lock) || (b_tunes && connected.vfo_b_lock) {
@@ -7692,8 +7695,15 @@ impl eframe::App for HpsdrApp {
                     ui.horizontal_wrapped(|ui| {
                         for mode in ALL_MODES {
                             let selected = mode == current_mode;
+                            // VFO A Lock disables the mode buttons, as
+                            // Thetis's (DisableAllModes); CAT and TCI can
+                            // still change the mode, as there.
                             if ui
-                                .add(egui::Button::selectable(selected, mode.label()))
+                                .add_enabled(
+                                    !connected.vfo_a_lock,
+                                    egui::Button::selectable(selected, mode.label()),
+                                )
+                                .on_disabled_hover_text("VFO A is locked")
                                 .clicked()
                                 && !selected
                             {
