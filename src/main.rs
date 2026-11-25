@@ -8184,6 +8184,12 @@ impl eframe::App for HpsdrApp {
                             connected.spectrum.set_binaural(!binaural);
                             settings_changed = true;
                         }
+                        // Compact: the AGC starts the second line, with the
+                        // RX gain/attenuation, rather than wrapping wherever
+                        // the width runs out.
+                        if compact {
+                            ui.end_row();
+                        }
                         if let Some(v) = agc_menu(ui, current_agc) {
                             connected.spectrum.set_agc(v);
                             settings_changed = true;
