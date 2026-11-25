@@ -19,6 +19,34 @@ microphone, with mic gain and level, the radio's TX power setting, and
 power and SWR while transmitting; not CW yet. If the connection drops, or
 the client stops sending audio for a second, hpsdr-rs unkeys.
 
+## Layout
+
+**Layout** (beside the connection status) is Auto, Standard or Compact.
+Standard has every control in rows above the spectrum. Compact, as
+hpsdr-rs's own for small screens, has only the frequency, - / + and S-meter
+above the spectrum, and a toolbar of large buttons below it -- Band and Mode
+show what they're set to, then Step, Filter, Noise, Audio, Key and TX as
+the server allows, and MOX (or CW's Stop) at the right. A button opens its
+controls over the bottom of the spectrum; it again, the close button or
+Escape closes them. The buttons go onto a second row when they'd be too
+narrow for a finger. Auto is compact on a screen narrower than 600 or
+shorter than 500 points: a phone either way up, or a Raspberry Pi's 7"
+800x480 display. The choice isn't remembered between runs yet.
+
+Natively, `--fullscreen` fills the screen (with a Quit button beside
+Layout) and F11 toggles it:
+
+    cargo run -p hpsdr-remote --release -- --fullscreen
+
+## Front-panel controller
+
+On a Raspberry Pi, natively, **Controller** (beside the connection status)
+sets up a piHPSDR front panel -- Controller 1, Controller 2 V1/V2 or the G2
+V1 panel -- as hpsdr-rs's Settings -> Controller does (the code is shared,
+crates/hpsdr-controller), and its encoders and switches then tune, change
+band, mode, filter and the rest from here. See
+[the manual](../../docs/manual/25-controller.md#with-hpsdr-remote).
+
 ## The easy way: served by hpsdr-rs
 
 Build the web client first (below), then hpsdr-rs, which then has it built
@@ -30,6 +58,12 @@ the microphone on an HTTPS page, and only start audio after a click, so
 audio starts when you press **Connect**.
 
 ## Native
+
+The Linux .deb installs it beside hpsdr-rs, as `hpsdr-remote` with its
+own menu entry. It remembers the last 3 servers it connected to (in
+`~/.config/hpsdr-remote/recent-servers.txt`), starts with the latest, and
+offers the others from the **▾** beside the Server field; in a browser,
+that site keeps its own list. Passwords aren't remembered. From the source:
 
     cargo run -p hpsdr-remote --release
 

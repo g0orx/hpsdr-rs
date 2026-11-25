@@ -72,6 +72,84 @@ streaming), both directly and through TCI Remote Compactor.
   (`dds`) and the offset of the listening frequency from it (`if`) are
   reported in the same RF terms, so a client's own spectrum display lines
   up with a transverter band too.
+- **A second receiver**, as Thetis's RX2: TCI receiver 1 is your first
+  extra receiver (the **RX 2** window, or the lowest-numbered one open).
+  Clients see two receivers, and `rx_enable:1` says whether there's one
+  open now. A client can open one with `rx_enable:1,true` -- as **Add
+  Receiver** does, if a receiver is free -- and close it with
+  `rx_enable:1,false`, as closing its window does. Receiver 1 has its own frequency (VFO A and B), mode,
+  filter, RIT, CTUN, AGC, volume, noise and squelch settings, audio
+  (`audio_start:1`) and S-meter (`rx_sensors:1`), all reported as they
+  change, and IQ (`iq_start:1`), each message giving receiver 1's own
+  sample rate, which on Protocol 2 can differ from receiver 0's;
+  transmitting stays with receiver 0. An `audio_start:1` or `iq_start:1`
+  sent before receiver 1 is open is remembered, so its audio and IQ
+  start as soon as it opens (and the client is sent
+  `rx_channel_enable:1,0,true` then, as Thetis does).
+- **CW is CWL or CWU**, as Thetis reports it, not plain CW. A client
+  that sends plain `cw` gets the usual sideband for the frequency (CWL
+  below 10 MHz, CWU above), and `cwr` the other one.
+- **Changes reach clients at once:** keying MOX, Tune, tuning, changing
+  mode, filter, RIT/XIT, split, AGC, volume, squelch, the noise controls,
+  TX power or Tune power -- from hpsdr-rs's
+  own window, MIDI, CAT or another client -- is sent to every TCI client
+  as it happens, within a few milliseconds. A value a client has just
+  set itself isn't echoed back to it for half a second, so a client
+  that's still tuning doesn't jump back. TX power goes as TCI's `drive`,
+  a percentage of the radio's maximum; squelch as `sql_level`, its 0-100
+  setting scaled to TCI's -140 to 0 dB.
+- **Split:** the transmit frequency is reported as Thetis does, at
+  connect and whenever it changes -- `tx_frequency` and
+  `tx_frequency_ex` (frequency, band such as `b40m`, whether receiver 1
+  is open, whether TX is on VFO B). It's VFO A, or VFO B with Split or
+  Duplex, as shown on screen (through its transverter), plus XIT. A
+  client can turn Split on and off with `split_enable`, as the Split
+  button does.
+- **Clients can set** Tune (`tune`, with the same checks as the TUNE
+  button), TX power (`drive`, a percentage of the radio's maximum), Tune
+  Power (`tune_drive`), the filter (`rx_filter_band`), volume (`volume`
+  or `rx_volume`, dB from -60 to 0), AGC (`agc_mode`, `agc_gain`) and
+  squelch (`sql_enable`, `sql_level`), as in Thetis; sending one with
+  only the receiver asks for its current value. hpsdr-rs's filters are a
+  width placed by the mode, so `rx_filter_band` sets the width nearest
+  the passband asked for (e.g. `-2400,-150` in LSB is 2.4 kHz). As with
+  the filter control here, the TX filter follows, and the width is
+  remembered for the mode.
+- **More controls, as Thetis's TCI** -- each reported to clients as it
+  changes, and settable by them:
+  - `rx_step_att_ex` / `rx_step_att_enabled_ex` -- the RX attenuation,
+    0-31 dB (on a HermesLite on Protocol 1, its RX Gain as an
+    attenuation, 12 to -48).
+  - `vfo_swap_ex` -- swaps VFO A and B, as **A<>B**.
+  - `lock` (VFO A), `vfo_lock` (VFO A or B) and `vfo_sync_ex` -- the
+    [Lock and Sync](02-main-window.md#vfo-a--vfo-b--split) buttons.
+  - `rx_mute` (either receiver) and `mute` -- Mute.
+  - `rx_balance` -- the receiver's [Pan](02-main-window.md#audio-gain),
+    on Thetis's -40 to +40 scale.
+  - `mon_enable` and `mon_volume` -- [Monitor TX
+    Audio](17-settings-tx.md#monitor-tx-audio) and its volume.
+  - `cw_keyer_speed` -- the CW speed.
+  - `rx_apf_enable` and `rx_nf_enable` -- the **APF** and **TNF**
+    buttons.
+  - `agc_auto_ex` -- the **Auto** button beside AGC Gain. Setting
+    `agc_gain` turns it off, as moving the slider does.
+  - `tx_profiles_ex` and `tx_profile_ex` -- list and choose the [TX
+    profiles](17-settings-tx.md#tx-profile) (**Default** when none are
+    saved); `tx_filter_band_ex` -- the [TX filter](17-settings-tx.md#tx-filter)
+    edges, signed as `rx_filter_band`'s.
+  - `app_ex:hpsdr-rs,<version>`, sent after `protocol:` at connect, so a
+    client can tell hpsdr-rs apart from Thetis.
+- **Sensors** (`rx_sensors_enable` / `tx_sensors_enable`, as Thetis):
+  while receiving, the S-meter level, its running average and the
+  strongest spectrum bin (`rx_sensors`, `rx_channel_sensors`,
+  `rx_channel_sensors_ex`); while transmitting, the mic level, power and
+  SWR (`tx_sensors`) -- every 200 ms, or the interval the client asks
+  for (30 to 1000 ms). The receive readings are only as fresh as the
+  spectrum, about 10 a second.
+- **Audio block size** follows the client, as in Thetis: 2048 samples
+  (about 43 ms at 48 kHz) unless the client asks for a smaller size
+  with `audio_stream_samples` (100 to 2048, e.g. 960 for 20 ms), used
+  for both the receive audio it gets and the transmit audio asked of it.
 - **Mute local audio output while a TCI client is connected** -- hpsdr-rs normally
   streams RX audio to both its own local audio device and TCI at the same
   time. If that local device is *also* independently picked up by your TCI
@@ -112,7 +190,10 @@ install. Enter the address to listen on (default `0.0.0.0:8080`), choose
 gives the address to open, e.g. `https://192.168.1.122:8080`. The client
 connects back through this same port to the **TCI** server, which must be
 running too. Like the other servers here it starts again automatically
-next time if it was running.
+next time if it was running. To run two copies of hpsdr-rs on one
+computer, give each its own port here (e.g. `0.0.0.0:8081` for the
+second), and its own TCI port; if the port is already taken, the error
+below the button says so and suggests the next one.
 
 **HTTPS** (on by default) is needed to transmit: browsers only let a page
 use the microphone over HTTPS. hpsdr-rs makes its own certificate the first
@@ -123,32 +204,95 @@ on Safari: **Show Details**, then **visit this website**). If you have a
 certificate of your own for this computer's name, put it in those two
 files instead.
 
-The client shows the radio's spectrum and waterfall, its band buttons, the
-VFO, mode, filter, AGC and noise controls, the S-meter, and the receive
+The client shows the radio's spectrum (with the band edges marked) and
+waterfall, its band buttons, the VFO, mode, filter, AGC and noise
+controls (**NB**, **NR** and **AGC** are drop-downs showing the current
+setting, e.g. **AGC: Slow**), the S-meter, and the receive
 audio (which starts when you press **Connect** -- browsers only start audio
 after a tap). Tune by tapping or sliding on the spectrum or waterfall, by
-sliding on the frequency, or with **-** and **+** and a chosen step. It
+sliding on the frequency, or with the **-** and **+** beside it, by a
+chosen step. A tap on the spectrum or waterfall lands on the nearest kHz
+(10 Hz in CW), and a slide moves from one kHz to the next (100 Hz in CW).
+**Mute** is remembered for next time. It
 uses about 150 kbit/s, compressed, rather than the several Mbit/s of
 standard TCI audio and IQ, plus about 70 kbit/s more while transmitting.
+It's dark or light as the phone, tablet or browser is set, and changes when
+that does; the spectrum and waterfall stay dark in both.
+
+The **Spectrum** and **Waterfall** buttons, beside **Range**, turn each
+display on or off. Drag the bar under the spectrum (or under a display
+shown on its own) to make them bigger or smaller. Both choices are
+remembered.
+
+If the browser loses the page's graphics (this happens in Chrome and
+Chromium on some graphics cards when the GPU restarts), the page reloads
+and connects to the same server again by itself; tap or press a key to
+get the audio back.
+
+On a small screen -- a phone either way up -- it uses a compact layout,
+like hpsdr-rs's own: just the frequency and S-meter above the spectrum,
+and a toolbar of large buttons below it (Band, Mode, Step, Filter, Noise,
+Audio, Key, TX, and MOX at the right). Each button opens its controls over
+the spectrum; tap it again, or the close button, to close them. The
+toolbar sits directly under the spectrum and waterfall, so it moves up
+when they're made smaller.
+**Layout**, beside the connection status, can choose **Standard** (every
+control above the spectrum) or **Compact** instead of **Auto**.
 
 To transmit, press **MOX**: the first time, the browser asks to use the
 microphone. Press **MOX** again to stop. **Mic** sets its level (keep the
 meter beside it out of the red), **Power** is the radio's TX power
 setting, and the power and SWR show while transmitting. The radio
 transmits only where it would from its own MOX button (in band, unless
-out-of-band TX is allowed in Settings -> TX), not in CW for now, and with
-**TX Audio Source** left at **Auto**. If the connection drops, or the
+out-of-band TX is allowed in Settings -> TX), and with **TX Audio Source**
+left at **Auto**. If the connection drops, or the
 client stops sending audio for a second -- a phone locked, a browser tab
 put in the background -- the radio unkeys by itself.
+
+In CW, **MOX** gives way to sending text: type it and press **Send** (or
+Enter), or press one of your saved messages from Settings -> CW, shown
+as buttons; **Stop** (red while sending) stops at once, and **Speed** is
+the radio's own CW speed. The radio sends it exactly as its own **Send**
+CW button does -- keying itself, and unkeying when the text is done -- so
+network delays don't affect the timing. The same TCI commands work from
+other TCI programs too (`cw_macros`, `cw_macros_stop`, `cw_macros_speed`).
+
+You can also key live, with an on-screen key or paddles (**Key**, on a
+phone a section of its own): **Straight** gives one big pad, down while
+you hold it; **Iambic A** and **Iambic B** give **dit** and **dah** pads
+side by side -- squeeze both with two fingers -- keyed at the CW speed, as
+piHPSDR's keyer is (B adds one element when a squeeze is released during a
+dah). You hear your own keying straight away, as a sidetone made in the
+client (**Sidetone** sets its level). The radio sends it **Delay** later
+(150 ms to start with), keeping your timing exactly however unevenly the
+network delivers it -- raise it if the keying sounds broken up over a slow
+or busy connection. The radio keys itself on your first element and
+unkeys after the CW tab's **Break-in delay**; if the connection drops, or
+the client goes quiet with the key down, the key is let go and the radio
+unkeyed within a second and a half.
+
+A real key or paddle can be plugged in too, through anything that looks
+like a USB keyboard -- e.g. a small microcontroller, plugged into a phone
+with an OTG cable -- that holds a key down while the dit paddle is closed
+and another while the dah paddle is (a straight key: either): **[** and
+**]** unless you choose others in Settings -> CW,
+[Remote Paddle Keys](06-settings-cw.md#remote-paddle-keys). It's sent
+through the same keyer, with the mode, speed and sidetone set here, and
+lights the on-screen pads; it works whenever the client can key, with
+**Key** open or not. While it can key, those two keys key rather than
+type. Tap the client once first so the page has the keyboard.
 
 Untick **Allow transmit** to let remote clients listen and tune but not
 transmit: their **MOX** button disappears, and one already transmitting is
 unkeyed at once. It takes effect straight away, without stopping the
 server.
 
-Set a **password** before making this port reachable from outside your own
-network: without one, anyone who can reach it can control the radio,
-transmitting included. TCI itself has no password, so for use over the
+Without a **password**, clients connecting here can only listen and tune:
+they get no **MOX** button, and anything they send that would transmit
+(MOX, CW, Tune, TX audio, power) is ignored, whatever **Allow transmit**
+says. Set one to transmit from the web client, and before making this port
+reachable from outside your own network. TCI itself has no password, and a
+program connecting to TCI directly isn't held by this, so for use over the
 internet forward only this port; TCI's address can then be
 `127.0.0.1:50001`, which the web client still reaches through here. A VPN
 (WireGuard, Tailscale) or an SSH tunnel is safer still.
@@ -181,12 +325,75 @@ named "rigctl" too.
 - Same **Start**/**Stop**/status/logging behavior as rigctl above (logs to
   `cat_log.txt`).
 - Implements a practical subset of the TS-2000 command set: frequency,
-  mode, PTT, S-meter, RIT/XIT, and a few identification/status commands.
-  Commands with no clean equivalent in this app yet (drive/power level,
-  mic gain, CW keyer, memory channels) respond `?;` or are accepted with
+  mode, PTT, S-meter, RIT/XIT, TX power, and a few identification/status
+  commands. `PC` is the **TX Power** setting as a percentage of the
+  radio's maximum (`PC;` answers `PC050;` for 50 W of 100 W, and `PC005;`
+  sets 5%) -- on a 100 W radio that's watts, as a TS-2000's own. With
+  transmit off it reads 0 and a set is ignored. This lets an amplifier
+  that sends `PC` (an SPE Expert does when its drive steps change) set the
+  drive. Commands with no clean equivalent in this app yet (mic gain, CW
+  keyer speed, memory channels) respond `?;` or are accepted with
   no effect, rather than reporting a made-up value. XIT can only be
   toggled on/off (`XT`), not set to a specific value -- matches real
   Kenwood TS-2000 behavior, which has no such command either.
+- **Auto reporting**: a client that sends `AI1;` is then sent `FA...;`
+  whenever the frequency changes, and with `AI2;` also `MD...;` whenever
+  the mode changes, without having to ask.
+
+### CAT on serial ports
+
+The same CAT commands can be served on up to three serial ports
+(**Serial 1**-**3**), for equipment that follows the radio over a CAT
+cable rather than the network: an amplifier or automatic tuner that
+changes band with the radio, a band decoder switching antennas, or a
+program that only talks to a COM port (Windows: a virtual pair such as
+com0com connects it to hpsdr-rs).
+
+- **Port** -- type the name (`COM3` on Windows, `/dev/ttyUSB0` on Linux,
+  `/dev/cu.usbserial-...` on macOS), or pick one from the list next to it.
+  On Linux the list also offers `/dev/serial/by-id/...` names, which stay
+  the same whichever order USB adapters are plugged in.
+- **Baud** -- 4800 to 115200. Always 8 data bits, no parity, 1 stop bit, no
+  handshaking. Set the amplifier to **Kenwood** (TS-2000/TS-480) CAT at the
+  same speed.
+- **Auto report** -- send the frequency (`FA`) and mode (`MD`) when they
+  change, and once as soon as the port opens, without being asked. Tick it
+  for a device that only listens; leave it off for one that polls (most
+  amplifiers and programs send `FA;` or `IF;` themselves).
+- **TX frequency** (on by default) -- `FA` and `IF` report the frequency
+  you transmit on rather than the one you listen on: VFO B with **Split**
+  or **Duplex**, plus XIT. An amplifier is then on the band you transmit on,
+  e.g. working split across a band edge. Turn it off for a logger, which
+  expects `FA` to be the receive frequency. Through a transverter it's the
+  RF frequency, as for the TCP server.
+- **PTT out** -- **RTS** or **DTR** is raised while the radio transmits,
+  e.g. to key an amplifier through the serial adapter (as Thetis and
+  Hamlib do). The line follows within a few milliseconds plus the
+  adapter's own delay, so set **TX Delay** ([Settings: TX](17-settings-tx.md#tx-delay))
+  to hold RF back until the amplifier's relay has closed -- the line's
+  delay plus the amplifier's switching time, e.g. 30-50 ms.
+- **PTT in** -- the radio transmits while **CTS** or **DSR** is raised:
+  a footswitch wired to the port, or a program set to "PTT via RTS" or
+  "PTT via DTR" on the other end of a virtual serial pair (com0com and the
+  like cross the lines: its RTS arrives as CTS, its DTR as DSR). Raising
+  the line keys the radio, dropping it unkeys -- only if the line keyed it,
+  so it doesn't fight the **MOX** button or another client -- and it obeys
+  the same out-of-band check as every other PTT. If the port closes or is
+  unplugged mid-transmission, the radio is unkeyed. A line that's already
+  up when the port opens doesn't key the radio until it drops and rises.
+- **Start**/**Stop** -- the status shows **Open**, or **Not open
+  (retrying)** with the reason when you hover over it (port in use by
+  another program, no permission, unplugged). A port that can't be opened,
+  or is unplugged while in use, is tried again every 2 seconds, so an
+  amplifier switched on or plugged in later is picked up by itself. Stop a
+  port before changing its settings.
+- On Linux, your user must be in the `dialout` group to open serial ports
+  (`sudo usermod -aG dialout $USER`, then log out and back in).
+
+Commands and replies on serial ports are logged to `cat_log.txt` too,
+each line starting with the port name. The **CAT** indicator in the main
+window is green while the server or any serial port is running, and red
+once a client is connected or a port is open.
 
 Each server's running state is saved: whichever were running when you
 last disconnected start again automatically the next time you connect to

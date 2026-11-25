@@ -8,8 +8,9 @@ splatter/IMD. It's mutually exclusive with [Diversity](07-diversity.md) --
 both reserve extra receiver resources on the radio in incompatible ways, so
 only one can be enabled at a time.
 
-The tab is hidden on radios this doesn't support: Metis and the original
-Hermes-Lite (their two receivers can't spare the feedback pair), Hermes-class
+The tab is hidden on radios this doesn't support: Metis, the original
+Hermes-Lite and the ANAN-10E/100B (their two receivers can't spare the
+feedback pair), Hermes-class
 boards (Hermes, Hermes II, Atlas -- and radios that report as one, such as
 the Brick2) on Protocol 2, and the receive-only USB devices.
 

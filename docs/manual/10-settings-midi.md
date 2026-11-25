@@ -25,6 +25,18 @@ Nothing is pre-mapped.
   to "..."**, or an error message. If your controller is unplugged and
   replugged while connected, hpsdr-rs reconnects automatically within a
   second or two -- no need to re-enable anything.
+- **Send changes back to the device** -- off by default. When a value
+  bound to a Knob control changes in hpsdr-rs (its on-screen slider, a
+  shortcut, a CAT or TCI client, or the saved settings on connecting),
+  the control is sent its new position as a Control Change (or Pitch
+  Bend, if that's what it sends). A controller that shows or holds a
+  position -- motor faders, LED rings, a keyer or pod with its own display
+  -- then stays in step, instead of the value jumping when the control is
+  next touched (e.g. AF Gain at 90% in hpsdr-rs and 20% on the pod). Moving
+  the control itself isn't echoed back to it. Everything is sent once when
+  the device connects. It goes to the device's MIDI output of the same
+  name as its input, which is how USB MIDI devices normally appear; if
+  there isn't one, the tab says so.
 
 ## Learn mode
 
@@ -48,9 +60,9 @@ This is how you map a physical control to a radio action:
 6. For a button bound to **MOX (PTT)** or **Tune**, an extra
    **Momentary** checkbox appears -- tick it for press-to-transmit/
    release-to-receive behavior instead of toggling on every press.
-7. For a Wheel binding, **Sensitivity** and **Rate limit (ms)** controls
-   appear -- see [Wheel sensitivity and rate limiting](#wheel-sensitivity-and-rate-limiting)
-   below.
+7. For a Wheel binding, **Sensitivity**, **Rate limit (ms)** and
+   **Reverse** controls appear -- see [Wheel sensitivity, rate limiting
+   and direction](#wheel-sensitivity-rate-limiting-and-direction) below.
 8. Click **Add**.
 
 The new binding appears in the table below and takes effect immediately.
@@ -114,6 +126,7 @@ to check.
 | Action | Effect |
 |---|---|
 | MOX (PTT) | Toggle transmit on/off (or momentary, see above) |
+| CW Key | A CW key: key down while the note is held -- e.g. a keyer that sends its key as MIDI. See [CW Key](#cw-key) |
 | Tune | Toggle the Tune tone on/off |
 | Split | Toggle Split on/off |
 | SAT / SATR (cycle) | Cycle satellite mode Off → SAT → SATR, same as the SAT button (turns Split on) |
@@ -122,9 +135,11 @@ to check.
 | VFO A -> B, VFO B -> A, VFO A/B Swap | Copy or swap VFO frequencies |
 | Mode Up, Mode Down | Cycle through modes |
 | Band Up, Band Down | Cycle through bands |
+| VFO Step Size +, VFO Step Size - | The VFO step (next to VFO-A) one larger or smaller; it's what a [front-panel controller](25-controller.md)'s VFO knob tunes by |
+| Band Stack (next) | The next entry of the current band's [band stack](02-main-window.md#band-stack), as pressing its band button again |
 | Band 160m ... Band 6m | Jump directly to that band (ten separate actions, one per band from 160m to 6m; there's no direct action for 60m -- use Band Up/Down to reach it). Ignored if the connected radio can't tune that band (e.g. 6m on a HermesLite/HermesLite2) |
 | Filter Width Up, Filter Width Down | Step the filter width |
-| VFO Step Up, VFO Step Down | Nudge the VFO by one tuning step |
+| VFO Step Up, VFO Step Down | Tune the VFO by one VFO step (the step beside VFO-A), onto a multiple of it |
 | CTUN On/Off | Toggle Click-to-Tune |
 | RX Equalizer On/Off | Toggle the RX [graphic equalizer](08-equalizer.md) |
 | Diversity On/Off | Toggle [Diversity](07-diversity.md) reception (ignored while PureSignal is enabled -- the two are mutually exclusive) |
@@ -144,6 +159,9 @@ to check.
 | RF Attenuation | RX step attenuator (0-31 dB) -- shown as **RF Gain** (-12 to +48 dB) instead when bound while connected to a HermesLite/HermesLite2 over Protocol 1, which has no step attenuator; the same control as the main window's slider next to **AGC Gain** |
 | TX Drive | Transmit power |
 | CW Speed | The radio's internal keyer speed (WPM) |
+| CW Sidetone Level | Sidetone level, 0-100% ([Settings: CW](06-settings-cw.md)) |
+| CW Sidetone Frequency | Sidetone frequency, 300-1200 Hz |
+| CW Pitch | CW Pitch, 300-1000 Hz -- where CWL/CWU center the RX filter, and the TX offset |
 | Filter Width | Set the filter width directly |
 
 **Wheel** (relative encoder) actions:
@@ -155,6 +173,35 @@ to check.
 | RIT Adjust | Nudge the RIT offset |
 | XIT Adjust | Nudge the XIT offset |
 
+## CW Key
+
+A button bound to **CW Key** keys CW from hpsdr-rs itself, as the web
+client's on-screen key does: a shaped carrier, with the key's timing kept
+(each transition is played the same time after the first as it arrived,
+about 20 ms after it arrives). It's handled as soon as the message comes
+in, not on the next screen update, so the keying doesn't depend on how
+busy the display is.
+
+- The first key-down keys the radio, if the mode is **CWL** or **CWU**,
+  transmit is armed (Settings -> TX -> Enable Transmit), the frequency is
+  inside the ham bands (or out-of-band TX is allowed) and Tune, Two Tone
+  or a CW text message isn't transmitting. Otherwise it's refused, and a
+  line saying why is printed (`midi: CW key refused -- ...`); the rest of
+  that press is ignored.
+- The radio unkeys once the key has been up for the **Break-in Delay**
+  (Settings -> CW).
+- If MOX is already on -- e.g. a keyer that sends a PTT note, bound to
+  **MOX**, before its paddle -- the key sends inside it, and the radio
+  stays keyed until MOX goes off, so the keyer's own PTT and hang time
+  decide when it unkeys.
+- With **PC Sidetone** on (Settings -> CW), you hear the key on the PC's
+  audio output as it's pressed.
+- If the MIDI device is unplugged or MIDI is turned off with the key down,
+  or the radio is unkeyed another way, the radio unkeys at once.
+- Speed and weight are the keyer's business: hpsdr-rs plays the key as it
+  is pressed, like a straight key. **TX Delay** (Settings -> TX) applies,
+  delaying the whole transmission.
+
 ## Knob vs. Wheel controls
 
 MIDI Control Change and Pitch Bend messages look the same on the wire
@@ -165,7 +212,8 @@ can't tell these apart automatically, so Learn mode asks:
 
 - **Knob (absolute)** -- for a fader, slider, or a knob with a fixed
   end-to-end travel. Use this for AF Gain, AGC Gain, Mic Gain, RF
-  Attenuation/RF Gain, TX Drive, CW Speed, and Filter Width.
+  Attenuation/RF Gain, TX Drive, CW Speed, CW Sidetone Level and
+  Frequency, CW Pitch, and Filter Width.
 - **Wheel (relative)** -- for an endless rotary encoder (no mechanical
   stops) commonly used for jog wheels/VFO knobs. Use this for VFO Tune,
   VFO B Tune, RIT Adjust, and XIT Adjust.
@@ -173,9 +221,9 @@ can't tell these apart automatically, so Learn mode asks:
 A Note On/Off message (a button) is never ambiguous -- it's always a
 **Key**.
 
-## Wheel sensitivity and rate limiting
+## Wheel sensitivity, rate limiting and direction
 
-Wheel bindings have two extra controls, because MIDI encoders vary
+Wheel bindings have three extra controls, because MIDI encoders vary
 enormously in how "chatty" and fine-grained they are:
 
 - **Sensitivity** (default 1.0) -- scales how far each message moves
@@ -188,6 +236,10 @@ enormously in how "chatty" and fine-grained they are:
   stay controllable against -- raising this bounds how many steps per
   second can get through, independent of Sensitivity. If a control still
   feels too touchy after lowering Sensitivity, raise this instead.
+- **Reverse** -- turns the other way. For an encoder that counts the
+  opposite way to what you want, without changing the controller itself
+  -- handy when it's also used with another program that needs it as it
+  is.
 
 Both are editable later from the bindings table (click **Edit**) without
 needing to re-learn the control.

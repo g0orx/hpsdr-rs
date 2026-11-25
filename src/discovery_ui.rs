@@ -258,13 +258,6 @@ impl DiscoveryWindow {
         let mut action = DiscoveryAction::None;
         let mut still_open = self.open;
 
-        // Light theme, matching the Settings window's own override (see
-        // its doc comment in main.rs) -- for the same reason: egui only
-        // tints a window's title bar while focused, so overriding the
-        // whole window's visuals is the only way to keep it consistently
-        // white regardless of focus.
-        let light_visuals = egui::Visuals::light();
-        let light_style = egui::Style { visuals: light_visuals.clone(), ..Default::default() };
         // Rendered in its own OS-level viewport (like the extra receiver
         // windows and the Settings window -- see its doc comment in
         // main.rs) rather than an embedded egui::Window, so it can be
@@ -287,7 +280,10 @@ impl DiscoveryWindow {
         // nor take focus, so this separate window could open hidden behind
         // the (empty, black) main window. There it's drawn inside the main
         // window instead.
-        let mut viewport_ui = |ui: &mut egui::Ui, _class: egui::ViewportClass| {
+        let mut viewport_ui = |ui: &mut egui::Ui, class: egui::ViewportClass| {
+                if class != egui::ViewportClass::Root {
+                    crate::sync_secondary_viewport_theme(ui.ctx());
+                }
                 if let Some(deadline) = self.focus_deadline {
                     let focused = ui.input(|i| i.viewport().focused).unwrap_or(false);
                     if focused || Instant::now() >= deadline {
@@ -301,10 +297,9 @@ impl DiscoveryWindow {
                     still_open = false;
                     return;
                 }
-                egui::CentralPanel::default().frame(egui::Frame::central_panel(&light_style)).show(
+                egui::CentralPanel::default().show(
                     ui,
                     |ui| {
-                ui.visuals_mut().clone_from(&light_visuals);
                 let discovering = *self.discovering.lock().unwrap();
 
                 if discovering {
@@ -385,6 +380,9 @@ impl DiscoveryWindow {
                                 format!("USB {}", crate::usb_port::port_label(dev.mac))
                             } else if matches!(dev.board, Boards::Ozy | Boards::Rx888) {
                                 "USB".to_string()
+                            } else if dev.is_saturn_xdma() {
+                                // The G2's FPGA, from its own Pi (saturn.rs).
+                                "XDMA".to_string()
                             } else {
                                 match interface_names.get(&dev.my_address.ip()) {
                                     Some(name) => format!("{name} ({})", dev.my_address.ip()),
@@ -401,6 +399,8 @@ impl DiscoveryWindow {
                             row_double_clicked |= resp.double_clicked();
                             let ip_cell = if matches!(dev.board, Boards::Ozy | Boards::Rx888 | Boards::RtlSdr | Boards::MsiSdr) {
                                 "USB".to_string()
+                            } else if dev.is_saturn_xdma() {
+                                "XDMA".to_string()
                             } else {
                                 dev.address.ip().to_string()
                             };
@@ -505,10 +505,17 @@ impl DiscoveryWindow {
                             }
                         }
                     }
+                    // A way out with no title bar (--fullscreen), e.g. on a
+                    // touch screen.
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button("Quit").on_hover_text("Close hpsdr-rs").clicked() {
+                            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+                        }
+                    });
                 });
 
                 if let Some(err) = &self.manual_error {
-                    ui.colored_label(egui::Color32::from_rgb(200, 60, 60), err);
+                    ui.colored_label(crate::readable(ui, egui::Color32::from_rgb(235, 70, 70)), err);
                 }
 
                 // Saved manual addresses (issue #5) -- already silently

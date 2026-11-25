@@ -3,8 +3,8 @@
 
     Written from the standard, ETSI EN 302 307-1 V1.4.1 (free from
     etsi.org) -- not ported from leansdr, SDRangel or any other
-    implementation, which are all GPL-3 (this project is GPL-2.0 or
-    later). The LDPC tables are generated from the standard's own annexes
+    implementation (they're GPL-3; this project was GPL-2.0 or later at
+    the time, and is GPL-3.0 or later since the Saturn XDMA port). The LDPC tables are generated from the standard's own annexes
     by gen_ldpc_tables.py, which checks them as it goes.
 
     Pipeline, input to output:

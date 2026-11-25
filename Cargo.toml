@@ -1,8 +1,8 @@
 [package]
 name = "hpsdr-rs"
-version = "0.11.0"
+version = "0.15.2"
 edition = "2021"
-license = "GPL-2.0-or-later"
+license = "GPL-3.0-or-later"
 authors = ["John Melton <john.d.melton@googlemail.com>"]
 description = "Desktop client for openHPSDR Protocol 1/2 SDR radios"
 repository = "https://github.com/g0orx/hpsdr-rs"
@@ -38,6 +38,9 @@ egui = "0.37"
 # The remote-operation wire encoding, shared with hpsdr-remote
 # (docs/remote-protocol.md).
 hpsdr-proto = { path = "crates/hpsdr-proto" }
+# Front-panel controllers (GPIO/I2C on a Raspberry Pi) and the actions a
+# control can be bound to -- shared with hpsdr-remote.
+hpsdr-controller = { path = "crates/hpsdr-controller" }
 # Already in the tree through eframe/wgpu/winit; used directly only for
 # main.rs's HPSDR_LOG diagnostic logger.
 log = "0.4"
@@ -96,6 +99,11 @@ nusb = "0.2"
 # are likewise OS-native, same as cpal's own per-platform backends -- no
 # new system dependency on any platform.
 midir = "0.11"
+# Serial ports for CAT (cat.rs's serial transport -- amplifiers, band
+# decoders and loggers on a COM port). Default features off: on Linux
+# that drops libudev (a system library the packages would then need);
+# port listing falls back to scanning /sys/class/tty instead.
+serialport = { version = "4", default-features = false }
 
 # Native Wayland (the default on Linux) needs the app to draw its own
 # window title bar; winit only draws a GNOME/Adwaita-style one (title
@@ -103,6 +111,10 @@ midir = "0.11"
 # plain fallback frame with no title. Same winit as eframe pulls in.
 [target.'cfg(target_os = "linux")'.dependencies]
 winit = { version = "0.30", default-features = false, features = ["wayland-csd-adwaita"] }
+# The desktop's dark/light setting (the XDG desktop portal's color-scheme,
+# over D-Bus) for Theme: Follow system -- winit doesn't report it on Linux,
+# on Wayland or X11. Windows and macOS use egui's own detection.
+dark-light = "3"
 
 [target.'cfg(windows)'.dependencies]
 # SetStdHandle, used by main.rs's redirect_stdio_to_log_file() to send
@@ -111,8 +123,10 @@ winit = { version = "0.30", default-features = false, features = ["wayland-csd-a
 # subsystem app (see the `#![windows_subsystem]` crate attribute at the
 # top of main.rs) so Windows stops auto-allocating a console window
 # when launched from Explorer/the Start Menu shortcut, which otherwise
-# silently swallows that same output with nowhere to show it.
-windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_Console"] }
+# silently swallows that same output with nowhere to show it. Dwm,
+# WindowsAndMessaging and Threading: main.rs's windows_title_bar, which
+# themes secondary (Settings) windows' title bars.
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_Console", "Win32_System_Threading", "Win32_Graphics_Dwm", "Win32_UI_WindowsAndMessaging"] }
 
 # NOTE: I could not compile-check this in the sandbox this was written in
 # (no Rust toolchain available), so treat these version numbers as a
@@ -158,7 +172,8 @@ including the ANAN series), using WDSP for DSP. \
 Features include spectrum/waterfall display, multiple simultaneous \
 receivers, PureSignal PA linearization, diversity reception, a graphic \
 equalizer, and rigctl/TCI control servers for use with WSJT-X and similar \
-digital-mode software."""
+digital-mode software. Also includes hpsdr-remote, a thin client that \
+controls hpsdr-rs on another computer over the network."""
 section = "hamradio"
 priority = "optional"
 # $auto covers what the binary links; libxkbcommon(-x11) are loaded by
@@ -175,10 +190,23 @@ depends = "$auto, libxkbcommon0, libxkbcommon-x11-0"
 revision = "2"
 assets = [
     ["target/release/hpsdr-rs", "usr/bin/", "755"],
+    # The native remote client, built on its own and packaged with
+    # `cargo deb --no-build` (scripts/build-deb.sh, CI): built together with
+    # hpsdr-rs it would get hpsdr-rs's eframe features (wgpu).
+    ["target/release/hpsdr-remote", "usr/bin/", "755"],
+    ["assets/hpsdr-remote.desktop", "usr/share/applications/hpsdr-remote.desktop", "644"],
     ["README.md", "usr/share/doc/hpsdr-rs/README.md", "644"],
     ["docs/manual/*.md", "usr/share/doc/hpsdr-rs/manual/", "644"],
     ["docs/manual/images/*", "usr/share/doc/hpsdr-rs/manual/images/", "644"],
     ["assets/hpsdr-rs.desktop", "usr/share/applications/hpsdr-rs.desktop", "644"],
+    # A "Ham Radio" submenu, for menus that have none (Raspberry Pi OS:
+    # rpd-applications.menu; LXDE, Xfce, MATE). Menus read add-ons from
+    # applications-merged; installed under each Pi menu's own name too, as
+    # the menu spec leaves which one applies unclear without a prefix.
+    ["assets/menu/hpsdr-rs-hamradio.directory", "usr/share/desktop-directories/hpsdr-rs-hamradio.directory", "644"],
+    ["assets/menu/hpsdr-rs-hamradio.menu", "etc/xdg/menus/applications-merged/hpsdr-rs-hamradio.menu", "644"],
+    ["assets/menu/hpsdr-rs-hamradio.menu", "etc/xdg/menus/rpd-applications-merged/hpsdr-rs-hamradio.menu", "644"],
+    ["assets/menu/hpsdr-rs-hamradio.menu", "etc/xdg/menus/lxde-applications-merged/hpsdr-rs-hamradio.menu", "644"],
     ["assets/icons/hpsdr-rs.png", "usr/share/icons/hicolor/256x256/apps/hpsdr-rs.png", "644"],
     ["assets/io.github.g0orx.hpsdr-rs.metainfo.xml", "usr/share/metainfo/io.github.g0orx.hpsdr-rs.metainfo.xml", "644"],
     # Not auto-installed to /etc/udev/rules.d/ (a .deb shouldn't silently
@@ -192,8 +220,8 @@ assets = [
     ["assets/90-rtlsdr.rules", "usr/share/doc/hpsdr-rs/90-rtlsdr.rules", "644"],
     ["assets/90-mirisdr.rules", "usr/share/doc/hpsdr-rs/90-mirisdr.rules", "644"],
     # Ozy's FX2 firmware + FPGA bitstream -- sourced from the author's
-    # own piHPSDR repo (github.com/g0orx/pihpsdr), same GPL-2.0 license
-    # as this project, not a third-party blob. Installed to
+    # own piHPSDR repo (github.com/g0orx/pihpsdr), GPL-2.0 licensed (so
+    # fine with this project's GPL-3), not a third-party blob. Installed to
     # usr/share/hpsdr-rs/ozy/ specifically -- ozy.rs's `bundled_path`
     # derives this exact location from the installed binary's own path
     # (usr/bin/hpsdr-rs -> ../share/hpsdr-rs/ozy/), so a .deb install
@@ -232,6 +260,9 @@ assets = [
     { source = "docs/manual/*.md", dest = "/usr/share/doc/hpsdr-rs/manual/", mode = "644", doc = true },
     { source = "docs/manual/images/*", dest = "/usr/share/doc/hpsdr-rs/manual/images/", mode = "644", doc = true },
     { source = "assets/hpsdr-rs.desktop", dest = "/usr/share/applications/hpsdr-rs.desktop", mode = "644" },
+    # "Ham Radio" submenu -- see the .deb's assets.
+    { source = "assets/menu/hpsdr-rs-hamradio.directory", dest = "/usr/share/desktop-directories/hpsdr-rs-hamradio.directory", mode = "644" },
+    { source = "assets/menu/hpsdr-rs-hamradio.menu", dest = "/etc/xdg/menus/applications-merged/hpsdr-rs-hamradio.menu", mode = "644", config = true },
     { source = "assets/icons/hpsdr-rs.png", dest = "/usr/share/icons/hicolor/256x256/apps/hpsdr-rs.png", mode = "644" },
     { source = "assets/io.github.g0orx.hpsdr-rs.metainfo.xml", dest = "/usr/share/metainfo/io.github.g0orx.hpsdr-rs.metainfo.xml", mode = "644" },
     # Reference copies, not installed to /etc/udev/rules.d/ -- same
@@ -245,5 +276,5 @@ assets = [
 # default-members keeps a plain `cargo build`/`cargo test` here (and the
 # packaging scripts, CI and the Windows MSI build) to hpsdr-rs alone.
 [workspace]
-members = [".", "crates/hpsdr-proto", "crates/hpsdr-remote"]
+members = [".", "crates/hpsdr-proto", "crates/hpsdr-remote", "crates/hpsdr-controller"]
 default-members = ["."]

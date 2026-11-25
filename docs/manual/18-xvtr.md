@@ -65,7 +65,7 @@ or to the slot's RF minimum the first time. While active:
   [CAT/rigctl/TCI](11-settings-network.md) frequency reporting all show the
   real RF frequency, even though the radio's actual hardware LO stays at
   the true IF underneath.
-- Typing a frequency into VFO-A's keypad entry (right-click VFO-A) works in
+- Typing a frequency into VFO-A's keypad entry (click VFO-A) works in
   RF too: a frequency inside a configured transverter's RF range selects
   that transverter and tunes its IF. Up to 11 digits are accepted.
 - Clicking back to an ordinary band leaves the transverter and returns to

@@ -102,7 +102,7 @@ fn io_err(e: impl std::fmt::Display) -> io::Error {
 
 /// Bundled copies of `ozyfw-sdr1k.hex`/`Ozy_Janus.rbf` -- sourced
 /// directly from the user's own piHPSDR repo (github.com/g0orx/pihpsdr,
-/// GPL-2.0, same license this project is under), not a third-party
+/// GPL-2.0, fine with this project's GPL-3), not a third-party
 /// blob of uncertain provenance. Checked in each candidate location a
 /// real install/build of hpsdr-rs might put them, mirroring (a
 /// simplified version of) piHPSDR's own `filePath()` multi-directory

@@ -2,25 +2,31 @@
     hpsdr-remote's window: connect to an hpsdr-rs TCI server, then its VFO,
     band and mode buttons, S-meter and audio gain, and the spectrum and
     waterfall it streams -- click or scroll them to tune -- and transmit:
-    MOX, the microphone, power and the power/SWR meter
-    (docs/remote-protocol.md).
+    MOX, the microphone, power and the power/SWR meter, and in CW, text
+    sent as CW and an on-screen key or paddles (docs/remote-protocol.md).
 */
 
 use std::collections::{HashMap, VecDeque};
 
 use egui::{Color32, ColorImage, Pos2, Rect, Stroke, TextureHandle, TextureOptions, Vec2};
 use hpsdr_proto::bands::{self, BandInfo};
+use hpsdr_proto::cw;
 use hpsdr_proto::spectrum::SpectrumFrame;
 use hpsdr_proto::state::{self as dsp, DspState};
-use hpsdr_proto::tci::{Command, AUDIO, FEATURE_TX, HELLO, NOTICE, SPECTRUM};
+use hpsdr_proto::tci::{Command, AUDIO, FEATURE_CW, FEATURE_KEY, FEATURE_TX, HELLO, NOTICE, SPECTRUM};
 use hpsdr_proto::tx::{self, TxState, TX_AUDIO_RATE};
 use hpsdr_proto::{
     adpcm, Header, CODEC_IMA_ADPCM, FORMAT_ADPCM, PROTOCOL_VERSION, TYPE_ADPCM_AUDIO, TYPE_SPECTRUM,
 };
 
 use crate::audio::Player;
+use crate::keyer::{self, Keyer};
 use crate::link::{Incoming, Link, Status};
 use crate::mic::Mic;
+use crate::prefs;
+use crate::reload;
+
+mod panel;
 
 /// What's asked of the server: points a row, rows a second, audio rate.
 const SPECTRUM_POINTS: usize = 1024;
@@ -47,11 +53,15 @@ const FALLBACK_BANDS: [(&str, u64, u64, u64); 14] = [
     ("QO-100", 10_489_500_000, 10_490_000_000, 10_489_750_000),
 ];
 
+/// Band edge lines on the spectrum -- hpsdr-rs's own colour.
+const BAND_EDGE_COLOUR: Color32 = Color32::from_rgb(255, 140, 0);
+
 /// TCI mode names and their buttons.
-const MODES: [(&str, &str); 8] = [
+const MODES: [(&str, &str); 9] = [
     ("lsb", "LSB"),
     ("usb", "USB"),
-    ("cw", "CW"),
+    ("cwl", "CWL"),
+    ("cwu", "CWU"),
     ("am", "AM"),
     ("sam", "SAM"),
     ("nfm", "FM"),
@@ -76,6 +86,19 @@ struct Radio {
     bands: Option<Vec<BandInfo>>,
     /// Its transmitter (hpsdr_tx): None until the first report.
     tx: Option<TxState>,
+    /// Its saved CW messages (hpsdr_cw_messages).
+    cw_messages: Vec<String>,
+    /// The keys a paddle plugged in as a keyboard types (dit, dah), as
+    /// set at the radio (hpsdr_paddle_keys); None until it says.
+    paddle_keys: Option<(char, char)>,
+    /// Standard TCI state the front-panel controller's buttons toggle or
+    /// move: RIT and XIT (on, offset Hz), split, tune, VFO B, binaural.
+    rit: (bool, i32),
+    xit: (bool, i32),
+    split: bool,
+    tune: bool,
+    vfo_b_hz: u64,
+    binaural: bool,
 }
 
 impl Radio {
@@ -84,6 +107,29 @@ impl Radio {
     fn can_transmit(&self) -> bool {
         self.extensions.as_ref().is_some_and(|e| e.iter().any(|f| f == FEATURE_TX))
             && self.tx.is_some_and(|t| t.available)
+    }
+
+    /// In CW, with a server that sends text as CW: the CW controls take
+    /// MOX's place.
+    fn sends_cw(&self) -> bool {
+        self.is_cw()
+            && self.can_transmit()
+            && self.extensions.as_ref().is_some_and(|e| e.iter().any(|f| f == FEATURE_CW))
+    }
+
+    /// In CW, with a server that takes live keying: the key or paddles too.
+    fn keys_cw(&self) -> bool {
+        self.sends_cw() && self.extensions.as_ref().is_some_and(|e| e.iter().any(|f| f == FEATURE_KEY))
+    }
+
+    /// CW, either sideband (or plain "cw", from an older hpsdr-rs).
+    fn is_cw(&self) -> bool {
+        matches!(self.mode.as_str(), "cw" | "cwl" | "cwu")
+    }
+
+    /// The paddle keys (dit, dah): the radio's, or `[` and `]`.
+    fn paddle_keys(&self) -> (char, char) {
+        self.paddle_keys.unwrap_or((cw::PADDLE_DIT_DEFAULT, cw::PADDLE_DAH_DEFAULT))
     }
 }
 
@@ -101,7 +147,8 @@ impl Radio {
                 "lsb" => (-w, -low_cut),
                 "digl" => (-w, 0),
                 "digu" => (0, w),
-                "cw" => (600 - w / 2, 600 + w / 2),
+                "cwl" => (-600 - w / 2, -600 + w / 2),
+                "cw" | "cwu" => (600 - w / 2, 600 + w / 2),
                 "am" | "sam" | "nfm" | "dsb" => (-w, w),
                 _ => (low_cut, w),
             };
@@ -110,7 +157,8 @@ impl Radio {
             Some((mode, low, high)) if *mode == self.mode => (*low, *high),
             _ => match self.mode.as_str() {
                 "lsb" | "digl" => (-2700, -150),
-                "cw" => (-250, 250),
+                "cwl" => (-850, -350),
+                "cw" | "cwu" => (350, 850),
                 "am" | "sam" | "nfm" => (-4000, 4000),
                 _ => (150, 2700),
             },
@@ -118,7 +166,8 @@ impl Radio {
     }
 }
 
-/// The groups of controls a narrow screen shows one at a time.
+/// The groups of controls the compact layout's toolbar opens, one at a
+/// time, over the spectrum.
 #[derive(Clone, Copy, PartialEq)]
 enum Section {
     Step,
@@ -127,6 +176,7 @@ enum Section {
     Filter,
     Noise,
     Audio,
+    Key,
     Tx,
 }
 
@@ -139,19 +189,61 @@ impl Section {
             Section::Filter => "Filter",
             Section::Noise => "Noise",
             Section::Audio => "Audio",
+            Section::Key => "Key",
             Section::Tx => "TX",
         }
     }
 }
 
+/// Standard: every control in rows above the spectrum. Compact, as
+/// hpsdr-rs's own for small screens: just the frequency above it, and a
+/// toolbar below whose buttons open a group of controls over it. Auto picks
+/// compact on a small screen.
+#[derive(Clone, Copy, PartialEq)]
+enum Layout {
+    Auto,
+    Standard,
+    Compact,
+}
+
+impl Layout {
+    const ALL: [Layout; 3] = [Layout::Auto, Layout::Standard, Layout::Compact];
+
+    fn label(self) -> &'static str {
+        match self {
+            Layout::Auto => "Auto",
+            Layout::Standard => "Standard",
+            Layout::Compact => "Compact",
+        }
+    }
+}
+
 /// Narrower than this (points) -- a phone held upright -- or shorter than
-/// SHORT_HEIGHT -- one held sideways -- the controls show a section at a
-/// time.
+/// SHORT_HEIGHT -- one held sideways, or a Raspberry Pi's 7" 800x480
+/// display -- Auto is compact, and the Connect fields go a line each.
 const NARROW_WIDTH: f32 = 600.0;
 const SHORT_HEIGHT: f32 = 500.0;
+/// The compact toolbar's buttons: their height, the narrowest they get
+/// before wrapping onto a second row, the widest, and MOX's width.
+const TOOLBAR_BUTTON_HEIGHT: f32 = 40.0;
+const TOOLBAR_BUTTON_MIN_WIDTH: f32 = 56.0;
+const TOOLBAR_BUTTON_MAX_WIDTH: f32 = 120.0;
+const TOOLBAR_MOX_WIDTH: f32 = 80.0;
 /// The controls take at most this share of the screen's height; beyond
 /// it they scroll, so the spectrum always keeps the rest.
 const CONTROLS_MAX_HEIGHT: f32 = 0.55;
+/// Compact and shorter than this (points) -- a phone held sideways, with
+/// the browser's own bars -- the whole page scrolls, with the spectrum and
+/// waterfall PANES_HEIGHT tall together. Fitted to the screen instead, they
+/// got squeezed until the waterfall vanished (REAL REPORT 2026-11-18,
+/// Pixel 10 Pro landscape, about 330 points high). A Pi's 7" display
+/// (480) stays as it was.
+const SCROLL_PAGE_HEIGHT: f32 = 420.0;
+const PANES_HEIGHT: f32 = 300.0;
+/// Frequency labels under the spectrum: at least this far apart
+/// (points) beyond their own width, and their font size.
+const FREQ_LABEL_GAP: f32 = 12.0;
+const FREQ_LABEL_SIZE: f32 = 10.0;
 
 struct Waterfall {
     rows: VecDeque<Vec<Color32>>,
@@ -161,6 +253,11 @@ struct Waterfall {
 
 pub struct App {
     url: String,
+    /// The servers connected to lately, newest first (prefs.rs), and
+    /// whether this connection's server has been added to them yet: it is
+    /// once the connection opens, so a mistyped address isn't kept.
+    recent: Vec<String>,
+    remembered: bool,
     link: Option<Link>,
     radio: Radio,
     player: Option<Player>,
@@ -171,10 +268,15 @@ pub struct App {
     muted: bool,
     db_low: f32,
     db_range: f32,
+    /// Spectrum and waterfall on/off and their split, kept between runs.
+    display: prefs::Display,
     band_memory: HashMap<&'static str, u64>,
     /// Data rates for the status line: bytes in and out at the last
     /// sample, when, and the rates in and out (kbit/s).
     rate_sample: (u64, u64, f64, f64, f64),
+    /// The audio output's callback count at the last sample, and whether
+    /// it had moved on since the one before (the output is running).
+    audio_callbacks: (u64, bool),
     /// The step for the frequency display's slide, the - and + buttons,
     /// and a plain scroll.
     step_hz: u64,
@@ -211,10 +313,56 @@ pub struct App {
     tx_pending: Vec<i16>,
     power_w: u32,
     power_set_at: f64,
+    /// CW: the text being typed, and the speed (WPM) with when it was last
+    /// changed here.
+    cw_text: String,
+    cw_speed_wpm: u32,
+    cw_speed_set_at: f64,
+    /// Live keying: the keyer, the playout delay asked of the server (ms),
+    /// the sidetone level; the pads pressed this frame (None if not shown);
+    /// the key state last sent and when, for the repeats while it's down;
+    /// and the fingers on the screen (for squeezing both paddles).
+    keyer: Keyer,
+    key_delay_ms: u32,
+    sidetone_level: f32,
+    pads: Option<(bool, bool)>,
+    /// A key or paddle plugged in as a keyboard (a microcontroller that
+    /// types the radio's paddle keys): dit and dah held now.
+    paddle_keys: (bool, bool),
+    key_sent: (bool, f64),
+    touches: HashMap<u64, Pos2>,
     /// The server's last hpsdr_notice, and when it came.
     notice: Option<(String, f64)>,
-    /// The section of controls open on a narrow screen, if any.
+    /// Connect on the first frame: the page was reloaded after a lost
+    /// WebGL context while connected (reload.rs).
+    reconnect: bool,
+    /// Audio output opened without a click: resume it on the next one.
+    audio_needs_click: bool,
+    /// The section of controls open over the spectrum in the compact
+    /// layout, if any.
     section: Option<Section>,
+    layout: Layout,
+    /// Native only: filling the screen (--fullscreen, or F11), when there's
+    /// a Quit button, as there's no title bar to close it from.
+    pub fullscreen: bool,
+    /// A piHPSDR front-panel controller (app/panel.rs): its settings, the
+    /// running one and its status, whether its settings window is open,
+    /// and the part-steps a tuning knob has left over.
+    controller_config: hpsdr_controller::ControllerConfig,
+    controller: Option<hpsdr_controller::Controller>,
+    controller_status: String,
+    controller_open: bool,
+    /// The compact toolbar's height last frame, kept clear for it under
+    /// the spectrum and waterfall.
+    toolbar_height: f32,
+    controller_tune_steps: hpsdr_controller::TuneSteps,
+    /// A setting a controller knob just changed, and when: shown over the
+    /// spectrum for a moment.
+    value_popup: Option<(String, f64)>,
+    /// When a controller button last changed RIT, XIT, split, tune, VFO B
+    /// or binaural: the server's reports are ignored just after, as with
+    /// tuning.
+    controls_set_at: f64,
 }
 
 /// TX audio goes in blocks this long (20 ms).
@@ -232,8 +380,19 @@ const STEPS_HZ: [(u64, &str); 4] = [(10, "10 Hz"), (100, "100 Hz"), (1_000, "1 k
 
 impl App {
     pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
-        Self {
-            url: default_url(),
+        let recent = prefs::load_recent();
+        let display = prefs::load_display();
+        // Natively, the server last connected to. In a browser, the page's
+        // own address (default_url), which is right when hpsdr-rs serves
+        // it; the others are a click away.
+        #[cfg(not(target_arch = "wasm32"))]
+        let url = recent.first().cloned().unwrap_or_else(default_url);
+        #[cfg(target_arch = "wasm32")]
+        let url = default_url();
+        let mut app = Self {
+            url,
+            recent,
+            remembered: false,
             link: None,
             radio: Radio::default(),
             player: None,
@@ -241,11 +400,13 @@ impl App {
             spectrum: None,
             waterfall: Waterfall { rows: VecDeque::new(), texture: None, dirty: false },
             af_gain_db: 0.0,
-            muted: false,
+            muted: display.muted,
             db_low: -130.0,
             db_range: 60.0,
+            display,
             band_memory: HashMap::new(),
             rate_sample: (0, 0, 0.0, 0.0, 0.0),
+            audio_callbacks: (0, true),
             step_hz: 1_000,
             vfo_slide_px: 0.0,
             span_slide_hz: 0.0,
@@ -265,9 +426,42 @@ impl App {
             tx_pending: Vec::new(),
             power_w: 0,
             power_set_at: f64::NEG_INFINITY,
+            cw_text: String::new(),
+            cw_speed_wpm: 20,
+            cw_speed_set_at: f64::NEG_INFINITY,
+            keyer: Keyer::new(keyer::Mode::IambicA),
+            key_delay_ms: cw::KEY_DELAY_DEFAULT_MS,
+            sidetone_level: 0.3,
+            pads: None,
+            paddle_keys: (false, false),
+            key_sent: (false, f64::NEG_INFINITY),
+            touches: HashMap::new(),
             notice: None,
-            section: Some(Section::Band),
+            reconnect: false,
+            audio_needs_click: false,
+            section: None,
+            layout: Layout::Auto,
+            fullscreen: false,
+            controller_config: panel::load_config(),
+            controller: None,
+            controller_status: String::new(),
+            controller_open: false,
+            toolbar_height: 60.0,
+            controller_tune_steps: Default::default(),
+            value_popup: None,
+            controls_set_at: f64::NEG_INFINITY,
+        };
+        // A front-panel controller: only natively, on Linux (a Raspberry
+        // Pi); in a browser there are no settings for one.
+        if app.controller_config.kind != hpsdr_controller::ControllerKind::None {
+            app.start_controller();
         }
+        if let Some((url, password)) = reload::take_reconnect() {
+            app.url = url;
+            app.password = password;
+            app.reconnect = true;
+        }
+        app
     }
 
     fn connect(&mut self, ctx: &egui::Context) {
@@ -277,6 +471,8 @@ impl App {
         self.waterfall.dirty = true;
         self.keyed_here = false;
         self.notice = None;
+        self.remembered = false;
+        reload::set_connected(Some((&self.url, &self.password)));
         self.link = match Link::connect(&with_password(&self.url, &self.password), ctx.clone()) {
             Ok(link) => Some(link),
             Err(e) => {
@@ -287,7 +483,11 @@ impl App {
         // Opened here, on the click: browsers only start audio after one.
         if self.player.is_none() {
             match Player::open() {
-                Ok(p) => self.player = Some(p),
+                Ok(p) => {
+                    self.player = Some(p);
+                    // A Mute kept from last time, and the gain.
+                    self.apply_gain();
+                }
                 Err(e) => self.audio_error = Some(e),
             }
         }
@@ -333,6 +533,22 @@ impl App {
                 self.send(Command::new(SPECTRUM, &[&SPECTRUM_POINTS.to_string(), &SPECTRUM_FPS.to_string()]));
                 self.send(Command::new(AUDIO, &["adpcm", &AUDIO_RATE.to_string()]));
             }
+            // Receiver 0 only: hpsdr-rs reports its second receiver (an
+            // extra receiver) as receiver 1, as Thetis does its RX2.
+            Incoming::Command(cmd)
+                if matches!(
+                    cmd.name.as_str(),
+                    "vfo" | "modulation" | "rx_filter_band" | "rit_enable" | "rit_offset" | "rx_bin_enable"
+                ) && cmd.arg::<u32>(0) != Some(0) => {}
+            // Just after a controller button changed one of these here, the
+            // server's report may be from before it.
+            Incoming::Command(cmd)
+                if matches!(
+                    cmd.name.as_str(),
+                    "rit_enable" | "rit_offset" | "xit_enable" | "xit_offset" | "split_enable" | "tune" | "rx_bin_enable"
+                ) && self.now - self.controls_set_at < TUNE_HOLD_S => {}
+            Incoming::Command(cmd)
+                if cmd.name == "vfo" && cmd.arg::<u32>(1) == Some(1) && self.now - self.controls_set_at < TUNE_HOLD_S => {}
             Incoming::Command(cmd) => match cmd.name.as_str() {
                 "vfo" if cmd.arg::<u32>(1) == Some(0) => {
                     // Not just after tuning here -- see tuned_at.
@@ -340,6 +556,18 @@ impl App {
                         self.radio.vfo_hz = hz;
                     }
                 }
+                "vfo" if cmd.arg::<u32>(1) == Some(1) => {
+                    if let Some(hz) = cmd.arg::<u64>(2) {
+                        self.radio.vfo_b_hz = hz;
+                    }
+                }
+                "rit_enable" => self.radio.rit.0 = cmd.args.get(1).is_some_and(|v| v == "true"),
+                "rit_offset" => self.radio.rit.1 = cmd.arg::<i32>(1).unwrap_or(0),
+                "xit_enable" => self.radio.xit.0 = cmd.args.get(1).is_some_and(|v| v == "true"),
+                "xit_offset" => self.radio.xit.1 = cmd.arg::<i32>(1).unwrap_or(0),
+                "split_enable" => self.radio.split = cmd.args.get(1).is_some_and(|v| v == "true"),
+                "tune" => self.radio.tune = cmd.args.get(1).is_some_and(|v| v == "true"),
+                "rx_bin_enable" => self.radio.binaural = cmd.args.get(1).is_some_and(|v| v == "true"),
                 "modulation" => {
                     if let Some(m) = cmd.args.get(1) {
                         self.radio.mode = m.to_ascii_lowercase();
@@ -369,6 +597,19 @@ impl App {
                         self.mox_pressed_at = f64::NEG_INFINITY;
                     }
                     self.notice = Some((cmd.args.join(", "), self.now));
+                }
+                cw::MACROS_SPEED => {
+                    if let Some(wpm) = cmd.arg::<u32>(0).filter(|_| self.now - self.cw_speed_set_at >= TUNE_HOLD_S) {
+                        self.cw_speed_wpm = wpm;
+                    }
+                }
+                cw::MESSAGES => self.radio.cw_messages = cw::messages_from(&cmd).unwrap_or_default(),
+                cw::PADDLE_KEYS => {
+                    let keys = cw::paddle_keys_from(&cmd);
+                    if keys.is_some() && keys != self.radio.paddle_keys {
+                        self.radio.paddle_keys = keys;
+                        self.paddle_keys = (false, false);
+                    }
                 }
                 "device" => self.radio.device = cmd.args.first().cloned().unwrap_or_default(),
                 HELLO => self.radio.extensions = Some(cmd.args.iter().skip(1).cloned().collect()),
@@ -483,7 +724,7 @@ impl App {
 
     /// MOX -- shown once the server says this radio can transmit.
     fn mox_button(&mut self, ui: &mut egui::Ui) {
-        let cw = self.radio.mode == "cw";
+        let cw = self.radio.is_cw();
         let (fill, text) = if self.radio.mox {
             (Color32::from_rgb(200, 30, 30), Color32::WHITE)
         } else {
@@ -497,7 +738,7 @@ impl App {
                     .min_size(Vec2::new(72.0, 32.0)),
             )
             .on_hover_text("Transmit from this microphone; press again to stop")
-            .on_disabled_hover_text("No remote CW yet: choose a voice or data mode to transmit");
+            .on_disabled_hover_text("In CW, this server can't send CW from here: choose a voice or data mode to transmit");
         if mox.clicked() {
             self.set_mox(!self.radio.mox);
         }
@@ -508,6 +749,24 @@ impl App {
     /// when `narrow`, as audio_controls.
     fn tx_settings(&mut self, ui: &mut egui::Ui, narrow: bool) {
         let tx = self.radio.tx.unwrap_or_default();
+        if !self.radio.sends_cw() {
+            self.mic_settings(ui, narrow);
+        }
+        ui.label("Power:");
+        let max = tx.max_power_w.max(1);
+        if ui.add(egui::Slider::new(&mut self.power_w, 0..=max).suffix(" W")).changed() {
+            self.power_set_at = self.now;
+            let watts = self.power_w.to_string();
+            self.send(Command::new(dsp::SET, &[tx::SET_POWER, &watts]));
+        }
+        if self.radio.mox {
+            ui.add_space(12.0);
+            ui.strong(format!("{:.1} W   SWR {:.2}", tx.forward_w, tx.swr));
+        }
+    }
+
+    /// The microphone's gain and level meter.
+    fn mic_settings(&mut self, ui: &mut egui::Ui, narrow: bool) {
         ui.label("Mic:");
         ui.add(egui::Slider::new(&mut self.mic_gain_db, -20.0..=30.0).suffix(" dB"));
         let (rect, _) = ui.allocate_exact_size(Vec2::new(80.0, 10.0), egui::Sense::hover());
@@ -524,16 +783,312 @@ impl App {
         } else {
             ui.add_space(12.0);
         }
-        ui.label("Power:");
-        let max = tx.max_power_w.max(1);
-        if ui.add(egui::Slider::new(&mut self.power_w, 0..=max).suffix(" W")).changed() {
-            self.power_set_at = self.now;
-            let watts = self.power_w.to_string();
-            self.send(Command::new(dsp::SET, &[tx::SET_POWER, &watts]));
+    }
+
+    /// Sends text as CW (TCI's cw_macros), after anything already going.
+    fn send_cw(&mut self, text: &str) {
+        if !text.trim().is_empty() {
+            self.send(cw::macros(text));
         }
-        if self.radio.mox {
+    }
+
+    /// CW: Stop, red while the radio is sending -- in MOX's place.
+    fn cw_stop_button(&mut self, ui: &mut egui::Ui) {
+        let (fill, text) = if self.radio.mox {
+            (Color32::from_rgb(200, 30, 30), Color32::WHITE)
+        } else {
+            (ui.visuals().widgets.inactive.bg_fill, ui.visuals().text_color())
+        };
+        let stop = ui
+            .add(
+                egui::Button::new(egui::RichText::new("Stop").strong().size(18.0).color(text))
+                    .fill(fill)
+                    .min_size(Vec2::new(72.0, 32.0)),
+            )
+            .on_hover_text("Stop sending CW at once");
+        if stop.clicked() {
+            self.send(cw::stop());
+        }
+    }
+
+    /// CW: a line of text to send (Enter or Send), and Stop unless
+    /// `narrow`, where it's already on the line above.
+    fn cw_send_row(&mut self, ui: &mut egui::Ui, narrow: bool) {
+        let width = if narrow { (ui.available_width() - 80.0).max(120.0) } else { 280.0 };
+        let edit = ui.add(
+            egui::TextEdit::singleline(&mut self.cw_text).hint_text("Text to send as CW").desired_width(width),
+        );
+        let entered = edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+        if ui.add(egui::Button::new(egui::RichText::new("Send").strong()).min_size(Vec2::new(60.0, 30.0))).clicked()
+            || entered
+        {
+            let text = std::mem::take(&mut self.cw_text);
+            self.send_cw(&text);
+            if entered {
+                edit.request_focus();
+            }
+        }
+        if !narrow {
+            self.cw_stop_button(ui);
+        }
+    }
+
+    /// Live keying's settings: the keyer's mode, the delay asked of the
+    /// server, and the sidetone -- on lines of their own when `narrow`.
+    fn key_settings(&mut self, ui: &mut egui::Ui, narrow: bool) {
+        for mode in keyer::Mode::ALL {
+            if ui.add(egui::Button::selectable(self.keyer.mode == mode, mode.label())).clicked() && self.keyer.mode != mode {
+                self.release_key();
+                self.keyer.mode = mode;
+            }
+        }
+        if narrow {
+            ui.end_row();
+        } else {
             ui.add_space(12.0);
-            ui.strong(format!("{:.1} W   SWR {:.2}", tx.forward_w, tx.swr));
+        }
+        ui.label("Delay:").on_hover_text(
+            "How far behind your keying the radio sends, so the network's ups and downs \
+             don't change your timing: more for a slower or busier connection",
+        );
+        ui.add(
+            egui::Slider::new(&mut self.key_delay_ms, cw::KEY_DELAY_MIN_MS..=500)
+                .suffix(" ms")
+                .logarithmic(true),
+        );
+        if narrow {
+            ui.end_row();
+        } else {
+            ui.add_space(12.0);
+        }
+        ui.label("Sidetone:");
+        ui.add(egui::Slider::new(&mut self.sidetone_level, 0.0..=1.0).show_value(false));
+    }
+
+    /// The on-screen key -- one pad -- or paddles -- dit and dah side by
+    /// side -- noting what's pressed for run_keyer. Fingers on a touch
+    /// screen count (both paddles at once squeezes them); otherwise the
+    /// mouse.
+    fn key_pads(&mut self, ui: &mut egui::Ui, narrow: bool) {
+        let straight = self.keyer.mode == keyer::Mode::Straight;
+        let height = if narrow { 90.0 } else { 70.0 };
+        let gap = ui.spacing().item_spacing.x;
+        let width = if straight {
+            if narrow { ui.available_width() } else { 240.0 }
+        } else if narrow {
+            (ui.available_width() - gap) / 2.0
+        } else {
+            140.0
+        };
+        let labels: &[&str] = if straight { &["KEY"] } else { &["dit", "dah"] };
+        let mut pressed = [false; 2];
+        ui.horizontal(|ui| {
+            for (i, label) in labels.iter().enumerate() {
+                let (rect, _) = ui.allocate_exact_size(Vec2::new(width, height), egui::Sense::click_and_drag());
+                pressed[i] = self.pad_pressed(ui, rect);
+                let keyed = if straight {
+                    self.paddle_keys.0 || self.paddle_keys.1
+                } else if i == 0 {
+                    self.paddle_keys.0
+                } else {
+                    self.paddle_keys.1
+                };
+                let fill = if pressed[i] || keyed { Color32::from_rgb(200, 30, 30) } else { ui.visuals().widgets.inactive.bg_fill };
+                ui.painter().rect_filled(rect, 8.0, fill);
+                ui.painter().text(
+                    rect.center() - Vec2::new(0.0, 9.0),
+                    egui::Align2::CENTER_CENTER,
+                    label,
+                    egui::FontId::proportional(22.0),
+                    ui.visuals().strong_text_color(),
+                );
+                // The key a paddle plugged in as a keyboard types for it.
+                let (dit_key, dah_key) = self.radio.paddle_keys();
+                let key_text = if straight {
+                    format!("{dit_key} or {dah_key}")
+                } else if i == 0 {
+                    dit_key.to_string()
+                } else {
+                    dah_key.to_string()
+                };
+                ui.painter().text(
+                    rect.center() + Vec2::new(0.0, 16.0),
+                    egui::Align2::CENTER_CENTER,
+                    key_text,
+                    egui::FontId::monospace(15.0),
+                    ui.visuals().weak_text_color(),
+                );
+            }
+        });
+        self.pads = Some((pressed[0], pressed[1]));
+    }
+
+    fn pad_pressed(&self, ui: &egui::Ui, rect: Rect) -> bool {
+        if !self.touches.is_empty() {
+            return self.touches.values().any(|p| rect.contains(*p));
+        }
+        ui.input(|i| i.pointer.primary_down() && i.pointer.interact_pos().is_some_and(|p| rect.contains(p)))
+    }
+
+    /// Keeps track of the fingers on the screen, for the pads.
+    fn track_touches(&mut self, ui: &egui::Ui) {
+        ui.input(|i| {
+            for e in &i.events {
+                if let egui::Event::Touch { id, phase, pos, .. } = e {
+                    match phase {
+                        egui::TouchPhase::Start | egui::TouchPhase::Move => {
+                            self.touches.insert(id.0, *pos);
+                        }
+                        egui::TouchPhase::End | egui::TouchPhase::Cancel => {
+                            self.touches.remove(&id.0);
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    fn can_key(&self) -> bool {
+        self.radio.keys_cw() && self.link.as_ref().is_some_and(|l| l.status == Status::Open)
+    }
+
+    /// Before the controls are drawn: a key or paddle plugged in as a
+    /// keyboard. While it can key, its two keys are taken out of the input
+    /// -- they key, rather than typing into the CW text -- and what's held
+    /// is noted for run_keyer. The keyboard's own repeats are ignored, and
+    /// everything's let go if the page loses focus (no key-up comes then).
+    fn take_paddle_keys(&mut self, ctx: &egui::Context) {
+        if !self.can_key() {
+            self.paddle_keys = (false, false);
+            return;
+        }
+        let mut keys = self.paddle_keys;
+        // Matched by where the key is on a US keyboard (what a
+        // microcontroller sends), so a phone set to another layout still
+        // sees it.
+        let (dit_char, dah_char) = self.radio.paddle_keys();
+        let dit_key = egui::Key::from_name(&dit_char.to_string());
+        let dah_key = egui::Key::from_name(&dah_char.to_string());
+        let is_paddle_text = |t: &str| {
+            let t = t.to_lowercase();
+            t == dit_char.to_string() || t == dah_char.to_string()
+        };
+        ctx.input_mut(|i| {
+            i.events.retain(|e| match e {
+                egui::Event::Key { key, physical_key, pressed, .. } => {
+                    let k = Some(physical_key.unwrap_or(*key));
+                    if k == dit_key {
+                        keys.0 = *pressed;
+                        false
+                    } else if k == dah_key {
+                        keys.1 = *pressed;
+                        false
+                    } else {
+                        true
+                    }
+                }
+                egui::Event::Text(t) => !is_paddle_text(t),
+                egui::Event::WindowFocused(false) => {
+                    keys = (false, false);
+                    true
+                }
+                _ => true,
+            })
+        });
+        self.paddle_keys = keys;
+    }
+
+    /// After the controls are drawn: runs the keyer on the pads and a key
+    /// or paddle plugged in as a keyboard, and sends its transitions,
+    /// repeating a held key so the server knows this client is still there;
+    /// and the sidetone.
+    fn run_keyer(&mut self, ctx: &egui::Context) {
+        let now_ms = self.now * 1000.0;
+        if !self.can_key() {
+            self.pads = None;
+            if self.keyer.is_busy() || self.key_sent.0 {
+                self.release_key();
+            }
+            return;
+        }
+        let (pad_dit, pad_dah) = self.pads.take().unwrap_or_default();
+        let (key_dit, key_dah) = self.paddle_keys;
+        let (dit, dah) = if self.keyer.mode == keyer::Mode::Straight {
+            (pad_dit || key_dit || key_dah, false)
+        } else {
+            (pad_dit || key_dit, pad_dah || key_dah)
+        };
+        let wpm = self.cw_speed_wpm;
+        let transitions = self.keyer.update(now_ms, dit, dah, wpm);
+        self.send_key(transitions);
+        if self.key_sent.0 && now_ms - self.key_sent.1 >= cw::KEY_REPEAT_MS as f64 {
+            self.send_key(vec![(now_ms, true)]);
+        }
+        let down = self.keyer.is_down(now_ms);
+        if let Some(p) = &self.player {
+            p.set_sidetone(down, self.sidetone_level);
+        }
+        if self.keyer.is_busy() || dit || dah {
+            ctx.request_repaint();
+        }
+    }
+
+    fn send_key(&mut self, transitions: Vec<(f64, bool)>) {
+        for (t, down) in transitions {
+            self.send(cw::key(t.max(0.0).round() as u64, down, self.key_delay_ms));
+            self.key_sent = (down, self.now * 1000.0);
+        }
+    }
+
+    /// Lets go of the key at once, and stops the sidetone.
+    fn release_key(&mut self) {
+        let now_ms = self.now * 1000.0;
+        let mut transitions = self.keyer.release(now_ms);
+        if transitions.is_empty() && self.key_sent.0 {
+            transitions.push((now_ms, false));
+        }
+        self.send_key(transitions);
+        self.key_sent.0 = false;
+        if let Some(p) = &self.player {
+            p.set_sidetone(false, self.sidetone_level);
+        }
+    }
+
+    /// CW: the radio's saved messages, one button each, and the speed --
+    /// on a line of its own when `narrow`.
+    fn cw_settings(&mut self, ui: &mut egui::Ui, narrow: bool) {
+        let messages: Vec<(usize, String)> = self
+            .radio
+            .cw_messages
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| !m.trim().is_empty())
+            .map(|(i, m)| (i, m.clone()))
+            .collect();
+        for (i, message) in messages {
+            let label: String = message.chars().take(10).collect();
+            let label = if message.chars().count() > 10 { format!("{}: {label}...", i + 1) } else { format!("{}: {label}", i + 1) };
+            if ui.button(label).on_hover_text(format!("Send \"{message}\"")).clicked() {
+                self.send_cw(&message);
+            }
+        }
+        if narrow {
+            ui.end_row();
+        } else {
+            ui.add_space(12.0);
+        }
+        ui.label("Speed:");
+        if ui
+            .add(egui::Slider::new(&mut self.cw_speed_wpm, cw::SPEED_MIN..=cw::SPEED_MAX).suffix(" WPM"))
+            .changed()
+        {
+            self.cw_speed_set_at = self.now;
+            self.send(cw::speed(self.cw_speed_wpm));
+        }
+        if narrow {
+            ui.end_row();
+        } else {
+            ui.add_space(12.0);
         }
     }
 
@@ -560,6 +1115,7 @@ impl App {
                     }
                     self.link = None;
                     self.keyed_here = false;
+                    reload::set_connected(None);
                 }
                 if !narrow {
                     ui.weak(&self.url);
@@ -573,7 +1129,20 @@ impl App {
                 let field = |ui: &mut egui::Ui, max: f32| if narrow { ui.available_width() - 80.0 } else { max };
                 ui.label("Server:");
                 let width = field(ui, 260.0);
+                let width = if self.recent.is_empty() { width } else { width - 36.0 };
                 ui.add(egui::TextEdit::singleline(&mut self.url).desired_width(width));
+                if !self.recent.is_empty() {
+                    ui.menu_button("\u{25BE}", |ui| {
+                        for u in self.recent.clone() {
+                            if ui.button(&u).clicked() {
+                                self.url = u;
+                                ui.close();
+                            }
+                        }
+                    })
+                    .response
+                    .on_hover_text("Servers connected to lately");
+                }
                 if narrow {
                     ui.end_row();
                 }
@@ -600,82 +1169,256 @@ impl App {
                 },
             };
             ui.weak(status);
+            ui.add_space(8.0);
+            egui::ComboBox::from_id_salt("layout")
+                .selected_text(format!("Layout: {}", self.layout.label()))
+                .show_ui(ui, |ui| {
+                    for l in Layout::ALL {
+                        ui.selectable_value(&mut self.layout, l, l.label());
+                    }
+                })
+                .response
+                .on_hover_text("Compact: the frequency above the spectrum and a toolbar below it, for a phone or a small screen; Auto picks it when the screen is small");
+            #[cfg(not(target_arch = "wasm32"))]
+            if ui
+                .add(egui::Button::selectable(self.controller_open, "Controller"))
+                .on_hover_text("A piHPSDR front panel (encoders and switches) on this Raspberry Pi")
+                .clicked()
+            {
+                self.controller_open = !self.controller_open;
+            }
+            if self.fullscreen
+                && ui.button(egui::RichText::new("Quit").strong()).on_hover_text("Close hpsdr-remote (F11 leaves fullscreen)").clicked()
+            {
+                ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+            }
         });
     }
 
-    /// Wide: every row of controls. Narrow (a phone held upright): the
-    /// frequency, S-meter, MOX and - / + always, and the rest one section at
-    /// a time, picked by a row of buttons -- the selected one again closes
-    /// it, leaving more of the screen to the spectrum.
-    fn controls(&mut self, ui: &mut egui::Ui, narrow: bool) {
+    /// The standard layout: every row of controls.
+    fn controls(&mut self, ui: &mut egui::Ui) {
         self.frequency_row(ui);
-        if !narrow {
-            self.step_row(ui);
-            self.band_row(ui);
-            ui.horizontal_wrapped(|ui| {
-                self.mode_buttons(ui);
-                ui.add_space(16.0);
-                self.audio_controls(ui, false);
-            });
-            self.dsp_controls(ui, true, true);
-            if self.radio.can_transmit() {
-                ui.horizontal_wrapped(|ui| {
-                    self.mox_button(ui);
-                    ui.add_space(12.0);
-                    self.tx_settings(ui, false);
-                });
-            }
-            return;
-        }
+        self.step_row(ui);
+        self.band_row(ui);
         ui.horizontal_wrapped(|ui| {
-            if self.radio.can_transmit() {
-                self.mox_button(ui);
-                ui.add_space(8.0);
-            }
-            self.minus_plus(ui);
-            if self.radio.mox {
-                let tx = self.radio.tx.unwrap_or_default();
-                ui.strong(format!("{:.1} W  SWR {:.2}", tx.forward_w, tx.swr));
-            }
+            self.mode_buttons(ui);
+            ui.add_space(16.0);
+            self.audio_controls(ui, false);
         });
-        let mut sections = vec![Section::Step, Section::Band, Section::Mode];
+        self.dsp_controls(ui, true, true);
+        if self.radio.sends_cw() {
+            ui.horizontal_wrapped(|ui| self.cw_send_row(ui, false));
+            ui.horizontal_wrapped(|ui| {
+                self.cw_settings(ui, false);
+                self.tx_settings(ui, false);
+            });
+            if self.radio.keys_cw() {
+                ui.horizontal_wrapped(|ui| self.key_settings(ui, false));
+                self.key_pads(ui, false);
+            }
+        } else if self.radio.can_transmit() {
+            ui.horizontal_wrapped(|ui| {
+                self.mox_button(ui);
+                ui.add_space(12.0);
+                self.tx_settings(ui, false);
+            });
+        }
+    }
+
+    /// The compact layout's top: the frequency, - / + and S-meter, and
+    /// power and SWR while transmitting.
+    fn compact_top(&mut self, ui: &mut egui::Ui) {
+        self.frequency_row(ui);
+        if self.radio.mox {
+            let tx = self.radio.tx.unwrap_or_default();
+            ui.strong(format!("{:.1} W  SWR {:.2}", tx.forward_w, tx.swr));
+        }
+    }
+
+    /// The sections the compact toolbar has buttons for, as this server
+    /// allows.
+    fn sections(&self) -> Vec<Section> {
+        let mut sections = vec![Section::Band, Section::Mode, Section::Step];
         if self.radio.dsp.is_some() {
             sections.extend([Section::Filter, Section::Noise]);
         }
         sections.push(Section::Audio);
+        if self.radio.keys_cw() {
+            sections.push(Section::Key);
+        }
         if self.radio.can_transmit() {
             sections.push(Section::Tx);
         }
-        ui.horizontal_wrapped(|ui| {
-            for s in sections {
-                let open = self.section == Some(s);
-                if ui.add(egui::Button::selectable(open, egui::RichText::new(s.label()).strong())).clicked() {
-                    self.section = if open { None } else { Some(s) };
+        sections
+    }
+
+    /// A section's toolbar button text: Band and Mode show what they're
+    /// set to.
+    fn section_button_text(&self, s: Section) -> String {
+        match s {
+            Section::Band => {
+                let band = match &self.radio.bands {
+                    Some(list) => current_band(list, self.radio.vfo_hz).map(str::to_string),
+                    None => FALLBACK_BANDS
+                        .iter()
+                        .find(|b| (b.1..=b.2).contains(&self.radio.vfo_hz))
+                        .map(|b| b.0.to_string()),
+                };
+                band.unwrap_or_else(|| "Band".to_string())
+            }
+            Section::Mode => MODES
+                .iter()
+                .find(|(tci, _)| *tci == self.radio.mode)
+                .map(|(_, label)| label.to_string())
+                .unwrap_or_else(|| "Mode".to_string()),
+            s => s.label().to_string(),
+        }
+    }
+
+    /// The compact layout's toolbar, under the spectrum: a big button per
+    /// section, sharing the width (a second row if they'd be too narrow
+    /// for a finger), and MOX -- or CW's Stop -- at the right-hand end.
+    /// The selected section's button again closes it.
+    fn compact_toolbar(&mut self, ui: &mut egui::Ui) {
+        const GAP: f32 = 4.0;
+        let sections = self.sections();
+        let tx_button = self.radio.sends_cw() || self.radio.can_transmit();
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing = Vec2::new(GAP, GAP);
+            let room = ui.available_width() - if tx_button { TOOLBAR_MOX_WIDTH + GAP } else { 0.0 };
+            let fit = (((room + GAP) / (TOOLBAR_BUTTON_MIN_WIDTH + GAP)).floor() as usize).clamp(1, sections.len());
+            // Spread over the rows needed, evenly.
+            let per_row = sections.len().div_ceil(sections.len().div_ceil(fit));
+            let width =
+                ((room - (per_row - 1) as f32 * GAP) / per_row as f32).clamp(TOOLBAR_BUTTON_MIN_WIDTH, TOOLBAR_BUTTON_MAX_WIDTH);
+            ui.vertical(|ui| {
+                for row in sections.chunks(per_row) {
+                    ui.horizontal(|ui| {
+                        for &s in row {
+                            let open = self.section == Some(s);
+                            let text = self.section_button_text(s);
+                            if ui
+                                .add_sized(
+                                    [width, TOOLBAR_BUTTON_HEIGHT],
+                                    egui::Button::selectable(open, egui::RichText::new(&text).size(16.0)).truncate(),
+                                )
+                                .on_hover_text(s.label())
+                                .clicked()
+                            {
+                                self.section = if open { None } else { Some(s) };
+                            }
+                        }
+                    });
                 }
+            });
+            if tx_button {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if self.radio.sends_cw() {
+                        self.cw_stop_button(ui);
+                    } else {
+                        self.mox_button(ui);
+                    }
+                });
             }
         });
-        match self.section {
-            Some(Section::Step) => self.step_row(ui),
-            Some(Section::Band) => self.band_row(ui),
-            Some(Section::Mode) => {
+        ui.add_space(4.0);
+    }
+
+    /// The open section's controls, over the bottom of the spectrum
+    /// (`over`), with a title and a close button, scrolling if they're
+    /// taller than it. Escape closes it too.
+    fn section_popup(&mut self, ctx: &egui::Context, over: Rect) {
+        let Some(section) = self.section else { return };
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.section = None;
+            return;
+        }
+        let width = (over.width() - 16.0).max(200.0);
+        let mut close = false;
+        egui::Area::new(egui::Id::unique("section_popup"))
+            .order(egui::Order::Foreground)
+            .pivot(egui::Align2::LEFT_BOTTOM)
+            .fixed_pos(Pos2::new(over.left() + 8.0, over.bottom() - 8.0))
+            .show(ctx, |ui| {
+                egui::Frame::popup(ui.style()).show(ui, |ui| {
+                    ui.set_width(width - 16.0);
+                    ui.spacing_mut().button_padding = Vec2::new(10.0, 8.0);
+                    ui.spacing_mut().interact_size.y = 32.0;
+                    ui.horizontal(|ui| {
+                        ui.strong(section.label());
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.button(egui::RichText::new("\u{2715}").size(16.0)).on_hover_text("Close").clicked() {
+                                close = true;
+                            }
+                        });
+                    });
+                    ui.separator();
+                    egui::ScrollArea::vertical().max_height((over.height() - 80.0).max(80.0)).show(ui, |ui| {
+                        self.section_controls(ui, section);
+                    });
+                });
+            });
+        if close {
+            self.section = None;
+        }
+    }
+
+    /// What a controller knob just changed, for a moment, in the middle of
+    /// the spectrum (`over`).
+    fn show_value_popup(&mut self, ctx: &egui::Context, over: Rect) {
+        let Some((text, at)) = &self.value_popup else { return };
+        if self.now - at > panel::VALUE_POPUP_S {
+            self.value_popup = None;
+            return;
+        }
+        egui::Area::new(egui::Id::unique("value_popup"))
+            .order(egui::Order::Foreground)
+            .pivot(egui::Align2::CENTER_CENTER)
+            .fixed_pos(over.center())
+            .interactable(false)
+            .show(ctx, |ui| {
+                egui::Frame::popup(ui.style()).show(ui, |ui| {
+                    ui.label(egui::RichText::new(text).size(24.0).strong());
+                });
+            });
+        ctx.request_repaint_after(std::time::Duration::from_millis(100));
+    }
+
+    fn section_controls(&mut self, ui: &mut egui::Ui, section: Section) {
+        match section {
+            Section::Step => self.step_row(ui),
+            Section::Band => self.band_row(ui),
+            Section::Mode => {
                 ui.horizontal_wrapped(|ui| self.mode_buttons(ui));
             }
-            Some(Section::Filter) => self.dsp_controls(ui, true, false),
-            Some(Section::Noise) => self.dsp_controls(ui, false, true),
-            Some(Section::Audio) => {
+            Section::Filter => self.dsp_controls(ui, true, false),
+            Section::Noise => self.dsp_controls(ui, false, true),
+            Section::Audio => {
                 ui.horizontal_wrapped(|ui| self.audio_controls(ui, true));
             }
-            Some(Section::Tx) => {
+            Section::Key if self.radio.keys_cw() => {
+                self.key_pads(ui, true);
+                ui.horizontal_wrapped(|ui| self.key_settings(ui, true));
+            }
+            Section::Key => {}
+            Section::Tx => {
+                if self.radio.sends_cw() {
+                    ui.horizontal_wrapped(|ui| self.cw_send_row(ui, true));
+                    ui.horizontal_wrapped(|ui| self.cw_settings(ui, true));
+                }
                 ui.horizontal_wrapped(|ui| self.tx_settings(ui, true));
             }
-            None => {}
         }
     }
 
     fn frequency_row(&mut self, ui: &mut egui::Ui) {
         ui.horizontal_wrapped(|ui| {
             let digits = format_frequency(self.radio.vfo_hz);
-            let colour = if self.radio.mox { Color32::from_rgb(230, 60, 60) } else { Color32::from_rgb(60, 230, 60) };
+            let colour = readable(
+                ui,
+                if self.radio.mox { Color32::from_rgb(230, 60, 60) } else { Color32::from_rgb(60, 230, 60) },
+            );
             let resp = ui
                 .add(
                     egui::Label::new(egui::RichText::new(digits).monospace().size(32.0).color(colour))
@@ -694,12 +1437,14 @@ impl App {
             } else {
                 self.vfo_slide_px = 0.0;
             }
+            ui.add_space(8.0);
+            self.minus_plus(ui);
             ui.add_space(16.0);
             self.s_meter(ui);
         });
     }
 
-    /// Steps, and - / +.
+    /// The steps; - / + are next to the frequency.
     fn step_row(&mut self, ui: &mut egui::Ui) {
         ui.horizontal_wrapped(|ui| {
             ui.label("Step:");
@@ -708,8 +1453,6 @@ impl App {
                     self.step_hz = hz;
                 }
             }
-            ui.add_space(8.0);
-            self.minus_plus(ui);
         });
     }
 
@@ -739,18 +1482,28 @@ impl App {
                 }
             } else {
                 let current = FALLBACK_BANDS.iter().find(|b| (b.1..=b.2).contains(&self.radio.vfo_hz)).map(|b| b.0);
-                for (name, low, high, first) in FALLBACK_BANDS {
+                for (name, ..) in FALLBACK_BANDS {
                     if ui.add(egui::Button::selectable(current == Some(name), name)).clicked() && current != Some(name) {
-                        if let Some(c) = current {
-                            self.band_memory.insert(c, self.radio.vfo_hz);
-                        }
-                        let hz =
-                            self.band_memory.get(name).copied().filter(|f| (low..=high).contains(f)).unwrap_or(first);
-                        self.tune(hz);
+                        self.select_fallback_band(name);
                     }
                 }
             }
         });
+    }
+
+    /// Without the server's band buttons: to `name`'s frequency when last
+    /// here, or its usual one.
+    fn select_fallback_band(&mut self, name: &str) {
+        let Some(&(name, low, high, first)) = FALLBACK_BANDS.iter().find(|b| b.0 == name) else { return };
+        let current = FALLBACK_BANDS.iter().find(|b| (b.1..=b.2).contains(&self.radio.vfo_hz)).map(|b| b.0);
+        if current == Some(name) {
+            return;
+        }
+        if let Some(c) = current {
+            self.band_memory.insert(c, self.radio.vfo_hz);
+        }
+        let hz = self.band_memory.get(name).copied().filter(|f| (low..=high).contains(f)).unwrap_or(first);
+        self.tune(hz);
     }
 
     fn mode_buttons(&mut self, ui: &mut egui::Ui) {
@@ -772,6 +1525,8 @@ impl App {
         if ui.add(egui::Button::selectable(self.muted, "Mute")).clicked() {
             self.muted = !self.muted;
             self.apply_gain();
+            self.display.muted = self.muted;
+            prefs::save_display(&self.display);
         }
         if narrow {
             ui.end_row();
@@ -780,6 +1535,21 @@ impl App {
         }
         ui.label("Range:");
         ui.add(egui::Slider::new(&mut self.db_range, 20.0..=120.0).suffix(" dB"));
+        // Each pane on or off; the bar between them sets their sizes.
+        let before = self.display;
+        if ui
+            .add(egui::Button::selectable(self.display.spectrum, "Spectrum"))
+            .on_hover_text("Show the spectrum (drag the bar under it to size it)")
+            .clicked()
+        {
+            self.display.spectrum = !self.display.spectrum;
+        }
+        if ui.add(egui::Button::selectable(self.display.waterfall, "Waterfall")).on_hover_text("Show the waterfall").clicked() {
+            self.display.waterfall = !self.display.waterfall;
+        }
+        if self.display != before {
+            prefs::save_display(&self.display);
+        }
     }
 
     /// Filter and AGC (`filter`), and noise controls (`noise`), once the
@@ -790,12 +1560,7 @@ impl App {
         if filter {
             ui.horizontal_wrapped(|ui| {
                 ui.label("Filter:");
-                let presets: &[u32] = match self.radio.mode.as_str() {
-                    "cw" => &[100, 250, 500, 1000],
-                    "am" | "sam" | "dsb" => &[3000, 4000, 5000],
-                    "nfm" => &[],
-                    _ => &[1800, 2100, 2400, 2700, 3000],
-                };
+                let presets = filter_presets(&self.radio.mode);
                 for &w in presets {
                     if ui.add(egui::Button::selectable(d.width_hz == w, format_hz(w))).clicked() {
                         d.width_hz = w;
@@ -806,11 +1571,9 @@ impl App {
                     ui.weak(format_hz(d.width_hz));
                 }
                 ui.add_space(12.0);
-                for (mode, label) in dsp::AGC_MODES.iter().zip(["AGC Off", "Long", "Slow", "Med", "Fast"]) {
-                    if ui.add(egui::Button::selectable(d.agc == *mode, label)).clicked() {
-                        d.agc = mode.to_string();
-                        changes.push((dsp::SET_AGC, mode.to_string()));
-                    }
+                if let Some(mode) = choice_combo(ui, "agc", "AGC", &d.agc, &dsp::AGC_MODES, &["Off", "Long", "Slow", "Medium", "Fast"]) {
+                    d.agc = mode.to_string();
+                    changes.push((dsp::SET_AGC, mode.to_string()));
                 }
                 if ui.add(egui::Slider::new(&mut d.agc_gain_db, 0..=140).suffix(" dB")).changed() {
                     changes.push((dsp::SET_AGC_GAIN, d.agc_gain_db.to_string()));
@@ -819,19 +1582,15 @@ impl App {
         }
         if noise {
             ui.horizontal_wrapped(|ui| {
-                for (mode, label) in dsp::NB_MODES.iter().zip(["NB Off", "NB", "NB2"]) {
-                    if ui.add(egui::Button::selectable(d.nb == *mode, label)).clicked() {
-                        d.nb = mode.to_string();
-                        changes.push((dsp::SET_NB, mode.to_string()));
-                    }
+                if let Some(mode) = choice_combo(ui, "nb", "NB", &d.nb, &dsp::NB_MODES, &["Off", "NB", "NB2"]) {
+                    d.nb = mode.to_string();
+                    changes.push((dsp::SET_NB, mode.to_string()));
                 }
                 ui.add_space(12.0);
                 // Labels as hpsdr-rs's own NR menu: its third, "nr3" here, is NNR.
-                for (mode, label) in dsp::NR_MODES.iter().zip(["NR Off", "NR", "NR2", "NNR"]) {
-                    if ui.add(egui::Button::selectable(d.nr == *mode, label)).clicked() {
-                        d.nr = mode.to_string();
-                        changes.push((dsp::SET_NR, mode.to_string()));
-                    }
+                if let Some(mode) = choice_combo(ui, "nr", "NR", &d.nr, &dsp::NR_MODES, &["Off", "NR", "NR2", "NNR"]) {
+                    d.nr = mode.to_string();
+                    changes.push((dsp::SET_NR, mode.to_string()));
                 }
                 ui.add_space(12.0);
                 if ui.add(egui::Button::selectable(d.anf, "ANF")).clicked() {
@@ -892,6 +1651,15 @@ impl App {
         self.step(notches, step);
     }
 
+    /// Each band's edges, Hz: the server's band buttons, or the fallback
+    /// list for an older server. Not Gen's, which is the whole receiver.
+    fn band_edges(&self) -> Vec<(u64, u64)> {
+        match &self.radio.bands {
+            Some(list) => list.iter().filter(|b| b.name != "Gen").map(|b| (b.low_hz, b.high_hz)).collect(),
+            None => FALLBACK_BANDS.iter().map(|b| (b.1, b.2)).collect(),
+        }
+    }
+
     fn spectrum_and_waterfall(&mut self, ui: &mut egui::Ui) {
         let Some(frame) = self.spectrum.clone() else {
             ui.weak("No spectrum yet.");
@@ -904,54 +1672,32 @@ impl App {
         let floor = sorted[sorted.len() / 5] - 5.0;
         self.db_low += 0.05 * (floor - self.db_low);
 
+        // Either pane can be off (the buttons beside Range); with both on,
+        // the bar between them sets the spectrum's share of the height.
         let full = ui.available_size();
-        let spectrum_h = (full.y * 0.45).max(100.0);
-        let (rect, resp) = ui.allocate_exact_size(Vec2::new(full.x, spectrum_h), egui::Sense::click_and_drag());
-        let painter = ui.painter_at(rect);
-        painter.rect_filled(rect, 0.0, Color32::BLACK);
+        let display = self.display;
+        if !display.spectrum && !display.waterfall {
+            ui.weak("The spectrum and waterfall are both off: turn them on beside Range.");
+            return;
+        }
+        let both = display.spectrum && display.waterfall;
+        const BAR_H: f32 = 10.0;
         let low_hz = frame.centre_hz as f64 - frame.span_hz as f64 / 2.0;
-        let x_of = |hz: f64| rect.left() + ((hz - low_hz) / frame.span_hz as f64) as f32 * rect.width();
-        let y_of = |v: f32| rect.bottom() - ((v - self.db_low) / self.db_range).clamp(0.0, 1.0) * rect.height();
-
-        // Passband and dial line.
-        let (pb_low, pb_high) = self.radio.passband();
-        let vfo = self.radio.vfo_hz as f64;
-        painter.rect_filled(
-            Rect::from_x_y_ranges(x_of(vfo + pb_low as f64)..=x_of(vfo + pb_high as f64), rect.y_range()),
-            0.0,
-            Color32::from_rgba_unmultiplied(70, 150, 230, 50),
-        );
-        painter.line_segment([Pos2::new(x_of(vfo), rect.top()), Pos2::new(x_of(vfo), rect.bottom())], Stroke::new(1.0, Color32::RED));
-
-        // dB gridlines every 10 dB, and frequency labels.
-        let mut g = (self.db_low / 10.0).ceil() * 10.0;
-        while g < self.db_low + self.db_range {
-            let y = y_of(g);
-            painter.line_segment([Pos2::new(rect.left(), y), Pos2::new(rect.right(), y)], Stroke::new(1.0, Color32::from_gray(45)));
-            painter.text(Pos2::new(rect.left() + 2.0, y), egui::Align2::LEFT_BOTTOM, format!("{g:.0} dB"), egui::FontId::monospace(10.0), Color32::GRAY);
-            g += 10.0;
+        // One pane alone takes alone_share of the height, with the bar
+        // under it to size it; the rest is left empty.
+        let usable = (full.y - BAR_H).max(40.0);
+        if display.spectrum {
+            let share = if both { display.spectrum_share } else { display.alone_share };
+            self.spectrum_pane(ui, &frame, &db, low_hz, Vec2::new(full.x, (usable * share).max(40.0)));
+            self.size_bar(ui, full.x, usable, both);
         }
-        let tick = nice_step(frame.span_hz as f64 / 8.0);
-        let mut f = (low_hz / tick).ceil() * tick;
-        while f < low_hz + frame.span_hz as f64 {
-            let x = x_of(f);
-            painter.line_segment([Pos2::new(x, rect.top()), Pos2::new(x, rect.bottom())], Stroke::new(1.0, Color32::from_gray(45)));
-            painter.text(Pos2::new(x + 2.0, rect.bottom()), egui::Align2::LEFT_BOTTOM, format!("{:.3}", f / 1e6), egui::FontId::monospace(10.0), Color32::GRAY);
-            f += tick;
+        if !display.waterfall {
+            return;
         }
-
-        // The trace.
-        let n = db.len().max(2);
-        let points: Vec<Pos2> =
-            db.iter().enumerate().map(|(i, &v)| Pos2::new(rect.left() + i as f32 / (n - 1) as f32 * rect.width(), y_of(v))).collect();
-        painter.add(egui::Shape::line(points, Stroke::new(1.0, Color32::from_rgb(140, 230, 140))));
-
-        self.click_and_scroll_tune(ui, &resp, low_hz, frame.span_hz);
 
         // Waterfall below, newest row at the top -- tuned the same way.
-        ui.add_space(4.0);
-        let (wf_rect, wf_resp) =
-            ui.allocate_exact_size(Vec2::new(full.x, ui.available_height().max(20.0)), egui::Sense::click_and_drag());
+        let wf_h = if both { ui.available_height() } else { usable * display.alone_share };
+        let (wf_rect, wf_resp) = ui.allocate_exact_size(Vec2::new(full.x, wf_h.max(20.0)), egui::Sense::click_and_drag());
         self.click_and_scroll_tune(ui, &wf_resp, low_hz, frame.span_hz);
         if self.waterfall.dirty && !self.waterfall.rows.is_empty() {
             let width = self.waterfall.rows[0].len();
@@ -970,15 +1716,118 @@ impl App {
         if let Some(t) = &self.waterfall.texture {
             ui.painter().image(t.id(), wf_rect, Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), Color32::WHITE);
         }
+        if !both {
+            self.size_bar(ui, full.x, usable, false);
+        }
+    }
+
+    /// The bar under the spectrum (or a pane on its own): dragging it
+    /// moves the split between spectrum and waterfall when `both`, or
+    /// sizes the one pane. `usable` is the height they share.
+    fn size_bar(&mut self, ui: &mut egui::Ui, width: f32, usable: f32, both: bool) {
+        const BAR_H: f32 = 10.0;
+        let (bar, resp) = ui.allocate_exact_size(Vec2::new(width, BAR_H), egui::Sense::drag());
+        let resp = resp.on_hover_cursor(egui::CursorIcon::ResizeVertical).on_hover_text(if both {
+            "Drag to size the spectrum and waterfall"
+        } else {
+            "Drag to size this display"
+        });
+        let colour = if resp.hovered() || resp.dragged() { Color32::from_gray(150) } else { Color32::from_gray(70) };
+        ui.painter().line_segment(
+            [Pos2::new(bar.center().x - 20.0, bar.center().y), Pos2::new(bar.center().x + 20.0, bar.center().y)],
+            Stroke::new(3.0, colour),
+        );
+        if resp.dragged() {
+            let dy = resp.drag_delta().y / usable.max(1.0);
+            let (share, (lo, hi)) = if both {
+                (&mut self.display.spectrum_share, prefs::SHARE_RANGE)
+            } else {
+                (&mut self.display.alone_share, prefs::ALONE_RANGE)
+            };
+            *share = (*share + dy).clamp(lo, hi);
+        }
+        if resp.drag_stopped() {
+            prefs::save_display(&self.display);
+        }
+    }
+
+    /// The spectrum, `size`, its trace `db` spanning the frame from
+    /// `low_hz`.
+    fn spectrum_pane(&mut self, ui: &mut egui::Ui, frame: &SpectrumFrame, db: &[f32], low_hz: f64, size: Vec2) {
+        let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click_and_drag());
+        let painter = ui.painter_at(rect);
+        painter.rect_filled(rect, 0.0, Color32::BLACK);
+        let x_of = |hz: f64| rect.left() + ((hz - low_hz) / frame.span_hz as f64) as f32 * rect.width();
+        let y_of = |v: f32| rect.bottom() - ((v - self.db_low) / self.db_range).clamp(0.0, 1.0) * rect.height();
+
+        // Passband (the dial line goes on top of the grid and labels, below).
+        let (pb_low, pb_high) = self.radio.passband();
+        let vfo = self.radio.vfo_hz as f64;
+        painter.rect_filled(
+            Rect::from_x_y_ranges(x_of(vfo + pb_low as f64)..=x_of(vfo + pb_high as f64), rect.y_range()),
+            0.0,
+            Color32::from_rgba_unmultiplied(70, 150, 230, 50),
+        );
+
+        // dB gridlines every 10 dB, and frequency labels.
+        let mut g = (self.db_low / 10.0).ceil() * 10.0;
+        while g < self.db_low + self.db_range {
+            let y = y_of(g);
+            painter.line_segment([Pos2::new(rect.left(), y), Pos2::new(rect.right(), y)], Stroke::new(1.0, Color32::from_gray(45)));
+            painter.text(Pos2::new(rect.left() + 2.0, y), egui::Align2::LEFT_BOTTOM, format!("{g:.0} dB"), egui::FontId::monospace(10.0), Color32::GRAY);
+            g += 10.0;
+        }
+        // As many labels as fit without touching (REAL REPORT 2026-11-18,
+        // Pixel 10 Pro portrait: "10489.400" labels ran into each other),
+        // and none that would run off the right-hand edge.
+        let font = egui::FontId::monospace(FREQ_LABEL_SIZE);
+        let label_of = |hz: f64| format!("{:.3}", hz / 1e6);
+        let char_w = ui.ctx().fonts_mut(|f| f.glyph_width(&font, '0'));
+        let label_w = label_of(low_hz + frame.span_hz as f64).len() as f32 * char_w;
+        let tick = freq_tick_hz(frame.span_hz as f64, rect.width(), label_w + FREQ_LABEL_GAP);
+        let mut f = (low_hz / tick).ceil() * tick;
+        while f < low_hz + frame.span_hz as f64 {
+            let x = x_of(f);
+            painter.line_segment([Pos2::new(x, rect.top()), Pos2::new(x, rect.bottom())], Stroke::new(1.0, Color32::from_gray(45)));
+            if x + 2.0 + label_w <= rect.right() {
+                painter.text(Pos2::new(x + 2.0, rect.bottom()), egui::Align2::LEFT_BOTTOM, label_of(f), font.clone(), Color32::GRAY);
+            }
+            f += tick;
+        }
+        // Band edges, as on the radio's own spectrum: orange, under the
+        // dial line and the trace.
+        for (low, high) in self.band_edges() {
+            for edge in [low as f64, high as f64] {
+                if (low_hz..=low_hz + frame.span_hz as f64).contains(&edge) {
+                    let x = x_of(edge);
+                    painter.line_segment([Pos2::new(x, rect.top()), Pos2::new(x, rect.bottom())], Stroke::new(2.0, BAND_EDGE_COLOUR));
+                }
+            }
+        }
+        // The dial line, over the grid, frequency labels and band edges.
+        painter.line_segment([Pos2::new(x_of(vfo), rect.top()), Pos2::new(x_of(vfo), rect.bottom())], Stroke::new(1.0, Color32::RED));
+
+        // The trace.
+        let n = db.len().max(2);
+        let points: Vec<Pos2> =
+            db.iter().enumerate().map(|(i, &v)| Pos2::new(rect.left() + i as f32 / (n - 1) as f32 * rect.width(), y_of(v))).collect();
+        painter.add(egui::Shape::line(points, Stroke::new(1.0, Color32::from_rgb(140, 230, 140))));
+
+        self.click_and_scroll_tune(ui, &resp, low_hz, frame.span_hz);
     }
 
     /// Click-to-tune and scroll-to-tune over the spectrum or waterfall:
     /// `resp` covers `span_hz` from `low_hz`, left to right.
     fn click_and_scroll_tune(&mut self, ui: &egui::Ui, resp: &egui::Response, low_hz: f64, span_hz: u32) {
+        // A click lands on the nearest whole kHz, as hpsdr-rs's (10 Hz in
+        // CW, to land on a signal); a slide moves from one whole kHz to
+        // the next (100 Hz in CW). REAL REPORT 2026-11-25: the web client's
+        // slide tuned to the Hz and its click to 100 Hz.
+        let cw = self.radio.is_cw();
         if let Some(pos) = resp.interact_pointer_pos().filter(|_| resp.clicked()) {
             let rect = resp.rect;
             let hz = low_hz + ((pos.x - rect.left()) / rect.width()) as f64 * span_hz as f64;
-            let step = if self.radio.mode == "cw" { 10.0 } else { 100.0 };
+            let step = if cw { 10.0 } else { 1000.0 };
             self.tune(((hz / step).round() * step).max(0.0) as u64);
         }
         if resp.hovered() {
@@ -989,11 +1838,16 @@ impl App {
         // dragging the band itself; REAL REPORT 2026-11-07, Android: sliding
         // to go higher went lower.)
         if resp.dragged() && resp.rect.width() > 0.0 {
+            let grid = if cw { 100.0 } else { 1000.0 };
             self.span_slide_hz += (resp.drag_delta().x / resp.rect.width()) as f64 * span_hz as f64;
-            let whole = self.span_slide_hz.trunc();
-            self.span_slide_hz -= whole;
-            if whole != 0.0 && self.radio.vfo_hz > 0 {
-                self.tune((self.radio.vfo_hz as f64 + whole).max(0.0) as u64);
+            let steps = (self.span_slide_hz / grid).trunc();
+            self.span_slide_hz -= steps * grid;
+            if steps != 0.0 && self.radio.vfo_hz > 0 {
+                // From the grid line on the side it's moving towards: the
+                // first step from 14.074350 up is 14.075, not 14.075350.
+                let now = self.radio.vfo_hz as f64 / grid;
+                let from = if steps > 0.0 { now.floor() } else { now.ceil() };
+                self.tune(((from + steps) * grid).max(0.0) as u64);
             }
         } else if !resp.dragged() && resp.drag_stopped() {
             self.span_slide_hz = 0.0;
@@ -1009,6 +1863,10 @@ impl App {
                 let rate_in = kbits(link.bytes_in.saturating_sub(bytes_in));
                 let rate_out = kbits(link.bytes_out.saturating_sub(bytes_out));
                 self.rate_sample = (link.bytes_in, link.bytes_out, now, rate_in, rate_out);
+                if let Some(p) = &self.player {
+                    let n = p.callbacks();
+                    self.audio_callbacks = (n, n != self.audio_callbacks.0);
+                }
             }
         }
         let mut text = format!("built {}   {:.0} kbit/s in", built_at(), self.rate_sample.3);
@@ -1021,14 +1879,26 @@ impl App {
         if let Some(e) = &self.audio_error {
             text.push_str(&format!("   {e}"));
         }
+        let audio_problem = self.player.as_ref().and_then(|p| {
+            p.error().or_else(|| (!self.audio_callbacks.1).then(|| "audio output isn't running".to_string()))
+        });
         ui.horizontal_wrapped(|ui| {
             ui.weak(text);
+            if let Some(e) = &audio_problem {
+                ui.colored_label(readable(ui, Color32::from_rgb(230, 80, 80)), e);
+            }
             if let Some(e) = &self.mic_error {
-                ui.colored_label(Color32::from_rgb(230, 80, 80), e);
+                ui.colored_label(readable(ui, Color32::from_rgb(230, 80, 80)), e);
+            }
+            if crate::audio::sound_server_unreachable() {
+                ui.colored_label(
+                    readable(ui, Color32::from_rgb(230, 180, 60)),
+                    "PipeWire is running, but ALSA can't reach it: install pipewire-alsa and restart",
+                );
             }
             if let Some((notice, at)) = &self.notice {
                 if now - at < NOTICE_S {
-                    ui.colored_label(Color32::from_rgb(230, 180, 60), notice);
+                    ui.colored_label(readable(ui, Color32::from_rgb(230, 180, 60)), notice);
                 }
             }
         });
@@ -1038,34 +1908,164 @@ impl App {
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.now = ui.input(|i| i.time);
+        if self.reconnect {
+            self.reconnect = false;
+            self.connect(ui.ctx());
+            self.audio_needs_click = true;
+            self.notice = Some(("Reconnected after the browser's graphics reset: click if there's no audio".to_string(), self.now));
+        }
+        if self.audio_needs_click
+            && ui.input(|i| {
+                i.pointer.any_pressed() || i.events.iter().any(|e| matches!(e, egui::Event::Key { pressed: true, .. }))
+            })
+        {
+            self.audio_needs_click = false;
+            if let Some(player) = &self.player {
+                player.resume();
+            }
+        }
         self.flush_tune();
         let incoming = self.link.as_mut().map(|l| l.poll()).unwrap_or_default();
         for i in incoming {
             self.handle(i);
         }
+        // Connected: remember the server.
+        if !self.remembered && self.link.as_ref().is_some_and(|l| l.status == Status::Open) {
+            self.remembered = true;
+            prefs::remember(&mut self.recent, &self.url);
+            prefs::save_recent(&self.recent);
+        }
         // Lost the connection: nothing to send to.
         if self.link.as_ref().is_none_or(|l| l.status != Status::Open) {
             self.keyed_here = false;
         }
+        self.track_touches(ui);
+        self.take_paddle_keys(ui.ctx());
+        self.poll_controller();
         self.send_tx_audio();
         if self.keyed_here {
             // Audio goes out in 20 ms blocks: keep coming back for it.
             ui.ctx().request_repaint_after(std::time::Duration::from_millis(10));
         }
+        // F11 toggles fullscreen, as in a web browser (which does its own).
+        #[cfg(not(target_arch = "wasm32"))]
+        if ui.input(|i| i.key_pressed(egui::Key::F11)) {
+            self.fullscreen = !self.fullscreen;
+            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Fullscreen(self.fullscreen));
+        }
         let screen = ui.ctx().content_rect().size();
         let narrow = screen.x < NARROW_WIDTH || screen.y < SHORT_HEIGHT;
+        let compact = match self.layout {
+            Layout::Auto => narrow,
+            Layout::Standard => false,
+            Layout::Compact => true,
+        };
+        let connected = self.link.as_ref().is_some_and(|l| l.status == Status::Open);
+        if compact && screen.y < SCROLL_PAGE_HEIGHT {
+            self.scrolling_page(ui, narrow, connected);
+            return;
+        }
         egui::Panel::top("top").show(ui, |ui| {
+            if compact {
+                self.top_bar(ui, narrow);
+                self.compact_top(ui);
+                return;
+            }
             // As tall as the controls, up to the limit: without the minimum,
             // the scroll area only gets what the panel had the frame before,
             // and shows a couple of rows.
             let limit = screen.y * CONTROLS_MAX_HEIGHT;
             egui::ScrollArea::vertical().max_height(limit).min_scrolled_height(limit).show(ui, |ui| {
                 self.top_bar(ui, narrow);
-                self.controls(ui, narrow);
+                self.controls(ui);
             });
         });
         egui::Panel::bottom("status").show(ui, |ui| self.status_line(ui));
-        egui::CentralPanel::default().show(ui, |ui| self.spectrum_and_waterfall(ui));
+        // Compact: the toolbar right under the spectrum and waterfall, so
+        // it moves up when they're made smaller. They get the room left
+        // after the toolbar (its height from the frame before).
+        let central = egui::CentralPanel::default().show(ui, |ui| {
+            if !(compact && connected) {
+                self.spectrum_and_waterfall(ui);
+                return None;
+            }
+            let room = (ui.available_height() - self.toolbar_height).max(60.0);
+            ui.allocate_ui(Vec2::new(ui.available_width(), room), |ui| self.spectrum_and_waterfall(ui));
+            let below = ui.cursor().top();
+            ui.separator();
+            let bar = ui.scope(|ui| self.compact_toolbar(ui)).response.rect;
+            // Separator and toolbar, with the spacing after the panes.
+            self.toolbar_height = bar.bottom() - below + ui.spacing().item_spacing.y;
+            Some(bar.top())
+        });
+        // The popups go over what's above the toolbar.
+        let mut spectrum = central.response.rect;
+        if let Some(top) = central.inner {
+            spectrum.max.y = top;
+        }
+        if compact && connected {
+            self.section_popup(ui.ctx(), spectrum);
+        }
+        self.show_value_popup(ui.ctx(), spectrum);
+        self.after_layout(ui);
+    }
+}
+
+impl App {
+    /// The compact layout on a screen too short for it (SCROLL_PAGE_HEIGHT):
+    /// everything in one page that scrolls -- drag anywhere but the
+    /// spectrum and waterfall, which tune -- with the spectrum and
+    /// waterfall a usable size.
+    fn scrolling_page(&mut self, ui: &mut egui::Ui, narrow: bool, connected: bool) {
+        let panes = egui::CentralPanel::default()
+            .show(ui, |ui| {
+                egui::ScrollArea::vertical()
+                    .auto_shrink(false)
+                    .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
+                    .show(ui, |ui| {
+                        self.top_bar(ui, narrow);
+                        self.compact_top(ui);
+                        ui.separator();
+                        let panes = ui
+                            // Up to PANES_HEIGHT: no more than the panes use,
+                            // so the toolbar comes up when they're made
+                            // smaller (REAL REPORT 2026-11-25: it didn't in
+                            // landscape, which is this layout on a phone).
+                            .allocate_ui(Vec2::new(ui.available_width(), PANES_HEIGHT), |ui| {
+                                self.spectrum_and_waterfall(ui);
+                            })
+                            .response
+                            .rect;
+                        if connected {
+                            ui.separator();
+                            self.compact_toolbar(ui);
+                        }
+                        ui.separator();
+                        self.status_line(ui);
+                        panes
+                    })
+                    .inner
+            })
+            .inner;
+        // Popups over the part of the panes on screen.
+        let shown = panes.intersect(ui.ctx().content_rect());
+        let over = if shown.height() >= 120.0 { shown } else { ui.ctx().content_rect() };
+        if connected {
+            self.section_popup(ui.ctx(), over);
+        }
+        self.show_value_popup(ui.ctx(), over);
+        self.after_layout(ui);
+    }
+
+    /// The end of every frame, whatever the layout.
+    fn after_layout(&mut self, ui: &mut egui::Ui) {
+        self.controller_window(ui.ctx());
+        if self.controller.is_some() {
+            // Controller events come between frames: look for them.
+            ui.ctx().request_repaint_after(std::time::Duration::from_millis(50));
+        }
+        // After the key pads (Key, in the popup) have been read this frame.
+        self.run_keyer(ui.ctx());
         // Keep the status line (data rate, buffer) moving.
         ui.ctx().request_repaint_after(std::time::Duration::from_millis(250));
     }
@@ -1090,6 +2090,16 @@ fn built_at() -> String {
 
 /// The band to highlight for `hz`: the first whose range has it, Gen
 /// (general coverage, which spans everything) only if no other does.
+/// The filter widths offered for a mode (Hz).
+fn filter_presets(mode: &str) -> &'static [u32] {
+    match mode {
+        "cw" | "cwl" | "cwu" => &[100, 250, 500, 1000],
+        "am" | "sam" | "dsb" => &[3000, 4000, 5000],
+        "nfm" => &[],
+        _ => &[1800, 2100, 2400, 2700, 3000],
+    }
+}
+
 fn current_band(list: &[BandInfo], hz: u64) -> Option<&str> {
     list.iter()
         .find(|b| b.name != "Gen" && (b.low_hz..=b.high_hz).contains(&hz))
@@ -1112,6 +2122,14 @@ fn format_frequency(hz: u64) -> String {
     format!("{}.{:06}", hz / 1_000_000, hz % 1_000_000)
 }
 
+/// The frequency grid's spacing for `span_hz` across `width` points: about
+/// eight lines, fewer if their labels (`label_room` points each) wouldn't
+/// fit.
+fn freq_tick_hz(span_hz: f64, width: f32, label_room: f32) -> f64 {
+    let fit = (width / label_room.max(1.0)).floor().max(1.0) as f64;
+    nice_step(span_hz / fit.min(8.0))
+}
+
 /// A round number of Hz near `approx`: 1, 2 or 5 times a power of ten.
 fn nice_step(approx: f64) -> f64 {
     let p = 10f64.powf(approx.max(1.0).log10().floor());
@@ -1119,6 +2137,19 @@ fn nice_step(approx: f64) -> f64 {
 }
 
 /// Black through blue, cyan, yellow to red, for 0..1.
+/// Colour for text drawn straight on the page's background: as given in
+/// dark mode, darker in light mode so it still reads. The client follows
+/// the browser's (or desktop's) dark/light setting -- egui's default --
+/// while the spectrum, waterfall and meters stay dark in both.
+fn readable(ui: &egui::Ui, c: Color32) -> Color32 {
+    if ui.visuals().dark_mode {
+        return c;
+    }
+    let [r, g, b, a] = c.to_array();
+    let dim = |v: u8| (v as f32 * 0.6) as u8;
+    Color32::from_rgba_premultiplied(dim(r), dim(g), dim(b), a)
+}
+
 fn waterfall_colour(v: f32) -> Color32 {
     let v = v.clamp(0.0, 1.0);
     let stops = [(0.0, [0, 0, 0]), (0.3, [0, 0, 200]), (0.55, [0, 200, 220]), (0.8, [240, 230, 0]), (1.0, [255, 40, 40])];
@@ -1177,6 +2208,29 @@ fn with_password(url: &str, password: &str) -> String {
     format!("{url}{separator}password={encoded}")
 }
 
+/// A drop-down for one of the server's DSP choices (AGC, NB, NR): shows
+/// "`title`: <current>" and returns the wire value picked, if it changed.
+/// `modes` are the wire values, `labels` what the menu shows for each.
+fn choice_combo(
+    ui: &mut egui::Ui,
+    id: &str,
+    title: &str,
+    current: &str,
+    modes: &[&'static str],
+    labels: &[&str],
+) -> Option<&'static str> {
+    let shown = modes.iter().position(|m| *m == current).map_or(current, |i| labels[i]);
+    let mut picked = None;
+    egui::ComboBox::from_id_salt(id).selected_text(format!("{title}: {shown}")).show_ui(ui, |ui| {
+        for (mode, label) in modes.iter().zip(labels) {
+            if ui.selectable_label(*mode == current, *label).clicked() && *mode != current {
+                picked = Some(*mode);
+            }
+        }
+    });
+    picked
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1188,6 +2242,11 @@ mod tests {
         assert_eq!(format_frequency(7_100_000), "7.100000");
         assert_eq!(format_frequency(10_489_750_000), "10489.750000");
         assert_eq!(nice_step(23_000.0), 50_000.0);
+        // 800 kHz across a phone held upright (~400 points), "10489.400"
+        // labels about 70 points with their gap: 200 kHz apart, not 100.
+        assert_eq!(freq_tick_hz(800_000.0, 400.0, 70.0), 200_000.0);
+        // Wide enough for eight: as before.
+        assert_eq!(freq_tick_hz(800_000.0, 1200.0, 70.0), nice_step(100_000.0));
         assert_eq!(nice_step(9_000.0), 10_000.0);
         assert_eq!(waterfall_colour(0.0), Color32::BLACK);
         let mut r = Radio { mode: "usb".into(), ..Default::default() };
@@ -1206,9 +2265,11 @@ mod tests {
             snb: false,
         });
         assert_eq!(r.passband(), (-1800, -150), "from the reported width");
-        r.mode = "cw".into();
+        r.mode = "cwu".into();
         r.dsp.as_mut().unwrap().width_hz = 500;
         assert_eq!(r.passband(), (350, 850));
+        r.mode = "cwl".into();
+        assert_eq!(r.passband(), (-850, -350));
         assert_eq!((format_hz(2700), format_hz(3000), format_hz(500)), ("2.7k".into(), "3k".into(), "500".into()));
         let list = vec![
             BandInfo { name: "70cm".into(), low_hz: 420_000_000, high_hz: 450_000_000 },
@@ -1220,3 +2281,4 @@ mod tests {
         assert_eq!(current_band(&list, 1_000_000_000), Some("Gen"));
     }
 }
+

@@ -18,7 +18,7 @@
     PORTED, not invented: every register sequence below is a
     transcription of osmocom librtlsdr v2.0.2 (~/github/rtl-sdr,
     commit 619ac31: src/librtlsdr.c and src/tuner_r82xx.c), which is
-    GPL-2.0-or-later -- the same licence as this project. Function names
+    GPL-2.0-or-later, so usable under this project's GPL-3. Function names
     match the C ones (minus their rtlsdr_/r82xx_ prefixes where a method
     receiver makes them redundant) so each can be checked side by side
     against its original. Deliberately NOT ported:
@@ -34,9 +34,9 @@
       librtlsdr would apply it are noted inline.
 
     A second, independent pure-Rust port exists in ~/github/sdroxide
-    (crates/sdroxide-rtlsdr, sdroxide-r82xx). It is GPL-3.0-or-later, so
-    NO code was copied from it (that would force this project to GPL-3);
-    it was only consulted to confirm the overall nusb approach is sound.
+    (crates/sdroxide-rtlsdr, sdroxide-r82xx). It is GPL-3.0-or-later, and
+    this project was GPL-2.0-or-later when this was written, so NO code
+    was copied from it; it was only consulted to confirm the overall nusb approach is sound.
 */
 
 use nusb::transfer::{Bulk, ControlIn, ControlOut, ControlType, In, Recipient};

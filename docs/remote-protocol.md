@@ -45,7 +45,7 @@ All start `hpsdr_`.
 
 - `hpsdr_hello:<version>;` -- client to server, first. The server answers
   `hpsdr_hello:<version>,<feature>,<feature>...;` with its own protocol
-  version (1) and what it offers: `spectrum`, `adpcm`, `tx`. A server
+  version (1) and what it offers: `spectrum`, `adpcm`, `tx`, `cw`, `key`. A server
   without the extensions ignores the command; the client then has plain
   TCI only.
 - `hpsdr_notice:<text>;` -- server to client: something to tell the
@@ -81,8 +81,8 @@ All start `hpsdr_`.
 
 - `hpsdr_mox:<true|false>;` -- client to server: key or unkey. The server
   keys only where the radio itself would -- in band, unless out-of-band TX
-  is allowed -- and not in CW (no remote keying yet), answering
-  `hpsdr_notice` with the reason if it doesn't. Any client can unkey.
+  is allowed -- and not in CW (see below), answering `hpsdr_notice` with
+  the reason if it doesn't. Any client can unkey.
 - TX audio -- client to server, while keyed: binary type 101 (the same
   IMA-ADPCM blocks as RX audio, mono), 20 ms each, at the rate in the
   header (the client uses 16000). The server feeds it to the transmitter
@@ -100,6 +100,54 @@ All start `hpsdr_`.
   transmitting, once a second otherwise, and at once when they change.
 - `hpsdr_set:power,<watts>;` -- client to server: the TX power setting, as
   the radio's own TX Power slider.
+
+### CW
+
+CW is sent as text, with TCI's own commands (as Thetis and deskHPSDR
+implement them), so any TCI client can use them, not only hpsdr-remote.
+TCI text can't contain `:` `,` `;`, so they travel as `^` `~` `*`.
+
+- `cw_macros:<rx>,<text>;` -- client to server: send this text as CW at the
+  radio's CW speed (Settings -> CW), after anything already being sent. The
+  server keys and unkeys the radio itself, exactly as for its own Send CW
+  button or CAT's `KY`: only in CW, in band, and not while it's otherwise
+  transmitting. Text it can't send then is dropped, not kept for later --
+  with the reason in `hpsdr_notice` to a client that said `hpsdr_hello`
+  (which is also held by the radio's **Allow transmit** setting).
+- `cw_macros_stop;` -- client to server: stop at once, dropping the rest.
+- `cw_macros_speed:<wpm>;` -- either way: the CW speed, 1-60 words a
+  minute -- sent to every client at first and when it changes.
+- `cw_macros_empty:<rx>;` -- server to client: everything has been sent.
+- `hpsdr_cw_messages:<text>,<text>,...;` -- server to client, after
+  `hpsdr_hello` and whenever they change: the radio's saved CW messages
+  (Settings -> CW), encoded as above, an empty one as nothing.
+- `hpsdr_paddle_keys:<dit>,<dah>;` -- server to client, after
+  `hpsdr_hello` and whenever they change: the keys a key or paddle
+  plugged into the client as a keyboard holds down (Settings -> CW,
+  Remote Paddle Keys), one character each, encoded as above -- a
+  lower-case letter, a digit or one of `` [ ] ; ' , . / \ - = ` ``, all
+  typed without Shift. Matched by where they are on a US keyboard.
+  Without it a client uses `[` and `]`.
+
+Live keying, from a key or paddles at the client:
+
+- `hpsdr_key:<time>,<down>,<delay>;` -- client to server: the key went down
+  (`true`) or up at `time`, in ms on the client's own clock. The first
+  key-down of a burst keys the radio -- under the same conditions as CW
+  text, and not while it's otherwise transmitting -- and is played `delay`
+  ms (50-1000) after it arrives; every later transition is played at the
+  same distance from the first as on the client's clock. So the keying's
+  timing, spaces included, comes through unchanged as long as the
+  network's jitter stays under `delay`; one arriving too late is played at
+  once. The radio unkeys when the key has been up for the CW hang time
+  (Settings -> CW, Break-in delay). A paddle keyer runs in the client, and
+  sends the times its elements should have, not when the screen saw them.
+- **While the key is down the client repeats it every 500 ms; after
+  1.5 s without a word, or if the client goes, the key is released and the
+  radio unkeyed.**
+- `keyer:<rx>,<true|false>[,<ms>];` -- TCI's own, as Thetis takes it, for
+  other TCI programs: down as it arrives, up `ms` after it went down (or as
+  it arrives), played 100 ms later.
 
 ## Binary streams
 

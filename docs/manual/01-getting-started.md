@@ -30,6 +30,19 @@ driver is the general cure. To choose the graphics API yourself, set
 `WGPU_BACKEND` to `dx12`, `vulkan` or `gl` -- e.g. `setx WGPU_BACKEND gl`
 in a Command Prompt, which takes effect for programs started afterwards.
 
+### On Linux
+
+The `.deb` and `.rpm` packages add hpsdr-rs (and hpsdr-remote) to the
+desktop's menu, under **Ham Radio**, including on Raspberry Pi OS, whose
+menu has no Ham Radio section of its own.
+
+### On a Raspberry Pi
+
+hpsdr-rs draws with OpenGL on a Raspberry Pi: through the Pi's Vulkan
+driver its windows can flicker and fill with blocks. To try Vulkan
+anyway, start it with `WGPU_BACKEND=vulkan hpsdr-rs`. The first line it
+prints says what it's drawing with.
+
 ## Discovering your radio
 
 On launch, the **Discover HPSDR Radios** list opens automatically and
@@ -97,7 +110,8 @@ filter width, calibration, etc.) automatically -- each physical radio (by
 MAC address) keeps its own independent saved configuration, so switching
 between radios doesn't mix up their settings.
 
-To disconnect, use the **Stop** button at the bottom of the main window.
+To disconnect, use the **Stop** button under **Settings...** at the top of
+the main window.
 This returns you to the discovery window.
 
 If the spectrum stays blank with **Waiting for samples from the

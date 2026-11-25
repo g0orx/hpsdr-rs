@@ -11,6 +11,24 @@ Open **Settings...** from the main window, then the **TX** tab.
 > antenna -- see the [top-level README](../../README.md) for what's
 > confirmed vs. best-effort in the current build.
 
+## TX Profile
+
+A TX profile is a named set of transmit settings: **Mic gain**, the TX
+[equalizer](08-equalizer.md), **Speech Processor** and its
+**Compression**, **CESSB** and the **TX Filter** (below) -- e.g. one for
+ragchewing and one for contests or DX.
+
+- **TX Profile** -- choose a saved profile to apply it. Once a setting no
+  longer matches it, it shows **(changed)**: **Save** stores the changes
+  in that profile, and **Delete** removes the profile (leaving the
+  settings as they are).
+- **New profile name** -- type a name and press **Save As** (or Enter) to
+  save the settings as they are now; with the name of an existing
+  profile the button says **Replace**.
+
+Profiles are saved per radio. TCI clients can list and choose them too
+(`tx_profiles_ex`, `tx_profile_ex`).
+
 ## Max TX Power
 
 The ceiling for the **TX Power** slider on the main window, in watts
@@ -53,6 +71,28 @@ already-tuned timing -- a generic tail here would hold MOX into the start
 of the next element at any real WPM) or to disarming **Enable Transmit**
 (which always drops MOX immediately, same as it always has).
 
+## TX Delay
+
+After keying, waits this many milliseconds (0-1000, default 0 = off)
+before sending any RF -- what Thetis calls RF delay. Everything that
+switches with PTT -- the radio's own PTT output and T/R relays, and a CAT
+serial port's **PTT out** line ([Settings: Network](11-settings-network.md#cat-on-serial-ports))
+-- changes over at once, so an amplifier or external relay keyed by them has
+time to close before power arrives, instead of switching with RF present
+("hot switching").
+
+Nothing is lost: speech, data-mode audio (WSJT-X etc.), Tune and CW sent
+by hpsdr-rs all start after the delay, rather than having their start cut
+off. The amplifier's manual gives its switching time; 20-50 ms is typical
+for a relay. The TX audio is handled in blocks of about 21 ms, so the
+delay is rounded up to the next block (100 ms gives about 107 ms). CW from the radio's own internal keyer is made inside the
+radio, so it isn't delayed -- use the radio's or amplifier's own settings
+for that.
+
+Saved per radio, like TX Tail Delay. **TX Tail Delay** above covers the
+other end: keeping the amplifier keyed until the transmission has
+finished.
+
 ## TX ADC0 Attenuation (standard boards only)
 
 Protects ADC0's front end from this radio's own TX leakage while
@@ -61,6 +101,12 @@ warning while transmitting, raise this. Not shown on HermesLite/
 HermesLite2, which handle RX gain differently. Same underlying value as
 [PureSignal](14-puresignal.md)'s **Feedback Attenuation** slider --
 adjusting either one changes both.
+
+## Split off when changing band
+
+Off by default: each band comes back with Split and Duplex as you left
+them there (see [VFO A / VFO B / Split](02-main-window.md#vfo-a--vfo-b--split)).
+Tick it to have every band change turn Split and Duplex off.
 
 ## Allow TX outside ham bands
 
@@ -108,6 +154,19 @@ this checkbox stays visible even while Speech Processor is off, but has
 no effect until it's turned on too, and greys out to make that
 dependency visible.
 
+## TX Filter
+
+**Use RX filter** (the default) transmits through the same passband as
+the receive filter set in the main window. Untick it to give the TX
+filter its own edges:
+
+- **Low** (0-1000 Hz) and **High** (500-8000 Hz) -- the audio edges for
+  USB and DIGU, mirrored for LSB and DIGL. AM, DSB and FM use plus and
+  minus **High**. CW always uses the RX filter.
+
+The TX passband drawn on the spectrum follows it. TCI clients can read
+and set it with `tx_filter_band_ex`.
+
 ## Enable Transmit
 
 Arms (or disarms) the whole TX signal path -- microphone input, the TX DSP
@@ -126,6 +185,25 @@ Chooses where TX audio comes from:
 - **Local Mic (ignore TCI audio)** -- always use this computer's local
   microphone, ignoring both the radio's mic input and TCI audio. Useful as
   a workaround if a particular TCI client's audio streaming has problems.
+
+## FM deviation
+
+The peak deviation when transmitting FM: **5 kHz (wide)**, the default,
+for 25 kHz channels and most 2 m repeaters, or **2.5 kHz (narrow)** for
+12.5 kHz channels. The CTCSS tone (set next to the mode buttons in FM) is
+a fixed share of it: about 455 Hz at 5 kHz and 230 Hz at 2.5 kHz. That
+lower figure is too little for many repeaters to decode, so if a
+repeater won't open on its tone, check this first.
+
+## Monitor TX Audio
+
+Shown while transmit is enabled. Plays the audio being fed into the
+transmitter -- after the TX audio source is chosen, before any
+processing -- through this computer's speakers or headphones, to tell
+whether a TX audio problem is already in the source (mic or TCI) or comes
+later. **Volume** sets how loud the monitor is, without changing what's
+transmitted; it's saved per radio. TCI clients can turn it on and set
+its level (`mon_enable`, `mon_volume`).
 
 ## Radio Mic Connector (Angelia/Orion/Orion2 only)
 

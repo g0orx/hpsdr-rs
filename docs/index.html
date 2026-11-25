@@ -1,0 +1,224 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="hpsdr-rs: a free, open-source SDR client for openHPSDR radios, written in Rust.">
+<title>hpsdr-rs</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wght@500;700;800&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap">
+<style>
+/* Layout: a receiver faceplate header with a band strip, then feature groups in a two-column grid that stacks on phones. */
+:root {
+  --bg: #f3f5f7;
+  --panel: #ffffff;
+  --fg: #16202a;
+  --muted: #586776;
+  --line: #d8dee5;
+  --accent: #0b6e8a;
+  --accent-soft: #e0eff4;
+  --note: #8a5a00;
+  --note-soft: #fbf0d9;
+  --display: "Archivo", "Helvetica Neue", Arial, sans-serif;
+  --body: "Inter", system-ui, -apple-system, "Segoe UI", sans-serif;
+  --mono: "JetBrains Mono", ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #0f151b; --panel: #161f27; --fg: #e4eaf0; --muted: #93a3b3; --line: #26323d;
+    --accent: #5cc3df; --accent-soft: #15303a; --note: #f0c06a; --note-soft: #33280f;
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #0f151b; --panel: #161f27; --fg: #e4eaf0; --muted: #93a3b3; --line: #26323d;
+  --accent: #5cc3df; --accent-soft: #15303a; --note: #f0c06a; --note-soft: #33280f;
+  color-scheme: dark;
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; }
+body {
+  background: var(--bg); color: var(--fg);
+  font-family: var(--body); font-size: 15px; line-height: 1.6;
+}
+.wrap {
+  max-width: 1080px; margin: 0 auto;
+  padding-block: 40px 56px;
+  padding-left: max(16px, env(safe-area-inset-left, 0px));
+  padding-right: max(16px, env(safe-area-inset-right, 0px));
+  display: grid; gap: 32px;
+}
+header { display: grid; gap: 16px; }
+.eyebrow {
+  font-family: var(--mono); font-size: 12px; letter-spacing: .08em; text-transform: uppercase;
+  color: var(--accent);
+}
+h1 {
+  font-family: var(--display); font-weight: 800; font-size: clamp(34px, 6vw, 52px);
+  line-height: 1.05; margin: 0; letter-spacing: -.01em;
+}
+.lede { max-width: 64ch; margin: 0; color: var(--muted); font-size: 17px; }
+.lede strong { color: var(--fg); font-weight: 600; }
+.links { display: flex; flex-wrap: wrap; gap: 10px; }
+.links a {
+  font-weight: 600; font-size: 14px; text-decoration: none;
+  color: var(--accent); background: var(--accent-soft);
+  padding: 7px 14px; border-radius: 6px;
+}
+.links a:hover, .links a:focus-visible { text-decoration: underline; }
+a:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+/* Band strip: the amateur bands hpsdr-rs tunes, laid out like a dial scale. */
+.bands {
+  border-top: 1px solid var(--line); border-bottom: 1px solid var(--line);
+  padding-block: 10px; overflow-x: auto;
+}
+.bands ol {
+  list-style: none; margin: 0; padding: 0;
+  display: flex; gap: 0; min-width: max-content;
+  font-family: var(--mono); font-size: 12px; color: var(--muted);
+}
+.bands li { padding: 2px 12px; border-left: 1px solid var(--line); white-space: nowrap; }
+.bands li:first-child { border-left: 0; padding-left: 0; }
+.bands li.vhf { color: var(--accent); }
+.bands-cap { font-size: 12px; color: var(--muted); margin: 6px 0 0; }
+
+.grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 20px; }
+@media (max-width: 760px) { .grid { grid-template-columns: minmax(0, 1fr); } }
+section {
+  background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
+  padding: 20px 22px; min-width: 0;
+}
+section.wide { grid-column: 1 / -1; }
+h2 {
+  font-family: var(--display); font-weight: 700; font-size: 20px; margin: 0 0 10px;
+  text-wrap: balance;
+}
+ul.f { margin: 0; padding: 0; list-style: none; display: grid; gap: 9px; }
+ul.f li { padding-left: 16px; position: relative; }
+ul.f li::before {
+  content: ""; position: absolute; left: 0; top: .62em; width: 6px; height: 6px;
+  border-radius: 1px; background: var(--accent);
+}
+.tag {
+  display: inline-block; font-family: var(--mono); font-size: 11px; line-height: 1.4;
+  padding: 1px 6px; border-radius: 4px; vertical-align: 1px; margin-left: 4px;
+  color: var(--note); background: var(--note-soft); white-space: nowrap;
+}
+.cols { columns: 2 280px; column-gap: 32px; }
+.cols li { break-inside: avoid; }
+footer { color: var(--muted); font-size: 13px; max-width: 70ch; }
+footer p { margin: 0 0 6px; }
+footer a { color: var(--accent); }
+.mono { font-family: var(--mono); font-size: .92em; }
+</style>
+</head>
+<body>
+
+<div class="wrap">
+  <header>
+    <div class="eyebrow">openHPSDR client · v0.15.2</div>
+    <h1>hpsdr-rs</h1>
+    <p class="lede"><strong>A free, open-source SDR client for openHPSDR radios and more,</strong> written in Rust with egui and using WDSP for the signal processing. It runs on Linux (including the Raspberry Pi), Windows and macOS. GPL-3.0-or-later, by John Melton G0ORX.</p>
+    <div class="links">
+      <a href="https://github.com/g0orx/hpsdr-rs/releases/latest">Download</a>
+      <a href="https://github.com/g0orx/hpsdr-rs/blob/master/docs/manual/README.md">User manual</a>
+      <a href="https://github.com/g0orx/hpsdr-rs">Source on GitHub</a>
+    </div>
+    <div class="bands" aria-label="Bands">
+      <ol>
+        <li>160m</li><li>80m</li><li>60m</li><li>40m</li><li>30m</li><li>20m</li><li>17m</li><li>15m</li><li>12m</li><li>10m</li><li>6m</li>
+        <li class="vhf">2m</li><li class="vhf">70cm</li><li class="vhf">23cm</li><li class="vhf">QO-100 10.489 GHz</li>
+      </ol>
+    </div>
+  </header>
+
+  <div class="grid">
+    <section class="wide">
+      <h2>Supported radios</h2>
+      <ul class="f cols">
+        <li><strong>openHPSDR Protocol 1 and 2 over Ethernet:</strong> Metis, Hermes, Angelia, Orion and Orion2 (the ANAN range, 10E to 8000DLE) and Hermes Lite 2.</li>
+        <li><strong>Original Ozy/Mercury/Penny</strong> over USB, with the firmware loaded from bundled files.</li>
+        <li><strong>ADALM-Pluto</strong> and clones, over the network. <span class="tag">TX not yet on air</span></li>
+        <li><strong>Receive only:</strong> RX-888 Mk2, RTL-SDR dongles (direct sampling below 24 MHz) and MSI.SDR / MSi2500 sticks. Several dongles at once, each kept by USB port.</li>
+        <li><strong>Discovery</strong> by broadcast on every network interface, including APIPA links, or by IP address.</li>
+        <li><strong>Settings saved per radio,</strong> keyed by its MAC address.</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>Receive</h2>
+      <ul class="f">
+        <li>Main receiver plus extra receiver windows, each with its own VFO, mode, filter and AF gain.</li>
+        <li>Spectrum and waterfall with Click-to-Tune, adjustable dB range, palettes and automatic floor tracking.</li>
+        <li>Tune by scrolling the digit under the mouse, by the VFO step on the spectrum, or by tapping a VFO to type a frequency.</li>
+        <li>SSB, CW, AM, FM and digital modes. Filter, AF gain and mode remembered per mode and per band; band stack with 3 memories per band.</li>
+        <li>NB/NB2, NR/NR2/NNR, SNB and squelch. AGC Off, Long, Slow, Medium or Fast, with adjustable gain.</li>
+        <li>Diversity reception on radios with two ADCs, and an RX equalizer.</li>
+        <li>Built-in CW decoder, and recording to WAV.</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>Transmit</h2>
+      <ul class="f">
+        <li>Mic audio through WDSP's TX chain with ALC, compressor, TX equalizer and power/SWR/ALC meters. Also works with no local mic (CW, TCI audio, the radio's own mic).</li>
+        <li>PureSignal PA linearisation on both protocols, switchable live.</li>
+        <li>9-point PA calibration per band, Tune at a separate reduced power, two-tone test, TX spectrum.</li>
+        <li>Dual VFO with Split and Duplex, TX tail delay.</li>
+        <li>FM repeater shift, CTCSS, and FM deviation of 5 or 2.5 kHz.</li>
+        <li>CW: radio keyer settings with break-in, PC sidetone with smooth edges, five stored messages, TX offset by the CW pitch.</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>Station integration</h2>
+      <ul class="f">
+        <li><strong>TCI</strong> (modelled on Thetis), <strong>rigctl</strong> (Hamlib) and <strong>Kenwood TS-2000 CAT</strong> for WSJT-X, N1MM+, Log4OM and similar. CAT also on up to 3 serial ports for amplifiers.</li>
+        <li>MIDI control surfaces with learn mode and Thetis Midi2Cat import.</li>
+        <li>Raspberry Pi front panels: piHPSDR's Controller 1, 2 V1, 2 V2 and G2.</li>
+        <li>Open-collector outputs, filter boards (Alex, Apollo, Charly25, N2ADR), per-band RX/TX antennas, HL2 IO board and audio codec add-on.</li>
+        <li>Selectable audio devices, for virtual audio cables.</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>VHF, UHF and satellite</h2>
+      <ul class="f">
+        <li>Transverters up to 10 GHz, for QO-100 through an LNB.</li>
+        <li>QO-100 beacon monitor that locks the LNB's frequency.</li>
+        <li>DVB-S2 DATV receiver, with the video sent to VLC.</li>
+        <li>2m, 70cm and 23cm bands for the dongles and the Pluto.</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>Remote operation</h2>
+      <ul class="f">
+        <li><strong>Web interface</strong> built in: operate from a phone, tablet or another computer's browser, with nothing to install. Spectrum, waterfall, tuning, receive audio, and transmit with the phone's mic.</li>
+        <li>CW from the browser: send text and saved messages, or key live with on-screen paddles or a real key through a USB keyboard adapter.</li>
+        <li>HTTPS and a password, a compact layout for phones, and about 150 kbit/s of compressed audio.</li>
+        <li><strong>hpsdr-remote</strong>, the same client as a native program, including on a Raspberry Pi with a front-panel controller.</li>
+        <li>Connects to hpsdr-rs over TCI, with extensions for the spectrum and compressed audio.</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>Also</h2>
+      <ul class="f">
+        <li>Compact layout for 7" displays, chosen automatically by screen size, and full screen.</li>
+        <li>FPGA firmware updates (bootloader or in-application) and static IP setup.</li>
+        <li>Installers: Windows <span class="mono">.msi</span>; macOS for Apple Silicon; Linux AppImage, <span class="mono">.deb</span> and <span class="mono">.rpm</span> for x86_64 and ARM64.</li>
+        <li>A 25-chapter user manual, also as a PDF.</li>
+      </ul>
+    </section>
+  </div>
+
+  <footer>
+    <p>Always bench-test into a dummy load at reduced drive before transmitting into an antenna, especially after a new build.</p>
+    <p>Demos: <a href="audio-demo.html">noise reduction audio</a> · <a href="qo100-demo.html">QO-100</a>.</p>
+    <p>Summary as of v0.15.2, 16 November 2026. Details and status for each radio are in the <a href="https://github.com/g0orx/hpsdr-rs#readme">README</a>.</p>
+  </footer>
+</div>
+</body>
+</html>

@@ -40,6 +40,10 @@ use rustls::{ServerConfig, ServerConnection, StreamOwned};
 pub const DEFAULT_ADDR: &str = "0.0.0.0:8080";
 /// Where the client's connection goes: passed through to the TCI server.
 const TCI_PATH: &str = "/tci";
+/// Added to the handshake passed to the TCI server when there's no
+/// password: that connection may listen and tune, but not transmit
+/// (tci.rs). Anyone who can reach the port could otherwise key the radio.
+pub const RECEIVE_ONLY_HEADER: &str = "X-Hpsdr-Receive-Only";
 const CERT_FILE: &str = "web-cert.pem";
 const KEY_FILE: &str = "web-key.pem";
 
@@ -250,6 +254,17 @@ fn handle(s: &mut impl Socket, peer: SocketAddr, context: &Context) {
     let _ = s.flush();
 }
 
+/// `request` with `header` added after its request line.
+fn with_header(request: &[u8], header: &str) -> Vec<u8> {
+    let at = request.windows(2).position(|w| w == b"\r\n").map_or(request.len(), |i| i + 2);
+    let mut out = Vec::with_capacity(request.len() + header.len() + 2);
+    out.extend_from_slice(&request[..at]);
+    out.extend_from_slice(header.as_bytes());
+    out.extend_from_slice(b"\r\n");
+    out.extend_from_slice(&request[at..]);
+    out
+}
+
 /// "200 OK" from a response made by `message`.
 fn status_of(reply: &[u8]) -> String {
     let end = reply.windows(2).position(|w| w == b"\r\n").unwrap_or(reply.len());
@@ -291,7 +306,13 @@ fn pass_through(s: &mut impl Socket, request: &[u8], query: &str, head: &str, pe
     };
     let _ = tci.set_nodelay(true);
     let _ = tci.set_read_timeout(Some(POLL));
-    if tci.write_all(request).is_err() {
+    let request = if context.password.is_empty() {
+        log("receive only: no password set");
+        with_header(request, &format!("{RECEIVE_ONLY_HEADER}: 1"))
+    } else {
+        request.to_vec()
+    };
+    if tci.write_all(&request).is_err() {
         log("TCI server closed before the handshake was passed on");
         return;
     }
@@ -462,7 +483,19 @@ mod tests {
         thread::spawn(move || {
             for stream in tci.incoming().flatten() {
                 thread::spawn(move || {
-                    let mut ws = tungstenite::accept(stream).unwrap();
+                    // Says first whether it was told the client is
+                    // receive only, then echoes.
+                    let mut receive_only = false;
+                    let mut ws = tungstenite::accept_hdr(
+                        stream,
+                        |request: &tungstenite::handshake::server::Request,
+                         response: tungstenite::handshake::server::Response| {
+                            receive_only = request.headers().contains_key(RECEIVE_ONLY_HEADER);
+                            Ok(response)
+                        },
+                    )
+                    .unwrap();
+                    ws.send(tungstenite::Message::Text(format!("receive_only:{receive_only};").into())).unwrap();
                     while let Ok(m) = ws.read() {
                         if m.is_text() && ws.send(m).is_err() {
                             break;
@@ -485,8 +518,23 @@ mod tests {
         .unwrap();
         assert!(tungstenite::connect(format!("ws://127.0.0.1:{port}/tci?password=wrong")).is_err());
         let (mut ws, _) = tungstenite::connect(format!("ws://127.0.0.1:{port}/tci?password=s3cret%21")).unwrap();
+        assert_eq!(ws.read().unwrap().into_text().unwrap().as_str(), "receive_only:false;");
         ws.send(tungstenite::Message::Text("vfo:0,0;".into())).unwrap();
         assert_eq!(ws.read().unwrap().into_text().unwrap().as_str(), "vfo:0,0;");
+        drop(ws);
+        drop(server);
+
+        // No password: the TCI server is told the client is receive only.
+        let server = WebServer::start(
+            &format!("127.0.0.1:{port}"),
+            None,
+            String::new(),
+            Arc::new(Mutex::new(format!("0.0.0.0:{tci_port}"))),
+            DebugLog::new(std::env::temp_dir().join(format!("hpsdr-rs-web-log2-{}.txt", std::process::id()))),
+        )
+        .unwrap();
+        let (mut ws, _) = tungstenite::connect(format!("ws://127.0.0.1:{port}/tci")).unwrap();
+        assert_eq!(ws.read().unwrap().into_text().unwrap().as_str(), "receive_only:true;");
         drop(ws);
         drop(server);
         thread::sleep(Duration::from_millis(100));

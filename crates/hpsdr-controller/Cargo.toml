@@ -1,0 +1,23 @@
+[package]
+name = "hpsdr-controller"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-2.0-or-later"
+authors = ["John Melton <john.d.melton@googlemail.com>"]
+description = "piHPSDR-style front-panel controllers (GPIO encoders and switches, MCP23017 on I2C) for hpsdr-rs and hpsdr-remote"
+repository = "https://github.com/g0orx/hpsdr-rs"
+
+# Shared by hpsdr-rs and hpsdr-remote: the actions a control can be bound
+# to, the controllers' settings and their Settings page, and (Linux) the
+# hardware. Builds everywhere, the web included, where there's no hardware.
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+egui = "0.37"
+
+# Encoders and switches on GPIO lines, through the kernel's GPIO character
+# device (uAPI v2: pull-ups and debouncing). Pure Rust, no libgpiod. The
+# MCP23017 switch expander on I2C (/dev/i2c-1): SMBus ioctls.
+[target.'cfg(target_os = "linux")'.dependencies]
+gpiocdev = "0.8"
+libc = "0.2"

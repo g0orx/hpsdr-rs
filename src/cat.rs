@@ -17,13 +17,16 @@
     written by the same author as this app), scoped down to a practical
     subset rather than porting its full ~5900 lines. Implemented:
     ID, IF, FA, FB, FR, FT, MD, AI, PS, TX, RX, SM, TY, RT, RC, RD, RU,
-    XT, KY. Deliberately NOT implemented (unlike the reference) because
+    XT, KY, PC. PC (output power) is the TX Power setting as a
+    percentage of the radio's maximum (Settings -> TX), as TCI's drive:
+    "PC;" answers "PC050;" for 50 W of 100 W, "PC005;" sets 5 %. On a
+    100 W radio that's watts, as a TS-2000's own PC. Real request
+    (2026-11-23): an SPE Expert amplifier sends PC when Operate is
+    pressed or its drive steps change, and got "?;". See CatPower.
+    Deliberately NOT implemented (unlike the reference) because
     this app has no clean value/range to back them with yet, matching
     rigctl.rs's own "respond unsupported rather than a made-up value"
     philosophy:
-      - PC (drive/power level): max_tx_power_watts isn't currently
-        shared via an Arc the way frequency/mox are, and the reference's
-        0-100 scale doesn't map cleanly onto watts without it.
       - MG (mic gain): this app's mic_gain is a linear 0.0-8.0
         multiplier, not the reference's -12..+50 dB range -- no honest
         conversion between the two.
@@ -46,11 +49,27 @@
         rit_enabled's doc comment (radio.rs). No command to set an
         absolute XIT value exists in real Kenwood CAT either, only XT's
         on/off toggle -- matches the reference exactly.
-      - AI's auto-reporting flag is stored and read back per the
-        client's own request, but no asynchronous FA/MD/... push
-        notifications are actually sent on state changes -- a client
-        relying on AI>0 to avoid polling will not see updates. Poll-
-        based clients (the common case) are unaffected.
+    AI (auto-reporting) is real: with AI1 or higher the client is sent
+    "FA...;" whenever the frequency changes, and with AI2 or higher
+    "MD...;" whenever the mode changes, checked every 200 ms -- the same
+    as deskHPSDR's autoreport_handler (FA/FB/MD, not IF). A serial port
+    with "Auto report" ticked starts at AI2 without being asked, for
+    devices that only listen (an amplifier or band decoder that never
+    sends a command), and sends the current frequency and mode as soon
+    as the port opens.
+
+    Serial ports: the same commands can also be served on a serial port
+    (CatSerialPort below; Settings -> Network, "Serial 1-3"), for an
+    amplifier, ATU or band decoder that follows the radio's band over a
+    Kenwood CAT cable, or a logger on a COM port (real or virtual, e.g.
+    a com0com pair on Windows). 8 data bits, no parity, 1 stop bit, no
+    flow control, as deskHPSDR's launch_serial_rigctl. A port that can't
+    be opened, or goes away (a USB adapter unplugged), is retried every
+    2 s until it's stopped. Per port: "TX frequency" makes FA/IF report
+    the frequency transmitted on (CatShared::tx_rf_frequency_hz) rather
+    than the RX one, so an amplifier follows Split/XIT; "PTT out" raises
+    RTS or DTR while transmitting; "PTT in" keys the radio on CTS or DSR
+    (run_ptt_lines).
 
     Kenwood CAT has no request/reply symmetry like Hamlib's rigctld:
     "read" commands (bare, e.g. "FA;") get a reply; "set" commands
@@ -77,13 +96,103 @@ use crate::debug_log::DebugLog;
 use crate::spectrum::{DemodParams, Mode, SpectrumDisplay};
 use std::collections::VecDeque;
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::TcpListener;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 pub const DEFAULT_ADDR: &str = "0.0.0.0:19090";
+
+/// Serial ports offered in Settings -> Network, as deskHPSDR's MAX_SERIAL.
+pub const SERIAL_PORTS: usize = 3;
+/// Baud rates offered for a serial port (deskHPSDR offers 4800-38400;
+/// some amplifiers' CAT inputs also do 57600/115200).
+pub const SERIAL_BAUD_RATES: [u32; 6] = [4800, 9600, 19200, 38400, 57600, 115200];
+pub const DEFAULT_SERIAL_BAUD: u32 = 9600;
+
+/// How often an auto-reporting client is checked for a changed
+/// frequency or mode.
+const AUTO_REPORT_INTERVAL: Duration = Duration::from_millis(200);
+
+/// The radio state every CAT client reads and changes -- the TCP
+/// server's clients and each serial port alike. See CatServer::start's
+/// parameters for what each one is.
+#[derive(Clone)]
+pub struct CatShared {
+    pub requested_frequency_hz: Arc<AtomicU64>,
+    pub rx_frequency_hz: Arc<AtomicU64>,
+    /// The frequency transmitted on, in the same RF terms as
+    /// rx_frequency_hz (through a transverter, its RF side): VFO B with
+    /// Split/Duplex, plus XIT and CW pitch -- see main.rs's per-frame
+    /// tx_dial_freq_hz. A serial port with "Report TX frequency" reports
+    /// this as FA/IF, so an amplifier is on the band actually
+    /// transmitted on.
+    pub tx_rf_frequency_hz: Arc<AtomicU64>,
+    pub mox: Arc<AtomicBool>,
+    pub tx_frequency_hz: Arc<AtomicU32>,
+    pub allow_out_of_band_tx: Arc<AtomicBool>,
+    pub rit_enabled: Arc<AtomicBool>,
+    pub rit_offset_hz: Arc<AtomicI32>,
+    pub xit_enabled: Arc<AtomicBool>,
+    pub cw_remote_pending: Arc<Mutex<VecDeque<String>>>,
+    pub cw_remote_busy: Arc<AtomicBool>,
+    pub power: CatPower,
+}
+
+/// The TX Power setting, for PC (see this module's doc comment). The
+/// setting itself is read here; a change is only asked for, and main.rs
+/// applies it each frame as the TX Power slider would (or not at all,
+/// with transmit off).
+#[derive(Clone)]
+pub struct CatPower {
+    /// RadioSession::tx_power_watts.
+    pub watts: Arc<AtomicU32>,
+    /// The radio's maximum power, W, kept current by main.rs; 0 when it
+    /// can't transmit, and then PC reads 0 and a set is ignored.
+    pub max_watts: Arc<AtomicU32>,
+    /// A setting a client has asked for, W; NO_REQUEST when none.
+    request: Arc<AtomicU32>,
+}
+
+const NO_REQUEST: u32 = u32::MAX;
+
+impl CatPower {
+    pub fn new(watts: Arc<AtomicU32>) -> Self {
+        CatPower {
+            watts,
+            max_watts: Arc::new(AtomicU32::new(0)),
+            request: Arc::new(AtomicU32::new(NO_REQUEST)),
+        }
+    }
+
+    /// A TX Power setting a client has asked for since the last call, W.
+    pub fn take_request(&self) -> Option<u32> {
+        match self.request.swap(NO_REQUEST, Ordering::Relaxed) {
+            NO_REQUEST => None,
+            watts => Some(watts),
+        }
+    }
+
+    /// PC's reply (read) or None (a set, asked for, or a bad one).
+    fn command(&self, suffix: &str) -> Option<String> {
+        let max = self.max_watts.load(Ordering::Relaxed);
+        if suffix.is_empty() {
+            let percent = if max == 0 {
+                0
+            } else {
+                ((self.watts.load(Ordering::Relaxed).min(max) * 100 + max / 2) / max).min(100)
+            };
+            Some(format!("PC{percent:03};"))
+        } else {
+            if let (Ok(percent), true) = (suffix.parse::<u32>(), max > 0) {
+                let watts = (percent.min(100) * max + 50) / 100;
+                self.request.store(watts, Ordering::Relaxed);
+            }
+            None
+        }
+    }
+}
 
 /// Same swappable-reference reasoning as rigctl.rs's DemodParamsCell --
 /// a sample-rate change (main.rs's change_sample_rate) rebuilds
@@ -113,42 +222,23 @@ impl CatServer {
     /// caller should treat that as non-fatal.
     pub fn start(
         addr: &str,
-        // Where FA's "set" form writes its request -- NOT the raw
-        // hardware frequency. See RadioSession::requested_frequency_hz's
-        // doc comment: main.rs's own per-frame loop reconciles this
-        // (moving the CTUN target if CTUN is on, retuning the real
-        // hardware otherwise), since CTUN state lives in the UI layer,
-        // not anywhere reachable from this server thread.
-        requested_frequency_hz: Arc<AtomicU64>,
-        // See RadioSession::rx_frequency_hz's doc comment -- used for
-        // FA/IF's frequency-read fields so a CTUN'd listen frequency is
-        // reported correctly, not the parked hardware LO.
-        rx_frequency_hz: Arc<AtomicU64>,
+        // What clients read and change -- see CatShared. In it:
+        // requested_frequency_hz is where FA's "set" form writes its
+        // request -- NOT the raw hardware frequency (see
+        // RadioSession::requested_frequency_hz's doc comment: main.rs's
+        // own per-frame loop reconciles this, since CTUN state lives in
+        // the UI layer); rx_frequency_hz is what FA/IF report, so a
+        // CTUN'd listen frequency is reported, not the parked hardware
+        // LO; tx_frequency_hz/allow_out_of_band_tx are checked before
+        // "TX" is honored (main.rs's tx_frequency_allowed); rit_*/
+        // xit_enabled back RT/RC/RD/RU and XT (no xit offset: Kenwood
+        // CAT has no command to set an absolute XIT value); cw_remote_*
+        // back "KY", shared with rigctl.rs's send_morse/stop_morse.
+        shared: CatShared,
         demod_params: Arc<Mutex<DemodParams>>,
         display: Arc<Mutex<SpectrumDisplay>>,
-        mox: Arc<AtomicBool>,
-        // See main.rs's tx_frequency_allowed doc comment -- real
-        // request, a safety default against accidentally transmitting
-        // outside the ham bands, checked before this server's own "TX"
-        // command is honored.
-        tx_frequency_hz: Arc<AtomicU32>,
-        allow_out_of_band_tx: Arc<AtomicBool>,
-        // See RadioSession::rit_enabled/rit_offset_hz/xit_enabled's doc
-        // comments -- backs RT/RC/RD/RU (RIT) and XT (XIT). No
-        // xit_offset_hz here -- real Kenwood TS-2000 CAT has no command
-        // to set an absolute XIT value, only RIT's RC/RD/RU (see
-        // RadioSession::xit_enabled's doc comment).
-        rit_enabled: Arc<AtomicBool>,
-        rit_offset_hz: Arc<AtomicI32>,
-        xit_enabled: Arc<AtomicBool>,
-        // "KY" -- see this module's own doc comment. Shared with
-        // rigctl.rs's send_morse/stop_morse (main.rs passes the SAME
-        // Arcs to both servers) so either protocol's client sees
-        // consistent behavior/status.
-        cw_remote_pending: Arc<Mutex<VecDeque<String>>>,
-        cw_remote_busy: Arc<AtomicBool>,
         logging: DebugLog,
-    ) -> std::io::Result<Self> {
+) -> std::io::Result<Self> {
         let listener = TcpListener::bind(addr)?;
         listener.set_nonblocking(true)?;
         println!("cat: listening on {addr}");
@@ -173,28 +263,24 @@ impl CatServer {
                         if let Err(e) = stream.set_read_timeout(Some(Duration::from_millis(250))) {
                             eprintln!("cat: failed to set read timeout: {e}");
                         }
-                        let freq = Arc::clone(&requested_frequency_hz);
-                        let rx_freq = Arc::clone(&rx_frequency_hz);
+                        let _ = stream.set_nodelay(true);
+                        let writer = match stream.try_clone() {
+                            Ok(s) => s,
+                            Err(_) => continue,
+                        };
+                        let conn_shared = shared.clone();
                         let params = Arc::clone(&accept_demod_params);
                         let disp = Arc::clone(&accept_display);
-                        let conn_mox = Arc::clone(&mox);
-                        let conn_tx_frequency_hz = Arc::clone(&tx_frequency_hz);
-                        let conn_allow_out_of_band_tx = Arc::clone(&allow_out_of_band_tx);
-                        let conn_rit_enabled = Arc::clone(&rit_enabled);
-                        let conn_rit_offset_hz = Arc::clone(&rit_offset_hz);
-                        let conn_xit_enabled = Arc::clone(&xit_enabled);
-                        let conn_cw_remote_pending = Arc::clone(&cw_remote_pending);
-                        let conn_cw_remote_busy = Arc::clone(&cw_remote_busy);
                         let conn_stop = Arc::clone(&accept_stop);
                         let conn_connected = Arc::clone(&accept_connected);
                         let conn_logging = accept_logging.clone();
                         let handle = thread::spawn(move || {
                             conn_connected.fetch_add(1, Ordering::Relaxed);
+                            // Logged without a prefix, as before serial
+                            // ports existed.
                             handle_client(
-                                stream, freq, rx_freq, params, disp, conn_mox, conn_tx_frequency_hz,
-                                conn_allow_out_of_band_tx, conn_rit_enabled, conn_rit_offset_hz,
-                                conn_xit_enabled, conn_cw_remote_pending, conn_cw_remote_busy, conn_stop,
-                                conn_logging,
+                                stream, writer, "", 0, false, &conn_shared, &params, &disp, &conn_stop,
+                                &conn_logging,
                             );
                             conn_connected.fetch_sub(1, Ordering::Relaxed);
                         });
@@ -255,47 +341,47 @@ impl Drop for CatServer {
     }
 }
 
-fn handle_client(
-    stream: TcpStream,
-    requested_frequency_hz: Arc<AtomicU64>,
-    rx_frequency_hz: Arc<AtomicU64>,
-    demod_params: DemodParamsCell,
-    display: DisplayCell,
-    mox: Arc<AtomicBool>,
-    tx_frequency_hz: Arc<AtomicU32>,
-    allow_out_of_band_tx: Arc<AtomicBool>,
-    rit_enabled: Arc<AtomicBool>,
-    rit_offset_hz: Arc<AtomicI32>,
-    xit_enabled: Arc<AtomicBool>,
-    cw_remote_pending: Arc<Mutex<VecDeque<String>>>,
-    cw_remote_busy: Arc<AtomicBool>,
-    stop: Arc<AtomicBool>,
-    logging: DebugLog,
+/// Serves one CAT client -- a TCP connection or an open serial port --
+/// until it goes away, a read or write fails, or `stop` is set.
+/// `reader` must time out (TCP read timeout / serial port timeout) so
+/// `stop` and auto-reporting are checked even when nothing arrives.
+/// `label` prefixes this client's log lines (the port name for a
+/// serial port, empty for TCP); `initial_auto_reporting` is the AI level
+/// it starts at (0 = only answer commands). `report_tx`: FA/IF and
+/// auto-reports give the TX frequency rather than the RX one (see
+/// CatShared::tx_rf_frequency_hz).
+fn handle_client<R: Read, W: Write>(
+    mut reader: R,
+    mut writer: W,
+    label: &str,
+    initial_auto_reporting: u8,
+    report_tx: bool,
+    shared: &CatShared,
+    demod_params: &DemodParamsCell,
+    display: &DisplayCell,
+    stop: &AtomicBool,
+    logging: &DebugLog,
 ) {
-    let _ = stream.set_nodelay(true);
-    let mut writer = match stream.try_clone() {
-        Ok(s) => s,
-        Err(_) => return,
-    };
-    let mut reader = stream;
+    let prefix = if label.is_empty() { String::new() } else { format!("{label}: ") };
     let mut read_buf = [0u8; 1024];
     // Accumulates bytes across reads until a full ';'-terminated
     // command is available -- a real command CAN arrive split across
-    // TCP packet boundaries (e.g. a slow/throttled client), unlike
-    // rigctl.rs's newline-delimited protocol where read_line already
-    // handles this for free.
+    // TCP packet boundaries (e.g. a slow/throttled client), or a few
+    // bytes at a time from a serial port, unlike rigctl.rs's
+    // newline-delimited protocol where read_line already handles this
+    // for free.
     let mut pending = String::new();
-    // Per-connection AI (auto-reporting) level -- see this module's
-    // doc comment for why setting it doesn't actually enable any push
-    // notifications yet; it's tracked and read back anyway since a
-    // client polling `AI;` to confirm its own request took effect
-    // shouldn't see it silently reset to 0.
-    let mut auto_reporting: u8 = 0;
+    // Per-client AI (auto-reporting) level -- see this module's doc
+    // comment.
+    let mut auto_reporting: u8 = initial_auto_reporting;
+    let mut auto_report = AutoReport::default();
+    let reported_frequency_hz =
+        if report_tx { &shared.tx_rf_frequency_hz } else { &shared.rx_frequency_hz };
 
     while !stop.load(Ordering::Relaxed) {
         match reader.read(&mut read_buf) {
             Ok(0) => {
-                logging.log("client closed the connection");
+                logging.log(&format!("{prefix}client closed the connection"));
                 break;
             }
             Ok(n) => {
@@ -309,43 +395,484 @@ fn handle_client(
                     if cmd.is_empty() {
                         continue;
                     }
-                    logging.log(&format!("<< {cmd};"));
+                    logging.log(&format!("{prefix}<< {cmd};"));
                     let current_params = demod_params.lock().unwrap().clone();
                     let current_display = display.lock().unwrap().clone();
-                    if let Some(response) = handle_command(
+                    let response = if cmd.len() >= 2 && cmd[..2].eq_ignore_ascii_case("PC") {
+                        shared.power.command(cmd[2..].trim())
+                    } else {
+                        handle_command(
                         cmd,
-                        &requested_frequency_hz,
-                        &rx_frequency_hz,
+                        &shared.requested_frequency_hz,
+                        reported_frequency_hz,
                         &current_params,
                         &current_display,
-                        &mox,
-                        &tx_frequency_hz,
-                        &allow_out_of_band_tx,
-                        &rit_enabled,
-                        &rit_offset_hz,
-                        &xit_enabled,
+                        &shared.mox,
+                        &shared.tx_frequency_hz,
+                        &shared.allow_out_of_band_tx,
+                        &shared.rit_enabled,
+                        &shared.rit_offset_hz,
+                        &shared.xit_enabled,
                         &mut auto_reporting,
-                        &cw_remote_pending,
-                        &cw_remote_busy,
-                    ) {
-                        logging.log(&format!(">> {response}"));
-                        if writer.write_all(response.as_bytes()).is_err() {
+                        &shared.cw_remote_pending,
+                        &shared.cw_remote_busy,
+                        )
+                    };
+                    if let Some(response) = response {
+                        logging.log(&format!("{prefix}>> {response}"));
+                        if writer.write_all(response.as_bytes()).and_then(|_| writer.flush()).is_err() {
                             return;
                         }
                     }
                 }
+                // A device sending something that never has a ';'
+                // (line noise, a wrong baud rate) mustn't grow this
+                // forever.
+                if pending.len() > 4096 {
+                    pending.clear();
+                }
             }
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock || e.kind() == std::io::ErrorKind::TimedOut => {
-                continue;
-            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock || e.kind() == std::io::ErrorKind::TimedOut => {}
             // See rigctl.rs/tci.rs's identical arm's doc comment -- same
             // read-timeout pattern.
             Err(e) => {
-                logging.log(&format!("connection error, closing: {e:?}"));
+                logging.log(&format!("{prefix}connection error, closing: {e:?}"));
                 break;
             }
         }
+        if auto_reporting > 0 {
+            let mode = demod_params.lock().unwrap().lock().unwrap().mode;
+            let reports = auto_report.due(
+                auto_reporting,
+                reported_frequency_hz.load(Ordering::Relaxed),
+                mode,
+                Instant::now(),
+            );
+            for report in reports {
+                logging.log(&format!("{prefix}>> {report}"));
+                if writer.write_all(report.as_bytes()).and_then(|_| writer.flush()).is_err() {
+                    return;
+                }
+            }
+        } else {
+            // Turned off (AI0;): report afresh if it's turned on again.
+            auto_report = AutoReport::default();
+        }
     }
+}
+
+/// What an auto-reporting client was last sent (see this module's doc
+/// comment on AI): None = nothing yet, so the first check reports the
+/// current values.
+#[derive(Default)]
+struct AutoReport {
+    last_check: Option<Instant>,
+    last_frequency_hz: Option<u64>,
+    last_mode: Option<u8>,
+}
+
+impl AutoReport {
+    /// The reports to send now for AI level `level`: FA when the
+    /// frequency has changed (level 1+), MD when the mode has (level 2+),
+    /// at most every AUTO_REPORT_INTERVAL.
+    fn due(&mut self, level: u8, frequency_hz: u64, mode: Mode, now: Instant) -> Vec<String> {
+        let mut reports = Vec::new();
+        if level == 0 || self.last_check.is_some_and(|t| now.duration_since(t) < AUTO_REPORT_INTERVAL) {
+            return reports;
+        }
+        self.last_check = Some(now);
+        if self.last_frequency_hz != Some(frequency_hz) {
+            self.last_frequency_hz = Some(frequency_hz);
+            reports.push(format!("FA{frequency_hz:011};"));
+        }
+        let code = mode_to_ts2000(mode);
+        if level >= 2 && self.last_mode != Some(code) {
+            self.last_mode = Some(code);
+            reports.push(format!("MD{code};"));
+        }
+        reports
+    }
+}
+
+/// A modem-control line hpsdr-rs raises while transmitting, e.g. to key
+/// an amplifier through a USB-serial adapter.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum PttOut {
+    #[default]
+    Off,
+    Rts,
+    Dtr,
+}
+
+/// A modem-control input that keys the radio while it's raised: a
+/// footswitch, or a program set to "PTT via RTS/DTR" on the other end
+/// of a virtual serial pair (its RTS arrives here as CTS, its DTR as
+/// DSR).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum PttIn {
+    #[default]
+    Off,
+    Cts,
+    Dsr,
+}
+
+impl PttOut {
+    pub const ALL: [PttOut; 3] = [PttOut::Off, PttOut::Rts, PttOut::Dtr];
+    pub fn label(self) -> &'static str {
+        match self {
+            PttOut::Off => "Off",
+            PttOut::Rts => "RTS",
+            PttOut::Dtr => "DTR",
+        }
+    }
+}
+
+impl PttIn {
+    pub const ALL: [PttIn; 3] = [PttIn::Off, PttIn::Cts, PttIn::Dsr];
+    pub fn label(self) -> &'static str {
+        match self {
+            PttIn::Off => "Off",
+            PttIn::Cts => "CTS",
+            PttIn::Dsr => "DSR",
+        }
+    }
+}
+
+/// How one serial port is set up (Settings -> Network).
+#[derive(Clone, Debug, PartialEq)]
+pub struct SerialOptions {
+    /// e.g. "/dev/ttyUSB0", "COM3".
+    pub port: String,
+    pub baud: u32,
+    /// Start at AI2 (send FA/MD on changes without being asked) -- for
+    /// a device that only listens.
+    pub auto_report: bool,
+    /// FA/IF give the TX frequency, not the RX one -- see
+    /// CatShared::tx_rf_frequency_hz. On by default: what an amplifier
+    /// needs, and the same as the RX frequency without Split/XIT.
+    pub report_tx: bool,
+    pub ptt_out: PttOut,
+    pub ptt_in: PttIn,
+}
+
+impl Default for SerialOptions {
+    fn default() -> Self {
+        Self {
+            port: String::new(),
+            baud: DEFAULT_SERIAL_BAUD,
+            auto_report: false,
+            report_tx: true,
+            ptt_out: PttOut::Off,
+            ptt_in: PttIn::Off,
+        }
+    }
+}
+
+/// One of Settings -> Network's CAT serial ports, as configured, and
+/// running or not.
+#[derive(Default)]
+pub struct CatSerialSlot {
+    pub options: SerialOptions,
+    pub running: Option<CatSerialPort>,
+}
+
+/// The state of a running serial port, for Settings -> Network.
+#[derive(Clone, Debug, PartialEq)]
+pub enum SerialState {
+    Opening,
+    Open,
+    /// Couldn't open, or lost: why. Retried every 2 s.
+    Failed(String),
+}
+
+/// How often the PTT lines are looked at. Keying an amplifier late
+/// means RF reaches it before its relay closes, so this is short.
+const PTT_POLL_INTERVAL: Duration = Duration::from_millis(2);
+
+/// Kenwood CAT on a serial port: opens it (retrying while it can't be
+/// opened or is lost) and serves it as a CAT client would be served over
+/// TCP, until stopped or dropped. With PTT lines set, a second thread
+/// drives/watches them while the port is open (run_ptt_lines).
+pub struct CatSerialPort {
+    demod_params: DemodParamsCell,
+    display: DisplayCell,
+    stop: Arc<AtomicBool>,
+    state: Arc<Mutex<SerialState>>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl CatSerialPort {
+    pub fn start(
+        options: SerialOptions,
+        shared: CatShared,
+        demod_params: Arc<Mutex<DemodParams>>,
+        display: Arc<Mutex<SpectrumDisplay>>,
+        logging: DebugLog,
+    ) -> Self {
+        let demod_params: DemodParamsCell = Arc::new(Mutex::new(demod_params));
+        let display: DisplayCell = Arc::new(Mutex::new(display));
+        let stop = Arc::new(AtomicBool::new(false));
+        let state = Arc::new(Mutex::new(SerialState::Opening));
+        let port = options.port.trim().to_string();
+        let baud = options.baud;
+        let thread_params = Arc::clone(&demod_params);
+        let thread_display = Arc::clone(&display);
+        let thread_stop = Arc::clone(&stop);
+        let thread_state = Arc::clone(&state);
+        let thread = thread::spawn(move || {
+            let initial_ai = if options.auto_report { 2 } else { 0 };
+            let mut last_error = String::new();
+            while !thread_stop.load(Ordering::Relaxed) {
+                match open_serial(&port, baud) {
+                    Ok((reader, writer)) => {
+                        println!("cat: serial port {port} open at {baud} baud");
+                        logging.log(&format!("{port}: open at {baud} baud"));
+                        last_error.clear();
+                        *thread_state.lock().unwrap() = SerialState::Open;
+                        let lines_stop = Arc::new(AtomicBool::new(false));
+                        let lines = if options.ptt_out != PttOut::Off || options.ptt_in != PttIn::Off {
+                            match writer.try_clone() {
+                                Ok(lines_port) => {
+                                    let lines_stop = Arc::clone(&lines_stop);
+                                    let lines_shared = shared.clone();
+                                    let lines_logging = logging.clone();
+                                    let lines_label = port.clone();
+                                    let (ptt_out, ptt_in) = (options.ptt_out, options.ptt_in);
+                                    Some(thread::spawn(move || {
+                                        run_ptt_lines(
+                                            lines_port, ptt_out, ptt_in, &lines_shared, &lines_stop,
+                                            &lines_label, &lines_logging,
+                                        )
+                                    }))
+                                }
+                                Err(e) => {
+                                    logging.log(&format!("{port}: PTT lines unavailable: {e}"));
+                                    None
+                                }
+                            }
+                        } else {
+                            None
+                        };
+                        handle_client(
+                            reader, writer, &port, initial_ai, options.report_tx, &shared, &thread_params,
+                            &thread_display, &thread_stop, &logging,
+                        );
+                        lines_stop.store(true, Ordering::SeqCst);
+                        if let Some(t) = lines {
+                            let _ = t.join();
+                        }
+                        if thread_stop.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        *thread_state.lock().unwrap() = SerialState::Failed("lost; reopening".to_string());
+                    }
+                    Err(e) => {
+                        let msg = e.to_string();
+                        // Logged once per distinct error, not every retry.
+                        if msg != last_error {
+                            eprintln!("cat: couldn't open serial port {port}: {msg}");
+                            logging.log(&format!("{port}: couldn't open: {msg}"));
+                            last_error = msg.clone();
+                        }
+                        *thread_state.lock().unwrap() = SerialState::Failed(msg);
+                    }
+                }
+                for _ in 0..20 {
+                    if thread_stop.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(100));
+                }
+            }
+            logging.log(&format!("{port}: closed"));
+        });
+        Self { demod_params, display, stop, state, thread: Some(thread) }
+    }
+
+    /// See CatServer::set_demod_params.
+    pub fn set_demod_params(&self, new_demod_params: Arc<Mutex<DemodParams>>) {
+        *self.demod_params.lock().unwrap() = new_demod_params;
+    }
+
+    pub fn set_display(&self, new_display: Arc<Mutex<SpectrumDisplay>>) {
+        *self.display.lock().unwrap() = new_display;
+    }
+
+    pub fn state(&self) -> SerialState {
+        self.state.lock().unwrap().clone()
+    }
+
+    pub fn stop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+    }
+}
+
+impl Drop for CatSerialPort {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+/// Drives `ptt_out` from the radio's transmit state, and keys/unkeys
+/// the radio on `ptt_in`'s edges, until `stop` is set or the port fails.
+///
+/// PTT in is edge-triggered: raising the line keys (if the frequency may
+/// be transmitted on -- main.rs's tx_frequency_allowed, as CAT's TX;),
+/// dropping it unkeys, but only if this line keyed it -- so the on-screen
+/// MOX, or another client, isn't overridden by a line that simply sits
+/// high or low, or rises while already transmitting. If the radio is unkeyed some other way while the line is
+/// still up, it stays unkeyed until the line drops and rises again. On
+/// leaving (stopped, or the port lost), a transmission this line started
+/// is ended, and the PTT out line is dropped.
+fn run_ptt_lines(
+    mut port: impl ModemLines,
+    ptt_out: PttOut,
+    ptt_in: PttIn,
+    shared: &CatShared,
+    stop: &AtomicBool,
+    label: &str,
+    logging: &DebugLog,
+) {
+    let mut out_state: Option<bool> = None;
+    // None until first read, so a line already up when the port opens
+    // doesn't key the radio.
+    let mut in_state: Option<bool> = None;
+    let mut keyed_by_line = false;
+    while !stop.load(Ordering::Relaxed) {
+        let transmitting = shared.mox.load(Ordering::Relaxed);
+        if ptt_out != PttOut::Off && out_state != Some(transmitting) {
+            if let Err(e) = port.set_out(ptt_out, transmitting) {
+                logging.log(&format!("{label}: couldn't set {}: {e}", ptt_out.label()));
+                break;
+            }
+            out_state = Some(transmitting);
+        }
+        if keyed_by_line && !transmitting {
+            // Unkeyed elsewhere: don't key again until the next rise.
+            keyed_by_line = false;
+        }
+        if ptt_in != PttIn::Off {
+            let up = match port.read_in(ptt_in) {
+                Ok(up) => up,
+                Err(e) => {
+                    logging.log(&format!("{label}: couldn't read {}: {e}", ptt_in.label()));
+                    break;
+                }
+            };
+            match (in_state, up) {
+                // Already transmitting (MOX button, another client): left
+                // to whatever keyed it.
+                (Some(false), true) if transmitting => {}
+                (Some(false), true) => {
+                    if crate::tx_frequency_allowed(
+                        shared.tx_frequency_hz.load(Ordering::Relaxed),
+                        shared.allow_out_of_band_tx.load(Ordering::Relaxed),
+                    ) {
+                        logging.log(&format!("{label}: {} up, TX", ptt_in.label()));
+                        shared.mox.store(true, Ordering::Relaxed);
+                        keyed_by_line = true;
+                    } else {
+                        logging.log(&format!("{label}: {} up, TX refused: out of band", ptt_in.label()));
+                    }
+                }
+                (Some(true), false) => {
+                    logging.log(&format!("{label}: {} down, RX", ptt_in.label()));
+                    if keyed_by_line {
+                        shared.mox.store(false, Ordering::Relaxed);
+                        keyed_by_line = false;
+                    }
+                }
+                _ => {}
+            }
+            in_state = Some(up);
+        }
+        thread::sleep(PTT_POLL_INTERVAL);
+    }
+    if keyed_by_line {
+        shared.mox.store(false, Ordering::Relaxed);
+    }
+    if ptt_out != PttOut::Off {
+        let _ = port.set_out(ptt_out, false);
+    }
+}
+
+/// A serial port's modem-control lines, as run_ptt_lines uses them (a
+/// trait so its logic can be tested without a serial port: a
+/// pseudo-terminal has no such lines).
+trait ModemLines {
+    fn set_out(&mut self, line: PttOut, on: bool) -> serialport::Result<()>;
+    fn read_in(&mut self, line: PttIn) -> serialport::Result<bool>;
+}
+
+impl ModemLines for Box<dyn serialport::SerialPort> {
+    fn set_out(&mut self, line: PttOut, on: bool) -> serialport::Result<()> {
+        match line {
+            PttOut::Rts => self.write_request_to_send(on),
+            PttOut::Dtr => self.write_data_terminal_ready(on),
+            PttOut::Off => Ok(()),
+        }
+    }
+
+    fn read_in(&mut self, line: PttIn) -> serialport::Result<bool> {
+        match line {
+            PttIn::Cts => self.read_clear_to_send(),
+            PttIn::Dsr => self.read_data_set_ready(),
+            PttIn::Off => Ok(false),
+        }
+    }
+}
+
+type SerialHalves = (Box<dyn serialport::SerialPort>, Box<dyn serialport::SerialPort>);
+
+fn open_serial(port: &str, baud: u32) -> serialport::Result<SerialHalves> {
+    if port.is_empty() {
+        return Err(serialport::Error::new(serialport::ErrorKind::InvalidInput, "no port name"));
+    }
+    let reader = serialport::new(port, baud)
+        .data_bits(serialport::DataBits::Eight)
+        .parity(serialport::Parity::None)
+        .stop_bits(serialport::StopBits::One)
+        .flow_control(serialport::FlowControl::None)
+        .timeout(Duration::from_millis(250))
+        .open()?;
+    let writer = reader.try_clone()?;
+    Ok((reader, writer))
+}
+
+/// The serial ports this computer has, for Settings -> Network's port
+/// list -- names only, sorted. Empty if they can't be listed.
+///
+/// On Linux, serialport (built without libudev) lists every legacy
+/// /dev/ttyS* slot the kernel reserves, usually 32 with no UART behind
+/// them; those whose sysfs `type` is 0 (PORT_UNKNOWN: no UART) are left
+/// out. /dev/serial/by-id names are added first: they stay the same
+/// whichever order USB adapters are plugged in, unlike /dev/ttyUSB0/1.
+pub fn serial_port_names() -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    #[cfg(target_os = "linux")]
+    if let Ok(entries) = std::fs::read_dir("/dev/serial/by-id") {
+        let mut by_id: Vec<String> =
+            entries.flatten().map(|e| e.path().to_string_lossy().into_owned()).collect();
+        by_id.sort();
+        names.extend(by_id);
+    }
+    let mut ports: Vec<String> = serialport::available_ports()
+        .map(|ports| ports.into_iter().map(|p| p.port_name).collect())
+        .unwrap_or_default();
+    #[cfg(target_os = "linux")]
+    ports.retain(|name| {
+        let Some(base) = name.strip_prefix("/dev/").filter(|b| b.starts_with("ttyS")) else {
+            return true;
+        };
+        std::fs::read_to_string(format!("/sys/class/tty/{base}/type")).map_or(true, |t| t.trim() != "0")
+    });
+    ports.sort();
+    ports.dedup();
+    names.extend(ports);
+    names
 }
 
 /// `cmd` is one command with the trailing ';' already stripped (e.g.
@@ -943,6 +1470,342 @@ mod tests {
         // "PS0;" (power off) is deliberately a no-op, not a shutdown --
         // see this module's doc comment.
         assert_eq!(handle_command("PS0", &f, &f, &p, &d, &m, &tx_of(&f), &Arc::new(AtomicBool::new(true)), &rit, &rit_hz, &xit, &mut ai, &cw_pending, &cw_busy), None);
+    }
+
+    #[test]
+    fn auto_report_sends_changes_only() {
+        let t0 = Instant::now();
+        let mut ar = AutoReport::default();
+        // First check reports the current state; AI1 is frequency only.
+        assert_eq!(ar.due(1, 14_074_000, Mode::Usb, t0), vec!["FA00014074000;".to_string()]);
+        // Nothing changed.
+        assert!(ar.due(1, 14_074_000, Mode::Usb, t0 + Duration::from_millis(300)).is_empty());
+        // Changed, but too soon after the last check.
+        assert!(ar.due(1, 7_074_000, Mode::Usb, t0 + Duration::from_millis(350)).is_empty());
+        assert_eq!(
+            ar.due(1, 7_074_000, Mode::Usb, t0 + Duration::from_millis(600)),
+            vec!["FA00007074000;".to_string()]
+        );
+        // AI2 adds the mode, reported the first time it's seen.
+        assert_eq!(ar.due(2, 7_074_000, Mode::Lsb, t0 + Duration::from_millis(900)), vec!["MD1;".to_string()]);
+        assert_eq!(
+            ar.due(2, 3_573_000, Mode::Cwu, t0 + Duration::from_millis(1200)),
+            vec!["FA00003573000;".to_string(), "MD3;".to_string()]
+        );
+        assert!(ar.due(0, 1_840_000, Mode::Lsb, t0 + Duration::from_millis(1500)).is_empty());
+    }
+
+    /// A CatShared for tests: RX at `f`, TX (hardware and RF) at `tx`.
+    fn test_shared(f: &Arc<AtomicU64>, tx: u64) -> CatShared {
+        let (_, _, _, m, rit, rit_hz, xit, cw_pending, cw_busy) = fixture();
+        CatShared {
+            requested_frequency_hz: Arc::clone(f),
+            rx_frequency_hz: Arc::clone(f),
+            tx_rf_frequency_hz: Arc::new(AtomicU64::new(tx)),
+            mox: m,
+            tx_frequency_hz: Arc::new(AtomicU32::new(tx as u32)),
+            allow_out_of_band_tx: Arc::new(AtomicBool::new(false)),
+            rit_enabled: rit,
+            rit_offset_hz: rit_hz,
+            xit_enabled: xit,
+            cw_remote_pending: cw_pending,
+            cw_remote_busy: cw_busy,
+            power: CatPower::new(Arc::new(AtomicU32::new(0))),
+        }
+    }
+
+    #[test]
+    fn pc_reads_and_asks_for_percent_of_max_power() {
+        let power = CatPower::new(Arc::new(AtomicU32::new(50)));
+        // Can't transmit: reads 0, a set is ignored.
+        assert_eq!(power.command(""), Some("PC000;".to_string()));
+        assert_eq!(power.command("005"), None);
+        assert_eq!(power.take_request(), None);
+
+        // 100 W radio: percent is watts.
+        power.max_watts.store(100, Ordering::Relaxed);
+        assert_eq!(power.command(""), Some("PC050;".to_string()));
+        assert_eq!(power.command("005"), None);
+        assert_eq!(power.take_request(), Some(5));
+        assert_eq!(power.take_request(), None);
+        assert_eq!(power.command("150"), None);
+        assert_eq!(power.take_request(), Some(100));
+        assert_eq!(power.command("x"), None);
+        assert_eq!(power.take_request(), None);
+
+        // 200 W radio: a percentage of it.
+        power.max_watts.store(200, Ordering::Relaxed);
+        assert_eq!(power.command(""), Some("PC025;".to_string()));
+        assert_eq!(power.command("009"), None);
+        assert_eq!(power.take_request(), Some(18));
+        // HL2, 5 W: 50 % rounds to 3 W (2.5), and 3 W reads back as 60 %.
+        power.max_watts.store(5, Ordering::Relaxed);
+        assert_eq!(power.command("050"), None);
+        assert_eq!(power.take_request(), Some(3));
+        power.watts.store(3, Ordering::Relaxed);
+        assert_eq!(power.command(""), Some("PC060;".to_string()));
+    }
+
+    #[test]
+    fn serial_client_answers_and_auto_reports() {
+        // A serial-style client: commands from a byte slice, replies
+        // into a Vec, starting at AI2 as a port with Auto report does.
+        let (f, p, d, ..) = fixture();
+        let shared = test_shared(&f, 14_074_000);
+        let mut out = Vec::new();
+        handle_client(
+            &b"ID;IF"[..],
+            &mut out,
+            "test",
+            2,
+            false,
+            &shared,
+            &Arc::new(Mutex::new(p)),
+            &Arc::new(Mutex::new(d)),
+            &AtomicBool::new(false),
+            &DebugLog::new("unused.txt".into()),
+        );
+        let out = String::from_utf8(out).unwrap();
+        // The partial "IF" (no ';') isn't answered; the end of input
+        // closes the client.
+        assert!(out.starts_with("ID019;FA00014074000;MD"), "{out}");
+    }
+
+    #[test]
+    fn serial_client_reads_and_sets_pc() {
+        // As an SPE Expert does on Operate: PC set, then read.
+        let (f, p, d, ..) = fixture();
+        let shared = test_shared(&f, 14_074_000);
+        shared.power.max_watts.store(100, Ordering::Relaxed);
+        shared.power.watts.store(50, Ordering::Relaxed);
+        let mut out = Vec::new();
+        handle_client(
+            &b"PC;pc009;"[..],
+            &mut out,
+            "test",
+            0,
+            false,
+            &shared,
+            &Arc::new(Mutex::new(p)),
+            &Arc::new(Mutex::new(d)),
+            &AtomicBool::new(false),
+            &DebugLog::new("unused.txt".into()),
+        );
+        assert_eq!(String::from_utf8(out).unwrap(), "PC050;");
+        assert_eq!(shared.power.take_request(), Some(9));
+    }
+
+    #[test]
+    fn report_tx_gives_the_tx_frequency() {
+        // Split: listening on 14.195, transmitting on 14.225.
+        let (f, p, d, ..) = fixture();
+        f.store(14_195_000, Ordering::Relaxed);
+        let shared = test_shared(&f, 14_225_000);
+        let params = Arc::new(Mutex::new(p));
+        let display = Arc::new(Mutex::new(d));
+        let run = |report_tx: bool| {
+            let mut out = Vec::new();
+            handle_client(
+                &b"FA;IF;"[..], &mut out, "test", 0, report_tx, &shared, &params, &display,
+                &AtomicBool::new(false), &DebugLog::new("unused.txt".into()),
+            );
+            String::from_utf8(out).unwrap()
+        };
+        let rx = run(false);
+        assert!(rx.starts_with("FA00014195000;IF00014195000"), "{rx}");
+        let tx = run(true);
+        assert!(tx.starts_with("FA00014225000;IF00014225000"), "{tx}");
+        // A set still moves the RX VFO, as for any client.
+        let mut out = Vec::new();
+        handle_client(
+            &b"FA00007074000;"[..], &mut out, "test", 0, true, &shared, &params, &display,
+            &AtomicBool::new(false), &DebugLog::new("unused.txt".into()),
+        );
+        assert_eq!(f.load(Ordering::Relaxed), 7_074_000);
+    }
+
+    /// A fake port for run_ptt_lines: the input line is set by the test,
+    /// the output line recorded.
+    #[derive(Clone, Default)]
+    struct FakeLines {
+        out: Arc<Mutex<Vec<(PttOut, bool)>>>,
+        input: Arc<AtomicBool>,
+    }
+
+    impl ModemLines for FakeLines {
+        fn set_out(&mut self, line: PttOut, on: bool) -> serialport::Result<()> {
+            self.out.lock().unwrap().push((line, on));
+            Ok(())
+        }
+        fn read_in(&mut self, _line: PttIn) -> serialport::Result<bool> {
+            Ok(self.input.load(Ordering::Relaxed))
+        }
+    }
+
+    fn wait_for(what: &str, cond: impl Fn() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !cond() {
+            assert!(Instant::now() < deadline, "timed out waiting for {what}");
+            thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    #[test]
+    fn ptt_out_follows_transmit() {
+        let (f, ..) = fixture();
+        let shared = test_shared(&f, 14_074_000);
+        let lines = FakeLines::default();
+        let stop = Arc::new(AtomicBool::new(false));
+        let t = {
+            let (lines, shared, stop) = (lines.clone(), shared.clone(), Arc::clone(&stop));
+            thread::spawn(move || {
+                run_ptt_lines(lines, PttOut::Rts, PttIn::Off, &shared, &stop, "t", &DebugLog::new("u.txt".into()))
+            })
+        };
+        // Dropped at once (the OS may raise it on opening).
+        wait_for("RTS off", || lines.out.lock().unwrap().last() == Some(&(PttOut::Rts, false)));
+        shared.mox.store(true, Ordering::Relaxed);
+        wait_for("RTS on", || lines.out.lock().unwrap().last() == Some(&(PttOut::Rts, true)));
+        shared.mox.store(false, Ordering::Relaxed);
+        wait_for("RTS off again", || lines.out.lock().unwrap().last() == Some(&(PttOut::Rts, false)));
+        shared.mox.store(true, Ordering::Relaxed);
+        wait_for("RTS on again", || lines.out.lock().unwrap().last() == Some(&(PttOut::Rts, true)));
+        // Stopping (port closed) drops it even mid-transmission.
+        stop.store(true, Ordering::Relaxed);
+        t.join().unwrap();
+        assert_eq!(lines.out.lock().unwrap().last(), Some(&(PttOut::Rts, false)));
+        assert_eq!(*lines.out.lock().unwrap(), vec![
+            (PttOut::Rts, false), (PttOut::Rts, true), (PttOut::Rts, false), (PttOut::Rts, true), (PttOut::Rts, false),
+        ]);
+    }
+
+    #[test]
+    fn ptt_in_keys_on_edges_only() {
+        let (f, ..) = fixture();
+        let shared = test_shared(&f, 14_074_000);
+        let lines = FakeLines::default();
+        // Already up when the port opens: must not key.
+        lines.input.store(true, Ordering::Relaxed);
+        let stop = Arc::new(AtomicBool::new(false));
+        let t = {
+            let (lines, shared, stop) = (lines.clone(), shared.clone(), Arc::clone(&stop));
+            thread::spawn(move || {
+                run_ptt_lines(lines, PttOut::Off, PttIn::Cts, &shared, &stop, "t", &DebugLog::new("u.txt".into()))
+            })
+        };
+        thread::sleep(Duration::from_millis(30));
+        assert!(!shared.mox.load(Ordering::Relaxed));
+        // Drop and raise: keys; drop: unkeys.
+        lines.input.store(false, Ordering::Relaxed);
+        thread::sleep(Duration::from_millis(30));
+        lines.input.store(true, Ordering::Relaxed);
+        wait_for("TX", || shared.mox.load(Ordering::Relaxed));
+        lines.input.store(false, Ordering::Relaxed);
+        wait_for("RX", || !shared.mox.load(Ordering::Relaxed));
+        // Keyed by something else (MOX button): the line rising and
+        // dropping leaves it keyed.
+        shared.mox.store(true, Ordering::Relaxed);
+        thread::sleep(Duration::from_millis(30));
+        lines.input.store(true, Ordering::Relaxed);
+        thread::sleep(Duration::from_millis(30));
+        lines.input.store(false, Ordering::Relaxed);
+        thread::sleep(Duration::from_millis(30));
+        assert!(shared.mox.load(Ordering::Relaxed));
+        // Unkeyed elsewhere while the line is up: stays unkeyed.
+        shared.mox.store(false, Ordering::Relaxed);
+        thread::sleep(Duration::from_millis(30));
+        lines.input.store(true, Ordering::Relaxed);
+        wait_for("TX", || shared.mox.load(Ordering::Relaxed));
+        shared.mox.store(false, Ordering::Relaxed);
+        thread::sleep(Duration::from_millis(30));
+        assert!(!shared.mox.load(Ordering::Relaxed));
+        // Port closed while keyed by the line: unkeyed.
+        lines.input.store(false, Ordering::Relaxed);
+        thread::sleep(Duration::from_millis(30));
+        lines.input.store(true, Ordering::Relaxed);
+        wait_for("TX", || shared.mox.load(Ordering::Relaxed));
+        stop.store(true, Ordering::Relaxed);
+        t.join().unwrap();
+        assert!(!shared.mox.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn ptt_in_refuses_out_of_band() {
+        let (f, ..) = fixture();
+        let shared = test_shared(&f, 15_000_000); // not a ham band
+        let lines = FakeLines::default();
+        let stop = Arc::new(AtomicBool::new(false));
+        let t = {
+            let (lines, shared, stop) = (lines.clone(), shared.clone(), Arc::clone(&stop));
+            thread::spawn(move || {
+                run_ptt_lines(lines, PttOut::Off, PttIn::Dsr, &shared, &stop, "t", &DebugLog::new("u.txt".into()))
+            })
+        };
+        thread::sleep(Duration::from_millis(20));
+        lines.input.store(true, Ordering::Relaxed);
+        thread::sleep(Duration::from_millis(40));
+        assert!(!shared.mox.load(Ordering::Relaxed));
+        stop.store(true, Ordering::Relaxed);
+        t.join().unwrap();
+    }
+
+    /// CatSerialPort on a real tty: a pseudo-terminal pair stands in for
+    /// a serial cable, the test reading and writing the other end.
+    #[cfg(unix)]
+    #[test]
+    fn serial_port_serves_cat_on_a_tty() {
+        use serialport::SerialPort;
+        use std::io::{Read, Write};
+        let (mut master, slave) = serialport::TTYPort::pair().expect("pty pair");
+        master.set_timeout(Duration::from_millis(100)).unwrap();
+        let name = slave.name().expect("pty name");
+        let (f, p, d, ..) = fixture();
+        // RX reported (Report TX frequency off), so the band change below
+        // shows in FA.
+        let shared = test_shared(&f, 14_074_000);
+        let options = SerialOptions { port: name, auto_report: true, report_tx: false, ..Default::default() };
+        let mut port = CatSerialPort::start(options, shared, p, d, DebugLog::new("unused.txt".into()));
+        let read_until = |master: &mut serialport::TTYPort, want: &str| -> String {
+            let mut got = String::new();
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while !got.contains(want) && Instant::now() < deadline {
+                let mut buf = [0u8; 256];
+                if let Ok(n) = master.read(&mut buf) {
+                    got.push_str(&String::from_utf8_lossy(&buf[..n]));
+                }
+            }
+            got
+        };
+        // Auto report: the current frequency and mode as soon as it opens.
+        let got = read_until(&mut master, "MD");
+        assert!(got.contains("FA00014074000;"), "{got}");
+        assert_eq!(port.state(), SerialState::Open);
+        // Polled, as an amplifier does.
+        master.write_all(b"IF;").unwrap();
+        let got = read_until(&mut master, "IF");
+        assert!(got.contains("IF00014074000"), "{got}");
+        // A band change is reported without being asked.
+        f.store(7_074_000, Ordering::Relaxed);
+        let got = read_until(&mut master, "FA00007074000;");
+        assert!(got.contains("FA00007074000;"), "{got}");
+        port.stop();
+    }
+
+    #[test]
+    fn serial_port_that_cannot_open_reports_why() {
+        let (f, p, d, ..) = fixture();
+        let shared = test_shared(&f, 14_074_000);
+        let options = SerialOptions { port: "/nonexistent/ttyNOPE".to_string(), ..Default::default() };
+        let mut port = CatSerialPort::start(options, shared, p, d, DebugLog::new("unused.txt".into()));
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while port.state() == SerialState::Opening && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(matches!(port.state(), SerialState::Failed(_)), "{:?}", port.state());
+        // Stopping doesn't wait out the 2 s retry pause.
+        let t = Instant::now();
+        port.stop();
+        assert!(t.elapsed() < Duration::from_millis(500));
     }
 
     #[test]

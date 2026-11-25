@@ -20,7 +20,7 @@ the network.
 1. **Firmware files** -- the Cypress FX2 RAM firmware
    (`ozyfw-sdr1k.hex`) and the FPGA bitstream (`Ozy_Janus.rbf`) are
    **bundled with hpsdr-rs** (sourced from the author's own piHPSDR
-   repo, same GPL-2.0 license) -- nothing to do here unless you want to
+   repo, under the GPL-2.0 license) -- nothing to do here unless you want to
    use a different/custom build, via **Choose...** in the Discover
    window's **Ozy USB setup** section.
 2. **Linux only**: install the udev rule for non-root USB access. Copy

@@ -34,12 +34,34 @@ disable/re-enable transmit (Settings → TX).
 
 - If a previously-selected device is no longer present on this machine
   (e.g. a saved virtual-cable choice on a machine that doesn't have it
-  installed), hpsdr-rs falls back to the system default rather than
-  failing to start audio at all.
+  installed, or a USB mic that has been renamed or unplugged), hpsdr-rs
+  falls back to the system default rather than failing to start audio at
+  all. The picker then shows the saved name with **(not found)**, and a
+  warning under it names the device actually in use. Plug the device back
+  in and pick it again to switch back, or pick another one.
+- Under each picker, **In use:** names the device actually playing or
+  capturing -- useful with (System Default), to see what that is.
 - Each [extra receiver](03-extra-receivers.md) has its own, independent
   Output device picker in its own Settings window's **RX** tab -- so, for
   example, the main receiver can go to real speakers while an extra
   receiver feeds a virtual cable for a second decoder, or vice versa.
+
+## No sound on Linux or a Raspberry Pi
+
+On Linux, **(System Default)** uses PipeWire's ALSA device (`pipewire`)
+or PulseAudio's (`pulse`) when ALSA has one, so the audio goes through
+the sound server: hpsdr-rs shows in pavucontrol, and you can send it to
+any output there. If neither will open, it uses ALSA's own default.
+
+Without either device, ALSA's default is simply the first sound card --
+on a Raspberry Pi, the **bcm2835 Headphones** jack -- so a USB headset
+or HDMI monitor stays silent, hpsdr-rs doesn't appear in pavucontrol,
+and the default microphone is reported as unavailable. Settings → Audio
+then shows a warning. Install the plugin and restart hpsdr-rs:
+
+```
+sudo apt install pipewire-alsa
+```
 
 ---
 

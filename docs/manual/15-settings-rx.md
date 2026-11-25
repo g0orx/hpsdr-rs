@@ -66,7 +66,7 @@ board -- there's nothing for it to do there.
 ## AGC tuning
 
 Five sliders fine-tune the AGC curve (the AGC mode itself -- Off/Long/Slow/
-Medium/Fast -- is toggled from the main window, not here):
+Medium/Fast -- is chosen from the main window's AGC menu, not here):
 
 | Slider | Range | Step |
 |---|---|---|
@@ -80,6 +80,15 @@ Medium/Fast -- is toggled from the main window, not here):
 (piHPSDR's name for the same value) -- both control the identical setting.
 Its default (80 dB) matches piHPSDR's own -- if AGC-on audio sounds
 clipped/distorted, lower this before assuming anything else is wrong.
+
+## Auto AGC offset
+
+How far above the noise floor the AGC starts working while **Auto** is on
+beside the main window's [AGC Gain](02-main-window.md#noiseagc-toggles)
+(-60 to +60 dB, +20 dB by default, as Thetis's). Auto keeps setting AGC
+Gain from the noise floor it measures on the spectrum; a higher offset
+gives less gain and a quieter background, a lower one more gain. It's
+shared by the main receiver and extra receivers, and saved per radio.
 
 ## S-Meter Cal
 
@@ -98,6 +107,21 @@ everything else on this tab.
 **NB Threshold** (0-100) is shared by both blanker stages (NB and NB2,
 toggled from the main window) -- there's only one threshold, whichever
 stage is active uses it.
+
+## NNR Mask Floor and Premium
+
+These only affect **NNR**, WDSP's neural-net noise reduction (chosen from
+the main window's **NR** menu).
+
+- **NNR Mask Floor** (-50 to -10 dB, -25 dB by default) -- how far NNR
+  may push down what it decides is noise. Lower removes more noise;
+  higher lets more of the real band noise through.
+- **Premium** -- switches NNR from its Standard model (about 10% of one
+  CPU core) to the Premium one (about 32%, and measurably better). Both
+  are built in, and switching is instant. In **CWL**/**CWU**, NNR uses
+  the CW versions of whichever model is chosen.
+
+Each extra receiver has its own, in its own RX settings.
 
 ---
 

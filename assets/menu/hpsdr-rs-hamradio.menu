@@ -1,0 +1,18 @@
+<!DOCTYPE Menu PUBLIC "-//freedesktop//DTD Menu 1.0//EN"
+ "http://www.freedesktop.org/standards/menu-spec/1.0/menu.dtd">
+<!-- A "Ham Radio" submenu for desktops whose menu has none (Raspberry Pi
+     OS, LXDE, Xfce, MATE), holding everything in the HamRadio category.
+     Other packages may add a menu named HamRadio too; menus with the same
+     name are merged. hpsdr-rs's own entries list only HamRadio, not
+     Network as well: an Exclude here can't keep them out of Internet,
+     because a merged file is read before the root menu's own rules. -->
+<Menu>
+  <Name>Applications</Name>
+  <Menu>
+    <Name>HamRadio</Name>
+    <Directory>hpsdr-rs-hamradio.directory</Directory>
+    <Include>
+      <Category>HamRadio</Category>
+    </Include>
+  </Menu>
+</Menu>

@@ -2,23 +2,36 @@
 
 # Main Window
 
-![Main window overview: QO-100's narrowband transponder through a Pluto,
-with a saved setup recalled (CTUN, Split, SAT and Duplex on, VFO B on the
-2400 MHz uplink) and the PSK Beacon panel open](images/02-main-window-overview.png)
+![Main window overview: 20m with CTUN on, the spectrum and waterfall
+across the band, the S-meter, and Settings..., Add Receiver and Stop at
+the top](images/02-main-window-overview.png)
 
 ## Frequency display and tuning
 
 The large number near the top, in its own **VFO-A** box, is the current
 main VFO frequency (comma-grouped, in Hz) -- green normally, red while
 that VFO is the one actually transmitting (see
-[Split](#vfo-a--vfo-b--split) below). You can tune it several ways:
+[Split](#vfo-a--vfo-b--split) below). Beside **VFO-A**'s label are the band
+and [band stack](#band-stack) entry (e.g. **20m-1**) and the **VFO step**
+(100 Hz to start with, 1 Hz to 1 MHz, including the FM channel steps
+6.25, 12.5 and 25 kHz): what scrolling the spectrum or waterfall, a
+[front-panel controller](25-controller.md)'s VFO knob and MIDI's **VFO
+Step Up/Down** tune by, landing on multiples of it; MIDI's **VFO Step
+Size +/-** actions change it. Each mode remembers its own step, so FM can
+tune by channel while SSB and CW keep a small step. FM starts at 5 kHz
+the first time; other modes start with the step already in use. You can
+tune it several ways:
 
-- **Scroll** while hovering the frequency display, or the spectrum/waterfall
-  panes: steps by 1 kHz per notch. Hold **Shift** while scrolling for 100 Hz
-  steps, or **Alt** for 10 Hz steps (in any mode -- e.g. for fine-tuning a
-  digital modem). In CW mode (**CWL**/**CWU**), steps are finer -- 100 Hz
-  per notch, 10 Hz with Shift -- matching how tightly CW is normally
-  zero-beaten.
+- **Scroll** over a digit of the frequency display: steps that digit up
+  or down -- over the 1 kHz digit it moves 1 kHz, over the 10 Hz digit
+  10 Hz, and so on. The digit under the mouse is underlined. A step that
+  would go past the radio's tuning range stops at its edge.
+- **Scroll** over the spectrum/waterfall panes: steps by the **VFO step**
+  per notch, landing on multiples of it -- with a 1 kHz step, one notch up
+  from 14.074.123 is 14.075.000. Set a small step (10 or 100 Hz) for CW.
+  Holding a key gives a fixed step whatever the VFO step is: **Shift**
+  100 Hz, or **Alt** 10 Hz (in any mode -- e.g. for fine-tuning a
+  digital modem); in CW mode (**CWL**/**CWU**) Shift is 10 Hz.
   Clicking a signal on the spectrum/waterfall in CW mode also centers it in
   the (narrow) CW filter passband rather than at the dial frequency itself,
   using the *exact* frequency under the cursor rather than rounding to the
@@ -32,15 +45,20 @@ that VFO is the one actually transmitting (see
   third tier to the plain-scroll steps above.
 - **Click** directly on the spectrum or waterfall: retunes straight to the
   clicked frequency -- rounded to the nearest kHz in every mode except CW,
-  which uses the exact clicked frequency (see above).
-- **Right-click** the frequency display (VFO-A or VFO-B): opens a small
+  which uses the exact clicked frequency (see above). A **right-click**
+  opens the [notch menu](#manual-notches-tnf) instead.
+- **Click** (or tap) the frequency display (VFO-A or VFO-B): opens a small
   popup with an on-screen numeric keypad (plus normal keyboard digit/
   Backspace/Enter/Escape input) to type an exact frequency directly,
-  rather than scrolling or clicking a spot on the spectrum. Retunes as
-  soon as you press **Enter**, clamped to the radio's own tunable range.
+  rather than scrolling or clicking a spot on the spectrum. **Enter**
+  takes the number in Hz; **Enter kHz** and **Enter MHz** multiply it by
+  1,000 or 1,000,000, so 14.074 then **Enter MHz**, or 14074 then
+  **Enter kHz**, tunes to 14.074 MHz. The **.** key adds a decimal point;
+  on a keyboard, **K** and **M** do the same as the kHz and MHz buttons.
+  It retunes at once, clamped to the radio's own tunable range.
   The keypad opens inside the main window, on top of everything there, so
   it can't get lost behind it; drag it by its title, and close it with
-  **Cancel**, Escape or its **x**. Right-clicking a VFO while it's open
+  **Cancel**, Escape or its **x**. Clicking a VFO while it's open
   starts it afresh for that VFO. While it's open the spacebar doesn't
   key the transmitter.
 - **Click and drag** across the spectrum or waterfall: retunes by however
@@ -52,7 +70,7 @@ that VFO is the one actually transmitting (see
   instead this drags the CTUN listen point directly, the same direction as
   your cursor, the same way clicking a spot tunes straight to it.
 
-![The right-click frequency-entry keypad](images/02-frequency-entry.png)
+![The frequency-entry keypad](images/02-frequency-entry.png)
 
 ### CTUN (Click to Tune)
 
@@ -151,7 +169,7 @@ The panel beside the spectrum/waterfall shows:
 - **CRC errors** (shown once there are any): pages that arrived but
   failed their checksum. On a signal good enough to decode at all these
   should be rare; many of them point at a weak or interrupted signal --
-  the [SNR](#s-meter--power-meter) readout under the S-meter, with the
+  the [SNR](#s-meter--power-meter) readout in the S-meter, with the
   beacon in the passband, shows how strong it is.
 - **»** (top right) minimizes the panel to a narrow strip, giving the
   spectrum and waterfall their width back. The beacon monitor and Lock
@@ -171,9 +189,8 @@ working.
 
 Next to the **VFO-A** box is a second, independent **VFO-B** box -- a
 second remembered frequency with no receiver of its own (this app doesn't
-receive on two frequencies at once). You can scroll on the VFO-B box the
-same way as VFO-A (Alt for 10 Hz steps, Shift for 100 Hz, otherwise 1 kHz) to change its
-stored value directly, or use the buttons between the two boxes:
+receive on two frequencies at once). You can scroll over a digit of VFO-B,
+as on VFO-A, to change its stored value directly, or use the buttons between the two boxes:
 
 - **A>B** -- copies VFO A's current frequency (and transverter) into VFO
   B.
@@ -196,7 +213,13 @@ stored value directly, or use the buttons between the two boxes:
   VFO A's, while reception continues on VFO A as normal. The box that's
   actually red while transmitting follows whichever VFO is really in use
   -- VFO A normally, VFO B when Split is on -- so the highlight always
-  points at what's really going out over the air.
+  points at what's really going out over the air. Each band remembers
+  Split and Duplex as you left it there: changing band brings them back
+  as they were on the new band, and off on a band you've never used them
+  on, so Split left on for a 2m repeater doesn't follow you to 40m. VFO B
+  itself isn't moved. To have every band change turn them off instead,
+  tick **Split off when changing band** in [Settings:
+  TX](17-settings-tx.md#split-off-when-changing-band).
 - **SAT** -- satellite mode, for working through a transponder. Click to
   cycle Off → **SAT** → **SATR** → Off; switching it on also turns Split
   on. In **SAT**, tuning VFO A moves VFO B by the same amount in the same
@@ -220,6 +243,19 @@ stored value directly, or use the buttons between the two boxes:
   TX](17-settings-tx.md), 20 dB by default, protecting it from the radio's
   own TX leakage); with a genuinely separate receive path, set that to 0
   so the downlink isn't 20 dB weaker while you transmit.
+- **Sync** -- keeps VFO B on VFO A's frequency (and transverter): tuning
+  either one tunes both. Turning it on turns **Split**, **Duplex** and
+  **SAT** off; turning Split on, or locking either VFO, turns it off. It
+  can't be turned on while either VFO is locked.
+- **Lock** (beside the VFO step in the **VFO-A** box, and in the
+  **VFO-B** box) -- stops anything retuning that VFO or changing its
+  band: the spectrum and waterfall, scrolling, the keypad, the band
+  buttons, MIDI and a [controller](25-controller.md), CAT, rigctl, TCI
+  and the web client. VFO A's Lock also stops the mode buttons (and
+  MIDI/controller Mode up/down) changing the mode, as Thetis's does;
+  CAT, rigctl and TCI can still change it.
+
+Both Locks and Sync are saved with the radio's settings.
 
 ### VFO B's transverter
 
@@ -248,8 +284,56 @@ mode, filter width, and the audio gain, or **Audio muted** in red); click
 folded away, including MIDI and rigctl/TCI/CAT, and whether they're
 minimized is remembered.
 
-![The control rows folded into one line: » and QO-100, USB, 3000 Hz,
-Audio -57 dB, with MOX directly below](images/02-controls-minimized.png)
+![The control rows folded into one line: » and 20m, USB, 2700 Hz,
+Audio 30 dB, with MOX directly below](images/02-controls-minimized.png)
+
+## Compact layout (small screens)
+
+For a small screen such as the 7" 800x480 Raspberry Pi display, the compact
+layout keeps the VFOs and meter at the top and gives the rest of the window
+to the spectrum and waterfall. It's used by itself on a screen smaller than
+1000x600, or always or never with Settings → Spectrum → **Layout**
+(**Auto**, **Compact** or **Standard**). On a screen that small the window
+opens maximized, and the size saved for each radio isn't applied. The control rows
+open one at a time from a toolbar of large buttons under the spectrum:
+
+- **Band** (showing the band and [band stack](#band-stack) entry, e.g.
+  **20m-1**) -- the band buttons. Press the selected band again to step its
+  band stack.
+- **Mode** (showing the mode and filter width) -- the modes and **Filter
+  width**.
+- **Audio** -- Audio gain, Mute, Pan and SQL, and with transmit enabled Mic gain,
+  the FM repeater controls, TCI TX gain and TX Power.
+- **DSP** -- NB, NR, SNB, ANF, APF (in CW), TNF and BIN, then on a
+  second line AGC, AGC Gain with its Auto button, and RX Attenuation.
+- **TX** -- the transmit row: Tune, Two Tone, CW messages, RIT and XIT.
+- **Menu** -- **Settings...**, **Add Receiver** and **Stop**, CW Decode, PSK
+  Beacon and DATV when they apply, and the rigctl/TCI/CAT/Web status and
+  **Record**.
+- **MOX**, on the right.
+
+Each opens above the toolbar, over the spectrum; press its button again, or
+**×**, to close it. A tap on VFO-A or VFO-B opens the frequency
+keypad, and dragging the spectrum tunes.
+
+On a narrow screen, such as the 720x1280 Raspberry Pi Touch Display 2 in
+portrait, VFO-B moves under VFO-A with the S-meter beside it. The compact
+window can be made as small as 520x400 (at 100% UI Scale), so a 720-wide
+screen can take a UI Scale of up to about 135%.
+
+When a front-panel controller's or MIDI knob changes a setting whose
+control isn't on screen -- in the compact layout, or with the control rows
+folded -- its name, new value and a bar show over the spectrum for a
+moment, e.g. **AF Gain -12 dB**. RIT and XIT show their offset the same way.
+
+To fill the screen with no title bar, start hpsdr-rs with `--fullscreen`,
+e.g. `hpsdr-rs --fullscreen` (with the AppImage,
+`./hpsdr-rs-*.AppImage --fullscreen`). The window size saved for each radio
+isn't applied then. Settings opens in its own window over it, no bigger
+than the screen, its tabs scrolling when they don't fit. With no title
+bar to close the window, there's a **Quit** button beside **Stop** (in the
+compact layout, in **Menu**) and in the Discovery window, and **F11** leaves
+fullscreen, or goes back to it.
 
 ## Bands and modes
 
@@ -280,11 +364,32 @@ extra button alongside the band row, showing the real RF frequency (e.g.
 2m) while the radio's actual hardware stays tuned to its true IF
 underneath -- see [Settings: XVTR](18-xvtr.md) for how to define one.
 
+### Band stack
+
+Each band, **Gen** and each transverter has a stack of three settings.
+Pressing the button of the band you're already on steps to the next one,
+and round again to the first. Each keeps its own frequency, mode, display
+levels, Split/Duplex, FM repeater setup and squelch (**SQL** on/off and
+level) as you left it. The band and
+the entry you're on are shown beside **VFO-A**, e.g. **20m-1**, **Gen-2**
+or a transverter's **144MHz-3**. With **CTUN** on, stepping to an entry
+inside the span shown only moves the CTUN frequency, leaving the spectrum
+where it is; one outside it recentres the spectrum on it.
+
+The first time you step to them, the second and third of an HF or 6m band
+start in its CW and phone segments, e.g. on 20m 14.074 USB, then 14.025 CWU,
+then 14.200 USB. On 30m, which has no phone, and 160m, whose first is
+already 1.900 LSB, the third is in DIGU instead: 10.140 (FT4) and 1.840
+(FT8). On 2m, 70cm and 23cm the third starts at the FM calling frequency
+(145.500, 433.500, 1297.500 MHz). On **Gen** and a transverter they start
+where you are. A MIDI band button (Band 20m etc.) and a remote client's band
+buttons step the stack the same way.
+
 Below that, a row of mode buttons: **LSB, USB, DSB, CWL, CWU, FM, AM, DIGU,
 SPEC, DIGL, SAM, DRM**.
 
 Next to the mode row, **Filter width** sets the demodulator passband width
-in Hz (50-5000 Hz). Each mode remembers its own last-used width. **USB**
+in Hz (50-5000 Hz, or up to 8000 Hz in FM). Each mode remembers its own last-used width. **USB**
 and **LSB** filters start 150 Hz from the carrier; **DIGU** and **DIGL**
 start at 0 Hz, using the whole audio passband (e.g. for a high-speed
 modem) -- for transmit as well as receive.
@@ -293,16 +398,29 @@ modem) -- for transmit as well as receive.
 
 **Audio gain** controls the speaker/headphone volume for the received
 audio (this is WDSP's own output gain stage, not your OS/sound-card
-volume). The slider is scaled in dB (-100 to +30), so each step is an equal
-relative loudness change across the whole range rather than the low end
-being too coarse and the high end too fine on a plain linear scale.
+volume). The slider reads 0-100% but moves in dB (-100 to +30 dB; hover
+over it for the dB), so each step is an equal relative loudness change
+across the whole range rather than the low end being too coarse and the
+high end too fine on a plain linear scale. **Mic gain** reads the same
+way, over -60 to +6 dB.
+
+Each mode remembers its own Audio gain, as it does its filter width, so
+turning FM down doesn't change USB or CW. FM runs without AGC, so at the
+same setting it's usually much louder than SSB with AGC Off; set it once
+in FM and it stays there. Extra receivers remember theirs separately.
 
 **Mute**, next to the slider, silences the speakers without moving it,
 so unmuting comes back at the same level. It's shown in red while on.
 Only the speakers go quiet: [Record](#record), TCI's audio stream, the
-waveform display and the CW decoder all carry on. Mute isn't saved, so
-hpsdr-rs always starts with sound. Extra receiver windows have their
-own.
+waveform display and the CW decoder all carry on. Mute is saved, so
+hpsdr-rs starts muted if you left it muted. Extra receiver windows have
+their own.
+
+**Pan**, after Mute, moves the receiver's audio between the left and
+right speakers, from **L100** through the centre (**C**) to **R100**.
+Double-click it to centre it again. Only what you hear is panned: the
+CW decoder, the waveform display and **Send RX audio to radio** still
+get the full audio. Each receiver keeps its own Pan.
 
 ## Noise/AGC toggles
 
@@ -325,11 +443,32 @@ A row of buttons and two sliders:
   left and right audio channels genuinely differ (an intentional SDR
   stereo-listening effect), instead of the usual identical L/R. Needs
   headphones or stereo speakers to hear the effect.
-- **AGC** -- cycles Off → Long → Slow → Medium → Fast → Off. Attack/decay/
-  hang/top/slope for AGC are tuned in Settings → RX.
+- **APF** (only in **CWL**/**CWU**) -- toggles the CW Audio Peak Filter,
+  a narrow audio peak on the CW pitch that lifts the signal you're
+  listening to above its neighbours and the noise. Its type, tuning,
+  bandwidth and gain are in [Settings: CW](06-settings-cw.md#cw-audio-peak-filter-apf).
+- **TNF** -- turns the [manual notches](#manual-notches-tnf) on and off;
+  hover over it to see how many are set.
+- **AGC** -- click to choose Off, Long, Slow, Medium or Fast from a menu,
+  as NB and NR. Attack/decay/hang/top/slope for AGC are tuned in
+  Settings → RX.
 - **AGC Gain** (0.0-140.0 dB) -- right after the AGC button. The same value
   as Settings → RX's **Top** slider, under the name piHPSDR uses for it --
-  raises or lowers the AGC's target output level.
+  raises or lowers the AGC's target output level. With AGC **Off** it
+  becomes **Fixed Gain** (-20 to +120 dB, starting at +50), the
+  receiver's gain with no AGC: raise it for a weak signal, lower it if a
+  strong one distorts. Each is kept, so switching AGC on and off doesn't
+  change the other. A MIDI AGC Gain control follows the same rule.
+- **Auto** (beside AGC Gain) -- automatic AGC, as Thetis's: hpsdr-rs
+  measures the noise floor on the spectrum and keeps setting AGC Gain so
+  the AGC starts working a set amount above it -- 20 dB to start with,
+  changed with **Auto AGC offset** in [Settings:
+  RX](15-settings-rx.md#auto-agc-offset). The background noise then stays
+  at about the same level as you change band, antenna or attenuation.
+  Moving AGC Gain yourself -- with the slider, MIDI, a controller, TCI or
+  the web client -- turns Auto off. It's greyed out while AGC is **Off**.
+  The noise floor is measured again when you retune by more than a
+  little, and takes about 2 seconds to settle.
 - **RX Attenuation / RX Gain / RF Gain** -- right after AGC Gain. The
   radio's front-end level; which one appears depends on the radio:
   - **RX Attenuation** (0-31 dB) on most boards: turn it up if strong
@@ -440,6 +579,33 @@ The controls themselves:
   frequency.
 - **Spacebar** is a hold-to-talk shortcut for MOX, active whenever no text
   field has keyboard focus.
+- **PA OFF** (amber, next to **MOX**) -- shown when the transverter you
+  transmit on has **Disable PA** set ([Settings: XVTR](18-xvtr.md)): the
+  radio's PA is off and the power meter reads 0 W. Hover over it to see
+  which transverter and VFO.
+
+### FM repeaters
+
+In **FM**, the transmit row also has:
+
+- **Shift** -- **-**, **Simplex** or **+**: transmit below, on, or above
+  VFO A by the offset next to it, e.g. **-** with 600 kHz for a 2m
+  repeater. The TX frequency is shown alongside, and while transmitting
+  VFO A shows it too (in red), as a radio does. Split and Duplex take
+  precedence, since VFO B names its own TX frequency.
+- **Offset** -- this band's repeater offset, in kHz. It starts at the usual
+  European offset (10m 100 kHz, 6m 500 kHz, 2m 600 kHz, 70cm 7.6 MHz, 23cm
+  6 MHz; none elsewhere), and a changed value is kept for that band or
+  transverter (e.g. 5 MHz for 70cm in the US). Drag it or click to type.
+- **CTCSS** -- a sub-audible tone sent while transmitting in FM, chosen
+  from the 50 standard tones, or off.
+
+Each band remembers its own Shift and CTCSS tone as you left it there,
+like Split.
+
+![A 2m repeater on the 144MHz transverter band: VFO A on 145.625 MHz, FM,
+Shift - with a 600 kHz offset, CTCSS 88.5 Hz and TX 145.025000, with PA OFF
+beside MOX](images/02-fm-repeater.png)
 
 With transmit enabled, the **Mic gain**, **TCI TX gain** and **TX Power**
 (**TX Drive**, in dB, on a [Pluto](24-pluto.md#transmit)) sliders have
@@ -450,9 +616,9 @@ shows the **Mic level** and **ALC** readouts.
 into a real antenna.** See the [top-level README](../../README.md) for the
 project's current TX verification status.
 
-![Transmitting in Duplex on QO-100: MOX ON and TUNE ON, VFO B (the uplink)
-in red, the receive spectrum still live on the downlink, and the TX inset
-showing Tune's tone in the middle of the TX filter](images/02-tx-active.png)
+![Transmitting on 20m: MOX ON, TUNE ON and TRANSMITTING, VFO A in red,
+the power meter in place of the S-meter, and the spectrum showing Tune's
+tone in the red TX filter](images/02-tx-active.png)
 
 ## Spectrum and waterfall
 
@@ -468,6 +634,33 @@ over time, colored by the selected palette (Settings → Spectrum).
 
 Drag the thin divider between the two panes to adjust how much vertical
 space each gets.
+
+### Manual notches (TNF)
+
+Right-click the spectrum or the waterfall for the notch menu, which
+removes a steady carrier or heterodyne at a frequency you choose -- for
+one that **ANF** doesn't catch, or several at once:
+
+- On an empty spot: **Add notch here (200 Hz)** or **Add narrow notch
+  here (100 Hz)**. Adding one also turns **TNF** on, so it takes effect
+  at once.
+- On a notch: its frequency, its **Width** (25, 50, 100, 200, 400 or 800
+  Hz), and **Remove this notch**.
+- **Remove all notches**, once there are any, and a **TNF (notches on)**
+  tick box, the same as the TNF button.
+
+Notches are shown on the spectrum as shaded bands, orange while TNF is on
+and grey while it's off. Each stays on its own RF frequency, so it stays
+on the carrier as you tune, and the notches apply to every receiver,
+extra receivers included. They're saved with the radio's settings.
+
+![Right-clicking an empty spot on the spectrum: Add notch here (200 Hz),
+Add narrow notch here (100 Hz) and TNF (notches on)](images/02-notch-add.png)
+
+![A 200 Hz notch at 14.191 MHz, drawn in orange with TNF on](images/02-notch-shown.png)
+
+![Right-clicking the notch: its frequency, Width 25-800 Hz, Remove this
+notch, Remove all notches (1) and TNF (notches on)](images/02-notch-menu.png)
 
 A small waveform display sits in the top-right corner of the spectrum
 pane -- a quick visual check that audio is actually flowing, and roughly
@@ -514,7 +707,8 @@ Anchored in the top-right of the window:
   10W to protect the PA -- see [Settings: TX](17-settings-tx.md#max-swr)
   for the full behavior.
 
-Below the meter:
+In the meter's readout, the S reading is on the left and the **SNR** on
+the right:
 
 - **SNR** -- the signal-to-noise ratio in the receive filter: the power
   across the passband against the noise floor either side of it (the
@@ -528,6 +722,21 @@ Below the meter:
   when comparing. It's blank while transmitting, when the passband
   is under 3 pixels wide on the spectrum (zoom in), or when it's too
   close to the edge of the view to see the noise beside it.
+
+Below the meter:
+
+- **Lost packets / Audio gaps** -- shown in orange for a few seconds
+  whenever packets from the radio go missing on the way, or the audio runs
+  dry and has to restart, with the totals (hover for details; Settings ->
+  [About](04-about.md) has the full figures and a Reset). Either one is heard as stuttering audio. Lost packets also make
+  the spectrum and waterfall jump. They point to the network (use a cable
+  rather than Wi-Fi) or a computer too busy to keep up (try a lower sample
+  rate, fewer receivers, or lighter noise reduction). Audio gaps on their
+  own point to the sound card or a busy computer. When the counts go up,
+  the log records the totals and the UTC time. On Linux, hpsdr-rs asks for a 1 MB
+  network receive buffer, but by default Raspberry Pi OS allows only about
+  208 KB (the log says what it got). `sudo sysctl -w
+  net.core.rmem_max=1048576` raises that limit until the next reboot.
 - **Settings...** opens the [Settings window](11-settings-network.md).
 - **Add Receiver (n/max)** adds another independent receiver window (see
   [Extra Receivers](03-extra-receivers.md)) -- hidden once you've reached
@@ -540,7 +749,8 @@ Below the meter:
 
 ## Stopping
 
-The **Stop** button at the bottom of the window disconnects from the radio
+The **Stop** button, under **Settings...** and **Add Receiver** at the top
+of the window, disconnects from the radio
 and returns to the discovery window.
 
 ---

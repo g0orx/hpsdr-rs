@@ -64,7 +64,7 @@
 */
 
 use crate::radio::{
-    CwKeyerAtomics, IqSample, TX_AUDIO_SOURCE_LOCAL_MIC, TX_AUDIO_SOURCE_RADIO_MIC,
+    CwKeyerAtomics, CwLive, IqSample, TX_AUDIO_SOURCE_LOCAL_MIC, TX_AUDIO_SOURCE_RADIO_MIC,
 };
 use crate::spectrum::{EqBandCount, EqualizerParams, Mode};
 use crate::wdsp_sys as wdsp;
@@ -72,7 +72,7 @@ use std::collections::VecDeque;
 use std::ffi::CString;
 use std::os::raw::c_int;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -378,6 +378,13 @@ pub fn ps_state_name(state: i32) -> String {
 pub struct TxParams {
     pub mode: Mode,
     pub mic_gain: f32,
+    /// Settings -> TX -> TX Filter's own edges, `(low, high)` Hz, or None
+    /// to follow the RX filter (width_hz) -- see
+    /// spectrum::tx_passband_for.
+    pub filter: Option<(f64, f64)>,
+    /// Monitor TX Audio's level (Settings -> TX), linear, 0.0-1.0 --
+    /// applied to tx_audio_monitor only, not to what's transmitted.
+    pub monitor_volume: f32,
     /// Filter width (Hz), same UI control/meaning as RX's per-mode
     /// width slider (spectrum::width_for_mode) -- ROOT CAUSE FIX, see
     /// TxProcessor's bandpass-freqs update in process() for the full
@@ -407,6 +414,10 @@ pub struct TxParams {
     /// exactly why every reference PS implementation calibrates with a
     /// two-tone generator, never a steady carrier.
     pub two_tone: bool,
+    /// CTCSS tone added in FM, Hz; 0 = none (main.rs sends 0 outside FM).
+    pub ctcss_hz: f32,
+    /// FM peak deviation, Hz (Settings -> TX): 5000 wide, 2500 narrow.
+    pub fm_deviation_hz: f64,
     /// See spectrum::EqualizerParams's doc comment -- same type, TXA side.
     pub eq: EqualizerParams,
     /// WDSP's Speech Processor (a baseband RF-clipper equivalent --
@@ -444,6 +455,8 @@ impl Default for TxParams {
             // switching to the reference's own dB convention to avoid a
             // breaking change to already-saved config values.
             mic_gain: 1.0,
+            monitor_volume: 1.0,
+            filter: None,
             width_hz: crate::spectrum::default_width_hz(Mode::Usb),
             tune: false,
             two_tone: false,
@@ -451,9 +464,17 @@ impl Default for TxParams {
             compressor_enabled: false,
             compressor_gain_db: 3.0,
             cessb_enabled: false,
+            ctcss_hz: 0.0,
+            fm_deviation_hz: FM_DEVIATION_WIDE_HZ,
         }
     }
 }
+
+/// FM peak deviation for 25 kHz channels (Thetis's default, and US 2 m
+/// repeaters).
+pub const FM_DEVIATION_WIDE_HZ: f64 = 5000.0;
+/// FM peak deviation for 12.5 kHz channels.
+pub const FM_DEVIATION_NARROW_HZ: f64 = 2500.0;
 
 /// Shared signature of PSSaveCorr/PSRestoreCorr -- see
 /// TxProcessor::ps_corr_action.
@@ -465,6 +486,10 @@ struct TxProcessor {
     iq_scratch: Vec<f64>,
     last_mode: Option<Mode>,
     last_gain: Option<f32>,
+    /// The CTCSS tone as last set (0 = off) -- see set_ctcss.
+    last_ctcss_hz: Option<f32>,
+    /// See set_fm_deviation.
+    last_fm_deviation_hz: Option<f64>,
     last_passband: Option<(f64, f64)>,
     /// The Tune tone's frequency as last set -- see process().
     last_tune_hz: Option<f64>,
@@ -788,7 +813,8 @@ impl TxProcessor {
             // modes, included for completeness/parity with the
             // reference rather than because this project currently
             // supports those modes.
-            wdsp::SetTXAFMDeviation(channel, 2500.0);
+            // FM deviation: set by process()'s caller from TxParams
+            // (set_fm_deviation), not here.
             wdsp::SetTXAAMCarrierLevel(channel, 0.5);
 
             // Inert startup state, matching every other TXA stage's
@@ -864,6 +890,8 @@ impl TxProcessor {
             iq_scratch: vec![0.0; out_iq_pairs * 2],
             last_mode: None,
             last_gain: None,
+            last_ctcss_hz: None,
+            last_fm_deviation_hz: None,
             // None, not Some(default_passband): process() also sets the
             // Tune tone (PostGen) frequency on a passband change, and
             // open() leaves it at 0 Hz -- so with the mode/width at the
@@ -913,12 +941,43 @@ impl TxProcessor {
     /// with, plus fexchange0's own error code (0 = ok, see call site
     /// below for what nonzero means -- this was previously discarded
     /// entirely, silently hiding a whole class of possible dropout).
+    /// The FM CTCSS tone (WDSP's FM modulator adds it), 0 = off.
+    fn set_ctcss(&mut self, hz: f32) {
+        if self.last_ctcss_hz == Some(hz) {
+            return;
+        }
+        unsafe {
+            if hz > 0.0 {
+                wdsp::SetTXACTCSSFreq(self.channel, hz as f64);
+            }
+            wdsp::SetTXACTCSSRun(self.channel, (hz > 0.0) as c_int);
+        }
+        self.last_ctcss_hz = Some(hz);
+    }
+
+    /// FM peak deviation, Hz. REAL REPORT (2026-11-12, issue #15): a US
+    /// 2 m repeater wouldn't open on a 103.5 Hz tone. WDSP's FM modulator
+    /// adds CTCSS at a fixed 0.10/1.10 of the peak deviation, and this
+    /// was fixed at 2500 Hz: the tone measured 227 Hz deviation (an
+    /// ignored test, ctcss_tests), where decoders expect around 500 Hz
+    /// (about 350 on narrow channels). At 5000 Hz it's 455 Hz.
+    fn set_fm_deviation(&mut self, hz: f64) {
+        if self.last_fm_deviation_hz == Some(hz) {
+            return;
+        }
+        unsafe {
+            wdsp::SetTXAFMDeviation(self.channel, hz);
+        }
+        self.last_fm_deviation_hz = Some(hz);
+    }
+
     fn process(
         &mut self,
         mic_samples: &[f32],
         mode: Mode,
         mic_gain: f32,
         width_hz: f64,
+        filter: Option<(f64, f64)>,
         tune: bool,
         two_tone: bool,
         eq: EqualizerParams,
@@ -934,7 +993,7 @@ impl TxProcessor {
         // keyed on the computed (f_low, f_high) pair instead of the
         // raw mode/width so a width change alone (same mode) still
         // triggers it.
-        let passband = crate::spectrum::passband_for(mode, width_hz);
+        let passband = crate::spectrum::tx_passband_for(mode, width_hz, filter);
         if self.last_passband != Some(passband) {
             unsafe {
                 wdsp::SetTXABandpassFreqs(self.channel, passband.0, passband.1);
@@ -1819,7 +1878,80 @@ impl CwTextGen {
     }
 }
 
+/// Live CW keying from a remote client's key or paddles (see
+/// radio::CwLive): plays the key transitions remote.rs schedules on the
+/// shared sample clock -- a carrier shaped like CwTextGen's (same 5 ms
+/// ramps, same sidetone monitor), but open-ended: the key stays down until
+/// a transition says up, however long that is.
+struct CwLiveGen {
+    down: bool,
+    gain: f32,
+    sidetone_phase: f32,
+}
+
+impl CwLiveGen {
+    fn new() -> Self {
+        Self { down: false, gain: 0.0, sidetone_phase: 0.0 }
+    }
+
+    /// Keying, or still ramping down from the last element.
+    fn is_active(&self, live: &CwLive) -> bool {
+        live.active.load(Ordering::Relaxed) || self.down || self.gain > 0.0
+    }
+
+    /// As CwTextGen::fill, playing `live`'s transitions as their samples
+    /// come round on its clock, which this advances.
+    #[allow(clippy::too_many_arguments)]
+    fn fill(
+        &mut self,
+        live: &CwLive,
+        count: usize,
+        rate: u32,
+        sidetone_freq_hz: f32,
+        sidetone_volume: f32,
+        iq: &mut Vec<f32>,
+        mono: &mut Vec<f32>,
+    ) {
+        iq.clear();
+        mono.clear();
+        let ramp_step = 1.0 / (0.005 * rate as f32).max(1.0);
+        let tone_step = 2.0 * std::f32::consts::PI * sidetone_freq_hz / rate as f32;
+        let mut clock = live.clock.load(Ordering::Relaxed);
+        let mut events = live.events.lock().unwrap();
+        for _ in 0..count {
+            while events.front().is_some_and(|&(at, _)| at <= clock) {
+                self.down = events.pop_front().unwrap().1;
+            }
+            let target = if self.down { 1.0 } else { 0.0 };
+            if self.gain < target {
+                self.gain = (self.gain + ramp_step).min(target);
+            } else if self.gain > target {
+                self.gain = (self.gain - ramp_step).max(target);
+            }
+            clock += 1;
+            iq.push(self.gain);
+            iq.push(0.0);
+            self.sidetone_phase += tone_step;
+            if self.sidetone_phase >= 2.0 * std::f32::consts::PI {
+                self.sidetone_phase -= 2.0 * std::f32::consts::PI;
+            }
+            mono.push(sidetone_volume * self.gain * self.sidetone_phase.sin());
+        }
+        drop(events);
+        live.clock.store(clock, Ordering::Relaxed);
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
+/// TX delay ("RF delay" in Thetis), in ms: after the radio is keyed,
+/// how long it sends silence before any RF -- time for an amplifier's
+/// or external relay's T/R switching (keyed by the radio's PTT output,
+/// or a CAT serial port's PTT out line) to close before power arrives.
+/// 0 = none (the default). Set from Settings -> TX (main.rs) and the
+/// radio's saved config. Only RF that hpsdr-rs makes is held back: a
+/// radio's own internal CW keyer makes its RF itself.
+pub static TX_RF_DELAY_MS: AtomicU32 = AtomicU32::new(0);
+
 fn run(
     mic_buffer: Arc<Mutex<VecDeque<f32>>>,
     tci_tx_audio: Arc<Mutex<VecDeque<f32>>>,
@@ -1885,6 +2017,8 @@ fn run(
     let mut cw_text_gen = CwTextGen::new(Arc::clone(&cw_text_elements), Arc::clone(&cw_text_active), Arc::clone(&cw_text_busy));
     let mut cw_iq_scratch: Vec<f32> = Vec::new();
     let mut cw_mono_scratch: Vec<f32> = Vec::new();
+    let mut cw_live_gen = CwLiveGen::new();
+    cw_keyer.live.rate.store(duc_rate as u32, Ordering::Relaxed);
     let duc_ratio = ((duc_rate / mic_rate).max(1)) as usize;
     let out_iq_pairs = TX_BUFFER_SIZE * duc_ratio;
     let mut chunk = vec![0.0f32; TX_BUFFER_SIZE];
@@ -1913,6 +2047,7 @@ fn run(
     let mut starve_window_start = Instant::now();
     let mut starved_chunks_this_window: u32 = 0;
     let mut chunks_this_window: u32 = 0;
+    let mut mic_ever_fed = false;
 
     // Second diagnostic, added after the mic-buffer one above didn't
     // reproduce anything (no underruns logged, yet power/ALC still
@@ -1950,6 +2085,8 @@ fn run(
     // PureSignal: when MOX went active most recently -- None while
     // idle. See below for why this matters.
     let mut mox_active_since: Option<Instant> = None;
+    // When MOX last went active, for TX_RF_DELAY_MS.
+    let mut keyed_since: Option<Instant> = None;
     // piHPSDR's transmitter.c documents a real ordering requirement
     // that isn't optional: "enabling should restart feedback streams
     // first, wait ~100ms, then turn PS on" -- ROOT CAUSE FIX for
@@ -2011,7 +2148,13 @@ fn run(
                 cw_text_gen = CwTextGen::new(Arc::clone(&cw_text_elements), Arc::clone(&cw_text_active), Arc::clone(&cw_text_busy));
                 cw_text_busy.store(false, Ordering::Relaxed);
             }
+            // And live keying: nothing left to play once MOX is off.
+            if cw_live_gen.is_active(&cw_keyer.live) {
+                cw_keyer.live.events.lock().unwrap().clear();
+                cw_live_gen = CwLiveGen::new();
+            }
             mox_active_since = None;
+            keyed_since = None;
             thread::sleep(Duration::from_millis(20));
             // Resync so the first chunk after PTT is produced against a
             // fresh schedule, not delayed by however long MOX was off --
@@ -2019,7 +2162,35 @@ fn run(
             next_chunk = Instant::now();
             continue;
         }
-        if cw_text_gen.is_active() {
+        // TX delay (see TX_RF_DELAY_MS): the radio is keyed (its MOX
+        // bit, relays and PTT output, and a serial port's PTT out, all
+        // follow `mox` at once), but sends silence until the delay has
+        // passed. Nothing is consumed meanwhile -- mic/TCI audio waits
+        // in its queue and CW elements aren't started -- so the
+        // transmission is delayed, not cut short.
+        let keyed_at = *keyed_since.get_or_insert_with(Instant::now);
+        let rf_delay = Duration::from_millis(TX_RF_DELAY_MS.load(Ordering::Relaxed) as u64);
+        if keyed_at.elapsed() < rf_delay {
+            {
+                let mut out = tx_iq_out.lock().unwrap();
+                for _ in 0..out_iq_pairs * 2 {
+                    if out.len() >= TX_IQ_BUFFER_CAPACITY {
+                        out.pop_front();
+                    }
+                    out.push_back(0.0);
+                }
+            }
+            next_chunk += chunk_interval;
+            let now = Instant::now();
+            if next_chunk > now {
+                thread::sleep(next_chunk - now);
+            } else {
+                next_chunk = now;
+            }
+            continue;
+        }
+        let cw_live_now = !cw_text_gen.is_active() && cw_live_gen.is_active(&cw_keyer.live);
+        if cw_text_gen.is_active() || cw_live_now {
             // See CwTextGen's own doc comment -- bypasses source
             // selection and WDSP entirely; a plain shaped on-frequency
             // carrier, not something fexchange0's SSB-modulation chain
@@ -2028,8 +2199,20 @@ fn run(
             // Same 0-255 full-byte range reused as a 0.0-1.0 amplitude
             // scalar as audio.rs's CwSidetone -- the Sidetone Level
             // slider governs this monitor tone too.
-            let sidetone_volume = (cw_keyer.sidetone_volume.load(Ordering::Relaxed).min(255) as f32) / 255.0;
-            cw_text_gen.fill(out_iq_pairs, duc_rate as u32, sidetone_freq_hz, sidetone_volume, &mut cw_iq_scratch, &mut cw_mono_scratch);
+            let sidetone_volume = (cw_keyer.sidetone_volume.load(Ordering::Relaxed).min(127) as f32) / 127.0;
+            if cw_live_now {
+                cw_live_gen.fill(
+                    &cw_keyer.live,
+                    out_iq_pairs,
+                    duc_rate as u32,
+                    sidetone_freq_hz,
+                    sidetone_volume,
+                    &mut cw_iq_scratch,
+                    &mut cw_mono_scratch,
+                );
+            } else {
+                cw_text_gen.fill(out_iq_pairs, duc_rate as u32, sidetone_freq_hz, sidetone_volume, &mut cw_iq_scratch, &mut cw_mono_scratch);
+            }
 
             {
                 let mut spec = tx_spectrum_iq.lock().unwrap();
@@ -2050,13 +2233,14 @@ fn run(
                 }
             }
             {
+                let volume = params.lock().unwrap().monitor_volume;
                 let mut mon = tx_audio_monitor.lock().unwrap();
                 let mut wave = waveform_tap.lock().unwrap();
                 for &sample in &cw_mono_scratch {
                     if mon.len() >= TX_AUDIO_MONITOR_CAPACITY {
                         mon.pop_front();
                     }
-                    mon.push_back((sample, sample));
+                    mon.push_back((sample * volume, sample * volume));
                     if wave.len() >= WAVEFORM_TAP_CAPACITY {
                         wave.pop_front();
                     }
@@ -2173,7 +2357,11 @@ fn run(
             } else {
                 drop(tci_buf);
                 let mut buf = mic_buffer.lock().unwrap();
-                if buf.len() < TX_BUFFER_SIZE {
+                // No local mic at all (no input device, e.g. a Raspberry
+                // Pi with no USB sound card -- see main.rs's
+                // ConnectedState::mic_input) isn't an underrun.
+                mic_ever_fed |= !buf.is_empty();
+                if mic_ever_fed && buf.len() < TX_BUFFER_SIZE {
                     starved_chunks_this_window += 1;
                 }
                 for slot in chunk.iter_mut() {
@@ -2187,6 +2375,7 @@ fn run(
         // present in the source audio or introduced downstream. See
         // TxHandle::tx_audio_monitor's doc comment.
         {
+            let volume = params.lock().unwrap().monitor_volume;
             let mut mon = tx_audio_monitor.lock().unwrap();
             let mut wave = waveform_tap.lock().unwrap();
             for &sample in chunk.iter() {
@@ -2198,7 +2387,7 @@ fn run(
                 // content (no binaural concept on TX), so duplicate to
                 // both channels, same as this project's own RX audio
                 // used to do before it gained real binaural support.
-                mon.push_back((sample, sample));
+                mon.push_back((sample * volume, sample * volume));
                 if wave.len() >= WAVEFORM_TAP_CAPACITY {
                     wave.pop_front();
                 }
@@ -2220,12 +2409,15 @@ fn run(
         }
 
         let p = *params.lock().unwrap();
+        processor.set_ctcss(p.ctcss_hz);
+        processor.set_fm_deviation(p.fm_deviation_hz);
         let (iq, exch_error) =
             processor.process(
                 &chunk,
                 p.mode,
                 p.mic_gain,
                 p.width_hz,
+                p.filter,
                 p.tune,
                 p.two_tone,
                 p.eq,
@@ -2545,6 +2737,16 @@ impl TxHandle {
         self.params.lock().unwrap().mic_gain = gain.max(0.0);
     }
 
+    /// See TxParams::filter.
+    pub fn set_filter(&self, filter: Option<(f64, f64)>) {
+        self.params.lock().unwrap().filter = filter;
+    }
+
+    /// See TxParams::monitor_volume.
+    pub fn set_monitor_volume(&self, volume: f32) {
+        self.params.lock().unwrap().monitor_volume = volume.clamp(0.0, 1.0);
+    }
+
     /// See TxParams::width_hz's doc comment -- feeds the TX bandpass
     /// filter's passband, same UI control as RX's per-mode width.
     pub fn set_width_hz(&self, width_hz: f64) {
@@ -2561,26 +2763,27 @@ impl TxHandle {
         self.params.lock().unwrap().two_tone = two_tone;
     }
 
-    /// See spectrum::EqualizerParams's doc comment.
-    pub fn eq(&self) -> EqualizerParams {
-        self.params.lock().unwrap().eq
+    /// See TxParams::ctcss_hz.
+    /// See TxParams::fm_deviation_hz.
+    pub fn set_fm_deviation_hz(&self, hz: f64) {
+        self.params.lock().unwrap().fm_deviation_hz = hz;
     }
+
+    pub fn set_ctcss_hz(&self, hz: f32) {
+        self.params.lock().unwrap().ctcss_hz = hz;
+    }
+
+    /// See spectrum::EqualizerParams's doc comment.
     pub fn set_eq(&self, eq: EqualizerParams) {
         self.params.lock().unwrap().eq = eq;
     }
 
     /// See TxParams::compressor_enabled's doc comment.
-    pub fn compressor_enabled(&self) -> bool {
-        self.params.lock().unwrap().compressor_enabled
-    }
     pub fn set_compressor_enabled(&self, enabled: bool) {
         self.params.lock().unwrap().compressor_enabled = enabled;
     }
 
     /// See TxParams::compressor_gain_db's doc comment.
-    pub fn compressor_gain_db(&self) -> f32 {
-        self.params.lock().unwrap().compressor_gain_db
-    }
     pub fn set_compressor_gain_db(&self, gain_db: f32) {
         self.params.lock().unwrap().compressor_gain_db = gain_db.clamp(0.0, 20.0);
     }
@@ -2588,9 +2791,6 @@ impl TxHandle {
     /// See TxParams::cessb_enabled's doc comment -- note that setting
     /// this alone doesn't guarantee CESSB actually runs in WDSP; see
     /// TxProcessor::process's compressor/CESSB update for why.
-    pub fn cessb_enabled(&self) -> bool {
-        self.params.lock().unwrap().cessb_enabled
-    }
     pub fn set_cessb_enabled(&self, enabled: bool) {
         self.params.lock().unwrap().cessb_enabled = enabled;
     }
@@ -2735,7 +2935,7 @@ mod tune_tone_tests {
         for _ in 0..8 {
             for _ in 0..(12_000 / TX_BUFFER_SIZE) {
                 let (iq, _) =
-                    processor.process(&mic, mode, 1.0, width_hz, true, false, EqualizerParams::default(), false, 0.0, false);
+                    processor.process(&mic, mode, 1.0, width_hz, None, true, false, EqualizerParams::default(), false, 0.0, false);
                 let mut q = iq_buf.lock().unwrap();
                 for pair in iq.chunks_exact(2) {
                     q.push_back(IqSample { i: (pair[0] * PS_IQ_NORM) as i32, q: (pair[1] * PS_IQ_NORM) as i32 });
@@ -2748,5 +2948,180 @@ mod tune_tone_tests {
         let tone_hz = tone_hz.unwrap_or((passband.0 + passband.1) / 2.0);
         let expected = (tone_hz - shown.0) / (shown.1 - shown.0) * (row.len() - 1) as f64;
         assert!((peak as f64 - expected).abs() <= 2.0, "peak at pixel {peak}, expected {expected:.1}");
+    }
+}
+
+#[cfg(test)]
+mod rf_delay_tests {
+    use super::*;
+
+    /// The real TX thread with Tune on: leading silence in what it hands
+    /// the radio, in ms, after MOX goes active. Needs WDSP (FFTW wisdom,
+    /// real-time threads), so on demand:
+    /// `cargo test --release rf_delay -- --ignored --test-threads=1`.
+    fn leading_silence_ms(channel: i32, delay_ms: u32) -> f64 {
+        TX_RF_DELAY_MS.store(delay_ms, Ordering::Relaxed);
+        let tx_iq_out = Arc::new(Mutex::new(VecDeque::new()));
+        let mox = Arc::new(AtomicBool::new(false));
+        let duc_rate = 48_000;
+        let handle = TxHandle::start(
+            Arc::new(Mutex::new(VecDeque::new())),
+            Arc::new(Mutex::new(VecDeque::new())),
+            Arc::new(Mutex::new(VecDeque::new())),
+            Arc::new(AtomicU8::new(0)),
+            Arc::new(AtomicBool::new(false)),
+            Arc::clone(&tx_iq_out),
+            Arc::new(Mutex::new(VecDeque::new())),
+            Arc::clone(&mox),
+            channel,
+            1,
+            48_000,
+            duc_rate,
+            false,
+            Arc::new(Mutex::new(VecDeque::new())),
+            Arc::new(Mutex::new(VecDeque::new())),
+            None,
+            Arc::new(crate::radio::CwKeyerAtomics::default()),
+        );
+        handle.set_tune(true);
+        thread::sleep(Duration::from_millis(500));
+        tx_iq_out.lock().unwrap().clear();
+        mox.store(true, Ordering::Relaxed);
+        thread::sleep(Duration::from_millis(delay_ms as u64 + 600));
+        mox.store(false, Ordering::Relaxed);
+        let out: Vec<f32> = tx_iq_out.lock().unwrap().iter().copied().collect();
+        drop(handle);
+        TX_RF_DELAY_MS.store(0, Ordering::Relaxed);
+        let first = out.chunks_exact(2).position(|p| p[0].abs() > 1e-4 || p[1].abs() > 1e-4);
+        let first = first.expect("Tune never produced RF");
+        first as f64 * 1000.0 / duc_rate as f64
+    }
+
+    #[test]
+    #[ignore]
+    fn tx_delay_holds_rf_back() {
+        // WDSP's one-time setup happens when the first analyzer opens;
+        // no TXA channel may open before it (see tune_tone_tests).
+        let _analyzer = crate::spectrum::SpectrumHandle::start(
+            28,
+            Arc::new(Mutex::new(VecDeque::new())),
+            48_000,
+            None,
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+        );
+        thread::sleep(Duration::from_secs(2));
+        let without = leading_silence_ms(26, 0);
+        let with = leading_silence_ms(27, 100);
+        println!("leading silence: {without:.1} ms without TX Delay, {with:.1} ms with 100 ms");
+        // TXA's own latency/ramp is there either way (~85 ms measured);
+        // the delay adds its 100 ms on top, give or take a chunk.
+        let added = with - without;
+        assert!((90.0..=125.0).contains(&added), "TX Delay added {added:.1} ms, not ~100");
+    }
+}
+
+#[cfg(test)]
+mod cw_live_tests {
+    use super::*;
+
+    /// Transitions play on exactly the samples they're scheduled for, across
+    /// fills, with 5 ms ramps, and the clock advances by what's generated.
+    #[test]
+    fn plays_transitions_on_their_samples() {
+        let live = CwLive::default();
+        let rate = 48_000;
+        live.events.lock().unwrap().extend([(100, true), (100 + 4_800, false)]);
+        let mut gen = CwLiveGen::new();
+        let (mut iq, mut mono) = (Vec::new(), Vec::new());
+        let mut envelope = Vec::new();
+        for _ in 0..10 {
+            gen.fill(&live, 1_024, rate, 800.0, 0.5, &mut iq, &mut mono);
+            envelope.extend(iq.chunks_exact(2).map(|p| p[0]));
+        }
+        assert_eq!(live.clock.load(Ordering::Relaxed), 10_240);
+        assert!(envelope[..100].iter().all(|&g| g == 0.0), "silent before the key goes down");
+        assert!(envelope[100] > 0.0 && envelope[100] < 0.01, "ramps up from sample 100");
+        assert_eq!(envelope[100 + 240], 1.0, "full after 5 ms");
+        assert_eq!(envelope[4_899], 1.0, "still down just before the release");
+        assert!(envelope[4_900] < 1.0, "ramps down from the release");
+        assert!(envelope[4_900 + 241..].iter().all(|&g| g == 0.0), "silent 5 ms later");
+        assert!(!gen.is_active(&live));
+    }
+}
+
+#[cfg(test)]
+mod ctcss_tests {
+    use super::*;
+
+    /// Measurement: FM-demodulates the TXA output with CTCSS 103.5 Hz and
+    /// prints the tone's deviation, with silence and with a 1 kHz mic tone.
+    #[test]
+    #[ignore]
+    fn ctcss_deviation() {
+        let _analyzer = crate::spectrum::SpectrumHandle::start(
+            29,
+            Arc::new(Mutex::new(VecDeque::new())),
+            48_000,
+            None,
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+        );
+        thread::sleep(Duration::from_secs(2));
+        let mut p = TxProcessor::open(30, 1, 48_000, 48_000, None);
+        p.set_ctcss(103.5);
+        let fs = 48_000.0f64;
+        for (deviation, mic_amp) in [(FM_DEVIATION_NARROW_HZ, 0.0f32), (FM_DEVIATION_WIDE_HZ, 0.0), (FM_DEVIATION_WIDE_HZ, 0.3)] {
+            p.set_fm_deviation(deviation);
+            let mut freq = Vec::new();
+            let mut last: Option<(f64, f64)> = None;
+            let mut n = 0usize;
+            let mut errors = 0;
+            for _ in 0..200 {
+                let mic: Vec<f32> = (0..TX_BUFFER_SIZE)
+                    .map(|_| {
+                        n += 1;
+                        mic_amp * (std::f64::consts::TAU * 1000.0 * n as f64 / fs).sin() as f32
+                    })
+                    .collect();
+                let (iq, err) =
+                    p.process(&mic, Mode::Fmn, 1.0, 5000.0, None, false, false, EqualizerParams::default(), false, 0.0, false);
+                // Paced like the real TX thread, so WDSP's own worker
+                // keeps up (fexchange0 hands back zeros otherwise).
+                thread::sleep(Duration::from_millis(15));
+                if err != 0 {
+                    errors += 1;
+                    last = None;
+                    continue;
+                }
+                for pair in iq.chunks_exact(2) {
+                    let s = (pair[0] as f64, pair[1] as f64);
+                    if let Some(l) = last {
+                        // arg(s * conj(l))
+                        let d = (s.1 * l.0 - s.0 * l.1).atan2(s.0 * l.0 + s.1 * l.1);
+                        freq.push(d * fs / std::f64::consts::TAU);
+                    }
+                    last = Some(s);
+                }
+            }
+            let f = &freq[freq.len() / 2..];
+            let proj = |hz: f64| {
+                let (mut c, mut s) = (0.0, 0.0);
+                for (k, v) in f.iter().enumerate() {
+                    let ph = std::f64::consts::TAU * hz * k as f64 / fs;
+                    c += v * ph.cos();
+                    s += v * ph.sin();
+                }
+                2.0 * (c * c + s * s).sqrt() / f.len() as f64
+            };
+            let peak = f.iter().fold(0.0f64, |a, v| a.max(v.abs()));
+            println!("{} samples, {errors} fexchange errors", freq.len());
+            println!(
+                "deviation {deviation}, mic {mic_amp}: CTCSS 103.5 Hz deviation {:.0} Hz, 1 kHz deviation {:.0} Hz, peak {:.0} Hz",
+                proj(103.5),
+                proj(1000.0),
+                peak
+            );
+        }
     }
 }

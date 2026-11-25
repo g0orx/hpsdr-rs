@@ -58,7 +58,8 @@
       an exact one for, but a static "wide enough" range is harmless and
       this field is documented as accepted-and-discarded by TCI Remote
       regardless).
-    - TCI mode-string spellings (LSB/USB/CW/etc.) match the spec's own
+    - TCI mode-string spellings (LSB/USB/CWL/CWU/etc.; CW is CWL/CWU
+      as Thetis reports it, a plain CW from a client taken by frequency) match the spec's own
       MODULATIONS_LIST example and are cross-checked against JTDX/
       WSJT-X source for exact case-sensitivity behavior (see
       mode_to_tci's doc comment).
@@ -133,7 +134,7 @@
 
 use crate::debug_log::DebugLog;
 use crate::spectrum::{Agc, DemodParams, Mode, NoiseBlanker, NoiseReduction, passband_for};
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
@@ -169,6 +170,9 @@ pub const DEFAULT_ADDR: &str = "0.0.0.0:50001";
 /// point is to be recognized as ExpertSDR3-compatible, not to
 /// accurately self-describe.
 const PROTOCOL_MESSAGE: &str = "protocol:ExpertSDR3,2.0;";
+
+/// hpsdr-rs's own name and version, sent after PROTOCOL_MESSAGE.
+const APP_MESSAGE: &str = concat!("app_ex:hpsdr-rs,", env!("CARGO_PKG_VERSION"), ";");
 
 /// A swappable reference to "whichever DemodParams is current right
 /// now" -- see TciServer::set_demod_params's doc comment (and
@@ -223,6 +227,65 @@ type AudioIqCell = Arc<Mutex<AudioIqTaps>>;
 struct ClientAudioIqSink {
     audio: Mutex<VecDeque<(f32, f32)>>,
     iq: Mutex<VecDeque<(f32, f32)>>,
+    /// Receiver 1's audio and IQ (see Rx2Share), filled the same way.
+    audio2: Mutex<VecDeque<(f32, f32)>>,
+    iq2: Mutex<VecDeque<(f32, f32)>>,
+}
+
+/// TCI's receiver 1, as Thetis's RX2: hpsdr-rs's first extra receiver
+/// (the lowest-numbered one open -- the "RX 2" window when it's there).
+/// Thetis's TCI server has two receivers, and its clients expect that,
+/// so this is too: trx_count is 2, and rx_enable:1 says whether there's
+/// an extra receiver behind it now. Transmit stays with receiver 0.
+///
+/// Extra receivers keep their frequencies and RIT in main.rs's own
+/// state, so main.rs publishes them here every frame (set_rx2) and
+/// applies what clients ask for (take_rx2_requests), as it does the
+/// band buttons; their DSP settings, audio and S-meter are shared
+/// directly (Rx2Taps), as the main receiver's are.
+#[derive(Default)]
+pub struct Rx2Share {
+    rx: Mutex<Option<(Rx2Taps, Rx2State)>>,
+    requests: Mutex<Rx2Requests>,
+}
+
+#[derive(Clone)]
+pub struct Rx2Taps {
+    pub demod_params: Arc<Mutex<DemodParams>>,
+    pub audio: Arc<Mutex<VecDeque<(f32, f32)>>>,
+    pub iq: Arc<Mutex<VecDeque<(f32, f32)>>>,
+    pub display: Arc<Mutex<crate::spectrum::SpectrumDisplay>>,
+}
+
+/// Receiver 1's frequencies: where it's listening, the centre of its
+/// spectrum (its DDC), its VFO B, RIT and CTUN; and its IQ rate.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Rx2State {
+    pub sample_rate_hz: u32,
+    pub frequency_hz: u64,
+    pub dds_hz: u64,
+    pub vfo_b_hz: u64,
+    pub rit_enabled: bool,
+    pub rit_offset_hz: i32,
+    pub ctun: bool,
+}
+
+/// What clients have asked of receiver 1 since main.rs last looked.
+#[derive(Debug, Default, PartialEq)]
+pub struct Rx2Requests {
+    pub frequency_hz: Option<u64>,
+    pub vfo_b_hz: Option<u64>,
+    pub rit_enabled: Option<bool>,
+    pub rit_offset_hz: Option<i32>,
+    pub ctun: Option<bool>,
+    /// rx_enable:1,<bool> -- open or close it.
+    pub enable: Option<bool>,
+}
+
+impl Rx2Share {
+    fn get(&self) -> Option<(Rx2Taps, Rx2State)> {
+        self.rx.lock().unwrap().clone()
+    }
 }
 
 /// Registry of currently-connected clients' own sinks, as Weak refs so a
@@ -280,7 +343,15 @@ const CLIENT_SINK_MAX_IQ_PAIRS: usize = 200_000;
 /// keeps every individual message the size a real client's own
 /// buffering/rendering is presumably already tuned for, instead of
 /// occasionally handing it an unusually large one.
+///
+/// Now a default and upper limit rather than fixed: a client can ask for
+/// smaller blocks with `audio_stream_samples` (AUDIO_STREAM_SAMPLES_MIN
+/// up to this), as Thetis allows (TCIServer.cs handleAudioStreamSamples
+/// -- e.g. 960 for 20 ms at 48 kHz). The size it asks for is used for
+/// both its RX audio messages and the TX audio it's asked for
+/// (TxChrono), as Thetis does.
 const MAX_AUDIO_SAMPLES_PER_MESSAGE: usize = 2048;
+const AUDIO_STREAM_SAMPLES_MIN: usize = 100;
 const MAX_IQ_PAIRS_PER_MESSAGE: usize = 256;
 
 /// The single reader of the real shared audio/IQ taps -- drains them
@@ -311,6 +382,7 @@ const MAX_IQ_PAIRS_PER_MESSAGE: usize = 256;
 fn spawn_audio_iq_broadcaster(
     audio_iq: AudioIqCell,
     registry: ClientAudioIqRegistry,
+    remote_share: Arc<crate::remote::RemoteShare>,
     stop: Arc<AtomicBool>,
 ) -> JoinHandle<()> {
     thread::spawn(move || {
@@ -321,6 +393,31 @@ fn spawn_audio_iq_broadcaster(
                 let mut q = taps.audio.lock().unwrap();
                 q.drain(..).collect()
             };
+            // Receiver 1's audio and IQ, when there is one (see Rx2Share).
+            let (audio2_batch, iq2_batch): (Vec<(f32, f32)>, Vec<(f32, f32)>) = match remote_share.rx2.get() {
+                Some((rx2, _)) => (
+                    rx2.audio.lock().unwrap().drain(..).collect(),
+                    rx2.iq.lock().unwrap().drain(..).collect(),
+                ),
+                None => (Vec::new(), Vec::new()),
+            };
+            if !audio2_batch.is_empty() || !iq2_batch.is_empty() {
+                let mut clients = registry.lock().unwrap();
+                for sink in clients.iter().filter_map(|w| w.upgrade()) {
+                    let mut q = sink.audio2.lock().unwrap();
+                    q.extend(audio2_batch.iter().copied());
+                    while q.len() > CLIENT_SINK_MAX_AUDIO_SAMPLES {
+                        q.pop_front();
+                    }
+                    drop(q);
+                    let mut q = sink.iq2.lock().unwrap();
+                    q.extend(iq2_batch.iter().copied());
+                    while q.len() > CLIENT_SINK_MAX_IQ_PAIRS {
+                        q.pop_front();
+                    }
+                }
+                clients.retain(|w| w.strong_count() > 0);
+            }
             let iq_batch: Vec<(f32, f32)> = {
                 let mut q = taps.iq.lock().unwrap();
                 q.drain(..).collect()
@@ -460,6 +557,9 @@ impl TciServer {
         // detected board (e.g. "Orion2"), not this project's own name.
         // See handle_client's doc comment on why this matters.
         board_name: String,
+        // RadioSession::cw_keyer: the CW hang time, and live keying from
+        // remote clients (radio::CwLive).
+        cw_keyer: Arc<crate::radio::CwKeyerAtomics>,
         logging: DebugLog,
     ) -> std::io::Result<Self> {
         let listener = TcpListener::bind(addr)?;
@@ -480,7 +580,12 @@ impl TciServer {
         // used to need.
         let audio_iq_registry: ClientAudioIqRegistry = Arc::new(Mutex::new(Vec::new()));
         let broadcaster_thread =
-            spawn_audio_iq_broadcaster(Arc::clone(&audio_iq), Arc::clone(&audio_iq_registry), Arc::clone(&stop));
+            spawn_audio_iq_broadcaster(
+                Arc::clone(&audio_iq),
+                Arc::clone(&audio_iq_registry),
+                Arc::clone(&remote_share),
+                Arc::clone(&stop),
+            );
         let accept_stop = Arc::clone(&stop);
         let accept_connected = Arc::clone(&connected);
         let accept_local_addrs = Arc::clone(&local_addrs);
@@ -525,6 +630,7 @@ impl TciServer {
                         let conn_connected = Arc::clone(&accept_connected);
                         let conn_logging = accept_logging.clone();
                         let conn_board_name = board_name.clone();
+                        let conn_cw_keyer = Arc::clone(&cw_keyer);
                         let handle = thread::spawn(move || {
                             conn_connected.fetch_add(1, Ordering::Relaxed);
                             if let Some(addr) = local_addr {
@@ -534,7 +640,7 @@ impl TciServer {
                                 stream, freq, rx_freq, hw_freq, rf_offset, conn_vfo_b, rate, params, conn_display, conn_remote_share, conn_audio_iq_registry, tx_audio,
                                 tx_gain, wants_mic, conn_mox, conn_tx_frequency_hz, conn_allow_out_of_band_tx,
                                 conn_rit_enabled, conn_rit_offset_hz, conn_xit_enabled, conn_xit_offset_hz,
-                                conn_stop, conn_board_name, conn_logging,
+                                conn_stop, conn_board_name, conn_cw_keyer, conn_logging,
                             );
                             conn_connected.fetch_sub(1, Ordering::Relaxed);
                             if let Some(addr) = local_addr {
@@ -605,10 +711,54 @@ impl TciServer {
         self.remote_share.set_tx(info);
     }
 
+    /// The saved TX profiles, for tx_profiles_ex and tx_profile_ex.
+    pub fn set_tx_profiles(&self, profiles: crate::remote::TxProfiles) {
+        self.remote_share.set_tx_profiles(profiles);
+    }
+
     /// A TX power setting (W) a remote client has asked for, for main.rs
     /// to apply as its own slider would.
     pub fn take_power_request(&self) -> Option<u32> {
         self.remote_share.take_power_request()
+    }
+
+    /// CW text, a stop and a speed TCI clients have asked for (cw_macros
+    /// and its kin), for main.rs to apply -- see remote::CwRequests.
+    pub fn take_cw(&self) -> crate::remote::CwRequests {
+        self.remote_share.take_cw()
+    }
+
+    /// Receiver 1 (see Rx2Share): the first extra receiver's shared
+    /// settings, audio and S-meter, and its frequencies -- None when
+    /// there's no extra receiver. main.rs calls this every frame.
+    pub fn set_rx2(&self, rx2: Option<(Rx2Taps, Rx2State)>) {
+        *self.remote_share.rx2.rx.lock().unwrap() = rx2;
+    }
+
+    /// What clients have asked of receiver 1 since the last call.
+    pub fn take_rx2_requests(&self) -> Rx2Requests {
+        std::mem::take(&mut *self.remote_share.rx2.requests.lock().unwrap())
+    }
+
+    /// Whether a client has changed receiver 0's filter width since the
+    /// last call (see RemoteShare::filter_changed).
+    pub fn take_filter_changed(&self) -> bool {
+        self.remote_share.take_filter_changed()
+    }
+
+    /// Tune and Tune Power, as TCI clients have asked (tune, tune_drive).
+    pub fn take_control(&self) -> crate::remote::ControlRequests {
+        self.remote_share.take_control()
+    }
+
+    /// The saved CW messages, shown to hpsdr-remote clients.
+    pub fn set_cw_messages(&self, list: &[String]) {
+        self.remote_share.set_cw_messages(list);
+    }
+
+    /// The keys a paddle plugged into an hpsdr-remote client types.
+    pub fn set_paddle_keys(&self, keys: (char, char)) {
+        self.remote_share.set_paddle_keys(keys);
     }
 
     /// Same idea as set_demod_params, for the streaming taps -- a
@@ -745,6 +895,7 @@ fn handle_client(
     // device: field -- see that field's own doc comment for why this
     // shouldn't just be this project's own name.
     board_name: String,
+    cw_keyer: Arc<crate::radio::CwKeyerAtomics>,
     logging: DebugLog,
 ) {
     let _ = stream.set_nodelay(true);
@@ -772,7 +923,16 @@ fn handle_client(
     // handshake ~700ms later onto an already-closed connection.
     let _ = stream.set_nonblocking(false);
 
-    let mut ws = match tungstenite::accept(stream) {
+    // Through the web server with no password: listen and tune only --
+    // see crate::web_server::RECEIVE_ONLY_HEADER.
+    let mut web_receive_only = false;
+    let mut ws = match tungstenite::accept_hdr(
+        stream,
+        |request: &tungstenite::handshake::server::Request, response: tungstenite::handshake::server::Response| {
+            web_receive_only = request.headers().contains_key(crate::web_server::RECEIVE_ONLY_HEADER);
+            Ok(response)
+        },
+    ) {
         Ok(ws) => ws,
         Err(e) => {
             logging.log(&format!("websocket handshake failed: {e}"));
@@ -806,7 +966,12 @@ fn handle_client(
     // local variable for this whole function -- the registry below only
     // holds a Weak reference, so this Arc is what keeps the sink (and
     // this client's registration) alive for as long as this thread runs.
-    let sink = Arc::new(ClientAudioIqSink { audio: Mutex::new(VecDeque::new()), iq: Mutex::new(VecDeque::new()) });
+    let sink = Arc::new(ClientAudioIqSink {
+        audio: Mutex::new(VecDeque::new()),
+        iq: Mutex::new(VecDeque::new()),
+        audio2: Mutex::new(VecDeque::new()),
+        iq2: Mutex::new(VecDeque::new()),
+    });
     audio_iq_registry.lock().unwrap().push(Arc::downgrade(&sink));
 
     // Best-effort initial state push -- see module-level note.
@@ -869,10 +1034,11 @@ fn handle_client(
     // unconfirmed belief about Thetis's own order.
     send_logged(&mut ws, &logging, "start;".into());
     send_logged(&mut ws, &logging, "ready;".into());
-    // This project has no real TX-profile concept (Thetis-style PA/EQ
-    // profile switching) -- "Default" is a static, harmless stand-in.
-    send_logged(&mut ws, &logging, "tx_profile_ex:Default;".into());
-    send_logged(&mut ws, &logging, "tx_profiles_ex:Default;".into());
+    // Settings -> TX -> TX Profile's (see tx_profile_state).
+    for (_, msg) in tx_profile_state(&remote_share) {
+        send_logged(&mut ws, &logging, msg.into());
+    }
+    send_logged(&mut ws, &logging, tx_filter_message(&remote_share.tx()).into());
 
     // TX_ENABLE (spec section 4.3): "informs clients that TX is
     // enabled... sent to the client when connected... in case
@@ -887,11 +1053,12 @@ fn handle_client(
     // TCI_TX_AUDIO_CHUNK (this project's own real per-reply request
     // size -- see that constant's doc comment for the full back-and-
     // forth on what value actually belongs here).
-    send_logged(&mut ws, &logging, "mon_volume:0.0;".into());
-    send_logged(&mut ws, &logging, "mon_enable:false;".into());
-    send_logged(&mut ws, &logging, "tune:0,false;".into());
-    send_logged(&mut ws, &logging, "rx_mute:0,false;".into());
-    send_logged(&mut ws, &logging, "mute:false;".into());
+    send_logged(&mut ws, &logging, format!("mon_volume:{:.1};", monitor_volume_db(&remote_share.tx())).into());
+    send_logged(&mut ws, &logging, format!("mon_enable:{};", remote_share.tx().monitor).into());
+    send_logged(&mut ws, &logging, format!("cw_keyer_speed:{};", remote_share.tx().cw_speed_wpm).into());
+    send_logged(&mut ws, &logging, format!("tune:0,{};", remote_share.tx().tune).into());
+    send_logged(&mut ws, &logging, format!("rx_mute:0,{};", params.muted).into());
+    send_logged(&mut ws, &logging, format!("mute:{};", params.muted).into());
     send_logged(&mut ws, &logging, "tx_stream_audio_buffering:50;".into());
     send_logged(&mut ws, &logging, format!("audio_stream_samples:{TCI_TX_AUDIO_CHUNK};").into());
     send_logged(&mut ws, &logging, "audio_stream_channels:2;".into());
@@ -900,20 +1067,25 @@ fn handle_client(
     send_logged(&mut ws, &logging, format!("iq_samplerate:{};", sample_rate.load(Ordering::Relaxed)).into());
     send_logged(&mut ws, &logging, "iq_stop:0;".into());
     send_logged(&mut ws, &logging, format!("trx:0,{};", mox.load(Ordering::Relaxed)).into());
-    send_logged(&mut ws, &logging, "tune_drive:0,50;".into());
-    send_logged(&mut ws, &logging, "drive:0,50;".into());
+    // Real values now (they used to be fixed): kept up to date after
+    // this by the live notifications -- see live_state.
+    let tx_info = remote_share.tx();
+    send_logged(&mut ws, &logging, format!("tune_drive:0,{};", tx_info.tune_power_percent).into());
+    send_logged(&mut ws, &logging, format!("drive:0,{};", drive_percent(&tx_info)).into());
     send_logged(&mut ws, &logging, "rx_channel_enable:0,0,true;".into());
-    send_logged(&mut ws, &logging, "tx_enable:0,true;".into());
-    send_logged(&mut ws, &logging, "split_enable:0,false;".into());
+    send_logged(&mut ws, &logging, format!("tx_enable:0,{};", !web_receive_only).into());
+    send_logged(&mut ws, &logging, format!("split_enable:0,{};", tx_info.split).into());
     // No real value to report for features this project doesn't
-    // implement at all (CW keyer, squelch, VFO lock, calibration,
+    // implement at all (CW keyer, squelch, calibration,
     // preamp/step attenuator) -- a safe/neutral static default (matching
     // Thetis's own example values where they're clearly just
     // "off"/"none") still beats the client getting no reply at all to a
     // field it expects.
-    send_logged(&mut ws, &logging, "sql_level:0,-140;".into());
-    send_logged(&mut ws, &logging, "sql_enable:0,false;".into());
-    send_logged(&mut ws, &logging, "lock:0,false;".into());
+    send_logged(&mut ws, &logging, format!("sql_level:0,{};", squelch_to_tci_db(params.squelch_level)).into());
+    send_logged(&mut ws, &logging, format!("sql_enable:0,{};", params.squelch_enabled).into());
+    for (_, msg) in vfo_lock_state(&remote_share.tx()) {
+        send_logged(&mut ws, &logging, msg.into());
+    }
     // Real values below where this project actually tracks the
     // underlying state (RIT/XIT, CTUN, AGC mode, noise blanker/
     // reduction, audio gain, filter passband, frequency/mode/dds).
@@ -928,13 +1100,16 @@ fn handle_client(
     send_logged(&mut ws, &logging, "agc_auto_ex:0,false;".into());
     send_logged(&mut ws, &logging, format!("agc_mode:0,{};", agc_to_tci(params.agc)).into());
     send_logged(&mut ws, &logging, "rx_preamp_att_ex:0,0;".into());
-    send_logged(&mut ws, &logging, "rx_step_att_ex:0,0;".into());
-    send_logged(&mut ws, &logging, "rx_step_att_enabled_ex:0,false;".into());
-    send_logged(&mut ws, &logging, "vfo_sync_ex:false;".into());
-    send_logged(&mut ws, &logging, "rx_balance:0,0,0.00;".into());
+    for (_, msg) in rx_att_state(&remote_share.tx()) {
+        send_logged(&mut ws, &logging, msg.into());
+    }
+    send_logged(&mut ws, &logging, format!("rx_balance:0,0,{:.2};", pan_to_balance(params.audio_pan)).into());
     send_logged(&mut ws, &logging, format!("rx_volume:0,0,{:.2};", gain_to_tci_db(params.gain)).into());
-    send_logged(&mut ws, &logging, "rx_nf_enable:0,false;".into());
-    send_logged(&mut ws, &logging, "rx_apf_enable:0,false;".into());
+    send_logged(&mut ws, &logging, format!("volume:{:.1};", gain_to_tci_db(params.gain).clamp(-60.0, 0.0)).into());
+    send_logged(&mut ws, &logging, format!("agc_gain:0,{};", params.agc_top_db.round() as i64).into());
+    send_logged(&mut ws, &logging, format!("agc_auto_ex:0,{};", params.agc_auto).into());
+    send_logged(&mut ws, &logging, format!("rx_nf_enable:0,{};", crate::spectrum::tnf()).into());
+    send_logged(&mut ws, &logging, format!("rx_apf_enable:0,{};", params.apf).into());
     send_logged(&mut ws, &logging, format!("rx_anf_enable:0,{};", params.anf).into());
     send_logged(&mut ws, &logging, format!("rx_bin_enable:0,{};", params.binaural).into());
     // ROOT CAUSE FIX: stage was hardcoded to 0 here regardless of which
@@ -960,9 +1135,18 @@ fn handle_client(
     send_logged(&mut ws, &logging, format!("rx_nr_enable_ex:0,{nr_on},{nr_stage};").into());
     send_logged(&mut ws, &logging, format!("rx_nr_enable:0,{nr_on};").into());
     send_logged(&mut ws, &logging, "rx_enable:0,true;".into());
+    // Receiver 1 itself, and its state, follow in the live notifications.
     send_logged(&mut ws, &logging, format!("rx_filter_band:0,{},{};", pb_low.round() as i64, pb_high.round() as i64).into());
     send_logged(&mut ws, &logging, format!("modulation:0,{};", mode_to_tci(mode)).into());
-    send_logged(&mut ws, &logging, format!("tx_frequency:{freq};").into());
+    for (_, msg) in tx_frequency_state(
+        &rx_frequency_hz,
+        &vfo_b,
+        &xit_enabled,
+        &xit_offset_hz,
+        &remote_share,
+    ) {
+        send_logged(&mut ws, &logging, msg);
+    }
     send_logged(&mut ws, &logging, format!("vfo:0,0,{freq};").into());
     send_logged(&mut ws, &logging, format!("if:0,0,{if_offset};").into());
     send_logged(&mut ws, &logging, format!("dds:0,{dds_freq};").into());
@@ -978,12 +1162,14 @@ fn handle_client(
     // rather than modeling exact hardware limits -- no single value is
     // right for every supported board/filter combination, and a
     // wide-open range never incorrectly rejects a client's request.
-    // RECEIVE_ONLY:false -- this project always has TX support wired
-    // up (Settings -> TX gates actual PTT, not the protocol handshake).
+    // RECEIVE_ONLY: true for receive-only hardware (board_name is the
+    // Boards variant's name), so a client doesn't offer to transmit;
+    // false otherwise (Settings -> TX gates actual PTT, not the
+    // protocol handshake).
     // TRX_COUNT/CHANNEL_COUNT:1 -- TCI (unlike rigctl) has no second-
     // VFO/extra-receiver concept implemented here; see this file's
     // module note on trx always being 0.
-    send_logged(&mut ws, &logging, "modulations_list:LSB,USB,DSB,CW,AM,NFM,DIGU,DIGL,SAM;".into());
+    send_logged(&mut ws, &logging, "modulations_list:LSB,USB,DSB,CWL,CWU,AM,NFM,DIGU,DIGL,SAM;".into());
     send_logged(&mut ws, &logging, "if_limits:-96000,96000;".into());
     send_logged(&mut ws, &logging, "vfo_limits:0,4000000000;".into());
     // FIELD NAME FIX: was "channel_count" (singular) -- confirmed wrong
@@ -995,8 +1181,11 @@ fn handle_client(
     // audio_stream_channels:2 declaration just above (RX audio frames
     // are always stereo here, mono duplicated to both channels).
     send_logged(&mut ws, &logging, "channels_count:2;".into());
-    send_logged(&mut ws, &logging, "trx_count:1;".into());
-    send_logged(&mut ws, &logging, "receive_only:false;".into());
+    // Two, as Thetis: receiver 1 is the first extra receiver, when there
+    // is one (rx_enable:1 says) -- see Rx2Share.
+    send_logged(&mut ws, &logging, "trx_count:2;".into());
+    let receive_only = matches!(board_name.as_str(), "Rx888" | "RtlSdr" | "MsiSdr");
+    send_logged(&mut ws, &logging, format!("receive_only:{};", receive_only || web_receive_only).into());
     // DEVICE identifies the actual radio hardware (e.g. Thetis reports
     // "ANAN8000D" for its connected board) -- a real report/correction:
     // this used to send this project's own name ("hpsdr-rs") here
@@ -1008,6 +1197,10 @@ fn handle_client(
     // reported over the wire.
     send_logged(&mut ws, &logging, format!("device:{board_name};").into());
     send_logged(&mut ws, &logging, PROTOCOL_MESSAGE.into());
+    // Which program this really is, and its version: protocol: has to say
+    // ExpertSDR3 for clients that expect it, so a client that wants to
+    // tell hpsdr-rs apart (ThetisLink asked) looks here.
+    send_logged(&mut ws, &logging, APP_MESSAGE.into());
 
     // Per-client streaming state -- audio defaults to ON (see below),
     // IQ defaults to OFF, only enabled by an explicit iq_start. This
@@ -1019,9 +1212,16 @@ fn handle_client(
     // them -- harmless either way, and keeps this spec-compliant for
     // any other TCI client that relies on that gate.
     let mut audio_streaming = true;
+    // Samples per audio message, both ways -- MAX_AUDIO_SAMPLES_PER_MESSAGE
+    // unless the client asks otherwise (audio_stream_samples).
+    let mut audio_samples = MAX_AUDIO_SAMPLES_PER_MESSAGE;
     // hpsdr-rs's remote extensions, if this client asks for them -- see
     // remote.rs and docs/remote-protocol.md.
     let mut remote = crate::remote::RemoteStreams::default();
+    remote.receive_only = web_receive_only;
+    if web_receive_only {
+        logging.log("receive only: through the web server, which has no password");
+    }
     // Counts this client as a remote client once it says hpsdr_hello, until
     // it goes -- see remote::ClientCount.
     let mut remote_count: Option<crate::remote::ClientCount> = None;
@@ -1033,6 +1233,7 @@ fn handle_client(
         allow_out_of_band: &allow_out_of_band_tx,
         wants_mic: &tci_wants_mic,
         audio: &tci_tx_audio,
+        cw: &cw_keyer,
     };
     let mut iq_streaming = false;
     // ROOT CAUSE INVESTIGATION continued: a real Windows report's
@@ -1079,8 +1280,8 @@ fn handle_client(
     // the underlying production isn't. Falls behind gracefully (resyncs
     // to now, matching the same fallback those references use) if the
     // queue can't keep up rather than bursting to catch up.
-    let audio_chunk_interval =
-        Duration::from_secs_f64(MAX_AUDIO_SAMPLES_PER_MESSAGE as f64 / TCI_AUDIO_SAMPLE_RATE as f64);
+    // (Worked out at each send, from the client's own block size --
+    // audio_samples.)
     let mut next_audio_send = Instant::now();
     // BUG FIX: a bad (garbage-value) pair used to be dropped outright
     // (`continue`, pushing nothing), which shortens tci_tx_audio's
@@ -1115,6 +1316,34 @@ fn handle_client(
     let mut pending_bad_count: usize = 0;
     // See the periodic vfo/modulation/trx heartbeat below.
     let mut last_status_broadcast = Instant::now();
+    // Live notifications (see live_state): what this client was last
+    // told of each, starting from what the connect handshake just sent;
+    // and when it last sent a command itself, by name, to hold back
+    // reports of what it's still changing (see LIVE_HOLD).
+    let mut live_sent: HashMap<String, String> = live_state(
+        &rx_frequency_hz,
+        &hw_frequency_hz,
+        &rx_rf_offset_hz,
+        &vfo_b,
+        &demod_params.lock().unwrap().clone().lock().unwrap(),
+        &mox,
+        &rit_enabled,
+        &rit_offset_hz,
+        &xit_enabled,
+        &xit_offset_hz,
+        &remote_share,
+    )
+    .into_iter()
+    .collect();
+    let mut live_held: HashMap<String, Instant> = HashMap::new();
+    // rx_sensors_enable / tx_sensors_enable -- see Sensors.
+    let mut sensors = Sensors::default();
+    // Receiver 1's audio (audio_start:1) -- see Rx2Share. Off until asked
+    // for, unlike receiver 0's (see audio_streaming).
+    let mut audio2_streaming = false;
+    let mut next_audio2_send = Instant::now();
+    // Receiver 1's IQ (iq_start:1), off until asked for, as receiver 0's.
+    let mut iq2_streaming = false;
     // BUG FIX (round 2 -- replaced fixed-interval pacing entirely):
     // TxChrono used to be sent one-at-a-time, real-time paced (one
     // request roughly every TCI_TX_AUDIO_CHUNK/TCI_AUDIO_SAMPLE_RATE),
@@ -1158,6 +1387,45 @@ fn handle_client(
                         continue;
                     }
                     logging.log(&format!("<< {cmd};"));
+                    let name = cmd.split(':').next().unwrap_or("").trim().to_ascii_lowercase();
+                    if web_receive_only && transmits(cmd) {
+                        logging.log("refused: receive only");
+                        continue;
+                    }
+                    for family in live_families(&name) {
+                        live_held.insert(family.to_string(), Instant::now());
+                    }
+                    if sensors.command(cmd) {
+                        continue;
+                    }
+                    // A setting a client changes is reported back once
+                    // LIVE_HOLD is over, as it then is -- confirming what it
+                    // asked for, or telling it the radio didn't take it.
+                    let families = live_families(&name);
+                    live_sent.retain(|key, _| !families.contains(&key.split(':').next().unwrap_or("")));
+                    // Receiver 1's own commands -- see Rx2Share.
+                    if let Some(reply) = rx2_command(cmd, &name, &remote_share, &mut audio2_streaming, &mut iq2_streaming, &sink) {
+                        if let Some(reply) = reply {
+                            logging.log(&format!(">> {reply}"));
+                            if send_is_fatal(&ws.send(Message::Text(reply.into()))) {
+                                return;
+                            }
+                        }
+                        continue;
+                    }
+                    let control = {
+                        let params = demod_params.lock().unwrap().clone();
+                        control_command(cmd, &remote_share, &params)
+                    };
+                    if let Some(reply) = control {
+                        if let Some(reply) = reply {
+                            logging.log(&format!(">> {reply}"));
+                            if send_is_fatal(&ws.send(Message::Text(reply.into()))) {
+                                return;
+                            }
+                        }
+                        continue;
+                    }
                     if cmd.to_ascii_lowercase().starts_with("hpsdr_") {
                         let current_params = demod_params.lock().unwrap().clone();
                         for c in hpsdr_proto::tci::parse(cmd) {
@@ -1179,6 +1447,27 @@ fn handle_client(
                         }
                         continue;
                     }
+                    // TCI's CW text commands (cw_macros, cw_macros_stop,
+                    // cw_macros_speed) -- see remote::RemoteStreams::cw_command.
+                    let lower = cmd.to_ascii_lowercase();
+                    if lower.starts_with("cw_macros") || lower.starts_with("keyer:") {
+                        let mode = demod_params.lock().unwrap().lock().unwrap().mode;
+                        for c in hpsdr_proto::tci::parse(cmd) {
+                            let reply = if c.name == hpsdr_proto::cw::KEYER {
+                                remote.keyer(&c, mode, &remote_share, &tx_link)
+                            } else {
+                                remote.cw_command(&c, mode, &remote_share, &tx_link)
+                            };
+                            if let Some(reply) = reply {
+                                logging.log(&format!(">> {reply}"));
+                                let result = ws.send(Message::Text(reply.into()));
+                                if send_is_fatal(&result) {
+                                    return;
+                                }
+                            }
+                        }
+                        continue;
+                    }
                     // Resolved fresh on every command (not once per
                     // connection) so a sample-rate change mid-session --
                     // see set_demod_params -- takes effect immediately
@@ -1188,6 +1477,7 @@ fn handle_client(
                     if let Some(response) = handle_command(
                         cmd,
                         &requested_frequency_hz,
+                        &rx_frequency_hz,
                         &vfo_b,
                         &current_params,
                         &mox,
@@ -1199,6 +1489,7 @@ fn handle_client(
                         &xit_offset_hz,
                         &tci_wants_mic,
                         &mut audio_streaming,
+                        &mut audio_samples,
                         &mut iq_streaming,
                         &sink,
                     ) {
@@ -1215,6 +1506,8 @@ fn handle_client(
                 logging.log("client closed the connection");
                 break;
             }
+            // Receive only: no TX audio either.
+            Ok(Message::Binary(_)) if web_receive_only => {}
             // A remote client's TX audio: its own ADPCM blocks (remote.rs).
             Ok(Message::Binary(data)) if remote.hello => remote.tx_audio(&data, &tx_link),
             Ok(Message::Binary(data)) => {
@@ -1440,14 +1733,15 @@ fn handle_client(
             if now >= next_audio_send {
                 let stereo: Option<Vec<(f32, f32)>> = {
                     let mut q = sink.audio.lock().unwrap();
-                    if q.len() >= MAX_AUDIO_SAMPLES_PER_MESSAGE {
-                        Some(q.drain(..MAX_AUDIO_SAMPLES_PER_MESSAGE).collect())
+                    if q.len() >= audio_samples {
+                        Some(q.drain(..audio_samples).collect())
                     } else {
                         None
                     }
                 };
                 if let Some(stereo) = stereo {
-                    next_audio_send += audio_chunk_interval;
+                    next_audio_send +=
+                        Duration::from_secs_f64(audio_samples as f64 / TCI_AUDIO_SAMPLE_RATE as f64);
                     if next_audio_send < now {
                         next_audio_send = now; // fell behind -- resync, don't chase
                     }
@@ -1498,6 +1792,52 @@ fn handle_client(
             }
         }
 
+        // Receiver 1's audio (audio_start:1), as receiver 0's: blocks of
+        // the client's own size, paced, the receiver in the header.
+        if audio2_streaming && Instant::now() >= next_audio2_send {
+            let stereo: Option<Vec<(f32, f32)>> = {
+                let mut q = sink.audio2.lock().unwrap();
+                (q.len() >= audio_samples).then(|| q.drain(..audio_samples).collect())
+            };
+            if let Some(stereo) = stereo {
+                next_audio2_send += Duration::from_secs_f64(audio_samples as f64 / TCI_AUDIO_SAMPLE_RATE as f64);
+                next_audio2_send = next_audio2_send.max(Instant::now());
+                let msg = encode_binary_message(
+                    1,
+                    TCI_AUDIO_SAMPLE_RATE,
+                    BinaryMessageType::RxAudioStream,
+                    stereo.len() as u32 * 2,
+                    &stereo,
+                );
+                let result = ws.send(Message::Binary(msg.into()));
+                if send_is_fatal(&result) {
+                    logging.log(&format!("receiver 1 audio send failed, closing: {:?}", result.unwrap_err()));
+                    return;
+                }
+            }
+        }
+
+        // Receiver 1's IQ (iq_start:1), as receiver 0's, with receiver 1
+        // and its own rate in each message's header: an extra receiver
+        // can run at a rate of its own (Protocol 2), and TCI's
+        // iq_samplerate is receiver 0's.
+        if iq2_streaming {
+            let pairs: Vec<(f32, f32)> = sink.iq2.lock().unwrap().drain(..).collect();
+            let rate = remote_share.rx2.get().map_or(0, |(_, f)| f.sample_rate_hz);
+            if !pairs.is_empty() && rate != 0 {
+                let swapped: Vec<(f32, f32)> = pairs.into_iter().map(|(i, q)| (q, i)).collect();
+                for chunk in swapped.chunks(MAX_IQ_PAIRS_PER_MESSAGE) {
+                    let msg =
+                        encode_binary_message(1, rate, BinaryMessageType::IqStream, chunk.len() as u32 * 2, chunk);
+                    let result = ws.send(Message::Binary(msg.into()));
+                    if send_is_fatal(&result) {
+                        logging.log(&format!("receiver 1 IQ send failed, closing: {:?}", result.unwrap_err()));
+                        return;
+                    }
+                }
+            }
+        }
+
         // hpsdr-rs's remote extensions: compressed audio from this
         // client's own sink (filled whether or not TCI's float audio is
         // on), and spectrum rows from the main receiver's display.
@@ -1524,6 +1864,10 @@ fn handle_client(
             logging.log(why);
             eprintln!("remote: {why}");
         }
+        if let Some(why) = remote.key_tick(&remote_share) {
+            logging.log(why);
+            eprintln!("remote: {why}");
+        }
         if let Some(bands) = remote.bands_message(&remote_share) {
             let result = ws.send(Message::Text(bands.into()));
             if send_is_fatal(&result) {
@@ -1532,6 +1876,13 @@ fn handle_client(
         }
         if let Some(tx_state) = remote.tx_message(&remote_share, &mox) {
             let result = ws.send(Message::Text(tx_state.into()));
+            if send_is_fatal(&result) {
+                return;
+            }
+        }
+        for cw in remote.cw_messages(&remote_share) {
+            logging.log(&format!(">> {cw}"));
+            let result = ws.send(Message::Text(cw.into()));
             if send_is_fatal(&result) {
                 return;
             }
@@ -1666,10 +2017,10 @@ fn handle_client(
                 tx_chrono_outstanding = 0;
             }
             let queued = tci_tx_audio.lock().unwrap().len();
-            let future = queued + tx_chrono_outstanding as usize * TCI_TX_AUDIO_CHUNK as usize;
+            let future = queued + tx_chrono_outstanding as usize * audio_samples;
             if future < TX_CHRONO_TARGET_BUFFER_SAMPLES {
                 let deficit = TX_CHRONO_TARGET_BUFFER_SAMPLES - future;
-                let requests_needed = deficit.div_ceil(TCI_TX_AUDIO_CHUNK as usize) as u32;
+                let requests_needed = deficit.div_ceil(audio_samples) as u32;
                 let requests_needed =
                     requests_needed.min(TX_CHRONO_MAX_OUTSTANDING.saturating_sub(tx_chrono_outstanding));
                 for _ in 0..requests_needed {
@@ -1677,7 +2028,7 @@ fn handle_client(
                         0,
                         TCI_AUDIO_SAMPLE_RATE,
                         BinaryMessageType::TxChrono,
-                        TCI_TX_AUDIO_CHUNK,
+                        audio_samples as u32,
                         &[],
                     );
                     let result = ws.send(Message::Binary(chrono.into()));
@@ -1698,6 +2049,76 @@ fn handle_client(
                     }
                     tx_chrono_outstanding += 1;
                 }
+            }
+        }
+
+        // rx_sensors / tx_sensors, if asked for.
+        let rx2_taps = remote_share.rx2.get().filter(|_| !remote.hello).map(|(taps, _)| taps);
+        for msg in sensors.due(&display, rx2_taps.as_ref(), &remote_share.tx(), mox.load(Ordering::Relaxed)) {
+            let result = ws.send(Message::Text(msg.into()));
+            if send_is_fatal(&result) {
+                return;
+            }
+        }
+
+        // Live notifications: anything changed elsewhere -- hpsdr-rs's
+        // own window, MIDI, CAT, another client -- reaches this client
+        // within a tick of this loop (5 ms), not at the next heartbeat.
+        {
+            let params_now = *demod_params.lock().unwrap().clone().lock().unwrap();
+            let mut state = live_state(
+                &rx_frequency_hz,
+                &hw_frequency_hz,
+                &rx_rf_offset_hz,
+                &vfo_b,
+                &params_now,
+                &mox,
+                &rit_enabled,
+                &rit_offset_hz,
+                &xit_enabled,
+                &xit_offset_hz,
+                &remote_share,
+            );
+            // Receiver 1 (see Rx2Share) -- not for an hpsdr-remote client,
+            // which has only the one. Gone, it's forgotten, so all of it
+            // is sent again when one's back.
+            if !remote.hello {
+                let rx2 = remote_share.rx2.get();
+                state.push(("rx_enable:1".to_string(), format!("rx_enable:1,{};", rx2.is_some())));
+                match rx2 {
+                    Some((taps, f)) => {
+                        let params2 = *taps.demod_params.lock().unwrap();
+                        // Its channel too, as Thetis: what makes a client
+                        // that asked for its audio and IQ at connect ask
+                        // again now it's open.
+                        state.push(("rx_channel_enable:1,0".to_string(), "rx_channel_enable:1,0,true;".to_string()));
+                        state.extend(receiver_live_state(1, &f, &params2));
+                    }
+                    None => live_sent.retain(|key, _| key == "rx_enable:1" || !is_rx1_key(key)),
+                }
+            }
+            for (key, msg) in state {
+                if live_sent.get(&key) == Some(&msg) {
+                    continue;
+                }
+                // Receiver 1's state only once the client's been told it's
+                // there (rx_enable:1,true comes first in `state`).
+                if is_rx1_key(&key)
+                    && key != "rx_enable:1"
+                    && live_sent.get("rx_enable:1").map(String::as_str) != Some("rx_enable:1,true;")
+                {
+                    continue;
+                }
+                let family = key.split(':').next().unwrap_or("");
+                if live_held.get(family).is_some_and(|t| t.elapsed() < LIVE_HOLD) {
+                    continue;
+                }
+                logging.log(&format!(">> {msg}"));
+                let result = ws.send(Message::Text(msg.clone().into()));
+                if send_is_fatal(&result) {
+                    return;
+                }
+                live_sent.insert(key, msg);
             }
         }
 
@@ -1748,6 +2169,905 @@ fn handle_client(
     }
 }
 
+/// The state a client is told of as it changes (handle_client's live
+/// notifications), as (key, message): the key is the message up to its
+/// value -- the command and which receiver/VFO -- so each is compared
+/// with what that client was last told. All of it is in the connect
+/// handshake too.
+#[allow(clippy::too_many_arguments)]
+fn live_state(
+    rx_frequency_hz: &AtomicU64,
+    hw_frequency_hz: &AtomicU32,
+    rx_rf_offset_hz: &AtomicI64,
+    vfo_b: &crate::radio::VfoBShared,
+    params: &DemodParams,
+    mox: &AtomicBool,
+    rit_enabled: &AtomicBool,
+    rit_offset_hz: &AtomicI32,
+    xit_enabled: &AtomicBool,
+    xit_offset_hz: &AtomicI32,
+    share: &crate::remote::RemoteShare,
+) -> Vec<(String, String)> {
+    let tx = &share.tx();
+    let dds_freq = (hw_frequency_hz.load(Ordering::Relaxed) as i64 + rx_rf_offset_hz.load(Ordering::Relaxed)).max(0);
+    let mut out = receiver_live_state(
+        0,
+        &Rx2State {
+            frequency_hz: rx_frequency_hz.load(Ordering::Relaxed),
+            dds_hz: dds_freq as u64,
+            vfo_b_hz: vfo_b.frequency_hz.load(Ordering::Relaxed),
+            rit_enabled: rit_enabled.load(Ordering::Relaxed),
+            rit_offset_hz: rit_offset_hz.load(Ordering::Relaxed),
+            ctun: params.ctun,
+            ..Default::default()
+        },
+        params,
+    );
+    out.extend(
+        [
+            ("trx:0", format!("trx:0,{};", mox.load(Ordering::Relaxed))),
+            ("xit_enable:0", format!("xit_enable:0,{};", xit_enabled.load(Ordering::Relaxed))),
+            ("xit_offset:0", format!("xit_offset:0,{};", xit_offset_hz.load(Ordering::Relaxed))),
+            ("volume", format!("volume:{:.1};", gain_to_tci_db(params.gain).clamp(-60.0, 0.0))),
+            ("tune:0", format!("tune:0,{};", tx.tune)),
+            ("tune_drive:0", format!("tune_drive:0,{};", tx.tune_power_percent)),
+            ("drive:0", format!("drive:0,{};", drive_percent(tx))),
+            ("split_enable:0", format!("split_enable:0,{};", tx.split)),
+            ("mute", format!("mute:{};", params.muted)),
+            ("mon_enable", format!("mon_enable:{};", tx.monitor)),
+            ("mon_volume", format!("mon_volume:{:.1};", monitor_volume_db(tx))),
+            ("cw_keyer_speed", format!("cw_keyer_speed:{};", tx.cw_speed_wpm)),
+            ("tx_filter_band_ex", tx_filter_message(tx)),
+        ]
+        .map(|(k, m)| (k.to_string(), m)),
+    );
+    out.extend(tx_profile_state(share));
+    out.extend(vfo_lock_state(tx));
+    out.extend(rx_att_state(tx));
+    out.extend(tx_frequency_state(rx_frequency_hz, vfo_b, xit_enabled, xit_offset_hz, share));
+    out
+}
+
+/// Where hpsdr-rs transmits, as Thetis reports it (TCIServer.cs
+/// sendTXFrequencyChanged): `tx_frequency:<Hz>;` and
+/// `tx_frequency_ex:<Hz>,<band>,<RX2 on>,<TX on VFO B>;` -- VFO A, or
+/// VFO B with Split or Duplex, as shown on screen (through its
+/// transverter), with XIT. The dial, as Thetis's: not the CW pitch
+/// hpsdr-rs moves its carrier by. The band is Thetis's style (b40m), from
+/// the radio's band list (gen outside them); RX2 on is whether TCI's
+/// receiver 1 is there (see Rx2Share).
+fn tx_frequency_state(
+    rx_frequency_hz: &AtomicU64,
+    vfo_b: &crate::radio::VfoBShared,
+    xit_enabled: &AtomicBool,
+    xit_offset_hz: &AtomicI32,
+    share: &crate::remote::RemoteShare,
+) -> Vec<(String, String)> {
+    let tx = share.tx();
+    let vfo_b_hz = vfo_b.frequency_hz.load(Ordering::Relaxed);
+    let dial = if tx.tx_on_vfo_b && vfo_b_hz != 0 { vfo_b_hz } else { rx_frequency_hz.load(Ordering::Relaxed) };
+    let xit = if xit_enabled.load(Ordering::Relaxed) { xit_offset_hz.load(Ordering::Relaxed) as i64 } else { 0 };
+    let hz = (dial as i64 + xit).max(0) as u64;
+    let band = share
+        .band_name(hz)
+        .map(|n| format!("b{}", n.to_lowercase().chars().filter(char::is_ascii_alphanumeric).collect::<String>()))
+        .filter(|b| b.len() > 1)
+        .unwrap_or_else(|| "gen".to_string());
+    vec![
+        ("tx_frequency".to_string(), format!("tx_frequency:{hz};")),
+        (
+            "tx_frequency_ex".to_string(),
+            format!("tx_frequency_ex:{hz},{band},{},{};", share.rx2.get().is_some(), tx.tx_on_vfo_b),
+        ),
+    ]
+}
+
+/// One receiver's part of live_state: its frequencies, mode, filter,
+/// RIT, CTUN, AGC, volume, noise and squelch settings -- for receiver 0,
+/// and for receiver 1 (Rx2Share) with `rx` 1.
+fn receiver_live_state(rx: u32, f: &Rx2State, params: &DemodParams) -> Vec<(String, String)> {
+    let freq = f.frequency_hz;
+    let dds_freq = f.dds_hz as i64;
+    let (pb_low, pb_high) = passband_for(params.mode, params.width_hz);
+    let nb_on = params.noise_blanker != NoiseBlanker::Off;
+    let nr_on = params.noise_reduction != NoiseReduction::Off;
+    let nb_stage = if params.noise_blanker == NoiseBlanker::Nb2 { 2 } else { 1 };
+    let nr_stage = match params.noise_reduction {
+        NoiseReduction::Nr2 => 2,
+        NoiseReduction::Nr3 => 3,
+        _ => 1,
+    };
+    let mut out = vec![
+        (format!("vfo:{rx},0"), format!("vfo:{rx},0,{freq};")),
+        (format!("if:{rx},0"), format!("if:{rx},0,{};", freq as i64 - dds_freq)),
+        (format!("dds:{rx}"), format!("dds:{rx},{dds_freq};")),
+        (format!("modulation:{rx}"), format!("modulation:{rx},{};", mode_to_tci(params.mode))),
+        (
+            format!("rx_filter_band:{rx}"),
+            format!("rx_filter_band:{rx},{},{};", pb_low.round() as i64, pb_high.round() as i64),
+        ),
+        (format!("rit_enable:{rx}"), format!("rit_enable:{rx},{};", f.rit_enabled)),
+        (format!("rit_offset:{rx}"), format!("rit_offset:{rx},{};", f.rit_offset_hz)),
+        (format!("rx_ctun_ex:{rx}"), format!("rx_ctun_ex:{rx},{};", f.ctun)),
+        (format!("agc_mode:{rx}"), format!("agc_mode:{rx},{};", agc_to_tci(params.agc))),
+        (format!("rx_volume:{rx},0"), format!("rx_volume:{rx},0,{:.2};", gain_to_tci_db(params.gain))),
+        (format!("agc_gain:{rx}"), format!("agc_gain:{rx},{};", params.agc_top_db.round() as i64)),
+        (format!("agc_auto_ex:{rx}"), format!("agc_auto_ex:{rx},{};", params.agc_auto)),
+        (format!("rx_anf_enable:{rx}"), format!("rx_anf_enable:{rx},{};", params.anf)),
+        (format!("rx_apf_enable:{rx}"), format!("rx_apf_enable:{rx},{};", params.apf)),
+        // TNF is every receiver's, as Thetis's (GetMNF).
+        (format!("rx_nf_enable:{rx}"), format!("rx_nf_enable:{rx},{};", crate::spectrum::tnf())),
+        (format!("rx_bin_enable:{rx}"), format!("rx_bin_enable:{rx},{};", params.binaural)),
+        (format!("rx_nb_enable_ex:{rx}"), format!("rx_nb_enable_ex:{rx},{nb_on},{nb_stage};")),
+        (format!("rx_nb_enable:{rx}"), format!("rx_nb_enable:{rx},{nb_on};")),
+        (
+            format!("rx_nb2_enable:{rx}"),
+            format!("rx_nb2_enable:{rx},{};", params.noise_blanker == NoiseBlanker::Nb2),
+        ),
+        (format!("rx_nr_enable_ex:{rx}"), format!("rx_nr_enable_ex:{rx},{nr_on},{nr_stage};")),
+        (format!("rx_nr_enable:{rx}"), format!("rx_nr_enable:{rx},{nr_on};")),
+        (format!("sql_enable:{rx}"), format!("sql_enable:{rx},{};", params.squelch_enabled)),
+        (format!("sql_level:{rx}"), format!("sql_level:{rx},{};", squelch_to_tci_db(params.squelch_level))),
+        (format!("rx_mute:{rx}"), format!("rx_mute:{rx},{};", params.muted)),
+        (format!("rx_balance:{rx},0"), format!("rx_balance:{rx},0,{:.2};", pan_to_balance(params.audio_pan))),
+    ];
+    if f.vfo_b_hz != 0 {
+        out.push((format!("vfo:{rx},1"), format!("vfo:{rx},1,{};", f.vfo_b_hz)));
+        out.push((format!("if:{rx},1"), format!("if:{rx},1,{};", f.vfo_b_hz as i64 - dds_freq)));
+    }
+    out
+}
+
+/// Settings -> TX -> TX Profile as Thetis reports its TX profiles
+/// (TCIServer.cs sendTXProfiles/sendTXProfile): tx_profiles_ex with the
+/// names, comma-separated, then tx_profile_ex with the chosen one ("" for
+/// none). With none saved, a single "Default", as before there were any.
+fn tx_profile_state(share: &crate::remote::RemoteShare) -> Vec<(String, String)> {
+    let p = share.tx_profiles();
+    let (names, current) =
+        if p.names.is_empty() { ("Default".to_string(), "Default".to_string()) } else { (p.names.join(","), p.current) };
+    vec![
+        ("tx_profiles_ex".to_string(), format!("tx_profiles_ex:{names};")),
+        ("tx_profile_ex".to_string(), format!("tx_profile_ex:{current};")),
+    ]
+}
+
+/// VFO A's and VFO B's Lock and Sync, as Thetis reports them without RX2
+/// (TCIServer.cs sendLock, sendAllVFOLocks): lock:0 and vfo_lock:0,0 are
+/// VFO A, vfo_lock:0,1 VFO B; then vfo_sync_ex.
+fn vfo_lock_state(tx: &crate::remote::TxInfo) -> Vec<(String, String)> {
+    vec![
+        ("lock:0".to_string(), format!("lock:0,{};", tx.vfo_a_lock)),
+        ("vfo_lock:0,0".to_string(), format!("vfo_lock:0,0,{};", tx.vfo_a_lock)),
+        ("vfo_lock:0,1".to_string(), format!("vfo_lock:0,1,{};", tx.vfo_b_lock)),
+        ("vfo_sync_ex".to_string(), format!("vfo_sync_ex:{};", tx.vfo_sync)),
+    ]
+}
+
+/// The TX filter's passband (see TxInfo::tx_filter) as
+/// tx_filter_band_ex:<low>,<high>; -- signed as rx_filter_band's.
+fn tx_filter_message(tx: &crate::remote::TxInfo) -> String {
+    format!("tx_filter_band_ex:{},{};", tx.tx_filter.0, tx.tx_filter.1)
+}
+
+/// Monitor TX Audio's level as TCI's mon_volume, dB, -60 (and below:
+/// silence) to 0 -- as Thetis's (its TXAF), the same scale as volume.
+fn monitor_volume_db(tx: &crate::remote::TxInfo) -> f64 {
+    gain_to_tci_db(tx.monitor_volume).clamp(-60.0, 0.0) as f64
+}
+
+/// A receiver's audio pan (spectrum::DemodParams::audio_pan, -1.0 left
+/// to 1.0 right) as TCI's rx_balance, -40 to 40 -- Thetis's scale and
+/// sign (TCIServer.cs: balance = 40 - pan * 0.8, pan 0 left to 100
+/// right), so +40 is all the way left.
+fn pan_to_balance(pan: f32) -> f64 {
+    // + 0.0: the middle is 0.00, not -0.00.
+    -40.0 * pan.clamp(-1.0, 1.0) as f64 + 0.0
+}
+
+fn balance_to_pan(balance: f64) -> f32 {
+    (-balance.clamp(-40.0, 40.0) / 40.0) as f32
+}
+
+/// Receiver 0's front end as TCI has it (see remote::RxAtt):
+/// rx_step_att_ex, attenuation dB, and rx_step_att_enabled_ex, whether
+/// there's a step attenuator at all.
+fn rx_att_state(tx: &crate::remote::TxInfo) -> Vec<(String, String)> {
+    let (db, on) = tx.rx_att.map_or((0, false), |a| (a.db, true));
+    vec![
+        ("rx_step_att_ex:0".to_string(), format!("rx_step_att_ex:0,{db};")),
+        ("rx_step_att_enabled_ex:0".to_string(), format!("rx_step_att_enabled_ex:0,{on};")),
+    ]
+}
+
+/// A live_state key belongs to receiver 1: its first argument is 1.
+fn is_rx1_key(key: &str) -> bool {
+    key.split_once(':').is_some_and(|(_, args)| args == "1" || args.starts_with("1,"))
+}
+
+/// TCI's sensors, for one client: rx_sensors_enable:<bool>[,<ms>]; and
+/// tx_sensors_enable:<bool>[,<ms>]; turn them on and off, as Thetis
+/// (TCIServer.cs) has them -- every `ms` (200 to start with, 30-1000),
+/// and only with a fresh reading:
+///
+/// - receiving: `rx_sensors:0,<dBm>;`, `rx_channel_sensors:0,0,<dBm>;`
+///   and `rx_channel_sensors_ex:0,0,<dBm>,<average dBm>,<peak bin dBm>;`
+///   -- the S-meter, its running average, and the strongest spectrum bin;
+/// - transmitting: `tx_sensors:0,<mic dB>,<W>,<peak W>,<SWR>;` -- the
+///   power and SWR as the main window's meter shows them (so peak power
+///   is the same as power, as in Thetis).
+///
+/// Not answered, as in Thetis.
+struct Sensors {
+    rx: Option<Duration>,
+    tx: Option<Duration>,
+    rx_sent: Option<Instant>,
+    tx_sent: Option<Instant>,
+    /// The spectrum revision last reported (only fresh readings go out),
+    /// and the running average of the S-meter, dBm.
+    rx_revision: u64,
+    rx_average_dbm: Option<f64>,
+    /// The same for receiver 1 (see Rx2Share).
+    rx2_revision: u64,
+    rx2_average_dbm: Option<f64>,
+}
+
+impl Default for Sensors {
+    fn default() -> Self {
+        Self {
+            rx: None,
+            tx: None,
+            rx_sent: None,
+            tx_sent: None,
+            rx_revision: u64::MAX,
+            rx_average_dbm: None,
+            rx2_revision: u64::MAX,
+            rx2_average_dbm: None,
+        }
+    }
+}
+
+const SENSORS_DEFAULT_MS: u64 = 200;
+
+/// One receiver's rx_sensors messages, if its S-meter has a fresh
+/// reading since `revision`: the level, its running average (kept in
+/// `average`), and the strongest spectrum bin. True if there was one.
+fn receiver_sensors(
+    rx: u32,
+    display: &Mutex<crate::spectrum::SpectrumDisplay>,
+    revision: &mut u64,
+    average: &mut Option<f64>,
+    out: &mut Vec<String>,
+) -> bool {
+    let d = display.lock().unwrap();
+    if d.revision == *revision || d.spectrum.is_empty() {
+        return false;
+    }
+    *revision = d.revision;
+    let level = d.meter_db;
+    let avg = match *average {
+        Some(a) => a + (level - a) * 0.2,
+        None => level,
+    };
+    *average = Some(avg);
+    let peak = d.spectrum.iter().copied().fold(f32::MIN, f32::max);
+    out.push(format!("rx_sensors:{rx},{level:.1};"));
+    out.push(format!("rx_channel_sensors:{rx},0,{level:.1};"));
+    out.push(format!("rx_channel_sensors_ex:{rx},0,{level:.1},{avg:.1},{peak:.1};"));
+    true
+}
+
+impl Sensors {
+    /// Takes a sensors command, if `cmd` is one.
+    fn command(&mut self, cmd: &str) -> bool {
+        let (name, args) = cmd.split_once(':').unwrap_or((cmd, ""));
+        let slot = match name.trim().to_ascii_lowercase().as_str() {
+            "rx_sensors_enable" => &mut self.rx,
+            "tx_sensors_enable" => &mut self.tx,
+            _ => return false,
+        };
+        let mut args = args.split(',').map(str::trim);
+        let on = match args.next().map(str::to_ascii_lowercase).as_deref() {
+            Some("true") => true,
+            Some("false") => false,
+            _ => return true,
+        };
+        let ms = match args.next() {
+            Some(a) => match a.parse::<u64>() {
+                Ok(ms) => ms,
+                Err(_) => return true,
+            },
+            None => slot.map_or(SENSORS_DEFAULT_MS, |d| d.as_millis() as u64),
+        };
+        *slot = on.then(|| Duration::from_millis(ms.clamp(30, 1000)));
+        // Straight away, then every interval.
+        if name.trim().eq_ignore_ascii_case("rx_sensors_enable") {
+            self.rx_sent = None;
+        } else {
+            self.tx_sent = None;
+        }
+        true
+    }
+
+    /// The sensor messages due now.
+    fn due(
+        &mut self,
+        display: &DisplayCell,
+        rx2: Option<&Rx2Taps>,
+        tx: &crate::remote::TxInfo,
+        transmitting: bool,
+    ) -> Vec<String> {
+        let mut out = Vec::new();
+        let due = |interval: Option<Duration>, sent: Option<Instant>| {
+            interval.is_some_and(|i| sent.is_none_or(|t| t.elapsed() >= i))
+        };
+        if !transmitting && due(self.rx, self.rx_sent) {
+            let display = display.lock().unwrap().clone();
+            let mut fresh = false;
+            if let Some(display) = display {
+                fresh |= receiver_sensors(0, &display, &mut self.rx_revision, &mut self.rx_average_dbm, &mut out);
+            }
+            // Receiver 1 (see Rx2Share), when there is one.
+            if let Some(rx2) = rx2 {
+                fresh |= receiver_sensors(1, &rx2.display, &mut self.rx2_revision, &mut self.rx2_average_dbm, &mut out);
+            }
+            if fresh {
+                self.rx_sent = Some(Instant::now());
+            }
+        }
+        if transmitting && due(self.tx, self.tx_sent) {
+            out.push(format!(
+                "tx_sensors:0,{:.1},{:.1},{:.1},{:.1};",
+                tx.mic_db, tx.forward_w, tx.forward_w, tx.swr
+            ));
+            self.tx_sent = Some(Instant::now());
+        }
+        out
+    }
+}
+
+/// The commands that name a receiver first, which receiver 1 has too.
+const RECEIVER_COMMANDS: &[&str] = &[
+    "vfo",
+    "modulation",
+    "rx_filter_band",
+    "rx_nb_enable",
+    "rx_nb_enable_ex",
+    "rx_nr_enable",
+    "rx_nr_enable_ex",
+    "rx_anf_enable",
+    "rx_apf_enable",
+    "rx_nf_enable",
+    "rx_bin_enable",
+    "rit_enable",
+    "rit_offset",
+    "rx_ctun_ex",
+    "agc_mode",
+    "agc_gain",
+    "agc_auto_ex",
+    "rx_volume",
+    "sql_enable",
+    "sql_level",
+    "audio_start",
+    "audio_stop",
+    "iq_start",
+    "iq_stop",
+    "rx_enable",
+    "rx_mute",
+    "rx_balance",
+];
+
+/// A command for receiver 1 (see Rx2Share): None if it isn't one --
+/// receiver 0's, or one with no receiver -- else what to answer, if
+/// anything. Its frequencies, RIT and CTUN are asked of main.rs and
+/// echoed, as receiver 0's are; its audio is this client's
+/// audio2_streaming and IQ iq2_streaming; its DSP settings are set as
+/// receiver 0's are, on its own. With no extra receiver behind it, it's
+/// ignored.
+fn rx2_command(
+    cmd: &str,
+    name: &str,
+    share: &crate::remote::RemoteShare,
+    audio2_streaming: &mut bool,
+    iq2_streaming: &mut bool,
+    sink: &ClientAudioIqSink,
+) -> Option<Option<String>> {
+    if !RECEIVER_COMMANDS.contains(&name) {
+        return None;
+    }
+    let args: Vec<&str> = cmd.split_once(':').map_or(Vec::new(), |(_, a)| a.split(',').map(str::trim).collect());
+    if args.first() != Some(&"1") {
+        return None;
+    }
+    // rx_enable:1,<bool> opens or closes it (main.rs): not answered at
+    // once -- the client hears how it turned out once LIVE_HOLD is over.
+    if name == "rx_enable" {
+        if let Some(on) = args.get(1).and_then(|a| a.to_ascii_lowercase().parse::<bool>().ok()) {
+            share.rx2.requests.lock().unwrap().enable = Some(on);
+            return Some(None);
+        }
+    }
+    let Some((taps, f)) = share.rx2.get() else {
+        // Audio and IQ asked for before receiver 1 is open (a client that
+        // asks once, at connect -- ThetisLink does): remembered, so they
+        // flow as soon as it opens.
+        match name {
+            "audio_start" => *audio2_streaming = true,
+            "audio_stop" => *audio2_streaming = false,
+            "iq_start" => *iq2_streaming = true,
+            "iq_stop" => *iq2_streaming = false,
+            _ => {}
+        }
+        return Some(match name {
+            "rx_enable" => Some("rx_enable:1,false;".to_string()),
+            "audio_start" | "audio_stop" | "iq_start" | "iq_stop" => Some(format!("{name}:1;")),
+            _ => None,
+        });
+    };
+    let mut requests = share.rx2.requests.lock().unwrap();
+    let reply = match name {
+        "vfo" => {
+            let vfo_b = args.get(1) == Some(&"1");
+            match args.get(2).and_then(|a| a.parse::<f64>().ok()) {
+                Some(hz) => {
+                    let hz = hz.round().max(0.0) as u64;
+                    if vfo_b {
+                        requests.vfo_b_hz = Some(hz);
+                    } else {
+                        requests.frequency_hz = Some(hz);
+                    }
+                    format!("vfo:1,{},{hz};", u8::from(vfo_b))
+                }
+                None => format!("vfo:1,{},{};", u8::from(vfo_b), if vfo_b { f.vfo_b_hz } else { f.frequency_hz }),
+            }
+        }
+        "rit_enable" => match args.get(1).and_then(|a| a.to_ascii_lowercase().parse::<bool>().ok()) {
+            Some(on) => {
+                requests.rit_enabled = Some(on);
+                format!("rit_enable:1,{on};")
+            }
+            None => format!("rit_enable:1,{};", f.rit_enabled),
+        },
+        "rit_offset" => match args.get(1).and_then(|a| a.parse::<f64>().ok()) {
+            Some(hz) => {
+                let hz = hz.round() as i32;
+                requests.rit_offset_hz = Some(hz);
+                format!("rit_offset:1,{hz};")
+            }
+            None => format!("rit_offset:1,{};", f.rit_offset_hz),
+        },
+        "rx_ctun_ex" => match args.get(1).and_then(|a| a.to_ascii_lowercase().parse::<bool>().ok()) {
+            Some(on) => {
+                requests.ctun = Some(on);
+                format!("rx_ctun_ex:1,{on};")
+            }
+            None => format!("rx_ctun_ex:1,{};", f.ctun),
+        },
+        "audio_start" => {
+            if !*audio2_streaming {
+                sink.audio2.lock().unwrap().clear();
+            }
+            *audio2_streaming = true;
+            "audio_start:1;".to_string()
+        }
+        "audio_stop" => {
+            *audio2_streaming = false;
+            "audio_stop:1;".to_string()
+        }
+        // As receiver 0's: what queued before it was asked for is dropped,
+        // so it starts from now -- only when it wasn't already on.
+        "iq_start" => {
+            if !*iq2_streaming {
+                sink.iq2.lock().unwrap().clear();
+            }
+            *iq2_streaming = true;
+            "iq_start:1;".to_string()
+        }
+        "iq_stop" => {
+            *iq2_streaming = false;
+            "iq_stop:1;".to_string()
+        }
+        "rx_enable" => "rx_enable:1,true;".to_string(),
+        _ => {
+            drop(requests);
+            // Its DSP settings, as receiver 0's: the same handlers, on its
+            // own settings.
+            if let Some(reply) = control_command(cmd, share, &taps.demod_params) {
+                return Some(reply);
+            }
+            let unused_u64 = Arc::new(AtomicU64::new(0));
+            return Some(handle_command(
+                cmd,
+                &unused_u64,
+                &Arc::new(AtomicU64::new(f.frequency_hz)),
+                &crate::radio::VfoBShared::default(),
+                &taps.demod_params,
+                &Arc::new(AtomicBool::new(false)),
+                &Arc::new(AtomicU32::new(0)),
+                &Arc::new(AtomicBool::new(false)),
+                &Arc::new(AtomicBool::new(false)),
+                &Arc::new(AtomicI32::new(0)),
+                &Arc::new(AtomicBool::new(false)),
+                &Arc::new(AtomicI32::new(0)),
+                &Arc::new(AtomicBool::new(false)),
+                &mut false,
+                &mut MAX_AUDIO_SAMPLES_PER_MESSAGE.clone(),
+                &mut false,
+                sink,
+            ));
+        }
+    };
+    Some(Some(reply))
+}
+
+/// TCI's controls, as Thetis takes them (TCIServer.cs): tune, drive,
+/// tune_drive, rx_filter_band, volume and rx_volume, agc_mode and
+/// agc_gain, sql_enable and sql_level. With only the receiver it's a
+/// question, answered with the setting; with a value it sets it, not
+/// answered at once -- the client hears what it became, from handle_client's
+/// live notifications, once LIVE_HOLD is over. None if `cmd` isn't one
+/// of these.
+///
+/// Tune and drive go through main.rs, as the TUNE button and the TX
+/// Power slider (RemoteShare); the rest straight into the receiver's
+/// settings, as the hpsdr-remote client's hpsdr_set does.
+/// Whether `cmd` (one command, without its ';') would key the radio or
+/// change how it transmits -- refused from a receive-only client. Asking
+/// what trx, tune or drive are (the receiver alone) is fine.
+fn transmits(cmd: &str) -> bool {
+    let (name, args) = cmd.split_once(':').unwrap_or((cmd, ""));
+    let name = name.trim().to_ascii_lowercase();
+    let mut args = args.split(',').map(str::trim).filter(|a| !a.is_empty());
+    match name.as_str() {
+        "trx" | "tune" | "drive" | "tune_drive" => args.nth(1).is_some(),
+        "tx_profile_ex" | "tx_filter_band_ex" => args.next().is_some(),
+        hpsdr_proto::tx::MOX | hpsdr_proto::cw::KEY | hpsdr_proto::cw::KEYER => true,
+        hpsdr_proto::state::SET => args.next() == Some(hpsdr_proto::tx::SET_POWER),
+        n => n.starts_with(hpsdr_proto::cw::MACROS),
+    }
+}
+
+fn control_command(cmd: &str, share: &crate::remote::RemoteShare, params: &Mutex<DemodParams>) -> Option<Option<String>> {
+    let (name, args) = cmd.split_once(':').unwrap_or((cmd, ""));
+    let name = name.trim().to_ascii_lowercase();
+    let args: Vec<&str> = args.split(',').map(str::trim).filter(|a| !a.is_empty()).collect();
+    let tx = share.tx();
+    // vfo_swap_ex; -- no arguments at all, as the A<>B button.
+    if name == "vfo_swap_ex" {
+        share.request_vfo_swap();
+        return Some(None);
+    }
+    // TX profiles and the TX filter (Settings -> TX): no receiver. As
+    // Thetis, choosing a profile has no reply -- the live notification
+    // reports it (unknown names do nothing, main.rs).
+    match name.as_str() {
+        "tx_profiles_ex" => return Some(Some(tx_profile_state(share)[0].1.clone())),
+        "tx_profile_ex" => {
+            return Some(match args.first() {
+                Some(profile) => {
+                    share.request_tx_profile(profile);
+                    None
+                }
+                None => Some(tx_profile_state(share)[1].1.clone()),
+            });
+        }
+        // As Thetis without RX2 (TCIServer.cs handleLock, handleVFOLock):
+        // lock:0 is VFO A, lock:1 VFO B; vfo_lock:0,0 VFO A, vfo_lock:0,1
+        // VFO B, any other receiver or VFO nothing. With the value it's
+        // set (reported live), without it answered.
+        "lock" | "vfo_lock" => {
+            let vfo_b = match (name.as_str(), args.first().copied(), args.get(1).copied()) {
+                ("lock", Some("0"), _) | ("vfo_lock", Some("0"), Some("0")) => false,
+                ("lock", Some("1"), _) | ("vfo_lock", Some("0"), Some("1")) => true,
+                _ => return Some(None),
+            };
+            let value = args.get(if name == "lock" { 1 } else { 2 });
+            return Some(match value.and_then(|v| v.to_ascii_lowercase().parse::<bool>().ok()) {
+                Some(on) => {
+                    share.request_vfo_lock(vfo_b, on);
+                    None
+                }
+                None => {
+                    let on = if vfo_b { tx.vfo_b_lock } else { tx.vfo_a_lock };
+                    Some(if name == "lock" {
+                        format!("lock:{},{on};", args[0])
+                    } else {
+                        format!("vfo_lock:0,{},{on};", args[1])
+                    })
+                }
+            });
+        }
+        "vfo_sync_ex" => {
+            return Some(match args.first().and_then(|v| v.to_ascii_lowercase().parse::<bool>().ok()) {
+                Some(on) => {
+                    share.request_vfo_sync(on);
+                    None
+                }
+                None => Some(format!("vfo_sync_ex:{};", tx.vfo_sync)),
+            });
+        }
+        "tx_filter_band_ex" => {
+            let edges = (args.first().and_then(|v| v.parse::<f64>().ok()), args.get(1).and_then(|v| v.parse::<f64>().ok()));
+            return Some(match edges {
+                (Some(low), Some(high)) if high > low => {
+                    share.request_tx_filter(low, high);
+                    None
+                }
+                _ => Some(tx_filter_message(&tx)),
+            });
+        }
+        _ => {}
+    }
+    let mut p = params.lock().unwrap();
+    // Receiver, then the value(s) -- rx_volume has a channel too.
+    let values = match name.as_str() {
+        "volume" | "mute" | "mon_enable" | "mon_volume" | "cw_keyer_speed" => &args[..],
+        "rx_balance" => args.get(2..).unwrap_or(&[]),
+        "rx_volume" => args.get(2..).unwrap_or(&[]),
+        "tune" | "drive" | "tune_drive" | "split_enable" | "rx_filter_band" | "agc_mode" | "agc_gain" | "sql_enable"
+        | "sql_level" | "rx_mute" | "rx_step_att_ex" | "rx_step_att_enabled_ex" => {
+            args.get(1..).unwrap_or(&[])
+        }
+        _ => return None,
+    };
+    let rx = args.first().copied().unwrap_or("0");
+    let number = |i: usize| values.get(i).and_then(|v| v.parse::<f64>().ok());
+    let boolean = |i: usize| values.get(i).and_then(|v| v.to_ascii_lowercase().parse::<bool>().ok());
+    if values.is_empty() {
+        let (pb_low, pb_high) = passband_for(p.mode, p.width_hz);
+        return Some(Some(match name.as_str() {
+            "tune" => format!("tune:{rx},{};", tx.tune),
+            "split_enable" => format!("split_enable:{rx},{};", tx.split),
+            "drive" => format!("drive:{rx},{};", drive_percent(&tx)),
+            "tune_drive" => format!("tune_drive:{rx},{};", tx.tune_power_percent),
+            "rx_filter_band" => format!("rx_filter_band:{rx},{},{};", pb_low.round() as i64, pb_high.round() as i64),
+            "volume" => format!("volume:{:.1};", gain_to_tci_db(p.gain).clamp(-60.0, 0.0)),
+            "rx_volume" => format!("rx_volume:{rx},{},{:.2};", args.get(1).unwrap_or(&"0"), gain_to_tci_db(p.gain)),
+            "agc_mode" => format!("agc_mode:{rx},{};", agc_to_tci(p.agc)),
+            "agc_gain" => format!("agc_gain:{rx},{};", p.agc_top_db.round() as i64),
+            "sql_enable" => format!("sql_enable:{rx},{};", p.squelch_enabled),
+            "rx_mute" => format!("rx_mute:{rx},{};", p.muted),
+            "mute" => format!("mute:{};", p.muted),
+            "mon_enable" => format!("mon_enable:{};", tx.monitor),
+            "mon_volume" => format!("mon_volume:{:.1};", monitor_volume_db(&tx)),
+            // Sub-receiver (channel 1): hpsdr-rs has none, so it's in the
+            // middle.
+            "rx_balance" => {
+                let chan = args.get(1).copied().unwrap_or("0");
+                let balance = if chan == "0" { pan_to_balance(p.audio_pan) } else { 0.0 };
+                format!("rx_balance:{rx},{chan},{balance:.2};")
+            }
+            "cw_keyer_speed" => format!("cw_keyer_speed:{};", tx.cw_speed_wpm),
+            "rx_step_att_ex" => format!("rx_step_att_ex:{rx},{};", tx.rx_att.map_or(0, |a| a.db)),
+            "rx_step_att_enabled_ex" => format!("rx_step_att_enabled_ex:{rx},{};", tx.rx_att.is_some()),
+            _ => format!("sql_level:{rx},{};", squelch_to_tci_db(p.squelch_level)),
+        }));
+    }
+    match name.as_str() {
+        "tune" => {
+            if let Some(on) = boolean(0) {
+                share.request_tune(on);
+            }
+        }
+        "split_enable" => {
+            if let Some(on) = boolean(0) {
+                share.request_split(on);
+            }
+        }
+        "drive" => {
+            if let Some(percent) = number(0) {
+                let percent = percent.clamp(0.0, 100.0);
+                share.request_power((percent * tx.max_power_w as f64 / 100.0).round() as u32);
+            }
+        }
+        "tune_drive" => {
+            if let Some(percent) = number(0) {
+                share.request_tune_power(percent.clamp(0.0, 100.0).round() as u32);
+            }
+        }
+        "rx_filter_band" => {
+            if let (Some(low), Some(high)) = (number(0), number(1)) {
+                if let Some(width) = width_for_band(p.mode, low, high) {
+                    p.width_hz = width.clamp(50.0, 20_000.0);
+                    // Receiver 0's: the TX filter follows (main.rs).
+                    if rx != "1" {
+                        share.filter_changed();
+                    }
+                }
+            }
+        }
+        "volume" | "rx_volume" => {
+            if let Some(db) = number(0) {
+                p.gain = tci_db_to_gain(db);
+            }
+        }
+        "agc_mode" => {
+            if let Some(mode) = values.first() {
+                p.agc = tci_to_agc(mode);
+            }
+        }
+        "agc_gain" => {
+            // Thetis takes -20 to 120 (its AGC-T); this AGC's top is 0-140.
+            // Setting it turns Auto AGC off, as the slider does.
+            if let Some(db) = number(0) {
+                p.agc_top_db = db.clamp(0.0, 140.0);
+                p.agc_auto = false;
+            }
+        }
+        "sql_enable" => {
+            if let Some(on) = boolean(0) {
+                p.squelch_enabled = on;
+            }
+        }
+        // As the main window's Mute: this receiver's speakers only.
+        "rx_mute" | "mute" => {
+            if let Some(on) = boolean(0) {
+                p.muted = on;
+            }
+        }
+        "mon_enable" => {
+            if let Some(on) = boolean(0) {
+                share.request_monitor(on);
+            }
+        }
+        "mon_volume" => {
+            if let Some(db) = number(0) {
+                share.request_monitor_volume(tci_db_to_gain(db));
+            }
+        }
+        // Channel 0 only: there's no sub-receiver to pan.
+        "rx_balance" => {
+            if let (Some(balance), Some(&"0")) = (number(0), args.get(1)) {
+                p.audio_pan = balance_to_pan(balance);
+            }
+        }
+        "cw_keyer_speed" => {
+            if let Some(wpm) = number(0) {
+                share.request_cw_speed(wpm.round().max(0.0) as u32);
+            }
+        }
+        // Receiver 0's only: one front end (main.rs clamps it to the
+        // board's range).
+        "rx_step_att_ex" => {
+            if let (Some(db), "0", Some(_)) = (number(0), rx, tx.rx_att) {
+                share.request_rx_att(db.round() as i32);
+            }
+        }
+        // There's a step attenuator or there isn't: nothing to set.
+        "rx_step_att_enabled_ex" => {}
+        _ => {
+            if let Some(db) = number(0) {
+                p.squelch_level = tci_db_to_squelch(db);
+            }
+        }
+    }
+    Some(None)
+}
+
+/// The filter width that gives a passband nearest `low`-`high` Hz in
+/// `mode`: hpsdr-rs's filters are a width placed by the mode (see
+/// spectrum::passband_for), so a passband the mode can't make is
+/// matched by its width -- the edge away from the carrier for SSB and
+/// digital, the whole span for CW, the wider side for AM and FM. None
+/// for nonsense (high not above low).
+fn width_for_band(mode: Mode, low: f64, high: f64) -> Option<f64> {
+    if high <= low {
+        return None;
+    }
+    Some(match mode {
+        Mode::Lsb | Mode::Digl => -low,
+        Mode::Usb | Mode::Digu | Mode::Spec => high,
+        Mode::Cwl | Mode::Cwu => high - low,
+        Mode::Am | Mode::Sam | Mode::Dsb | Mode::Fmn | Mode::Drm => low.abs().max(high.abs()),
+    })
+    .filter(|w| *w > 0.0)
+}
+
+/// TCI's volume, dB, as this project's linear gain: as Thetis, -60 dB
+/// and below is silence, 0 dB the most.
+fn tci_db_to_gain(db: f64) -> f32 {
+    if db <= -60.0 { 0.0 } else { 10f64.powf(db.min(0.0) / 20.0) as f32 }
+}
+
+/// A client's AGC mode, as Thetis reads it (tciModeToAgcMode): off or
+/// fixed is off, normal/med/medium (and anything it doesn't know) medium.
+fn tci_to_agc(mode: &str) -> Agc {
+    match mode.trim().to_ascii_lowercase().as_str() {
+        "off" | "fixd" | "fixed" => Agc::Off,
+        "long" => Agc::Long,
+        "slow" => Agc::Slow,
+        "fast" => Agc::Fast,
+        _ => Agc::Medium,
+    }
+}
+
+/// TCI's sql_level, dB (-140 to 0), as the squelch's 0-100 -- the
+/// reverse of squelch_to_tci_db.
+fn tci_db_to_squelch(db: f64) -> f32 {
+    ((db.clamp(-140.0, 0.0) + 140.0) / 1.4) as f32
+}
+
+/// The TX power setting as TCI's drive, 0-100 % of the radio's maximum.
+fn drive_percent(tx: &crate::remote::TxInfo) -> u32 {
+    if tx.max_power_w == 0 {
+        0
+    } else {
+        (tx.power_w * 100 + tx.max_power_w / 2) / tx.max_power_w
+    }
+}
+
+/// The squelch level (0-100, 0 open) as TCI's sql_level, dB from -140
+/// (open) to 0 -- Thetis's range; hpsdr-rs's own level is per-mode
+/// (see spectrum::Squelch), so this is a straight scaling, not a real
+/// signal level.
+fn squelch_to_tci_db(level: f32) -> i32 {
+    (-140.0 + level.clamp(0.0, 100.0) * 1.4).round() as i32
+}
+
+/// After a client sends a command, reports of what it changes are held
+/// back this long: the radio may not have caught up with it yet, and
+/// reporting the value it's on its way from would make a client still
+/// tuning or sliding jump back. Anything still different once it's over
+/// is sent then.
+const LIVE_HOLD: Duration = Duration::from_millis(500);
+
+/// The live_state messages, by command name, that a client's command
+/// `name` changes -- held back for LIVE_HOLD.
+fn live_families(name: &str) -> &'static [&'static str] {
+    match name {
+        "vfo" | "hpsdr_band" => &["vfo", "if", "dds"],
+        "modulation" => &["modulation", "rx_filter_band"],
+        "rx_filter_band" => &["rx_filter_band"],
+        "trx" | "hpsdr_mox" => &["trx"],
+        "rit_enable" => &["rit_enable"],
+        "rit_offset" => &["rit_offset"],
+        "xit_enable" => &["xit_enable"],
+        "xit_offset" => &["xit_offset"],
+        "rx_ctun_ex" => &["rx_ctun_ex"],
+        "agc_mode" => &["agc_mode"],
+        // Setting the gain turns Auto AGC off.
+        "agc_gain" => &["agc_gain", "agc_auto_ex"],
+        "agc_auto_ex" => &["agc_auto_ex"],
+        "rx_volume" | "volume" => &["rx_volume", "volume"],
+        "tune" => &["tune", "drive"],
+        "split_enable" => &["split_enable", "tx_frequency", "tx_frequency_ex"],
+        "drive" => &["drive"],
+        "tune_drive" => &["tune_drive", "drive"],
+        "sql_enable" => &["sql_enable"],
+        "rx_enable" => &["rx_enable"],
+        "sql_level" => &["sql_level"],
+        "rx_mute" | "mute" => &["rx_mute", "mute"],
+        "mon_enable" => &["mon_enable"],
+        "mon_volume" => &["mon_volume"],
+        "rx_balance" => &["rx_balance"],
+        "cw_keyer_speed" | "cw_macros_speed" => &["cw_keyer_speed"],
+        "rx_step_att_ex" => &["rx_step_att_ex"],
+        "tx_profile_ex" => &["tx_profile_ex", "tx_filter_band_ex"],
+        "tx_filter_band_ex" => &["tx_filter_band_ex"],
+        // A lock turns Sync off; Sync turns Split off and moves VFO B.
+        "lock" | "vfo_lock" => &["lock", "vfo_lock", "vfo_sync_ex"],
+        "vfo_sync_ex" => &["vfo_sync_ex", "split_enable", "vfo", "if", "tx_frequency", "tx_frequency_ex"],
+        "vfo_swap_ex" => &["vfo", "if", "dds", "tx_frequency", "tx_frequency_ex"],
+        "rx_anf_enable" => &["rx_anf_enable"],
+        "rx_apf_enable" => &["rx_apf_enable"],
+        "rx_nf_enable" => &["rx_nf_enable"],
+        "rx_bin_enable" => &["rx_bin_enable"],
+        "rx_nb_enable" | "rx_nb_enable_ex" | "rx_nb2_enable" => &["rx_nb_enable", "rx_nb_enable_ex", "rx_nb2_enable"],
+        "rx_nr_enable" | "rx_nr_enable_ex" => &["rx_nr_enable", "rx_nr_enable_ex"],
+        "hpsdr_set" => &[
+            "rx_filter_band",
+            "agc_mode",
+            "rx_anf_enable",
+            "rx_nb_enable",
+            "rx_nb_enable_ex",
+            "rx_nb2_enable",
+            "rx_nr_enable",
+            "rx_nr_enable_ex",
+        ],
+        _ => &[],
+    }
+}
+
 /// Samples requested per TxChrono message -- NOT tied to tx.rs's own
 /// TX_BUFFER_SIZE (that's this project's WDSP-consumption granularity;
 /// tci_tx_audio, a plain queue, already decouples producer and consumer
@@ -1790,6 +3110,10 @@ fn handle_client(
 /// this project can fix by tuning TCI_TX_AUDIO_CHUNK further. 2048 is
 /// kept because it's the best-evidenced value (matches a real working
 /// Thetis session), not because it resolved the underlying issue.
+///
+/// Now the default only, announced at connect: a client that sends
+/// audio_stream_samples gets TX audio asked for in blocks of its own
+/// size instead (see MAX_AUDIO_SAMPLES_PER_MESSAGE).
 const TCI_TX_AUDIO_CHUNK: u32 = 2048;
 
 /// Target amount of TX audio to keep pre-buffered in tci_tx_audio while
@@ -1970,6 +3294,7 @@ fn decode_binary_message(data: &[u8]) -> Option<(u32, Vec<f32>)> {
 fn handle_command(
     cmd: &str,
     requested_frequency_hz: &Arc<AtomicU64>,
+    rx_frequency_hz: &Arc<AtomicU64>,
     vfo_b: &crate::radio::VfoBShared,
     demod_params: &Arc<Mutex<DemodParams>>,
     mox: &Arc<AtomicBool>,
@@ -1985,6 +3310,7 @@ fn handle_command(
     xit_offset_hz: &Arc<AtomicI32>,
     tci_wants_mic: &Arc<AtomicBool>,
     audio_streaming: &mut bool,
+    audio_samples: &mut usize,
     iq_streaming: &mut bool,
     sink: &ClientAudioIqSink,
 ) -> Option<String> {
@@ -2016,7 +3342,7 @@ fn handle_command(
         // modulation:receiver,mode;
         "modulation" => {
             let requested = *args.get(1)?;
-            let mode = tci_to_mode(requested)?;
+            let mode = tci_to_mode(requested, rx_frequency_hz.load(Ordering::Relaxed))?;
             demod_params.lock().unwrap().mode = mode;
             // BUG FIX: this used to echo back mode_to_tci(mode) (this
             // project's own fixed-case convention, e.g. "USB") instead
@@ -2168,6 +3494,37 @@ fn handle_command(
                 }
             }
         }
+        // rx_apf_enable:receiver[,bool]; -- the CW Audio Peak Filter
+        // (DemodParams::apf), set or asked as rx_anf_enable above. As
+        // Thetis's (TCIServer.cs handleRxApfEnable) it can be on in any
+        // mode but only runs in CW.
+        "rx_apf_enable" => {
+            let recv = args.first().unwrap_or(&"0");
+            if let Some(on) = args.get(1).and_then(|v| v.trim().to_ascii_lowercase().parse::<bool>().ok()) {
+                demod_params.lock().unwrap().apf = on;
+            }
+            Some(format!("rx_apf_enable:{recv},{};", demod_params.lock().unwrap().apf))
+        }
+        // agc_auto_ex:receiver[,bool]; -- Auto AGC (DemodParams::agc_auto),
+        // set or asked as rx_apf_enable above. Thetis's TCI server has no
+        // such command; this is ThetisLink's name for it.
+        "agc_auto_ex" => {
+            let recv = args.first().unwrap_or(&"0");
+            if let Some(on) = args.get(1).and_then(|v| v.trim().to_ascii_lowercase().parse::<bool>().ok()) {
+                demod_params.lock().unwrap().agc_auto = on;
+            }
+            Some(format!("agc_auto_ex:{recv},{};", demod_params.lock().unwrap().agc_auto))
+        }
+        // rx_nf_enable:receiver[,bool]; -- TNF, the manual notches' master
+        // switch, which is every receiver's: as Thetis's handleRxNfEnable
+        // (TNFActive), whichever receiver it names.
+        "rx_nf_enable" => {
+            let recv = args.first().unwrap_or(&"0");
+            if let Some(on) = args.get(1).and_then(|v| v.trim().to_ascii_lowercase().parse::<bool>().ok()) {
+                crate::spectrum::set_tnf(on);
+            }
+            Some(format!("rx_nf_enable:{recv},{};", crate::spectrum::tnf()))
+        }
         // rx_bin_enable:receiver[,bool]; -- same bare-query-or-set
         // pattern as rx_anf_enable above. See DemodParams::binaural's
         // doc comment for what this actually controls.
@@ -2288,6 +3645,17 @@ fn handle_command(
             *audio_streaming = false;
             Some(format!("audio_stop:{};", args.first().unwrap_or(&"0")))
         }
+        // audio_stream_samples:n; -- the samples per audio message, both
+        // RX audio and the TX audio asked for, AUDIO_STREAM_SAMPLES_MIN to
+        // MAX_AUDIO_SAMPLES_PER_MESSAGE. As Thetis: anything else is
+        // ignored, and the reply is the size in use either way.
+        "audio_stream_samples" => {
+            let n = args.first().and_then(|a| a.trim().parse::<usize>().ok());
+            if let Some(n) = n.filter(|n| (AUDIO_STREAM_SAMPLES_MIN..=MAX_AUDIO_SAMPLES_PER_MESSAGE).contains(n)) {
+                *audio_samples = n;
+            }
+            Some(format!("audio_stream_samples:{audio_samples};"))
+        }
         // iq_start:receiver; / iq_stop:receiver; -- same reasoning as
         // audio_start/stop above.
         "iq_start" => {
@@ -2327,14 +3695,6 @@ fn handle_command(
             *iq_streaming = false;
             Some(format!("iq_stop:{};", args.first().unwrap_or(&"0")))
         }
-        // Bare queries (no args) for state also pushed once at connect
-        // (see handle_client's initial state push) -- answered here too
-        // since a client is explicitly asking again, not just relying
-        // on what it already got. This project has no real TX-profile
-        // concept (Thetis-style PA/EQ profile switching), so "Default"
-        // is a static, harmless stand-in.
-        "tx_profile_ex" => Some("tx_profile_ex:Default;".to_string()),
-        "tx_profiles_ex" => Some("tx_profiles_ex:Default;".to_string()),
         _ => None,
     }
 }
@@ -2362,7 +3722,10 @@ fn mode_to_tci(mode: Mode) -> &'static str {
         Mode::Lsb => "lsb",
         Mode::Usb => "usb",
         Mode::Dsb => "dsb",
-        Mode::Cwl | Mode::Cwu => "cw",
+        // As Thetis (TCIServer.cs sendMode, with its "CWL/CWU becomes CW"
+        // option off, the default): the sideband, not plain CW.
+        Mode::Cwl => "cwl",
+        Mode::Cwu => "cwu",
         Mode::Fmn => "nfm",
         Mode::Am => "am",
         Mode::Digu => "digu",
@@ -2373,12 +3736,20 @@ fn mode_to_tci(mode: Mode) -> &'static str {
     }
 }
 
-fn tci_to_mode(s: &str) -> Option<Mode> {
+/// A client's mode, at `freq_hz`. Plain CW (which some clients send)
+/// takes the usual sideband for the frequency -- CWL below 10 MHz, CWU
+/// from 10 MHz up, as Thetis's "CW becomes CWU above 10 MHz" option --
+/// and CWR the other one.
+fn tci_to_mode(s: &str, freq_hz: u64) -> Option<Mode> {
+    let (cw, cw_reverse) = if freq_hz >= 10_000_000 { (Mode::Cwu, Mode::Cwl) } else { (Mode::Cwl, Mode::Cwu) };
     match s.to_uppercase().as_str() {
         "LSB" => Some(Mode::Lsb),
         "USB" => Some(Mode::Usb),
         "DSB" => Some(Mode::Dsb),
-        "CW" | "CWR" => Some(Mode::Cwu),
+        "CWL" => Some(Mode::Cwl),
+        "CWU" => Some(Mode::Cwu),
+        "CW" => Some(cw),
+        "CWR" => Some(cw_reverse),
         "NFM" | "FM" | "WFM" => Some(Mode::Fmn),
         "AM" => Some(Mode::Am),
         "DIGU" | "PKTUSB" => Some(Mode::Digu),
@@ -2448,6 +3819,7 @@ mod remote_tests {
             Arc::new(AtomicBool::new(false)),
             Arc::new(AtomicI32::new(0)),
             "Test".to_string(),
+            Arc::new(crate::radio::CwKeyerAtomics::default()),
             DebugLog::new(std::env::temp_dir().join("hpsdr-rs-tci-remote-test.log")),
         )
         .unwrap();
@@ -2523,6 +3895,9 @@ mod remote_tests {
         let port = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
         let mox = Arc::new(AtomicBool::new(false));
         let tci_tx_audio = Arc::new(Mutex::new(VecDeque::with_capacity(24_000)));
+        let cw_keyer = Arc::new(crate::radio::CwKeyerAtomics::default());
+        cw_keyer.live.rate.store(48_000, Ordering::Relaxed);
+        cw_keyer.hang_time_ms.store(0, Ordering::Relaxed);
         let mut server = TciServer::start(
             &format!("127.0.0.1:{port}"),
             Arc::new(AtomicU64::new(14_200_000)),
@@ -2546,6 +3921,7 @@ mod remote_tests {
             Arc::new(AtomicBool::new(false)),
             Arc::new(AtomicI32::new(0)),
             "Test".to_string(),
+            Arc::clone(&cw_keyer),
             DebugLog::new(std::env::temp_dir().join("hpsdr-rs-tci-remote-tx-test.log")),
         )
         .unwrap();
@@ -2556,7 +3932,36 @@ mod remote_tests {
             max_power_w: 100,
             forward_w: 0.0,
             swr: 1.0,
+            cw_sending: false,
+            cw_speed_wpm: 20,
+            ..Default::default()
         });
+
+        // Through the web server with no password: told it can't, and
+        // never keys.
+        {
+            use tungstenite::client::IntoClientRequest;
+            let mut request = format!("ws://127.0.0.1:{port}").into_client_request().unwrap();
+            request.headers_mut().insert(
+                tungstenite::http::HeaderName::from_bytes(crate::web_server::RECEIVE_ONLY_HEADER.as_bytes()).unwrap(),
+                "1".parse().unwrap(),
+            );
+            let (mut ws, _) = tungstenite::connect(request).unwrap();
+            if let tungstenite::stream::MaybeTlsStream::Plain(s) = ws.get_ref() {
+                s.set_read_timeout(Some(Duration::from_millis(20))).unwrap();
+            }
+            ws.send(Message::Text("hpsdr_hello:1;hpsdr_mox:true;trx:0,true;keyer:0,true;".into())).unwrap();
+            let mut heard = String::new();
+            let until = Instant::now() + Duration::from_millis(1500);
+            while Instant::now() < until {
+                if let Ok(Message::Text(t)) = ws.read() {
+                    heard.push_str(&t);
+                }
+                assert!(!mox.load(Ordering::Relaxed), "a receive-only client keyed the radio");
+            }
+            assert!(heard.contains("receive_only:true;") && heard.contains("tx_enable:0,false;"), "{heard}");
+            assert!(heard.contains("hpsdr_tx:false,"), "{heard}");
+        }
 
         let (mut ws, _) = tungstenite::connect(format!("ws://127.0.0.1:{port}")).unwrap();
         if let tungstenite::stream::MaybeTlsStream::Plain(s) = ws.get_ref() {
@@ -2600,6 +4005,1041 @@ mod remote_tests {
             std::thread::sleep(Duration::from_millis(20));
         }
         assert!(!mox.load(Ordering::Relaxed), "unkeyed once the client went");
+
+        // CW text from a plain TCI client (no hpsdr_hello): told the
+        // speed, and its text queued for main.rs, reserved characters
+        // restored.
+        let (mut ws, _) = tungstenite::connect(format!("ws://127.0.0.1:{port}")).unwrap();
+        if let tungstenite::stream::MaybeTlsStream::Plain(s) = ws.get_ref() {
+            s.set_read_timeout(Some(Duration::from_millis(20))).unwrap();
+        }
+        ws.send(Message::Text("modulation:0,cw;cw_macros:0,TEST~ 73;".into())).unwrap();
+        let by = Instant::now() + Duration::from_secs(2);
+        let mut speed_told = false;
+        let mut queued = Vec::new();
+        while (!speed_told || queued.is_empty()) && Instant::now() < by {
+            if let Ok(Message::Text(t)) = ws.read() {
+                speed_told |= t.contains("cw_macros_speed:20;");
+            }
+            queued.extend(server.take_cw().text);
+        }
+        assert!(speed_told, "told the CW speed");
+        assert_eq!(queued, vec!["TEST, 73".to_string()]);
+        drop(ws);
+
+        // Live keying from an hpsdr-remote client, in CW: the first
+        // key-down keys the radio and is scheduled the delay ahead on the
+        // transmitter's clock, the release 60 ms (2,880 samples) after it;
+        // with no hang time the radio unkeys once the clock passes it.
+        let (mut ws, _) = tungstenite::connect(format!("ws://127.0.0.1:{port}")).unwrap();
+        if let tungstenite::stream::MaybeTlsStream::Plain(s) = ws.get_ref() {
+            s.set_read_timeout(Some(Duration::from_millis(20))).unwrap();
+        }
+        let live = &cw_keyer.live;
+        live.clock.store(1_000, Ordering::Relaxed);
+        ws.send(Message::Text("hpsdr_hello:1;modulation:0,cw;hpsdr_key:5000,true,100;hpsdr_key:5060,false,100;".into()))
+            .unwrap();
+        let by = Instant::now() + Duration::from_secs(2);
+        while live.events.lock().unwrap().len() < 2 && Instant::now() < by {
+            let _ = ws.read();
+        }
+        let start = 1_000 + 100 * 48;
+        assert_eq!(live.events.lock().unwrap().iter().copied().collect::<Vec<_>>(), vec![(start, true), (start + 2_880, false)]);
+        assert!(mox.load(Ordering::Relaxed) && live.active.load(Ordering::Relaxed), "keyed");
+        live.clock.store(start + 2_880 + 10 * 48, Ordering::Relaxed);
+        let by = Instant::now() + Duration::from_secs(2);
+        while mox.load(Ordering::Relaxed) && Instant::now() < by {
+            let _ = ws.read();
+        }
+        assert!(!mox.load(Ordering::Relaxed) && !live.active.load(Ordering::Relaxed), "unkeyed after the release");
+        server.stop();
+    }
+
+    /// A plain TCI client asking for 20 ms audio blocks
+    /// (audio_stream_samples:960, as Thetis allows) gets RX audio in
+    /// blocks that size, and TX audio asked for in them; a size out of
+    /// range is ignored, the reply giving the one in use.
+    #[test]
+    fn a_client_chooses_its_audio_block_size() {
+        let port = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let tci_audio_out = Arc::new(Mutex::new(VecDeque::new()));
+        let mox = Arc::new(AtomicBool::new(false));
+        let mut server = TciServer::start(
+            &format!("127.0.0.1:{port}"),
+            Arc::new(AtomicU64::new(7_100_000)),
+            Arc::new(AtomicU64::new(7_100_000)),
+            Arc::new(AtomicU32::new(7_100_000)),
+            Arc::new(AtomicI64::new(0)),
+            Arc::new(crate::radio::VfoBShared::default()),
+            Arc::new(AtomicU32::new(192_000)),
+            Arc::new(Mutex::new(DemodParams::default())),
+            Arc::clone(&mox),
+            Arc::new(AtomicU32::new(7_100_000)),
+            Arc::new(AtomicBool::new(false)),
+            Arc::clone(&tci_audio_out),
+            Arc::new(Mutex::new(VecDeque::new())),
+            Arc::new(Mutex::new(VecDeque::new())),
+            Arc::new(Mutex::new(1.0)),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicI32::new(0)),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicI32::new(0)),
+            "Test".to_string(),
+            Arc::new(crate::radio::CwKeyerAtomics::default()),
+            DebugLog::new(std::env::temp_dir().join("hpsdr-rs-tci-block-test.log")),
+        )
+        .unwrap();
+        let (mut ws, _) = tungstenite::connect(format!("ws://127.0.0.1:{port}")).unwrap();
+        if let tungstenite::stream::MaybeTlsStream::Plain(s) = ws.get_ref() {
+            s.set_read_timeout(Some(Duration::from_millis(100))).unwrap();
+        }
+        ws.send(Message::Text("audio_stream_samples:960;audio_stream_samples:50;audio_start:0;".into())).unwrap();
+        let (mut replies, mut rx_blocks, mut chrono) = (Vec::new(), 0, 0);
+        let start = Instant::now();
+        while start.elapsed() < Duration::from_secs(2) {
+            match ws.read() {
+                Ok(Message::Text(t)) if t.starts_with("audio_stream_samples:") => {
+                    replies.push(t.to_string());
+                    if replies.len() == 2 {
+                        // Set up: half a second of audio, then key.
+                        tci_audio_out.lock().unwrap().extend(std::iter::repeat_n((0.1f32, 0.1f32), 24_000));
+                        mox.store(true, Ordering::Relaxed);
+                    }
+                }
+                Ok(Message::Binary(b)) => {
+                    let (header, payload) = hpsdr_proto::Header::decode(&b).unwrap();
+                    match header.msg_type {
+                        hpsdr_proto::TYPE_RX_AUDIO => {
+                            // length counts floats, both channels.
+                            assert_eq!((header.length, payload.len()), (960 * 2, 960 * 2 * 4));
+                            rx_blocks += 1;
+                        }
+                        hpsdr_proto::TYPE_TX_CHRONO => {
+                            assert_eq!(header.length, 960);
+                            chrono += 1;
+                        }
+                        _ => {}
+                    }
+                }
+                _ => {}
+            }
+        }
+        server.stop();
+        // The connect handshake announces the default first.
+        assert_eq!(&replies[replies.len() - 2..], ["audio_stream_samples:960;", "audio_stream_samples:960;"]);
+        assert!(rx_blocks >= 20, "{rx_blocks} RX audio blocks of 960");
+        assert!(chrono >= 5, "{chrono} TX audio requests");
+    }
+
+    /// Changes made elsewhere -- here, as hpsdr-rs's own window would --
+    /// reach a plain TCI client at once, not at the next once-a-second
+    /// heartbeat; a value the client itself just set isn't reported back
+    /// to it while it's still changing it.
+    #[test]
+    fn a_client_hears_of_changes_at_once() {
+        let port = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let mox = Arc::new(AtomicBool::new(false));
+        let rx_freq = Arc::new(AtomicU64::new(7_100_000));
+        let rit_on = Arc::new(AtomicBool::new(false));
+        let requested = Arc::new(AtomicU64::new(7_100_000));
+        let params = Arc::new(Mutex::new(DemodParams::default()));
+        let mut server = TciServer::start(
+            &format!("127.0.0.1:{port}"),
+            Arc::clone(&requested),
+            Arc::clone(&rx_freq),
+            Arc::new(AtomicU32::new(7_100_000)),
+            Arc::new(AtomicI64::new(0)),
+            Arc::new(crate::radio::VfoBShared::default()),
+            Arc::new(AtomicU32::new(192_000)),
+            Arc::clone(&params),
+            Arc::clone(&mox),
+            Arc::new(AtomicU32::new(7_100_000)),
+            Arc::new(AtomicBool::new(true)),
+            Arc::new(Mutex::new(VecDeque::new())),
+            Arc::new(Mutex::new(VecDeque::new())),
+            Arc::new(Mutex::new(VecDeque::new())),
+            Arc::new(Mutex::new(1.0)),
+            Arc::new(AtomicBool::new(false)),
+            Arc::clone(&rit_on),
+            Arc::new(AtomicI32::new(0)),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicI32::new(0)),
+            "Test".to_string(),
+            Arc::new(crate::radio::CwKeyerAtomics::default()),
+            DebugLog::new(std::env::temp_dir().join("hpsdr-rs-tci-live-test.log")),
+        )
+        .unwrap();
+        let (mut ws, _) = tungstenite::connect(format!("ws://127.0.0.1:{port}")).unwrap();
+        if let tungstenite::stream::MaybeTlsStream::Plain(s) = ws.get_ref() {
+            s.set_read_timeout(Some(Duration::from_millis(10))).unwrap();
+        }
+        // Reads text messages for `ms`, returning them with when each came.
+        let read_for = |ws: &mut tungstenite::WebSocket<tungstenite::stream::MaybeTlsStream<TcpStream>>, ms: u64| {
+            let mut got = Vec::new();
+            let start = Instant::now();
+            while start.elapsed() < Duration::from_millis(ms) {
+                if let Ok(Message::Text(t)) = ws.read() {
+                    for m in t.split(';').filter(|m| !m.is_empty()) {
+                        got.push((m.to_string(), start.elapsed()));
+                    }
+                }
+            }
+            got
+        };
+        let handshake = read_for(&mut ws, 300);
+        assert!(handshake.iter().any(|(m, _)| m == "trx:0,false"));
+
+        // The window keys, tunes, turns RIT and squelch on, presses
+        // Tune at 30 %, sets the power to 50 W of 100 and turns split on.
+        mox.store(true, Ordering::Relaxed);
+        rx_freq.store(7_101_000, Ordering::Relaxed);
+        rit_on.store(true, Ordering::Relaxed);
+        {
+            let mut p = params.lock().unwrap();
+            p.squelch_enabled = true;
+            p.squelch_level = 50.0;
+        }
+        server.set_tx_info(crate::remote::TxInfo {
+            power_w: 50,
+            max_power_w: 100,
+            tune: true,
+            tune_power_percent: 30,
+            split: true,
+            ..Default::default()
+        });
+        let got = read_for(&mut ws, 300);
+        for want in [
+            "trx:0,true",
+            "vfo:0,0,7101000",
+            "rit_enable:0,true",
+            "sql_enable:0,true",
+            "sql_level:0,-70",
+            "tune:0,true",
+            "tune_drive:0,30",
+            "drive:0,50",
+            "split_enable:0,true",
+        ] {
+            let at = got.iter().find(|(m, _)| m == want).unwrap_or_else(|| panic!("no {want} in {got:?}")).1;
+            assert!(at < Duration::from_millis(100), "{want} after {at:?}");
+        }
+
+        // The client tunes itself: the radio's frequency, not yet caught
+        // up, isn't reported back to it meanwhile.
+        ws.send(Message::Text("vfo:0,0,7102000;".into())).unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+        rx_freq.store(7_101_500, Ordering::Relaxed);
+        let got = read_for(&mut ws, 300);
+        assert!(!got.iter().any(|(m, _)| m == "vfo:0,0,7101500"), "{got:?}");
+        server.stop();
+    }
+
+    /// CW goes out as Thetis has it, CWL or CWU; a client's plain CW
+    /// takes the usual sideband for the frequency, CWR the other.
+    #[test]
+    fn receive_only_refuses_what_transmits() {
+        for cmd in ["trx:0,true", "TRX:0,false", "tune:0,true", "drive:0,50", "tune_drive:0,10", "hpsdr_mox:true",
+            "hpsdr_key:5000,true,100", "keyer:0,true", "cw_macros:0,CQ", "cw_macros_speed:20", "hpsdr_set:power,10"]
+        {
+            assert!(transmits(cmd), "{cmd}");
+        }
+        for cmd in ["trx:0", "drive:0", "vfo:0,0,14074000", "modulation:0,usb", "hpsdr_set:width,2700", "hpsdr_hello:1"] {
+            assert!(!transmits(cmd), "{cmd}");
+        }
+    }
+
+    #[test]
+    fn cw_is_cwl_or_cwu() {
+        assert_eq!((mode_to_tci(Mode::Cwl), mode_to_tci(Mode::Cwu)), ("cwl", "cwu"));
+        assert_eq!(tci_to_mode("CWL", 14_000_000), Some(Mode::Cwl));
+        assert_eq!(tci_to_mode("cwu", 7_000_000), Some(Mode::Cwu));
+        assert_eq!(tci_to_mode("cw", 7_030_000), Some(Mode::Cwl));
+        assert_eq!(tci_to_mode("CW", 14_030_000), Some(Mode::Cwu));
+        assert_eq!(tci_to_mode("cwr", 14_030_000), Some(Mode::Cwl));
+    }
+
+    /// rx_sensors_enable / tx_sensors_enable, as Thetis: the S-meter
+    /// while receiving, mic, power and SWR while transmitting, at the
+    /// interval asked for.
+    #[test]
+    fn a_client_gets_sensors() {
+        let port = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let mox = Arc::new(AtomicBool::new(false));
+        let mut server = TciServer::start(
+            &format!("127.0.0.1:{port}"),
+            Arc::new(AtomicU64::new(7_100_000)),
+            Arc::new(AtomicU64::new(7_100_000)),
+            Arc::new(AtomicU32::new(7_100_000)),
+            Arc::new(AtomicI64::new(0)),
+            Arc::new(crate::radio::VfoBShared::default()),
+            Arc::new(AtomicU32::new(192_000)),
+            Arc::new(Mutex::new(DemodParams::default())),
+            Arc::clone(&mox),
+            Arc::new(AtomicU32::new(7_100_000)),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(Mutex::new(VecDeque::new())),
+            Arc::new(Mutex::new(VecDeque::new())),
+            Arc::new(Mutex::new(VecDeque::new())),
+            Arc::new(Mutex::new(1.0)),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicI32::new(0)),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicI32::new(0)),
+            "Test".to_string(),
+            Arc::new(crate::radio::CwKeyerAtomics::default()),
+            DebugLog::new(std::env::temp_dir().join("hpsdr-rs-tci-sensors-test.log")),
+        )
+        .unwrap();
+        let display = Arc::new(Mutex::new(SpectrumDisplay {
+            spectrum: vec![-120.0, -95.5, -110.0],
+            meter_db: -73.0,
+            revision: 1,
+            ..Default::default()
+        }));
+        server.set_display(Arc::clone(&display));
+        let (mut ws, _) = tungstenite::connect(format!("ws://127.0.0.1:{port}")).unwrap();
+        if let tungstenite::stream::MaybeTlsStream::Plain(s) = ws.get_ref() {
+            s.set_read_timeout(Some(Duration::from_millis(10))).unwrap();
+        }
+        let read_for = |ws: &mut tungstenite::WebSocket<tungstenite::stream::MaybeTlsStream<TcpStream>>,
+                        display: &Mutex<SpectrumDisplay>,
+                        ms: u64| {
+            let mut got = Vec::new();
+            let start = Instant::now();
+            while start.elapsed() < Duration::from_millis(ms) {
+                if let Ok(Message::Text(t)) = ws.read() {
+                    got.extend(t.split(';').filter(|m| m.contains("sensors")).map(str::to_string));
+                }
+                // A fresh reading every 10 ms or so.
+                display.lock().unwrap().revision += 1;
+            }
+            got
+        };
+        assert!(read_for(&mut ws, &display, 300).is_empty(), "none until asked for");
+
+        ws.send(Message::Text("rx_sensors_enable:true,100;tx_sensors_enable:true,50;".into())).unwrap();
+        let got = read_for(&mut ws, &display, 500);
+        let rx = got.iter().filter(|m| *m == "rx_sensors:0,-73.0").count();
+        assert!((4..=7).contains(&rx), "{rx} rx_sensors in 0.5 s at 100 ms: {got:?}");
+        assert!(got.contains(&"rx_channel_sensors:0,0,-73.0".to_string()));
+        assert!(got.contains(&"rx_channel_sensors_ex:0,0,-73.0,-73.0,-95.5".to_string()));
+        assert!(!got.iter().any(|m| m.starts_with("tx_sensors")), "not while receiving");
+
+        mox.store(true, Ordering::Relaxed);
+        server.set_tx_info(crate::remote::TxInfo { forward_w: 50.0, swr: 1.2, mic_db: -20.0, ..Default::default() });
+        let got = read_for(&mut ws, &display, 500);
+        let tx = got.iter().filter(|m| *m == "tx_sensors:0,-20.0,50.0,50.0,1.2").count();
+        assert!((8..=12).contains(&tx), "{tx} tx_sensors in 0.5 s at 50 ms: {got:?}");
+        assert!(!got.iter().any(|m| m.starts_with("rx_sensors")), "not while transmitting");
+
+        mox.store(false, Ordering::Relaxed);
+        ws.send(Message::Text("rx_sensors_enable:false;".into())).unwrap();
+        read_for(&mut ws, &display, 100);
+        assert!(read_for(&mut ws, &display, 300).is_empty(), "off again");
+        server.stop();
+    }
+
+    /// TCI's controls, as Thetis takes them: settings change, questions
+    /// are answered, and a change is confirmed once LIVE_HOLD is over;
+    /// tune and drive are passed on for main.rs.
+    #[test]
+    fn a_client_sets_the_controls() {
+        let port = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let params = Arc::new(Mutex::new(DemodParams { mode: Mode::Lsb, ..DemodParams::default() }));
+        let mut server = TciServer::start(
+            &format!("127.0.0.1:{port}"),
+            Arc::new(AtomicU64::new(7_100_000)),
+            Arc::new(AtomicU64::new(7_100_000)),
+            Arc::new(AtomicU32::new(7_100_000)),
+            Arc::new(AtomicI64::new(0)),
+            Arc::new(crate::radio::VfoBShared::default()),
+            Arc::new(AtomicU32::new(192_000)),
+            Arc::clone(&params),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicU32::new(7_100_000)),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(Mutex::new(VecDeque::new())),
+            Arc::new(Mutex::new(VecDeque::new())),
+            Arc::new(Mutex::new(VecDeque::new())),
+            Arc::new(Mutex::new(1.0)),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicI32::new(0)),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicI32::new(0)),
+            "Test".to_string(),
+            Arc::new(crate::radio::CwKeyerAtomics::default()),
+            DebugLog::new(std::env::temp_dir().join("hpsdr-rs-tci-controls-test.log")),
+        )
+        .unwrap();
+        server.set_tx_info(crate::remote::TxInfo {
+            available: true,
+            power_w: 10,
+            max_power_w: 200,
+            tune_power_percent: 20,
+            ..Default::default()
+        });
+        let (mut ws, _) = tungstenite::connect(format!("ws://127.0.0.1:{port}")).unwrap();
+        if let tungstenite::stream::MaybeTlsStream::Plain(s) = ws.get_ref() {
+            s.set_read_timeout(Some(Duration::from_millis(10))).unwrap();
+        }
+        let read_for = |ws: &mut tungstenite::WebSocket<tungstenite::stream::MaybeTlsStream<TcpStream>>, ms: u64| {
+            let mut got = Vec::new();
+            let start = Instant::now();
+            while start.elapsed() < Duration::from_millis(ms) {
+                if let Ok(Message::Text(t)) = ws.read() {
+                    got.extend(t.split(';').filter(|m| !m.is_empty()).map(str::to_string));
+                }
+            }
+            got
+        };
+        read_for(&mut ws, 300);
+
+        // Questions.
+        ws.send(Message::Text("drive:0;tune_drive:0;tune:0;volume;agc_mode:0;sql_level:0;".into())).unwrap();
+        let got = read_for(&mut ws, 200);
+        for want in ["drive:0,5", "tune_drive:0,20", "tune:0,false", "volume:-10.5", "agc_mode:0,off", "sql_level:0,-98"] {
+            assert!(got.iter().any(|m| m == want), "no {want} in {got:?}");
+        }
+
+        // Settings.
+        ws.send(Message::Text(
+            "drive:0,40;tune_drive:0,30;tune:0,true;rx_filter_band:0,-2400,-150;volume:-20;\
+             agc_mode:0,fast;agc_gain:0,90;sql_enable:0,true;sql_level:0,-70;"
+                .into(),
+        ))
+        .unwrap();
+        let soon = read_for(&mut ws, 300);
+        assert_eq!(server.take_power_request(), Some(80), "40 % of 200 W");
+        let control = server.take_control();
+        assert_eq!((control.tune, control.tune_power_percent), (Some(true), Some(30)));
+        let p = *params.lock().unwrap();
+        assert_eq!(p.width_hz, 2400.0);
+        assert!(server.take_filter_changed(), "the TX filter to follow");
+        assert!(!server.take_filter_changed());
+        assert!((p.gain - 0.1).abs() < 1e-6, "{}", p.gain);
+        assert_eq!((p.agc, p.agc_top_db, p.squelch_enabled, p.squelch_level), (Agc::Fast, 90.0, true, 50.0));
+        assert!(!soon.iter().any(|m| m.starts_with("agc_mode")), "not echoed at once: {soon:?}");
+
+        // Confirmed once LIVE_HOLD is over -- with what the radio did:
+        // here nothing ran main.rs, so tune stays off.
+        let later = read_for(&mut ws, 600);
+        for want in ["agc_mode:0,fast", "agc_gain:0,90", "sql_enable:0,true", "sql_level:0,-70", "volume:-20.0", "tune:0,false"] {
+            assert!(later.iter().any(|m| m == want), "no {want} in {later:?}");
+        }
+
+        // APF (this receiver's) and TNF (every receiver's), as Thetis's
+        // rx_apf_enable/rx_nf_enable: set, asked, and a bad value ignored.
+        ws.send(Message::Text("rx_apf_enable:0,true;rx_nf_enable:0,true;".into())).unwrap();
+        let got = read_for(&mut ws, 200);
+        for want in ["rx_apf_enable:0,true", "rx_nf_enable:0,true"] {
+            assert!(got.iter().any(|m| m == want), "no {want} in {got:?}");
+        }
+        assert!(params.lock().unwrap().apf && crate::spectrum::tnf());
+        ws.send(Message::Text("rx_apf_enable:0,maybe;rx_nf_enable:0,false;rx_apf_enable:0;".into())).unwrap();
+        let got = read_for(&mut ws, 200);
+        assert!(got.iter().any(|m| m == "rx_nf_enable:0,false"), "{got:?}");
+        assert!(got.iter().filter(|m| *m == "rx_apf_enable:0,true").count() == 2, "{got:?}");
+        assert!(!crate::spectrum::tnf());
+
+        // Auto AGC: set and asked; setting agc_gain turns it off.
+        ws.send(Message::Text("agc_auto_ex:0,true;".into())).unwrap();
+        let got = read_for(&mut ws, 200);
+        assert!(got.iter().any(|m| m == "agc_auto_ex:0,true"), "{got:?}");
+        assert!(params.lock().unwrap().agc_auto);
+        ws.send(Message::Text("agc_gain:0,70;agc_auto_ex:0;".into())).unwrap();
+        let got = read_for(&mut ws, 200);
+        assert!(got.iter().any(|m| m == "agc_auto_ex:0,false"), "{got:?}");
+        assert!(!params.lock().unwrap().agc_auto);
+        server.stop();
+    }
+
+    /// Receiver 1, as Thetis's RX2: the first extra receiver, when there
+    /// is one -- its state live, its own frequency and DSP settings, its
+    /// audio and S-meter -- and rx_enable:1 saying whether there is.
+    #[test]
+    fn a_client_uses_receiver_1() {
+        let port = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let params0 = Arc::new(Mutex::new(DemodParams { mode: Mode::Lsb, ..DemodParams::default() }));
+        let mut server = TciServer::start(
+            &format!("127.0.0.1:{port}"),
+            Arc::new(AtomicU64::new(7_100_000)),
+            Arc::new(AtomicU64::new(7_100_000)),
+            Arc::new(AtomicU32::new(7_100_000)),
+            Arc::new(AtomicI64::new(0)),
+            Arc::new(crate::radio::VfoBShared::default()),
+            Arc::new(AtomicU32::new(192_000)),
+            Arc::clone(&params0),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicU32::new(7_100_000)),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(Mutex::new(VecDeque::new())),
+            Arc::new(Mutex::new(VecDeque::new())),
+            Arc::new(Mutex::new(VecDeque::new())),
+            Arc::new(Mutex::new(1.0)),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicI32::new(0)),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicI32::new(0)),
+            "Test".to_string(),
+            Arc::new(crate::radio::CwKeyerAtomics::default()),
+            DebugLog::new(std::env::temp_dir().join("hpsdr-rs-tci-rx2-test.log")),
+        )
+        .unwrap();
+        let (mut ws, _) = tungstenite::connect(format!("ws://127.0.0.1:{port}")).unwrap();
+        if let tungstenite::stream::MaybeTlsStream::Plain(s) = ws.get_ref() {
+            s.set_read_timeout(Some(Duration::from_millis(10))).unwrap();
+        }
+        // Text messages, and receiver 1's audio blocks (their sizes).
+        let read_for = |ws: &mut tungstenite::WebSocket<tungstenite::stream::MaybeTlsStream<TcpStream>>, ms: u64| {
+            let (mut text, mut audio1) = (Vec::new(), Vec::new());
+            let start = Instant::now();
+            while start.elapsed() < Duration::from_millis(ms) {
+                match ws.read() {
+                    Ok(Message::Text(t)) => text.extend(t.split(';').filter(|m| !m.is_empty()).map(str::to_string)),
+                    Ok(Message::Binary(b)) => {
+                        let (h, payload) = hpsdr_proto::Header::decode(&b).unwrap();
+                        if h.msg_type == hpsdr_proto::TYPE_RX_AUDIO && h.receiver == 1 {
+                            audio1.push(payload.len() / 8);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            (text, audio1)
+        };
+        let (got, _) = read_for(&mut ws, 300);
+        assert!(got.contains(&"trx_count:2".to_string()), "{got:?}");
+        assert!(got.contains(&"rx_enable:1,false".to_string()), "{got:?}");
+
+        // The client asks for one: passed on to main.rs (which would open
+        // it, as Add Receiver does), and not answered at once.
+        ws.send(Message::Text("rx_enable:1,true;".into())).unwrap();
+        let (got, _) = read_for(&mut ws, 100);
+        assert_eq!(server.take_rx2_requests().enable, Some(true));
+        assert!(!got.iter().any(|m| m.starts_with("rx_enable:1")), "{got:?}");
+
+        // An extra receiver is opened.
+        let taps = Rx2Taps {
+            demod_params: Arc::new(Mutex::new(DemodParams { mode: Mode::Usb, ..DemodParams::default() })),
+            audio: Arc::new(Mutex::new(VecDeque::new())),
+            iq: Arc::new(Mutex::new(VecDeque::new())),
+            display: Arc::new(Mutex::new(SpectrumDisplay {
+                spectrum: vec![-120.0, -80.0],
+                meter_db: -91.0,
+                revision: 1,
+                ..Default::default()
+            })),
+        };
+        let state =
+            Rx2State { sample_rate_hz: 96_000, frequency_hz: 14_200_000, dds_hz: 14_190_000, ..Default::default() };
+        server.set_rx2(Some((taps.clone(), state)));
+        // Past LIVE_HOLD, since the client's just sent rx_enable.
+        let (got, _) = read_for(&mut ws, 700);
+        for want in ["rx_enable:1,true", "vfo:1,0,14200000", "dds:1,14190000", "if:1,0,10000", "modulation:1,usb"] {
+            assert!(got.contains(&want.to_string()), "no {want} in {got:?}");
+        }
+        let at = |m: &str| got.iter().position(|g| g == m).unwrap();
+        assert!(at("rx_enable:1,true") < at("vfo:1,0,14200000"), "told it's there first: {got:?}");
+
+        // Tuned, its mode and AGC changed, its audio and S-meter asked for.
+        ws.send(Message::Text(
+            "vfo:1,0,14210000;modulation:1,cwu;agc_mode:1,fast;rx_filter_band:1,350,850;audio_start:1;\
+             rx_sensors_enable:true,100;"
+                .into(),
+        ))
+        .unwrap();
+        taps.audio.lock().unwrap().extend(std::iter::repeat_n((0.1f32, 0.1f32), 4096 + 100));
+        let (got, audio1) = read_for(&mut ws, 300);
+        for want in ["vfo:1,0,14210000", "modulation:1,cwu", "audio_start:1", "rx_sensors:1,-91.0"] {
+            assert!(got.contains(&want.to_string()), "no {want} in {got:?}");
+        }
+        assert_eq!(server.take_rx2_requests().frequency_hz, Some(14_210_000));
+        let p1 = *taps.demod_params.lock().unwrap();
+        assert_eq!((p1.mode, p1.agc), (Mode::Cwu, Agc::Fast));
+        assert_eq!(params0.lock().unwrap().mode, Mode::Lsb, "receiver 0 untouched");
+        assert_eq!(p1.width_hz, 500.0);
+        assert!(!server.take_filter_changed(), "receiver 1's filter isn't the transmitter's");
+        assert_eq!(audio1, vec![2048, 2048], "receiver 1's audio, in blocks, receiver 1 in the header");
+
+        // Its IQ: receiver 1 and its own rate in the header, I and Q in
+        // TCI's order (as receiver 0's), none of what came before.
+        taps.iq.lock().unwrap().extend(std::iter::repeat_n((9.0f32, 9.0f32), 50));
+        std::thread::sleep(Duration::from_millis(50));
+        ws.send(Message::Text("iq_start:1;".into())).unwrap();
+        let (got, _) = read_for(&mut ws, 100);
+        assert!(got.contains(&"iq_start:1".to_string()), "{got:?}");
+        taps.iq.lock().unwrap().extend(std::iter::repeat_n((0.25f32, 0.5f32), 600));
+        let mut iq1 = Vec::new();
+        let start = Instant::now();
+        while start.elapsed() < Duration::from_millis(300) {
+            if let Ok(Message::Binary(b)) = ws.read() {
+                let (h, payload) = hpsdr_proto::Header::decode(&b).unwrap();
+                if h.msg_type == hpsdr_proto::TYPE_IQ {
+                    assert_eq!((h.receiver, h.sample_rate), (1, 96_000));
+                    iq1.extend(payload.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())));
+                }
+            }
+        }
+        assert_eq!(iq1.len(), 1200, "600 pairs");
+        assert!(iq1.chunks(2).all(|p| p == [0.5, 0.25]), "swapped as receiver 0's, nothing stale");
+        ws.send(Message::Text("iq_stop:1;".into())).unwrap();
+
+        // Closed again -- asked for by the client, done by main.rs.
+        ws.send(Message::Text("rx_enable:1,false;".into())).unwrap();
+        read_for(&mut ws, 50);
+        assert_eq!(server.take_rx2_requests().enable, Some(false));
+        server.set_rx2(None);
+        let (got, _) = read_for(&mut ws, 700);
+        assert!(got.contains(&"rx_enable:1,false".to_string()), "{got:?}");
+        server.stop();
+    }
+
+    /// Receiver 1's audio and IQ asked for at connect, before it's open
+    /// (ThetisLink does): they flow once it opens, and the client's told
+    /// its channel is there (rx_channel_enable:1,0,true), as Thetis does.
+    #[test]
+    fn receiver_1_audio_asked_for_before_it_opens() {
+        let port = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let params = Arc::new(Mutex::new(DemodParams::default()));
+        let mut server = TciServer::start(
+            &format!("127.0.0.1:{port}"),
+            Arc::new(AtomicU64::new(7_100_000)),
+            Arc::new(AtomicU64::new(7_100_000)),
+            Arc::new(AtomicU32::new(7_100_000)),
+            Arc::new(AtomicI64::new(0)),
+            Arc::new(crate::radio::VfoBShared::default()),
+            Arc::new(AtomicU32::new(192_000)),
+            Arc::clone(&params),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicU32::new(7_100_000)),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(Mutex::new(VecDeque::new())),
+            Arc::new(Mutex::new(VecDeque::new())),
+            Arc::new(Mutex::new(VecDeque::new())),
+            Arc::new(Mutex::new(1.0)),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicI32::new(0)),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicI32::new(0)),
+            "Test".to_string(),
+            Arc::new(crate::radio::CwKeyerAtomics::default()),
+            DebugLog::new(std::env::temp_dir().join("hpsdr-rs-tci-rx2-early-test.log")),
+        )
+        .unwrap();
+        let (mut ws, _) = tungstenite::connect(format!("ws://127.0.0.1:{port}")).unwrap();
+        if let tungstenite::stream::MaybeTlsStream::Plain(s) = ws.get_ref() {
+            s.set_read_timeout(Some(Duration::from_millis(10))).unwrap();
+        }
+        let read_for = |ws: &mut tungstenite::WebSocket<tungstenite::stream::MaybeTlsStream<TcpStream>>, ms: u64| {
+            let (mut text, mut audio1, mut iq1) = (Vec::new(), 0, 0);
+            let start = Instant::now();
+            while start.elapsed() < Duration::from_millis(ms) {
+                match ws.read() {
+                    Ok(Message::Text(t)) => text.extend(t.split(';').filter(|m| !m.is_empty()).map(str::to_string)),
+                    Ok(Message::Binary(b)) => {
+                        let (h, _) = hpsdr_proto::Header::decode(&b).unwrap();
+                        if h.receiver == 1 && h.msg_type == hpsdr_proto::TYPE_RX_AUDIO {
+                            audio1 += 1;
+                        }
+                        if h.receiver == 1 && h.msg_type == hpsdr_proto::TYPE_IQ {
+                            iq1 += 1;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            (text, audio1, iq1)
+        };
+        read_for(&mut ws, 300);
+        ws.send(Message::Text("audio_start:1;iq_start:1;".into())).unwrap();
+        let (got, _, _) = read_for(&mut ws, 100);
+        assert!(got.contains(&"audio_start:1".to_string()) && got.contains(&"iq_start:1".to_string()), "{got:?}");
+        assert!(!got.iter().any(|m| m.starts_with("rx_channel_enable:1")), "{got:?}");
+
+        let taps = Rx2Taps {
+            demod_params: Arc::new(Mutex::new(DemodParams::default())),
+            audio: Arc::new(Mutex::new(VecDeque::new())),
+            iq: Arc::new(Mutex::new(VecDeque::new())),
+            display: Arc::new(Mutex::new(SpectrumDisplay::default())),
+        };
+        let state = Rx2State { sample_rate_hz: 96_000, frequency_hz: 14_200_000, dds_hz: 14_190_000, ..Default::default() };
+        server.set_rx2(Some((taps.clone(), state)));
+        let (got, _, _) = read_for(&mut ws, 200);
+        assert!(got.contains(&"rx_channel_enable:1,0,true".to_string()), "{got:?}");
+        taps.audio.lock().unwrap().extend(std::iter::repeat_n((0.1f32, 0.1f32), 4096 + 100));
+        taps.iq.lock().unwrap().extend(std::iter::repeat_n((0.25f32, 0.5f32), 600));
+        let (_, audio1, iq1) = read_for(&mut ws, 300);
+        assert_eq!(audio1, 2, "receiver 1's audio, without asking again");
+        assert!(iq1 > 0, "and its IQ");
+        server.stop();
+    }
+
+    /// mute/rx_mute, mon_enable, cw_keyer_speed, rx_step_att_ex and
+    /// vfo_swap_ex: settings change or go to main.rs, questions are
+    /// answered, the attenuator and the program's own name are reported.
+    #[test]
+    fn a_client_sets_mute_monitor_speed_attenuator_and_swaps_vfos() {
+        let port = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let params = Arc::new(Mutex::new(DemodParams::default()));
+        let mut server = TciServer::start(
+            &format!("127.0.0.1:{port}"),
+            Arc::new(AtomicU64::new(7_100_000)),
+            Arc::new(AtomicU64::new(7_100_000)),
+            Arc::new(AtomicU32::new(7_100_000)),
+            Arc::new(AtomicI64::new(0)),
+            Arc::new(crate::radio::VfoBShared::default()),
+            Arc::new(AtomicU32::new(192_000)),
+            Arc::clone(&params),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicU32::new(7_100_000)),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(Mutex::new(VecDeque::new())),
+            Arc::new(Mutex::new(VecDeque::new())),
+            Arc::new(Mutex::new(VecDeque::new())),
+            Arc::new(Mutex::new(1.0)),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicI32::new(0)),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicI32::new(0)),
+            "Test".to_string(),
+            Arc::new(crate::radio::CwKeyerAtomics::default()),
+            DebugLog::new(std::env::temp_dir().join("hpsdr-rs-tci-more-controls-test.log")),
+        )
+        .unwrap();
+        server.set_tx_info(crate::remote::TxInfo {
+            available: true,
+            cw_speed_wpm: 22,
+            rx_att: Some(crate::remote::RxAtt { db: 10, min_db: 0, max_db: 31 }),
+            monitor_volume: 0.5,
+            ..Default::default()
+        });
+        let (mut ws, _) = tungstenite::connect(format!("ws://127.0.0.1:{port}")).unwrap();
+        if let tungstenite::stream::MaybeTlsStream::Plain(s) = ws.get_ref() {
+            s.set_read_timeout(Some(Duration::from_millis(10))).unwrap();
+        }
+        let read_for = |ws: &mut tungstenite::WebSocket<tungstenite::stream::MaybeTlsStream<TcpStream>>, ms: u64| {
+            let mut got = Vec::new();
+            let start = Instant::now();
+            while start.elapsed() < Duration::from_millis(ms) {
+                if let Ok(Message::Text(t)) = ws.read() {
+                    got.extend(t.split(';').filter(|m| !m.is_empty()).map(str::to_string));
+                }
+            }
+            got
+        };
+        let got = read_for(&mut ws, 300);
+        for want in [
+            "rx_step_att_ex:0,10",
+            "rx_step_att_enabled_ex:0,true",
+            "mute:false",
+            "rx_mute:0,false",
+            "mon_enable:false",
+            "cw_keyer_speed:22",
+            "mon_volume:-6.0",
+            "rx_balance:0,0,0.00",
+            APP_MESSAGE.trim_end_matches(';'),
+        ] {
+            assert!(got.iter().any(|m| m == want), "no {want} at connect in {got:?}");
+        }
+
+        ws.send(Message::Text(
+            "rx_mute:0;mon_enable;cw_keyer_speed;rx_step_att_ex:0;mon_volume;rx_balance:0,0;rx_balance:0,1;".into(),
+        ))
+        .unwrap();
+        let got = read_for(&mut ws, 200);
+        for want in [
+            "rx_mute:0,false",
+            "mon_enable:false",
+            "cw_keyer_speed:22",
+            "rx_step_att_ex:0,10",
+            "mon_volume:-6.0",
+            "rx_balance:0,0,0.00",
+            "rx_balance:0,1,0.00",
+        ] {
+            assert!(got.iter().any(|m| m == want), "no {want} in {got:?}");
+        }
+
+        ws.send(Message::Text(
+            "rx_mute:0,true;mon_enable:true;cw_keyer_speed:30;rx_step_att_ex:0,20;rx_step_att_ex:1,5;vfo_swap_ex;\
+             mon_volume:-20;rx_balance:0,0,20;rx_balance:0,1,-40;"
+                .into(),
+        ))
+        .unwrap();
+        read_for(&mut ws, 200);
+        assert!(params.lock().unwrap().muted);
+        // Thetis's sign: +20 is halfway to the left.
+        assert_eq!(params.lock().unwrap().audio_pan, -0.5, "channel 1 (no sub-receiver) ignored");
+        let control = server.take_control();
+        assert_eq!((control.monitor, control.rx_att_db, control.vfo_swap), (Some(true), Some(20), true));
+        assert!((control.monitor_volume.unwrap() - 0.1).abs() < 1e-6, "{:?}", control.monitor_volume);
+        assert_eq!(server.take_cw().speed_wpm, Some(30));
+
+        // Receiver 0's mute is the main window's, and mute: is it too.
+        ws.send(Message::Text("mute:false;".into())).unwrap();
+        read_for(&mut ws, 100);
+        assert!(!params.lock().unwrap().muted);
+
+        // Live: a change made in hpsdr-rs reaches the client.
+        server.set_tx_info(crate::remote::TxInfo {
+            monitor: true,
+            rx_att: Some(crate::remote::RxAtt { db: 20, min_db: 0, max_db: 31 }),
+            cw_speed_wpm: 30,
+            monitor_volume: 1.0,
+            ..Default::default()
+        });
+        let got = read_for(&mut ws, 700);
+        for want in ["rx_step_att_ex:0,20", "mon_enable:true", "cw_keyer_speed:30", "mon_volume:0.0", "rx_balance:0,0,20.00"] {
+            assert!(got.iter().any(|m| m == want), "no {want} in {got:?}");
+        }
+        server.stop();
+    }
+
+    /// tx_profiles_ex/tx_profile_ex list and choose Settings -> TX's TX
+    /// profiles ("Default" with none saved); tx_filter_band_ex reads and
+    /// sets the TX filter, live; setting either is refused from a
+    /// receive-only client (transmits).
+    #[test]
+    fn a_client_chooses_a_tx_profile_and_sets_the_tx_filter() {
+        let port = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let mut server = TciServer::start(
+            &format!("127.0.0.1:{port}"),
+            Arc::new(AtomicU64::new(7_100_000)),
+            Arc::new(AtomicU64::new(7_100_000)),
+            Arc::new(AtomicU32::new(7_100_000)),
+            Arc::new(AtomicI64::new(0)),
+            Arc::new(crate::radio::VfoBShared::default()),
+            Arc::new(AtomicU32::new(192_000)),
+            Arc::new(Mutex::new(DemodParams::default())),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicU32::new(7_100_000)),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(Mutex::new(VecDeque::new())),
+            Arc::new(Mutex::new(VecDeque::new())),
+            Arc::new(Mutex::new(VecDeque::new())),
+            Arc::new(Mutex::new(1.0)),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicI32::new(0)),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicI32::new(0)),
+            "Test".to_string(),
+            Arc::new(crate::radio::CwKeyerAtomics::default()),
+            DebugLog::new(std::env::temp_dir().join("hpsdr-rs-tci-tx-profile-test.log")),
+        )
+        .unwrap();
+        server.set_tx_info(crate::remote::TxInfo { available: true, tx_filter: (150, 2700), ..Default::default() });
+        let (mut ws, _) = tungstenite::connect(format!("ws://127.0.0.1:{port}")).unwrap();
+        if let tungstenite::stream::MaybeTlsStream::Plain(s) = ws.get_ref() {
+            s.set_read_timeout(Some(Duration::from_millis(10))).unwrap();
+        }
+        let read_for = |ws: &mut tungstenite::WebSocket<tungstenite::stream::MaybeTlsStream<TcpStream>>, ms: u64| {
+            let mut got = Vec::new();
+            let start = Instant::now();
+            while start.elapsed() < Duration::from_millis(ms) {
+                if let Ok(Message::Text(t)) = ws.read() {
+                    got.extend(t.split(';').filter(|m| !m.is_empty()).map(str::to_string));
+                }
+            }
+            got
+        };
+        let got = read_for(&mut ws, 300);
+        for want in ["tx_profiles_ex:Default", "tx_profile_ex:Default", "tx_filter_band_ex:150,2700"] {
+            assert!(got.iter().any(|m| m == want), "no {want} at connect in {got:?}");
+        }
+
+        // Profiles saved in hpsdr-rs reach the client, the list first.
+        server.set_tx_profiles(crate::remote::TxProfiles {
+            names: vec!["Rag chew".to_string(), "DX".to_string()],
+            current: "DX".to_string(),
+        });
+        let got = read_for(&mut ws, 700);
+        let list = got.iter().position(|m| m == "tx_profiles_ex:Rag chew,DX");
+        let current = got.iter().position(|m| m == "tx_profile_ex:DX");
+        assert!(list.is_some() && list < current, "{got:?}");
+
+        ws.send(Message::Text("tx_profiles_ex;tx_profile_ex;tx_filter_band_ex;".into())).unwrap();
+        let got = read_for(&mut ws, 200);
+        for want in ["tx_profiles_ex:Rag chew,DX", "tx_profile_ex:DX", "tx_filter_band_ex:150,2700"] {
+            assert!(got.iter().any(|m| m == want), "no {want} in {got:?}");
+        }
+
+        ws.send(Message::Text("tx_profile_ex:Rag chew;tx_filter_band_ex:-2800,-200;".into())).unwrap();
+        read_for(&mut ws, 200);
+        let control = server.take_control();
+        assert_eq!(control.tx_profile.as_deref(), Some("Rag chew"));
+        assert_eq!(control.tx_filter, Some((-2800.0, -200.0)));
+
+        // Nonsense edges are a question.
+        ws.send(Message::Text("tx_filter_band_ex:3000,100;".into())).unwrap();
+        let got = read_for(&mut ws, 200);
+        assert!(got.iter().any(|m| m == "tx_filter_band_ex:150,2700"), "{got:?}");
+        assert_eq!(server.take_control().tx_filter, None);
+
+        assert!(transmits("tx_profile_ex:DX") && transmits("tx_filter_band_ex:100,2900"));
+        assert!(!transmits("tx_profile_ex") && !transmits("tx_filter_band_ex"));
+
+        // Live: the TX filter changing in hpsdr-rs reaches the client.
+        server.set_tx_info(crate::remote::TxInfo { available: true, tx_filter: (-2800, -200), ..Default::default() });
+        let got = read_for(&mut ws, 700);
+        assert!(got.iter().any(|m| m == "tx_filter_band_ex:-2800,-200"), "{got:?}");
+        server.stop();
+    }
+
+    /// lock, vfo_lock and vfo_sync_ex, as Thetis without RX2: reported at
+    /// connect and live, answered, and set through main.rs; vfo_lock on
+    /// another receiver or VFO is ignored.
+    #[test]
+    fn a_client_locks_and_syncs_the_vfos() {
+        let port = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let mut server = TciServer::start(
+            &format!("127.0.0.1:{port}"),
+            Arc::new(AtomicU64::new(7_100_000)),
+            Arc::new(AtomicU64::new(7_100_000)),
+            Arc::new(AtomicU32::new(7_100_000)),
+            Arc::new(AtomicI64::new(0)),
+            Arc::new(crate::radio::VfoBShared::default()),
+            Arc::new(AtomicU32::new(192_000)),
+            Arc::new(Mutex::new(DemodParams::default())),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicU32::new(7_100_000)),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(Mutex::new(VecDeque::new())),
+            Arc::new(Mutex::new(VecDeque::new())),
+            Arc::new(Mutex::new(VecDeque::new())),
+            Arc::new(Mutex::new(1.0)),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicI32::new(0)),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicI32::new(0)),
+            "Test".to_string(),
+            Arc::new(crate::radio::CwKeyerAtomics::default()),
+            DebugLog::new(std::env::temp_dir().join("hpsdr-rs-tci-vfo-lock-test.log")),
+        )
+        .unwrap();
+        server.set_tx_info(crate::remote::TxInfo { available: true, vfo_b_lock: true, ..Default::default() });
+        let (mut ws, _) = tungstenite::connect(format!("ws://127.0.0.1:{port}")).unwrap();
+        if let tungstenite::stream::MaybeTlsStream::Plain(s) = ws.get_ref() {
+            s.set_read_timeout(Some(Duration::from_millis(10))).unwrap();
+        }
+        let read_for = |ws: &mut tungstenite::WebSocket<tungstenite::stream::MaybeTlsStream<TcpStream>>, ms: u64| {
+            let mut got = Vec::new();
+            let start = Instant::now();
+            while start.elapsed() < Duration::from_millis(ms) {
+                if let Ok(Message::Text(t)) = ws.read() {
+                    got.extend(t.split(';').filter(|m| !m.is_empty()).map(str::to_string));
+                }
+            }
+            got
+        };
+        let got = read_for(&mut ws, 300);
+        for want in ["lock:0,false", "vfo_lock:0,0,false", "vfo_lock:0,1,true", "vfo_sync_ex:false"] {
+            assert!(got.iter().any(|m| m == want), "no {want} at connect in {got:?}");
+        }
+
+        ws.send(Message::Text("lock:0;lock:1;vfo_lock:0,1;vfo_sync_ex;".into())).unwrap();
+        let got = read_for(&mut ws, 200);
+        for want in ["lock:0,false", "lock:1,true", "vfo_lock:0,1,true", "vfo_sync_ex:false"] {
+            assert!(got.iter().any(|m| m == want), "no {want} in {got:?}");
+        }
+
+        ws.send(Message::Text("vfo_lock:0,0,true;vfo_lock:1,0,true;vfo_sync_ex:true;".into())).unwrap();
+        read_for(&mut ws, 200);
+        let control = server.take_control();
+        assert_eq!((control.vfo_a_lock, control.vfo_b_lock, control.vfo_sync), (Some(true), None, Some(true)));
+        ws.send(Message::Text("lock:1,false;".into())).unwrap();
+        read_for(&mut ws, 200);
+        assert_eq!(server.take_control().vfo_b_lock, Some(false));
+
+        // Live.
+        server.set_tx_info(crate::remote::TxInfo { available: true, vfo_a_lock: true, vfo_sync: false, ..Default::default() });
+        let got = read_for(&mut ws, 700);
+        for want in ["lock:0,true", "vfo_lock:0,0,true", "vfo_lock:0,1,false"] {
+            assert!(got.iter().any(|m| m == want), "no {want} in {got:?}");
+        }
+        server.stop();
+    }
+
+    /// Where it transmits, as Thetis reports it: tx_frequency and
+    /// tx_frequency_ex -- VFO A, or VFO B with Split, plus XIT, the band
+    /// Thetis-style -- live; and split_enable from a client.
+    #[test]
+    fn a_client_hears_the_tx_frequency() {
+        let port = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let vfo_b = Arc::new(crate::radio::VfoBShared::default());
+        let xit_on = Arc::new(AtomicBool::new(false));
+        let xit_hz = Arc::new(AtomicI32::new(500));
+        let mut server = TciServer::start(
+            &format!("127.0.0.1:{port}"),
+            Arc::new(AtomicU64::new(7_100_000)),
+            Arc::new(AtomicU64::new(7_100_000)),
+            Arc::new(AtomicU32::new(7_100_000)),
+            Arc::new(AtomicI64::new(0)),
+            Arc::clone(&vfo_b),
+            Arc::new(AtomicU32::new(192_000)),
+            Arc::new(Mutex::new(DemodParams::default())),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicU32::new(7_100_000)),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(Mutex::new(VecDeque::new())),
+            Arc::new(Mutex::new(VecDeque::new())),
+            Arc::new(Mutex::new(VecDeque::new())),
+            Arc::new(Mutex::new(1.0)),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicI32::new(0)),
+            Arc::clone(&xit_on),
+            Arc::clone(&xit_hz),
+            "Test".to_string(),
+            Arc::new(crate::radio::CwKeyerAtomics::default()),
+            DebugLog::new(std::env::temp_dir().join("hpsdr-rs-tci-txfreq-test.log")),
+        )
+        .unwrap();
+        server.set_bands(vec![hpsdr_proto::bands::BandInfo {
+            name: "40m".to_string(),
+            low_hz: 7_000_000,
+            high_hz: 7_300_000,
+        }]);
+        let (mut ws, _) = tungstenite::connect(format!("ws://127.0.0.1:{port}")).unwrap();
+        if let tungstenite::stream::MaybeTlsStream::Plain(s) = ws.get_ref() {
+            s.set_read_timeout(Some(Duration::from_millis(10))).unwrap();
+        }
+        let read_for = |ws: &mut tungstenite::WebSocket<tungstenite::stream::MaybeTlsStream<TcpStream>>, ms: u64| {
+            let mut got = Vec::new();
+            let start = Instant::now();
+            while start.elapsed() < Duration::from_millis(ms) {
+                if let Ok(Message::Text(t)) = ws.read() {
+                    got.extend(t.split(';').filter(|m| !m.is_empty()).map(str::to_string));
+                }
+            }
+            got
+        };
+        let got = read_for(&mut ws, 300);
+        for want in ["tx_frequency:7100000", "tx_frequency_ex:7100000,b40m,false,false"] {
+            assert!(got.contains(&want.to_string()), "no {want} in {got:?}");
+        }
+
+        // Split on, VFO B elsewhere in the band, then XIT.
+        vfo_b.frequency_hz.store(7_150_000, Ordering::Relaxed);
+        server.set_tx_info(crate::remote::TxInfo { split: true, tx_on_vfo_b: true, ..Default::default() });
+        let got = read_for(&mut ws, 100);
+        for want in ["split_enable:0,true", "tx_frequency:7150000", "tx_frequency_ex:7150000,b40m,false,true"] {
+            assert!(got.contains(&want.to_string()), "no {want} in {got:?}");
+        }
+        xit_on.store(true, Ordering::Relaxed);
+        let got = read_for(&mut ws, 100);
+        assert!(got.contains(&"tx_frequency:7150500".to_string()), "{got:?}");
+
+        // A client turns split off: passed on to main.rs.
+        ws.send(Message::Text("split_enable:0,false;split_enable:0;".into())).unwrap();
+        let got = read_for(&mut ws, 100);
+        assert_eq!(server.take_control().split, Some(false));
+        assert!(got.contains(&"split_enable:0,true".to_string()), "the question answered: {got:?}");
         server.stop();
     }
 }

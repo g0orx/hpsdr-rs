@@ -5,6 +5,10 @@
     TARGET_S of it before starting, and drops back to that if bursts pile
     it past MAX_S -- a little latency for no gaps. Resampled to whatever
     rate the device runs at.
+
+    Also the CW sidetone while keying from the on-screen key or paddles:
+    made here, straight into the output, so it follows the key with no
+    network delay.
 */
 
 use std::collections::VecDeque;
@@ -24,6 +28,39 @@ struct Jitter {
     pos: f64,
     playing: bool,
     gain: f32,
+    sidetone: Sidetone,
+    /// Output callbacks so far: the status line says if they stop.
+    callbacks: u64,
+    /// The stream's last error, if any.
+    error: Option<String>,
+}
+
+/// A tone at SIDETONE_HZ while the key is down, with 5 ms ramps so it
+/// doesn't click.
+#[derive(Default)]
+struct Sidetone {
+    on: bool,
+    level: f32,
+    gain: f32,
+    phase: f32,
+}
+
+const SIDETONE_HZ: f32 = 600.0;
+
+impl Sidetone {
+    fn next(&mut self, device_rate: u32) -> f32 {
+        let target = if self.on { 1.0 } else { 0.0 };
+        if self.gain == 0.0 && target == 0.0 {
+            return 0.0;
+        }
+        let step = 1.0 / (0.005 * device_rate as f32).max(1.0);
+        self.gain = if self.gain < target { (self.gain + step).min(target) } else { (self.gain - step).max(target) };
+        self.phase += 2.0 * std::f32::consts::PI * SIDETONE_HZ / device_rate as f32;
+        if self.phase >= 2.0 * std::f32::consts::PI {
+            self.phase -= 2.0 * std::f32::consts::PI;
+        }
+        self.level * self.gain * self.phase.sin()
+    }
 }
 
 impl Jitter {
@@ -66,41 +103,159 @@ pub struct Player {
     _stream: cpal::Stream,
 }
 
+/// Natively, the stereo 48 kHz f32 output hpsdr-rs itself opens, which works
+/// on the Raspberry Pis it runs on; the device's default config if that's
+/// refused.
+const OUTPUT_RATE: u32 = 48_000;
+#[cfg(not(target_arch = "wasm32"))]
+const OUTPUT_CHANNELS: u16 = 2;
+
+/// The output stream, writing samples of type `T`.
+fn build_output<T>(device: &cpal::Device, config: &cpal::StreamConfig, jitter: &Arc<Mutex<Jitter>>) -> Result<cpal::Stream, String>
+where
+    T: cpal::SizedSample + cpal::FromSample<f32>,
+{
+    let channels = config.channels as usize;
+    let feed = Arc::clone(jitter);
+    device
+        .build_output_stream(
+            config,
+            move |data: &mut [T], _: &cpal::OutputCallbackInfo| {
+                let mut j = feed.lock().unwrap();
+                j.callbacks += 1;
+                let rate = j.device_rate;
+                for frame in data.chunks_mut(channels) {
+                    let v = (j.next() + j.sidetone.next(rate)).clamp(-1.0, 1.0);
+                    frame.fill(T::from_sample(v));
+                }
+            },
+            {
+                let jitter = Arc::clone(jitter);
+                move |e| {
+                    let e = format!("audio output: {e}");
+                    #[cfg(not(target_arch = "wasm32"))]
+                    eprintln!("hpsdr-remote: {e}");
+                    jitter.lock().unwrap().error = Some(e);
+                }
+            },
+            None,
+        )
+        .map_err(|e| format!("audio output: {e}"))
+}
+
+/// The devices to try, in order, for the default output (`output`) or
+/// microphone. On Linux, PipeWire's ALSA device ("pipewire"), else
+/// PulseAudio's ("pulse"), comes first, then ALSA's own default: without
+/// pipewire-alsa, ALSA's default is just the first sound card (a Pi's
+/// bcm2835 headphone jack -- REAL REPORT 2026-11-16, a Pi 4 with a USB
+/// headset played nothing). Same choice as hpsdr-rs's (System Default).
+pub fn default_devices(output: bool) -> Vec<cpal::Device> {
+    let host = cpal::default_host();
+    let mut devices: Vec<cpal::Device> = sound_server_device(&host, output).into_iter().collect();
+    devices.extend(if output { host.default_output_device() } else { host.default_input_device() });
+    devices
+}
+
+#[cfg(target_os = "linux")]
+fn sound_server_device(host: &cpal::Host, output: bool) -> Option<cpal::Device> {
+    let devices: Vec<cpal::Device> =
+        if output { host.output_devices().ok()?.collect() } else { host.input_devices().ok()?.collect() };
+    ["pipewire", "pulse"]
+        .into_iter()
+        .find_map(|want| devices.iter().find(|d| d.id().is_ok_and(|id| id.1 == want)).cloned())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn sound_server_device(_host: &cpal::Host, _output: bool) -> Option<cpal::Device> {
+    None
+}
+
+/// Linux: PipeWire or PulseAudio is running but ALSA has no device that
+/// reaches it, so the audio goes to the first sound card. Checked once.
+pub fn sound_server_unreachable() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        static ONCE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ONCE.get_or_init(|| {
+            let Some(dir) = std::env::var_os("XDG_RUNTIME_DIR").map(std::path::PathBuf::from) else {
+                return false;
+            };
+            let running = dir.join("pipewire-0").exists() || dir.join("pulse/native").exists();
+            running && sound_server_device(&cpal::default_host(), true).is_none()
+        })
+    }
+    #[cfg(not(target_os = "linux"))]
+    false
+}
+
 impl Player {
-    /// Opens the default output device. In a browser this has to happen in
-    /// response to a click (browsers only start audio after one).
+    /// Opens the default output device (see default_devices). In a
+    /// browser this has to happen in response to a click (browsers only
+    /// start audio after one).
     pub fn open() -> Result<Self, String> {
-        let host = cpal::default_host();
-        let device = host.default_output_device().ok_or("no audio output device")?;
-        let supported = device.default_output_config().map_err(|e| format!("audio output: {e}"))?;
-        if supported.sample_format() != cpal::SampleFormat::F32 {
-            return Err(format!("audio output: unsupported sample format {:?}", supported.sample_format()));
+        let mut last = Err("no audio output device".to_string());
+        for device in default_devices(true) {
+            last = Self::open_on(device);
+            match &last {
+                Ok(_) => break,
+                Err(e) => eprintln!("hpsdr-remote: {e}"),
+            }
         }
-        let config: cpal::StreamConfig = supported.into();
-        let channels = config.channels as usize;
+        last
+    }
+
+    fn open_on(device: cpal::Device) -> Result<Self, String> {
         let jitter = Arc::new(Mutex::new(Jitter {
             buf: VecDeque::new(),
             rate: 0,
-            device_rate: config.sample_rate,
+            device_rate: OUTPUT_RATE,
             pos: 0.0,
             playing: false,
             gain: 1.0,
+            sidetone: Sidetone::default(),
+            callbacks: 0,
+            error: None,
         }));
-        let feed = Arc::clone(&jitter);
-        let stream = device
-            .build_output_stream(
-                &config,
-                move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
-                    let mut j = feed.lock().unwrap();
-                    for frame in data.chunks_mut(channels) {
-                        let v = j.next();
-                        frame.fill(v);
-                    }
-                },
-                |e| log::warn!("audio output: {e}"),
-                None,
-            )
-            .map_err(|e| format!("audio output: {e}"))?;
+        // REAL REPORT 2026-11-14, Raspberry Pi 4: no audio and no playback
+        // stream in pavucontrol, though the stream opened, with the
+        // device's default config. hpsdr-rs on the same Pi plays with this
+        // fixed one.
+        #[cfg(not(target_arch = "wasm32"))]
+        let fixed = {
+            let config =
+                cpal::StreamConfig { channels: OUTPUT_CHANNELS, sample_rate: OUTPUT_RATE, buffer_size: cpal::BufferSize::Default };
+            build_output::<f32>(&device, &config, &jitter).map(|s| (s, config, cpal::SampleFormat::F32))
+        };
+        #[cfg(target_arch = "wasm32")]
+        let fixed: Result<(cpal::Stream, cpal::StreamConfig, cpal::SampleFormat), String> = Err(String::new());
+        let (stream, config, format) = match fixed {
+            Ok(opened) => opened,
+            Err(_) => {
+                let supported = device.default_output_config().map_err(|e| format!("audio output: {e}"))?;
+                let format = supported.sample_format();
+                let config: cpal::StreamConfig = supported.into();
+                jitter.lock().unwrap().device_rate = config.sample_rate;
+                // In the device's own sample format; any other than these,
+                // f32, which ALSA's default device converts.
+                let stream = match format {
+                    cpal::SampleFormat::I16 => build_output::<i16>(&device, &config, &jitter),
+                    cpal::SampleFormat::U16 => build_output::<u16>(&device, &config, &jitter),
+                    cpal::SampleFormat::I32 => build_output::<i32>(&device, &config, &jitter),
+                    _ => build_output::<f32>(&device, &config, &jitter),
+                }?;
+                (stream, config, format)
+            }
+        };
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let name = device.description().map(|d| d.name().to_string()).unwrap_or_else(|_| "?".to_string());
+            eprintln!(
+                "hpsdr-remote: audio output \"{name}\", {} Hz, {} channels, {format:?}",
+                config.sample_rate, config.channels
+            );
+        }
+        #[cfg(target_arch = "wasm32")]
+        let _ = (&config, format);
         stream.play().map_err(|e| format!("audio output: {e}"))?;
         Ok(Self { jitter, _stream: stream })
     }
@@ -111,6 +266,29 @@ impl Player {
 
     pub fn set_gain(&self, gain: f32) {
         self.jitter.lock().unwrap().gain = gain;
+    }
+
+    /// The CW sidetone: on while the key is down, at `level` (0-1).
+    pub fn set_sidetone(&self, on: bool, level: f32) {
+        let mut j = self.jitter.lock().unwrap();
+        j.sidetone.on = on;
+        j.sidetone.level = level;
+    }
+
+    /// Output callbacks so far, and the stream's last error: for the
+    /// status line.
+    pub fn callbacks(&self) -> u64 {
+        self.jitter.lock().unwrap().callbacks
+    }
+
+    pub fn error(&self) -> Option<String> {
+        self.jitter.lock().unwrap().error.clone()
+    }
+
+    /// Start it again: in a browser, output opened without a click (the
+    /// reconnect after a reload, reload.rs) stays suspended until one.
+    pub fn resume(&self) {
+        let _ = self._stream.play();
     }
 
     /// Seconds buffered, for the status line.
@@ -129,7 +307,17 @@ mod tests {
     use super::*;
 
     fn jitter(device_rate: u32) -> Jitter {
-        Jitter { buf: VecDeque::new(), rate: 0, device_rate, pos: 0.0, playing: false, gain: 1.0 }
+        Jitter {
+            buf: VecDeque::new(),
+            rate: 0,
+            device_rate,
+            pos: 0.0,
+            playing: false,
+            gain: 1.0,
+            sidetone: Sidetone::default(),
+            callbacks: 0,
+            error: None,
+        }
     }
 
     #[test]

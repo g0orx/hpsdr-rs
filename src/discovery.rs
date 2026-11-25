@@ -27,6 +27,18 @@ use std::time::Duration;
 
 const DISCOVERY_PORT: u16 = 1024;
 const SOCKET_TIMEOUT: Duration = Duration::from_millis(250);
+/// The longest one discovery round keeps listening for replies, however
+/// many keep arriving or errors come back.
+const REPLY_WINDOW: Duration = Duration::from_millis(1500);
+
+/// Whether a recv error means the replies have stopped (the read timed
+/// out). Anything else is skipped: Windows reports an ICMP "port
+/// unreachable" for an earlier datagram from this socket as a
+/// ConnectionReset on the next recv, which used to end the round before
+/// a radio's reply was read.
+fn quiet(e: &std::io::Error) -> bool {
+    matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut)
+}
 
 #[derive(Copy, Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum Boards {
@@ -133,7 +145,7 @@ impl Device {
         let version = buf[9];
         let board_id = buf[10];
         let (board, adcs, supported_receivers, supported_transmitters, frequency_min, frequency_max) =
-            board_info_p1(board_id, version, buf[19], buf[20]);
+            board_info_p1(board_id, version, buf[19], buf[20], buf[3..7] == HL2_MAC_PREFIX);
 
         Some(Device {
             address: src,
@@ -194,10 +206,22 @@ impl Device {
     }
 }
 
+/// The first four bytes of every Hermes-Lite 2's MAC address: each
+/// gateware variant sets 00:1C:C0:A2 and only the last two bytes differ
+/// (hermeslite_core.v, variants/*/hermeslite.v), even with an alternate MAC.
+const HL2_MAC_PREFIX: [u8; 4] = [0x00, 0x1C, 0xC0, 0xA2];
+
 /// Board characteristics for Protocol 1 board IDs.
 /// `buf19` is only meaningful for HermesLite2, which reports its receiver
 /// count in that byte (mirrors the original code's `buf[19]` lookup).
-fn board_info_p1(board_id: u8, version: u8, buf19: u8, buf20: u8) -> (Boards, u8, u8, u8, u64, u64) {
+/// `hl2_mac` says the MAC address starts with [`HL2_MAC_PREFIX`].
+fn board_info_p1(
+    board_id: u8,
+    version: u8,
+    buf19: u8,
+    buf20: u8,
+    hl2_mac: bool,
+) -> (Boards, u8, u8, u8, u64, u64) {
     match board_id {
         0 => (Boards::Metis, 1, 5, 1, 0, 61_440_000),
         // A Hermes-Lite 2 can say it's a Hermes: its gateware sends board
@@ -205,14 +229,28 @@ fn board_info_p1(board_id: u8, version: u8, buf19: u8, buf20: u8) -> (Boards, u8
         // reports version 54 whatever it is (usopenhpsdr1.v,
         // hermeslite_core.v). It still fills in byte 19 (its receiver
         // count) and byte 20 (its hardware revision, BOARD, in the low 6
-        // bits), which a real Hermes leaves at 0. REAL REPORT (issue #7,
-        // HL2b2 on 74p2 gateware shown as "Hermes v5.4"): taken for a
-        // Hermes, it never got the HL2's PA-enable bit (address 0x09 C2
-        // 0x08), so +VPA stayed off though the TX LED lit.
-        1 if (1..=31).contains(&(buf20 & 0x3F)) && (1..=12).contains(&buf19) => {
+        // bits). REAL REPORT (issue #7, HL2b2 on 74p2 gateware shown as
+        // "Hermes v5.4"): taken for a Hermes, it never got the HL2's
+        // PA-enable bit (address 0x09 C2 0x08), so +VPA stayed off though
+        // the TX LED lit. But Apache's Hermes gateware fills bytes 19 and
+        // 20 too (with 0x01, see the next arm; Thetis reads them as Metis
+        // version and receiver count),
+        // so those alone took an ANAN-10E for an HL2 (REAL REPORT, v0.12.0):
+        // the HL2's MAC prefix has to match as well.
+        1 if hl2_mac && (1..=31).contains(&(buf20 & 0x3F)) && (1..=12).contains(&buf19) => {
             (Boards::HermesLite2, 1, buf19, 1, 0, 38_400_000)
         }
-        1 => (Boards::Hermes, 1, 5, 1, 0, 61_440_000),
+        // The discovery reply doesn't say how many receivers a Hermes has:
+        // after the MAC and version, Apache's Hermes gateware fills the rest
+        // with 0x01 (Tx_MAC.v, "send 50 x 0x01s"), so bytes 19 and 20 are
+        // always 1. The version tells them apart. The ANAN-10E and 100B
+        // (Hermes10E v1.x, `NR = 2` in Hermes.v) build 2 receivers; Hermes
+        // and the ANAN-10/100 (v2.x/v3.x, `NR = 4`) build 4. Hermes v1.x
+        // from 2012 had 2 as well. Asking for more than that gets a
+        // receiver the FPGA doesn't have. REAL REPORT (2026-11-11, ANAN-10E
+        // v1.5): "Add Receiver" offered 5.
+        1 if version < 20 => (Boards::Hermes, 1, 2, 1, 0, 61_440_000),
+        1 => (Boards::Hermes, 1, 4, 1, 0, 61_440_000),
         4 => (Boards::Angelia, 2, 7, 1, 0, 61_440_000),
         5 => (Boards::Orion, 2, 7, 1, 0, 61_440_000),
         6 => {
@@ -342,7 +380,8 @@ pub fn protocol1_discovery(
 
     let local_addr = socket.local_addr().unwrap_or(socket_addr);
     let mut buf = [0u8; 1024];
-    loop {
+    let deadline = std::time::Instant::now() + REPLY_WINDOW;
+    while std::time::Instant::now() < deadline {
         match socket.recv_from(&mut buf) {
             Ok((amt, src)) if amt == 60 && src.port() == DISCOVERY_PORT => {
                 if let Some(device) = Device::from_p1_reply(&buf[..amt], src, local_addr) {
@@ -350,7 +389,8 @@ pub fn protocol1_discovery(
                 }
             }
             Ok(_) => continue,
-            Err(_) => break, // timeout or real error -- either way, stop listening
+            Err(e) if quiet(&e) => break,
+            Err(_) => continue, // see quiet()
         }
     }
 }
@@ -391,7 +431,8 @@ pub fn protocol2_discovery(
 
     let local_addr = socket.local_addr().unwrap_or(socket_addr);
     let mut buf = [0u8; 1024];
-    loop {
+    let deadline = std::time::Instant::now() + REPLY_WINDOW;
+    while std::time::Instant::now() < deadline {
         match socket.recv_from(&mut buf) {
             Ok((amt, src)) if amt == 60 && src.port() == DISCOVERY_PORT => {
                 if let Some(device) = Device::from_p2_reply(&buf[..amt], src, local_addr) {
@@ -399,7 +440,8 @@ pub fn protocol2_discovery(
                 }
             }
             Ok(_) => continue,
-            Err(_) => break,
+            Err(e) if quiet(&e) => break,
+            Err(_) => continue, // see quiet()
         }
     }
 }
@@ -431,6 +473,7 @@ pub fn discover(devices: Arc<Mutex<Vec<Device>>>, interface_names: Arc<Mutex<Has
     discover_rtlsdr_usb(&devices);
     discover_mirisdr_usb(&devices);
     discover_pluto(&devices);
+    discover_saturn_xdma(&devices);
 
     let interfaces = match NetworkInterface::show() {
         Ok(v) => v,
@@ -444,10 +487,21 @@ pub fn discover(devices: Arc<Mutex<Vec<Device>>>, interface_names: Arc<Mutex<Has
         for addr in &itf.addr {
             if let Addr::V4(v4_info) = addr {
                 let ip = v4_info.ip;
-                // Probe that the interface is actually up/bindable before using it.
-                if std::net::UdpSocket::bind((ip, 5000)).is_ok() {
+                // Probe that the interface is actually up/bindable before
+                // using it. Port 0 (any free port), as manual_discovery
+                // has always used. REAL REPORT (2026-11-12, issue #15):
+                // on Windows, discovery found neither of two HL2s that
+                // manual addresses reached fine, while Linux found both.
+                // This probed fixed port 5000 and discovered from fixed
+                // port 50000; Windows reserves UDP port ranges for
+                // Hyper-V/WSL/Docker (`netsh int ipv4 show
+                // excludedportrange protocol=udp`), commonly taking in
+                // 50000, and a failed bind skipped the interface, logged
+                // only to a console a Windows GUI app doesn't have. The
+                // radios reply to whatever port asked.
+                if std::net::UdpSocket::bind((ip, 0)).is_ok() {
                     interface_names.lock().unwrap().insert(IpAddr::V4(ip), itf.name.clone());
-                    let socket_address = SocketAddr::new(IpAddr::V4(ip), 50000);
+                    let socket_address = SocketAddr::new(IpAddr::V4(ip), 0);
                     // See protocol1_discovery's own doc comment --
                     // this interface's own subnet-directed broadcast,
                     // straight from the OS (via the network-interface
@@ -668,6 +722,44 @@ fn discover_pluto(devices: &Arc<Mutex<Vec<Device>>>) {
     }
 }
 
+/// An ANAN G2 seen from its own Raspberry Pi through XDMA (saturn.rs),
+/// rather than over the network through p2app: board Saturn, Protocol 2,
+/// with the USB boards' "no address" sentinel -- which is what
+/// Device::is_saturn_xdma looks for. In use by another program (p2app,
+/// piHPSDR) it's listed as running, so it can't be picked; with firmware
+/// saturn.rs doesn't know it's listed with the reason, also unpickable.
+fn discover_saturn_xdma(devices: &Arc<Mutex<Vec<Device>>>) {
+    let Some(found) = crate::saturn::discover() else { return };
+    if let Some(who) = &found.in_use_by {
+        eprintln!("discover: Saturn XDMA is in use by {who}");
+    }
+    let sentinel = SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0);
+    devices.lock().unwrap().push(Device {
+        address: sentinel,
+        my_address: sentinel,
+        device: 10,
+        board: Boards::Saturn,
+        protocol: 2,
+        version: found.info.minor_version.min(255) as u8,
+        status: if found.in_use_by.is_some() { 3 } else { 2 },
+        mac: found.mac,
+        // The FPGA's ten DDCs.
+        supported_receivers: 10,
+        supported_transmitters: 1,
+        adcs: 2,
+        frequency_min: 0,
+        frequency_max: 61_440_000,
+        usb_link_speed_warning: found.incompatible.then_some("FPGA firmware not supported"),
+    });
+}
+
+impl Device {
+    /// An ANAN G2 reached through XDMA -- see discover_saturn_xdma.
+    pub fn is_saturn_xdma(&self) -> bool {
+        self.board == Boards::Saturn && self.address.port() == 0
+    }
+}
+
 pub(crate) fn pluto_device(info: &pluto::Info) -> Device {
     Device {
         address: info.addr,
@@ -772,8 +864,8 @@ mod tests {
 
     /// An HL2b2 on 74p2 gateware identifying as a Hermes (board id 1,
     /// version 54, per usopenhpsdr1.v): its receiver count (byte 19) and
-    /// hardware revision (byte 20) give it away, so it's a Hermes-Lite 2 --
-    /// while a real Hermes, with zeros there, stays a Hermes (issue #7).
+    /// hardware revision (byte 20) with its MAC prefix give it away, so it's
+    /// a Hermes-Lite 2 -- while a real Hermes stays a Hermes (issue #7).
     #[test]
     fn hl2_identifying_as_hermes_is_a_hermes_lite_2() {
         let mut reply = vec![0u8; 60];
@@ -789,6 +881,38 @@ mod tests {
         reply[19] = 0;
         reply[20] = 0;
         assert_eq!(Device::from_p1_reply(&reply, addr, addr).unwrap().board, Boards::Hermes);
+        // An ANAN-10E fills bytes 19 and 20 too, but isn't an HL2's MAC
+        // (REAL REPORT, v0.12.0 showed one as a Hermes-Lite 2).
+        let anan10e = apache_hermes_reply(15);
+        let device = Device::from_p1_reply(&anan10e, addr, addr).unwrap();
+        assert_eq!(device.board, Boards::Hermes);
+    }
+
+    /// A discovery reply as Apache's Hermes gateware sends it (Tx_MAC.v):
+    /// MAC, version, then 0x01 to the end -- board id 1 included.
+    fn apache_hermes_reply(version: u8) -> Vec<u8> {
+        let mut reply = vec![0x01u8; 60];
+        reply[..3].copy_from_slice(&[0xEF, 0xFE, 0x02]);
+        reply[3..9].copy_from_slice(&[0x00, 0x04, 0xA3, 0x12, 0x34, 0x56]);
+        reply[9] = version;
+        reply
+    }
+
+    /// An ANAN-10E/100B (Hermes10E v1.5) has 2 receivers and no room for
+    /// PureSignal's feedback on receivers 3 and 4; Hermes and the ANAN-10/100
+    /// (v3.3, v3.2) have 4.
+    #[test]
+    fn hermes_receivers_follow_the_firmware() {
+        let addr: SocketAddr = "192.168.1.45:1024".parse().unwrap();
+        for (version, receivers) in [(15, 2), (33, 4), (32, 4)] {
+            let device = Device::from_p1_reply(&apache_hermes_reply(version), addr, addr).unwrap();
+            assert_eq!((device.board, device.supported_receivers), (Boards::Hermes, receivers), "v{version}");
+            assert_eq!(
+                crate::radio::puresignal_supported(1, device.board, device.supported_receivers),
+                receivers == 4,
+                "v{version}"
+            );
+        }
     }
 
     /// A Brick2's real P2 discovery reply (from a Wireshark capture,
@@ -804,7 +928,7 @@ mod tests {
         assert_eq!(device.board, Boards::Hermes);
         assert_eq!(device.supported_receivers, 2);
         // Its receivers start at DDC0: no DDC0/DDC1 reservation.
-        assert!(!crate::radio::puresignal_supported(2, device.board));
+        assert!(!crate::radio::puresignal_supported(2, device.board, device.supported_receivers));
         // A reply without the count keeps the board table's.
         reply[20] = 0;
         assert_eq!(Device::from_p2_reply(&reply, addr, addr).unwrap().supported_receivers, 5);

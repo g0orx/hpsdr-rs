@@ -16,6 +16,11 @@ pub const FEATURE_SPECTRUM: &str = "spectrum";
 pub const FEATURE_ADPCM: &str = "adpcm";
 /// The server takes hpsdr_mox and TX audio (tx.rs).
 pub const FEATURE_TX: &str = "tx";
+/// The server takes TCI's cw_macros commands and sends hpsdr_cw_messages
+/// (cw.rs).
+pub const FEATURE_CW: &str = "cw";
+/// The server takes hpsdr_key, live keying (cw.rs).
+pub const FEATURE_KEY: &str = "key";
 
 /// Audio rates `hpsdr_audio` accepts.
 pub const AUDIO_RATES: [u32; 5] = [8_000, 12_000, 16_000, 24_000, 48_000];

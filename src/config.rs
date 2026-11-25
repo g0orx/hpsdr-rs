@@ -50,6 +50,9 @@ pub struct Config {
     pub agc_hang_ms: Option<i32>,
     pub agc_top_db: Option<f64>,
     pub agc_slope_db: Option<i32>,
+    /// AGC Off's gain (spectrum::DemodParams::agc_fixed_db).
+    #[serde(default)]
+    pub agc_fixed_db: Option<f64>,
     /// See spectrum::DemodParams::meter_calibration_db's own doc
     /// comment. `#[serde(default)]` since older saved configs predate
     /// this field -- missing = 0.0/uncalibrated, the pre-existing
@@ -144,6 +147,11 @@ pub struct Config {
     pub tci_logging_enabled: Option<bool>,
     #[serde(default)]
     pub cat_logging_enabled: Option<bool>,
+    /// CAT on serial ports (Settings -> Network, "Serial 1-3") -- see
+    /// cat.rs's CatSerialPort. Missing (configs saved before these
+    /// existed) means none.
+    #[serde(default)]
+    pub cat_serial: Option<Vec<CatSerialConfig>>,
     /// The web client server's connection log, web_log.txt.
     #[serde(default)]
     pub web_logging_enabled: Option<bool>,
@@ -167,6 +175,30 @@ pub struct Config {
     /// ANF ("Automatic Notch Filter") -- see spectrum::DemodParams::anf's
     /// doc comment.
     pub anf: Option<bool>,
+    /// Main receiver CW Audio Peak Filter on/off -- see
+    /// spectrum::DemodParams::apf.
+    #[serde(default)]
+    pub apf: bool,
+    /// The APF's settings, shared by every receiver -- see
+    /// spectrum::ApfSettings.
+    #[serde(default)]
+    pub apf_settings: crate::spectrum::ApfSettings,
+    /// TNF and the manual notches, shared by every receiver -- see
+    /// spectrum::Notch.
+    #[serde(default)]
+    pub tnf: bool,
+    #[serde(default)]
+    pub notches: Vec<crate::spectrum::Notch>,
+    /// Main receiver Auto AGC -- see spectrum::DemodParams::agc_auto.
+    #[serde(default)]
+    pub agc_auto: bool,
+    /// Main receiver Mute (the speakers only) -- see
+    /// spectrum::DemodParams::muted.
+    #[serde(default)]
+    pub muted: bool,
+    /// Auto AGC's offset above the noise floor, shared by every receiver
+    /// -- see spectrum::agc_auto_offset_db. None = the default.
+    pub agc_auto_offset_db: Option<f64>,
     /// Main receiver squelch on/off and 0-100 level -- see
     /// spectrum::Squelch.
     pub squelch_enabled: Option<bool>,
@@ -174,6 +206,9 @@ pub struct Config {
     /// Binaural ("phasing") RX audio -- see spectrum::DemodParams::
     /// binaural's doc comment.
     pub binaural: Option<bool>,
+    /// Main receiver's audio pan, -1.0 (left) to 1.0 (right) -- see
+    /// spectrum::DemodParams::audio_pan.
+    pub audio_pan: Option<f32>,
     /// Main receiver's graphic EQ -- see spectrum::EqualizerParams's doc
     /// comment. Each extra receiver window persists its own copy
     /// separately, see ExtraReceiverConfig::eq.
@@ -182,6 +217,9 @@ pub struct Config {
     /// -- whether TX was armed (tx_enabled) is intentionally NOT saved
     /// (see main.rs's auto-arm-on-connect comment).
     pub mic_gain: Option<f32>,
+    /// Settings -> TX's Monitor TX Audio level, linear 0.0-1.0 -- see
+    /// tx::TxParams::monitor_volume.
+    pub tx_monitor_volume: Option<f32>,
     /// TX graphic EQ -- see spectrum::EqualizerParams's doc comment.
     pub tx_eq: Option<EqualizerParams>,
     /// Speech Processor (WDSP compressor) on/off -- see
@@ -196,6 +234,15 @@ pub struct Config {
     /// tx::TxParams::cessb_enabled's doc comment.
     #[serde(default)]
     pub tx_cessb_enabled: Option<bool>,
+    /// Settings -> TX -> TX Filter -- see TxFilter.
+    #[serde(default)]
+    pub tx_filter: Option<TxFilter>,
+    /// Settings -> TX -> TX Profile: the saved profiles, and the one last
+    /// chosen or saved.
+    #[serde(default)]
+    pub tx_profiles: Vec<TxProfile>,
+    #[serde(default)]
+    pub tx_profile: Option<String>,
     /// Gain applied specifically to TX audio received from a TCI
     /// client (WSJT-X, TCI Remote, etc.), independent of mic_gain
     /// above -- see radio::RadioSession::tci_tx_gain's doc comment for
@@ -247,6 +294,11 @@ pub struct Config {
     /// out-of-range falls back to 0.
     #[serde(default)]
     pub cw_text_selected: Option<usize>,
+    /// The keys a key or paddle plugged into a remote client as a
+    /// keyboard types: dit (or a straight key) and dah, each one of
+    /// hpsdr_proto::cw::PADDLE_KEY_CHOICES. Missing: `[` and `]`.
+    #[serde(default)]
+    pub cw_paddle_keys: Option<(char, char)>,
     /// Per-band PA gain (dB) entered via the PA Calibration sliders
     /// (Settings -> TX), keyed by band name (see main.rs's BANDS).
     /// Feeds radio::drive_byte_for_watts in place of the flat
@@ -340,6 +392,10 @@ pub struct Config {
     /// map didn't exist at all.
     #[serde(default)]
     pub width_memory: std::collections::HashMap<String, f64>,
+    /// Last AF Gain used per mode, keyed by Mode::label() -- see main.rs's
+    /// track_gain_per_mode.
+    #[serde(default)]
+    pub gain_memory: std::collections::HashMap<String, f32>,
     /// Extra receivers (beyond the primary one above), P2 only. On
     /// reconnect these are automatically recreated with their saved
     /// settings, matching however many were active last time.
@@ -367,6 +423,11 @@ pub struct Config {
     /// ConnectedState::allow_out_of_band_tx by every PTT path each time.
     #[serde(default)]
     pub allow_out_of_band_tx: Option<bool>,
+    /// Settings -> TX "Split off when changing band": a band button turns
+    /// Split (and Duplex) off, rather than restoring how that band was
+    /// last left (BandSettings::split).
+    #[serde(default)]
+    pub split_off_on_band_change: Option<bool>,
     /// Diversity reception (2-ADC boards only, Settings -> Diversity) --
     /// see radio::RadioSettings's matching field doc comment. Only takes
     /// effect on the next connect, same as puresignal_enabled (and
@@ -471,6 +532,34 @@ pub struct Config {
     pub vfo_b_frequency_hz: Option<u32>,
     #[serde(default)]
     pub split: Option<bool>,
+    /// FM repeater shift: -1, 0 (simplex) or +1 -- ConnectedState::fm_shift.
+    #[serde(default)]
+    pub fm_shift: Option<i8>,
+    /// CTCSS tone sent in FM, Hz; 0 = none.
+    #[serde(default)]
+    pub ctcss_hz: Option<f32>,
+    /// FM TX peak deviation, Hz (tx::FM_DEVIATION_WIDE_HZ/NARROW_HZ).
+    #[serde(default)]
+    pub fm_deviation_hz: Option<f64>,
+    /// VFO step, Hz (main.rs's VFO_STEPS_HZ): what a front-panel
+    /// controller's VFO knob moves by.
+    #[serde(default)]
+    pub vfo_step_hz: Option<u32>,
+    /// VFO step per mode, keyed by Mode::label() -- see main.rs's
+    /// track_step_per_mode. `vfo_step_hz` is the current mode's.
+    #[serde(default)]
+    pub step_memory: std::collections::HashMap<String, u32>,
+    /// Repeater offset per band (band_memory key), Hz, where it was
+    /// changed from the default (main.rs's default_repeater_offset_hz).
+    #[serde(default)]
+    pub repeater_offsets: std::collections::HashMap<String, u32>,
+    /// Band stacks: BANDSTACK_SIZE entries per band_memory key (None = not
+    /// yet used), and which one each band is on. The entry in use lives in
+    /// band_settings; see main.rs's step_bandstack.
+    #[serde(default)]
+    pub bandstacks: std::collections::HashMap<String, Vec<Option<BandSettings>>>,
+    #[serde(default)]
+    pub bandstack_index: std::collections::HashMap<String, usize>,
     /// See ConnectedState::sat_mode: 0 off, 1 SAT, 2 SATR.
     #[serde(default)]
     pub sat_mode: Option<u8>,
@@ -482,6 +571,14 @@ pub struct Config {
     /// See ConnectedState::duplex. `None` falls back to off.
     #[serde(default)]
     pub duplex: Option<bool>,
+    /// See ConnectedState::vfo_a_lock, vfo_b_lock and vfo_sync. Off when
+    /// missing.
+    #[serde(default)]
+    pub vfo_a_lock: bool,
+    #[serde(default)]
+    pub vfo_b_lock: bool,
+    #[serde(default)]
+    pub vfo_sync: bool,
     /// Named setups (the main window's Setups menu), in the order saved.
     #[serde(default)]
     pub setups: Vec<SavedSetup>,
@@ -570,6 +667,10 @@ pub struct Config {
     /// (a config saved before this existed) falls back to 0 (off).
     #[serde(default)]
     pub tx_tail_delay_ms: Option<u32>,
+    /// See tx::TX_RF_DELAY_MS. `None` (a config saved before this
+    /// existed) means 0 (off).
+    #[serde(default)]
+    pub tx_rf_delay_ms: Option<u32>,
     /// Global Open Collector mask ORed into the active band's Tx mask
     /// while TUNE is active -- see main.rs's ConnectedState::oc_tune
     /// doc comment.
@@ -598,6 +699,10 @@ pub struct Config {
     /// keyed list, same precedent as `xvtrs` above, not a flat field.
     #[serde(default)]
     pub midi_bindings: Vec<crate::midi::MidiBinding>,
+    /// Send control changes back to the MIDI device -- see
+    /// midi::MidiWorker::feedback. Missing = off.
+    #[serde(default)]
+    pub midi_feedback: Option<bool>,
 }
 
 fn default_nb_threshold() -> f64 {
@@ -647,6 +752,64 @@ pub struct SavedSetup {
     pub lnb_lock: Option<bool>,
 }
 
+/// Settings -> TX -> TX Filter: follow the RX filter (the default, as
+/// before this existed), or the TX filter's own audio edges, Hz -- see
+/// spectrum::tx_passband_for for how they're placed for each mode.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq)]
+pub struct TxFilter {
+    pub use_rx: bool,
+    pub low_hz: f64,
+    pub high_hz: f64,
+}
+
+impl Default for TxFilter {
+    /// The RX filter's own default for USB (150-2700 Hz), so turning
+    /// "Use RX filter" off starts where it was.
+    fn default() -> Self {
+        TxFilter { use_rx: true, low_hz: 150.0, high_hz: 2700.0 }
+    }
+}
+
+impl TxFilter {
+    /// The edges for tx::TxParams::filter, or None to follow RX.
+    pub fn edges(&self) -> Option<(f64, f64)> {
+        (!self.use_rx).then_some((self.low_hz, self.high_hz))
+    }
+
+    /// Sets the edges from a passband as TCI's tx_filter_band_ex gives it
+    /// -- Hz from the carrier, signed as rx_filter_band's: below the
+    /// carrier (LSB) is mirrored; one straddling it (AM, FM) sets High
+    /// only, from its wider side. Use RX filter goes off. Kept to the
+    /// Settings -> TX ranges (Low 0-1000, High 500-8000, 100 Hz apart).
+    pub fn set_passband(&mut self, low: f64, high: f64) {
+        let (low, high) = if high <= 0.0 {
+            (-high, -low)
+        } else if low < 0.0 {
+            (self.low_hz, high.max(-low))
+        } else {
+            (low, high)
+        };
+        self.use_rx = false;
+        self.low_hz = low.round().clamp(0.0, 1000.0);
+        self.high_hz = high.round().clamp(500.0, 8000.0).max(self.low_hz + 100.0);
+    }
+}
+
+/// A named set of TX audio settings (Settings -> TX -> TX Profile), as
+/// Thetis's TX profiles: mic gain, the TX EQ, the Speech Processor and
+/// its compression, CESSB, and the TX filter. Not power, drive or FM
+/// settings -- those go with the band and the mode, not the voice.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct TxProfile {
+    pub name: String,
+    pub mic_gain: f32,
+    pub eq: EqualizerParams,
+    pub compressor_enabled: bool,
+    pub compressor_gain_db: f32,
+    pub cessb_enabled: bool,
+    pub filter: TxFilter,
+}
+
 #[derive(Serialize, Deserialize, Clone)]
 pub struct ExtraReceiverConfig {
     pub frequency_hz: u32,
@@ -654,10 +817,18 @@ pub struct ExtraReceiverConfig {
     pub adc: u8,
     #[serde(default)]
     pub band_settings: std::collections::HashMap<String, BandSettings>,
+    /// This receiver's band stacks -- see Config::bandstacks.
+    #[serde(default)]
+    pub bandstacks: std::collections::HashMap<String, Vec<Option<BandSettings>>>,
+    #[serde(default)]
+    pub bandstack_index: std::collections::HashMap<String, usize>,
     /// See Config::width_memory's doc comment -- same thing, per extra
     /// receiver instead of shared across the session.
     #[serde(default)]
     pub width_memory: std::collections::HashMap<String, f64>,
+    /// See Config::gain_memory.
+    #[serde(default)]
+    pub gain_memory: std::collections::HashMap<String, f32>,
     pub mode: Mode,
     pub width_hz: f64,
     pub gain: f32,
@@ -671,6 +842,8 @@ pub struct ExtraReceiverConfig {
     pub agc_hang_ms: i32,
     pub agc_top_db: f64,
     pub agc_slope_db: i32,
+    #[serde(default = "default_agc_fixed_db")]
+    pub agc_fixed_db: f64,
     /// See spectrum::DemodParams::meter_calibration_db's own doc
     /// comment. `#[serde(default)]` -- same reasoning as every other
     /// field added to this struct after the ones above it.
@@ -702,6 +875,15 @@ pub struct ExtraReceiverConfig {
     /// See Config::anf's doc comment.
     #[serde(default)]
     pub anf: bool,
+    /// See Config::apf's doc comment.
+    #[serde(default)]
+    pub apf: bool,
+    /// See Config::agc_auto's doc comment.
+    #[serde(default)]
+    pub agc_auto: bool,
+    /// See Config::muted's doc comment.
+    #[serde(default)]
+    pub muted: bool,
     /// See Config::squelch_enabled's doc comment.
     #[serde(default)]
     pub squelch_enabled: bool,
@@ -710,6 +892,9 @@ pub struct ExtraReceiverConfig {
     /// See Config::binaural's doc comment.
     #[serde(default)]
     pub binaural: bool,
+    /// See Config::audio_pan's doc comment.
+    #[serde(default)]
+    pub audio_pan: f32,
     /// See Config::spectrum_waterfall_ratio's doc comment.
     #[serde(default = "default_spectrum_waterfall_ratio")]
     pub spectrum_waterfall_ratio: f32,
@@ -815,10 +1000,17 @@ pub(crate) fn settings_dir() -> Option<PathBuf> {
 /// A window's on-screen position and content size, in egui points
 /// (matches `egui::ViewportBuilder::with_position`/`with_inner_size`'s
 /// units -- see Config::window_geometry/ExtraReceiverConfig::window_geometry).
+/// The position is None on Wayland, which never tells an app where its
+/// window is nor lets it choose: the compositor places it. REAL REPORT
+/// (2026-11-10): with native Wayland the default (since f76d51b), no
+/// geometry was saved at all, size included, so windows always opened at
+/// their default size.
 #[derive(Serialize, Deserialize, Clone, Copy)]
 pub struct WindowGeometry {
-    pub x: f32,
-    pub y: f32,
+    #[serde(default)]
+    pub x: Option<f32>,
+    #[serde(default)]
+    pub y: Option<f32>,
     pub width: f32,
     pub height: f32,
 }
@@ -840,6 +1032,76 @@ pub fn ps_corr_path(mac: [u8; 6]) -> Option<PathBuf> {
     let [a, b, c, d, e, f] = mac;
     path.push(format!("ps_corr-{a:02x}-{b:02x}-{c:02x}-{d:02x}-{e:02x}-{f:02x}.dat"));
     Some(path)
+}
+
+/// Settings for this computer rather than for one radio, in
+/// `ui_prefs.json` beside the per-radio configs (like the discovery
+/// window's manual_ips.json).
+#[derive(Serialize, Deserialize, Default)]
+pub struct UiPrefs {
+    /// egui's zoom factor: the whole interface, every window, scaled on
+    /// top of the desktop's own display scale. Set in Settings -> Spectrum
+    /// (UI Scale) or with Ctrl - / Ctrl + / Ctrl 0. REAL REPORT: on an RPi
+    /// whose desktop scaled everything up, text was so big that extra
+    /// receiver windows wouldn't fit on the screen, and egui's Ctrl -
+    /// zoom wasn't kept from one run to the next.
+    pub zoom: Option<f32>,
+    /// Dark, Light or following the computer's own setting (Settings ->
+    /// Spectrum). Missing in older files: Dark, as before.
+    #[serde(default)]
+    pub theme: ThemeChoice,
+    /// Settings -> Spectrum's Layout: the compact layout is for small
+    /// screens such as the 7" 800x480 Raspberry Pi display (the control
+    /// rows open as popups from a toolbar under the spectrum). Auto (the
+    /// default) picks it on a small screen.
+    #[serde(default)]
+    pub layout: LayoutChoice,
+}
+
+/// See UiPrefs::layout.
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Default, Debug)]
+pub enum LayoutChoice {
+    #[default]
+    Auto,
+    Standard,
+    Compact,
+}
+
+/// See UiPrefs::theme. Dark by default: hpsdr-rs was always dark, and
+/// following the system unasked turned it white on Windows (a real report,
+/// see HpsdrApp::new).
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Default, Debug)]
+pub enum ThemeChoice {
+    #[default]
+    Dark,
+    Light,
+    System,
+}
+
+fn ui_prefs_path() -> Option<PathBuf> {
+    let mut path = settings_dir()?;
+    path.push("ui_prefs.json");
+    Some(path)
+}
+
+impl UiPrefs {
+    pub fn load() -> UiPrefs {
+        ui_prefs_path()
+            .and_then(|p| std::fs::read_to_string(p).ok())
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default()
+    }
+
+    pub fn save(&self) {
+        let Some(path) = ui_prefs_path() else {
+            return;
+        };
+        if let Ok(json) = serde_json::to_string_pretty(self) {
+            if let Err(e) = std::fs::write(&path, json) {
+                eprintln!("failed to save UI settings to {}: {e}", path.display());
+            }
+        }
+    }
 }
 
 impl Config {
@@ -874,9 +1136,72 @@ fn default_squelch_level() -> f32 {
     30.0
 }
 
+fn default_agc_fixed_db() -> f64 {
+    crate::spectrum::DEFAULT_AGC_FIXED_DB
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A window's geometry saved with a position (X11, Windows, macOS)
+    /// still loads, and one saved without (Wayland) keeps its size.
+    #[test]
+    fn window_geometry_loads_with_or_without_a_position() {
+        let g: WindowGeometry = serde_json::from_str(r#"{"x":10.0,"y":20.0,"width":800.0,"height":400.0}"#).unwrap();
+        assert_eq!((g.x, g.y, g.width, g.height), (Some(10.0), Some(20.0), 800.0, 400.0));
+        let g: WindowGeometry = serde_json::from_str(r#"{"width":800.0,"height":400.0}"#).unwrap();
+        assert_eq!((g.x, g.y, g.width), (None, None, 800.0));
+        let json = serde_json::to_string(&g).unwrap();
+        let g: WindowGeometry = serde_json::from_str(&json).unwrap();
+        assert_eq!((g.x, g.height), (None, 400.0));
+    }
+
+    /// TX profiles and the TX filter survive a save and load; a config
+    /// written before they existed loads with none, and the TX filter
+    /// following RX.
+    #[test]
+    fn tx_profiles_round_trip_and_old_configs_load() {
+        let profile = TxProfile {
+            name: "DX".to_string(),
+            mic_gain: 1.5,
+            eq: EqualizerParams::default(),
+            compressor_enabled: true,
+            compressor_gain_db: 8.0,
+            cessb_enabled: true,
+            filter: TxFilter { use_rx: false, low_hz: 200.0, high_hz: 2600.0 },
+        };
+        let cfg = Config {
+            tx_profiles: vec![profile.clone()],
+            tx_profile: Some("DX".to_string()),
+            tx_filter: Some(profile.filter),
+            ..Default::default()
+        };
+        let back: Config = serde_json::from_str(&serde_json::to_string(&cfg).unwrap()).unwrap();
+        assert_eq!(back.tx_profiles, vec![profile]);
+        assert_eq!(back.tx_profile.as_deref(), Some("DX"));
+        assert_eq!(back.tx_filter.unwrap().edges(), Some((200.0, 2600.0)));
+
+        let old: Config = serde_json::from_str("{}").unwrap();
+        assert!(old.tx_profiles.is_empty() && old.tx_profile.is_none());
+        assert_eq!(old.tx_filter.unwrap_or_default().edges(), None, "follows RX");
+    }
+
+    /// TCI's tx_filter_band_ex passbands, signed as rx_filter_band's,
+    /// become the TX filter's own edges, whichever side of the carrier.
+    #[test]
+    fn tx_filter_from_a_tci_passband() {
+        let set = |low, high| {
+            let mut f = TxFilter::default();
+            f.set_passband(low, high);
+            f.edges()
+        };
+        assert_eq!(set(100.0, 2900.0), Some((100.0, 2900.0)), "USB");
+        assert_eq!(set(-2800.0, -200.0), Some((200.0, 2800.0)), "LSB, mirrored");
+        assert_eq!(set(-4000.0, 3500.0), Some((150.0, 4000.0)), "AM: High only, Low kept");
+        assert_eq!(set(0.0, 20_000.0), Some((0.0, 8000.0)), "kept to the range");
+        assert_eq!(set(900.0, 950.0), Some((900.0, 1000.0)), "100 Hz apart");
+    }
 
     /// A named setup survives a save and load, and a config written before
     /// setups existed still loads, with none.
@@ -915,4 +1240,59 @@ mod tests {
         assert_eq!(if_era.setups[0].name, "QO-100");
         assert_eq!((if_era.setups[0].vfo_a_rf_hz, if_era.setups[0].psk_beacon), (None, None));
     }
+}
+
+/// One CAT serial port's settings (see Config::cat_serial).
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct CatSerialConfig {
+    #[serde(default)]
+    pub port: String,
+    #[serde(default = "default_cat_serial_baud")]
+    pub baud: u32,
+    #[serde(default)]
+    pub auto_report: bool,
+    /// FA/IF report the TX frequency (default on) -- see
+    /// cat::SerialOptions::report_tx.
+    #[serde(default = "default_true")]
+    pub report_tx: bool,
+    #[serde(default)]
+    pub ptt_out: crate::cat::PttOut,
+    #[serde(default)]
+    pub ptt_in: crate::cat::PttIn,
+    /// Running when last saved: started again on connecting.
+    #[serde(default)]
+    pub running: bool,
+}
+
+impl CatSerialConfig {
+    pub fn options(&self) -> crate::cat::SerialOptions {
+        crate::cat::SerialOptions {
+            port: self.port.clone(),
+            baud: self.baud,
+            auto_report: self.auto_report,
+            report_tx: self.report_tx,
+            ptt_out: self.ptt_out,
+            ptt_in: self.ptt_in,
+        }
+    }
+
+    pub fn from_options(o: &crate::cat::SerialOptions, running: bool) -> Self {
+        Self {
+            port: o.port.clone(),
+            baud: o.baud,
+            auto_report: o.auto_report,
+            report_tx: o.report_tx,
+            ptt_out: o.ptt_out,
+            ptt_in: o.ptt_in,
+            running,
+        }
+    }
+}
+
+fn default_cat_serial_baud() -> u32 {
+    crate::cat::DEFAULT_SERIAL_BAUD
+}
+
+fn default_true() -> bool {
+    true
 }

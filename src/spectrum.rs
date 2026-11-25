@@ -154,6 +154,218 @@ pub fn set_cw_pitch_hz(hz: f64) {
     CW_PITCH_HZ.store(clamped, Ordering::Relaxed);
 }
 
+/// The CW Audio Peak Filter's (APF) settings, shared by every receiver
+/// like the CW pitch above; each receiver only has its own on/off
+/// (DemodParams::apf). As Thetis's Settings -> DSP -> Audio -> APF: the
+/// filter type, a tune offset from the CW pitch, the bandwidth, and a
+/// 0-100 gain that WDSP gets as 10^(gain/200) (0 = unity, 100 = +10 dB).
+/// Defaults are Thetis's: Bi-Quad, 150 Hz, no offset, unity gain.
+#[derive(Copy, Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct ApfSettings {
+    /// WDSP's SetRXASPCWSelection: 0 Double Pole, 1 Matched, 2 Gaussian,
+    /// 3 Bi-Quad.
+    pub kind: u8,
+    /// Hz from the CW pitch, -250..250.
+    pub tune_hz: i32,
+    /// Approximate -3 dB bandwidth, 10..150 Hz.
+    pub bandwidth_hz: i32,
+    /// 0..100, see above.
+    pub gain: i32,
+}
+
+pub const APF_KINDS: [&str; 4] = ["Double Pole", "Matched", "Gaussian", "Bi-Quad"];
+
+impl ApfSettings {
+    pub const DEFAULT: Self = Self { kind: 3, tune_hz: 0, bandwidth_hz: 150, gain: 0 };
+
+    pub fn clamped(self) -> Self {
+        Self {
+            kind: self.kind.min(3),
+            tune_hz: self.tune_hz.clamp(-250, 250),
+            bandwidth_hz: self.bandwidth_hz.clamp(10, 150),
+            gain: self.gain.clamp(0, 100),
+        }
+    }
+}
+
+impl Default for ApfSettings {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
+
+static APF_SETTINGS: Mutex<ApfSettings> = Mutex::new(ApfSettings::DEFAULT);
+
+pub fn apf_settings() -> ApfSettings {
+    *APF_SETTINGS.lock().unwrap()
+}
+
+pub fn set_apf_settings(s: ApfSettings) {
+    *APF_SETTINGS.lock().unwrap() = s.clamped();
+}
+
+/// One manual notch (Thetis's TNF notches): an RF frequency -- what the
+/// VFO shows, transverter included -- and a width, both Hz. It stays at
+/// that frequency whatever the receiver is tuned to.
+#[derive(Copy, Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Notch {
+    pub frequency_hz: f64,
+    pub width_hz: f64,
+}
+
+/// The manual notches and TNF, Thetis's master switch for them, shared
+/// by every receiver as in Thetis. `generation` moves on every change, so
+/// each receiver's thread reloads WDSP's notch list only then.
+struct NotchState {
+    generation: u64,
+    tnf: bool,
+    notches: Vec<Notch>,
+}
+
+static NOTCHES: Mutex<NotchState> = Mutex::new(NotchState { generation: 0, tnf: false, notches: Vec::new() });
+
+/// Most notches kept -- WDSP's notch list holds 1024; this is plenty.
+pub const MAX_NOTCHES: usize = 64;
+
+pub fn notches() -> Vec<Notch> {
+    NOTCHES.lock().unwrap().notches.clone()
+}
+
+pub fn set_notches(notches: Vec<Notch>) {
+    let mut s = NOTCHES.lock().unwrap();
+    s.notches = notches;
+    s.notches.truncate(MAX_NOTCHES);
+    s.generation += 1;
+}
+
+pub fn tnf() -> bool {
+    NOTCHES.lock().unwrap().tnf
+}
+
+pub fn set_tnf(on: bool) {
+    let mut s = NOTCHES.lock().unwrap();
+    if s.tnf != on {
+        s.tnf = on;
+        s.generation += 1;
+    }
+}
+
+/// Auto AGC's offset (Thetis's "Auto AGC" offset, Setup -> AGC/ALC): the
+/// AGC threshold is put this many dB above the noise floor. Shared by
+/// every receiver, -60..60, default 20 as Thetis's.
+static AGC_AUTO_OFFSET_DB: Mutex<f64> = Mutex::new(DEFAULT_AGC_AUTO_OFFSET_DB);
+pub const DEFAULT_AGC_AUTO_OFFSET_DB: f64 = 20.0;
+pub const AGC_AUTO_OFFSET_RANGE: (f64, f64) = (-60.0, 60.0);
+
+pub fn agc_auto_offset_db() -> f64 {
+    *AGC_AUTO_OFFSET_DB.lock().unwrap()
+}
+
+pub fn set_agc_auto_offset_db(db: f64) {
+    *AGC_AUTO_OFFSET_DB.lock().unwrap() = db.clamp(AGC_AUTO_OFFSET_RANGE.0, AGC_AUTO_OFFSET_RANGE.1);
+}
+
+/// The noise floor of a receiver's spectrum, for Auto AGC -- Thetis's
+/// display.cs processNoiseFloor: each frame averages (in power) the
+/// pixels less than 2 dB above the current estimate, and moves the
+/// estimate halfway to that; with too few such pixels (under 15%) the
+/// estimate creeps up 1 dB a frame instead. What's reported follows that
+/// with a 2 s attack. After a retune it "fast attacks" for a second and
+/// reports nothing until that's over.
+struct NoiseFloor {
+    average_db: f32,
+    reported_db: f32,
+    fast_until: Option<std::time::Instant>,
+}
+
+impl NoiseFloor {
+    const ATTACK_S: f32 = 2.0;
+    const FAST_ATTACK: Duration = Duration::from_secs(1);
+
+    fn new() -> Self {
+        let mut nf = Self { average_db: -200.0, reported_db: -200.0, fast_until: None };
+        nf.restart();
+        nf
+    }
+
+    fn restart(&mut self) {
+        self.fast_until = Some(std::time::Instant::now() + Self::FAST_ATTACK);
+    }
+
+    /// One spectrum frame, dB per pixel. The floor once it's settled.
+    fn update(&mut self, pixels: &[f32]) -> Option<f32> {
+        // The analyzer's edges roll off; leave them out as the spectrum's
+        // own Auto Low does.
+        let edge = pixels.len() / 20;
+        let body = &pixels[edge..pixels.len() - edge];
+        if body.is_empty() {
+            return None;
+        }
+        let fast = match self.fast_until {
+            Some(t) if std::time::Instant::now() < t => true,
+            Some(_) => {
+                self.fast_until = None;
+                false
+            }
+            None => false,
+        };
+        if fast {
+            // Thetis climbs 3 dB a frame from where it was; at this
+            // file's 10 frames a second that's too slow to settle within
+            // the fast attack, so start from the quietest 15% instead.
+            let mut sorted: Vec<f32> = body.iter().copied().filter(|v| v.is_finite()).collect();
+            if sorted.is_empty() {
+                return None;
+            }
+            sorted.sort_by(|a, b| a.total_cmp(b));
+            let low = &sorted[..(sorted.len() * 3 / 20).max(1)];
+            let power = low.iter().map(|v| 10f32.powf(v / 10.0)).sum::<f32>() / low.len() as f32;
+            self.average_db = 10.0 * (power + 1e-30).log10();
+            self.reported_db = self.average_db;
+            return None;
+        }
+        let limit = self.average_db + 2.0;
+        let (mut sum, mut count) = (0f32, 0usize);
+        for &v in body {
+            if v < limit {
+                sum += 10f32.powf(v / 10.0);
+                count += 1;
+            }
+        }
+        if count > 0 && count >= body.len() * 3 / 20 {
+            let mean = sum / count as f32;
+            let old = 10f32.powf(self.average_db / 10.0);
+            self.average_db = 10.0 * ((mean + old) * 0.5 + 1e-30).log10();
+        } else {
+            self.average_db += 1.0;
+        }
+        self.average_db = self.average_db.clamp(-200.0, 200.0);
+        let frames = (SPECTRUM_FPS * Self::ATTACK_S) as i32 + 1;
+        self.reported_db -= (self.reported_db - self.average_db) / frames as f32;
+        Some(self.reported_db)
+    }
+}
+
+/// The AGC gain (WDSP's Top, dB) that puts the AGC threshold at
+/// `thresh_db`, a spectrum pixel's level -- WDSP's own SetRXAAGCThresh
+/// formula (wcpAGC.c), done here because that call overwrites the same
+/// max_gain SetRXAAGCTop sets (see SpectrumAnalyzer::demod). Its
+/// noise_offset scales a bin's level to the AGC's bandwidth, the
+/// passband; this file's pixels are WDSP's per-bin levels plus its
+/// NormOneHz term 10*log10(fft_size / (pixels*zoom)) (SetDisplaySampleRate
+/// is pixels*zoom), so the FFT size cancels and a pixel's "bin" is
+/// sample_rate / (pixels*zoom) wide. Clamped as Thetis's
+/// setAGCThresholdPoint, to this file's 0..120.
+fn agc_top_for_threshold(thresh_db: f64, passband_hz: f64, pixels_wide: f64, sample_rate: f64, slope_db: i32) -> f64 {
+    // create_wcpagc's out_targ 1.0 with n_tau 4 (RXA.c), and
+    // SetRXAAGCSlope's var_gain.
+    let out_target = (1.0 - (-4.0f64).exp()) * 0.9999;
+    let var_gain = 10f64.powf(slope_db as f64 / 200.0);
+    let noise_offset = 10.0 * (passband_hz.abs().max(1.0) * pixels_wide / sample_rate).log10();
+    (20.0 * (out_target / var_gain).log10() - thresh_db - noise_offset).clamp(0.0, 120.0)
+}
+
 /// Computes passband edges (Hz, relative to the tuned/dial frequency)
 /// from mode + a single "width" control. This is our own UI convention,
 /// not a WDSP requirement -- WDSP just takes whatever edges it's given
@@ -181,6 +393,34 @@ pub fn passband_for(mode: Mode, width_hz: f64) -> (f64, f64) {
             let pitch = cw_pitch_hz();
             (pitch - width_hz / 2.0, pitch + width_hz / 2.0)
         }
+    }
+}
+
+/// The TX filter's passband: passband_for's (the RX filter's) with no
+/// `filter` of its own -- Settings -> TX -> TX Filter's "Use RX filter" --
+/// else that filter's `(low, high)` audio edges, Hz, placed for the mode:
+/// as they are for USB and DIGU, mirrored below the carrier for LSB and
+/// DIGL, and +/-high for AM, SAM, DSB, FM and DRM (both sidebands; low
+/// cut only matters with one). CW keeps the RX filter's: its carrier is
+/// generated, not filtered, so there's nothing to shape.
+pub fn tx_passband_for(mode: Mode, width_hz: f64, filter: Option<(f64, f64)>) -> (f64, f64) {
+    let Some((low, high)) = filter else { return passband_for(mode, width_hz) };
+    let high = high.max(low + 50.0);
+    match mode {
+        Mode::Usb | Mode::Digu | Mode::Spec => (low, high),
+        Mode::Lsb | Mode::Digl => (-high, -low),
+        Mode::Dsb | Mode::Am | Mode::Sam | Mode::Drm | Mode::Fmn => (-high, high),
+        Mode::Cwl | Mode::Cwu => passband_for(mode, width_hz),
+    }
+}
+
+/// The widest the filter width control goes for `mode` (Hz). FM gets
+/// 8 kHz (+/-8 kHz) for wide VHF/UHF FM; everything else stops at 5 kHz
+/// so the slider stays fine enough for CW and SSB.
+pub fn max_width_hz(mode: Mode) -> f64 {
+    match mode {
+        Mode::Fmn => 8000.0,
+        _ => 5000.0,
     }
 }
 
@@ -232,13 +472,16 @@ impl Agc {
         }
     }
 
-    pub fn next(self) -> Self {
+    pub const ALL: [Self; 5] = [Agc::Off, Agc::Long, Agc::Slow, Agc::Medium, Agc::Fast];
+
+    /// The choice on its own, for the main window's AGC menu.
+    pub fn name(self) -> &'static str {
         match self {
-            Agc::Off => Agc::Long,
-            Agc::Long => Agc::Slow,
-            Agc::Slow => Agc::Medium,
-            Agc::Medium => Agc::Fast,
-            Agc::Fast => Agc::Off,
+            Agc::Off => "Off",
+            Agc::Long => "Long",
+            Agc::Slow => "Slow",
+            Agc::Medium => "Medium",
+            Agc::Fast => "Fast",
         }
     }
 }
@@ -466,6 +709,23 @@ impl Squelch {
     }
 }
 
+/// AGC Off's gain, dB: +50 was calibrated on a real S9+20 AM station
+/// (see the SetRXAAGCFixed call in SpectrumAnalyzer::new) -- a weaker
+/// signal needs more, hence the slider.
+pub const DEFAULT_AGC_FIXED_DB: f64 = 50.0;
+/// Thetis's Fixed Gain range.
+pub const AGC_FIXED_DB_RANGE: (f64, f64) = (-20.0, 120.0);
+
+/// The left and right gains for audio pan `pan` (DemodParams::audio_pan,
+/// -1.0 left to 1.0 right): WDSP's SetRXAPanelPan law, constant power --
+/// the near side stays at full level, the far side falls away to nothing
+/// as sin(), both at 1.0 in the middle.
+pub fn pan_gains(pan: f32) -> (f32, f32) {
+    let p = (pan.clamp(-1.0, 1.0) + 1.0) / 2.0;
+    let far = (p * std::f32::consts::PI).sin();
+    if p <= 0.5 { (1.0, far) } else { (far, 1.0) }
+}
+
 #[derive(Copy, Clone)]
 pub struct DemodParams {
     pub mode: Mode,
@@ -482,6 +742,16 @@ pub struct DemodParams {
     pub agc_hang_ms: i32,
     pub agc_top_db: f64,
     pub agc_slope_db: i32,
+    /// Auto AGC (Thetis's): the receiver's thread keeps agc_top_db at
+    /// the gain that puts the AGC threshold agc_auto_offset_db() above
+    /// the spectrum's noise floor. SpectrumHandle::set_agc_top_db turns
+    /// it off, as moving Thetis's AGC-T slider does.
+    pub agc_auto: bool,
+    /// The gain with AGC Off (WDSP's SetRXAAGCFixed), dB -- Thetis's
+    /// "Fixed Gain", which its AGC-T slider sets while AGC is Fixed, as
+    /// the AGC Gain slider does here while AGC is Off. Default
+    /// DEFAULT_AGC_FIXED_DB.
+    pub agc_fixed_db: f64,
     /// NB (ANB) vs. NB2 (NOB) vs. off -- mutually exclusive, see
     /// NoiseBlanker's doc comment. External to the RXA chain: whichever
     /// stage is active runs on the raw ADC-rate IQ before fexchange0,
@@ -526,6 +796,9 @@ pub struct DemodParams {
     /// no mutually-exclusive cycle to fold into). Targets a steady
     /// heterodyne/carrier within the passband, not broadband noise.
     pub anf: bool,
+    /// CW Audio Peak Filter on/off; it only runs in CWL/CWU, as Thetis's.
+    /// Its settings are shared -- see ApfSettings.
+    pub apf: bool,
     /// Squelch: on/off and a 0-100 level (0 = open, 100 = tightest),
     /// mapped per mode onto WDSP's three squelches -- see Squelch.
     pub squelch_enabled: bool,
@@ -539,6 +812,13 @@ pub struct DemodParams {
     /// actually applied. radio-audio-to-radio downmixes to mono
     /// regardless of this setting -- see run()'s own doc comment.
     pub binaural: bool,
+    /// Audio pan (balance), -1.0 (left only) to 1.0 (right only), 0.0 the
+    /// middle -- the same constant-power law as WDSP's SetRXAPanelPan
+    /// (pan_gains), applied in run() to the speakers, Record and TCI, as
+    /// Thetis pans its TCI audio too. Not in WDSP itself: the mono taps
+    /// (CW decoder, waveform, audio to the radio) take (L+R)/2 and would
+    /// lose 6 dB at either end.
+    pub audio_pan: f32,
     /// CTUN ("Click to Tune"): when true, the hardware/LO frequency
     /// (lo_frequency_hz below) stays fixed and ctun_offset_hz shifts the
     /// RXA demod chain instead, so the user can pick a different listen
@@ -549,11 +829,12 @@ pub struct DemodParams {
     /// Only meaningful while ctun is true; ignored (and reset to 0 on
     /// the wire) while false.
     pub ctun_offset_hz: f64,
-    /// The actual hardware-tuned (LO) frequency, mirrored here every
-    /// frame from main.rs's RadioSession/ExtraReceiver state purely so
-    /// demod() can pass it to RXANBPSetTuneFrequency while CTUN is off
-    /// -- radio.rs/main.rs own the real value, this is just a read-only
-    /// copy for the analyzer thread.
+    /// The actual hardware-tuned (LO) frequency as RF -- the transverter
+    /// offset added, as the VFO shows it -- mirrored here every frame
+    /// from main.rs's RadioSession/ExtraReceiver state purely so demod()
+    /// can pass it to RXANBPSetTuneFrequency, which places the manual
+    /// notches (Notch) -- radio.rs/main.rs own the real value, this is
+    /// just a read-only copy for the analyzer thread.
     pub lo_frequency_hz: f64,
     /// See EqualizerParams's doc comment. One instance per receiver --
     /// every extra receiver window has its own DemodParams (and thus its
@@ -655,6 +936,8 @@ impl Default for DemodParams {
             // had been carrying.
             agc_top_db: 80.0,
             agc_slope_db: 35,
+            agc_auto: false,
+            agc_fixed_db: DEFAULT_AGC_FIXED_DB,
             // NB/NR off by default, same reasoning as AGC above --
             // these reshape the signal in ways that can surprise a
             // user who didn't ask for them; opt-in from the main panel.
@@ -665,9 +948,11 @@ impl Default for DemodParams {
             nnr_premium: false,
             snb: false,
             anf: false,
+            apf: false,
             squelch_enabled: false,
             squelch_level: 30.0,
             binaural: false,
+            audio_pan: 0.0,
             ctun: false,
             ctun_offset_hz: 0.0,
             lo_frequency_hz: 0.0,
@@ -804,12 +1089,18 @@ struct SpectrumAnalyzer {
     last_passband: Option<(f64, f64)>,
     last_agc: Option<Agc>,
     last_agc_params: Option<(i32, i32, i32, f64, i32)>,
+    last_agc_fixed_db: Option<f64>,
     last_nb_enabled: Option<NoiseBlanker>,
     last_nb_threshold: Option<f64>,
     last_nr_enabled: Option<NoiseReduction>,
     last_nnr_params: Option<(f64, c_int)>,
     last_snb_enabled: Option<bool>,
     last_anf_enabled: Option<bool>,
+    /// What the APF was last set to: run, (kind, centre Hz, bandwidth,
+    /// gain) -- see ApfSettings.
+    last_apf: Option<(bool, u8, f64, f64, f64)>,
+    /// NotchState::generation last loaded into WDSP.
+    last_notch_generation: Option<u64>,
     last_squelch: Option<Squelch>,
     last_binaural: Option<bool>,
     last_ctun: Option<bool>,
@@ -856,8 +1147,21 @@ impl SpectrumAnalyzer {
             // See config::settings_dir's doc comment -- shared, platform-
             // correct settings directory logic (this used to duplicate
             // an $HOME/.config-only version of the same thing here).
-            if let Some(dir) = crate::config::settings_dir().map(|d| d.join("wdsp_wisdom")) {
+            if let Some(settings) = crate::config::settings_dir() {
+                let dir = settings.join("wdsp_wisdom");
                 if std::fs::create_dir_all(&dir).is_ok() {
+                    // WDSPwisdom appends "wdspWisdom01" straight onto the
+                    // string with no separator, so it needs a trailing one
+                    // (join("") adds '/' or '\' per platform). Without it
+                    // the file landed beside the folder as
+                    // "wdsp_wisdomwdspWisdom01". Move any such file into
+                    // the folder so existing users don't re-plan FFTs.
+                    let stray = settings.join("wdsp_wisdomwdspWisdom01");
+                    let wanted = dir.join("wdspWisdom01");
+                    if stray.is_file() && !wanted.exists() {
+                        let _ = std::fs::rename(&stray, &wanted);
+                    }
+                    let dir = dir.join("");
                     if let Ok(cstring) = std::ffi::CString::new(dir.to_string_lossy().as_bytes()) {
                         // WDSP 2.11: -1 means the path was rejected and no
                         // wisdom was loaded or built.
@@ -1018,7 +1322,10 @@ impl SpectrumAnalyzer {
             // on real hardware -- revisit with a fresh recording (Audio
             // Gain swept low-to-high on the same or another station) if
             // it's still off in either direction.
-            wdsp::SetRXAAGCFixed(channel, 50.0);
+            // The starting point: DemodParams::agc_fixed_db (the AGC
+            // Gain slider while AGC is Off) sets it from the first
+            // demod() call.
+            wdsp::SetRXAAGCFixed(channel, DEFAULT_AGC_FIXED_DB);
 
             // Creates the noise blanker DSP objects themselves -- must
             // happen before the Set*Samplerate calls below, since those
@@ -1170,12 +1477,15 @@ impl SpectrumAnalyzer {
                 last_passband: None,
                 last_agc: None,
                 last_agc_params: None,
+                last_agc_fixed_db: None,
                 last_nb_enabled: None,
                 last_nb_threshold: None,
                 last_nr_enabled: None,
                 last_nnr_params: None,
                 last_snb_enabled: None,
                 last_anf_enabled: None,
+                last_apf: None,
+                last_notch_generation: None,
                 last_squelch: None,
                 last_binaural: None,
                 last_ctun: None,
@@ -1410,6 +1720,12 @@ impl SpectrumAnalyzer {
             }
             self.last_agc_params = Some(agc_params);
         }
+        if self.last_agc_fixed_db != Some(params.agc_fixed_db) {
+            unsafe {
+                wdsp::SetRXAAGCFixed(self.channel, params.agc_fixed_db);
+            }
+            self.last_agc_fixed_db = Some(params.agc_fixed_db);
+        }
 
         // Noise blanker: NB (ANB) and NB2 (NOB) are mutually exclusive
         // (see NoiseBlanker's doc comment), so setting one's Run flag
@@ -1491,6 +1807,51 @@ impl SpectrumAnalyzer {
             self.last_anf_enabled = Some(params.anf);
         }
 
+        // APF -- see ApfSettings. As Thetis (setup.cs
+        // chkDSPRX1APFEnable_CheckedChanged): runs only in CW, centred on
+        // the CW pitch plus the tune offset, the gain as 10^(gain/200).
+        let apf = apf_settings();
+        let apf_now = (
+            params.apf && matches!(params.mode, Mode::Cwl | Mode::Cwu),
+            apf.kind,
+            cw_pitch_hz() + apf.tune_hz as f64,
+            apf.bandwidth_hz as f64,
+            10f64.powf(apf.gain as f64 / 200.0),
+        );
+        if self.last_apf != Some(apf_now) {
+            let (run, kind, freq, bandwidth, gain) = apf_now;
+            unsafe {
+                wdsp::SetRXASPCWFreq(self.channel, freq);
+                wdsp::SetRXASPCWBandwidth(self.channel, bandwidth);
+                wdsp::SetRXASPCWGain(self.channel, gain);
+                wdsp::SetRXASPCWSelection(self.channel, kind as c_int);
+                wdsp::SetRXASPCWRun(self.channel, run as c_int);
+            }
+            self.last_apf = Some(apf_now);
+        }
+
+        // Manual notches and TNF -- see NotchState. WDSP's list is
+        // reloaded whole on any change; the notches are RF frequencies,
+        // placed through RXANBPSetTuneFrequency below.
+        let notch_update = {
+            let s = NOTCHES.lock().unwrap();
+            (self.last_notch_generation != Some(s.generation)).then(|| (s.generation, s.tnf, s.notches.clone()))
+        };
+        if let Some((generation, tnf, notches)) = notch_update {
+            unsafe {
+                let mut n: c_int = 0;
+                wdsp::RXANBPGetNumNotches(self.channel, &mut n);
+                for _ in 0..n {
+                    wdsp::RXANBPDeleteNotch(self.channel, 0);
+                }
+                for (i, notch) in notches.iter().enumerate() {
+                    wdsp::RXANBPAddNotch(self.channel, i as c_int, notch.frequency_hz, notch.width_hz, 1);
+                }
+                wdsp::RXANBPSetNotchesRun(self.channel, tnf as c_int);
+            }
+            self.last_notch_generation = Some(generation);
+        }
+
         // Squelch -- see Squelch. Exactly one of WDSP's three runs (or
         // none), re-sent whenever the mode, level or on/off changes.
         let squelch = Squelch::for_mode(params.mode, params.squelch_enabled, params.squelch_level);
@@ -1544,12 +1905,10 @@ impl SpectrumAnalyzer {
         // (rustyHPSDR). SetRXAShiftFreq shifts the IQ into the RXA
         // demod chain so the passband tracks the CTUN'd frequency
         // without retuning the radio; RXANBPSetShiftFrequency keeps the
-        // noise-blanker preprocessor's own frequency reference in sync
-        // with that same shift. These are mutually exclusive with
-        // RXANBPSetTuneFrequency below -- the NBP object tracks either
-        // an absolute tuned frequency or a shift, never both at once,
-        // matching the reference's own if/else (never both branches in
-        // the same call).
+        // notch filter's own frequency reference in sync with that same
+        // shift. RXANBPSetTuneFrequency below is sent either way: WDSP
+        // places the manual notches at tune frequency + shift, and
+        // Thetis sets both (console.cs, radio.cs RXOsc).
         if params.ctun {
             if self.last_ctun != Some(true) {
                 unsafe {
@@ -1569,16 +1928,17 @@ impl SpectrumAnalyzer {
                 unsafe {
                     wdsp::SetRXAShiftFreq(self.channel, 0.0);
                     wdsp::SetRXAShiftRun(self.channel, 0);
+                    wdsp::RXANBPSetShiftFrequency(self.channel, 0.0);
                 }
                 self.last_ctun = Some(false);
                 self.last_ctun_offset = Some(0.0);
             }
-            if self.last_lo_frequency != Some(params.lo_frequency_hz) {
-                unsafe {
-                    wdsp::RXANBPSetTuneFrequency(self.channel, params.lo_frequency_hz);
-                }
-                self.last_lo_frequency = Some(params.lo_frequency_hz);
+        }
+        if self.last_lo_frequency != Some(params.lo_frequency_hz) {
+            unsafe {
+                wdsp::RXANBPSetTuneFrequency(self.channel, params.lo_frequency_hz);
             }
+            self.last_lo_frequency = Some(params.lo_frequency_hz);
         }
 
         for (i, s) in samples.iter().enumerate() {
@@ -1767,6 +2127,9 @@ fn run(
     // One instance per channel so L/R stay independent for binaural.
     let mut dc_block_l = DcBlocker::new();
     let mut dc_block_r = DcBlocker::new();
+    let mut noise_floor = NoiseFloor::new();
+    // (the LO at the last restart, (zoom, pan, agc_auto)).
+    let mut nf_view: Option<(f64, (i32, u32, bool))> = None;
 
     while !stop.load(Ordering::Relaxed) {
         chunk.clear();
@@ -1819,6 +2182,48 @@ fn run(
             + params.rf_gain_offset_db;
 
         let (spectrum, waterfall) = analyzer.feed(&chunk);
+
+        // Auto AGC -- see DemodParams::agc_auto. The floor is taken from
+        // the raw pixels (before the calibration below), as Thetis takes
+        // its calibration back off before setting the threshold. Not
+        // while transmitting, and started afresh after a retune.
+        // A retune restarts it only once the view has moved by more than
+        // 2% of its span: the QO-100 LNB lock nudges the LO by a few Hz
+        // all the time, and restarting on each of those kept it from
+        // ever settling.
+        let mox_now = mox.load(Ordering::Relaxed);
+        let view = (params.zoom, params.pan.to_bits(), params.agc_auto);
+        let span_hz = sample_rate as f64 / params.zoom.max(1) as f64;
+        let moved = match nf_view {
+            Some((lo, v)) => v != view || (params.lo_frequency_hz - lo).abs() > span_hz * 0.02,
+            None => true,
+        };
+        if !params.agc_auto || mox_now || moved {
+            noise_floor.restart();
+            nf_view = Some((params.lo_frequency_hz, view));
+        }
+        if let Some(s) = &spectrum {
+            if params.agc_auto && !mox_now && params.agc != Agc::Off {
+                if let Some(floor_db) = noise_floor.update(s) {
+                    let (lo, hi) = passband_for(params.mode, params.width_hz);
+                    let top = agc_top_for_threshold(
+                        floor_db as f64 + agc_auto_offset_db(),
+                        hi - lo,
+                        (SPECTRUM_WIDTH * params.zoom.max(1)) as f64,
+                        sample_rate as f64,
+                        params.agc_slope_db,
+                    )
+                    .round();
+                    let mut p = demod_params.lock().unwrap();
+                    // Checked again under the lock: the slider may have
+                    // just turned it off.
+                    if p.agc_auto && p.agc_top_db != top {
+                        p.agc_top_db = top;
+                    }
+                }
+            }
+        }
+
         if spectrum.is_some() || waterfall.is_some() {
             // Same correction as the S-meter (real request -- one
             // shared control rather than a second independent one, see
@@ -1951,7 +2356,11 @@ fn run(
                 // the real (l, r) pair -- identical (l==r) when binaural
                 // is off, same as every consumer effectively saw before
                 // this was ever a stereo pair at all.
-                let (l, r) = ((l * params.gain).clamp(-1.0, 1.0), (r * params.gain).clamp(-1.0, 1.0));
+                let (pan_l, pan_r) = pan_gains(params.audio_pan);
+                let (l, r) = (
+                    (l * params.gain * pan_l).clamp(-1.0, 1.0),
+                    (r * params.gain * pan_r).clamp(-1.0, 1.0),
+                );
                 if !mute_local {
                     if out.len() >= AUDIO_BUFFER_CAPACITY {
                         out.pop_front();
@@ -2308,8 +2717,18 @@ impl SpectrumHandle {
     pub fn set_agc_hang_ms(&self, v: i32) {
         self.demod_params.lock().unwrap().agc_hang_ms = v.max(0);
     }
+    /// Also turns Auto AGC off, as moving Thetis's AGC-T slider does -- so
+    /// a restore must set agc_auto after this.
     pub fn set_agc_top_db(&self, v: f64) {
-        self.demod_params.lock().unwrap().agc_top_db = v;
+        let mut p = self.demod_params.lock().unwrap();
+        p.agc_top_db = v;
+        p.agc_auto = false;
+    }
+    pub fn set_agc_auto(&self, v: bool) {
+        self.demod_params.lock().unwrap().agc_auto = v;
+    }
+    pub fn set_agc_fixed_db(&self, v: f64) {
+        self.demod_params.lock().unwrap().agc_fixed_db = v.clamp(AGC_FIXED_DB_RANGE.0, AGC_FIXED_DB_RANGE.1);
     }
     pub fn set_agc_slope_db(&self, v: i32) {
         self.demod_params.lock().unwrap().agc_slope_db = v.max(0);
@@ -2371,6 +2790,12 @@ impl SpectrumHandle {
     pub fn set_anf(&self, v: bool) {
         self.demod_params.lock().unwrap().anf = v;
     }
+    pub fn apf(&self) -> bool {
+        self.demod_params.lock().unwrap().apf
+    }
+    pub fn set_apf(&self, v: bool) {
+        self.demod_params.lock().unwrap().apf = v;
+    }
 
     pub fn squelch_enabled(&self) -> bool {
         self.demod_params.lock().unwrap().squelch_enabled
@@ -2390,6 +2815,14 @@ impl SpectrumHandle {
     }
     pub fn set_binaural(&self, v: bool) {
         self.demod_params.lock().unwrap().binaural = v;
+    }
+
+    /// See DemodParams::audio_pan.
+    pub fn audio_pan(&self) -> f32 {
+        self.demod_params.lock().unwrap().audio_pan
+    }
+    pub fn set_audio_pan(&self, v: f32) {
+        self.demod_params.lock().unwrap().audio_pan = v.clamp(-1.0, 1.0);
     }
 
     pub fn eq(&self) -> EqualizerParams {
@@ -2453,6 +2886,32 @@ mod squelch_tests {
     use super::*;
 
     #[test]
+    fn tx_filter_is_placed_for_the_mode() {
+        let f = Some((200.0, 2600.0));
+        assert_eq!(tx_passband_for(Mode::Usb, 2700.0, None), passband_for(Mode::Usb, 2700.0), "follows RX");
+        assert_eq!(tx_passband_for(Mode::Usb, 2700.0, f), (200.0, 2600.0));
+        assert_eq!(tx_passband_for(Mode::Digu, 2700.0, f), (200.0, 2600.0));
+        assert_eq!(tx_passband_for(Mode::Lsb, 2700.0, f), (-2600.0, -200.0));
+        assert_eq!(tx_passband_for(Mode::Digl, 2700.0, f), (-2600.0, -200.0));
+        assert_eq!(tx_passband_for(Mode::Am, 2700.0, f), (-2600.0, 2600.0));
+        assert_eq!(tx_passband_for(Mode::Fmn, 2700.0, f), (-2600.0, 2600.0));
+        assert_eq!(tx_passband_for(Mode::Cwu, 500.0, f), passband_for(Mode::Cwu, 500.0), "CW keeps RX's");
+    }
+
+    #[test]
+    fn pan_follows_wdsps_law() {
+        assert_eq!(pan_gains(0.0), (1.0, 1.0));
+        let (l, r) = pan_gains(-1.0);
+        assert_eq!(l, 1.0);
+        assert!(r.abs() < 1e-6, "left only: {r}");
+        let (l, r) = pan_gains(1.0);
+        assert!(l.abs() < 1e-6 && r == 1.0, "right only: {l}");
+        // Halfway right: WDSP's pan 0.75, sin(0.75 pi) on the left.
+        let (l, r) = pan_gains(0.5);
+        assert!((l - 0.70710677).abs() < 1e-6 && r == 1.0, "{l}");
+    }
+
+    #[test]
     fn digital_modes_start_at_0_hz() {
         assert_eq!(passband_for(Mode::Digu, 2800.0), (0.0, 2800.0));
         assert_eq!(passband_for(Mode::Digl, 2800.0), (-2800.0, 0.0));
@@ -2471,5 +2930,245 @@ mod squelch_tests {
         assert_eq!(Squelch::for_mode(Mode::Cwu, true, 50.0), Squelch::Off);
         assert!(!Squelch::available(Mode::Digu));
         assert!(Squelch::available(Mode::Lsb));
+    }
+}
+
+#[cfg(test)]
+mod level_tests {
+    use super::*;
+
+    /// RMS of the left channel after settling, for a carrier `make(n)`.
+    fn level(ch: i32, mode: Mode, agc: Agc, make: &dyn Fn(usize) -> (f64, f64)) -> f64 {
+        let mut a = SpectrumAnalyzer::open(ch, 48_000);
+        let params = DemodParams { mode, width_hz: default_width_hz(mode), agc, ..DemodParams::default() };
+        let pb = passband_for(mode, params.width_hz);
+        let (mut sum, mut count) = (0.0, 0usize);
+        for b in 0..300 {
+            let iq: Vec<IqSample> = (0..BUFFER_SIZE)
+                .map(|k| {
+                    let (re, im) = make(b * BUFFER_SIZE + k);
+                    IqSample { i: (re * IQ_NORM) as i32, q: (im * IQ_NORM) as i32 }
+                })
+                .collect();
+            let out = a.demod(&iq, params, pb);
+            if b >= 150 {
+                for (l, _) in out {
+                    sum += (l as f64) * (l as f64);
+                    count += 1;
+                }
+            }
+        }
+        (sum / count as f64).sqrt()
+    }
+
+    /// As level(), with any DemodParams (lo_frequency_hz, CTUN, APF...).
+    fn level_with(ch: i32, params: DemodParams, make: &dyn Fn(usize) -> (f64, f64)) -> f64 {
+        let mut a = SpectrumAnalyzer::open(ch, 48_000);
+        let pb = passband_for(params.mode, params.width_hz);
+        let (mut sum, mut count) = (0.0, 0usize);
+        for b in 0..300 {
+            let iq: Vec<IqSample> = (0..BUFFER_SIZE)
+                .map(|k| {
+                    let (re, im) = make(b * BUFFER_SIZE + k);
+                    IqSample { i: (re * IQ_NORM) as i32, q: (im * IQ_NORM) as i32 }
+                })
+                .collect();
+            let out = a.demod(&iq, params, pb);
+            if b >= 150 {
+                for (l, _) in out {
+                    sum += (l as f64) * (l as f64);
+                    count += 1;
+                }
+            }
+        }
+        (sum / count as f64).sqrt()
+    }
+
+    /// Auto AGC's pieces: the noise floor of a spectrum of white noise
+    /// (some strong carriers on it shouldn't lift it), turned into the
+    /// passband's noise power, lands near the real one; and
+    /// agc_top_for_threshold is WDSP's own SetRXAAGCThresh. Ignored: a
+    /// WDSP channel -- run alone with
+    /// `cargo test --bin hpsdr-rs auto_agc -- --ignored --test-threads=1`.
+    #[test]
+    #[ignore]
+    fn auto_agc_finds_the_noise_floor_and_matches_wdsp() {
+        let fs = 48_000.0;
+        let ch = 31;
+        let mut a = SpectrumAnalyzer::open(ch, fs as i32);
+        let usb = DemodParams { mode: Mode::Usb, width_hz: 2700.0, ..DemodParams::default() };
+        let (lo, hi) = passband_for(usb.mode, usb.width_hz);
+        // Complex white noise, sigma 1e-4 per part, plus three carriers.
+        let sigma = 1e-4;
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut uniform = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            ((seed >> 11) as f64 + 0.5) / (1u64 << 53) as f64
+        };
+        let mut nf = NoiseFloor::new();
+        let mut floor = None;
+        let mut n = 0usize;
+        for _ in 0..(fs as usize * 8 / BUFFER_SIZE) {
+            let iq: Vec<IqSample> = (0..BUFFER_SIZE)
+                .map(|_| {
+                    n += 1;
+                    let (u1, u2) = (uniform(), uniform());
+                    let r = sigma * (-2.0 * u1.ln()).sqrt();
+                    let (mut re, mut im) = (r * (std::f64::consts::TAU * u2).cos(), r * (std::f64::consts::TAU * u2).sin());
+                    for f in [-9000.0, 3000.0, 12000.0] {
+                        let p = std::f64::consts::TAU * f * n as f64 / fs;
+                        re += 1e-2 * p.cos();
+                        im += 1e-2 * p.sin();
+                    }
+                    IqSample { i: (re * IQ_NORM) as i32, q: (im * IQ_NORM) as i32 }
+                })
+                .collect();
+            let _ = a.demod(&iq, usb, (lo, hi));
+            if let (Some(s), _) = a.feed(&iq) {
+                if let Some(f) = nf.update(&s) {
+                    floor = Some(f);
+                } else {
+                    // Past the first (fast) frame: settle at the normal rate.
+                    nf.fast_until = Some(std::time::Instant::now());
+                }
+            }
+        }
+        let floor = floor.expect("a floor") as f64;
+        let pixels_wide = SPECTRUM_WIDTH as f64;
+        let measured = floor + 10.0 * ((hi - lo) * pixels_wide / fs).log10();
+        let real = 10.0 * (2.0 * sigma * sigma * (hi - lo) / fs).log10();
+        println!("floor {floor:.1} dB/pixel -> passband noise {measured:.1} dB, real {real:.1} dB");
+        assert!((measured - real).abs() < 6.0, "measured {measured:.1} vs real {real:.1}");
+
+        // The formula against WDSP's own, with this channel's passband
+        // and slope set by demod().
+        for thresh in [-120.0, -100.0, -80.0] {
+            let mut top = 0.0;
+            unsafe {
+                wdsp::SetRXAAGCThresh(ch, thresh, pixels_wide, fs);
+                wdsp::GetRXAAGCTop(ch, &mut top);
+            }
+            let ours = agc_top_for_threshold(thresh, hi - lo, pixels_wide, fs, usb.agc_slope_db);
+            println!("thresh {thresh}: WDSP top {top:.2}, ours {ours:.2}");
+            assert!((top.clamp(0.0, 120.0) - ours).abs() < 0.01, "thresh {thresh}: WDSP {top} ours {ours}");
+        }
+    }
+
+    /// The manual notches and the APF in the real WDSP chain: a notch at
+    /// a tone's RF frequency (LO + its offset, with and without CTUN)
+    /// takes it out only with TNF on, one elsewhere doesn't; the APF
+    /// lifts a tone on the CW pitch against one off it. Ignored: WDSP
+    /// channels and the shared notch list -- run alone with
+    /// `cargo test --bin hpsdr-rs notches_and_apf -- --ignored --test-threads=1`.
+    #[test]
+    #[ignore]
+    fn notches_and_apf_act_where_they_should() {
+        let tau = std::f64::consts::TAU;
+        let fs = 48_000.0;
+        let lo = 14_000_000.0;
+        // Which sign of baseband offset USB hears (see IqSample's
+        // real/imaginary note): the louder of the two.
+        let tone = |f: f64| move |n: usize| {
+            let p = tau * f * n as f64 / fs;
+            (1e-3 * p.cos(), 1e-3 * p.sin())
+        };
+        let usb = DemodParams { mode: Mode::Usb, width_hz: 2700.0, agc: Agc::Off, lo_frequency_hz: lo, ..DemodParams::default() };
+        let sign = if level_with(23, usb, &tone(1000.0)) > level_with(23, usb, &tone(-1000.0)) { 1.0 } else { -1.0 };
+        // main.rs's CTUN offset is + when listening above the LO: check
+        // that holds here (narrow CW filter, so only one sign hears it).
+        {
+            let cw = DemodParams { mode: Mode::Cwu, width_hz: 200.0, ctun: true, ..usb };
+            let at = sign * (500.0 + cw_pitch_hz());
+            let up = level_with(30, DemodParams { ctun_offset_hz: 500.0, ..cw }, &tone(at));
+            let down = level_with(30, DemodParams { ctun_offset_hz: -500.0, ..cw }, &tone(at));
+            assert!(up > 100.0 * down, "CTUN +500 listens 500 Hz above the LO");
+        }
+        let db = |v: f64| 20.0 * v.log10();
+
+        let cases: [(&str, DemodParams, f64, f64); 3] = [
+            ("no CTUN", usb, 1000.0, lo + 1000.0),
+            // CTUN 500 Hz up: a tone 1500 Hz above the LO is heard at 1000.
+            ("CTUN", DemodParams { ctun: true, ctun_offset_hz: 500.0, ..usb }, 1500.0, lo + 1500.0),
+            // A transverter-style RF tune frequency.
+            ("RF LO", DemodParams { lo_frequency_hz: 144_000_000.0, ..usb }, 1000.0, 144_001_000.0),
+        ];
+        for (i, (name, params, offset, rf)) in cases.into_iter().enumerate() {
+            let ch = 24 + i as i32;
+            let make = tone(sign * offset);
+            set_notches(vec![Notch { frequency_hz: rf, width_hz: 200.0 }]);
+            set_tnf(false);
+            let off = level_with(ch, params, &make);
+            set_tnf(true);
+            let on = level_with(ch, params, &make);
+            set_notches(vec![Notch { frequency_hz: rf + 600.0, width_hz: 200.0 }]);
+            let elsewhere = level_with(ch, params, &make);
+            println!("{name}: TNF off {:.1} dB, on {:.1} dB, notch 600 Hz away {:.1} dB", db(off), db(on), db(elsewhere));
+            assert!(db(off) - db(on) > 20.0, "{name}: the notch takes the tone out");
+            assert!((db(off) - db(elsewhere)).abs() < 1.5, "{name}: a notch elsewhere leaves it");
+        }
+        set_notches(Vec::new());
+        set_tnf(false);
+
+        // APF: CWU, peak on the pitch, full gain, narrow.
+        set_apf_settings(ApfSettings { kind: 3, tune_hz: 0, bandwidth_hz: 50, gain: 100 });
+        let cw = DemodParams { mode: Mode::Cwu, width_hz: 500.0, ..usb };
+        let pitch = cw_pitch_hz();
+        let ratio = |apf: bool| {
+            let p = DemodParams { apf, ..cw };
+            db(level_with(27, p, &tone(sign * pitch))) - db(level_with(28, p, &tone(sign * (pitch + 150.0))))
+        };
+        let (without, with) = (ratio(false), ratio(true));
+        println!("APF: on-pitch vs 150 Hz off, without {without:.1} dB, with {with:.1} dB");
+        assert!(with - without > 6.0, "the APF lifts the pitch against 150 Hz off it");
+        // Not in USB.
+        let usb_apf = |apf: bool| db(level_with(29, DemodParams { apf, ..usb }, &tone(sign * pitch)));
+        assert!((usb_apf(true) - usb_apf(false)).abs() < 0.5, "no APF outside CW");
+        set_apf_settings(ApfSettings::DEFAULT);
+    }
+
+    /// Measurement, not a check: prints the demodulated level of a
+    /// 1 kHz tone in SSB (each AGC) and in FM (several deviations).
+    #[test]
+    #[ignore]
+    fn fm_vs_ssb_level() {
+        let tau = std::f64::consts::TAU;
+        let fs = 48_000.0;
+        for amp in [1e-2, 1e-4] {
+            for agc in [Agc::Off, Agc::Medium] {
+                for (mode, f) in [(Mode::Usb, 1000.0), (Mode::Usb, -1000.0)] {
+                    let r = level(20, mode, agc, &|n| {
+                        let p = tau * f * n as f64 / fs;
+                        (amp * p.cos(), amp * p.sin())
+                    });
+                    println!("USB tone {f:+} Hz amp {amp:e} {agc:?}: rms {r:.4} ({:.1} dBFS)", 20.0 * r.log10());
+                }
+            }
+        }
+        for dev in [1000.0, 2500.0, 5000.0] {
+            let r = level(21, Mode::Fmn, Agc::Medium, &|n| {
+                let t = n as f64 / fs;
+                let p = dev / 1000.0 * (tau * 1000.0 * t).sin();
+                (1e-3 * p.cos(), 1e-3 * p.sin())
+            });
+            println!("FM 1 kHz tone dev {dev} Hz: rms {r:.4} ({:.1} dBFS)", 20.0 * r.log10());
+        }
+        // Noise only: a cheap LCG Gaussian-ish (sum of 4 uniforms).
+        let noise = |n: usize, seed: u64| {
+            let mut x = (n as u64).wrapping_mul(6364136223846793005).wrapping_add(seed);
+            let mut acc = 0.0;
+            for _ in 0..4 {
+                x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                acc += (x >> 11) as f64 / (1u64 << 53) as f64 - 0.5;
+            }
+            acc
+        };
+        for amp in [1e-6, 1e-5] {
+            for (mode, agc) in [(Mode::Usb, Agc::Off), (Mode::Usb, Agc::Medium), (Mode::Fmn, Agc::Medium)] {
+                let r = level(22, mode, agc, &|n| (amp * noise(n, 1), amp * noise(n, 7)));
+                println!("noise amp {amp:e} {mode:?} {agc:?}: rms {r:.4} ({:.1} dBFS)", 20.0 * r.log10());
+            }
+        }
     }
 }
