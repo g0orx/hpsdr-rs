@@ -82,7 +82,10 @@ streaming), both directly and through TCI Remote Compactor.
   (`audio_start:1`) and S-meter (`rx_sensors:1`), all reported as they
   change, and IQ (`iq_start:1`), each message giving receiver 1's own
   sample rate, which on Protocol 2 can differ from receiver 0's;
-  transmitting stays with receiver 0.
+  transmitting stays with receiver 0. An `audio_start:1` or `iq_start:1`
+  sent before receiver 1 is open is remembered, so its audio and IQ
+  start as soon as it opens (and the client is sent
+  `rx_channel_enable:1,0,true` then, as Thetis does).
 - **CW is CWL or CWU**, as Thetis reports it, not plain CW. A client
   that sends plain `cw` gets the usual sideband for the frequency (CWL
   below 10 MHz, CWU above), and `cwr` the other one.
@@ -112,6 +115,30 @@ streaming), both directly and through TCI Remote Compactor.
   the passband asked for (e.g. `-2400,-150` in LSB is 2.4 kHz). As with
   the filter control here, the TX filter follows, and the width is
   remembered for the mode.
+- **More controls, as Thetis's TCI** -- each reported to clients as it
+  changes, and settable by them:
+  - `rx_step_att_ex` / `rx_step_att_enabled_ex` -- the RX attenuation,
+    0-31 dB (on a HermesLite on Protocol 1, its RX Gain as an
+    attenuation, 12 to -48).
+  - `vfo_swap_ex` -- swaps VFO A and B, as **A<>B**.
+  - `lock` (VFO A), `vfo_lock` (VFO A or B) and `vfo_sync_ex` -- the
+    [Lock and Sync](02-main-window.md#vfo-a--vfo-b--split) buttons.
+  - `rx_mute` (either receiver) and `mute` -- Mute.
+  - `rx_balance` -- the receiver's [Pan](02-main-window.md#audio-gain),
+    on Thetis's -40 to +40 scale.
+  - `mon_enable` and `mon_volume` -- [Monitor TX
+    Audio](17-settings-tx.md#monitor-tx-audio) and its volume.
+  - `cw_keyer_speed` -- the CW speed.
+  - `rx_apf_enable` and `rx_nf_enable` -- the **APF** and **TNF**
+    buttons.
+  - `agc_auto_ex` -- the **Auto** button beside AGC Gain. Setting
+    `agc_gain` turns it off, as moving the slider does.
+  - `tx_profiles_ex` and `tx_profile_ex` -- list and choose the [TX
+    profiles](17-settings-tx.md#tx-profile) (**Default** when none are
+    saved); `tx_filter_band_ex` -- the [TX filter](17-settings-tx.md#tx-filter)
+    edges, signed as `rx_filter_band`'s.
+  - `app_ex:hpsdr-rs,<version>`, sent after `protocol:` at connect, so a
+    client can tell hpsdr-rs apart from Thetis.
 - **Sensors** (`rx_sensors_enable` / `tx_sensors_enable`, as Thetis):
   while receiving, the S-meter level, its running average and the
   strongest spectrum bin (`rx_sensors`, `rx_channel_sensors`,
@@ -177,21 +204,38 @@ on Safari: **Show Details**, then **visit this website**). If you have a
 certificate of your own for this computer's name, put it in those two
 files instead.
 
-The client shows the radio's spectrum and waterfall, its band buttons, the
-VFO, mode, filter, AGC and noise controls, the S-meter, and the receive
+The client shows the radio's spectrum (with the band edges marked) and
+waterfall, its band buttons, the VFO, mode, filter, AGC and noise
+controls (**NB**, **NR** and **AGC** are drop-downs showing the current
+setting, e.g. **AGC: Slow**), the S-meter, and the receive
 audio (which starts when you press **Connect** -- browsers only start audio
 after a tap). Tune by tapping or sliding on the spectrum or waterfall, by
-sliding on the frequency, or with the **-** and **+** beside it, by a chosen step. It
+sliding on the frequency, or with the **-** and **+** beside it, by a
+chosen step. A tap on the spectrum or waterfall lands on the nearest kHz
+(10 Hz in CW), and a slide moves from one kHz to the next (100 Hz in CW).
+**Mute** is remembered for next time. It
 uses about 150 kbit/s, compressed, rather than the several Mbit/s of
 standard TCI audio and IQ, plus about 70 kbit/s more while transmitting.
 It's dark or light as the phone, tablet or browser is set, and changes when
 that does; the spectrum and waterfall stay dark in both.
 
+The **Spectrum** and **Waterfall** buttons, beside **Range**, turn each
+display on or off. Drag the bar under the spectrum (or under a display
+shown on its own) to make them bigger or smaller. Both choices are
+remembered.
+
+If the browser loses the page's graphics (this happens in Chrome and
+Chromium on some graphics cards when the GPU restarts), the page reloads
+and connects to the same server again by itself; tap or press a key to
+get the audio back.
+
 On a small screen -- a phone either way up -- it uses a compact layout,
 like hpsdr-rs's own: just the frequency and S-meter above the spectrum,
 and a toolbar of large buttons below it (Band, Mode, Step, Filter, Noise,
 Audio, Key, TX, and MOX at the right). Each button opens its controls over
-the spectrum; tap it again, or the close button, to close them.
+the spectrum; tap it again, or the close button, to close them. The
+toolbar sits directly under the spectrum and waterfall, so it moves up
+when they're made smaller.
 **Layout**, beside the connection status, can choose **Standard** (every
 control above the spectrum) or **Compact** instead of **Auto**.
 
@@ -281,9 +325,14 @@ named "rigctl" too.
 - Same **Start**/**Stop**/status/logging behavior as rigctl above (logs to
   `cat_log.txt`).
 - Implements a practical subset of the TS-2000 command set: frequency,
-  mode, PTT, S-meter, RIT/XIT, and a few identification/status commands.
-  Commands with no clean equivalent in this app yet (drive/power level,
-  mic gain, CW keyer speed, memory channels) respond `?;` or are accepted with
+  mode, PTT, S-meter, RIT/XIT, TX power, and a few identification/status
+  commands. `PC` is the **TX Power** setting as a percentage of the
+  radio's maximum (`PC;` answers `PC050;` for 50 W of 100 W, and `PC005;`
+  sets 5%) -- on a 100 W radio that's watts, as a TS-2000's own. With
+  transmit off it reads 0 and a set is ignored. This lets an amplifier
+  that sends `PC` (an SPE Expert does when its drive steps change) set the
+  drive. Commands with no clean equivalent in this app yet (mic gain, CW
+  keyer speed, memory channels) respond `?;` or are accepted with
   no effect, rather than reporting a made-up value. XIT can only be
   toggled on/off (`XT`), not set to a specific value -- matches real
   Kenwood TS-2000 behavior, which has no such command either.

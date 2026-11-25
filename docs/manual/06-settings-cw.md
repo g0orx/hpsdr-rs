@@ -16,6 +16,23 @@ shared by the main receiver and every extra receiver window (no
 per-receiver override), since it's really "what pitch do you want to
 hear/zero-beat CW at" rather than a per-receiver hardware setting.
 
+## CW Audio Peak Filter (APF)
+
+Settings for the **APF** button, which is in the main window's (and each
+extra receiver's) noise/AGC row while in **CWL**/**CWU**. APF puts a
+narrow peak in the audio on the CW pitch, lifting the signal you're
+listening to above the noise and its neighbours. These settings are
+shared by every receiver; each receiver turns APF on or off itself.
+
+- **Type** -- the filter shape: **Double Pole**, **Matched**,
+  **Gaussian** or **Bi-Quad** (the default).
+- **Tune** -- -250 to +250 Hz, 0 by default: moves the peak away from the
+  CW pitch, e.g. to sit on a signal that isn't quite zero-beat.
+- **Bandwidth** -- 10-150 Hz, 150 Hz by default: roughly the width of the
+  peak at -3 dB. Narrower picks one signal out of a crowd more sharply.
+- **Gain** -- 0-100, 0 by default: 0 leaves the peak's level unchanged,
+  100 raises it by 10 dB.
+
 ## Keyer (radio's own built-in/internal keyer)
 
 These controls configure the radio's own CW keyer, for a paddle wired

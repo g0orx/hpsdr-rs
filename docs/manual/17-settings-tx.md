@@ -11,6 +11,24 @@ Open **Settings...** from the main window, then the **TX** tab.
 > antenna -- see the [top-level README](../../README.md) for what's
 > confirmed vs. best-effort in the current build.
 
+## TX Profile
+
+A TX profile is a named set of transmit settings: **Mic gain**, the TX
+[equalizer](08-equalizer.md), **Speech Processor** and its
+**Compression**, **CESSB** and the **TX Filter** (below) -- e.g. one for
+ragchewing and one for contests or DX.
+
+- **TX Profile** -- choose a saved profile to apply it. Once a setting no
+  longer matches it, it shows **(changed)**: **Save** stores the changes
+  in that profile, and **Delete** removes the profile (leaving the
+  settings as they are).
+- **New profile name** -- type a name and press **Save As** (or Enter) to
+  save the settings as they are now; with the name of an existing
+  profile the button says **Replace**.
+
+Profiles are saved per radio. TCI clients can list and choose them too
+(`tx_profiles_ex`, `tx_profile_ex`).
+
 ## Max TX Power
 
 The ceiling for the **TX Power** slider on the main window, in watts
@@ -136,6 +154,19 @@ this checkbox stays visible even while Speech Processor is off, but has
 no effect until it's turned on too, and greys out to make that
 dependency visible.
 
+## TX Filter
+
+**Use RX filter** (the default) transmits through the same passband as
+the receive filter set in the main window. Untick it to give the TX
+filter its own edges:
+
+- **Low** (0-1000 Hz) and **High** (500-8000 Hz) -- the audio edges for
+  USB and DIGU, mirrored for LSB and DIGL. AM, DSB and FM use plus and
+  minus **High**. CW always uses the RX filter.
+
+The TX passband drawn on the spectrum follows it. TCI clients can read
+and set it with `tx_filter_band_ex`.
+
 ## Enable Transmit
 
 Arms (or disarms) the whole TX signal path -- microphone input, the TX DSP
@@ -163,6 +194,16 @@ for 25 kHz channels and most 2 m repeaters, or **2.5 kHz (narrow)** for
 a fixed share of it: about 455 Hz at 5 kHz and 230 Hz at 2.5 kHz. That
 lower figure is too little for many repeaters to decode, so if a
 repeater won't open on its tone, check this first.
+
+## Monitor TX Audio
+
+Shown while transmit is enabled. Plays the audio being fed into the
+transmitter -- after the TX audio source is chosen, before any
+processing -- through this computer's speakers or headphones, to tell
+whether a TX audio problem is already in the source (mic or TCI) or comes
+later. **Volume** sets how loud the monitor is, without changing what's
+transmitted; it's saved per radio. TCI clients can turn it on and set
+its level (`mon_enable`, `mon_volume`).
 
 ## Radio Mic Connector (Angelia/Orion/Orion2 only)
 

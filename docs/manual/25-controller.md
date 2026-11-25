@@ -32,6 +32,11 @@ Each encoder, push button and switch can do any of the
 - A tuning action has a **sensitivity** that multiplies its steps, e.g. x0.5
   for a high-resolution optical VFO knob, to move one VFO step for every two
   of its own. RIT and XIT move 10 Hz a step.
+- A tuning encoder also has **clicks/step** (1-20, 1 to start with), before
+  its sensitivity: how many clicks of the knob make one step. With a
+  touchy knob, 2 or 3 makes a single VFO step easy to hit. Turning back
+  the other way starts the count afresh, so the first step back takes the
+  same number of clicks.
 - **Push buttons and switches** do a button action on press: MOX, Tune,
   Band and Mode up/down, **Band Stack (next)** (the next entry of the band's
   [band stack](02-main-window.md#band-stack)), A>B, CTUN, NB/NR and so on.

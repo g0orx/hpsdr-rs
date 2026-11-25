@@ -45,7 +45,8 @@ tune it several ways:
   third tier to the plain-scroll steps above.
 - **Click** directly on the spectrum or waterfall: retunes straight to the
   clicked frequency -- rounded to the nearest kHz in every mode except CW,
-  which uses the exact clicked frequency (see above).
+  which uses the exact clicked frequency (see above). A **right-click**
+  opens the [notch menu](#manual-notches-tnf) instead.
 - **Click** (or tap) the frequency display (VFO-A or VFO-B): opens a small
   popup with an on-screen numeric keypad (plus normal keyboard digit/
   Backspace/Enter/Escape input) to type an exact frequency directly,
@@ -168,7 +169,7 @@ The panel beside the spectrum/waterfall shows:
 - **CRC errors** (shown once there are any): pages that arrived but
   failed their checksum. On a signal good enough to decode at all these
   should be rare; many of them point at a weak or interrupted signal --
-  the [SNR](#s-meter--power-meter) readout under the S-meter, with the
+  the [SNR](#s-meter--power-meter) readout in the S-meter, with the
   beacon in the passband, shows how strong it is.
 - **»** (top right) minimizes the panel to a narrow strip, giving the
   spectrum and waterfall their width back. The beacon monitor and Lock
@@ -242,6 +243,19 @@ as on VFO-A, to change its stored value directly, or use the buttons between the
   TX](17-settings-tx.md), 20 dB by default, protecting it from the radio's
   own TX leakage); with a genuinely separate receive path, set that to 0
   so the downlink isn't 20 dB weaker while you transmit.
+- **Sync** -- keeps VFO B on VFO A's frequency (and transverter): tuning
+  either one tunes both. Turning it on turns **Split**, **Duplex** and
+  **SAT** off; turning Split on, or locking either VFO, turns it off. It
+  can't be turned on while either VFO is locked.
+- **Lock** (beside the VFO step in the **VFO-A** box, and in the
+  **VFO-B** box) -- stops anything retuning that VFO or changing its
+  band: the spectrum and waterfall, scrolling, the keypad, the band
+  buttons, MIDI and a [controller](25-controller.md), CAT, rigctl, TCI
+  and the web client. VFO A's Lock also stops the mode buttons (and
+  MIDI/controller Mode up/down) changing the mode, as Thetis's does;
+  CAT, rigctl and TCI can still change it.
+
+Both Locks and Sync are saved with the radio's settings.
 
 ### VFO B's transverter
 
@@ -288,9 +302,10 @@ open one at a time from a toolbar of large buttons under the spectrum:
   band stack.
 - **Mode** (showing the mode and filter width) -- the modes and **Filter
   width**.
-- **Audio** -- Audio gain, Mute and SQL, and with transmit enabled Mic gain,
+- **Audio** -- Audio gain, Mute, Pan and SQL, and with transmit enabled Mic gain,
   the FM repeater controls, TCI TX gain and TX Power.
-- **DSP** -- NB, NR, SNB, ANF, BIN, AGC, AGC Gain and RX Attenuation.
+- **DSP** -- NB, NR, SNB, ANF, APF (in CW), TNF and BIN, then on a
+  second line AGC, AGC Gain with its Auto button, and RX Attenuation.
 - **TX** -- the transmit row: Tune, Two Tone, CW messages, RIT and XIT.
 - **Menu** -- **Settings...**, **Add Receiver** and **Stop**, CW Decode, PSK
   Beacon and DATV when they apply, and the rigctl/TCI/CAT/Web status and
@@ -397,9 +412,15 @@ in FM and it stays there. Extra receivers remember theirs separately.
 **Mute**, next to the slider, silences the speakers without moving it,
 so unmuting comes back at the same level. It's shown in red while on.
 Only the speakers go quiet: [Record](#record), TCI's audio stream, the
-waveform display and the CW decoder all carry on. Mute isn't saved, so
-hpsdr-rs always starts with sound. Extra receiver windows have their
-own.
+waveform display and the CW decoder all carry on. Mute is saved, so
+hpsdr-rs starts muted if you left it muted. Extra receiver windows have
+their own.
+
+**Pan**, after Mute, moves the receiver's audio between the left and
+right speakers, from **L100** through the centre (**C**) to **R100**.
+Double-click it to centre it again. Only what you hear is panned: the
+CW decoder, the waveform display and **Send RX audio to radio** still
+get the full audio. Each receiver keeps its own Pan.
 
 ## Noise/AGC toggles
 
@@ -422,8 +443,15 @@ A row of buttons and two sliders:
   left and right audio channels genuinely differ (an intentional SDR
   stereo-listening effect), instead of the usual identical L/R. Needs
   headphones or stereo speakers to hear the effect.
-- **AGC** -- cycles Off → Long → Slow → Medium → Fast → Off. Attack/decay/
-  hang/top/slope for AGC are tuned in Settings → RX.
+- **APF** (only in **CWL**/**CWU**) -- toggles the CW Audio Peak Filter,
+  a narrow audio peak on the CW pitch that lifts the signal you're
+  listening to above its neighbours and the noise. Its type, tuning,
+  bandwidth and gain are in [Settings: CW](06-settings-cw.md#cw-audio-peak-filter-apf).
+- **TNF** -- turns the [manual notches](#manual-notches-tnf) on and off;
+  hover over it to see how many are set.
+- **AGC** -- click to choose Off, Long, Slow, Medium or Fast from a menu,
+  as NB and NR. Attack/decay/hang/top/slope for AGC are tuned in
+  Settings → RX.
 - **AGC Gain** (0.0-140.0 dB) -- right after the AGC button. The same value
   as Settings → RX's **Top** slider, under the name piHPSDR uses for it --
   raises or lowers the AGC's target output level. With AGC **Off** it
@@ -431,6 +459,16 @@ A row of buttons and two sliders:
   receiver's gain with no AGC: raise it for a weak signal, lower it if a
   strong one distorts. Each is kept, so switching AGC on and off doesn't
   change the other. A MIDI AGC Gain control follows the same rule.
+- **Auto** (beside AGC Gain) -- automatic AGC, as Thetis's: hpsdr-rs
+  measures the noise floor on the spectrum and keeps setting AGC Gain so
+  the AGC starts working a set amount above it -- 20 dB to start with,
+  changed with **Auto AGC offset** in [Settings:
+  RX](15-settings-rx.md#auto-agc-offset). The background noise then stays
+  at about the same level as you change band, antenna or attenuation.
+  Moving AGC Gain yourself -- with the slider, MIDI, a controller, TCI or
+  the web client -- turns Auto off. It's greyed out while AGC is **Off**.
+  The noise floor is measured again when you retune by more than a
+  little, and takes about 2 seconds to settle.
 - **RX Attenuation / RX Gain / RF Gain** -- right after AGC Gain. The
   radio's front-end level; which one appears depends on the radio:
   - **RX Attenuation** (0-31 dB) on most boards: turn it up if strong
@@ -597,6 +635,33 @@ over time, colored by the selected palette (Settings → Spectrum).
 Drag the thin divider between the two panes to adjust how much vertical
 space each gets.
 
+### Manual notches (TNF)
+
+Right-click the spectrum or the waterfall for the notch menu, which
+removes a steady carrier or heterodyne at a frequency you choose -- for
+one that **ANF** doesn't catch, or several at once:
+
+- On an empty spot: **Add notch here (200 Hz)** or **Add narrow notch
+  here (100 Hz)**. Adding one also turns **TNF** on, so it takes effect
+  at once.
+- On a notch: its frequency, its **Width** (25, 50, 100, 200, 400 or 800
+  Hz), and **Remove this notch**.
+- **Remove all notches**, once there are any, and a **TNF (notches on)**
+  tick box, the same as the TNF button.
+
+Notches are shown on the spectrum as shaded bands, orange while TNF is on
+and grey while it's off. Each stays on its own RF frequency, so it stays
+on the carrier as you tune, and the notches apply to every receiver,
+extra receivers included. They're saved with the radio's settings.
+
+![Right-clicking an empty spot on the spectrum: Add notch here (200 Hz),
+Add narrow notch here (100 Hz) and TNF (notches on)](images/02-notch-add.png)
+
+![A 200 Hz notch at 14.191 MHz, drawn in orange with TNF on](images/02-notch-shown.png)
+
+![Right-clicking the notch: its frequency, Width 25-800 Hz, Remove this
+notch, Remove all notches (1) and TNF (notches on)](images/02-notch-menu.png)
+
 A small waveform display sits in the top-right corner of the spectrum
 pane -- a quick visual check that audio is actually flowing, and roughly
 what level it's at, without needing an external scope. It shows the
@@ -642,7 +707,8 @@ Anchored in the top-right of the window:
   10W to protect the PA -- see [Settings: TX](17-settings-tx.md#max-swr)
   for the full behavior.
 
-Below the meter:
+In the meter's readout, the S reading is on the left and the **SNR** on
+the right:
 
 - **SNR** -- the signal-to-noise ratio in the receive filter: the power
   across the passband against the noise floor either side of it (the
@@ -656,6 +722,9 @@ Below the meter:
   when comparing. It's blank while transmitting, when the passband
   is under 3 pixels wide on the spectrum (zoom in), or when it's too
   close to the edge of the view to see the noise beside it.
+
+Below the meter:
+
 - **Lost packets / Audio gaps** -- shown in orange for a few seconds
   whenever packets from the radio go missing on the way, or the audio runs
   dry and has to restart, with the totals (hover for details; Settings ->

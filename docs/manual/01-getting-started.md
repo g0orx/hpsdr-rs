@@ -30,6 +30,12 @@ driver is the general cure. To choose the graphics API yourself, set
 `WGPU_BACKEND` to `dx12`, `vulkan` or `gl` -- e.g. `setx WGPU_BACKEND gl`
 in a Command Prompt, which takes effect for programs started afterwards.
 
+### On Linux
+
+The `.deb` and `.rpm` packages add hpsdr-rs (and hpsdr-remote) to the
+desktop's menu, under **Ham Radio**, including on Raspberry Pi OS, whose
+menu has no Ham Radio section of its own.
+
 ### On a Raspberry Pi
 
 hpsdr-rs draws with OpenGL on a Raspberry Pi: through the Pi's Vulkan
