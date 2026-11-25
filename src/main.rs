@@ -17391,10 +17391,6 @@ fn tune_power_level(connected: &ConnectedState, current: u32) -> u32 {
     (current as f32 - down_db).round().clamp(0.0, pluto::TX_DRIVE_STEPS as f32) as u32
 }
 
-/// Mute, next to Audio gain: silences the speakers without touching the
-/// gain, so unmuting comes back at the same level. Record, TCI and the
-/// rest still get the audio (see spectrum::DemodParams::muted). Not
-/// saved: a restart always starts with sound.
 /// The receiver's audio pan (see spectrum::DemodParams::audio_pan): a
 /// short slider, L100 to R100, scroll-wheel stepped; double-click puts it
 /// back in the middle. True if it changed.
@@ -17449,7 +17445,10 @@ fn pan_slider(ui: &mut egui::Ui, scroll_accum: &mut f32, spectrum: &SpectrumHand
     }
 }
 
-/// True when clicked, so the caller saves it (it's kept across restarts).
+/// Mute, next to Audio gain: silences the speakers without touching the
+/// gain, so unmuting comes back at the same level. Record, TCI and the
+/// rest still get the audio (see spectrum::DemodParams::muted). True when
+/// clicked, so the caller saves it: it's kept across restarts.
 fn mute_button(ui: &mut egui::Ui, spectrum: &SpectrumHandle) -> bool {
     let muted = spectrum.muted();
     let button = egui::Button::selectable(muted, "Mute");
