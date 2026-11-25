@@ -268,6 +268,8 @@ pub struct App {
     muted: bool,
     db_low: f32,
     db_range: f32,
+    /// Spectrum and waterfall on/off and their split, kept between runs.
+    display: prefs::Display,
     band_memory: HashMap<&'static str, u64>,
     /// Data rates for the status line: bytes in and out at the last
     /// sample, when, and the rates in and out (kbit/s).
@@ -350,6 +352,9 @@ pub struct App {
     controller: Option<hpsdr_controller::Controller>,
     controller_status: String,
     controller_open: bool,
+    /// The compact toolbar's height last frame, kept clear for it under
+    /// the spectrum and waterfall.
+    toolbar_height: f32,
     controller_tune_steps: hpsdr_controller::TuneSteps,
     /// A setting a controller knob just changed, and when: shown over the
     /// spectrum for a moment.
@@ -376,6 +381,7 @@ const STEPS_HZ: [(u64, &str); 4] = [(10, "10 Hz"), (100, "100 Hz"), (1_000, "1 k
 impl App {
     pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
         let recent = prefs::load_recent();
+        let display = prefs::load_display();
         // Natively, the server last connected to. In a browser, the page's
         // own address (default_url), which is right when hpsdr-rs serves
         // it; the others are a click away.
@@ -394,9 +400,10 @@ impl App {
             spectrum: None,
             waterfall: Waterfall { rows: VecDeque::new(), texture: None, dirty: false },
             af_gain_db: 0.0,
-            muted: false,
+            muted: display.muted,
             db_low: -130.0,
             db_range: 60.0,
+            display,
             band_memory: HashMap::new(),
             rate_sample: (0, 0, 0.0, 0.0, 0.0),
             audio_callbacks: (0, true),
@@ -439,6 +446,7 @@ impl App {
             controller: None,
             controller_status: String::new(),
             controller_open: false,
+            toolbar_height: 60.0,
             controller_tune_steps: Default::default(),
             value_popup: None,
             controls_set_at: f64::NEG_INFINITY,
@@ -475,7 +483,11 @@ impl App {
         // Opened here, on the click: browsers only start audio after one.
         if self.player.is_none() {
             match Player::open() {
-                Ok(p) => self.player = Some(p),
+                Ok(p) => {
+                    self.player = Some(p);
+                    // A Mute kept from last time, and the gain.
+                    self.apply_gain();
+                }
                 Err(e) => self.audio_error = Some(e),
             }
         }
@@ -1513,6 +1525,8 @@ impl App {
         if ui.add(egui::Button::selectable(self.muted, "Mute")).clicked() {
             self.muted = !self.muted;
             self.apply_gain();
+            self.display.muted = self.muted;
+            prefs::save_display(&self.display);
         }
         if narrow {
             ui.end_row();
@@ -1521,6 +1535,21 @@ impl App {
         }
         ui.label("Range:");
         ui.add(egui::Slider::new(&mut self.db_range, 20.0..=120.0).suffix(" dB"));
+        // Each pane on or off; the bar between them sets their sizes.
+        let before = self.display;
+        if ui
+            .add(egui::Button::selectable(self.display.spectrum, "Spectrum"))
+            .on_hover_text("Show the spectrum (drag the bar under it to size it)")
+            .clicked()
+        {
+            self.display.spectrum = !self.display.spectrum;
+        }
+        if ui.add(egui::Button::selectable(self.display.waterfall, "Waterfall")).on_hover_text("Show the waterfall").clicked() {
+            self.display.waterfall = !self.display.waterfall;
+        }
+        if self.display != before {
+            prefs::save_display(&self.display);
+        }
     }
 
     /// Filter and AGC (`filter`), and noise controls (`noise`), once the
@@ -1643,12 +1672,91 @@ impl App {
         let floor = sorted[sorted.len() / 5] - 5.0;
         self.db_low += 0.05 * (floor - self.db_low);
 
+        // Either pane can be off (the buttons beside Range); with both on,
+        // the bar between them sets the spectrum's share of the height.
         let full = ui.available_size();
-        let spectrum_h = (full.y * 0.45).max(100.0);
-        let (rect, resp) = ui.allocate_exact_size(Vec2::new(full.x, spectrum_h), egui::Sense::click_and_drag());
+        let display = self.display;
+        if !display.spectrum && !display.waterfall {
+            ui.weak("The spectrum and waterfall are both off: turn them on beside Range.");
+            return;
+        }
+        let both = display.spectrum && display.waterfall;
+        const BAR_H: f32 = 10.0;
+        let low_hz = frame.centre_hz as f64 - frame.span_hz as f64 / 2.0;
+        // One pane alone takes alone_share of the height, with the bar
+        // under it to size it; the rest is left empty.
+        let usable = (full.y - BAR_H).max(40.0);
+        if display.spectrum {
+            let share = if both { display.spectrum_share } else { display.alone_share };
+            self.spectrum_pane(ui, &frame, &db, low_hz, Vec2::new(full.x, (usable * share).max(40.0)));
+            self.size_bar(ui, full.x, usable, both);
+        }
+        if !display.waterfall {
+            return;
+        }
+
+        // Waterfall below, newest row at the top -- tuned the same way.
+        let wf_h = if both { ui.available_height() } else { usable * display.alone_share };
+        let (wf_rect, wf_resp) = ui.allocate_exact_size(Vec2::new(full.x, wf_h.max(20.0)), egui::Sense::click_and_drag());
+        self.click_and_scroll_tune(ui, &wf_resp, low_hz, frame.span_hz);
+        if self.waterfall.dirty && !self.waterfall.rows.is_empty() {
+            let width = self.waterfall.rows[0].len();
+            let mut image = ColorImage::new([width, WATERFALL_ROWS], vec![Color32::BLACK; width * WATERFALL_ROWS]);
+            for (y, row) in self.waterfall.rows.iter().enumerate() {
+                if row.len() == width {
+                    image.pixels[y * width..(y + 1) * width].copy_from_slice(row);
+                }
+            }
+            match &mut self.waterfall.texture {
+                Some(t) => t.set(image, TextureOptions::LINEAR),
+                None => self.waterfall.texture = Some(ui.ctx().load_texture("waterfall", image, TextureOptions::LINEAR)),
+            }
+            self.waterfall.dirty = false;
+        }
+        if let Some(t) = &self.waterfall.texture {
+            ui.painter().image(t.id(), wf_rect, Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), Color32::WHITE);
+        }
+        if !both {
+            self.size_bar(ui, full.x, usable, false);
+        }
+    }
+
+    /// The bar under the spectrum (or a pane on its own): dragging it
+    /// moves the split between spectrum and waterfall when `both`, or
+    /// sizes the one pane. `usable` is the height they share.
+    fn size_bar(&mut self, ui: &mut egui::Ui, width: f32, usable: f32, both: bool) {
+        const BAR_H: f32 = 10.0;
+        let (bar, resp) = ui.allocate_exact_size(Vec2::new(width, BAR_H), egui::Sense::drag());
+        let resp = resp.on_hover_cursor(egui::CursorIcon::ResizeVertical).on_hover_text(if both {
+            "Drag to size the spectrum and waterfall"
+        } else {
+            "Drag to size this display"
+        });
+        let colour = if resp.hovered() || resp.dragged() { Color32::from_gray(150) } else { Color32::from_gray(70) };
+        ui.painter().line_segment(
+            [Pos2::new(bar.center().x - 20.0, bar.center().y), Pos2::new(bar.center().x + 20.0, bar.center().y)],
+            Stroke::new(3.0, colour),
+        );
+        if resp.dragged() {
+            let dy = resp.drag_delta().y / usable.max(1.0);
+            let (share, (lo, hi)) = if both {
+                (&mut self.display.spectrum_share, prefs::SHARE_RANGE)
+            } else {
+                (&mut self.display.alone_share, prefs::ALONE_RANGE)
+            };
+            *share = (*share + dy).clamp(lo, hi);
+        }
+        if resp.drag_stopped() {
+            prefs::save_display(&self.display);
+        }
+    }
+
+    /// The spectrum, `size`, its trace `db` spanning the frame from
+    /// `low_hz`.
+    fn spectrum_pane(&mut self, ui: &mut egui::Ui, frame: &SpectrumFrame, db: &[f32], low_hz: f64, size: Vec2) {
+        let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click_and_drag());
         let painter = ui.painter_at(rect);
         painter.rect_filled(rect, 0.0, Color32::BLACK);
-        let low_hz = frame.centre_hz as f64 - frame.span_hz as f64 / 2.0;
         let x_of = |hz: f64| rect.left() + ((hz - low_hz) / frame.span_hz as f64) as f32 * rect.width();
         let y_of = |v: f32| rect.bottom() - ((v - self.db_low) / self.db_range).clamp(0.0, 1.0) * rect.height();
 
@@ -1706,38 +1814,20 @@ impl App {
         painter.add(egui::Shape::line(points, Stroke::new(1.0, Color32::from_rgb(140, 230, 140))));
 
         self.click_and_scroll_tune(ui, &resp, low_hz, frame.span_hz);
-
-        // Waterfall below, newest row at the top -- tuned the same way.
-        ui.add_space(4.0);
-        let (wf_rect, wf_resp) =
-            ui.allocate_exact_size(Vec2::new(full.x, ui.available_height().max(20.0)), egui::Sense::click_and_drag());
-        self.click_and_scroll_tune(ui, &wf_resp, low_hz, frame.span_hz);
-        if self.waterfall.dirty && !self.waterfall.rows.is_empty() {
-            let width = self.waterfall.rows[0].len();
-            let mut image = ColorImage::new([width, WATERFALL_ROWS], vec![Color32::BLACK; width * WATERFALL_ROWS]);
-            for (y, row) in self.waterfall.rows.iter().enumerate() {
-                if row.len() == width {
-                    image.pixels[y * width..(y + 1) * width].copy_from_slice(row);
-                }
-            }
-            match &mut self.waterfall.texture {
-                Some(t) => t.set(image, TextureOptions::LINEAR),
-                None => self.waterfall.texture = Some(ui.ctx().load_texture("waterfall", image, TextureOptions::LINEAR)),
-            }
-            self.waterfall.dirty = false;
-        }
-        if let Some(t) = &self.waterfall.texture {
-            ui.painter().image(t.id(), wf_rect, Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), Color32::WHITE);
-        }
     }
 
     /// Click-to-tune and scroll-to-tune over the spectrum or waterfall:
     /// `resp` covers `span_hz` from `low_hz`, left to right.
     fn click_and_scroll_tune(&mut self, ui: &egui::Ui, resp: &egui::Response, low_hz: f64, span_hz: u32) {
+        // A click lands on the nearest whole kHz, as hpsdr-rs's (10 Hz in
+        // CW, to land on a signal); a slide moves from one whole kHz to
+        // the next (100 Hz in CW). REAL REPORT 2026-11-25: the web client's
+        // slide tuned to the Hz and its click to 100 Hz.
+        let cw = self.radio.is_cw();
         if let Some(pos) = resp.interact_pointer_pos().filter(|_| resp.clicked()) {
             let rect = resp.rect;
             let hz = low_hz + ((pos.x - rect.left()) / rect.width()) as f64 * span_hz as f64;
-            let step = if self.radio.is_cw() { 10.0 } else { 100.0 };
+            let step = if cw { 10.0 } else { 1000.0 };
             self.tune(((hz / step).round() * step).max(0.0) as u64);
         }
         if resp.hovered() {
@@ -1748,11 +1838,16 @@ impl App {
         // dragging the band itself; REAL REPORT 2026-11-07, Android: sliding
         // to go higher went lower.)
         if resp.dragged() && resp.rect.width() > 0.0 {
+            let grid = if cw { 100.0 } else { 1000.0 };
             self.span_slide_hz += (resp.drag_delta().x / resp.rect.width()) as f64 * span_hz as f64;
-            let whole = self.span_slide_hz.trunc();
-            self.span_slide_hz -= whole;
-            if whole != 0.0 && self.radio.vfo_hz > 0 {
-                self.tune((self.radio.vfo_hz as f64 + whole).max(0.0) as u64);
+            let steps = (self.span_slide_hz / grid).trunc();
+            self.span_slide_hz -= steps * grid;
+            if steps != 0.0 && self.radio.vfo_hz > 0 {
+                // From the grid line on the side it's moving towards: the
+                // first step from 14.074350 up is 14.075, not 14.075350.
+                let now = self.radio.vfo_hz as f64 / grid;
+                let from = if steps > 0.0 { now.floor() } else { now.ceil() };
+                self.tune(((from + steps) * grid).max(0.0) as u64);
             }
         } else if !resp.dragged() && resp.drag_stopped() {
             self.span_slide_hz = 0.0;
@@ -1886,10 +1981,28 @@ impl eframe::App for App {
             });
         });
         egui::Panel::bottom("status").show(ui, |ui| self.status_line(ui));
-        if compact && connected {
-            egui::Panel::bottom("toolbar").show(ui, |ui| self.compact_toolbar(ui));
+        // Compact: the toolbar right under the spectrum and waterfall, so
+        // it moves up when they're made smaller. They get the room left
+        // after the toolbar (its height from the frame before).
+        let central = egui::CentralPanel::default().show(ui, |ui| {
+            if !(compact && connected) {
+                self.spectrum_and_waterfall(ui);
+                return None;
+            }
+            let room = (ui.available_height() - self.toolbar_height).max(60.0);
+            ui.allocate_ui(Vec2::new(ui.available_width(), room), |ui| self.spectrum_and_waterfall(ui));
+            let below = ui.cursor().top();
+            ui.separator();
+            let bar = ui.scope(|ui| self.compact_toolbar(ui)).response.rect;
+            // Separator and toolbar, with the spacing after the panes.
+            self.toolbar_height = bar.bottom() - below + ui.spacing().item_spacing.y;
+            Some(bar.top())
+        });
+        // The popups go over what's above the toolbar.
+        let mut spectrum = central.response.rect;
+        if let Some(top) = central.inner {
+            spectrum.max.y = top;
         }
-        let spectrum = egui::CentralPanel::default().show(ui, |ui| self.spectrum_and_waterfall(ui)).response.rect;
         if compact && connected {
             self.section_popup(ui.ctx(), spectrum);
         }
@@ -1914,8 +2027,11 @@ impl App {
                         self.compact_top(ui);
                         ui.separator();
                         let panes = ui
+                            // Up to PANES_HEIGHT: no more than the panes use,
+                            // so the toolbar comes up when they're made
+                            // smaller (REAL REPORT 2026-11-25: it didn't in
+                            // landscape, which is this layout on a phone).
                             .allocate_ui(Vec2::new(ui.available_width(), PANES_HEIGHT), |ui| {
-                                ui.set_min_height(PANES_HEIGHT);
                                 self.spectrum_and_waterfall(ui);
                             })
                             .response

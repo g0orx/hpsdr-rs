@@ -192,6 +192,10 @@ pub struct Config {
     /// Main receiver Auto AGC -- see spectrum::DemodParams::agc_auto.
     #[serde(default)]
     pub agc_auto: bool,
+    /// Main receiver Mute (the speakers only) -- see
+    /// spectrum::DemodParams::muted.
+    #[serde(default)]
+    pub muted: bool,
     /// Auto AGC's offset above the noise floor, shared by every receiver
     /// -- see spectrum::agc_auto_offset_db. None = the default.
     pub agc_auto_offset_db: Option<f64>,
@@ -877,6 +881,9 @@ pub struct ExtraReceiverConfig {
     /// See Config::agc_auto's doc comment.
     #[serde(default)]
     pub agc_auto: bool,
+    /// See Config::muted's doc comment.
+    #[serde(default)]
+    pub muted: bool,
     /// See Config::squelch_enabled's doc comment.
     #[serde(default)]
     pub squelch_enabled: bool,

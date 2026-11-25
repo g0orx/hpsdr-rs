@@ -5251,6 +5251,7 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
             spectrum.set_apf(cfg.apf);
             // After set_agc_top_db above, which turns it off.
             spectrum.set_agc_auto(cfg.agc_auto);
+            spectrum.set_muted(cfg.muted);
             if let Some(v) = cfg.agc_auto_offset_db {
                 spectrum::set_agc_auto_offset_db(v);
             }
@@ -7843,7 +7844,9 @@ impl eframe::App for HpsdrApp {
                                 connected.spectrum.set_gain(gain);
                                 settings_changed = true;
                             }
-                            mute_button(ui, &connected.spectrum);
+                            if mute_button(ui, &connected.spectrum) {
+                                settings_changed = true;
+                            }
                             if pan_slider(ui, &mut connected.slider_scroll_accum, &connected.spectrum) {
                                 settings_changed = true;
                             }
@@ -14766,6 +14769,7 @@ impl eframe::App for HpsdrApp {
                                 anf: agc_params.anf,
                                 apf: agc_params.apf,
                                 agc_auto: agc_params.agc_auto,
+                                muted: agc_params.muted,
                                 squelch_enabled: agc_params.squelch_enabled,
                                 squelch_level: agc_params.squelch_level,
                                 binaural: agc_params.binaural,
@@ -14834,6 +14838,7 @@ impl eframe::App for HpsdrApp {
                         notches: spectrum::notches(),
                         agc_auto: agc_params_now.agc_auto,
                         agc_auto_offset_db: Some(spectrum::agc_auto_offset_db()),
+                        muted: agc_params_now.muted,
                         squelch_enabled: Some(agc_params_now.squelch_enabled),
                         squelch_level: Some(agc_params_now.squelch_level),
                         binaural: Some(agc_params_now.binaural),
@@ -17437,13 +17442,16 @@ fn pan_slider(ui: &mut egui::Ui, scroll_accum: &mut f32, spectrum: &SpectrumHand
     }
 }
 
-fn mute_button(ui: &mut egui::Ui, spectrum: &SpectrumHandle) {
+/// True when clicked, so the caller saves it (it's kept across restarts).
+fn mute_button(ui: &mut egui::Ui, spectrum: &SpectrumHandle) -> bool {
     let muted = spectrum.muted();
     let button = egui::Button::selectable(muted, "Mute");
     let button = if muted { button.fill(egui::Color32::from_rgb(170, 40, 40)) } else { button };
-    if ui.add(button).on_hover_text("Silence the speakers. Recording and TCI carry on.").clicked() {
+    let clicked = ui.add(button).on_hover_text("Silence the speakers. Recording and TCI carry on.").clicked();
+    if clicked {
         spectrum.set_muted(!muted);
     }
+    clicked
 }
 
 /// The Pluto can't transmit while its wide stream is on: its TX rate is
@@ -18290,7 +18298,9 @@ fn render_extra_receiver_ui(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceiver>>) {
             rx.spectrum.set_gain(gain);
             rx.settings_dirty.store(true, Ordering::Relaxed);
         }
-        mute_button(ui, &rx.spectrum);
+        if mute_button(ui, &rx.spectrum) {
+            rx.settings_dirty.store(true, Ordering::Relaxed);
+        }
         let mut scroll_accum = rx.slider_scroll_accum;
         if pan_slider(ui, &mut scroll_accum, &rx.spectrum) {
             rx.settings_dirty.store(true, Ordering::Relaxed);
@@ -19559,6 +19569,7 @@ fn spawn_extra_receiver(
         spectrum.set_apf(s.apf);
         // After set_agc_top_db, which turns it off.
         spectrum.set_agc_auto(s.agc_auto);
+        spectrum.set_muted(s.muted);
         spectrum.set_squelch_enabled(s.squelch_enabled);
         spectrum.set_squelch_level(s.squelch_level);
         spectrum.set_binaural(s.binaural);
