@@ -473,6 +473,7 @@ pub fn discover(devices: Arc<Mutex<Vec<Device>>>, interface_names: Arc<Mutex<Has
     discover_rtlsdr_usb(&devices);
     discover_mirisdr_usb(&devices);
     discover_pluto(&devices);
+    discover_saturn_xdma(&devices);
 
     let interfaces = match NetworkInterface::show() {
         Ok(v) => v,
@@ -718,6 +719,44 @@ fn discover_pluto(devices: &Arc<Mutex<Vec<Device>>>) {
         if let Some(info) = pluto::probe(ip) {
             devices.lock().unwrap().push(pluto_device(&info));
         }
+    }
+}
+
+/// An ANAN G2 seen from its own Raspberry Pi through XDMA (saturn.rs),
+/// rather than over the network through p2app: board Saturn, Protocol 2,
+/// with the USB boards' "no address" sentinel -- which is what
+/// Device::is_saturn_xdma looks for. In use by another program (p2app,
+/// piHPSDR) it's listed as running, so it can't be picked; with firmware
+/// saturn.rs doesn't know it's listed with the reason, also unpickable.
+fn discover_saturn_xdma(devices: &Arc<Mutex<Vec<Device>>>) {
+    let Some(found) = crate::saturn::discover() else { return };
+    if let Some(who) = &found.in_use_by {
+        eprintln!("discover: Saturn XDMA is in use by {who}");
+    }
+    let sentinel = SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0);
+    devices.lock().unwrap().push(Device {
+        address: sentinel,
+        my_address: sentinel,
+        device: 10,
+        board: Boards::Saturn,
+        protocol: 2,
+        version: found.info.minor_version.min(255) as u8,
+        status: if found.in_use_by.is_some() { 3 } else { 2 },
+        mac: found.mac,
+        // The FPGA's ten DDCs.
+        supported_receivers: 10,
+        supported_transmitters: 1,
+        adcs: 2,
+        frequency_min: 0,
+        frequency_max: 61_440_000,
+        usb_link_speed_warning: found.incompatible.then_some("FPGA firmware not supported"),
+    });
+}
+
+impl Device {
+    /// An ANAN G2 reached through XDMA -- see discover_saturn_xdma.
+    pub fn is_saturn_xdma(&self) -> bool {
+        self.board == Boards::Saturn && self.address.port() == 0
     }
 }
 

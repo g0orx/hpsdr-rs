@@ -2,7 +2,7 @@
 name = "hpsdr-rs"
 version = "0.15.2"
 edition = "2021"
-license = "GPL-2.0-or-later"
+license = "GPL-3.0-or-later"
 authors = ["John Melton <john.d.melton@googlemail.com>"]
 description = "Desktop client for openHPSDR Protocol 1/2 SDR radios"
 repository = "https://github.com/g0orx/hpsdr-rs"
@@ -220,8 +220,8 @@ assets = [
     ["assets/90-rtlsdr.rules", "usr/share/doc/hpsdr-rs/90-rtlsdr.rules", "644"],
     ["assets/90-mirisdr.rules", "usr/share/doc/hpsdr-rs/90-mirisdr.rules", "644"],
     # Ozy's FX2 firmware + FPGA bitstream -- sourced from the author's
-    # own piHPSDR repo (github.com/g0orx/pihpsdr), same GPL-2.0 license
-    # as this project, not a third-party blob. Installed to
+    # own piHPSDR repo (github.com/g0orx/pihpsdr), GPL-2.0 licensed (so
+    # fine with this project's GPL-3), not a third-party blob. Installed to
     # usr/share/hpsdr-rs/ozy/ specifically -- ozy.rs's `bundled_path`
     # derives this exact location from the installed binary's own path
     # (usr/bin/hpsdr-rs -> ../share/hpsdr-rs/ozy/), so a .deb install

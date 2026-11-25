@@ -35,6 +35,7 @@ mod remote;
 mod rigctl;
 mod rtlsdr;
 mod rx888;
+mod saturn;
 mod spectrum;
 mod tci;
 mod transponder;
@@ -5978,7 +5979,11 @@ impl eframe::App for HpsdrApp {
                     connected.device.protocol,
                     connected.device.version / 10,
                     connected.device.version % 10,
-                    connected.device.address.ip()
+                    if connected.device.is_saturn_xdma() {
+                        "XDMA".to_string()
+                    } else {
+                        connected.device.address.ip().to_string()
+                    }
                 );
                 // Only when it changes: egui's send_viewport_cmd asks for an
                 // immediate repaint every time, so sending it each frame
@@ -11505,6 +11510,8 @@ impl eframe::App for HpsdrApp {
                                         ui.label("IP Address:");
                                         ui.label(if is_usb_board {
                                             "USB".to_string()
+                                        } else if connected.device.is_saturn_xdma() {
+                                            "XDMA (this computer's FPGA)".to_string()
                                         } else {
                                             format!("{}", connected.device.address.ip())
                                         });

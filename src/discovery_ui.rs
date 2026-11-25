@@ -380,6 +380,9 @@ impl DiscoveryWindow {
                                 format!("USB {}", crate::usb_port::port_label(dev.mac))
                             } else if matches!(dev.board, Boards::Ozy | Boards::Rx888) {
                                 "USB".to_string()
+                            } else if dev.is_saturn_xdma() {
+                                // The G2's FPGA, from its own Pi (saturn.rs).
+                                "XDMA".to_string()
                             } else {
                                 match interface_names.get(&dev.my_address.ip()) {
                                     Some(name) => format!("{name} ({})", dev.my_address.ip()),
@@ -396,6 +399,8 @@ impl DiscoveryWindow {
                             row_double_clicked |= resp.double_clicked();
                             let ip_cell = if matches!(dev.board, Boards::Ozy | Boards::Rx888 | Boards::RtlSdr | Boards::MsiSdr) {
                                 "USB".to_string()
+                            } else if dev.is_saturn_xdma() {
+                                "XDMA".to_string()
                             } else {
                                 dev.address.ip().to_string()
                             };

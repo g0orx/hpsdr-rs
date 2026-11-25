@@ -77,6 +77,50 @@ const P2_PACKET_SIZE: usize = 1444; // General/DDC-specific/High-Priority and DD
 const P2_KEEPALIVE_INTERVAL: Duration = Duration::from_millis(250);
 const P2_DSP_CLOCK_HZ: f64 = 122_880_000.0; // Hermes/Angelia/Orion; fixed for v1
 
+/// Where a Protocol 2 session's packets go: a network radio's UDP socket,
+/// or an ANAN G2's FPGA through XDMA (saturn.rs) when running on the G2's
+/// own Pi. The same packets either way -- send_to's port picks what a
+/// packet is, and recv_from's source port says what came back -- so the
+/// Protocol 2 loops below don't know which they have.
+enum P2Socket {
+    Udp(UdpSocket),
+    Saturn(Arc<crate::saturn::SaturnLink>),
+}
+
+impl P2Socket {
+    fn try_clone(&self) -> io::Result<P2Socket> {
+        Ok(match self {
+            P2Socket::Udp(s) => P2Socket::Udp(s.try_clone()?),
+            P2Socket::Saturn(link) => P2Socket::Saturn(Arc::clone(link)),
+        })
+    }
+
+    fn send_to(&self, buf: &[u8], addr: (std::net::IpAddr, u16)) -> io::Result<usize> {
+        match self {
+            P2Socket::Udp(s) => s.send_to(buf, addr),
+            P2Socket::Saturn(link) => {
+                link.send(addr.1, buf);
+                Ok(buf.len())
+            }
+        }
+    }
+
+    /// As UdpSocket::recv_from with the session's 500 ms read timeout.
+    fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, std::net::SocketAddr)> {
+        match self {
+            P2Socket::Udp(s) => s.recv_from(buf),
+            P2Socket::Saturn(link) => match link.recv(Duration::from_millis(500)) {
+                Some((port, packet)) => {
+                    let n = packet.len().min(buf.len());
+                    buf[..n].copy_from_slice(&packet[..n]);
+                    Ok((n, std::net::SocketAddr::from(([0, 0, 0, 0], port))))
+                }
+                None => Err(io::Error::from(io::ErrorKind::TimedOut)),
+            },
+        }
+    }
+}
+
 /// How many IQ samples to keep buffered per receiver before dropping the
 /// oldest. ~2 seconds at 48kHz; tune once real DSP consumption exists.
 /// How many IQ samples to keep buffered per receiver before dropping the
@@ -1340,6 +1384,9 @@ pub struct RadioSession {
     /// see ozy.rs's RxEndpoint/TxEndpoint/OzyDevice doc comments), not
     /// stored here.
     is_ozy: bool,
+    /// An ANAN G2 through XDMA (see P2Socket): the stop goes to it, and
+    /// closes it, rather than to a network address.
+    saturn: Option<Arc<crate::saturn::SaturnLink>>,
     /// `pub` so main.rs's About tab can show the firmware versions read
     /// at connect time.
     pub ozy_versions: Option<crate::ozy::OzyVersions>,
@@ -1939,7 +1986,12 @@ impl RadioSession {
             2 => {
                 // High Priority packet with the run bit cleared.
                 let pkt = [0u8; P2_PACKET_SIZE]; // seq=0, byte4=0 (run=0) is fine for a one-shot goodbye
-                let _ = self.stop_socket.send_to(&pkt, (self.radio_ip, P2_HIGH_PRIORITY_PORT));
+                if let Some(link) = &self.saturn {
+                    link.send(P2_HIGH_PRIORITY_PORT, &pkt);
+                    link.close();
+                } else {
+                    let _ = self.stop_socket.send_to(&pkt, (self.radio_ip, P2_HIGH_PRIORITY_PORT));
+                }
             }
             _ => {}
         }
@@ -2384,6 +2436,7 @@ fn start_protocol1(
         radio_ip: device.address.ip(),
         stop_socket,
         is_ozy: false,
+        saturn: None,
         ozy_versions: None,
         ozy_atlas: None,
         ozy_i2c_thread: None,
@@ -2749,6 +2802,7 @@ fn start_protocol1_ozy_usb(
         radio_ip: device.address.ip(),
         stop_socket: UdpSocket::bind(("0.0.0.0", 0))?,
         is_ozy: true,
+        saturn: None,
         ozy_versions: Some(ozy_versions),
         ozy_atlas: Some(ozy_atlas),
         ozy_i2c_thread: Some(i2c_thread),
@@ -3027,6 +3081,7 @@ fn start_rx888_usb(
         radio_ip: device.address.ip(),
         stop_socket: UdpSocket::bind(("0.0.0.0", 0))?,
         is_ozy: false,
+        saturn: None,
         ozy_versions: None,
         ozy_atlas: None,
         ozy_i2c_thread: None,
@@ -3273,6 +3328,7 @@ fn start_usb_dongle(
         radio_ip: device.address.ip(),
         stop_socket: UdpSocket::bind(("0.0.0.0", 0))?,
         is_ozy: false,
+        saturn: None,
         ozy_versions: None,
         ozy_atlas: None,
         ozy_i2c_thread: None,
@@ -6240,7 +6296,7 @@ fn p2_audio_packet(seq: u32, rx_audio: &Mutex<VecDeque<f32>>) -> [u8; P2_AUDIO_P
 /// depend on an unrelated, off-by-default, general-purpose setting the
 /// user has no reason to know CW needs.
 fn p2_rx_audio_loop(
-    socket: UdpSocket,
+    socket: P2Socket,
     radio_ip: std::net::IpAddr,
     mox: Arc<AtomicBool>,
     send_rx_audio_to_radio: Arc<AtomicBool>,
@@ -7375,6 +7431,14 @@ fn start_protocol2(
     // full story) -- cloned now, before `socket` gets consumed by the
     // sender/receiver threads below.
     let stop_socket = socket.try_clone()?;
+    // An ANAN G2 from its own Pi: the same packets go to its FPGA through
+    // XDMA instead (see P2Socket). The UDP socket above then carries
+    // nothing.
+    let saturn = if device.is_saturn_xdma() { Some(crate::saturn::SaturnLink::open()?) } else { None };
+    let socket = match &saturn {
+        Some(link) => P2Socket::Saturn(Arc::clone(link)),
+        None => P2Socket::Udp(socket),
+    };
     // See RadioSession::disable_pa's doc comment.
     let disable_pa = Arc::new(AtomicBool::new(false));
     let tune_active = Arc::new(AtomicBool::new(false));
@@ -7652,6 +7716,7 @@ fn start_protocol2(
         radio_ip,
         stop_socket,
         is_ozy: false,
+        saturn,
         ozy_versions: None,
         ozy_atlas: None,
         ozy_i2c_thread: None,
@@ -8356,7 +8421,7 @@ fn alex1_word(freq_hz: u32, mox_on: bool) -> u16 {
 }
 
 fn p2_sender_loop(
-    socket: UdpSocket,
+    socket: P2Socket,
     radio_ip: std::net::IpAddr,
     num_adcs: u8,
     // RX2/Alex1 bandpass-filter word (High Priority packet bytes
@@ -8730,7 +8795,7 @@ fn p2_sender_loop(
 
 #[allow(clippy::too_many_arguments)]
 fn p2_receiver_loop(
-    socket: UdpSocket,
+    socket: P2Socket,
     buffers: Vec<Arc<Mutex<VecDeque<IqSample>>>>,
     sample_rate: Arc<AtomicU32>,
     hp_request: Arc<AtomicBool>,
@@ -9176,7 +9241,7 @@ fn p2_duc_packet(seq: u32, tx_iq: &Mutex<VecDeque<f32>>) -> ([u8; P2_PACKET_SIZE
 /// way p2_receiver_loop's RX IQ ingestion is a separate fast path from
 /// the C&C keepalive.
 fn p2_tx_iq_loop(
-    socket: UdpSocket,
+    socket: P2Socket,
     radio_ip: std::net::IpAddr,
     mox: Arc<AtomicBool>,
     tx_iq: Arc<Mutex<VecDeque<f32>>>,

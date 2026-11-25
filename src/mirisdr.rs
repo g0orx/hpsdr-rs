@@ -13,7 +13,7 @@
     PORTED, not invented: every register sequence below is a
     transcription of libmirisdr-4 (~/github/libmirisdr-4, commit fd0452e:
     src/adc.c, hard.c, soft.c, gain.c, streaming.c, convert/252_s16.c),
-    which is GPL-2.0-or-later -- the same licence as this project. Function
+    which is GPL-2.0-or-later, so usable under this project's GPL-3. Function
     names match the C ones minus their mirisdr_ prefix. Deliberately NOT
     ported:
     - Isochronous streaming (libmirisdr's default on Unix): nusb has no

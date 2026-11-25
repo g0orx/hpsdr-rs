@@ -1,6 +1,6 @@
 # hpsdr-rs
 
-![License: GPLv2+](https://img.shields.io/badge/license-GPLv2%2B-blue.svg)
+![License: GPLv3+](https://img.shields.io/badge/license-GPLv3%2B-blue.svg)
 ![Status: early development](https://img.shields.io/badge/status-early%20development-yellow.svg)
 ![Rust edition](https://img.shields.io/badge/rust-2021-orange.svg)
 
@@ -167,7 +167,7 @@ setup normal boards don't:
 
 1. **Firmware files** — the Cypress FX2 RAM firmware (`ozyfw-sdr1k.hex`)
    and the FPGA bitstream (`Ozy_Janus.rbf`) are **bundled with
-   hpsdr-rs** (sourced from the author's own piHPSDR repo, same
+   hpsdr-rs** (sourced from the author's own piHPSDR repo, under the
    GPL-2.0 license) — a `.deb` install or a `cargo run` from a source
    checkout both find them automatically, no setup needed. The
    Discover window's **Ozy USB setup** section shows which copy is in
@@ -433,4 +433,4 @@ Issues and pull requests are welcome. A few things that'll help:
 
 ## License
 
-GNU General Public License, version 2 or (at your option) any later version -- see [LICENSE](LICENSE). This matches WDSP's own license, which hpsdr-rs statically links against.
+GNU General Public License, version 3 or (at your option) any later version -- see [LICENSE](LICENSE). It was version 2 or later until the ANAN G2 (Saturn) XDMA support, which is ported from piHPSDR's GPL-3.0-or-later Saturn code. WDSP, which hpsdr-rs statically links against, is GPL version 2 or later, so it can be used under version 3.
