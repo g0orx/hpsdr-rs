@@ -9414,7 +9414,7 @@ impl eframe::App for HpsdrApp {
                     }
                     let x_dial = x_for_offset(ctun_offset_hz);
 
-                    // SNR readout under the S-meter, from the row drawn here.
+                    // SNR readout in the S-meter, from the row drawn here.
                     let snr = if transmitting {
                         None
                     } else {
@@ -9988,7 +9988,7 @@ impl eframe::App for HpsdrApp {
                             // at.
                             connected.smoothed_fwd_power = 0.0;
                             connected.smoothed_rev_power = 0.0;
-                            draw_s_meter(ui, meter_rect, meter_db);
+                            draw_s_meter(ui, meter_rect, meter_db, connected.smoothed_snr_db);
                         }
 
                         // ADC front-end overload -- see
@@ -10012,15 +10012,7 @@ impl eframe::App for HpsdrApp {
                             egui::vec2(180.0, line_height),
                             egui::Sense::hover(),
                         );
-                        if let Some(snr) = connected.smoothed_snr_db {
-                            ui.painter().text(
-                                row_rect.right_center(),
-                                egui::Align2::RIGHT_CENTER,
-                                format!("SNR {snr:.1} dB"),
-                                egui::TextStyle::Body.resolve(ui.style()),
-                                readable(ui, egui::Color32::from_gray(200)),
-                            );
-                        }
+                        // (The SNR is in the S-meter's readout.)
                         if adc0_ov || adc1_ov {
                             let text = if adc0_ov && adc1_ov {
                                 "ADC0+ADC1 OVERLOAD"
@@ -10254,7 +10246,7 @@ impl eframe::App for HpsdrApp {
                                 .show(ui, |ui| {
                                     let (meter_rect, _resp) =
                                         ui.allocate_exact_size(egui::vec2(180.0, 85.0), egui::Sense::hover());
-                                    draw_s_meter(ui, meter_rect, meter_db);
+                                    draw_s_meter(ui, meter_rect, meter_db, None);
                                 });
 
                             egui::CentralPanel::default().show(ui, |ui| {
@@ -17601,7 +17593,8 @@ fn passband_snr_db(row: &[f32], frac_low: f64, frac_high: f64) -> Option<f64> {
     Some((10.0 * (signal.max(0.0) / noise_power).log10()).max(-10.0))
 }
 
-fn draw_s_meter(ui: &mut egui::Ui, rect: egui::Rect, db: f64) {
+/// `snr_db`: the passband SNR to show beside the reading, if any.
+fn draw_s_meter(ui: &mut egui::Ui, rect: egui::Rect, db: f64, snr_db: Option<f64>) {
     let painter = ui.painter();
     painter.rect_filled(rect, 4.0, egui::Color32::from_gray(20));
 
@@ -17712,14 +17705,37 @@ fn draw_s_meter(ui: &mut egui::Ui, rect: egui::Rect, db: f64) {
     );
     painter.circle_filled(center, 4.0, egui::Color32::YELLOW);
 
-    // Digital readout
-    painter.text(
-        egui::pos2(center.x, rect.bottom() - 2.0),
-        egui::Align2::CENTER_BOTTOM,
-        s_meter_label(db, S9),
-        egui::FontId::monospace(13.0),
-        egui::Color32::WHITE,
-    );
+    // Digital readout: the S reading, centred -- or with an SNR, the S
+    // reading on the left and the SNR on the right, a size smaller so
+    // both fit the meter's width.
+    match snr_db {
+        None => {
+            painter.text(
+                egui::pos2(center.x, rect.bottom() - 2.0),
+                egui::Align2::CENTER_BOTTOM,
+                s_meter_label(db, S9),
+                egui::FontId::monospace(13.0),
+                egui::Color32::WHITE,
+            );
+        }
+        Some(snr) => {
+            const MARGIN: f32 = 5.0;
+            painter.text(
+                egui::pos2(rect.left() + MARGIN, rect.bottom() - 2.0),
+                egui::Align2::LEFT_BOTTOM,
+                s_meter_label(db, S9),
+                egui::FontId::monospace(11.0),
+                egui::Color32::WHITE,
+            );
+            painter.text(
+                egui::pos2(rect.right() - MARGIN, rect.bottom() - 2.0),
+                egui::Align2::RIGHT_BOTTOM,
+                format!("SNR {snr:.1}dB"),
+                egui::FontId::monospace(11.0),
+                egui::Color32::from_gray(200),
+            );
+        }
+    }
 }
 
 /// Same semicircle-gauge treatment as draw_s_meter, scaled 0..max_watts
