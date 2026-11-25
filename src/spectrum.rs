@@ -251,6 +251,121 @@ pub fn set_tnf(on: bool) {
     }
 }
 
+/// Auto AGC's offset (Thetis's "Auto AGC" offset, Setup -> AGC/ALC): the
+/// AGC threshold is put this many dB above the noise floor. Shared by
+/// every receiver, -60..60, default 20 as Thetis's.
+static AGC_AUTO_OFFSET_DB: Mutex<f64> = Mutex::new(DEFAULT_AGC_AUTO_OFFSET_DB);
+pub const DEFAULT_AGC_AUTO_OFFSET_DB: f64 = 20.0;
+pub const AGC_AUTO_OFFSET_RANGE: (f64, f64) = (-60.0, 60.0);
+
+pub fn agc_auto_offset_db() -> f64 {
+    *AGC_AUTO_OFFSET_DB.lock().unwrap()
+}
+
+pub fn set_agc_auto_offset_db(db: f64) {
+    *AGC_AUTO_OFFSET_DB.lock().unwrap() = db.clamp(AGC_AUTO_OFFSET_RANGE.0, AGC_AUTO_OFFSET_RANGE.1);
+}
+
+/// The noise floor of a receiver's spectrum, for Auto AGC -- Thetis's
+/// display.cs processNoiseFloor: each frame averages (in power) the
+/// pixels less than 2 dB above the current estimate, and moves the
+/// estimate halfway to that; with too few such pixels (under 15%) the
+/// estimate creeps up 1 dB a frame instead. What's reported follows that
+/// with a 2 s attack. After a retune it "fast attacks" for a second and
+/// reports nothing until that's over.
+struct NoiseFloor {
+    average_db: f32,
+    reported_db: f32,
+    fast_until: Option<std::time::Instant>,
+}
+
+impl NoiseFloor {
+    const ATTACK_S: f32 = 2.0;
+    const FAST_ATTACK: Duration = Duration::from_secs(1);
+
+    fn new() -> Self {
+        let mut nf = Self { average_db: -200.0, reported_db: -200.0, fast_until: None };
+        nf.restart();
+        nf
+    }
+
+    fn restart(&mut self) {
+        self.fast_until = Some(std::time::Instant::now() + Self::FAST_ATTACK);
+    }
+
+    /// One spectrum frame, dB per pixel. The floor once it's settled.
+    fn update(&mut self, pixels: &[f32]) -> Option<f32> {
+        // The analyzer's edges roll off; leave them out as the spectrum's
+        // own Auto Low does.
+        let edge = pixels.len() / 20;
+        let body = &pixels[edge..pixels.len() - edge];
+        if body.is_empty() {
+            return None;
+        }
+        let fast = match self.fast_until {
+            Some(t) if std::time::Instant::now() < t => true,
+            Some(_) => {
+                self.fast_until = None;
+                false
+            }
+            None => false,
+        };
+        if fast {
+            // Thetis climbs 3 dB a frame from where it was; at this
+            // file's 10 frames a second that's too slow to settle within
+            // the fast attack, so start from the quietest 15% instead.
+            let mut sorted: Vec<f32> = body.iter().copied().filter(|v| v.is_finite()).collect();
+            if sorted.is_empty() {
+                return None;
+            }
+            sorted.sort_by(|a, b| a.total_cmp(b));
+            let low = &sorted[..(sorted.len() * 3 / 20).max(1)];
+            let power = low.iter().map(|v| 10f32.powf(v / 10.0)).sum::<f32>() / low.len() as f32;
+            self.average_db = 10.0 * (power + 1e-30).log10();
+            self.reported_db = self.average_db;
+            return None;
+        }
+        let limit = self.average_db + 2.0;
+        let (mut sum, mut count) = (0f32, 0usize);
+        for &v in body {
+            if v < limit {
+                sum += 10f32.powf(v / 10.0);
+                count += 1;
+            }
+        }
+        if count > 0 && count >= body.len() * 3 / 20 {
+            let mean = sum / count as f32;
+            let old = 10f32.powf(self.average_db / 10.0);
+            self.average_db = 10.0 * ((mean + old) * 0.5 + 1e-30).log10();
+        } else {
+            self.average_db += 1.0;
+        }
+        self.average_db = self.average_db.clamp(-200.0, 200.0);
+        let frames = (SPECTRUM_FPS * Self::ATTACK_S) as i32 + 1;
+        self.reported_db -= (self.reported_db - self.average_db) / frames as f32;
+        Some(self.reported_db)
+    }
+}
+
+/// The AGC gain (WDSP's Top, dB) that puts the AGC threshold at
+/// `thresh_db`, a spectrum pixel's level -- WDSP's own SetRXAAGCThresh
+/// formula (wcpAGC.c), done here because that call overwrites the same
+/// max_gain SetRXAAGCTop sets (see SpectrumAnalyzer::demod). Its
+/// noise_offset scales a bin's level to the AGC's bandwidth, the
+/// passband; this file's pixels are WDSP's per-bin levels plus its
+/// NormOneHz term 10*log10(fft_size / (pixels*zoom)) (SetDisplaySampleRate
+/// is pixels*zoom), so the FFT size cancels and a pixel's "bin" is
+/// sample_rate / (pixels*zoom) wide. Clamped as Thetis's
+/// setAGCThresholdPoint, to this file's 0..120.
+fn agc_top_for_threshold(thresh_db: f64, passband_hz: f64, pixels_wide: f64, sample_rate: f64, slope_db: i32) -> f64 {
+    // create_wcpagc's out_targ 1.0 with n_tau 4 (RXA.c), and
+    // SetRXAAGCSlope's var_gain.
+    let out_target = (1.0 - (-4.0f64).exp()) * 0.9999;
+    let var_gain = 10f64.powf(slope_db as f64 / 200.0);
+    let noise_offset = 10.0 * (passband_hz.abs().max(1.0) * pixels_wide / sample_rate).log10();
+    (20.0 * (out_target / var_gain).log10() - thresh_db - noise_offset).clamp(0.0, 120.0)
+}
+
 /// Computes passband edges (Hz, relative to the tuned/dial frequency)
 /// from mode + a single "width" control. This is our own UI convention,
 /// not a WDSP requirement -- WDSP just takes whatever edges it's given
@@ -627,6 +742,11 @@ pub struct DemodParams {
     pub agc_hang_ms: i32,
     pub agc_top_db: f64,
     pub agc_slope_db: i32,
+    /// Auto AGC (Thetis's): the receiver's thread keeps agc_top_db at
+    /// the gain that puts the AGC threshold agc_auto_offset_db() above
+    /// the spectrum's noise floor. SpectrumHandle::set_agc_top_db turns
+    /// it off, as moving Thetis's AGC-T slider does.
+    pub agc_auto: bool,
     /// The gain with AGC Off (WDSP's SetRXAAGCFixed), dB -- Thetis's
     /// "Fixed Gain", which its AGC-T slider sets while AGC is Fixed, as
     /// the AGC Gain slider does here while AGC is Off. Default
@@ -816,6 +936,7 @@ impl Default for DemodParams {
             // had been carrying.
             agc_top_db: 80.0,
             agc_slope_db: 35,
+            agc_auto: false,
             agc_fixed_db: DEFAULT_AGC_FIXED_DB,
             // NB/NR off by default, same reasoning as AGC above --
             // these reshape the signal in ways that can surprise a
@@ -2006,6 +2127,9 @@ fn run(
     // One instance per channel so L/R stay independent for binaural.
     let mut dc_block_l = DcBlocker::new();
     let mut dc_block_r = DcBlocker::new();
+    let mut noise_floor = NoiseFloor::new();
+    // (the LO at the last restart, (zoom, pan, agc_auto)).
+    let mut nf_view: Option<(f64, (i32, u32, bool))> = None;
 
     while !stop.load(Ordering::Relaxed) {
         chunk.clear();
@@ -2058,6 +2182,48 @@ fn run(
             + params.rf_gain_offset_db;
 
         let (spectrum, waterfall) = analyzer.feed(&chunk);
+
+        // Auto AGC -- see DemodParams::agc_auto. The floor is taken from
+        // the raw pixels (before the calibration below), as Thetis takes
+        // its calibration back off before setting the threshold. Not
+        // while transmitting, and started afresh after a retune.
+        // A retune restarts it only once the view has moved by more than
+        // 2% of its span: the QO-100 LNB lock nudges the LO by a few Hz
+        // all the time, and restarting on each of those kept it from
+        // ever settling.
+        let mox_now = mox.load(Ordering::Relaxed);
+        let view = (params.zoom, params.pan.to_bits(), params.agc_auto);
+        let span_hz = sample_rate as f64 / params.zoom.max(1) as f64;
+        let moved = match nf_view {
+            Some((lo, v)) => v != view || (params.lo_frequency_hz - lo).abs() > span_hz * 0.02,
+            None => true,
+        };
+        if !params.agc_auto || mox_now || moved {
+            noise_floor.restart();
+            nf_view = Some((params.lo_frequency_hz, view));
+        }
+        if let Some(s) = &spectrum {
+            if params.agc_auto && !mox_now && params.agc != Agc::Off {
+                if let Some(floor_db) = noise_floor.update(s) {
+                    let (lo, hi) = passband_for(params.mode, params.width_hz);
+                    let top = agc_top_for_threshold(
+                        floor_db as f64 + agc_auto_offset_db(),
+                        hi - lo,
+                        (SPECTRUM_WIDTH * params.zoom.max(1)) as f64,
+                        sample_rate as f64,
+                        params.agc_slope_db,
+                    )
+                    .round();
+                    let mut p = demod_params.lock().unwrap();
+                    // Checked again under the lock: the slider may have
+                    // just turned it off.
+                    if p.agc_auto && p.agc_top_db != top {
+                        p.agc_top_db = top;
+                    }
+                }
+            }
+        }
+
         if spectrum.is_some() || waterfall.is_some() {
             // Same correction as the S-meter (real request -- one
             // shared control rather than a second independent one, see
@@ -2551,8 +2717,15 @@ impl SpectrumHandle {
     pub fn set_agc_hang_ms(&self, v: i32) {
         self.demod_params.lock().unwrap().agc_hang_ms = v.max(0);
     }
+    /// Also turns Auto AGC off, as moving Thetis's AGC-T slider does -- so
+    /// a restore must set agc_auto after this.
     pub fn set_agc_top_db(&self, v: f64) {
-        self.demod_params.lock().unwrap().agc_top_db = v;
+        let mut p = self.demod_params.lock().unwrap();
+        p.agc_top_db = v;
+        p.agc_auto = false;
+    }
+    pub fn set_agc_auto(&self, v: bool) {
+        self.demod_params.lock().unwrap().agc_auto = v;
     }
     pub fn set_agc_fixed_db(&self, v: f64) {
         self.demod_params.lock().unwrap().agc_fixed_db = v.clamp(AGC_FIXED_DB_RANGE.0, AGC_FIXED_DB_RANGE.1);
@@ -2809,6 +2982,78 @@ mod level_tests {
             }
         }
         (sum / count as f64).sqrt()
+    }
+
+    /// Auto AGC's pieces: the noise floor of a spectrum of white noise
+    /// (some strong carriers on it shouldn't lift it), turned into the
+    /// passband's noise power, lands near the real one; and
+    /// agc_top_for_threshold is WDSP's own SetRXAAGCThresh. Ignored: a
+    /// WDSP channel -- run alone with
+    /// `cargo test --bin hpsdr-rs auto_agc -- --ignored --test-threads=1`.
+    #[test]
+    #[ignore]
+    fn auto_agc_finds_the_noise_floor_and_matches_wdsp() {
+        let fs = 48_000.0;
+        let ch = 31;
+        let mut a = SpectrumAnalyzer::open(ch, fs as i32);
+        let usb = DemodParams { mode: Mode::Usb, width_hz: 2700.0, ..DemodParams::default() };
+        let (lo, hi) = passband_for(usb.mode, usb.width_hz);
+        // Complex white noise, sigma 1e-4 per part, plus three carriers.
+        let sigma = 1e-4;
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut uniform = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            ((seed >> 11) as f64 + 0.5) / (1u64 << 53) as f64
+        };
+        let mut nf = NoiseFloor::new();
+        let mut floor = None;
+        let mut n = 0usize;
+        for _ in 0..(fs as usize * 8 / BUFFER_SIZE) {
+            let iq: Vec<IqSample> = (0..BUFFER_SIZE)
+                .map(|_| {
+                    n += 1;
+                    let (u1, u2) = (uniform(), uniform());
+                    let r = sigma * (-2.0 * u1.ln()).sqrt();
+                    let (mut re, mut im) = (r * (std::f64::consts::TAU * u2).cos(), r * (std::f64::consts::TAU * u2).sin());
+                    for f in [-9000.0, 3000.0, 12000.0] {
+                        let p = std::f64::consts::TAU * f * n as f64 / fs;
+                        re += 1e-2 * p.cos();
+                        im += 1e-2 * p.sin();
+                    }
+                    IqSample { i: (re * IQ_NORM) as i32, q: (im * IQ_NORM) as i32 }
+                })
+                .collect();
+            let _ = a.demod(&iq, usb, (lo, hi));
+            if let (Some(s), _) = a.feed(&iq) {
+                if let Some(f) = nf.update(&s) {
+                    floor = Some(f);
+                } else {
+                    // Past the first (fast) frame: settle at the normal rate.
+                    nf.fast_until = Some(std::time::Instant::now());
+                }
+            }
+        }
+        let floor = floor.expect("a floor") as f64;
+        let pixels_wide = SPECTRUM_WIDTH as f64;
+        let measured = floor + 10.0 * ((hi - lo) * pixels_wide / fs).log10();
+        let real = 10.0 * (2.0 * sigma * sigma * (hi - lo) / fs).log10();
+        println!("floor {floor:.1} dB/pixel -> passband noise {measured:.1} dB, real {real:.1} dB");
+        assert!((measured - real).abs() < 6.0, "measured {measured:.1} vs real {real:.1}");
+
+        // The formula against WDSP's own, with this channel's passband
+        // and slope set by demod().
+        for thresh in [-120.0, -100.0, -80.0] {
+            let mut top = 0.0;
+            unsafe {
+                wdsp::SetRXAAGCThresh(ch, thresh, pixels_wide, fs);
+                wdsp::GetRXAAGCTop(ch, &mut top);
+            }
+            let ours = agc_top_for_threshold(thresh, hi - lo, pixels_wide, fs, usb.agc_slope_db);
+            println!("thresh {thresh}: WDSP top {top:.2}, ours {ours:.2}");
+            assert!((top.clamp(0.0, 120.0) - ours).abs() < 0.01, "thresh {thresh}: WDSP {top} ours {ours}");
+        }
     }
 
     /// The manual notches and the APF in the real WDSP chain: a notch at

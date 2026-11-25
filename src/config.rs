@@ -189,6 +189,12 @@ pub struct Config {
     pub tnf: bool,
     #[serde(default)]
     pub notches: Vec<crate::spectrum::Notch>,
+    /// Main receiver Auto AGC -- see spectrum::DemodParams::agc_auto.
+    #[serde(default)]
+    pub agc_auto: bool,
+    /// Auto AGC's offset above the noise floor, shared by every receiver
+    /// -- see spectrum::agc_auto_offset_db. None = the default.
+    pub agc_auto_offset_db: Option<f64>,
     /// Main receiver squelch on/off and 0-100 level -- see
     /// spectrum::Squelch.
     pub squelch_enabled: Option<bool>,
@@ -868,6 +874,9 @@ pub struct ExtraReceiverConfig {
     /// See Config::apf's doc comment.
     #[serde(default)]
     pub apf: bool,
+    /// See Config::agc_auto's doc comment.
+    #[serde(default)]
+    pub agc_auto: bool,
     /// See Config::squelch_enabled's doc comment.
     #[serde(default)]
     pub squelch_enabled: bool,

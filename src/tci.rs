@@ -1107,6 +1107,7 @@ fn handle_client(
     send_logged(&mut ws, &logging, format!("rx_volume:0,0,{:.2};", gain_to_tci_db(params.gain)).into());
     send_logged(&mut ws, &logging, format!("volume:{:.1};", gain_to_tci_db(params.gain).clamp(-60.0, 0.0)).into());
     send_logged(&mut ws, &logging, format!("agc_gain:0,{};", params.agc_top_db.round() as i64).into());
+    send_logged(&mut ws, &logging, format!("agc_auto_ex:0,{};", params.agc_auto).into());
     send_logged(&mut ws, &logging, format!("rx_nf_enable:0,{};", crate::spectrum::tnf()).into());
     send_logged(&mut ws, &logging, format!("rx_apf_enable:0,{};", params.apf).into());
     send_logged(&mut ws, &logging, format!("rx_anf_enable:0,{};", params.anf).into());
@@ -2291,6 +2292,7 @@ fn receiver_live_state(rx: u32, f: &Rx2State, params: &DemodParams) -> Vec<(Stri
         (format!("agc_mode:{rx}"), format!("agc_mode:{rx},{};", agc_to_tci(params.agc))),
         (format!("rx_volume:{rx},0"), format!("rx_volume:{rx},0,{:.2};", gain_to_tci_db(params.gain))),
         (format!("agc_gain:{rx}"), format!("agc_gain:{rx},{};", params.agc_top_db.round() as i64)),
+        (format!("agc_auto_ex:{rx}"), format!("agc_auto_ex:{rx},{};", params.agc_auto)),
         (format!("rx_anf_enable:{rx}"), format!("rx_anf_enable:{rx},{};", params.anf)),
         (format!("rx_apf_enable:{rx}"), format!("rx_apf_enable:{rx},{};", params.apf)),
         // TNF is every receiver's, as Thetis's (GetMNF).
@@ -2542,6 +2544,7 @@ const RECEIVER_COMMANDS: &[&str] = &[
     "rx_ctun_ex",
     "agc_mode",
     "agc_gain",
+    "agc_auto_ex",
     "rx_volume",
     "sql_enable",
     "sql_level",
@@ -2885,8 +2888,10 @@ fn control_command(cmd: &str, share: &crate::remote::RemoteShare, params: &Mutex
         }
         "agc_gain" => {
             // Thetis takes -20 to 120 (its AGC-T); this AGC's top is 0-140.
+            // Setting it turns Auto AGC off, as the slider does.
             if let Some(db) = number(0) {
                 p.agc_top_db = db.clamp(0.0, 140.0);
+                p.agc_auto = false;
             }
         }
         "sql_enable" => {
@@ -3020,7 +3025,9 @@ fn live_families(name: &str) -> &'static [&'static str] {
         "xit_offset" => &["xit_offset"],
         "rx_ctun_ex" => &["rx_ctun_ex"],
         "agc_mode" => &["agc_mode"],
-        "agc_gain" => &["agc_gain"],
+        // Setting the gain turns Auto AGC off.
+        "agc_gain" => &["agc_gain", "agc_auto_ex"],
+        "agc_auto_ex" => &["agc_auto_ex"],
         "rx_volume" | "volume" => &["rx_volume", "volume"],
         "tune" => &["tune", "drive"],
         "split_enable" => &["split_enable", "tx_frequency", "tx_frequency_ex"],
@@ -3497,6 +3504,16 @@ fn handle_command(
                 demod_params.lock().unwrap().apf = on;
             }
             Some(format!("rx_apf_enable:{recv},{};", demod_params.lock().unwrap().apf))
+        }
+        // agc_auto_ex:receiver[,bool]; -- Auto AGC (DemodParams::agc_auto),
+        // set or asked as rx_apf_enable above. Thetis's TCI server has no
+        // such command; this is ThetisLink's name for it.
+        "agc_auto_ex" => {
+            let recv = args.first().unwrap_or(&"0");
+            if let Some(on) = args.get(1).and_then(|v| v.trim().to_ascii_lowercase().parse::<bool>().ok()) {
+                demod_params.lock().unwrap().agc_auto = on;
+            }
+            Some(format!("agc_auto_ex:{recv},{};", demod_params.lock().unwrap().agc_auto))
         }
         // rx_nf_enable:receiver[,bool]; -- TNF, the manual notches' master
         // switch, which is every receiver's: as Thetis's handleRxNfEnable
@@ -4425,6 +4442,16 @@ mod remote_tests {
         assert!(got.iter().any(|m| m == "rx_nf_enable:0,false"), "{got:?}");
         assert!(got.iter().filter(|m| *m == "rx_apf_enable:0,true").count() == 2, "{got:?}");
         assert!(!crate::spectrum::tnf());
+
+        // Auto AGC: set and asked; setting agc_gain turns it off.
+        ws.send(Message::Text("agc_auto_ex:0,true;".into())).unwrap();
+        let got = read_for(&mut ws, 200);
+        assert!(got.iter().any(|m| m == "agc_auto_ex:0,true"), "{got:?}");
+        assert!(params.lock().unwrap().agc_auto);
+        ws.send(Message::Text("agc_gain:0,70;agc_auto_ex:0;".into())).unwrap();
+        let got = read_for(&mut ws, 200);
+        assert!(got.iter().any(|m| m == "agc_auto_ex:0,false"), "{got:?}");
+        assert!(!params.lock().unwrap().agc_auto);
         server.stop();
     }
 

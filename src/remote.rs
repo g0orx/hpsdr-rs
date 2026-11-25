@@ -995,8 +995,10 @@ fn apply_set(cmd: &Command, p: &mut DemodParams) {
             }
         }
         dsp::SET_AGC_GAIN => {
+            // Turns Auto AGC off, as the slider does.
             if let Ok(db) = value.parse::<f64>() {
                 p.agc_top_db = db.clamp(0.0, 140.0);
+                p.agc_auto = false;
             }
         }
         dsp::SET_NB => {

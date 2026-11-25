@@ -5247,6 +5247,11 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                 spectrum.set_anf(v);
             }
             spectrum.set_apf(cfg.apf);
+            // After set_agc_top_db above, which turns it off.
+            spectrum.set_agc_auto(cfg.agc_auto);
+            if let Some(v) = cfg.agc_auto_offset_db {
+                spectrum::set_agc_auto_offset_db(v);
+            }
             spectrum::set_apf_settings(cfg.apf_settings);
             spectrum::set_notches(cfg.notches.clone());
             spectrum::set_tnf(cfg.tnf);
@@ -12456,6 +12461,29 @@ impl eframe::App for HpsdrApp {
                                         }
                                     });
 
+                                    // Auto AGC's offset, shared by every
+                                    // receiver -- see DemodParams::agc_auto.
+                                    ui.horizontal_wrapped(|ui| {
+                                        let mut offset = spectrum::agc_auto_offset_db();
+                                        ui.label("Auto AGC offset:").on_hover_text(
+                                            "With Auto on (beside AGC Gain), the AGC threshold is kept this \
+                                             far above the noise floor, as Thetis's Auto AGC. Higher: less \
+                                             gain, quieter background.",
+                                        );
+                                        let (lo, hi) = spectrum::AGC_AUTO_OFFSET_RANGE;
+                                        if scroll_slider_f64(
+                                            ui,
+                                            &mut connected.slider_scroll_accum,
+                                            &mut offset,
+                                            lo..=hi,
+                                            1.0,
+                                            " dB",
+                                        ) {
+                                            spectrum::set_agc_auto_offset_db(offset.round());
+                                            settings_changed = true;
+                                        }
+                                    });
+
                                     // Real request: a controlled real-
                                     // hardware test (Elecraft XG2 signal
                                     // generator, known 50uV/-73dBm/S9
@@ -14737,6 +14765,7 @@ impl eframe::App for HpsdrApp {
                                 snb: agc_params.snb,
                                 anf: agc_params.anf,
                                 apf: agc_params.apf,
+                                agc_auto: agc_params.agc_auto,
                                 squelch_enabled: agc_params.squelch_enabled,
                                 squelch_level: agc_params.squelch_level,
                                 binaural: agc_params.binaural,
@@ -14803,6 +14832,8 @@ impl eframe::App for HpsdrApp {
                         apf_settings: spectrum::apf_settings(),
                         tnf: spectrum::tnf(),
                         notches: spectrum::notches(),
+                        agc_auto: agc_params_now.agc_auto,
+                        agc_auto_offset_db: Some(spectrum::agc_auto_offset_db()),
                         squelch_enabled: Some(agc_params_now.squelch_enabled),
                         squelch_level: Some(agc_params_now.squelch_level),
                         binaural: Some(agc_params_now.binaural),
@@ -16843,7 +16874,8 @@ fn sidetone_level_from_percent(percent: f64) -> u32 {
 /// doesn't change the other.
 fn agc_gain_slider(ui: &mut egui::Ui, scroll_accum: &mut f32, spectrum: &SpectrumHandle) -> bool {
     let params = spectrum.agc_params();
-    if params.agc == spectrum::Agc::Off {
+    let agc_off = params.agc == spectrum::Agc::Off;
+    let mut changed = if agc_off {
         ui.label("Fixed Gain:")
             .on_hover_text("With AGC Off, the receiver's gain is fixed: raise it for a weak signal, lower it if a strong one distorts");
         let mut db = params.agc_fixed_db;
@@ -16856,12 +16888,28 @@ fn agc_gain_slider(ui: &mut egui::Ui, scroll_accum: &mut f32, spectrum: &Spectru
     } else {
         ui.label("AGC Gain:");
         let mut db = params.agc_top_db;
+        // Moving it turns Auto off (set_agc_top_db), as Thetis's AGC-T.
         let changed = scroll_slider_f64(ui, scroll_accum, &mut db, 0.0..=140.0, 2.0, " dB");
         if changed {
             spectrum.set_agc_top_db(db);
         }
         changed
+    };
+    // Shown with AGC Off too (greyed out), so it's always in the same
+    // place; it only acts while the AGC runs.
+    let auto = ui
+        .add_enabled(!agc_off, egui::Button::selectable(params.agc_auto, "Auto"))
+        .on_hover_text(format!(
+            "Auto AGC: keeps the AGC threshold {:+.0} dB above the noise floor, as Thetis's \
+             (the offset is in Settings -> RX). Moving the slider turns it off.",
+            spectrum::agc_auto_offset_db()
+        ))
+        .on_disabled_hover_text("Auto AGC works with the AGC on -- not with AGC Off");
+    if auto.clicked() {
+        spectrum.set_agc_auto(!params.agc_auto);
+        changed = true;
     }
+    changed
 }
 
 fn scroll_slider_f64(
@@ -19485,6 +19533,8 @@ fn spawn_extra_receiver(
         spectrum.set_snb(s.snb);
         spectrum.set_anf(s.anf);
         spectrum.set_apf(s.apf);
+        // After set_agc_top_db, which turns it off.
+        spectrum.set_agc_auto(s.agc_auto);
         spectrum.set_squelch_enabled(s.squelch_enabled);
         spectrum.set_squelch_level(s.squelch_level);
         spectrum.set_binaural(s.binaural);
@@ -19641,6 +19691,8 @@ fn change_sample_rate(connected: &mut ConnectedState, new_rate: u32) {
     spectrum.set_snb(agc_params.snb);
     spectrum.set_anf(agc_params.anf);
     spectrum.set_apf(agc_params.apf);
+    // After set_agc_top_db, which turns it off.
+    spectrum.set_agc_auto(agc_params.agc_auto);
     spectrum.set_squelch_enabled(agc_params.squelch_enabled);
     spectrum.set_squelch_level(agc_params.squelch_level);
     spectrum.set_binaural(agc_params.binaural);
@@ -19850,6 +19902,8 @@ fn change_extra_receiver_sample_rate(rx: &mut ExtraReceiver, new_rate: u32) {
     spectrum.set_snb(agc_params.snb);
     spectrum.set_anf(agc_params.anf);
     spectrum.set_apf(agc_params.apf);
+    // After set_agc_top_db, which turns it off.
+    spectrum.set_agc_auto(agc_params.agc_auto);
     spectrum.set_squelch_enabled(agc_params.squelch_enabled);
     spectrum.set_squelch_level(agc_params.squelch_level);
     spectrum.set_binaural(agc_params.binaural);
