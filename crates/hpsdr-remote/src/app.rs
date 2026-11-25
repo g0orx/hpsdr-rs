@@ -350,7 +350,7 @@ pub struct App {
     controller: Option<hpsdr_controller::Controller>,
     controller_status: String,
     controller_open: bool,
-    controller_tune_remainder: HashMap<hpsdr_controller::ControlId, f32>,
+    controller_tune_steps: hpsdr_controller::TuneSteps,
     /// A setting a controller knob just changed, and when: shown over the
     /// spectrum for a moment.
     value_popup: Option<(String, f64)>,
@@ -439,7 +439,7 @@ impl App {
             controller: None,
             controller_status: String::new(),
             controller_open: false,
-            controller_tune_remainder: HashMap::new(),
+            controller_tune_steps: Default::default(),
             value_popup: None,
             controls_set_at: f64::NEG_INFINITY,
         };

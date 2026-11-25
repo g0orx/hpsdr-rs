@@ -83,6 +83,16 @@ pub fn settings_ui(
             pin(ui, &mut e.pin_b);
             action_combo(ui, salt, &mut e.action, &knob_choices);
             if e.action.is_some_and(|a| WHEEL_ACTIONS.contains(&a)) {
+                ui.add(
+                    egui::DragValue::new(&mut e.clicks_per_step)
+                        .range(1..=crate::MAX_CLICKS_PER_STEP)
+                        .speed(0.05)
+                        .suffix(" clicks/step"),
+                )
+                .on_hover_text(
+                    "How many clicks of this knob make one step -- raise it if a single step is hard \
+                     to hit. Turning back always takes the same number of clicks.",
+                );
                 ui.add(egui::DragValue::new(&mut e.sensitivity).range(0.1..=20.0).speed(0.05).prefix("x"))
                     .on_hover_text(sensitivity_hint);
             }

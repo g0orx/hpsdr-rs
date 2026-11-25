@@ -136,13 +136,11 @@ impl App {
             ControllerEvent::Turned(id, steps) => {
                 let Some(action) = self.controller_config.action(id) else { return };
                 if WHEEL_ACTIONS.contains(&action) {
-                    // Sensitivity: the fraction of a step left over waits
-                    // for the next turn.
-                    let r = self.controller_tune_remainder.entry(id).or_insert(0.0);
-                    *r += steps as f32 * self.controller_config.sensitivity(id);
-                    let whole = r.trunc();
-                    *r -= whole;
-                    if whole != 0.0 {
+                    // Clicks per step and sensitivity; a part step left
+                    // over waits for the next turn.
+                    let sensitivity = self.controller_config.sensitivity(id);
+                    let whole = self.controller_tune_steps.steps(&self.controller_config, id, steps, sensitivity);
+                    if whole != 0 {
                         self.wheel(action, whole as i64);
                     }
                 } else {

@@ -2451,11 +2451,8 @@ fn dispatch_controller_event(
         ControllerEvent::Turned(_, steps)
             if steps != 0 && matches!(action, MidiAction::VfoTune | MidiAction::VfoBTune) =>
         {
-            let scaled = steps as f32 * connected.controller_config.sensitivity(id)
-                + connected.controller_tune_remainder.get(&id).copied().unwrap_or(0.0);
-            let whole = scaled.trunc();
-            connected.controller_tune_remainder.insert(id, scaled - whole);
-            let whole = whole as i32;
+            let sensitivity = connected.controller_config.sensitivity(id);
+            let whole = connected.controller_tune_steps.steps(&connected.controller_config, id, steps, sensitivity);
             if whole == 0 {
                 return;
             }
@@ -2482,7 +2479,12 @@ fn dispatch_controller_event(
                 passband,
             );
         }
-        ControllerEvent::Turned(_, steps) if steps != 0 && WHEEL_ACTIONS.contains(&action) => {
+        // RIT/XIT: clicks per step here, the sensitivity scaling the Hz.
+        ControllerEvent::Turned(_, clicks) if clicks != 0 && WHEEL_ACTIONS.contains(&action) => {
+            let steps = connected.controller_tune_steps.steps(&connected.controller_config, id, clicks, 1.0);
+            if steps == 0 {
+                return;
+            }
             let sensitivity = steps.unsigned_abs() as f32 * connected.controller_config.sensitivity(id);
             let value = if steps > 0 { 65 } else { 63 };
             apply_midi_binding(
@@ -3688,9 +3690,9 @@ struct ConnectedState {
     step_memory: std::collections::HashMap<String, u32>,
     /// The mode `vfo_step_hz` currently belongs to.
     step_mode: spectrum::Mode,
-    /// A controller encoder's tuning steps not yet applied, when its
-    /// sensitivity makes them fractional (see dispatch_controller_event).
-    controller_tune_remainder: std::collections::HashMap<controller::ControlId, f32>,
+    /// A controller encoder's clicks to tuning steps -- its clicks per
+    /// step and sensitivity (see dispatch_controller_event).
+    controller_tune_steps: hpsdr_controller::TuneSteps,
     /// The setting a knob (front-panel controller or MIDI) last changed,
     /// and when -- shown for a moment over the spectrum when its own
     /// control isn't on screen (see show_value_popup).
@@ -5564,7 +5566,7 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                 vfo_step_hz: cfg.vfo_step_hz.filter(|s| VFO_STEPS_HZ.contains(s)).unwrap_or(100),
                 step_memory: cfg.step_memory.clone(),
                 step_mode: gain_mode,
-                controller_tune_remainder: std::collections::HashMap::new(),
+                controller_tune_steps: Default::default(),
                 value_popup: None,
                 repeater_offsets: cfg.repeater_offsets.clone(),
                 bandstacks: cfg.bandstacks.clone(),

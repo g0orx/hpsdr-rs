@@ -91,10 +91,49 @@ pub struct EncoderLines {
     /// the VFO step (VFO-A's box), RIT/XIT 10 Hz a step.
     #[serde(default = "one")]
     pub sensitivity: f32,
+    /// Clicks of a tuning (Wheel) encoder that make one step, 1-20: more
+    /// for a knob where one step is hard to hit. Before `sensitivity`.
+    #[serde(default = "one_click")]
+    pub clicks_per_step: u32,
 }
 
 fn one() -> f32 {
     1.0
+}
+
+fn one_click() -> u32 {
+    1
+}
+
+pub const MAX_CLICKS_PER_STEP: u32 = 20;
+
+/// A tuning encoder's clicks to steps: `clicks_per_step` clicks are one
+/// step, times `scale` (its `sensitivity`, or 1 where the caller applies
+/// that itself). A part step left over waits for the next click the same
+/// way; turning back starts afresh, so a step back always takes the same
+/// number of clicks.
+#[derive(Debug, Default)]
+pub struct TuneSteps {
+    left: std::collections::HashMap<ControlId, f32>,
+}
+
+impl TuneSteps {
+    pub fn steps(&mut self, cfg: &ControllerConfig, id: ControlId, clicks: i32, scale: f32) -> i32 {
+        if clicks == 0 {
+            return 0;
+        }
+        let per = cfg.clicks_per_step(id).clamp(1, MAX_CLICKS_PER_STEP) as f32;
+        let add = clicks as f32 / per * scale;
+        let left = self.left.entry(id).or_insert(0.0);
+        if *left != 0.0 && left.signum() != add.signum() {
+            *left = 0.0;
+        }
+        *left += add;
+        // The small nudge stops three thirds coming to 0.9999999.
+        let whole = (*left + left.signum() * 1e-4).trunc();
+        *left -= whole;
+        whole as i32
+    }
 }
 
 /// A push button or switch: a GPIO line (or, for MCP23017 switches, a
@@ -140,7 +179,7 @@ impl Default for ControllerConfig {
 }
 
 fn enc(enabled: bool, a: u32, b: u32, action: Option<MidiAction>, half_step: bool) -> EncoderLines {
-    EncoderLines { enabled, pin_a: a, pin_b: b, action, half_step, sensitivity: 1.0 }
+    EncoderLines { enabled, pin_a: a, pin_b: b, action, half_step, sensitivity: 1.0, clicks_per_step: 1 }
 }
 
 fn sw(enabled: bool, pin: u32, action: Option<MidiAction>) -> SwitchLine {
@@ -148,7 +187,7 @@ fn sw(enabled: bool, pin: u32, action: Option<MidiAction>) -> SwitchLine {
 }
 
 const NO_ENC: EncoderLines =
-    EncoderLines { enabled: false, pin_a: 0, pin_b: 0, action: None, half_step: false, sensitivity: 1.0 };
+    EncoderLines { enabled: false, pin_a: 0, pin_b: 0, action: None, half_step: false, sensitivity: 1.0, clicks_per_step: 1 };
 const NO_SW: SwitchLine = SwitchLine { enabled: false, pin: 0, action: None };
 
 impl ControllerConfig {
@@ -418,6 +457,14 @@ impl ControllerConfig {
             ControlId::EncoderBottom(i) => self.encoders.get(i).map_or(1.0, |e| e.bottom.sensitivity),
             ControlId::EncoderTop(i) => self.encoders.get(i).map_or(1.0, |e| e.top.sensitivity),
             _ => 1.0,
+        }
+    }
+
+    pub fn clicks_per_step(&self, id: ControlId) -> u32 {
+        match id {
+            ControlId::EncoderBottom(i) => self.encoders.get(i).map_or(1, |e| e.bottom.clicks_per_step),
+            ControlId::EncoderTop(i) => self.encoders.get(i).map_or(1, |e| e.top.clicks_per_step),
+            _ => 1,
         }
     }
 }
@@ -985,6 +1032,28 @@ mod linux {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Clicks per step: three clicks a step each way, a turn back starting
+    /// afresh, and the sensitivity on top.
+    #[test]
+    fn clicks_make_steps() {
+        let mut cfg = ControllerConfig::defaults(ControllerKind::Controller2V2);
+        let id = ControlId::EncoderBottom(0);
+        cfg.encoders[0].bottom.clicks_per_step = 3;
+        let mut t = TuneSteps::default();
+        let got: Vec<i32> = (0..6).map(|_| t.steps(&cfg, id, 1, 1.0)).collect();
+        assert_eq!(got, [0, 0, 1, 0, 0, 1]);
+        // Two clicks up, then back: three clicks down for a step.
+        assert_eq!((t.steps(&cfg, id, 1, 1.0), t.steps(&cfg, id, 1, 1.0)), (0, 0));
+        let got: Vec<i32> = (0..3).map(|_| t.steps(&cfg, id, -1, 1.0)).collect();
+        assert_eq!(got, [0, 0, -1]);
+        // A fast turn in one go, and a sensitivity of 2.
+        assert_eq!(t.steps(&cfg, id, 9, 1.0), 3);
+        assert_eq!(t.steps(&cfg, id, 3, 2.0), 2);
+        // The default, 1 click a step.
+        cfg.encoders[0].bottom.clicks_per_step = 1;
+        assert_eq!(t.steps(&cfg, id, -1, 1.0), -1);
+    }
 
     /// Drives an encoder through A/B levels (1 = closed).
     fn turn(e: &mut EncoderState, levels: &[(u8, u8)]) {
