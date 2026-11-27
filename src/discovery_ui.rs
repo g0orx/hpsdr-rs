@@ -113,6 +113,56 @@ pub struct DiscoveryWindow {
     /// `manual_discovery` (see `spawn_manual`) needs to append to it
     /// and save from its own thread, not just the UI thread.
     manual_ips: Arc<Mutex<Vec<String>>>,
+    /// The Autostart tick box and the radio it starts -- see Autostart.
+    autostart: Autostart,
+    /// Only the window opened when hpsdr-rs starts autostarts: not one
+    /// reopened by Stop or after a failed start, or Stop would just
+    /// start the radio again. Cleared once used, and by any click on the
+    /// list, Rediscover or unticking.
+    autostart_armed: bool,
+    /// When the radio is started, once it's been found (a short delay so
+    /// the tick box can still be cleared, e.g. if the radio's settings
+    /// make it misbehave at every start).
+    autostart_at: Option<Instant>,
+}
+
+/// Delay between finding the autostart radio and starting it.
+const AUTOSTART_DELAY: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// The Discover window's Autostart: when hpsdr-rs starts, the radio last
+/// started (by MAC) is started by itself once discovery finds it
+/// available. Kept in its own file (autostart.json), like the manual
+/// addresses, rather than UiPrefs: HpsdrApp holds its own copy of
+/// UiPrefs and saves it whole, which would undo a change made here.
+#[derive(serde::Serialize, serde::Deserialize, Default, Clone, Copy)]
+struct Autostart {
+    enabled: bool,
+    /// The radio last started from this window.
+    mac: Option<[u8; 6]>,
+}
+
+fn autostart_path() -> Option<std::path::PathBuf> {
+    let mut path = crate::config::settings_dir()?;
+    path.push("autostart.json");
+    Some(path)
+}
+
+impl Autostart {
+    fn load() -> Self {
+        autostart_path()
+            .and_then(|p| std::fs::read_to_string(p).ok())
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default()
+    }
+
+    fn save(&self) {
+        let Some(path) = autostart_path() else { return };
+        if let Ok(json) = serde_json::to_string_pretty(self) {
+            if let Err(e) = std::fs::write(&path, json) {
+                eprintln!("failed to save autostart to {}: {e}", path.display());
+            }
+        }
+    }
 }
 
 /// See DiscoveryWindow::manual_ips's own doc comment -- a flat JSON
@@ -149,8 +199,9 @@ const OZY_CONFIG_MAC: [u8; 6] = [0; 6];
 
 impl DiscoveryWindow {
     /// Creates the window and immediately kicks off a background discovery
-    /// pass, same as the original GTK dialog did on open.
-    pub fn new(ctx: &egui::Context) -> Self {
+    /// pass, same as the original GTK dialog did on open. `at_launch`: the
+    /// window opened when hpsdr-rs starts, the only one that autostarts.
+    pub fn new(ctx: &egui::Context, at_launch: bool) -> Self {
         let ozy_cfg = Config::load(OZY_CONFIG_MAC);
         let rx888_cfg = Config::load(crate::discovery::RX888_SENTINEL_MAC);
         let window = Self {
@@ -167,6 +218,9 @@ impl DiscoveryWindow {
             ozy_fpga_path: ozy_cfg.ozy_fpga_path,
             rx888_firmware_path: rx888_cfg.rx888_firmware_path,
             manual_ips: Arc::new(Mutex::new(load_manual_ips())),
+            autostart: Autostart::load(),
+            autostart_armed: at_launch,
+            autostart_at: None,
         };
         window.spawn_discovery(ctx.clone());
         // Real request (issue #5): re-try every saved manual address in
@@ -331,6 +385,26 @@ impl DiscoveryWindow {
                     }
                 }
 
+                // Autostart (see Autostart): once the radio last started is
+                // found and available, select it and start it after
+                // AUTOSTART_DELAY.
+                if self.autostart_armed && self.autostart.enabled {
+                    let found = self.autostart.mac.and_then(|mac| {
+                        devices_snapshot.iter().position(|d| d.mac == mac && device_available(d))
+                    });
+                    if let Some(i) = found {
+                        self.selected = Some(i);
+                        let at = *self.autostart_at.get_or_insert_with(|| Instant::now() + AUTOSTART_DELAY);
+                        if Instant::now() >= at {
+                            self.autostart_armed = false;
+                            self.autostart_at = None;
+                            action = DiscoveryAction::Start(devices_snapshot[i]);
+                        } else {
+                            ui.ctx().request_repaint_after(std::time::Duration::from_millis(100));
+                        }
+                    }
+                }
+
                 egui::Grid::new("discovery_grid")
                     .num_columns(7)
                     .striped(true)
@@ -457,6 +531,9 @@ impl DiscoveryWindow {
 
                             if row_clicked {
                                 self.selected = Some(i);
+                                // Choosing for yourself stops Autostart.
+                                self.autostart_armed = false;
+                                self.autostart_at = None;
                             }
                             if row_double_clicked && available {
                                 self.selected = Some(i);
@@ -481,6 +558,8 @@ impl DiscoveryWindow {
                         .clicked()
                     {
                         self.selected = None;
+                        self.autostart_armed = false;
+                        self.autostart_at = None;
                         self.spawn_discovery(ui.ctx().clone());
                     }
 
@@ -566,6 +645,42 @@ impl DiscoveryWindow {
 
                     if ui.button("Cancel").clicked() {
                         action = DiscoveryAction::Cancelled;
+                    }
+
+                    ui.separator();
+
+                    let last = self
+                        .autostart
+                        .mac
+                        .map(|mac| match devices_snapshot.iter().find(|d| d.mac == mac) {
+                            Some(d) => format!("{:?} {:02X?}", d.board, mac),
+                            None => format!("{mac:02X?}"),
+                        })
+                        .unwrap_or_else(|| "the radio you start next".to_string());
+                    if ui
+                        .checkbox(&mut self.autostart.enabled, "Autostart")
+                        .on_hover_text(format!(
+                            "When hpsdr-rs starts, start the radio last started here ({last}) by \
+                             itself, {} seconds after it's found. Clicking the list or \
+                             Rediscover stops it for this time.",
+                            AUTOSTART_DELAY.as_secs()
+                        ))
+                        .changed()
+                    {
+                        if self.autostart.enabled {
+                            // Ticked with a radio selected: that one.
+                            if let Some(dev) = self.selected.and_then(|i| devices_snapshot.get(i)) {
+                                self.autostart.mac = Some(dev.mac);
+                            }
+                        } else {
+                            self.autostart_armed = false;
+                            self.autostart_at = None;
+                        }
+                        self.autostart.save();
+                    }
+                    if let Some(at) = self.autostart_at {
+                        let left = at.saturating_duration_since(Instant::now()).as_secs_f32().ceil();
+                        ui.label(format!("Starting in {left:.0} s"));
                     }
 
                     ui.separator();
@@ -666,6 +781,15 @@ impl DiscoveryWindow {
 
         if !still_open {
             action = DiscoveryAction::Cancelled;
+        }
+
+        // The radio started (by Start, a double-click or Autostart) is the
+        // one Autostart starts next time.
+        if let DiscoveryAction::Start(dev) = &action {
+            if self.autostart.mac != Some(dev.mac) {
+                self.autostart.mac = Some(dev.mac);
+                self.autostart.save();
+            }
         }
 
         action

@@ -76,6 +76,17 @@ The first **Available** radio in the list is selected automatically as
 soon as results land (skipping over any radio already **In Use**), so you
 can usually just click **Start** -- or double-click that row.
 
+**Autostart**, beside **Cancel**, starts your radio without a click:
+when hpsdr-rs starts and discovery finds the radio you last started (by
+its MAC address) **Available**, it's selected and started 3 seconds
+later -- the line beside the tick box counts down. Useful for a radio
+with its own dedicated computer, such as a Raspberry Pi in a front
+panel. Ticking it with a radio selected makes that the one; after that,
+whichever radio you start is the one used next time. It only happens
+when hpsdr-rs starts, not when you come back here with **Stop**, and
+clicking the list, **Rediscover** or unticking it during the countdown
+stops it that time. It's kept on this computer, not per radio.
+
 **Rediscover** clears the current list and scans again -- useful if your
 radio was slow to respond or you just powered it on.
 

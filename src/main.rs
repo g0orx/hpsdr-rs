@@ -4725,7 +4725,7 @@ impl HpsdrApp {
         set_theme_choice(ui_prefs.theme);
         set_layout_choice(ui_prefs.layout);
         Self {
-            state: AppState::Discovering(DiscoveryWindow::new(ctx)),
+            state: AppState::Discovering(DiscoveryWindow::new(ctx, true)),
             was_focused: true,
             ignore_interaction_until: None,
             main_window_geometry: None,
@@ -15083,7 +15083,7 @@ impl eframe::App for HpsdrApp {
                     connected.session.stop();
                     connected.spectrum.stop();
                     let ctx = ui.ctx().clone();
-                    self.state = AppState::Discovering(DiscoveryWindow::new(&ctx));
+                    self.state = AppState::Discovering(DiscoveryWindow::new(&ctx, false));
                 } else if let Some(device) = restart_after_firmware_update {
                     // Reconnects automatically once an in-app firmware
                     // update finishes, loading the same saved Config a
@@ -15117,7 +15117,7 @@ impl eframe::App for HpsdrApp {
                     // constructing the replacement, rather than trying to
                     // hand-replicate that teardown field-by-field here.
                     let ctx = ui.ctx().clone();
-                    self.state = AppState::Discovering(DiscoveryWindow::new(&ctx));
+                    self.state = AppState::Discovering(DiscoveryWindow::new(&ctx, false));
                     // Re-query the radio rather than reusing `device` as-is
                     // -- it's a snapshot from BEFORE the update, so its
                     // `version` byte (shown in the title bar, see
@@ -15154,7 +15154,7 @@ impl eframe::App for HpsdrApp {
 
                 if retry_clicked {
                     let ctx = ui.ctx().clone();
-                    self.state = AppState::Discovering(DiscoveryWindow::new(&ctx));
+                    self.state = AppState::Discovering(DiscoveryWindow::new(&ctx, false));
                 }
             }
         }
