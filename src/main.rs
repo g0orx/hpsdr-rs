@@ -5959,6 +5959,15 @@ impl eframe::App for HpsdrApp {
                         Ok(connected) => self.state = AppState::Connected(connected),
                         Err(e) => self.state = AppState::Error(e),
                     }
+                    // REAL REPORT (RPi 4, Autostart): the radio started but
+                    // the Discover window stayed until the screen was
+                    // touched. A click on Start brings input events, and so
+                    // more frames; Autostart brings none, and the main
+                    // window -- behind the always-on-top Discover window,
+                    // unfocused -- wasn't redrawn to close it. Ask for the
+                    // next frame, and the focus, outright.
+                    ui.ctx().send_viewport_cmd(egui::ViewportCommand::Focus);
+                    ui.ctx().request_repaint();
                 }
                 DiscoveryAction::Cancelled => {
                     self.state = AppState::Error("Discovery cancelled.".to_string());
